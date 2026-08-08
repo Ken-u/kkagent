@@ -1,0 +1,58 @@
+# 复制到 ~/.kkagent/config.toml 后改 api_key / base_url / default_model
+#
+#   mkdir -p ~/.kkagent
+#   cp examples/config.example.toml ~/.kkagent/config.toml
+
+# IMPORTANT: default_model 必须是下面 [models."..."] 里存在的别名
+default_model = "local/claude-opus-4-8"
+default_permission_mode = "yolo"   # manual | yolo | auto
+default_plan_mode = false
+telemetry = false
+
+[providers.local]
+type = "anthropic"
+api_key = "sk-your-key-here"
+base_url = "http://127.0.0.1:3000"
+
+# 别名 "local/claude-opus-4-8" —— 必须与 default_model 一致
+[models."local/claude-opus-4-8"]
+provider = "local"
+model = "claude-opus-4-8"          # 发给上游的真实 model id
+max_context_size = 262144
+# 输出上限建议不要过大，否则可能被上游以「context + max_tokens」超限拒绝
+max_output_size = 16384
+capabilities = ["tool_use"]
+display_name = "claude-opus-4-8"
+
+# 可选：第二个模型
+# [models."local/other"]
+# provider = "local"
+# model = "other-model-id"
+# max_context_size = 131072
+# max_output_size = 8192
+# capabilities = ["tool_use"]
+# display_name = "other"
+
+[loop_control]
+max_attempts_per_step = 3
+reserved_context_size = 50000
+
+[background]
+max_running_tasks = 4
+keep_alive_on_exit = false
+
+# 可选：常开权限规则
+# [[permission.rules]]
+# decision = "allow"
+# scope = "user"
+# pattern = "Read"
+
+# 可选：MCP
+# [mcp_servers.filesystem]
+# command = "npx"
+# args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+
+# 可选：thinking（部分上游对 thinking+tools 组合不稳定，联调时可关掉）
+# [thinking]
+# enabled = false
+# effort = "high"

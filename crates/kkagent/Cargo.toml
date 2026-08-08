@@ -1,0 +1,26 @@
+[package]
+name = "kkagent"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "kkagent"
+path = "src/main.rs"
+
+[dependencies]
+kkagent-protocol = { workspace = true }
+kkagent-rpc = { workspace = true }
+kkagent-config = { workspace = true }
+kkagent-llm = { workspace = true }
+kkagent-core = { workspace = true }
+kkagent-tools = { workspace = true }
+kkagent-mcp = { workspace = true }
+kkagent-client = { workspace = true }
+kkagent-tui = { workspace = true }
+tokio = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }

@@ -1,0 +1,15 @@
+[package]
+name = "kkagent-client"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+kkagent-protocol = { workspace = true }
+kkagent-rpc = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+futures = { workspace = true }
