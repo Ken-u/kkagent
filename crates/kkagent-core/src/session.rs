@@ -32,7 +32,8 @@ pub struct Session {
     /// Only this file may be written/edited while plan_mode is on.
     pub plan_file_path: PathBuf,
     /// Model alias from config (e.g. "local/claude-opus-4-8").
-    pub model_alias: String,
+    /// Shared Arc so `/model` can update mid-turn while the session is out of the map.
+    pub model_alias: Arc<std::sync::Mutex<String>>,
     /// How many messages have already been written to the transcript DB.
     pub persisted_message_count: usize,
     pub approval_waiters: HashMap<String, oneshot::Sender<ApprovalResponse>>,
@@ -69,7 +70,7 @@ impl Session {
             permission_mode,
             plan_mode: false,
             plan_file_path,
-            model_alias,
+            model_alias: Arc::new(std::sync::Mutex::new(model_alias)),
             persisted_message_count: 0,
             approval_waiters: HashMap::new(),
             approval_rx,
@@ -154,6 +155,17 @@ impl Session {
         self.interrupted.load(Ordering::SeqCst)
     }
 
+    pub fn get_model_alias(&self) -> String {
+        self.model_alias
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    pub fn set_model_alias(&self, alias: impl Into<String>) {
+        *self.model_alias.lock().unwrap_or_else(|e| e.into_inner()) = alias.into();
+    }
+
     pub fn add_user_message(&mut self, text: String) {
         self.messages.push(ChatMessage {
             role: "user".into(),
@@ -231,6 +243,8 @@ Write in the user's language unless they explicitly ask for a different one. Det
 For simple questions/greetings that do not involve any information in the working directory, you may simply reply directly. For anything else, default to taking action with tools. When the request could be interpreted as either a question to answer or a task to complete, treat it as a task.
 
 When handling the user's request, if it involves creating, modifying, or running code or files, you MUST use the appropriate tools available to you to make actual changes — do not just describe the solution in text. When calling tools, do not provide detailed explanations or chain-of-thought. For non-trivial or multi-step tasks, first emit one short user-visible sentence describing what you will do next, then call the tool(s).
+
+For broad codebase exploration (map a module, find call sites across many files, compare alternatives), prefer launching a `Task` subagent with a focused prompt so work can proceed in parallel; then use `TaskOutput` / `TaskList` to collect results. Do the exploration yourself only when it is a small, single-path lookup.
 
 When a dedicated tool fits the job, reach for it before raw shell: `Read` a known path, `Glob` to find files by name, and `Grep` to search file contents.
 

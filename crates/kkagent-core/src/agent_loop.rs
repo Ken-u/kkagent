@@ -4,7 +4,7 @@ use std::time::Duration;
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::AbortHandle;
 use kkagent_protocol::{AgentEvent, SessionStatus};
-use kkagent_llm::{LlmProvider, LlmRequest, StreamEvent, ChatMessage, ChatContent, ToolDef, ThinkingParams};
+use kkagent_llm::{LlmRequest, StreamEvent, ChatMessage, ChatContent, ToolDef, ThinkingParams, create_provider};
 use kkagent_tools::{ToolContext, ToolOutput, ToolRegistry};
 use kkagent_config::AppConfig;
 
@@ -13,29 +13,40 @@ use crate::session::Session;
 
 pub struct AgentLoop {
     config: Arc<AppConfig>,
-    provider: Arc<dyn LlmProvider>,
     tools: Arc<ToolRegistry>,
     permission: Arc<Mutex<PermissionChain>>,
     event_tx: mpsc::Sender<AgentEvent>,
     abort_registry: Arc<Mutex<HashMap<String, AbortHandle>>>,
+    /// Max LLM rounds per top-level run_turn (tool recursion counts).
+    max_rounds: u32,
 }
 
 impl AgentLoop {
     pub fn new(
         config: Arc<AppConfig>,
-        provider: Arc<dyn LlmProvider>,
         tools: Arc<ToolRegistry>,
         permission: Arc<Mutex<PermissionChain>>,
         event_tx: mpsc::Sender<AgentEvent>,
         abort_registry: Arc<Mutex<HashMap<String, AbortHandle>>>,
     ) -> Self {
+        Self::with_max_rounds(config, tools, permission, event_tx, abort_registry, 64)
+    }
+
+    pub fn with_max_rounds(
+        config: Arc<AppConfig>,
+        tools: Arc<ToolRegistry>,
+        permission: Arc<Mutex<PermissionChain>>,
+        event_tx: mpsc::Sender<AgentEvent>,
+        abort_registry: Arc<Mutex<HashMap<String, AbortHandle>>>,
+        max_rounds: u32,
+    ) -> Self {
         Self {
             config,
-            provider,
             tools,
             permission,
             event_tx,
             abort_registry,
+            max_rounds: max_rounds.max(1),
         }
     }
 
@@ -43,12 +54,23 @@ impl AgentLoop {
         &'a self,
         session: &'a mut Session,
     ) -> futures::future::BoxFuture<'a, anyhow::Result<()>> {
-        Box::pin(self.run_turn_inner(session))
+        self.run_turn_inner(session, self.max_rounds)
     }
 
-    async fn run_turn_inner(
+    fn run_turn_inner<'a>(
+        &'a self,
+        session: &'a mut Session,
+        rounds_left: u32,
+    ) -> futures::future::BoxFuture<'a, anyhow::Result<()>> {
+        Box::pin(async move {
+            self.run_turn_body(session, rounds_left).await
+        })
+    }
+
+    async fn run_turn_body(
         &self,
         session: &mut Session,
+        rounds_left: u32,
     ) -> anyhow::Result<()> {
         let session_id = session.id.clone();
         tracing::info!("Starting turn for session {}", session_id);
@@ -72,14 +94,23 @@ impl AgentLoop {
             perm.set_mode(session.permission_mode);
         }
 
-        let model_alias = if session.model_alias.is_empty() {
-            self.config.default_model_alias().unwrap_or("default").to_string()
-        } else {
-            session.model_alias.clone()
+        let model_alias = {
+            let alias = session.get_model_alias();
+            if alias.is_empty() {
+                self.config.default_model_alias().unwrap_or("default").to_string()
+            } else {
+                alias
+            }
         };
-        let (model_config, _) = self.config
+        let (model_config, provider_config) = self.config
             .resolve_model(&model_alias)
             .ok_or_else(|| anyhow::anyhow!("Model '{}' not found", model_alias))?;
+        tracing::info!(
+            "Using model alias={} id={}",
+            model_alias,
+            model_config.model
+        );
+        let provider = create_provider(provider_config, model_config);
 
         let tool_defs: Vec<ToolDef> = self.tools.tool_definitions().iter().map(|td| {
             ToolDef {
@@ -111,7 +142,6 @@ impl AgentLoop {
         };
 
         let (stream_tx, mut stream_rx) = mpsc::channel::<StreamEvent>(256);
-        let provider = self.provider.clone();
 
         let handle = tokio::spawn(async move {
             if let Err(e) = provider.stream_chat(request, stream_tx).await {
@@ -420,8 +450,19 @@ impl AgentLoop {
                 return self.finish_interrupted(session).await;
             }
 
-            tracing::info!("Recursing into next turn");
-            return self.run_turn(session).await;
+            tracing::info!("Recursing into next turn ({} rounds left)", rounds_left.saturating_sub(1));
+            if rounds_left <= 1 {
+                tracing::warn!("Agent turn limit reached for session {}", session_id);
+                let _ = self.event_tx.send(AgentEvent::StatusUpdate {
+                    session_id: session_id.clone(),
+                    status: SessionStatus::Idle,
+                }).await;
+                let _ = self.event_tx.send(AgentEvent::TurnEnd {
+                    session_id: session_id.clone(),
+                }).await;
+                return Ok(());
+            }
+            return self.run_turn_inner(session, rounds_left - 1).await;
         }
 
         let _ = self.event_tx.send(AgentEvent::StatusUpdate {

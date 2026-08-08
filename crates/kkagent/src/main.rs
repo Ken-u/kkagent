@@ -11,7 +11,7 @@ use kkagent_config::{load_config, AppConfig};
 use kkagent_protocol::{Frame, PermissionMode, AgentEvent};
 use kkagent_protocol::subagent::SubagentManager;
 use kkagent_rpc::{RpcClient, RpcServer, transport::memory::create_memory_pair};
-use kkagent_llm::{create_provider, ChatMessage, ChatContent};
+use kkagent_llm::{ChatMessage, ChatContent};
 use kkagent_core::{AgentLoop, PermissionChain, Session, TranscriptDb};
 use kkagent_tools::ToolRegistry;
 use kkagent_client::KkagentClient;
@@ -224,6 +224,8 @@ struct ServerState {
     approval_txs: Mutex<HashMap<String, mpsc::Sender<kkagent_protocol::ApprovalResponse>>>,
     /// Interrupt flags remain reachable while the session is out of `sessions` during a turn.
     interrupt_flags: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    /// Model alias handles — reachable mid-turn when session is removed from `sessions`.
+    model_aliases: Mutex<HashMap<String, Arc<std::sync::Mutex<String>>>>,
     abort_registry: Arc<Mutex<HashMap<String, AbortHandle>>>,
     transcript: Mutex<TranscriptDb>,
     subagents: Arc<SubagentManager>,
@@ -256,6 +258,7 @@ async fn run_server_handler<T: kkagent_rpc::transport::AsyncTransport>(
         sessions: Mutex::new(HashMap::new()),
         approval_txs: Mutex::new(HashMap::new()),
         interrupt_flags: Mutex::new(HashMap::new()),
+        model_aliases: Mutex::new(HashMap::new()),
         abort_registry: Arc::new(Mutex::new(HashMap::new())),
         transcript: Mutex::new(transcript),
         subagents: Arc::new(SubagentManager::new(4)),
@@ -374,6 +377,10 @@ async fn handle_rpc_call(
                 session_id.clone(),
                 session.interrupted.clone(),
             );
+            state.model_aliases.lock().await.insert(
+                session_id.clone(),
+                session.model_alias.clone(),
+            );
             state.approval_txs.lock().await.insert(
                 session_id.clone(),
                 session.approval_tx.clone(),
@@ -436,7 +443,7 @@ async fn handle_rpc_call(
                         "messages": existing.messages,
                         "plan_mode": existing.plan_mode,
                         "permission_mode": existing.permission_mode,
-                        "model": existing.model_alias,
+                        "model": existing.get_model_alias(),
                     }));
                 }
             }
@@ -463,6 +470,10 @@ async fn handle_rpc_call(
             state.interrupt_flags.lock().await.insert(
                 session_id.clone(),
                 session.interrupted.clone(),
+            );
+            state.model_aliases.lock().await.insert(
+                session_id.clone(),
+                session.model_alias.clone(),
             );
             state.approval_txs.lock().await.insert(
                 session_id.clone(),
@@ -558,23 +569,59 @@ async fn handle_rpc_call(
                 }
             });
 
-            // Resolve model from session (may differ from global default)
+            // Resolve model from shared alias handle (works even mid-turn)
             let model_alias = {
-                let sessions = state.sessions.lock().await;
-                sessions
+                let aliases = state.model_aliases.lock().await;
+                aliases
                     .get(&session_id)
-                    .map(|s| s.model_alias.clone())
+                    .map(|a| a.lock().unwrap_or_else(|e| e.into_inner()).clone())
                     .filter(|a| !a.is_empty())
+                    .or_else(|| {
+                        // Fallback if map missing
+                        None
+                    })
                     .or_else(|| state.config.default_model_alias().map(|s| s.to_string()))
                     .ok_or_else(|| (-32000, "No default_model in config".into()))?
             };
-            let (model_config, provider_config) = state.config.resolve_model(&model_alias)
-                .ok_or_else(|| (-32000, format!("Model '{}' not found", model_alias)))?;
+            if state.config.resolve_model(&model_alias).is_none() {
+                return Err((-32000, format!("Model '{}' not found", model_alias)));
+            }
 
-            let provider = create_provider(provider_config, model_config);
             let mut tools = ToolRegistry::new();
             kkagent_tools::register_builtin_tools(&mut tools);
+
+            let subagents = state.subagents.clone();
+            let cfg_for_sub = state.config.clone();
+            let launch: kkagent_tools::builtin::task::SubagentLaunchFn = Arc::new(move |sub_cfg| {
+                let mgr = subagents.clone();
+                let app_cfg = cfg_for_sub.clone();
+                let id = sub_cfg.agent_id.clone();
+                tokio::spawn(async move {
+                    tracing::info!("Subagent {} starting: {}", id, sub_cfg.description);
+                    match kkagent_core::run_subagent(app_cfg, sub_cfg, PermissionMode::Auto).await {
+                        Ok(result) => {
+                            tracing::info!(
+                                "Subagent {} complete ({} chars)",
+                                id,
+                                result.len()
+                            );
+                            mgr.complete(&id, result).await;
+                        }
+                        Err(e) => {
+                            tracing::error!("Subagent {} failed: {}", id, e);
+                            mgr.fail(&id, e.to_string()).await;
+                        }
+                    }
+                });
+            });
             tools.register(Arc::new(kkagent_tools::builtin::TaskTool::new(
+                state.subagents.clone(),
+                launch,
+            )));
+            tools.register(Arc::new(kkagent_tools::builtin::TaskOutputTool::new(
+                state.subagents.clone(),
+            )));
+            tools.register(Arc::new(kkagent_tools::builtin::TaskListTool::new(
                 state.subagents.clone(),
             )));
             // Goal tools if available
@@ -591,7 +638,6 @@ async fn handle_rpc_call(
 
             let agent_loop = Arc::new(AgentLoop::new(
                 state.config.clone(),
-                Arc::from(provider),
                 Arc::new(tools),
                 Arc::new(Mutex::new(permission)),
                 agent_event_tx.clone(),
@@ -711,10 +757,20 @@ async fn handle_rpc_call(
             if state.config.resolve_model(&model).is_none() {
                 return Err((-32602, format!("Unknown model: {}", model)));
             }
-            let mut sessions = state.sessions.lock().await;
-            if let Some(session) = sessions.get_mut(&session_id) {
-                session.model_alias = model.clone();
+            // Always update the shared Arc (works mid-turn while session is out of the map).
+            let mut updated = false;
+            if let Some(arc) = state.model_aliases.lock().await.get(&session_id) {
+                *arc.lock().unwrap_or_else(|e| e.into_inner()) = model.clone();
+                updated = true;
             }
+            if let Some(session) = state.sessions.lock().await.get(&session_id) {
+                session.set_model_alias(model.clone());
+                updated = true;
+            }
+            if !updated {
+                return Err((-32602, format!("Session not found: {}", session_id)));
+            }
+            tracing::info!("Session {} model set to {}", session_id, model);
             Ok(serde_json::json!({"ok": true, "model": model}))
         }
         "session.set_title" => {
