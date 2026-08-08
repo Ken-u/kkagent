@@ -11,8 +11,8 @@
 | Read | 已实现 | 已实现 | **不足**：无 UTF-16 转码、无二进制/图片拒绝、无 `MAX_LINE_LENGTH` 截断、无结构化输出（lineCount） |
 | Write | 已实现 | 已实现 | **不足**：无结构化输出 `bytesWritten`，缺少 path access policy 前置校验 |
 | Edit | 已实现 | 已实现 | **不足**：未处理 CRLF 回合（写入时未按原文件换行风格还原），无 `replace_all` 外的模糊匹配 |
-| Grep | 已实现 | 已实现 | **不足**：缺少 `output_mode`（content/files_with_matches/count）、`-A/-B/-C` 上下文、`head_limit/offset`、type filter、`include_ignored`、敏感文件过滤 |
-| Glob | 已实现 | 已实现 | **不足**：未尊重 `.gitignore/.ignore/.rgignore`（仅硬编码跳过 `.`/`node_modules`/`target`）、无 `include_ignored`、最大匹配 500 且无提示、未过滤敏感文件 |
+| Grep | **部分增强** `[已核对]` | 已实现 | 已有 output_mode / 上下文 / head_limit / offset / type / include_ignored；仍缺敏感文件过滤 |
+| Glob | **部分增强** `[已核对]` | 已实现 | 已尊重 gitignore、include_ignored、head_limit(默认100)与截断提示；仍缺敏感文件过滤 |
 | Bash | **部分增强** `[已核对]` | 已实现 | 已有 `cwd` / `description` / `run_in_background` / `shell_id` 轮询、前景超时可转后台；仍缺 Bash parser 服务 |
 | TodoList | **已对齐 schema** `[已核对]` | 已实现 | 使用 ref 的 `todos`/`title`/`done`；仍缺持久化与 reminder 注入 |
 | ExitPlanMode | 已实现 | 已实现 | 基本对齐；ref 有 enter-plan-mode 对应工具，当前由 TUI/配置触发 |
@@ -189,6 +189,7 @@
 - [x] AskUserQuestion 工具 + TUI 选项面板 + question.respond
 - [x] TodoList schema 对齐 kimi（todos/title/done）并删除死代码
 - [x] 会话注入 AGENTS.md / 工作区 instructions
+- [x] Grep output_mode/上下文/分页；Glob 尊重 gitignore
 
 ## 十五、建议优先级（仅供参考）
 
@@ -200,7 +201,7 @@
 2. **P1 - 补齐核心体验**
    - ~~AskUserQuestion 工具 + TUI 选项渲染~~
    - ~~TodoList schema 对齐 ref（`todos`/`title`/`done`）~~
-   - Grep/Glob/Read 参数对齐
+   - ~~Grep/Glob/Read 参数对齐~~（Grep/Glob 已增强；Read 仍缺二进制拒绝等）
    - ~~AGENTS.md / Skill 注入~~（AGENTS.md 已注入；Skill 工具仍缺）
 
 3. **P2 - 扩展能力**
