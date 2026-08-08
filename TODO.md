@@ -14,7 +14,7 @@
 | Grep | 已实现 | 已实现 | **不足**：缺少 `output_mode`（content/files_with_matches/count）、`-A/-B/-C` 上下文、`head_limit/offset`、type filter、`include_ignored`、敏感文件过滤 |
 | Glob | 已实现 | 已实现 | **不足**：未尊重 `.gitignore/.ignore/.rgignore`（仅硬编码跳过 `.`/`node_modules`/`target`）、无 `include_ignored`、最大匹配 500 且无提示、未过滤敏感文件 |
 | Bash | **部分增强** `[已核对]` | 已实现 | 已有 `cwd` / `description` / `run_in_background` / `shell_id` 轮询、前景超时可转后台；仍缺 Bash parser 服务 |
-| TodoList | 已实现 | 已实现 | **不足** `[已核对]`：schema 用 `items`/`id`/`content`/`completed`，ref 用 `todos`/`title`/`done`；无持久化；无 reminder 注入；无 `SetTodoList` 别名。另有未接入的死文件 `todo_list.rs` |
+| TodoList | **已对齐 schema** `[已核对]` | 已实现 | 使用 ref 的 `todos`/`title`/`done`；仍缺持久化与 reminder 注入 |
 | ExitPlanMode | 已实现 | 已实现 | 基本对齐；ref 有 enter-plan-mode 对应工具，当前由 TUI/配置触发 |
 | CreateGoal / GetGoal / UpdateGoal | 已实现 | 已实现 | **不足**：无 `SetGoalBudget`、无 `cancelGoal`/`markBlocked`、goal 未持久化、未注入系统提示 |
 | Task / TaskOutput / TaskList / TaskStop | **部分实现** `[已核对]` | 已实现 | 已能 spawn 并真正跑 `run_subagent`，可用 TaskOutput/TaskList/TaskStop；仍缺输出持久化、镜像事件、profile 选择 |
@@ -187,6 +187,7 @@
 - [x] TaskStop + `tasks.stop` RPC + abort handle
 - [x] Bash cwd / description / background / timeout detach
 - [x] AskUserQuestion 工具 + TUI 选项面板 + question.respond
+- [x] TodoList schema 对齐 kimi（todos/title/done）并删除死代码
 
 ## 十五、建议优先级（仅供参考）
 
@@ -197,7 +198,7 @@
 
 2. **P1 - 补齐核心体验**
    - ~~AskUserQuestion 工具 + TUI 选项渲染~~
-   - TodoList schema 对齐 ref（`todos`/`title`/`done`）
+   - ~~TodoList schema 对齐 ref（`todos`/`title`/`done`）~~
    - Grep/Glob/Read 参数对齐
    - AGENTS.md / Skill 注入
 
