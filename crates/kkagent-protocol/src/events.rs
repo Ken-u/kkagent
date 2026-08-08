@@ -55,6 +55,24 @@ pub enum AgentEvent {
         session_id: String,
         enabled: bool,
     },
+    /// Fired when the plan file was written/updated so the TUI can show full plan.
+    PlanFileUpdated {
+        session_id: String,
+        path: String,
+        content: String,
+    },
+    /// Live todo list for the sticky TUI panel (latest state).
+    TodoUpdated {
+        session_id: String,
+        items: Vec<TodoItemEvent>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TodoItemEvent {
+    pub id: String,
+    pub content: String,
+    pub status: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

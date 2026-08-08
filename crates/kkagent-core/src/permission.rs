@@ -345,7 +345,7 @@ mod tests {
     #[test]
     fn test_plan_mode_denies_non_plan_write() {
         let chain = PermissionChain::new(PermissionMode::Yolo, vec![]);
-        let plan = PathBuf::from("/tmp/ws/.kkagent/plan.md");
+        let plan = PathBuf::from("/tmp/ws/.kkagent/plans/test.md");
         let decision = chain.evaluate(
             "Write",
             &serde_json::json!({"path": "src/main.rs"}),
@@ -359,10 +359,10 @@ mod tests {
     #[test]
     fn test_plan_mode_allows_plan_file_write() {
         let chain = PermissionChain::new(PermissionMode::Yolo, vec![]);
-        let plan = PathBuf::from("/tmp/ws/.kkagent/plan.md");
+        let plan = PathBuf::from("/tmp/ws/.kkagent/plans/test.md");
         let decision = chain.evaluate(
             "Write",
-            &serde_json::json!({"path": ".kkagent/plan.md"}),
+            &serde_json::json!({"path": ".kkagent/plans/test.md"}),
             Path::new("/tmp/ws"),
             true,
             Some(&plan),
@@ -373,7 +373,7 @@ mod tests {
     #[test]
     fn test_plan_mode_blocks_write_even_in_auto() {
         let chain = PermissionChain::new(PermissionMode::Auto, vec![]);
-        let plan = PathBuf::from("/tmp/ws/.kkagent/plan.md");
+        let plan = PathBuf::from("/tmp/ws/.kkagent/plans/test.md");
         let decision = chain.evaluate(
             "Edit",
             &serde_json::json!({"path": "foo.rs"}),

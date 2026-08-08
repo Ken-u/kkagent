@@ -369,6 +369,37 @@ impl AgentLoop {
                     is_error: output.is_error,
                 }).await;
 
+                if !output.is_error && tc.name == "TodoList" {
+                    if let Some(items) = todo_items_from_output(&output) {
+                        let _ = self
+                            .event_tx
+                            .send(AgentEvent::TodoUpdated {
+                                session_id: session_id.clone(),
+                                items,
+                            })
+                            .await;
+                    }
+                }
+
+                // After a successful plan-file write, push full content to the TUI.
+                if !output.is_error
+                    && session.plan_mode
+                    && (tc.name == "Write" || tc.name == "Edit")
+                {
+                    if let Some(content) =
+                        read_plan_file_if_matched(session, &tc.input).await
+                    {
+                        let _ = self
+                            .event_tx
+                            .send(AgentEvent::PlanFileUpdated {
+                                session_id: session_id.clone(),
+                                path: session.plan_file_path.display().to_string(),
+                                content,
+                            })
+                            .await;
+                    }
+                }
+
                 tool_results.push((tc.id.clone(), output));
             }
 
@@ -465,6 +496,50 @@ struct PendingToolCall {
     id: String,
     name: String,
     input: serde_json::Value,
+}
+
+async fn read_plan_file_if_matched(
+    session: &Session,
+    input: &serde_json::Value,
+) -> Option<String> {
+    let path_str = input.get("path").and_then(|v| v.as_str())?;
+    let candidate = if std::path::Path::new(path_str).is_absolute() {
+        std::path::PathBuf::from(path_str)
+    } else {
+        session.working_dir.join(path_str)
+    };
+    let plan = &session.plan_file_path;
+    let same = match (
+        tokio::fs::canonicalize(&candidate).await,
+        tokio::fs::canonicalize(plan).await,
+    ) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => {
+            let na = candidate.components().collect::<Vec<_>>();
+            let nb = plan.components().collect::<Vec<_>>();
+            na == nb
+        }
+    };
+    if !same {
+        return None;
+    }
+    tokio::fs::read_to_string(plan).await.ok()
+}
+
+fn todo_items_from_output(output: &ToolOutput) -> Option<Vec<kkagent_protocol::TodoItemEvent>> {
+    let data = output.data.as_ref()?;
+    let arr = data.get("items")?.as_array()?;
+    let items = arr
+        .iter()
+        .filter_map(|v| {
+            Some(kkagent_protocol::TodoItemEvent {
+                id: v.get("id")?.as_str()?.to_string(),
+                content: v.get("content")?.as_str()?.to_string(),
+                status: v.get("status")?.as_str()?.to_string(),
+            })
+        })
+        .collect();
+    Some(items)
 }
 
 fn describe_tool_action(name: &str, input: &serde_json::Value) -> String {

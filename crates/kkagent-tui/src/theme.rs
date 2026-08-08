@@ -30,9 +30,11 @@ impl Default for Theme {
             border: Color::Rgb(0x5A, 0x5A, 0x5A),
             border_focus: Color::Rgb(0xE8, 0xA8, 0x38),
             success: Color::Rgb(0x4E, 0xC8, 0x7E),
+            // yolo / auto badge — same warm amber as kimi
             warning: Color::Rgb(0xE8, 0xA8, 0x38),
             error: Color::Rgb(0xE8, 0x54, 0x54),
-            role_user: Color::Rgb(0xFF, 0xCB, 0x6B),
+            // user marker + message body (kimi yellow user bubble)
+            role_user: Color::Rgb(0xE8, 0xA8, 0x38),
             shell_mode: Color::Rgb(0xBD, 0x93, 0xF9),
             plan_mode: Color::Rgb(0x4F, 0xA8, 0xFF),
         }

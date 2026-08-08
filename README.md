@@ -235,6 +235,15 @@ TUI 模式下日志**不会**打印到屏幕（避免破坏布局），而是追
 ./target/release/kkagent server --listen /tmp/kkagent.sock
 ```
 
+**TUI ↔ Server 配对：**
+
+| 启动方式 | 配对关系 | 退出行为 |
+|---------|---------|---------|
+| 默认 `kkagent`（无 subcommand） | 进程内 memory duplex，**1 个 TUI ↔ 1 个 server task** | Ctrl-C / `/exit` 退出 TUI 时会 `abort` 配对的 server task；不影响其他 `kkagent` 进程 |
+| `kkagent server` | 独立进程，UDS 监听；可被多个客户端连接（多 session） | 只有你停掉这个 server 进程它才退出；**不会**随某个 TUI 一起退出 |
+
+默认 TUI **不会**自动连到残留的 `server.sock`。若感觉「连上了旧对话」，多半是 `--resume` / 历史 transcript，或另开了一个仍在跑的 `kkagent server`，而不是默认 TUI 跨进程复用。
+
 （TUI `--connect` 对接外部 server 的能力预留；默认 TUI 使用进程内 memory RPC。）
 
 ---

@@ -127,13 +127,18 @@ async fn run_tui(
     plan_mode: bool,
     resume: Option<String>,
 ) -> Result<()> {
+    // Default TUI: 1:1 in-process pair via memory duplex.
+    // This process owns both ends — quitting the TUI aborts the paired server
+    // task so a subsequent `kkagent` never talks to a leftover in-process agent.
+    // Standalone `kkagent server` (UDS) is a separate process with its own lifetime;
+    // only that mode can outlive a TUI, and only when you explicitly start it.
     let (client_stream, server_stream) = create_memory_pair();
 
     let (event_tx, event_rx) = mpsc::channel::<Frame>(256);
     let rpc_client = RpcClient::new(client_stream, event_tx);
 
     let server_config = Arc::new(config.clone());
-    tokio::spawn(async move {
+    let server_handle = tokio::spawn(async move {
         run_server_handler(server_stream, server_config).await;
     });
     // Let the server task bind the memory transport before the first RPC.
@@ -145,7 +150,13 @@ async fn run_tui(
 
     let client = KkagentClient::new(rpc_client, event_rx);
     let app = TuiApp::new(tui_config, client);
-    app.run(resume).await
+    let result = app.run(resume).await;
+
+    // Drop the paired server (and any in-flight agent/LLM tasks it owns).
+    server_handle.abort();
+    let _ = server_handle.await;
+
+    result
 }
 
 async fn run_print_mode(config: AppConfig, prompt: String, permission_mode: PermissionMode) -> Result<()> {

@@ -25,15 +25,33 @@ pub struct ToolContext {
 pub struct ToolOutput {
     pub content: String,
     pub is_error: bool,
+    /// Optional structured payload (e.g. todo items) for the agent loop / TUI.
+    pub data: Option<Value>,
 }
 
 impl ToolOutput {
     pub fn success(content: impl Into<String>) -> Self {
-        Self { content: content.into(), is_error: false }
+        Self {
+            content: content.into(),
+            is_error: false,
+            data: None,
+        }
+    }
+
+    pub fn success_with_data(content: impl Into<String>, data: Value) -> Self {
+        Self {
+            content: content.into(),
+            is_error: false,
+            data: Some(data),
+        }
     }
 
     pub fn error(content: impl Into<String>) -> Self {
-        Self { content: content.into(), is_error: true }
+        Self {
+            content: content.into(),
+            is_error: true,
+            data: None,
+        }
     }
 }
 

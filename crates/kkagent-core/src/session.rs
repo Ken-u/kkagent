@@ -56,7 +56,10 @@ impl Session {
         model_alias: String,
     ) -> Self {
         let (approval_tx, approval_rx) = mpsc::channel(16);
-        let plan_file_path = working_dir.join(".kkagent").join("plan.md");
+        let plan_file_path = working_dir
+            .join(".kkagent")
+            .join("plans")
+            .join(format!("{}.md", id));
         Self {
             id,
             title: None,
@@ -159,16 +162,13 @@ impl Session {
     }
 
     pub fn build_messages(&self) -> Vec<ChatMessage> {
-        self.messages.clone()
+        messages_for_llm(self)
     }
 
     pub fn effective_system_prompt(&self) -> String {
-        let mut prompt = self.system_prompt.clone();
-        if self.plan_mode {
-            prompt.push_str("\n\n");
-            prompt.push_str(&plan_mode_reminder(&self.plan_file_path));
-        }
-        prompt
+        // Plan-mode constraints are injected as a fresh `<system-reminder>` user
+        // message each turn (kimi-code style), not baked into the system prompt.
+        self.system_prompt.clone()
     }
 
     pub async fn wait_approval(&mut self, approval_id: &str) -> ApprovalResponse {
@@ -217,36 +217,92 @@ impl Session {
 }
 
 fn default_system_prompt() -> String {
-    r#"You are an AI coding assistant that helps users with software engineering tasks.
-You can read and edit code, run shell commands, search files, and choose the next step based on feedback.
+    // Aligned with kimi-code `profile/default/system.md` (trimmed for CLI v1 scope).
+    r#"You are kkagent (Kimi Code CLI compatible), an interactive general AI agent running on a user's computer.
 
-Guidelines:
-- Be concise and focused on the task
-- Use tools to accomplish work rather than just describing what to do
-- Always verify your work when possible
-- Ask for clarification when requirements are ambiguous
+Your primary goal is to help users with software engineering tasks by taking action — use the tools available to you to make real changes on the user's system. You should also answer questions when asked. Always adhere strictly to the following system instructions and the user's requirements.
+
+# Language
+
+Write in the user's language unless they explicitly ask for a different one. Determine it from their most recent messages — if they switch languages mid-session, switch with them. This applies to everything user-visible: your replies, your reasoning and thinking, progress notes before and between tool calls, and questions you ask. Keep code, commands, identifiers, file paths, and technical terms in their original form.
+
+# Prompt and Tool Use
+
+For simple questions/greetings that do not involve any information in the working directory, you may simply reply directly. For anything else, default to taking action with tools. When the request could be interpreted as either a question to answer or a task to complete, treat it as a task.
+
+When handling the user's request, if it involves creating, modifying, or running code or files, you MUST use the appropriate tools available to you to make actual changes — do not just describe the solution in text. When calling tools, do not provide detailed explanations or chain-of-thought. For non-trivial or multi-step tasks, first emit one short user-visible sentence describing what you will do next, then call the tool(s).
+
+When a dedicated tool fits the job, reach for it before raw shell: `Read` a known path, `Glob` to find files by name, and `Grep` to search file contents.
+
+Your text replies render as Markdown in the user's terminal. Use light Markdown: short paragraphs, `-` bullets, backticks for code/paths, fenced blocks for multi-line code. Do not use emoji unless the user does first.
+
+You have the capability to output any number of tool calls in a single response. If you anticipate making multiple non-interfering tool calls, make them in parallel.
+
+Tool calls run behind the user's permission settings. A rejected or denied call means the user or their policy declined that specific action — adjust your approach. Do not retry the same call unchanged.
+
+# General Guidelines for Coding
+
+When working on an existing codebase:
+- Understand it by reading with tools (`Read`, `Glob`, `Grep`) before making changes.
+- Make MINIMAL changes to achieve the goal.
+- Keep edits scoped to the files and modules the request actually implies.
+- Make new code read like the code around it.
+
+DO NOT run `git commit`, `git push`, `git reset`, `git rebase` or other git mutations unless explicitly asked. Ask for confirmation each time.
+
+Weigh reversibility and blast radius before destructive actions (`rm -rf`, dropping databases, force-pushing). Confirm first when the action is hard to undo or reaches beyond the local workspace.
+
+# Context Management
+
+When the conversation grows long, older turns may be compacted into a summary. Treat that summary as an accurate record of what already happened: do not redo work it reports as done.
+
+Tool results and user messages may include `<system-reminder>` tags. These are authoritative system directives that you MUST follow — they may override normal behavior (e.g., restricting you to read-only actions during plan mode).
 "#
     .to_string()
 }
 
-/// Mirrors kimi-code plan-mode-full-reminder.md (simplified).
+/// Mirrors kimi-code plan-mode injector `fullReminder`.
 pub fn plan_mode_reminder(plan_file: &std::path::Path) -> String {
     format!(
-        r#"Plan mode is active. You MUST NOT make any edits (with the exception of the current plan file) or otherwise make changes to the system. Prefer read-only tools (Read, Grep, Glob). Use Bash only when needed for read-only exploration. This supersedes any other instructions you have received.
+        r#"<system-reminder>
+Plan mode is active. You MUST NOT make any edits (with the exception of the current plan file) or otherwise make changes to the system unless a tool request is explicitly approved. Prefer read-only tools. Use Bash only when needed; Bash follows the normal permission mode and rules. This supersedes any other instructions you have received.
 
-Current plan file (ONLY file you may Write/Edit): {plan}
+Plan file: {plan}
 
 Workflow:
   1. Understand — explore the codebase with Glob, Grep, Read.
   2. Design — converge on the best approach; consider trade-offs but aim for a single recommendation.
   3. Review — re-read key files to verify understanding.
-  4. Write Plan — create/update the plan file with Write or Edit (full markdown plan).
-  5. Exit — call ExitPlanMode when the plan is ready for user approval.
+  4. Write Plan — create/update the plan file with Write or Edit (full markdown plan covering goal, approach, steps, risks, and verification).
+  5. Exit — call ExitPlanMode for user approval.
 
-Do NOT edit source code, configs, or any file other than the plan file.
-Do NOT start implementing. Your turn should end after writing a complete plan and calling ExitPlanMode.
-Ask clarifying questions in text if requirements are ambiguous — then continue planning.
-"#,
+## Plan quality
+Write a COMPLETE plan in the plan file before exiting. Include:
+- Goal / problem statement
+- Chosen approach (and briefly why)
+- Concrete implementation steps (files to touch, key changes)
+- Risks / edge cases
+- How to verify (tests / manual checks)
+
+Keep at most 2-3 meaningfully different approaches. If one is clearly superior, just propose that one.
+Your turn must end with either clarifying questions in text, or ExitPlanMode after writing the plan file.
+Do NOT start implementing source changes. Do NOT edit files other than the plan file.
+</system-reminder>"#,
         plan = plan_file.display()
     )
+}
+
+/// Build LLM-facing messages; when plan mode is on, append a fresh system-reminder
+/// (kimi injects these into the conversation, not only the system prompt).
+pub fn messages_for_llm(session: &Session) -> Vec<ChatMessage> {
+    let mut messages = session.messages.clone();
+    if session.plan_mode {
+        messages.push(ChatMessage {
+            role: "user".into(),
+            content: vec![ChatContent::Text {
+                text: plan_mode_reminder(&session.plan_file_path),
+            }],
+        });
+    }
+    messages
 }

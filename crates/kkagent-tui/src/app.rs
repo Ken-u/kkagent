@@ -74,6 +74,10 @@ pub struct AppState {
     pub history_draft: String,
     /// First Esc timestamp for double-Esc undo (millis since epoch)
     pub pending_esc_ms: Option<u128>,
+    /// Sticky todo panel (above input), latest TodoList state.
+    pub todos: Vec<TodoItem>,
+    /// Expand sticky todo beyond the collapsed max rows.
+    pub todos_expanded: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -123,7 +127,46 @@ pub struct DisplayMessage {
     pub role: MessageRole,
     pub content: String,
     pub thinking: Option<String>,
+    /// Chronological assistant segments (text + tools interleaved by event order).
+    pub parts: Vec<DisplayPart>,
+    /// Legacy parallel list — kept empty for new assistant bubbles; resume may fill both.
     pub tool_calls: Vec<DisplayToolCall>,
+}
+
+#[derive(Debug, Clone)]
+pub enum DisplayPart {
+    Text(String),
+    Tool(DisplayToolCall),
+}
+
+impl DisplayMessage {
+    pub fn append_assistant_text(&mut self, text: &str) {
+        if let Some(DisplayPart::Text(existing)) = self.parts.last_mut() {
+            existing.push_str(text);
+        } else {
+            self.parts.push(DisplayPart::Text(text.to_string()));
+        }
+        // Keep content mirror for export / simple searches.
+        self.content.push_str(text);
+    }
+
+    pub fn push_tool(&mut self, tc: DisplayToolCall) {
+        self.parts.push(DisplayPart::Tool(tc));
+    }
+
+    pub fn find_pending_tool_mut(&mut self, name: &str) -> Option<&mut DisplayToolCall> {
+        for part in self.parts.iter_mut().rev() {
+            if let DisplayPart::Tool(tc) = part {
+                if tc.name == name && tc.output.is_none() {
+                    return Some(tc);
+                }
+            }
+        }
+        self.tool_calls
+            .iter_mut()
+            .rev()
+            .find(|t| t.name == name && t.output.is_none())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -131,6 +174,8 @@ pub enum MessageRole {
     User,
     Assistant,
     System,
+    /// Full plan.md contents shown after Write/Edit in plan mode.
+    Plan,
 }
 
 #[derive(Debug, Clone)]
@@ -140,6 +185,13 @@ pub struct DisplayToolCall {
     pub output: Option<String>,
     pub is_error: bool,
     pub collapsed: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct TodoItem {
+    pub id: String,
+    pub content: String,
+    pub status: String,
 }
 
 #[derive(Debug, Clone)]
@@ -182,6 +234,8 @@ impl AppState {
             history_index: None,
             history_draft: String::new(),
             pending_esc_ms: None,
+            todos: Vec::new(),
+            todos_expanded: false,
         }
     }
 
@@ -303,6 +357,15 @@ impl TuiApp {
             self.state.session_id = Some(session_id);
         }
 
+        // Sync CLI / config plan mode onto the server session (create starts with plan_mode=false).
+        if self.state.plan_mode {
+            if let Some(ref sid) = self.state.session_id.clone() {
+                if let Err(e) = self.client.set_plan_mode(sid, true).await {
+                    eprintln!("Failed to enable plan mode: {}", e);
+                }
+            }
+        }
+
         enable_raw_mode().map_err(|e| {
             anyhow::anyhow!(
                 "Failed to enter raw mode (is stdin a TTY?): {}. \
@@ -326,6 +389,11 @@ impl TuiApp {
 
         let result = self.main_loop(&mut terminal).await;
         let sid = self.state.session_id.clone();
+
+        // Interrupt any in-flight turn before tearing down the paired server.
+        if let Some(ref id) = sid {
+            let _ = self.client.interrupt(id).await;
+        }
 
         // Always restore the terminal, even if the loop failed.
         let _ = disable_raw_mode();
@@ -645,7 +713,7 @@ impl TuiApp {
                 }
                 if self.state.plan_mode {
                     self.system_message(
-                        "Plan mode ON — explore & write plan only (.kkagent/plan.md). \
+                        "Plan mode ON — explore & write plan only. \
                          Source edits are denied until you ExitPlanMode."
                             .into(),
                     );
@@ -669,6 +737,12 @@ impl TuiApp {
             // Ctrl-O: toggle tool output folding
             KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.toggle_tool_folding();
+            }
+            // Ctrl-T: expand/collapse sticky todo panel
+            KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if self.state.todos.len() > 5 {
+                    self.state.todos_expanded = !self.state.todos_expanded;
+                }
             }
             // Normal character input
             KeyCode::Char(c) => {
@@ -977,6 +1051,8 @@ impl TuiApp {
             .to_string();
         self.state.session_id = Some(sid.clone());
         self.state.messages.clear();
+        self.state.todos.clear();
+        self.state.todos_expanded = false;
         self.state.thinking_text.clear();
         self.state.scroll_up = 0;
         self.state.follow_bottom = true;
@@ -1033,6 +1109,7 @@ impl TuiApp {
             role: MessageRole::User,
             content: text,
             thinking: None,
+            parts: Vec::new(),
             tool_calls: Vec::new(),
         });
         self.state.status = SessionStatus::Thinking;
@@ -1125,7 +1202,7 @@ impl TuiApp {
                 }
                 if self.state.plan_mode {
                     self.system_message(
-                        "Plan mode ON — explore & write plan only (.kkagent/plan.md). \
+                        "Plan mode ON — explore & write plan only. \
                          Source edits are denied until ExitPlanMode."
                             .into(),
                     );
@@ -1138,6 +1215,8 @@ impl TuiApp {
             }
             "new" | "clear" => {
                 self.state.messages.clear();
+                self.state.todos.clear();
+                self.state.todos_expanded = false;
                 self.state.thinking_text.clear();
                 let cwd = std::env::current_dir()?.to_string_lossy().to_string();
                 let session_id = self
@@ -1145,6 +1224,11 @@ impl TuiApp {
                     .create_session(Some(&cwd), Some(self.state.permission_mode))
                     .await?;
                 self.state.session_id = Some(session_id);
+                if self.state.plan_mode {
+                    if let Some(ref sid) = self.state.session_id.clone() {
+                        let _ = self.client.set_plan_mode(sid, true).await;
+                    }
+                }
                 self.system_message("New session started.".into());
             }
             "sessions" | "resume" => {
@@ -1374,6 +1458,7 @@ impl TuiApp {
                         MessageRole::User => "User",
                         MessageRole::Assistant => "Assistant",
                         MessageRole::System => "System",
+                        MessageRole::Plan => "Plan",
                     };
                     md.push_str(&format!("## {}\n\n{}\n\n", role, msg.content));
                 }
@@ -1410,6 +1495,7 @@ impl TuiApp {
             role: MessageRole::System,
             content,
             thinking: None,
+            parts: Vec::new(),
             tool_calls: Vec::new(),
         });
     }
@@ -1448,7 +1534,6 @@ impl TuiApp {
             if let Ok(evt) = serde_json::from_value::<AgentEvent>(data) {
                 match evt {
                     AgentEvent::MessageDelta { text, .. } => {
-                        // Finalize live thinking onto the assistant bubble once text starts
                         let pending_thinking = if !self.state.thinking_text.is_empty() {
                             Some(std::mem::take(&mut self.state.thinking_text))
                         } else {
@@ -1460,16 +1545,19 @@ impl TuiApp {
                                 if last.thinking.is_none() {
                                     last.thinking = pending_thinking;
                                 }
-                                last.content.push_str(&text);
+                                last.append_assistant_text(&text);
                                 return;
                             }
                         }
-                        self.state.messages.push(DisplayMessage {
+                        let mut msg = DisplayMessage {
                             role: MessageRole::Assistant,
-                            content: text,
+                            content: String::new(),
                             thinking: pending_thinking,
+                            parts: Vec::new(),
                             tool_calls: Vec::new(),
-                        });
+                        };
+                        msg.append_assistant_text(&text);
+                        self.state.messages.push(msg);
                     }
                     AgentEvent::ThinkingDelta { text, .. } => {
                         self.state.thinking_text.push_str(&text);
@@ -1485,37 +1573,35 @@ impl TuiApp {
                         } else {
                             None
                         };
+                        let tc = DisplayToolCall {
+                            name: tool_name,
+                            input_summary: summary,
+                            output: None,
+                            is_error: false,
+                            collapsed: true,
+                        };
                         if let Some(last) = self.state.messages.last_mut() {
                             if last.role == MessageRole::Assistant {
                                 if last.thinking.is_none() {
                                     last.thinking = pending_thinking;
                                 }
-                                last.tool_calls.push(DisplayToolCall {
-                                    name: tool_name,
-                                    input_summary: summary,
-                                    output: None,
-                                    is_error: false,
-                                    collapsed: true,
-                                });
+                                last.push_tool(tc);
                                 return;
                             }
                         }
-                        self.state.messages.push(DisplayMessage {
+                        let mut msg = DisplayMessage {
                             role: MessageRole::Assistant,
                             content: String::new(),
                             thinking: pending_thinking,
-                            tool_calls: vec![DisplayToolCall {
-                                name: tool_name,
-                                input_summary: summary,
-                                output: None,
-                                is_error: false,
-                                collapsed: true,
-                            }],
-                        });
+                            parts: Vec::new(),
+                            tool_calls: Vec::new(),
+                        };
+                        msg.push_tool(tc);
+                        self.state.messages.push(msg);
                     }
                     AgentEvent::ToolResult { tool_name, output, is_error, .. } => {
                         if let Some(last) = self.state.messages.last_mut() {
-                            if let Some(tc) = last.tool_calls.iter_mut().rev().find(|t| t.name == tool_name && t.output.is_none()) {
+                            if let Some(tc) = last.find_pending_tool_mut(&tool_name) {
                                 tc.output = Some(output);
                                 tc.is_error = is_error;
                             }
@@ -1523,7 +1609,6 @@ impl TuiApp {
                     }
                     AgentEvent::StatusUpdate { status, .. } => {
                         self.state.status = status;
-                        // Don't clear thinking_text here — finalize on MessageDelta / TurnEnd
                     }
                     AgentEvent::ApprovalRequested { request, .. } => {
                         let detail = request
@@ -1546,9 +1631,7 @@ impl TuiApp {
                     }
                     AgentEvent::Error { message, .. } => {
                         self.state.status = SessionStatus::Idle;
-                        if message == "Interrupted" {
-                            // Already shown via Esc/Ctrl-C feedback; avoid duplicate if present
-                        } else {
+                        if message != "Interrupted" {
                             self.system_message(format!("Error: {}", message));
                         }
                     }
@@ -1564,8 +1647,32 @@ impl TuiApp {
                             if enabled { "on" } else { "off" }
                         ));
                     }
+                    AgentEvent::PlanFileUpdated { path, content, .. } => {
+                        self.state.messages.retain(|m| m.role != MessageRole::Plan);
+                        self.state.messages.push(DisplayMessage {
+                            role: MessageRole::Plan,
+                            content: format!("file: {}\n\n{}", path, content),
+                            thinking: None,
+                            parts: Vec::new(),
+                            tool_calls: Vec::new(),
+                        });
+                        self.state.scroll_up = 0;
+                        self.state.follow_bottom = true;
+                    }
+                    AgentEvent::TodoUpdated { items, .. } => {
+                        self.state.todos = items
+                            .into_iter()
+                            .map(|i| TodoItem {
+                                id: i.id,
+                                content: i.content,
+                                status: i.status,
+                            })
+                            .collect();
+                        if self.state.todos.is_empty() {
+                            self.state.todos_expanded = false;
+                        }
+                    }
                     AgentEvent::TurnEnd { .. } => {
-                        // Preserve any leftover thinking onto last assistant msg
                         if !self.state.thinking_text.is_empty() {
                             let t = std::mem::take(&mut self.state.thinking_text);
                             if let Some(last) = self.state.messages.last_mut() {
@@ -1576,6 +1683,7 @@ impl TuiApp {
                                         role: MessageRole::Assistant,
                                         content: String::new(),
                                         thinking: Some(t),
+                                        parts: Vec::new(),
                                         tool_calls: Vec::new(),
                                     });
                                 }
@@ -1584,6 +1692,7 @@ impl TuiApp {
                                     role: MessageRole::Assistant,
                                     content: String::new(),
                                     thinking: Some(t),
+                                    parts: Vec::new(),
                                     tool_calls: Vec::new(),
                                 });
                             }
@@ -1601,12 +1710,18 @@ impl TuiApp {
 
     fn toggle_tool_folding(&mut self) {
         for msg in &mut self.state.messages {
+            for part in &mut msg.parts {
+                if let DisplayPart::Tool(tc) = part {
+                    tc.collapsed = !tc.collapsed;
+                }
+            }
             for tc in &mut msg.tool_calls {
                 tc.collapsed = !tc.collapsed;
             }
         }
     }
 }
+
 
 fn slash_help_text() -> String {
     let mut s = String::from(
@@ -1619,6 +1734,7 @@ fn slash_help_text() -> String {
   Shift-Tab     - Toggle plan mode\n\
   !             - Shell mode\n\
   Ctrl-O        - Fold tool output\n\
+  Ctrl-T        - Expand/collapse todo panel\n\
   Mouse wheel   - Scroll history\n\n\
 Slash commands:\n",
     );
@@ -1636,6 +1752,7 @@ Slash commands:\n",
 /// pairing tool_result blocks onto preceding tool_use entries.
 fn transcript_messages_to_display(msgs: &[serde_json::Value]) -> Vec<DisplayMessage> {
     let mut out: Vec<DisplayMessage> = Vec::new();
+    // tool_use id -> (msg_idx, part_idx)
     let mut tool_index: std::collections::HashMap<String, (usize, usize)> =
         std::collections::HashMap::new();
 
@@ -1677,9 +1794,9 @@ fn transcript_messages_to_display(msgs: &[serde_json::Value]) -> Vec<DisplayMess
                                 .get("is_error")
                                 .and_then(|v| v.as_bool())
                                 .unwrap_or(false);
-                            if let Some(&(mi, ti)) = tool_index.get(id) {
+                            if let Some(&(mi, pi)) = tool_index.get(id) {
                                 if let Some(msg) = out.get_mut(mi) {
-                                    if let Some(tc) = msg.tool_calls.get_mut(ti) {
+                                    if let Some(DisplayPart::Tool(tc)) = msg.parts.get_mut(pi) {
                                         tc.output = Some(result);
                                         tc.is_error = is_error;
                                         tc.collapsed = true;
@@ -1695,24 +1812,27 @@ fn transcript_messages_to_display(msgs: &[serde_json::Value]) -> Vec<DisplayMess
                         role: MessageRole::User,
                         content: text,
                         thinking: None,
+                        parts: Vec::new(),
                         tool_calls: Vec::new(),
                     });
                 }
             }
             "assistant" => {
-                let mut text = String::new();
                 let mut thinking = None;
-                let mut tool_calls = Vec::new();
+                let mut parts: Vec<DisplayPart> = Vec::new();
+                let mut content_mirror = String::new();
                 let msg_idx = out.len();
                 for block in content {
                     let ty = block.get("type").and_then(|v| v.as_str()).unwrap_or("");
                     match ty {
                         "text" => {
                             if let Some(t) = block.get("text").and_then(|v| v.as_str()) {
-                                if !text.is_empty() {
-                                    text.push('\n');
+                                if let Some(DisplayPart::Text(existing)) = parts.last_mut() {
+                                    existing.push_str(t);
+                                } else {
+                                    parts.push(DisplayPart::Text(t.to_string()));
                                 }
-                                text.push_str(t);
+                                content_mirror.push_str(t);
                             }
                         }
                         "thinking" => {
@@ -1734,27 +1854,28 @@ fn transcript_messages_to_display(msgs: &[serde_json::Value]) -> Vec<DisplayMess
                             let input = block.get("input").cloned().unwrap_or_default();
                             let summary = serde_json::to_string(&input).unwrap_or_default();
                             let summary: String = summary.chars().take(120).collect();
-                            let ti = tool_calls.len();
+                            let pi = parts.len();
                             if !id.is_empty() {
-                                tool_index.insert(id, (msg_idx, ti));
+                                tool_index.insert(id, (msg_idx, pi));
                             }
-                            tool_calls.push(DisplayToolCall {
+                            parts.push(DisplayPart::Tool(DisplayToolCall {
                                 name,
                                 input_summary: summary,
                                 output: None,
                                 is_error: false,
                                 collapsed: true,
-                            });
+                            }));
                         }
                         _ => {}
                     }
                 }
-                if !text.is_empty() || thinking.is_some() || !tool_calls.is_empty() {
+                if !content_mirror.is_empty() || thinking.is_some() || !parts.is_empty() {
                     out.push(DisplayMessage {
                         role: MessageRole::Assistant,
-                        content: text,
+                        content: content_mirror,
                         thinking,
-                        tool_calls,
+                        parts,
+                        tool_calls: Vec::new(),
                     });
                 }
             }
@@ -1775,6 +1896,7 @@ fn transcript_messages_to_display(msgs: &[serde_json::Value]) -> Vec<DisplayMess
                         role: MessageRole::System,
                         content: text,
                         thinking: None,
+                        parts: Vec::new(),
                         tool_calls: Vec::new(),
                     });
                 }
@@ -1784,6 +1906,7 @@ fn transcript_messages_to_display(msgs: &[serde_json::Value]) -> Vec<DisplayMess
     }
     out
 }
+
 
 fn copy_to_clipboard(text: &str) -> anyhow::Result<()> {
     #[cfg(target_os = "macos")]

@@ -9,7 +9,7 @@ use kkagent_config::AppConfig;
 use kkagent_protocol::{PermissionMode, SessionStatus};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::app::{AppMode, AppState, ListPickerState, MessageRole, PendingApproval};
+use crate::app::{AppMode, AppState, DisplayPart, ListPickerState, MessageRole, PendingApproval, TodoItem};
 use crate::theme::Theme;
 
 const TIPS: &[&str] = &[
@@ -33,44 +33,40 @@ pub fn render_ui(f: &mut Frame, state: &mut AppState, config: &AppConfig) {
         .or_else(|| state.list_picker.as_ref().map(picker_height))
         .unwrap_or(0);
 
-    // kimi 布局：消息区 | 带边框输入框(3行) | footer 两行
+    // Sticky todo sits above the input (highest visual priority).
+    let todo_height = todo_panel_height(state);
+
+    // kimi 布局：消息区 | todo(可选) | 带边框输入框 | footer 两行
     let input_inner = input_inner_height(state);
     let input_box = input_inner + 2; // borders
+    let bottom_stack = todo_height + input_box + slash_height;
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(1),
-            Constraint::Length(input_box + slash_height),
+            Constraint::Length(bottom_stack),
             Constraint::Length(2),
         ])
         .split(size);
 
-    // Message area sits above the combined input+slash area
-    let input_and_slash = chunks[1];
-    let input_area = if slash_height > 0 {
-        Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(slash_height),
-                Constraint::Length(input_box),
-            ])
-            .split(input_and_slash)[1]
-    } else {
-        input_and_slash
-    };
-    let slash_area = if slash_height > 0 {
-        Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(slash_height),
-                Constraint::Length(input_box),
-            ])
-            .split(input_and_slash)[0]
-    } else {
-        input_and_slash
-    };
+    let bottom = chunks[1];
+    let bottom_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(todo_height),
+            Constraint::Length(slash_height),
+            Constraint::Length(input_box),
+        ])
+        .split(bottom);
+
+    let todo_area = bottom_chunks[0];
+    let slash_area = bottom_chunks[1];
+    let input_area = bottom_chunks[2];
 
     render_messages(f, chunks[0], state, &theme);
+    if todo_height > 0 {
+        render_todo_panel(f, todo_area, state, &theme);
+    }
     render_input(f, input_area, state, &theme);
     render_footer(f, chunks[2], state, config, &theme);
 
@@ -168,7 +164,7 @@ fn build_transcript_lines(state: &AppState, theme: &Theme, width: u16) -> Vec<Li
     for msg in &state.messages {
         match msg.role {
             MessageRole::User => {
-                // kimi: 黄色用户标记
+                // kimi: 用户标记 + 正文均为黄色（与 footer 的 yolo 同色）
                 push_wrapped_prefixed(
                     &mut lines,
                     "✦ ",
@@ -177,8 +173,31 @@ fn build_transcript_lines(state: &AppState, theme: &Theme, width: u16) -> Vec<Li
                     Style::default()
                         .fg(theme.role_user)
                         .add_modifier(Modifier::BOLD),
-                    Style::default().fg(theme.text),
+                    Style::default().fg(theme.role_user),
                 );
+                lines.push(Line::from(""));
+            }
+            MessageRole::Plan => {
+                lines.push(Line::from(Span::styled(
+                    "● plan",
+                    Style::default()
+                        .fg(theme.plan_mode)
+                        .add_modifier(Modifier::BOLD),
+                )));
+                let mut body = msg.content.as_str();
+                if let Some(rest) = body.strip_prefix("file: ") {
+                    if let Some((path_line, rest_body)) = rest.split_once('\n') {
+                        lines.push(Line::from(Span::styled(
+                            format!("  {}", path_line.trim()),
+                            Style::default().fg(theme.text_muted),
+                        )));
+                        body = rest_body.trim_start_matches('\n');
+                    }
+                }
+                // Full plan — no line cap (unlike tool-result previews).
+                for line in body.lines() {
+                    push_assistant_wrapped(&mut lines, line, width, theme, false);
+                }
                 lines.push(Line::from(""));
             }
             MessageRole::Assistant => {
@@ -213,74 +232,69 @@ fn build_transcript_lines(state: &AppState, theme: &Theme, width: u16) -> Vec<Li
                     }
                 }
 
-                let mut first = true;
-                if !msg.content.is_empty() {
-                    for (i, line) in msg.content.lines().enumerate() {
-                        if i == 0 {
-                            push_assistant_wrapped(&mut lines, line, width, theme, true);
-                            first = false;
-                        } else {
-                            push_assistant_wrapped(&mut lines, line, width, theme, false);
+                // Chronological parts: tools stay where they were called;
+                // later text (final answer) naturally ends at the bottom.
+                let mut first_bullet = true;
+                let mut rendered_any = false;
+
+                let parts: Vec<&DisplayPart> = if !msg.parts.is_empty() {
+                    msg.parts.iter().collect()
+                } else {
+                    // Legacy fallback: tools then content (prefer tools above text).
+                    Vec::new()
+                };
+
+                if !parts.is_empty() {
+                    for part in parts {
+                        match part {
+                            DisplayPart::Text(text) => {
+                                if text.is_empty() {
+                                    continue;
+                                }
+                                for (i, line) in text.lines().enumerate() {
+                                    if first_bullet && i == 0 {
+                                        push_assistant_wrapped(&mut lines, line, width, theme, true);
+                                        first_bullet = false;
+                                    } else {
+                                        push_assistant_wrapped(&mut lines, line, width, theme, false);
+                                    }
+                                }
+                                rendered_any = true;
+                            }
+                            DisplayPart::Tool(tc) => {
+                                render_tool_call_lines(
+                                    &mut lines,
+                                    tc,
+                                    width,
+                                    theme,
+                                    first_bullet,
+                                );
+                                first_bullet = false;
+                                rendered_any = true;
+                            }
                         }
+                    }
+                } else {
+                    // Fallback for old messages without parts: tools first, then content.
+                    for tc in &msg.tool_calls {
+                        render_tool_call_lines(&mut lines, tc, width, theme, first_bullet);
+                        first_bullet = false;
+                        rendered_any = true;
+                    }
+                    if !msg.content.is_empty() {
+                        for (i, line) in msg.content.lines().enumerate() {
+                            if first_bullet && i == 0 {
+                                push_assistant_wrapped(&mut lines, line, width, theme, true);
+                                first_bullet = false;
+                            } else {
+                                push_assistant_wrapped(&mut lines, line, width, theme, false);
+                            }
+                        }
+                        rendered_any = true;
                     }
                 }
 
-                for tc in &msg.tool_calls {
-                    if first {
-                        lines.push(Line::from(vec![
-                            Span::styled("● ", Style::default().fg(theme.text)),
-                            Span::styled(
-                                format!("{} {}", status_icon(tc), tc.name),
-                                Style::default().fg(if tc.is_error {
-                                    theme.error
-                                } else {
-                                    theme.text_dim
-                                }),
-                            ),
-                            Span::styled(
-                                format!("  {}", truncate(&tc.input_summary, 64)),
-                                Style::default().fg(theme.text_muted),
-                            ),
-                        ]));
-                        first = false;
-                    } else {
-                        lines.push(tool_continuation_line(tc, theme));
-                    }
-
-                    if !tc.collapsed {
-                        if let Some(ref output) = tc.output {
-                            let max_preview = 12;
-                            let all: Vec<&str> = output.lines().collect();
-                            let show = all.len().min(max_preview);
-                            for l in &all[..show] {
-                                let truncated = truncate(l, width.saturating_sub(4) as usize);
-                                lines.push(Line::from(Span::styled(
-                                    format!("  {}", truncated),
-                                    Style::default().fg(theme.text_muted),
-                                )));
-                            }
-                            if all.len() > max_preview {
-                                lines.push(Line::from(Span::styled(
-                                    format!(
-                                        "  ... ({} more lines, ctrl+o to expand)",
-                                        all.len() - max_preview
-                                    ),
-                                    Style::default().fg(theme.text_muted),
-                                )));
-                            }
-                        }
-                    } else if tc.output.as_ref().map(|o| o.lines().count()).unwrap_or(0) > 0 {
-                        let n = tc.output.as_ref().map(|o| o.lines().count()).unwrap_or(0);
-                        if n > 1 {
-                            lines.push(Line::from(Span::styled(
-                                format!("  ... ({} more lines, ctrl+o to expand)", n),
-                                Style::default().fg(theme.text_muted),
-                            )));
-                        }
-                    }
-                }
-
-                if !msg.content.is_empty() || !msg.tool_calls.is_empty() {
+                if rendered_any {
                     lines.push(Line::from(""));
                 }
             }
@@ -385,6 +399,276 @@ fn status_icon(tc: &crate::app::DisplayToolCall) -> &'static str {
         }
     } else {
         "·"
+    }
+}
+
+fn render_tool_call_lines(
+    lines: &mut Vec<Line<'static>>,
+    tc: &crate::app::DisplayToolCall,
+    width: u16,
+    theme: &Theme,
+    first_bullet: bool,
+) {
+    if first_bullet {
+        lines.push(Line::from(vec![
+            Span::styled("● ", Style::default().fg(theme.text)),
+            Span::styled(
+                format!("{} {}", status_icon(tc), tc.name),
+                Style::default().fg(if tc.is_error {
+                    theme.error
+                } else {
+                    theme.text_dim
+                }),
+            ),
+            Span::styled(
+                format!("  {}", truncate(&tc.input_summary, 64)),
+                Style::default().fg(theme.text_muted),
+            ),
+        ]));
+    } else {
+        lines.push(tool_continuation_line(tc, theme));
+    }
+
+    if !tc.collapsed {
+        if let Some(ref output) = tc.output {
+            let max_preview = 12;
+            let all: Vec<&str> = output.lines().collect();
+            let show = all.len().min(max_preview);
+            for l in &all[..show] {
+                let truncated = truncate(l, width.saturating_sub(4) as usize);
+                lines.push(Line::from(Span::styled(
+                    format!("  {}", truncated),
+                    Style::default().fg(theme.text_muted),
+                )));
+            }
+            if all.len() > max_preview {
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "  ... ({} more lines, ctrl+o to expand)",
+                        all.len() - max_preview
+                    ),
+                    Style::default().fg(theme.text_muted),
+                )));
+            }
+        }
+    } else if tc.output.as_ref().map(|o| o.lines().count()).unwrap_or(0) > 1 {
+        let n = tc.output.as_ref().map(|o| o.lines().count()).unwrap_or(0);
+        lines.push(Line::from(Span::styled(
+            format!("  ... ({} more lines, ctrl+o to expand)", n),
+            Style::default().fg(theme.text_muted),
+        )));
+    }
+}
+
+const TODO_MAX_VISIBLE: usize = 5;
+
+fn todo_panel_height(state: &AppState) -> u16 {
+    if state.todos.is_empty() {
+        return 0;
+    }
+    // separator + title + rows (+ optional overflow hint)
+    let rows = if state.todos_expanded {
+        state.todos.len()
+    } else {
+        state.todos.len().min(TODO_MAX_VISIBLE)
+    };
+    let overflow = !state.todos_expanded && state.todos.len() > TODO_MAX_VISIBLE;
+    (2 + rows + if overflow { 1 } else { 0 }) as u16
+}
+
+fn render_todo_panel(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    if area.height == 0 || state.todos.is_empty() {
+        return;
+    }
+
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(Span::styled(
+        "─".repeat(area.width as usize),
+        Style::default().fg(theme.border),
+    )));
+    lines.push(Line::from(Span::styled(
+        "  Todo",
+        Style::default()
+            .fg(theme.primary)
+            .add_modifier(Modifier::BOLD),
+    )));
+
+    let visible = if state.todos_expanded {
+        VisibleTodos {
+            indices: (0..state.todos.len()).collect(),
+            hidden: 0,
+            hidden_done: 0,
+            hidden_progress: 0,
+            hidden_pending: 0,
+        }
+    } else {
+        select_visible_todos(&state.todos)
+    };
+
+    for &i in &visible.indices {
+        if let Some(todo) = state.todos.get(i) {
+            lines.push(todo_row_line(todo, theme));
+        }
+    }
+
+    if state.todos_expanded && state.todos.len() > TODO_MAX_VISIBLE {
+        lines.push(Line::from(Span::styled(
+            format!("  all {} items · ctrl+t to collapse", state.todos.len()),
+            Style::default().fg(theme.text_dim),
+        )));
+    } else if visible.hidden > 0 {
+        let mut parts = Vec::new();
+        if visible.hidden_done > 0 {
+            parts.push(format!("{} done", visible.hidden_done));
+        }
+        if visible.hidden_progress > 0 {
+            parts.push(format!("{} in progress", visible.hidden_progress));
+        }
+        if visible.hidden_pending > 0 {
+            parts.push(format!("{} pending", visible.hidden_pending));
+        }
+        let suffix = if parts.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", parts.join(" · "))
+        };
+        lines.push(Line::from(Span::styled(
+            format!("  … +{} more{} · ctrl+t to expand", visible.hidden, suffix),
+            Style::default().fg(theme.text_dim),
+        )));
+    }
+
+    f.render_widget(Paragraph::new(Text::from(lines)), area);
+}
+
+fn todo_row_line(todo: &TodoItem, theme: &Theme) -> Line<'static> {
+    let (marker, marker_style, title_style) = match normalize_todo_status(&todo.status) {
+        "in_progress" => (
+            "●",
+            Style::default()
+                .fg(theme.primary)
+                .add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme.text)
+                .add_modifier(Modifier::BOLD),
+        ),
+        "completed" => (
+            "✓",
+            Style::default().fg(theme.success),
+            Style::default()
+                .fg(theme.text_dim)
+                .add_modifier(Modifier::CROSSED_OUT),
+        ),
+        "cancelled" => (
+            "✗",
+            Style::default().fg(theme.error),
+            Style::default().fg(theme.text_dim),
+        ),
+        _ => (
+            "○",
+            Style::default().fg(theme.text_dim),
+            Style::default().fg(theme.text),
+        ),
+    };
+    Line::from(vec![
+        Span::raw("  "),
+        Span::styled(marker.to_string(), marker_style),
+        Span::raw(" "),
+        Span::styled(todo.content.clone(), title_style),
+    ])
+}
+
+fn normalize_todo_status(status: &str) -> &str {
+    match status {
+        "done" => "completed",
+        other => other,
+    }
+}
+
+struct VisibleTodos {
+    indices: Vec<usize>,
+    hidden: usize,
+    hidden_done: usize,
+    hidden_progress: usize,
+    hidden_pending: usize,
+}
+
+/// kimi-style collapsed selector: all in_progress, then pending + latest done.
+fn select_visible_todos(todos: &[TodoItem]) -> VisibleTodos {
+    if todos.len() <= TODO_MAX_VISIBLE {
+        return VisibleTodos {
+            indices: (0..todos.len()).collect(),
+            hidden: 0,
+            hidden_done: 0,
+            hidden_progress: 0,
+            hidden_pending: 0,
+        };
+    }
+
+    let mut in_progress = Vec::new();
+    let mut pending = Vec::new();
+    let mut done = Vec::new();
+    for (i, todo) in todos.iter().enumerate() {
+        match normalize_todo_status(&todo.status) {
+            "in_progress" => in_progress.push(i),
+            "completed" => done.push(i),
+            "cancelled" => {}
+            _ => pending.push(i),
+        }
+    }
+
+    let mut picked = std::collections::BTreeSet::new();
+    for &i in in_progress.iter().take(TODO_MAX_VISIBLE) {
+        picked.insert(i);
+    }
+
+    if picked.len() < TODO_MAX_VISIBLE {
+        let remaining = TODO_MAX_VISIBLE - picked.len();
+        let done_rev: Vec<usize> = done.iter().copied().rev().collect();
+        let (done_count, pending_count) = if done_rev.is_empty() {
+            (0, remaining.min(pending.len()))
+        } else if pending.is_empty() {
+            (remaining.min(done_rev.len()), 0)
+        } else {
+            let mut pending_count = (remaining - 1).min(pending.len());
+            let mut done_count = 1;
+            if pending_count < remaining - 1 {
+                done_count = (remaining - pending_count).min(done_rev.len());
+            }
+            let _ = &mut pending_count;
+            (done_count, pending_count)
+        };
+        for &i in done_rev.iter().take(done_count) {
+            picked.insert(i);
+        }
+        for &i in pending.iter().take(pending_count) {
+            picked.insert(i);
+        }
+    }
+
+    let mut hidden_done = 0;
+    let mut hidden_progress = 0;
+    let mut hidden_pending = 0;
+    for (i, todo) in todos.iter().enumerate() {
+        if picked.contains(&i) {
+            continue;
+        }
+        match normalize_todo_status(&todo.status) {
+            "in_progress" => hidden_progress += 1,
+            "completed" => hidden_done += 1,
+            "cancelled" => {}
+            _ => hidden_pending += 1,
+        }
+    }
+
+    let indices: Vec<usize> = picked.into_iter().collect();
+    let shown = indices.len();
+    VisibleTodos {
+        indices,
+        hidden: todos.len().saturating_sub(shown),
+        hidden_done,
+        hidden_progress,
+        hidden_pending,
     }
 }
 
