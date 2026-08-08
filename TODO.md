@@ -13,7 +13,7 @@
 | Edit | 已实现 | 已实现 | **不足**：未处理 CRLF 回合（写入时未按原文件换行风格还原），无 `replace_all` 外的模糊匹配 |
 | Grep | 已实现 | 已实现 | **不足**：缺少 `output_mode`（content/files_with_matches/count）、`-A/-B/-C` 上下文、`head_limit/offset`、type filter、`include_ignored`、敏感文件过滤 |
 | Glob | 已实现 | 已实现 | **不足**：未尊重 `.gitignore/.ignore/.rgignore`（仅硬编码跳过 `.`/`node_modules`/`target`）、无 `include_ignored`、最大匹配 500 且无提示、未过滤敏感文件 |
-| Bash | 已实现 | 已实现 | **不足**：无后台运行、无 `cwd` 参数、无描述字段、超时后未转后台/未杀进程、无 Bash parser 服务；配置里有 `bash_auto_background_on_timeout` 占位未用 |
+| Bash | **部分增强** `[已核对]` | 已实现 | 已有 `cwd` / `description` / `run_in_background` / `shell_id` 轮询、前景超时可转后台；仍缺 Bash parser 服务 |
 | TodoList | 已实现 | 已实现 | **不足** `[已核对]`：schema 用 `items`/`id`/`content`/`completed`，ref 用 `todos`/`title`/`done`；无持久化；无 reminder 注入；无 `SetTodoList` 别名。另有未接入的死文件 `todo_list.rs` |
 | ExitPlanMode | 已实现 | 已实现 | 基本对齐；ref 有 enter-plan-mode 对应工具，当前由 TUI/配置触发 |
 | CreateGoal / GetGoal / UpdateGoal | 已实现 | 已实现 | **不足**：无 `SetGoalBudget`、无 `cancelGoal`/`markBlocked`、goal 未持久化、未注入系统提示 |
@@ -191,7 +191,7 @@
 1. **P0 - 让工具真正可用**
    - ~~MCP 工具接入 AgentLoop（`mcp__server__tool`）~~
    - ~~TaskStop + 任务面板停止~~
-   - Bash `cwd` / 后台运行 / 超时处理
+   - ~~Bash `cwd` / 后台运行 / 超时处理~~
 
 2. **P1 - 补齐核心体验**
    - AskUserQuestion 工具 + TUI 选项渲染

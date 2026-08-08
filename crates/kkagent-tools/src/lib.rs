@@ -2,6 +2,7 @@ pub mod registry;
 pub mod builtin;
 
 pub use registry::*;
+pub use builtin::{BackgroundShellManager, BashOptions, BashTool};
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -62,7 +63,7 @@ pub fn register_builtin_tools(registry: &mut ToolRegistry) {
     registry.register(Arc::new(builtin::EditTool));
     registry.register(Arc::new(builtin::GrepTool));
     registry.register(Arc::new(builtin::GlobTool));
-    registry.register(Arc::new(builtin::BashTool));
+    registry.register(Arc::new(builtin::BashTool::default()));
     registry.register(Arc::new(builtin::TodoListTool::new()));
     registry.register(Arc::new(builtin::ExitPlanModeTool));
 }

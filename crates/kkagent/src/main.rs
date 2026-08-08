@@ -232,6 +232,8 @@ struct ServerState {
     subagents: Arc<SubagentManager>,
     /// Connected MCP servers; tools registered per turn from this manager.
     mcp: Arc<McpManager>,
+    /// Shared background shell jobs for Bash tool.
+    bash_shells: Arc<kkagent_tools::builtin::BackgroundShellManager>,
 }
 
 fn mcp_manager_from_config(config: &AppConfig) -> McpManager {
@@ -294,6 +296,7 @@ async fn run_server_handler<T: kkagent_rpc::transport::AsyncTransport>(
         transcript: Mutex::new(transcript),
         subagents: Arc::new(SubagentManager::new(4)),
         mcp,
+        bash_shells: Arc::new(kkagent_tools::builtin::BackgroundShellManager::new()),
     });
 
     let handler: kkagent_rpc::server::RequestHandler = {
@@ -621,6 +624,18 @@ async fn handle_rpc_call(
 
             let mut tools = ToolRegistry::new();
             kkagent_tools::register_builtin_tools(&mut tools);
+            let auto_bg = state
+                .config
+                .background
+                .as_ref()
+                .and_then(|b| b.bash_auto_background_on_timeout)
+                .unwrap_or(true);
+            tools.register(Arc::new(kkagent_tools::builtin::BashTool::new(
+                state.bash_shells.clone(),
+                kkagent_tools::builtin::BashOptions {
+                    auto_background_on_timeout: auto_bg,
+                },
+            )));
             register_mcp_tools(&mut tools, &state.mcp).await;
 
             let subagents = state.subagents.clone();

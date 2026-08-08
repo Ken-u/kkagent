@@ -14,7 +14,7 @@ pub use write::WriteTool;
 pub use edit::EditTool;
 pub use grep::GrepTool;
 pub use glob::GlobTool;
-pub use bash::BashTool;
+pub use bash::{BashTool, BackgroundShellManager, BashOptions};
 pub use todo::TodoListTool;
 pub use goal::{CreateGoalTool, GetGoalTool, UpdateGoalTool};
 pub use task::{TaskTool, TaskOutputTool, TaskListTool, TaskStopTool};
