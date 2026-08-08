@@ -1,9 +1,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::Mutex;
+use tokio::task::AbortHandle;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum SubagentStatus {
     Pending,
@@ -34,6 +35,7 @@ pub struct SubagentState {
 
 pub struct SubagentManager {
     agents: Arc<Mutex<HashMap<String, SubagentState>>>,
+    aborts: Arc<Mutex<HashMap<String, AbortHandle>>>,
     max_concurrent: usize,
 }
 
@@ -41,17 +43,22 @@ impl SubagentManager {
     pub fn new(max_concurrent: usize) -> Self {
         Self {
             agents: Arc::new(Mutex::new(HashMap::new())),
+            aborts: Arc::new(Mutex::new(HashMap::new())),
             max_concurrent,
         }
     }
 
     pub async fn spawn(&self, config: SubagentConfig) -> anyhow::Result<String> {
         let agents = self.agents.lock().await;
-        let running = agents.values()
+        let running = agents
+            .values()
             .filter(|a| a.status == SubagentStatus::Running)
             .count();
         if running >= self.max_concurrent {
-            anyhow::bail!("Maximum concurrent subagents reached ({})", self.max_concurrent);
+            anyhow::bail!(
+                "Maximum concurrent subagents reached ({})",
+                self.max_concurrent
+            );
         }
         drop(agents);
 
@@ -64,31 +71,67 @@ impl SubagentManager {
             turns_used: 0,
         };
 
-        self.agents.lock().await.insert(config.agent_id.clone(), state);
+        self.agents
+            .lock()
+            .await
+            .insert(config.agent_id.clone(), state);
         Ok(config.agent_id)
+    }
+
+    pub async fn set_abort_handle(&self, agent_id: &str, handle: AbortHandle) {
+        self.aborts.lock().await.insert(agent_id.to_string(), handle);
     }
 
     pub async fn complete(&self, agent_id: &str, result: String) {
         let mut agents = self.agents.lock().await;
         if let Some(agent) = agents.get_mut(agent_id) {
-            agent.status = SubagentStatus::Complete;
-            agent.result = Some(result);
+            if agent.status == SubagentStatus::Running {
+                agent.status = SubagentStatus::Complete;
+                agent.result = Some(result);
+            }
         }
+        self.aborts.lock().await.remove(agent_id);
     }
 
     pub async fn fail(&self, agent_id: &str, error: String) {
         let mut agents = self.agents.lock().await;
         if let Some(agent) = agents.get_mut(agent_id) {
-            agent.status = SubagentStatus::Failed;
-            agent.error = Some(error);
+            if agent.status == SubagentStatus::Running {
+                agent.status = SubagentStatus::Failed;
+                agent.error = Some(error);
+            }
+        }
+        self.aborts.lock().await.remove(agent_id);
+    }
+
+    /// Mark cancelled and abort the running tokio task if present.
+    pub async fn stop(&self, agent_id: &str) -> anyhow::Result<SubagentState> {
+        let mut agents = self.agents.lock().await;
+        let agent = agents
+            .get_mut(agent_id)
+            .ok_or_else(|| anyhow::anyhow!("Unknown task_id: {}", agent_id))?;
+
+        match agent.status {
+            SubagentStatus::Running | SubagentStatus::Pending => {
+                agent.status = SubagentStatus::Cancelled;
+                agent.error = Some("Stopped by TaskStop".into());
+                let snapshot = agent.clone();
+                drop(agents);
+                if let Some(handle) = self.aborts.lock().await.remove(agent_id) {
+                    handle.abort();
+                }
+                Ok(snapshot)
+            }
+            other => Err(anyhow::anyhow!(
+                "Task {} is not running (status={:?})",
+                agent_id,
+                other
+            )),
         }
     }
 
     pub async fn cancel(&self, agent_id: &str) {
-        let mut agents = self.agents.lock().await;
-        if let Some(agent) = agents.get_mut(agent_id) {
-            agent.status = SubagentStatus::Cancelled;
-        }
+        let _ = self.stop(agent_id).await;
     }
 
     pub async fn get_state(&self, agent_id: &str) -> Option<SubagentState> {
@@ -96,7 +139,10 @@ impl SubagentManager {
     }
 
     pub async fn list_running(&self) -> Vec<SubagentState> {
-        self.agents.lock().await.values()
+        self.agents
+            .lock()
+            .await
+            .values()
             .filter(|a| a.status == SubagentStatus::Running)
             .cloned()
             .collect()

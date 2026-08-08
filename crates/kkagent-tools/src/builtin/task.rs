@@ -210,3 +210,56 @@ impl Tool for TaskListTool {
         Ok(ToolOutput::success(lines.join("\n")))
     }
 }
+
+pub struct TaskStopTool {
+    subagent_mgr: Arc<SubagentManager>,
+}
+
+impl TaskStopTool {
+    pub fn new(subagent_mgr: Arc<SubagentManager>) -> Self {
+        Self { subagent_mgr }
+    }
+}
+
+#[async_trait]
+impl Tool for TaskStopTool {
+    fn name(&self) -> &str {
+        "TaskStop"
+    }
+    fn description(&self) -> &str {
+        "Stop a running Task subagent by id. Use TaskList to find running tasks."
+    }
+    fn parameters_schema(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "task_id": {
+                    "type": "string",
+                    "description": "Subagent / task id returned by the Task tool"
+                },
+                "agent_id": {
+                    "type": "string",
+                    "description": "Alias for task_id"
+                }
+            }
+        })
+    }
+
+    async fn execute(&self, input: Value, _ctx: &ToolContext) -> anyhow::Result<ToolOutput> {
+        let id = input
+            .get("task_id")
+            .or_else(|| input.get("agent_id"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if id.is_empty() {
+            return Ok(ToolOutput::error("Missing task_id"));
+        }
+        match self.subagent_mgr.stop(id).await {
+            Ok(state) => Ok(ToolOutput::success(format!(
+                "Stopped task {} ({})",
+                state.agent_id, state.description
+            ))),
+            Err(e) => Ok(ToolOutput::error(e.to_string())),
+        }
+    }
+}

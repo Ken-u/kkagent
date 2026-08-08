@@ -17,5 +17,5 @@ pub use glob::GlobTool;
 pub use bash::BashTool;
 pub use todo::TodoListTool;
 pub use goal::{CreateGoalTool, GetGoalTool, UpdateGoalTool};
-pub use task::{TaskTool, TaskOutputTool, TaskListTool};
+pub use task::{TaskTool, TaskOutputTool, TaskListTool, TaskStopTool};
 pub use plan::ExitPlanModeTool;

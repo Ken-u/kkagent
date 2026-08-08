@@ -629,9 +629,13 @@ async fn handle_rpc_call(
                 let mgr = subagents.clone();
                 let app_cfg = cfg_for_sub.clone();
                 let id = sub_cfg.agent_id.clone();
-                tokio::spawn(async move {
+                let mgr_abort = mgr.clone();
+                let id_abort = id.clone();
+                let join = tokio::spawn(async move {
                     tracing::info!("Subagent {} starting: {}", id, sub_cfg.description);
-                    match kkagent_core::run_subagent(app_cfg, sub_cfg, PermissionMode::Auto).await {
+                    // JoinError / cancel path: TaskStop aborts this task.
+                    let run = kkagent_core::run_subagent(app_cfg, sub_cfg, PermissionMode::Auto);
+                    match run.await {
                         Ok(result) => {
                             tracing::info!(
                                 "Subagent {} complete ({} chars)",
@@ -646,6 +650,10 @@ async fn handle_rpc_call(
                         }
                     }
                 });
+                let abort = join.abort_handle();
+                tokio::spawn(async move {
+                    mgr_abort.set_abort_handle(&id_abort, abort).await;
+                });
             });
             tools.register(Arc::new(kkagent_tools::builtin::TaskTool::new(
                 state.subagents.clone(),
@@ -655,6 +663,9 @@ async fn handle_rpc_call(
                 state.subagents.clone(),
             )));
             tools.register(Arc::new(kkagent_tools::builtin::TaskListTool::new(
+                state.subagents.clone(),
+            )));
+            tools.register(Arc::new(kkagent_tools::builtin::TaskStopTool::new(
                 state.subagents.clone(),
             )));
             // Goal tools if available
@@ -929,6 +940,21 @@ async fn handle_rpc_call(
                 })
                 .collect();
             Ok(serde_json::json!({"tasks": tasks}))
+        }
+        "tasks.stop" => {
+            let task_id = params
+                .as_ref()
+                .and_then(|p| p.get("task_id").or_else(|| p.get("agent_id")))
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| (-32602, "Missing task_id".into()))?;
+            match state.subagents.stop(task_id).await {
+                Ok(state) => Ok(serde_json::json!({
+                    "ok": true,
+                    "task_id": state.agent_id,
+                    "status": "cancelled",
+                })),
+                Err(e) => Err((-32000, e.to_string())),
+            }
         }
         "approval.respond" => {
             if let Some(params) = params {

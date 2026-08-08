@@ -17,7 +17,7 @@
 | TodoList | 已实现 | 已实现 | **不足** `[已核对]`：schema 用 `items`/`id`/`content`/`completed`，ref 用 `todos`/`title`/`done`；无持久化；无 reminder 注入；无 `SetTodoList` 别名。另有未接入的死文件 `todo_list.rs` |
 | ExitPlanMode | 已实现 | 已实现 | 基本对齐；ref 有 enter-plan-mode 对应工具，当前由 TUI/配置触发 |
 | CreateGoal / GetGoal / UpdateGoal | 已实现 | 已实现 | **不足**：无 `SetGoalBudget`、无 `cancelGoal`/`markBlocked`、goal 未持久化、未注入系统提示 |
-| Task / TaskOutput / TaskList | **部分实现** `[已核对]` | 已实现 | 已能 spawn 并真正跑 `run_subagent`，可用 TaskOutput/TaskList 取结果；**仍缺** TaskStop、输出持久化、镜像事件、profile 选择 |
+| Task / TaskOutput / TaskList / TaskStop | **部分实现** `[已核对]` | 已实现 | 已能 spawn 并真正跑 `run_subagent`，可用 TaskOutput/TaskList/TaskStop；仍缺输出持久化、镜像事件、profile 选择 |
 | Agent | 未实现 | 已实现 | ref 的 `Agent` 工具是完整 SubagentTool，支持 profile 选择、后台运行、恢复、镜像运行 |
 | AgentSwarm | 未实现 | 已实现 | ref 支持多子代理并发编排 |
 | AskUserQuestion | 事件已有，工具未实现 `[已核对]` | 已实现 | `QuestionAsked` / permission 已预留；无工具、TUI 未渲染选项 |
@@ -66,7 +66,7 @@
 | 子代理生命周期 | **部分实现** `[已核对]` | 已实现 | 有 `SubagentManager`（spawn/complete/fail/cancel/list）；无 fork/remove 完整服务 |
 | 子代理运行 | **已实现** `[已核对]` | 已实现 | `run_subagent` + Task 启动后真正跑 AgentLoop |
 | Agent Profile | 未实现 | 已实现 | ref 有 agent/coder/explore 等 profile |
-| 任务工具链 | **部分实现** `[已核对]` | 已实现 | 有 Task / TaskOutput / TaskList；**缺 TaskStop** |
+| 任务工具链 | **部分实现** `[已核对]` | 已实现 | 有 Task / TaskOutput / TaskList / TaskStop；仍缺 profile / 镜像 |
 | 后台任务 | 部分实现 | 已实现 | Task 已 fire-and-forget；Bash 无后台；无 detach/timeout 转后台 |
 | 任务输出持久化 | 未实现 | 已实现 | 结果只在内存 `SubagentManager` |
 | 子代理镜像运行 | 未实现 | 已实现 | ref `mirrorAgentRun` 会把子代理事件同步到父代理 |
@@ -184,12 +184,13 @@
 - [x] Task 真正驱动子代理（`run_subagent`）+ TaskOutput / TaskList
 - [x] AgentLoop `max_rounds` 硬限制（尚未接配置）
 - [x] MCP 工具注册为 `mcp__server__tool` 并接入 AgentLoop
+- [x] TaskStop + `tasks.stop` RPC + abort handle
 
 ## 十五、建议优先级（仅供参考）
 
 1. **P0 - 让工具真正可用**
    - ~~MCP 工具接入 AgentLoop（`mcp__server__tool`）~~
-   - TaskStop + 任务面板停止
+   - ~~TaskStop + 任务面板停止~~
    - Bash `cwd` / 后台运行 / 超时处理
 
 2. **P1 - 补齐核心体验**
