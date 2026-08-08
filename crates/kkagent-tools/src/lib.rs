@@ -65,5 +65,6 @@ pub fn register_builtin_tools(registry: &mut ToolRegistry) {
     registry.register(Arc::new(builtin::GlobTool));
     registry.register(Arc::new(builtin::BashTool::default()));
     registry.register(Arc::new(builtin::TodoListTool::new()));
+    registry.register(Arc::new(builtin::AskUserQuestionTool));
     registry.register(Arc::new(builtin::ExitPlanModeTool));
 }

@@ -58,6 +58,11 @@ impl PermissionChain {
             );
         }
 
+        // AskUserQuestion is the user interaction itself — never gate behind another approval.
+        if tool_name == "AskUserQuestion" {
+            return PermissionDecision::Approve;
+        }
+
         // 2. user-configured-deny
         for rule in &self.rules {
             if rule.decision == "deny" && matches_pattern(&rule.pattern, tool_name, input) {

@@ -9,7 +9,7 @@ use kkagent_config::AppConfig;
 use kkagent_protocol::{PermissionMode, SessionStatus};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::app::{AppMode, AppState, DisplayPart, ListPickerState, MessageRole, PendingApproval, TodoItem};
+use crate::app::{AppMode, AppState, DisplayPart, ListPickerState, MessageRole, PendingApproval, PendingQuestion, TodoItem};
 use crate::theme::Theme;
 
 const TIPS: &[&str] = &[
@@ -72,6 +72,10 @@ pub fn render_ui(f: &mut Frame, state: &mut AppState, config: &AppConfig) {
 
     if let Some(ref mut approval) = state.approval_pending {
         render_approval_panel(f, size, approval, &theme);
+    }
+
+    if let Some(ref mut question) = state.question_pending {
+        render_question_panel(f, size, question, &theme);
     }
 
     if state.slash_menu.is_some() {
@@ -1371,6 +1375,82 @@ fn render_approval_panel(f: &mut Frame, area: Rect, approval: &mut PendingApprov
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         "  click / 1·2·3 / enter",
+        Style::default().fg(theme.text_muted),
+    )));
+
+    f.render_widget(Paragraph::new(Text::from(lines)).block(block), panel_area);
+}
+
+fn render_question_panel(f: &mut Frame, area: Rect, question: &mut PendingQuestion, theme: &Theme) {
+    let panel_width = 72.min(area.width.saturating_sub(4)).max(40);
+    let opt_count = question.options.len() as u16;
+    let free_lines: u16 = if question.allow_free_text { 2 } else { 0 };
+    let panel_height = (6 + opt_count + free_lines)
+        .min(area.height.saturating_sub(2))
+        .max(8);
+    let x = (area.width.saturating_sub(panel_width)) / 2;
+    let y = (area.height.saturating_sub(panel_height)) / 2;
+    let panel_area = Rect::new(x, y, panel_width, panel_height);
+    question.panel_rect = Some((x, y, panel_width, panel_height));
+
+    f.render_widget(Clear, panel_area);
+
+    let block = Block::default()
+        .title(" question ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.primary));
+
+    let mut lines: Vec<Line> = vec![
+        Line::from(Span::styled(
+            question.text.clone(),
+            Style::default()
+                .fg(theme.text_strong)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+    ];
+
+    for (i, (_id, label)) in question.options.iter().enumerate() {
+        let selected = i == question.selected;
+        let checked = question.toggled.get(i).copied().unwrap_or(false);
+        let style = if selected {
+            Style::default()
+                .fg(theme.primary)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.text_dim)
+        };
+        let marker = if selected { "> " } else { "  " };
+        let boxc = if checked { "[x]" } else { "[ ]" };
+        lines.push(Line::from(vec![
+            Span::styled(marker, style),
+            Span::styled(format!("{} {}  ", i + 1, boxc), Style::default().fg(theme.text_muted)),
+            Span::styled(label.clone(), style),
+        ]));
+    }
+
+    if question.allow_free_text {
+        let selected = question.selected >= question.options.len();
+        let style = if selected {
+            Style::default()
+                .fg(theme.primary)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.text_dim)
+        };
+        let marker = if selected { "> " } else { "  " };
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            Span::styled(marker, style),
+            Span::styled("text: ", Style::default().fg(theme.text_muted)),
+            Span::styled(question.free_text.clone(), style),
+            Span::styled("▌", style),
+        ]));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  1-9 / space toggle / enter confirm / esc cancel",
         Style::default().fg(theme.text_muted),
     )));
 

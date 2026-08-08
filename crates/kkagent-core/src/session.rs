@@ -1,6 +1,6 @@
 use tokio::sync::{mpsc, oneshot};
 use kkagent_llm::{ChatMessage, ChatContent};
-use kkagent_protocol::{ApprovalResponse, PermissionMode};
+use kkagent_protocol::{ApprovalResponse, PermissionMode, QuestionResponse};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -39,6 +39,8 @@ pub struct Session {
     pub approval_waiters: HashMap<String, oneshot::Sender<ApprovalResponse>>,
     approval_rx: mpsc::Receiver<ApprovalResponse>,
     pub approval_tx: mpsc::Sender<ApprovalResponse>,
+    question_rx: mpsc::Receiver<QuestionResponse>,
+    pub question_tx: mpsc::Sender<QuestionResponse>,
     /// Set by session.interrupt — agent loop checks between stream/tool steps.
     pub interrupted: Arc<AtomicBool>,
     /// Index of the current turn's user message (set by `begin_turn`).
@@ -57,6 +59,7 @@ impl Session {
         model_alias: String,
     ) -> Self {
         let (approval_tx, approval_rx) = mpsc::channel(16);
+        let (question_tx, question_rx) = mpsc::channel(16);
         let plan_file_path = working_dir
             .join(".kkagent")
             .join("plans")
@@ -75,6 +78,8 @@ impl Session {
             approval_waiters: HashMap::new(),
             approval_rx,
             approval_tx,
+            question_rx,
+            question_tx,
             interrupted: Arc::new(AtomicBool::new(false)),
             turn_message_start: None,
             current_turn_changes: Vec::new(),
@@ -148,6 +153,12 @@ impl Session {
             decision: kkagent_protocol::ApprovalDecision::Cancelled,
             scope: None,
             feedback: Some("interrupted".into()),
+        });
+        let _ = self.question_tx.try_send(QuestionResponse {
+            question_id: String::new(),
+            selected_option_ids: Vec::new(),
+            free_text: None,
+            cancelled: true,
         });
     }
 
@@ -225,6 +236,47 @@ impl Session {
 
     pub fn submit_approval(&self, response: ApprovalResponse) {
         let _ = self.approval_tx.try_send(response);
+    }
+
+    pub async fn wait_question(&mut self, question_id: &str) -> QuestionResponse {
+        loop {
+            if self.is_interrupted() {
+                return QuestionResponse {
+                    question_id: question_id.to_string(),
+                    selected_option_ids: Vec::new(),
+                    free_text: None,
+                    cancelled: true,
+                };
+            }
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                self.question_rx.recv(),
+            )
+            .await
+            {
+                Ok(Some(resp)) => {
+                    if resp.question_id == question_id
+                        || resp.question_id.is_empty()
+                        || resp.cancelled
+                    {
+                        return resp;
+                    }
+                }
+                Ok(None) => {
+                    return QuestionResponse {
+                        question_id: question_id.to_string(),
+                        selected_option_ids: Vec::new(),
+                        free_text: Some("question channel closed".into()),
+                        cancelled: true,
+                    };
+                }
+                Err(_) => continue,
+            }
+        }
+    }
+
+    pub fn submit_question(&self, response: QuestionResponse) {
+        let _ = self.question_tx.try_send(response);
     }
 }
 

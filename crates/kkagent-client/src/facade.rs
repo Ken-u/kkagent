@@ -81,6 +81,20 @@ impl KkagentClient {
         Ok(())
     }
 
+    pub async fn respond_question(
+        &self,
+        session_id: &str,
+        response: kkagent_protocol::QuestionResponse,
+    ) -> anyhow::Result<()> {
+        let mut params = serde_json::to_value(&response)?;
+        if let Some(obj) = params.as_object_mut() {
+            obj.insert("session_id".into(), serde_json::json!(session_id));
+        }
+        self.rpc.call("question.respond", Some(params)).await
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        Ok(())
+    }
+
     pub async fn set_model(&self, session_id: &str, model: &str) -> anyhow::Result<()> {
         let params = serde_json::json!({
             "session_id": session_id,

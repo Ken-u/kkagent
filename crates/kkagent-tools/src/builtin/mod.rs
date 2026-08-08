@@ -8,6 +8,7 @@ pub mod todo;
 pub mod goal;
 pub mod task;
 pub mod plan;
+pub mod ask_user;
 
 pub use read::ReadTool;
 pub use write::WriteTool;
@@ -19,3 +20,4 @@ pub use todo::TodoListTool;
 pub use goal::{CreateGoalTool, GetGoalTool, UpdateGoalTool};
 pub use task::{TaskTool, TaskOutputTool, TaskListTool, TaskStopTool};
 pub use plan::ExitPlanModeTool;
+pub use ask_user::AskUserQuestionTool;

@@ -56,6 +56,8 @@ pub struct AppState {
     pub approval_pending: Option<PendingApproval>,
     /// Mouse click on approval option — processed in main loop (needs await)
     pub pending_approval_click: Option<(kkagent_protocol::ApprovalDecision, Option<kkagent_protocol::ApprovalScope>)>,
+    /// AskUserQuestion panel
+    pub question_pending: Option<PendingQuestion>,
     /// `/` command autocomplete popup
     pub slash_menu: Option<SlashMenuState>,
     /// Model / session list picker overlay
@@ -205,6 +207,18 @@ pub struct PendingApproval {
     pub panel_rect: Option<(u16, u16, u16, u16)>, // x, y, w, h
 }
 
+#[derive(Debug, Clone)]
+pub struct PendingQuestion {
+    pub question_id: String,
+    pub text: String,
+    pub options: Vec<(String, String)>, // id, label
+    pub allow_free_text: bool,
+    pub selected: usize,
+    pub toggled: Vec<bool>,
+    pub free_text: String,
+    pub panel_rect: Option<(u16, u16, u16, u16)>,
+}
+
 impl AppState {
     pub fn new(permission_mode: PermissionMode, plan_mode: bool) -> Self {
         Self {
@@ -225,6 +239,7 @@ impl AppState {
             approx_tokens: 0,
             approval_pending: None,
             pending_approval_click: None,
+            question_pending: None,
             slash_menu: None,
             list_picker: None,
             tasks_panel: None,
@@ -495,6 +510,11 @@ impl TuiApp {
     }
 
     async fn handle_key(&mut self, key: KeyEvent) -> anyhow::Result<()> {
+        // Handle question panel first
+        if self.state.question_pending.is_some() {
+            return self.handle_question_key(key).await;
+        }
+
         // Handle approval panel
         if let Some(ref mut approval) = self.state.approval_pending {
             match key.code {
@@ -1529,6 +1549,106 @@ impl TuiApp {
         Ok(())
     }
 
+    async fn handle_question_key(&mut self, key: KeyEvent) -> anyhow::Result<()> {
+        let Some(ref mut q) = self.state.question_pending else {
+            return Ok(());
+        };
+        let n = q.options.len();
+        let free_row = if q.allow_free_text { 1 } else { 0 };
+        let max_row = n.saturating_add(free_row).saturating_sub(1);
+
+        match key.code {
+            KeyCode::Esc => {
+                self.respond_question(true).await?;
+            }
+            KeyCode::Up => {
+                if q.selected > 0 {
+                    q.selected -= 1;
+                }
+            }
+            KeyCode::Down => {
+                if q.selected < max_row {
+                    q.selected += 1;
+                }
+            }
+            KeyCode::Char(' ') if q.selected < n => {
+                if let Some(t) = q.toggled.get_mut(q.selected) {
+                    *t = !*t;
+                }
+            }
+            KeyCode::Enter => {
+                if q.selected < n && !q.toggled.iter().any(|t| *t) {
+                    if let Some(t) = q.toggled.get_mut(q.selected) {
+                        *t = true;
+                    }
+                }
+                self.respond_question(false).await?;
+            }
+            KeyCode::Char(c) if q.allow_free_text && q.selected >= n => {
+                q.free_text.push(c);
+            }
+            KeyCode::Backspace if q.allow_free_text && q.selected >= n => {
+                q.free_text.pop();
+            }
+            KeyCode::Char(c) if c.is_ascii_digit() && n > 0 => {
+                let idx = (c as u8 - b'1') as usize;
+                if idx < n {
+                    q.selected = idx;
+                    q.toggled.iter_mut().for_each(|t| *t = false);
+                    if let Some(t) = q.toggled.get_mut(idx) {
+                        *t = true;
+                    }
+                    self.respond_question(false).await?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    async fn respond_question(&mut self, cancelled: bool) -> anyhow::Result<()> {
+        let Some(q) = self.state.question_pending.take() else {
+            return Ok(());
+        };
+        let Some(sid) = self.state.session_id.clone() else {
+            self.system_message("No session for question.".into());
+            return Ok(());
+        };
+
+        let selected_option_ids: Vec<String> = q
+            .options
+            .iter()
+            .zip(q.toggled.iter())
+            .filter_map(|((id, _), on)| if *on { Some(id.clone()) } else { None })
+            .collect();
+        let free_text = {
+            let t = q.free_text.trim();
+            if t.is_empty() {
+                None
+            } else {
+                Some(t.to_string())
+            }
+        };
+
+        if let Err(e) = self
+            .client
+            .respond_question(
+                &sid,
+                kkagent_protocol::QuestionResponse {
+                    question_id: q.question_id.clone(),
+                    selected_option_ids,
+                    free_text,
+                    cancelled,
+                },
+            )
+            .await
+        {
+            self.state.question_pending = Some(q);
+            self.system_message(format!("Question reply failed: {}", e));
+        }
+        Ok(())
+    }
+
     fn handle_server_event(&mut self, frame: Frame) {
         if let Frame::Event { event: _, data, .. } = frame {
             if let Ok(evt) = serde_json::from_value::<AgentEvent>(data) {
@@ -1625,6 +1745,25 @@ impl TuiApp {
                             panel_rect: None,
                         });
                         self.state.status = SessionStatus::WaitingApproval;
+                    }
+                    AgentEvent::QuestionAsked { question, .. } => {
+                        let options: Vec<(String, String)> = question
+                            .options
+                            .into_iter()
+                            .map(|o| (o.id, o.label))
+                            .collect();
+                        let toggled = vec![false; options.len()];
+                        self.state.question_pending = Some(PendingQuestion {
+                            question_id: question.question_id,
+                            text: question.text,
+                            options,
+                            allow_free_text: question.allow_free_text,
+                            selected: 0,
+                            toggled,
+                            free_text: String::new(),
+                            panel_rect: None,
+                        });
+                        self.state.status = SessionStatus::WaitingQuestion;
                     }
                     AgentEvent::UsageUpdate { usage, .. } => {
                         self.state.approx_tokens = usage.input_tokens.saturating_add(usage.output_tokens);

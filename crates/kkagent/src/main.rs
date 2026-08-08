@@ -223,6 +223,7 @@ struct ServerState {
     /// Session approval senders — must not require holding `sessions` lock
     /// (agent loop may be waiting on approval while holding the session).
     approval_txs: Mutex<HashMap<String, mpsc::Sender<kkagent_protocol::ApprovalResponse>>>,
+    question_txs: Mutex<HashMap<String, mpsc::Sender<kkagent_protocol::QuestionResponse>>>,
     /// Interrupt flags remain reachable while the session is out of `sessions` during a turn.
     interrupt_flags: Mutex<HashMap<String, Arc<AtomicBool>>>,
     /// Model alias handles — reachable mid-turn when session is removed from `sessions`.
@@ -290,6 +291,7 @@ async fn run_server_handler<T: kkagent_rpc::transport::AsyncTransport>(
         config: config.clone(),
         sessions: Mutex::new(HashMap::new()),
         approval_txs: Mutex::new(HashMap::new()),
+        question_txs: Mutex::new(HashMap::new()),
         interrupt_flags: Mutex::new(HashMap::new()),
         model_aliases: Mutex::new(HashMap::new()),
         abort_registry: Arc::new(Mutex::new(HashMap::new())),
@@ -420,6 +422,10 @@ async fn handle_rpc_call(
                 session_id.clone(),
                 session.approval_tx.clone(),
             );
+            state.question_txs.lock().await.insert(
+                session_id.clone(),
+                session.question_tx.clone(),
+            );
             state.sessions.lock().await.insert(session_id.clone(), session);
             Ok(serde_json::json!({"session_id": session_id}))
         }
@@ -513,6 +519,10 @@ async fn handle_rpc_call(
             state.approval_txs.lock().await.insert(
                 session_id.clone(),
                 session.approval_tx.clone(),
+            );
+            state.question_txs.lock().await.insert(
+                session_id.clone(),
+                session.question_tx.clone(),
             );
             state.sessions.lock().await.insert(session_id.clone(), session);
 
@@ -987,13 +997,38 @@ async fn handle_rpc_call(
                             return Ok(serde_json::json!({"ok": true}));
                         }
                     }
-                    // Fallback: broadcast to all (single-session TUI)
+                    // Fallback: try all
                     for tx in txs.values() {
                         let _ = tx.try_send(response.clone());
                     }
+                    return Ok(serde_json::json!({"ok": true}));
                 }
             }
-            Ok(serde_json::json!({"ok": true}))
+            Err((-32602, "Invalid approval response".into()))
+        }
+        "question.respond" => {
+            if let Some(params) = params {
+                if let Ok(response) =
+                    serde_json::from_value::<kkagent_protocol::QuestionResponse>(params.clone())
+                {
+                    let session_id = params
+                        .get("session_id")
+                        .and_then(|v| v.as_str())
+                        .map(String::from);
+                    let txs = state.question_txs.lock().await;
+                    if let Some(sid) = session_id {
+                        if let Some(tx) = txs.get(&sid) {
+                            let _ = tx.try_send(response);
+                            return Ok(serde_json::json!({"ok": true}));
+                        }
+                    }
+                    for tx in txs.values() {
+                        let _ = tx.try_send(response.clone());
+                    }
+                    return Ok(serde_json::json!({"ok": true}));
+                }
+            }
+            Err((-32602, "Invalid question response".into()))
         }
         _ => {
             Err((-32601, format!("Method not found: {}", method)))

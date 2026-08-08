@@ -503,6 +503,10 @@ impl AgentLoop {
         name: &str,
         input: &serde_json::Value,
     ) -> ToolOutput {
+        if name == "AskUserQuestion" {
+            return self.run_ask_user_question(session, input).await;
+        }
+
         // Snapshot files before mutating tools so undo can restore them.
         if name == "Write" || name == "Edit" {
             if let Some(path_str) = input.get("path").and_then(|v| v.as_str()) {
@@ -529,6 +533,100 @@ impl AgentLoop {
             Ok(output) => output,
             Err(e) => ToolOutput::error(format!("Tool execution error: {}", e)),
         }
+    }
+
+    async fn run_ask_user_question(
+        &self,
+        session: &mut Session,
+        input: &serde_json::Value,
+    ) -> ToolOutput {
+        let question_text = input
+            .get("question")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        if question_text.is_empty() {
+            return ToolOutput::error("Missing 'question'");
+        }
+
+        let options: Vec<kkagent_protocol::QuestionOption> = input
+            .get("options")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|o| {
+                        Some(kkagent_protocol::QuestionOption {
+                            id: o.get("id")?.as_str()?.to_string(),
+                            label: o.get("label")?.as_str()?.to_string(),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let allow_multiple = input
+            .get("allow_multiple")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let allow_free_text = input
+            .get("allow_free_text")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(options.is_empty());
+
+        let question_id = uuid::Uuid::new_v4().to_string();
+        let session_id = session.id.clone();
+
+        let _ = self
+            .event_tx
+            .send(AgentEvent::QuestionAsked {
+                session_id: session_id.clone(),
+                question: kkagent_protocol::QuestionPayload {
+                    question_id: question_id.clone(),
+                    text: question_text.to_string(),
+                    options: options.clone(),
+                    allow_free_text,
+                },
+            })
+            .await;
+        let _ = self
+            .event_tx
+            .send(AgentEvent::StatusUpdate {
+                session_id: session_id.clone(),
+                status: SessionStatus::WaitingQuestion,
+            })
+            .await;
+
+        let response = session.wait_question(&question_id).await;
+        if response.cancelled || session.is_interrupted() {
+            return ToolOutput::error("Question was cancelled");
+        }
+
+        let mut parts = Vec::new();
+        if !response.selected_option_ids.is_empty() {
+            let labels: Vec<String> = response
+                .selected_option_ids
+                .iter()
+                .map(|id| {
+                    options
+                        .iter()
+                        .find(|o| &o.id == id)
+                        .map(|o| o.label.clone())
+                        .unwrap_or_else(|| id.clone())
+                })
+                .collect();
+            if allow_multiple {
+                parts.push(format!("Selected: {}", labels.join(", ")));
+            } else {
+                parts.push(format!("Selected: {}", labels.first().cloned().unwrap_or_default()));
+            }
+        }
+        if let Some(text) = response.free_text.filter(|t| !t.trim().is_empty()) {
+            parts.push(format!("Answer: {}", text));
+        }
+        if parts.is_empty() {
+            return ToolOutput::error("No answer provided");
+        }
+        ToolOutput::success(parts.join("\n"))
     }
 }
 

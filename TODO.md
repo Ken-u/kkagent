@@ -20,7 +20,7 @@
 | Task / TaskOutput / TaskList / TaskStop | **部分实现** `[已核对]` | 已实现 | 已能 spawn 并真正跑 `run_subagent`，可用 TaskOutput/TaskList/TaskStop；仍缺输出持久化、镜像事件、profile 选择 |
 | Agent | 未实现 | 已实现 | ref 的 `Agent` 工具是完整 SubagentTool，支持 profile 选择、后台运行、恢复、镜像运行 |
 | AgentSwarm | 未实现 | 已实现 | ref 支持多子代理并发编排 |
-| AskUserQuestion | 事件已有，工具未实现 `[已核对]` | 已实现 | `QuestionAsked` / permission 已预留；无工具、TUI 未渲染选项 |
+| AskUserQuestion | **已实现** `[已核对]` | 已实现 | 工具 + QuestionAsked + TUI 选项面板 + `question.respond`；auto 模式仍禁用 |
 | Skill | 发现代码有，未接入 `[已核对]` | 已实现 | `kkagent-mcp::SkillsManager` 能扫 skill / AGENTS.md，但无 Skill 工具、未注入系统提示 |
 | WebSearch | 未实现 | 已实现 | 配置 `services.moonshot_search` 占位 |
 | FetchURL | 未实现 | 已实现 | 配置 `services.moonshot_fetch` 占位 |
@@ -138,7 +138,7 @@
 | 模型选择器 | 已实现 | 已实现 | `/model` |
 | 会话选择器 | 已实现 | 已实现 | `/sessions` |
 | 任务面板 | UI 占位 | 已实现 | `/tasks` 只有列表，无输出详情/停止 |
-| 问题回答 UI | 未实现 `[已核对]` | 已实现 | TUI 未处理 `QuestionAsked` |
+| 问题回答 UI | **已实现** `[已核对]` | 已实现 | TUI 问题面板：数字键/空格/回车/自由文本 |
 | 计划模式 UI | 已实现 | 已实现 | Shift-Tab 切换 |
 | Shell 模式 | 已实现 | 已实现 | `!` 触发 |
 | 撤销 | 已实现 | 已实现 | Esc Esc |
@@ -185,6 +185,8 @@
 - [x] AgentLoop `max_rounds` 硬限制（尚未接配置）
 - [x] MCP 工具注册为 `mcp__server__tool` 并接入 AgentLoop
 - [x] TaskStop + `tasks.stop` RPC + abort handle
+- [x] Bash cwd / description / background / timeout detach
+- [x] AskUserQuestion 工具 + TUI 选项面板 + question.respond
 
 ## 十五、建议优先级（仅供参考）
 
@@ -194,7 +196,7 @@
    - ~~Bash `cwd` / 后台运行 / 超时处理~~
 
 2. **P1 - 补齐核心体验**
-   - AskUserQuestion 工具 + TUI 选项渲染
+   - ~~AskUserQuestion 工具 + TUI 选项渲染~~
    - TodoList schema 对齐 ref（`todos`/`title`/`done`）
    - Grep/Glob/Read 参数对齐
    - AGENTS.md / Skill 注入
