@@ -28,16 +28,11 @@ impl AnthropicProvider {
             .trim_end_matches('/')
             .to_string();
         let api_key = config.api_key.clone().unwrap_or_default();
-
-        let client = reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(30))
-            .timeout(std::time::Duration::from_secs(300))
-            .pool_max_idle_per_host(0)
-            .http1_only()
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
-
-        Self { client, base_url, api_key }
+        Self {
+            client: build_client(),
+            base_url,
+            api_key,
+        }
     }
 }
 
@@ -48,13 +43,158 @@ impl LlmProvider for AnthropicProvider {
         request: LlmRequest,
         event_tx: mpsc::Sender<StreamEvent>,
     ) -> anyhow::Result<()> {
-        crate::stream::anthropic_stream(&self.client, &self.base_url, &self.api_key, request, event_tx).await
+        with_retries(3, || {
+            let client = self.client.clone();
+            let base = self.base_url.clone();
+            let key = self.api_key.clone();
+            let req = request.clone();
+            let tx = event_tx.clone();
+            async move {
+                crate::stream::anthropic_stream(&client, &base, &key, req, tx).await
+            }
+        })
+        .await
     }
 }
 
-pub fn create_provider(provider_config: &ProviderConfig, _model_config: &ModelConfig) -> Box<dyn LlmProvider> {
+pub struct OpenAiProvider {
+    client: reqwest::Client,
+    base_url: String,
+    api_key: String,
+}
+
+impl OpenAiProvider {
+    pub fn new(config: &ProviderConfig) -> Self {
+        let base_url = config
+            .base_url
+            .as_deref()
+            .unwrap_or("https://api.openai.com")
+            .trim_end_matches('/')
+            .to_string();
+        Self {
+            client: build_client(),
+            base_url,
+            api_key: config.api_key.clone().unwrap_or_default(),
+        }
+    }
+}
+
+#[async_trait]
+impl LlmProvider for OpenAiProvider {
+    async fn stream_chat(
+        &self,
+        request: LlmRequest,
+        event_tx: mpsc::Sender<StreamEvent>,
+    ) -> anyhow::Result<()> {
+        with_retries(3, || {
+            let client = self.client.clone();
+            let base = self.base_url.clone();
+            let key = self.api_key.clone();
+            let req = request.clone();
+            let tx = event_tx.clone();
+            async move { crate::stream::openai_stream(&client, &base, &key, req, tx).await }
+        })
+        .await
+    }
+}
+
+pub struct GoogleProvider {
+    client: reqwest::Client,
+    base_url: String,
+    api_key: String,
+}
+
+impl GoogleProvider {
+    pub fn new(config: &ProviderConfig) -> Self {
+        let base_url = config
+            .base_url
+            .as_deref()
+            .unwrap_or("https://generativelanguage.googleapis.com")
+            .trim_end_matches('/')
+            .to_string();
+        Self {
+            client: build_client(),
+            base_url,
+            api_key: config.api_key.clone().unwrap_or_default(),
+        }
+    }
+}
+
+#[async_trait]
+impl LlmProvider for GoogleProvider {
+    async fn stream_chat(
+        &self,
+        request: LlmRequest,
+        event_tx: mpsc::Sender<StreamEvent>,
+    ) -> anyhow::Result<()> {
+        with_retries(3, || {
+            let client = self.client.clone();
+            let base = self.base_url.clone();
+            let key = self.api_key.clone();
+            let req = request.clone();
+            let tx = event_tx.clone();
+            async move { crate::stream::google_stream(&client, &base, &key, req, tx).await }
+        })
+        .await
+    }
+}
+
+fn build_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .timeout(std::time::Duration::from_secs(300))
+        .pool_max_idle_per_host(0)
+        .http1_only()
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
+async fn with_retries<F, Fut>(max: u32, mut make: F) -> anyhow::Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<()>>,
+{
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        match make().await {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                let msg = e.to_string();
+                let retryable = msg.contains("429")
+                    || msg.contains("500")
+                    || msg.contains("502")
+                    || msg.contains("503")
+                    || msg.contains("timeout")
+                    || msg.contains("timed out")
+                    || msg.contains("connection");
+                if !retryable || attempt >= max {
+                    return Err(e);
+                }
+                let backoff = std::time::Duration::from_millis(400 * attempt as u64);
+                tracing::warn!(
+                    "LLM request failed (attempt {}/{}): {}; retrying in {:?}",
+                    attempt,
+                    max,
+                    msg,
+                    backoff
+                );
+                tokio::time::sleep(backoff).await;
+            }
+        }
+    }
+}
+
+pub fn create_provider(
+    provider_config: &ProviderConfig,
+    _model_config: &ModelConfig,
+) -> Box<dyn LlmProvider> {
     match provider_config.provider_type.as_str() {
-        "anthropic" | "openai" | "kimi" => Box::new(AnthropicProvider::new(provider_config)),
-        _ => Box::new(AnthropicProvider::new(provider_config)),
+        "openai" | "openai-responses" | "openai-legacy" => {
+            Box::new(OpenAiProvider::new(provider_config))
+        }
+        "google" | "google-genai" | "gemini" => Box::new(GoogleProvider::new(provider_config)),
+        // Kimi intentionally stays on Anthropic-compatible Messages for now (user request).
+        "anthropic" | "kimi" | _ => Box::new(AnthropicProvider::new(provider_config)),
     }
 }

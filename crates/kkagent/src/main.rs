@@ -235,6 +235,10 @@ struct ServerState {
     mcp: Arc<McpManager>,
     /// Shared background shell jobs for Bash tool.
     bash_shells: Arc<kkagent_tools::builtin::BackgroundShellManager>,
+    cron: Arc<kkagent_tools::CronManager>,
+    hooks: Arc<kkagent_mcp::HookManager>,
+    skills: Arc<kkagent_tools::SkillCatalog>,
+    web: Arc<kkagent_tools::WebServicesConfig>,
 }
 
 fn mcp_manager_from_config(config: &AppConfig) -> McpManager {
@@ -287,6 +291,28 @@ async fn run_server_handler<T: kkagent_rpc::transport::AsyncTransport>(
         }
     }
 
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let mut hooks = kkagent_mcp::HookManager::new(&cwd);
+    hooks.load_from_app_config(&config.hooks).await;
+    let _ = hooks.discover().await;
+    let skills = Arc::new(kkagent_tools::SkillCatalog::discover(&cwd).await);
+    let cron = Arc::new(kkagent_tools::CronManager::new());
+    let web = Arc::new(kkagent_tools::WebServicesConfig::from_app(&config));
+
+    // Background cron poller — fires due prompts into a dedicated channel log for now.
+    {
+        let cron_bg = cron.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                let due = cron_bg.take_due().await;
+                for (id, prompt) in due {
+                    tracing::info!("Cron job {} due: {}", id, prompt.chars().take(80).collect::<String>());
+                }
+            }
+        });
+    }
+
     let state = Arc::new(ServerState {
         config: config.clone(),
         sessions: Mutex::new(HashMap::new()),
@@ -299,6 +325,10 @@ async fn run_server_handler<T: kkagent_rpc::transport::AsyncTransport>(
         subagents: Arc::new(SubagentManager::new(4)),
         mcp,
         bash_shells: Arc::new(kkagent_tools::builtin::BackgroundShellManager::new()),
+        cron,
+        hooks: Arc::new(hooks),
+        skills,
+        web,
     });
 
     let handler: kkagent_rpc::server::RequestHandler = {
@@ -359,6 +389,46 @@ fn messages_from_records(
         .collect()
 }
 
+async fn summarize_with_llm(config: Arc<AppConfig>, digest: &str) -> Option<String> {
+    use kkagent_llm::{create_provider, LlmRequest, StreamEvent};
+    let alias = config
+        .secondary_model
+        .clone()
+        .or_else(|| config.default_model_alias().map(|s| s.to_string()))?;
+    let (model_cfg, provider_cfg) = config.resolve_model(&alias)?;
+    let provider = create_provider(provider_cfg, model_cfg);
+    let (tx, mut rx) = mpsc::channel(64);
+    let request = LlmRequest {
+        model: model_cfg.model.clone(),
+        messages: vec![ChatMessage {
+            role: "user".into(),
+            content: vec![ChatContent::Text {
+                text: digest.to_string(),
+            }],
+        }],
+        tools: Vec::new(),
+        max_tokens: 1024,
+        system: Some("You compress conversation history into a concise factual summary.".into()),
+        thinking: None,
+    };
+    tokio::spawn(async move {
+        let _ = provider.stream_chat(request, tx).await;
+    });
+    let mut out = String::new();
+    while let Some(ev) = rx.recv().await {
+        match ev {
+            StreamEvent::TextDelta(t) => out.push_str(&t),
+            StreamEvent::MessageEnd { .. } | StreamEvent::Error(_) => break,
+            _ => {}
+        }
+    }
+    if out.trim().is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
 fn resolve_session_id(db: &TranscriptDb, query: &str) -> Option<String> {
     if db.get_session(query).ok().flatten().is_some() {
         return Some(query.to_string());
@@ -402,7 +472,24 @@ async fn handle_rpc_call(
                 perm_mode,
                 model_alias.clone(),
             );
+            if !kkagent_core::is_workspace_trusted(&state.config, &session.working_dir) {
+                return Err((
+                    -32000,
+                    format!(
+                        "Workspace {} is not in trusted_workspaces",
+                        session.working_dir.display()
+                    ),
+                ));
+            }
+            session.inject_date_reminder();
             session.inject_workspace_instructions().await;
+            session.inject_git_context();
+            {
+                let section = state.skills.catalog_prompt_section().await;
+                if !section.is_empty() {
+                    session.system_prompt.push_str(&section);
+                }
+            }
 
             {
                 let db = state.transcript.lock().await;
@@ -506,6 +593,14 @@ async fn handle_rpc_call(
                 },
             );
             session.inject_workspace_instructions().await;
+            session.inject_date_reminder();
+            session.inject_git_context();
+            {
+                let section = state.skills.catalog_prompt_section().await;
+                if !section.is_empty() {
+                    session.system_prompt.push_str(&section);
+                }
+            }
             session.messages = messages.clone();
             session.persisted_message_count = messages.len();
             session.title = record.title.clone();
@@ -684,6 +779,14 @@ async fn handle_rpc_call(
             });
             tools.register(Arc::new(kkagent_tools::builtin::TaskTool::new(
                 state.subagents.clone(),
+                launch.clone(),
+            )));
+            tools.register(Arc::new(kkagent_tools::builtin::AgentTool::new(
+                state.subagents.clone(),
+                launch.clone(),
+            )));
+            tools.register(Arc::new(kkagent_tools::builtin::AgentSwarmTool::new(
+                state.subagents.clone(),
                 launch,
             )));
             tools.register(Arc::new(kkagent_tools::builtin::TaskOutputTool::new(
@@ -700,6 +803,24 @@ async fn handle_rpc_call(
             tools.register(Arc::new(kkagent_tools::builtin::CreateGoalTool::new(goal_mgr.clone())));
             tools.register(Arc::new(kkagent_tools::builtin::GetGoalTool::new(goal_mgr.clone())));
             tools.register(Arc::new(kkagent_tools::builtin::UpdateGoalTool::new(goal_mgr)));
+            tools.register(Arc::new(kkagent_tools::builtin::SkillTool::new(
+                state.skills.clone(),
+            )));
+            tools.register(Arc::new(kkagent_tools::builtin::WebSearchTool::new(
+                state.web.clone(),
+            )));
+            tools.register(Arc::new(kkagent_tools::builtin::FetchUrlTool::new(
+                state.web.clone(),
+            )));
+            tools.register(Arc::new(kkagent_tools::builtin::CronCreateTool::new(
+                state.cron.clone(),
+            )));
+            tools.register(Arc::new(kkagent_tools::builtin::CronListTool::new(
+                state.cron.clone(),
+            )));
+            tools.register(Arc::new(kkagent_tools::builtin::CronDeleteTool::new(
+                state.cron.clone(),
+            )));
 
             let permission_rules = state.config.permission.as_ref()
                 .map(|p| p.rules.clone())
@@ -707,13 +828,16 @@ async fn handle_rpc_call(
             let perm_mode: PermissionMode = state.config.effective_permission_mode().parse().unwrap_or_default();
             let permission = PermissionChain::new(perm_mode, permission_rules);
 
-            let agent_loop = Arc::new(AgentLoop::new(
-                state.config.clone(),
-                Arc::new(tools),
-                Arc::new(Mutex::new(permission)),
-                agent_event_tx.clone(),
-                state.abort_registry.clone(),
-            ));
+            let agent_loop = Arc::new(
+                AgentLoop::new(
+                    state.config.clone(),
+                    Arc::new(tools),
+                    Arc::new(Mutex::new(permission)),
+                    agent_event_tx.clone(),
+                    state.abort_registry.clone(),
+                )
+                .with_hooks(state.hooks.clone()),
+            );
 
             let state_clone = state.clone();
             let sid = session_id.clone();
@@ -924,18 +1048,51 @@ async fn handle_rpc_call(
                 .and_then(|p| p.get("keep_last"))
                 .and_then(|v| v.as_u64())
                 .unwrap_or(6) as usize;
-            let instruction = params.as_ref()
-                .and_then(|p| p.get("instruction"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("Conversation compacted.");
+
+            // Build a summary of older messages via secondary/default model when possible.
+            let summary = {
+                let sessions = state.sessions.lock().await;
+                let Some(session) = sessions.get(&session_id) else {
+                    drop(sessions);
+                    let db = state.transcript.lock().await;
+                    let deleted = db
+                        .compact_session(&session_id, keep_last, "Conversation compacted.")
+                        .map_err(|e| (-32000, e.to_string()))?;
+                    return Ok(serde_json::json!({"ok": true, "deleted": deleted}));
+                };
+                if session.messages.len() <= keep_last {
+                    return Ok(serde_json::json!({"ok": true, "deleted": 0}));
+                }
+                let old = &session.messages[..session.messages.len() - keep_last];
+                let mut digest = String::from("Summarize the following conversation for future context. Keep decisions, file paths, and unfinished tasks.\n\n");
+                for m in old.iter().take(40) {
+                    let role = &m.role;
+                    let text: String = m
+                        .content
+                        .iter()
+                        .filter_map(|c| match c {
+                            ChatContent::Text { text } => Some(text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    if !text.is_empty() {
+                        digest.push_str(&format!("[{role}] {}\n", text.chars().take(500).collect::<String>()));
+                    }
+                }
+                digest
+            };
+
+            let summary_text = summarize_with_llm(state.config.clone(), &summary)
+                .await
+                .unwrap_or_else(|| "Conversation compacted.".into());
 
             let deleted = {
                 let db = state.transcript.lock().await;
-                db.compact_session(&session_id, keep_last, instruction)
+                db.compact_session(&session_id, keep_last, &summary_text)
                     .map_err(|e| (-32000, e.to_string()))?
             };
 
-            // Reload messages into in-memory session if present
             {
                 let db = state.transcript.lock().await;
                 let records = db.load_messages(&session_id).unwrap_or_default();
@@ -949,7 +1106,7 @@ async fn handle_rpc_call(
                 }
             }
 
-            Ok(serde_json::json!({"ok": true, "deleted": deleted}))
+            Ok(serde_json::json!({"ok": true, "deleted": deleted, "summary": summary_text}))
         }
         "tasks.list" => {
             let all = state.subagents.list_all().await;

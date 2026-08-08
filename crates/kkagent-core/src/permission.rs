@@ -23,7 +23,7 @@ const SENSITIVE_PATTERNS: &[&str] = &[
 const READ_ONLY_TOOLS: &[&str] = &[
     "Read", "Grep", "Glob", "ReadMediaFile", "WebSearch",
     "FetchURL", "EnterPlanMode", "ExitPlanMode", "TodoList", "GetGoal",
-    "TaskList", "TaskOutput", "CronList", "SelectTools",
+    "TaskList", "TaskOutput", "CronList", "SelectTools", "Skill",
 ];
 
 impl PermissionChain {

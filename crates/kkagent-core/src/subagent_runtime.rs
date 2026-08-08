@@ -20,9 +20,22 @@ pub async fn run_subagent(
 ) -> anyhow::Result<String> {
     let model = sub_cfg
         .model
+        .clone()
         .filter(|m| !m.is_empty())
+        .or_else(|| {
+            app_config
+                .secondary_model
+                .clone()
+                .filter(|m| !m.is_empty())
+        })
         .or_else(|| app_config.default_model_alias().map(|s| s.to_string()))
         .unwrap_or_else(|| "default".into());
+
+    let profile = sub_cfg
+        .profile
+        .as_deref()
+        .unwrap_or("general")
+        .to_lowercase();
 
     let mut session = Session::new(
         format!("sub-{}", sub_cfg.agent_id),
@@ -30,43 +43,76 @@ pub async fn run_subagent(
         permission_mode,
         model,
     );
-    session.system_prompt.push_str(
-        "\n\n# Subagent mode\n\
-You are a focused subagent launched by the main agent. Complete the assigned task thoroughly, \
-use tools as needed, then finish with a concise report of findings. Do not ask clarifying \
-questions to a user — make reasonable assumptions and state them. Do not launch further Task subagents.",
-    );
-    session.add_user_message(sub_cfg.prompt);
+    session.inject_workspace_instructions().await;
+    session.system_prompt.push_str(&profile_system_addon(&profile));
+    session.add_user_message(sub_cfg.prompt.clone());
 
     let mut tools = ToolRegistry::new();
-    // Builtins only — no nested Task / Goal to keep the subagent bounded.
     register_builtin_tools(&mut tools);
+    // Strip nested Task tools if present — builtins don't include them.
 
     let permission_rules = app_config
         .permission
         .as_ref()
         .map(|p| p.rules.clone())
         .unwrap_or_default();
-    // Prefer Auto for subagents so they don't block on interactive approvals.
     let permission = PermissionChain::new(PermissionMode::Auto, permission_rules);
 
     let (event_tx, mut event_rx) = mpsc::channel(64);
+    // Optional mirror: drain events (parent can attach later).
     tokio::spawn(async move {
         while event_rx.recv().await.is_some() {}
     });
 
     let abort_registry = Arc::new(Mutex::new(HashMap::<String, AbortHandle>::new()));
+    let max_rounds = match profile.as_str() {
+        "explore" => 16,
+        "coder" => 32,
+        _ => 24,
+    };
     let agent = AgentLoop::with_max_rounds(
         app_config,
         Arc::new(tools),
         Arc::new(Mutex::new(permission)),
         event_tx,
         abort_registry,
-        24,
+        max_rounds,
     );
 
     agent.run_turn(&mut session).await?;
-    Ok(extract_final_assistant_text(&session))
+    let result = extract_final_assistant_text(&session);
+    persist_subagent_output(&sub_cfg, &result).await;
+    Ok(result)
+}
+
+fn profile_system_addon(profile: &str) -> String {
+    match profile {
+        "explore" => "\n\n# Subagent profile: explore\n\
+You are a read-only explorer. Prefer Glob/Grep/Read. Do not modify files. \
+Produce a structured map of findings with paths. Do not launch Task subagents.".into(),
+        "coder" => "\n\n# Subagent profile: coder\n\
+You are an implementation agent. Make concrete code changes with Write/Edit. \
+Keep changes focused. Do not launch Task subagents.".into(),
+        _ => "\n\n# Subagent mode\n\
+You are a focused subagent. Complete the assigned task thoroughly, use tools as needed, \
+then finish with a concise report. Do not ask the user clarifying questions. Do not launch Task subagents.".into(),
+    }
+}
+
+async fn persist_subagent_output(cfg: &SubagentConfig, result: &str) {
+    let dir = PathBuf::from(&cfg.working_dir)
+        .join(".kkagent")
+        .join("tasks");
+    let _ = tokio::fs::create_dir_all(&dir).await;
+    let path = dir.join(format!("{}.md", cfg.agent_id));
+    let body = format!(
+        "# Task {}\n\n**description:** {}\n**profile:** {}\n\n---\n\n{}\n",
+        cfg.agent_id,
+        cfg.description,
+        cfg.profile.as_deref().unwrap_or("general"),
+        result
+    );
+    let _ = tokio::fs::write(path, body).await;
 }
 
 fn extract_final_assistant_text(session: &Session) -> String {

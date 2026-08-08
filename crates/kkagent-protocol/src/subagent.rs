@@ -21,6 +21,9 @@ pub struct SubagentConfig {
     pub prompt: String,
     pub model: Option<String>,
     pub working_dir: String,
+    /// Optional profile: explore | coder | general (default).
+    #[serde(default)]
+    pub profile: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

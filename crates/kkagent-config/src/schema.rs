@@ -5,6 +5,9 @@ use std::collections::HashMap;
 pub struct AppConfig {
     #[serde(default)]
     pub default_model: Option<String>,
+    /// Optional secondary model alias for subagents / summarization.
+    #[serde(default)]
+    pub secondary_model: Option<String>,
     #[serde(default)]
     pub default_permission_mode: Option<String>,
     #[serde(default)]
@@ -15,6 +18,9 @@ pub struct AppConfig {
     pub extra_skill_dirs: Vec<String>,
     #[serde(default)]
     pub telemetry: bool,
+    /// Trusted workspace roots (absolute paths). Empty = trust cwd implicitly.
+    #[serde(default)]
+    pub trusted_workspaces: Vec<String>,
     #[serde(default)]
     pub providers: HashMap<String, ProviderConfig>,
     #[serde(default)]
@@ -81,10 +87,13 @@ pub struct LoopControlConfig {
     pub max_attempts_per_step: u32,
     #[serde(default = "default_reserved_context")]
     pub reserved_context_size: u64,
+    #[serde(default = "default_max_steps")]
+    pub max_steps_per_turn: u32,
 }
 
 fn default_max_attempts() -> u32 { 10 }
 fn default_reserved_context() -> u64 { 50000 }
+fn default_max_steps() -> u32 { 64 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackgroundConfig {

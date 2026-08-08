@@ -47,6 +47,11 @@ After launching, continue other work and collect results with TaskOutput / TaskL
                 "model": {
                     "type": "string",
                     "description": "Optional model alias override for the subagent"
+                },
+                "profile": {
+                    "type": "string",
+                    "enum": ["general", "explore", "coder"],
+                    "description": "Subagent profile (default general)"
                 }
             },
             "required": ["description", "prompt"]
@@ -66,6 +71,10 @@ After launching, continue other work and collect results with TaskOutput / TaskL
             .get("model")
             .and_then(|v| v.as_str())
             .map(String::from);
+        let profile = input
+            .get("profile")
+            .and_then(|v| v.as_str())
+            .map(String::from);
 
         if prompt.trim().is_empty() {
             return Ok(ToolOutput::error("Task prompt must not be empty"));
@@ -77,6 +86,7 @@ After launching, continue other work and collect results with TaskOutput / TaskL
             prompt: prompt.to_string(),
             model,
             working_dir: ctx.working_dir.to_string_lossy().to_string(),
+            profile,
         };
 
         match self.subagent_mgr.spawn(config.clone()).await {
@@ -208,6 +218,151 @@ impl Tool for TaskListTool {
             })
             .collect();
         Ok(ToolOutput::success(lines.join("\n")))
+    }
+}
+
+/// Agent tool — Task with explicit profile (explore/coder/general).
+pub struct AgentTool {
+    inner: TaskTool,
+}
+
+impl AgentTool {
+    pub fn new(subagent_mgr: Arc<SubagentManager>, launch: SubagentLaunchFn) -> Self {
+        Self {
+            inner: TaskTool::new(subagent_mgr, launch),
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for AgentTool {
+    fn name(&self) -> &str {
+        "Agent"
+    }
+    fn description(&self) -> &str {
+        "Launch a profiled subagent (explore/coder/general). Prefer explore for codebase mapping, \
+coder for implementation. Collect results with TaskOutput."
+    }
+    fn parameters_schema(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "description": {"type": "string"},
+                "prompt": {"type": "string"},
+                "profile": {
+                    "type": "string",
+                    "enum": ["general", "explore", "coder"],
+                    "description": "Agent profile (default explore)"
+                },
+                "model": {"type": "string"}
+            },
+            "required": ["description", "prompt"]
+        })
+    }
+    async fn execute(&self, mut input: Value, ctx: &ToolContext) -> anyhow::Result<ToolOutput> {
+        if input.get("profile").is_none() {
+            if let Some(obj) = input.as_object_mut() {
+                obj.insert("profile".into(), Value::String("explore".into()));
+            }
+        }
+        self.inner.execute(input, ctx).await
+    }
+}
+
+/// Launch multiple subagents in parallel.
+pub struct AgentSwarmTool {
+    subagent_mgr: Arc<SubagentManager>,
+    launch: SubagentLaunchFn,
+}
+
+impl AgentSwarmTool {
+    pub fn new(subagent_mgr: Arc<SubagentManager>, launch: SubagentLaunchFn) -> Self {
+        Self {
+            subagent_mgr,
+            launch,
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for AgentSwarmTool {
+    fn name(&self) -> &str {
+        "AgentSwarm"
+    }
+    fn description(&self) -> &str {
+        "Launch multiple subagents in parallel. Pass `agents` array of {description, prompt, profile?}."
+    }
+    fn parameters_schema(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "agents": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "description": {"type": "string"},
+                            "prompt": {"type": "string"},
+                            "profile": {"type": "string"},
+                            "model": {"type": "string"}
+                        },
+                        "required": ["description", "prompt"]
+                    }
+                }
+            },
+            "required": ["agents"]
+        })
+    }
+    async fn execute(&self, input: Value, ctx: &ToolContext) -> anyhow::Result<ToolOutput> {
+        let agents = input
+            .get("agents")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        if agents.is_empty() {
+            return Ok(ToolOutput::error("agents array is empty"));
+        }
+        let mut launched = Vec::new();
+        for a in agents {
+            let desc = a
+                .get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or("swarm agent");
+            let prompt = a.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
+            if prompt.is_empty() {
+                continue;
+            }
+            let config = SubagentConfig {
+                agent_id: uuid::Uuid::new_v4().to_string(),
+                description: desc.to_string(),
+                prompt: prompt.to_string(),
+                model: a.get("model").and_then(|v| v.as_str()).map(String::from),
+                working_dir: ctx.working_dir.to_string_lossy().to_string(),
+                profile: a
+                    .get("profile")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+                    .or_else(|| Some("explore".into())),
+            };
+            match self.subagent_mgr.spawn(config.clone()).await {
+                Ok(id) => {
+                    (self.launch)(config);
+                    launched.push(id);
+                }
+                Err(e) => {
+                    return Ok(ToolOutput::error(format!(
+                        "Failed after launching {}: {}",
+                        launched.join(", "),
+                        e
+                    )));
+                }
+            }
+        }
+        Ok(ToolOutput::success(format!(
+            "Launched {} agents: {}\nUse TaskOutput / TaskList to collect results.",
+            launched.len(),
+            launched.join(", ")
+        )))
     }
 }
 

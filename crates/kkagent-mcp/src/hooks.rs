@@ -49,6 +49,19 @@ impl HookManager {
         }
     }
 
+    pub async fn load_from_app_config(&mut self, hooks: &[kkagent_config::HookConfig]) {
+        for h in hooks {
+            if let Some(event) = HookEvent::from_str(&h.event) {
+                self.hooks.push(HookConfig {
+                    event,
+                    command: h.command.clone(),
+                    args: Vec::new(),
+                    timeout_ms: h.timeout.saturating_mul(1000).max(1000),
+                });
+            }
+        }
+    }
+
     /// Load hooks from ~/.kkagent/hooks.json or .kkagent/hooks.json
     pub async fn discover(&mut self) -> Result<()> {
         self.hooks.clear();

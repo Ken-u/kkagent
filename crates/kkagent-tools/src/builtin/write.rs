@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::path::Path;
+use crate::path_policy::is_sensitive_path;
 use crate::{Tool, ToolContext, ToolOutput};
 
 pub struct WriteTool;
@@ -40,10 +41,15 @@ impl Tool for WriteTool {
             ctx.working_dir.join(path_str)
         };
 
+        if is_sensitive_path(&path) {
+            tracing::warn!("Writing sensitive path: {}", path.display());
+        }
+
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
 
+        let bytes = content.as_bytes();
         match mode {
             "append" => {
                 use tokio::io::AsyncWriteExt;
@@ -52,14 +58,21 @@ impl Tool for WriteTool {
                     .append(true)
                     .open(&path)
                     .await?;
-                file.write_all(content.as_bytes()).await?;
+                file.write_all(bytes).await?;
             }
             _ => {
-                tokio::fs::write(&path, content).await?;
+                tokio::fs::write(&path, bytes).await?;
             }
         }
 
         let line_count = content.lines().count();
-        Ok(ToolOutput::success(format!("Wrote {} lines to {}", line_count, path_str)))
+        Ok(ToolOutput::success_with_data(
+            format!("Wrote {} lines ({} bytes) to {}", line_count, bytes.len(), path_str),
+            json!({
+                "bytesWritten": bytes.len(),
+                "lineCount": line_count,
+                "path": path_str,
+            }),
+        ))
     }
 }

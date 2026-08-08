@@ -1,6 +1,9 @@
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::path::Path;
+use crate::path_policy::{
+    decode_text, is_sensitive_path, looks_binary_ext, MAX_LINE_LENGTH,
+};
 use crate::{Tool, ToolContext, ToolOutput};
 
 pub struct ReadTool;
@@ -9,7 +12,8 @@ pub struct ReadTool;
 impl Tool for ReadTool {
     fn name(&self) -> &str { "Read" }
     fn description(&self) -> &str {
-        "Read the contents of a file. Returns up to 1000 lines or 100KB."
+        "Read the contents of a text file. Returns numbered lines (up to 1000 lines or 100KB). \
+Rejects binary/image files — use ReadMediaFile for media."
     }
     fn read_only(&self) -> bool { true }
     fn parameters_schema(&self) -> Value {
@@ -38,9 +42,29 @@ impl Tool for ReadTool {
         if !path.exists() {
             return Ok(ToolOutput::error(format!("File not found: {}", path_str)));
         }
+        if looks_binary_ext(&path) {
+            return Ok(ToolOutput::error(format!(
+                "Refusing to Read binary/media file `{}`. Use ReadMediaFile instead.",
+                path_str
+            )));
+        }
+        if is_sensitive_path(&path) {
+            // Still allow, but annotate — permission layer may have asked already.
+            tracing::warn!("Reading sensitive path: {}", path.display());
+        }
 
-        let content = tokio::fs::read_to_string(&path).await
+        let bytes = tokio::fs::read(&path).await
             .map_err(|e| anyhow::anyhow!("Failed to read file: {}", e))?;
+
+        let content = match decode_text(&bytes) {
+            Ok(c) => c,
+            Err(e) => {
+                return Ok(ToolOutput::error(format!(
+                    "{}: {}. Use ReadMediaFile for media/binary.",
+                    path_str, e
+                )));
+            }
+        };
 
         let lines: Vec<&str> = content.lines().collect();
         let total_lines = lines.len();
@@ -62,7 +86,15 @@ impl Tool for ReadTool {
         let selected: Vec<String> = lines[start..end]
             .iter()
             .enumerate()
-            .map(|(i, line)| format!("{:>6}|{}", start + i + 1, line))
+            .map(|(i, line)| {
+                let truncated: String = line.chars().take(MAX_LINE_LENGTH).collect();
+                let suffix = if line.chars().count() > MAX_LINE_LENGTH {
+                    "…"
+                } else {
+                    ""
+                };
+                format!("{:>6}|{}{}", start + i + 1, truncated, suffix)
+            })
             .collect();
 
         let mut result = selected.join("\n");
@@ -70,6 +102,14 @@ impl Tool for ReadTool {
             result.push_str(&format!("\n... {} more lines not shown ...", total_lines - end));
         }
 
-        Ok(ToolOutput::success(result))
+        Ok(ToolOutput::success_with_data(
+            result,
+            json!({
+                "lineCount": total_lines,
+                "bytes": bytes.len(),
+                "startLine": start + 1,
+                "endLine": end,
+            }),
+        ))
     }
 }

@@ -47,3 +47,45 @@ impl Tool for ExitPlanModeTool {
         )))
     }
 }
+
+/// Enter plan mode — agent may only write the session plan file until ExitPlanMode.
+pub struct EnterPlanModeTool;
+
+#[async_trait]
+impl Tool for EnterPlanModeTool {
+    fn name(&self) -> &str {
+        "EnterPlanMode"
+    }
+
+    fn description(&self) -> &str {
+        "Enter plan mode. While active, you may only write/edit the session plan file. \
+Use this when the task needs careful planning before implementation."
+    }
+
+    fn parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "reason": {
+                    "type": "string",
+                    "description": "Why plan mode is needed"
+                }
+            }
+        })
+    }
+
+    fn read_only(&self) -> bool {
+        true
+    }
+
+    async fn execute(&self, input: Value, _ctx: &ToolContext) -> anyhow::Result<ToolOutput> {
+        let reason = input
+            .get("reason")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Planning before implementation");
+        Ok(ToolOutput::success(format!(
+            "Entered plan mode. Reason: {}. Write the plan file, then call ExitPlanMode when ready.",
+            reason
+        )))
+    }
+}

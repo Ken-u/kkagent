@@ -1096,6 +1096,7 @@ dependencies = [
  "futures",
  "kkagent-config",
  "kkagent-llm",
+ "kkagent-mcp",
  "kkagent-protocol",
  "kkagent-tools",
  "rusqlite",
@@ -1124,6 +1125,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -1179,10 +1181,14 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "base64",
+ "chrono",
+ "dirs",
  "globset",
  "ignore",
  "kkagent-config",
  "kkagent-protocol",
+ "reqwest",
  "serde",
  "serde_json",
  "thiserror 2.0.20",

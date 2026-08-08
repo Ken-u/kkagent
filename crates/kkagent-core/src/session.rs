@@ -49,6 +49,10 @@ pub struct Session {
     pub current_turn_changes: Vec<FileChange>,
     /// Completed turns available for undo (most recent last).
     pub undo_stack: Vec<TurnCheckpoint>,
+    /// Progressive tool disclosure filter (None = all tools).
+    pub enabled_tools: Option<std::collections::HashSet<String>>,
+    /// Turns since last TodoList write (for reminder).
+    pub turns_since_todo: u32,
 }
 
 impl Session {
@@ -84,6 +88,8 @@ impl Session {
             turn_message_start: None,
             current_turn_changes: Vec::new(),
             undo_stack: Vec::new(),
+            enabled_tools: None,
+            turns_since_todo: 0,
         }
     }
 
@@ -310,6 +316,19 @@ impl Session {
             // Prefer the first existing instructions file.
             break;
         }
+    }
+
+    pub fn inject_git_context(&mut self) {
+        if let Some(ctx) = crate::git_context::collect_git_context(&self.working_dir) {
+            self.system_prompt.push_str(&ctx);
+        }
+    }
+
+    pub fn inject_date_reminder(&mut self) {
+        let today = chrono::Local::now().format("%Y-%m-%d (%A)");
+        self.system_prompt.push_str(&format!(
+            "\n\n# Date\n\nToday's date is {today}.\n"
+        ));
     }
 }
 

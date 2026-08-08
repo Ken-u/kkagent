@@ -18,3 +18,7 @@ globset = { workspace = true }
 walkdir = { workspace = true }
 which = { workspace = true }
 uuid = { workspace = true }
+reqwest = { workspace = true }
+chrono = { workspace = true }
+dirs = { workspace = true }
+base64 = "0.22"

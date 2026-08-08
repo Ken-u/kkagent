@@ -574,6 +574,51 @@ impl TuiApp {
                     self.open_tasks_panel().await?;
                     return Ok(());
                 }
+                KeyCode::Enter => {
+                    if let Some(ref p) = self.state.tasks_panel {
+                        if let Some(t) = p.tasks.get(p.selected) {
+                            let mut detail = format!(
+                                "task {} [{}]\n{}\n",
+                                t.task_id, t.status, t.description
+                            );
+                            if let Some(ref r) = t.result {
+                                detail.push_str("\nresult:\n");
+                                detail.push_str(r);
+                            }
+                            if let Some(ref e) = t.error {
+                                detail.push_str("\nerror:\n");
+                                detail.push_str(e);
+                            }
+                            self.system_message(detail);
+                        }
+                    }
+                    return Ok(());
+                }
+                KeyCode::Char('x') | KeyCode::Char('s') | KeyCode::Char('S') => {
+                    let id = self
+                        .state
+                        .tasks_panel
+                        .as_ref()
+                        .and_then(|p| p.tasks.get(p.selected))
+                        .map(|t| t.task_id.clone());
+                    if let Some(task_id) = id {
+                        match self
+                            .client
+                            .rpc_call(
+                                "tasks.stop",
+                                Some(serde_json::json!({ "task_id": task_id })),
+                            )
+                            .await
+                        {
+                            Ok(_) => {
+                                self.system_message(format!("Stopped task {}", task_id));
+                                self.open_tasks_panel().await?;
+                            }
+                            Err(e) => self.system_message(format!("Stop failed: {}", e)),
+                        }
+                    }
+                    return Ok(());
+                }
                 KeyCode::Esc | KeyCode::Char('q') => {
                     self.state.tasks_panel = None;
                     return Ok(());

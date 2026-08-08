@@ -19,7 +19,10 @@ pub struct AgentLoop {
     abort_registry: Arc<Mutex<HashMap<String, AbortHandle>>>,
     /// Max LLM rounds per top-level run_turn (tool recursion counts).
     max_rounds: u32,
+    hooks: Option<Arc<kkagent_mcp::HookManager>>,
 }
+
+const TOOL_RESULT_INLINE_MAX: usize = 32_000;
 
 impl AgentLoop {
     pub fn new(
@@ -29,7 +32,17 @@ impl AgentLoop {
         event_tx: mpsc::Sender<AgentEvent>,
         abort_registry: Arc<Mutex<HashMap<String, AbortHandle>>>,
     ) -> Self {
-        Self::with_max_rounds(config, tools, permission, event_tx, abort_registry, 64)
+        let max = config
+            .loop_control
+            .as_ref()
+            .map(|l| l.max_steps_per_turn)
+            .unwrap_or(64);
+        Self::with_max_rounds(config, tools, permission, event_tx, abort_registry, max)
+    }
+
+    pub fn with_hooks(mut self, hooks: Arc<kkagent_mcp::HookManager>) -> Self {
+        self.hooks = Some(hooks);
+        self
     }
 
     pub fn with_max_rounds(
@@ -47,6 +60,7 @@ impl AgentLoop {
             event_tx,
             abort_registry,
             max_rounds: max_rounds.max(1),
+            hooks: None,
         }
     }
 
@@ -112,14 +126,38 @@ impl AgentLoop {
         );
         let provider = create_provider(provider_config, model_config);
 
-        let tool_defs: Vec<ToolDef> = self.tools.tool_definitions().iter().map(|td| {
-            ToolDef {
+        let tool_defs: Vec<ToolDef> = self
+            .tools
+            .tool_definitions()
+            .iter()
+            .filter(|td| tool_allowed(session, &td.name))
+            .map(|td| ToolDef {
                 name: td.name.clone(),
                 description: td.description.clone(),
                 input_schema: td.parameters.clone(),
-            }
-        }).collect();
+            })
+            .collect();
         tracing::debug!("Sending {} tools to LLM", tool_defs.len());
+
+        // Todo reminder injection
+        session.turns_since_todo = session.turns_since_todo.saturating_add(1);
+        if session.turns_since_todo >= 8 {
+            session.add_user_message(
+                "<system-reminder>\nThe TodoList tool has not been updated recently. \
+If you are working on multi-step tasks, consider updating TodoList. \
+Do not mention this reminder to the user.\n</system-reminder>".into(),
+            );
+            session.turns_since_todo = 0;
+        }
+
+        if let Some(hooks) = &self.hooks {
+            let _ = hooks
+                .fire(
+                    kkagent_mcp::hooks::HookEvent::TurnStart,
+                    &serde_json::json!({"session_id": session_id}),
+                )
+                .await;
+        }
 
         let messages = session.build_messages();
         tracing::debug!("Conversation has {} messages", messages.len());
@@ -383,6 +421,28 @@ impl AgentLoop {
                         enabled: false,
                     }).await;
                 }
+                if tc.name == "EnterPlanMode" && !output.is_error {
+                    session.plan_mode = true;
+                    let _ = self.event_tx.send(AgentEvent::PlanModeChanged {
+                        session_id: session_id.clone(),
+                        enabled: true,
+                    }).await;
+                }
+                if tc.name == "SelectTools" && !output.is_error {
+                    if let Some(data) = &output.data {
+                        if data.get("tools").map(|v| v.is_null()).unwrap_or(false) {
+                            session.enabled_tools = None;
+                        } else if let Some(arr) = data.get("tools").and_then(|v| v.as_array()) {
+                            session.enabled_tools = Some(
+                                arr.iter()
+                                    .filter_map(|v| v.as_str().map(String::from))
+                                    .collect(),
+                            );
+                        }
+                    }
+                }
+
+                let output = truncate_tool_output(session, &tc.name, output);
 
                 tracing::info!(
                     "Tool {} result: error={} len={}",
@@ -400,6 +460,7 @@ impl AgentLoop {
                 }).await;
 
                 if !output.is_error && tc.name == "TodoList" {
+                    session.turns_since_todo = 0;
                     if let Some(items) = todo_items_from_output(&output) {
                         let _ = self
                             .event_tx
@@ -505,6 +566,20 @@ impl AgentLoop {
     ) -> ToolOutput {
         if name == "AskUserQuestion" {
             return self.run_ask_user_question(session, input).await;
+        }
+        if !tool_allowed(session, name) {
+            return ToolOutput::error(format!(
+                "Tool `{name}` is not in the current SelectTools allowlist"
+            ));
+        }
+
+        if let Some(hooks) = &self.hooks {
+            let _ = hooks
+                .fire(
+                    kkagent_mcp::hooks::HookEvent::PreToolCall,
+                    &serde_json::json!({"tool": name, "input": input}),
+                )
+                .await;
         }
 
         // Snapshot files before mutating tools so undo can restore them.
@@ -679,6 +754,38 @@ fn todo_items_from_output(output: &ToolOutput) -> Option<Vec<kkagent_protocol::T
         })
         .collect();
     Some(items)
+}
+
+fn tool_allowed(session: &Session, name: &str) -> bool {
+    match &session.enabled_tools {
+        None => true,
+        Some(set) => {
+            set.contains(name)
+                || name == "SelectTools"
+                || name == "AskUserQuestion"
+                || name == "TodoList"
+                || name == "ExitPlanMode"
+                || name == "EnterPlanMode"
+        }
+    }
+}
+
+fn truncate_tool_output(session: &Session, tool_name: &str, mut output: ToolOutput) -> ToolOutput {
+    if output.content.len() <= TOOL_RESULT_INLINE_MAX {
+        return output;
+    }
+    let dir = session.working_dir.join(".kkagent").join("tool-results");
+    let _ = std::fs::create_dir_all(&dir);
+    let id = uuid::Uuid::new_v4().to_string();
+    let path = dir.join(format!("{}.txt", id));
+    let _ = std::fs::write(&path, &output.content);
+    let preview: String = output.content.chars().take(4000).collect();
+    output.content = format!(
+        "{preview}\n\n… tool result truncated ({tool_name}, {} chars). Full output saved to {} — use Read on that path if needed.",
+        output.content.len(),
+        path.display()
+    );
+    output
 }
 
 fn describe_tool_action(name: &str, input: &serde_json::Value) -> String {
