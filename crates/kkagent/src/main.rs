@@ -14,6 +14,7 @@ use kkagent_rpc::{RpcClient, RpcServer, transport::memory::create_memory_pair};
 use kkagent_llm::{ChatMessage, ChatContent};
 use kkagent_core::{AgentLoop, PermissionChain, Session, TranscriptDb};
 use kkagent_tools::ToolRegistry;
+use kkagent_mcp::{McpManager, register_mcp_tools};
 use kkagent_client::KkagentClient;
 use kkagent_tui::TuiApp;
 
@@ -229,6 +230,22 @@ struct ServerState {
     abort_registry: Arc<Mutex<HashMap<String, AbortHandle>>>,
     transcript: Mutex<TranscriptDb>,
     subagents: Arc<SubagentManager>,
+    /// Connected MCP servers; tools registered per turn from this manager.
+    mcp: Arc<McpManager>,
+}
+
+fn mcp_manager_from_config(config: &AppConfig) -> McpManager {
+    let configs: Vec<kkagent_mcp::McpServerConfig> = config
+        .mcp_servers
+        .iter()
+        .map(|(name, cfg)| kkagent_mcp::McpServerConfig {
+            name: name.clone(),
+            command: cfg.command.clone(),
+            args: cfg.args.clone(),
+            env: cfg.env.clone(),
+        })
+        .collect();
+    McpManager::new(configs)
 }
 
 async fn run_server_handler<T: kkagent_rpc::transport::AsyncTransport>(
@@ -253,6 +270,20 @@ async fn run_server_handler<T: kkagent_rpc::transport::AsyncTransport>(
         }
     };
 
+    let mcp = Arc::new(mcp_manager_from_config(&config));
+    if !config.mcp_servers.is_empty() {
+        if let Err(e) = mcp.connect_all().await {
+            tracing::warn!("MCP connect_all error: {}", e);
+        } else {
+            let n = mcp.list_tools().await.len();
+            tracing::info!(
+                "MCP ready: {} server(s), {} tool(s)",
+                config.mcp_servers.len(),
+                n
+            );
+        }
+    }
+
     let state = Arc::new(ServerState {
         config: config.clone(),
         sessions: Mutex::new(HashMap::new()),
@@ -262,6 +293,7 @@ async fn run_server_handler<T: kkagent_rpc::transport::AsyncTransport>(
         abort_registry: Arc::new(Mutex::new(HashMap::new())),
         transcript: Mutex::new(transcript),
         subagents: Arc::new(SubagentManager::new(4)),
+        mcp,
     });
 
     let handler: kkagent_rpc::server::RequestHandler = {
@@ -589,6 +621,7 @@ async fn handle_rpc_call(
 
             let mut tools = ToolRegistry::new();
             kkagent_tools::register_builtin_tools(&mut tools);
+            register_mcp_tools(&mut tools, &state.mcp).await;
 
             let subagents = state.subagents.clone();
             let cfg_for_sub = state.config.clone();

@@ -27,7 +27,7 @@
 | ReadMediaFile | 未实现 | 已实现 | 当前无法读取图片/视频 |
 | CronCreate / CronList / CronDelete | 未实现 | 已实现 | 当前无定时任务能力 |
 | SelectTools | 未实现 | 已实现 | 当前无渐进式工具披露 |
-| MCP 工具 | 客户端有，未接入 Agent `[已核对]` | 已实现 | `McpManager` 可 connect/list/call；**未注册到 ToolRegistry**，模型看不到 `mcp__server__tool` |
+| MCP 工具 | **已接入** `[已核对]` | 已实现 | stdio 客户端 + `mcp__*` 注册进 AgentLoop；仍缺 SSE/HTTP、OAuth、重连 |
 
 ## 二、Agent 核心循环
 
@@ -87,7 +87,7 @@
 |------|-------------|---------|---------|
 | MCP stdio 客户端 | 已实现 | 已实现 | `kkagent-mcp` 使用 rmcp |
 | MCP SSE/HTTP | 未实现 | 已实现 | ref 有 client-sse/client-http |
-| MCP 工具接入 Agent | **未实现** `[已核对]` | 已实现 | 未注册 `mcp__*` 到 ToolRegistry |
+| MCP 工具接入 Agent | **已实现** `[已核对]` | 已实现 | 启动时 connect，注册 `mcp__server__tool` 到 ToolRegistry |
 | MCP 权限/OAuth | 未实现 | 已实现 | ref 有 mcpCore/oauth |
 | MCP 连接管理 | 简单实现 | 已实现 | 有 connect/list/call；无重连、timeout 配置 |
 
@@ -183,11 +183,12 @@
 - [x] README server/TUI 配对说明
 - [x] Task 真正驱动子代理（`run_subagent`）+ TaskOutput / TaskList
 - [x] AgentLoop `max_rounds` 硬限制（尚未接配置）
+- [x] MCP 工具注册为 `mcp__server__tool` 并接入 AgentLoop
 
 ## 十五、建议优先级（仅供参考）
 
 1. **P0 - 让工具真正可用**
-   - MCP 工具接入 AgentLoop（`mcp__server__tool`）
+   - ~~MCP 工具接入 AgentLoop（`mcp__server__tool`）~~
    - TaskStop + 任务面板停止
    - Bash `cwd` / 后台运行 / 超时处理
 

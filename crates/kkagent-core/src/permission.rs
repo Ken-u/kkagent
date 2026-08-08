@@ -209,7 +209,41 @@ fn matches_pattern(pattern: &str, tool_name: &str, _input: &serde_json::Value) -
     if pattern == "*" {
         return true;
     }
+    // Glob-style: only `*` suffix / infix used for MCP allowlists (e.g. mcp__*).
+    if pattern.contains('*') {
+        return glob_match(pattern, tool_name);
+    }
     false
+}
+
+fn glob_match(pattern: &str, text: &str) -> bool {
+    let parts: Vec<&str> = pattern.split('*').collect();
+    if parts.len() == 1 {
+        return pattern == text;
+    }
+    let mut rest = text;
+    for (i, part) in parts.iter().enumerate() {
+        if part.is_empty() {
+            continue;
+        }
+        if i == 0 {
+            if !rest.starts_with(part) {
+                return false;
+            }
+            rest = &rest[part.len()..];
+        } else if i == parts.len() - 1 && !pattern.ends_with('*') {
+            if !rest.ends_with(part) {
+                return false;
+            }
+            return true;
+        } else {
+            match rest.find(part) {
+                Some(idx) => rest = &rest[idx + part.len()..],
+                None => return false,
+            }
+        }
+    }
+    pattern.ends_with('*') || rest.is_empty()
 }
 
 fn approval_pattern(tool_name: &str, _input: &serde_json::Value) -> String {
@@ -382,5 +416,25 @@ mod tests {
             Some(&plan),
         );
         assert!(matches!(decision, PermissionDecision::Deny(_)));
+    }
+
+    #[test]
+    fn test_mcp_wildcard_allow_rule() {
+        let chain = PermissionChain::new(
+            PermissionMode::Manual,
+            vec![PermissionRule {
+                decision: "allow".into(),
+                pattern: "mcp__*".into(),
+                scope: None,
+            }],
+        );
+        let decision = chain.evaluate(
+            "mcp__github__search_issues",
+            &serde_json::json!({}),
+            Path::new("/tmp/ws"),
+            false,
+            None,
+        );
+        assert_eq!(decision, PermissionDecision::Approve);
     }
 }
