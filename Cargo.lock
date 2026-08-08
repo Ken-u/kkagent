@@ -1134,6 +1134,7 @@ dependencies = [
  "async-trait",
  "kkagent-config",
  "kkagent-protocol",
+ "kkagent-tools",
  "rmcp",
  "serde",
  "serde_json",
