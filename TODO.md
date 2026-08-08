@@ -155,7 +155,7 @@
 |------|-------------|---------|---------|
 | git 上下文收集 | 未实现 | 已实现 | ref `gitContext.ts` 收集分支/状态/最近提交 |
 | 工作区信任 | 未实现 | 已实现 | ref 有 workspaceTrust |
-| 工作区 instructions | 未实现 `[已核对]` | 已实现 | AGENTS.md 可被 SkillsManager 读到，但未注入会话 |
+| 工作区 instructions | **部分实现** `[已核对]` | 已实现 | 会话创建/恢复时注入 AGENTS.md（或 `.kkagent/AGENTS.md` / `CLAUDE.md`）；仍缺层级合并与热重载 |
 | 文件监听 | 未实现 | 已实现 | ref 有 fsWatchService |
 | 进程运行器 | 部分实现 | 已实现 | 当前 BashTool 直接用 tokio；ref 有统一 process runner |
 
@@ -188,6 +188,7 @@
 - [x] Bash cwd / description / background / timeout detach
 - [x] AskUserQuestion 工具 + TUI 选项面板 + question.respond
 - [x] TodoList schema 对齐 kimi（todos/title/done）并删除死代码
+- [x] 会话注入 AGENTS.md / 工作区 instructions
 
 ## 十五、建议优先级（仅供参考）
 
@@ -200,7 +201,7 @@
    - ~~AskUserQuestion 工具 + TUI 选项渲染~~
    - ~~TodoList schema 对齐 ref（`todos`/`title`/`done`）~~
    - Grep/Glob/Read 参数对齐
-   - AGENTS.md / Skill 注入
+   - ~~AGENTS.md / Skill 注入~~（AGENTS.md 已注入；Skill 工具仍缺）
 
 3. **P2 - 扩展能力**
    - WebSearch / FetchURL / ReadMediaFile

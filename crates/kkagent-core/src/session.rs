@@ -278,6 +278,39 @@ impl Session {
     pub fn submit_question(&self, response: QuestionResponse) {
         let _ = self.question_tx.try_send(response);
     }
+
+    /// Append AGENTS.md / `.kkagent/AGENTS.md` into the system prompt (kimi-style workspace instructions).
+    pub async fn inject_workspace_instructions(&mut self) {
+        const MAX_CHARS: usize = 80_000;
+        let candidates = [
+            self.working_dir.join("AGENTS.md"),
+            self.working_dir.join(".kkagent").join("AGENTS.md"),
+            self.working_dir.join("CLAUDE.md"),
+        ];
+        for path in &candidates {
+            let Ok(content) = tokio::fs::read_to_string(path).await else {
+                continue;
+            };
+            let content = content.trim();
+            if content.is_empty() {
+                continue;
+            }
+            let truncated: String = content.chars().take(MAX_CHARS).collect();
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("instructions");
+            self.system_prompt.push_str(&format!(
+                "\n\n# Project instructions ({name})\n\n{truncated}"
+            ));
+            if content.chars().count() > MAX_CHARS {
+                self.system_prompt
+                    .push_str("\n\n… (truncated; open the file for the full text)");
+            }
+            // Prefer the first existing instructions file.
+            break;
+        }
+    }
 }
 
 fn default_system_prompt() -> String {

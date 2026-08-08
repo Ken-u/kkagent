@@ -396,12 +396,13 @@ async fn handle_rpc_call(
 
             let model_alias = state.config.default_model_alias().unwrap_or("default").to_string();
 
-            let session = Session::new(
+            let mut session = Session::new(
                 session_id.clone(),
                 PathBuf::from(&workspace),
                 perm_mode,
                 model_alias.clone(),
             );
+            session.inject_workspace_instructions().await;
 
             {
                 let db = state.transcript.lock().await;
@@ -504,6 +505,7 @@ async fn handle_rpc_call(
                     record.model.clone()
                 },
             );
+            session.inject_workspace_instructions().await;
             session.messages = messages.clone();
             session.persisted_message_count = messages.len();
             session.title = record.title.clone();
