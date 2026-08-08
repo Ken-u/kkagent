@@ -14,6 +14,7 @@ members = [
     "crates/kkagent-di",
     "crates/kkagent-wire",
     "crates/kkagent-telemetry",
+    "crates/kkagent-acp",
 ]
 
 [workspace.package]
@@ -82,6 +83,12 @@ async-trait = "0.1"
 bytes = "1"
 pin-project-lite = "0.2"
 
+# HTTP / WebSocket server
+axum = { version = "0.8", features = ["ws"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+tokio-tungstenite = "0.26"
+
 # Internal crates
 kkagent-protocol = { path = "crates/kkagent-protocol" }
 kkagent-rpc = { path = "crates/kkagent-rpc" }
@@ -95,3 +102,4 @@ kkagent-tui = { path = "crates/kkagent-tui" }
 kkagent-di = { path = "crates/kkagent-di" }
 kkagent-wire = { path = "crates/kkagent-wire" }
 kkagent-telemetry = { path = "crates/kkagent-telemetry" }
+kkagent-acp = { path = "crates/kkagent-acp" }

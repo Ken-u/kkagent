@@ -45,6 +45,10 @@ Unavailable in auto mode."
                 "allow_free_text": {
                     "type": "boolean",
                     "description": "Allow a free-text answer in addition to options (default true if no options)"
+                },
+                "background": {
+                    "type": "boolean",
+                    "description": "If true, park the question as a background task the user can answer later (default false)"
                 }
             },
             "required": ["question"]

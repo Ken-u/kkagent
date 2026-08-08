@@ -83,58 +83,127 @@ impl Tool for WebSearchTool {
             return Ok(ToolOutput::error("Missing query"));
         }
         let limit = input.get("limit").and_then(|v| v.as_u64()).unwrap_or(5) as usize;
-        let Some(base) = self.cfg.search_base_url.as_ref() else {
-            return Ok(ToolOutput::error(
-                "WebSearch not configured. Set [services.moonshot_search] base_url (and api_key) in config.toml",
-            ));
-        };
+
+        // Provider matrix: moonshot → local DuckDuckGo HTML fallback.
+        if let Some(base) = self.cfg.search_base_url.as_ref() {
+            match self.moonshot_search(base, query, limit).await {
+                Ok(out) => return Ok(out),
+                Err(e) => tracing::warn!("moonshot search failed ({e}), trying local fallback"),
+            }
+        }
+        match self.local_ddg_search(query, limit).await {
+            Ok(out) => Ok(out),
+            Err(e) => Ok(ToolOutput::error(format!(
+                "WebSearch failed (moonshot+local): {e}. Configure [services.moonshot_search]."
+            ))),
+        }
+    }
+}
+
+impl WebSearchTool {
+    async fn moonshot_search(
+        &self,
+        base: &str,
+        query: &str,
+        limit: usize,
+    ) -> anyhow::Result<ToolOutput> {
         let url = format!("{}/v1/search", base.trim_end_matches('/'));
         let mut req = self.client.post(&url).json(&json!({ "text_query": query }));
         if let Some(key) = &self.cfg.search_api_key {
             req = req.bearer_auth(key);
         }
-        match req.send().await {
-            Ok(resp) => {
-                let status = resp.status();
-                let text = resp.text().await.unwrap_or_default();
-                if !status.is_success() {
-                    return Ok(ToolOutput::error(format!(
-                        "WebSearch HTTP {}: {}",
-                        status,
-                        &text[..text.len().min(400)]
-                    )));
-                }
-                let parsed: Value = serde_json::from_str(&text).unwrap_or(json!({}));
-                let results = parsed
-                    .get("search_results")
-                    .and_then(|v| v.as_array())
-                    .cloned()
-                    .unwrap_or_default();
-                if results.is_empty() {
-                    return Ok(ToolOutput::success("No search results."));
-                }
-                let mut lines = Vec::new();
-                for (i, r) in results.iter().take(limit).enumerate() {
-                    let title = r.get("title").and_then(|v| v.as_str()).unwrap_or("(no title)");
-                    let url = r.get("url").and_then(|v| v.as_str()).unwrap_or("");
-                    let snippet = r
-                        .get("snippet")
-                        .or_else(|| r.get("content"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-                    lines.push(format!(
-                        "{}. {}\n   {}\n   {}",
-                        i + 1,
-                        title,
-                        url,
-                        snippet.chars().take(300).collect::<String>()
-                    ));
-                }
-                Ok(ToolOutput::success(lines.join("\n\n")))
+        let resp = req.send().await?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            anyhow::bail!("HTTP {}: {}", status, &text[..text.len().min(200)]);
+        }
+        let parsed: Value = serde_json::from_str(&text).unwrap_or(json!({}));
+        let results = parsed
+            .get("search_results")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        if results.is_empty() {
+            return Ok(ToolOutput::success("No search results."));
+        }
+        let mut lines = Vec::new();
+        for (i, r) in results.iter().take(limit).enumerate() {
+            let title = r.get("title").and_then(|v| v.as_str()).unwrap_or("(no title)");
+            let url = r.get("url").and_then(|v| v.as_str()).unwrap_or("");
+            let snippet = r
+                .get("snippet")
+                .or_else(|| r.get("content"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            lines.push(format!(
+                "{}. {}\n   {}\n   {}",
+                i + 1,
+                title,
+                url,
+                snippet.chars().take(300).collect::<String>()
+            ));
+        }
+        Ok(ToolOutput::success_with_data(
+            lines.join("\n\n"),
+            json!({"provider": "moonshot", "count": lines.len()}),
+        ))
+    }
+
+    async fn local_ddg_search(&self, query: &str, limit: usize) -> anyhow::Result<ToolOutput> {
+        let url = format!(
+            "https://html.duckduckgo.com/html/?q={}",
+            urlencoding_minimal(query)
+        );
+        let resp = self
+            .client
+            .get(&url)
+            .header("User-Agent", "kkagent/0.1")
+            .send()
+            .await?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            anyhow::bail!("ddg HTTP {status}");
+        }
+        // Very light scrape: collect result-like anchors.
+        let mut lines = Vec::new();
+        for (i, chunk) in text.split("result__a").skip(1).take(limit).enumerate() {
+            let href = chunk
+                .split("href=\"")
+                .nth(1)
+                .and_then(|s| s.split('"').next())
+                .unwrap_or("");
+            let title = chunk
+                .split('>')
+                .nth(1)
+                .and_then(|s| s.split('<').next())
+                .unwrap_or("(result)")
+                .trim();
+            lines.push(format!("{}. {}\n   {}", i + 1, title, href));
+        }
+        if lines.is_empty() {
+            anyhow::bail!("no local results parsed");
+        }
+        Ok(ToolOutput::success_with_data(
+            lines.join("\n\n"),
+            json!({"provider": "local-ddg", "count": lines.len()}),
+        ))
+    }
+}
+
+fn urlencoding_minimal(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
             }
-            Err(e) => Ok(ToolOutput::error(format!("WebSearch failed: {}", e))),
+            b' ' => out.push_str("%20"),
+            _ => out.push_str(&format!("%{b:02X}")),
         }
     }
+    out
 }
 
 pub struct FetchUrlTool {

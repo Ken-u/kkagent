@@ -60,12 +60,20 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Run as standalone server
+    /// Run as standalone RPC server (memory/socket)
     Server {
         /// Socket path to listen on
         #[arg(long)]
         listen: Option<String>,
+        /// Also serve REST+WS on this address (e.g. 127.0.0.1:8787)
+        #[arg(long)]
+        http: Option<String>,
+        /// Bearer/query token for HTTP API
+        #[arg(long)]
+        http_token: Option<String>,
     },
+    /// Serve Agent Client Protocol over stdio (IDE bridge)
+    Acp,
 }
 
 #[tokio::main]
@@ -86,8 +94,24 @@ async fn main() -> Result<()> {
     };
 
     match cli.command {
-        Some(Commands::Server { listen }) => {
+        Some(Commands::Server {
+            listen,
+            http,
+            http_token,
+        }) => {
+            if let Some(addr) = http {
+                let token = http_token.or_else(|| std::env::var("KKAGENT_HTTP_TOKEN").ok());
+                tokio::spawn(async move {
+                    if let Err(e) = kkagent_rpc::serve_http(&addr, token).await {
+                        tracing::error!("HTTP server error: {e}");
+                    }
+                });
+            }
             run_server(config, listen).await
+        }
+        Some(Commands::Acp) => {
+            let server = kkagent_acp::AcpServer::new();
+            server.serve_stdio().await
         }
         None => {
             if let Some(prompt) = cli.prompt {
@@ -241,10 +265,13 @@ struct ServerState {
     /// Shared background shell jobs for Bash tool.
     bash_shells: Arc<kkagent_tools::builtin::BackgroundShellManager>,
     cron: Arc<kkagent_tools::CronManager>,
+    /// Pending cron-fire XML injections for the next turn.
+    cron_fires: Arc<Mutex<Vec<String>>>,
     goal_mgr: Arc<kkagent_protocol::goal::GoalManager>,
     hooks: Arc<kkagent_mcp::HookManager>,
     skills: Arc<kkagent_tools::SkillCatalog>,
     web: Arc<kkagent_tools::WebServicesConfig>,
+    plugins: Arc<kkagent_core::PluginManager>,
     telemetry: kkagent_telemetry::TelemetryServiceHandle,
 }
 
@@ -304,19 +331,38 @@ async fn run_server_handler<T: kkagent_rpc::transport::AsyncTransport>(
     let goal_mgr = Arc::new(kkagent_protocol::goal::GoalManager::new());
     let web = Arc::new(kkagent_tools::WebServicesConfig::from_app(&config));
 
-    // Background cron poller — fires due prompts into a dedicated channel log for now.
+    let cron_fires: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    // Background cron poller — enqueue cron-fire XML for session injection.
     {
         let cron_bg = cron.clone();
+        let fires = cron_fires.clone();
+        let hooks_cron = hooks.clone();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(15)).await;
                 let due = cron_bg.take_due().await;
                 for (id, prompt) in due {
-                    tracing::info!("Cron job {} due: {}", id, prompt.chars().take(80).collect::<String>());
+                    let xml = kkagent_tools::render_cron_fire_xml(
+                        &id, "scheduled", &prompt, false, 1, false,
+                    );
+                    tracing::info!(
+                        "Cron job {} due: {}",
+                        id,
+                        prompt.chars().take(80).collect::<String>()
+                    );
+                    fires.lock().await.push(xml);
+                    let _ = hooks_cron
+                        .fire_notification(&format!("cron:{id}"))
+                        .await;
                 }
             }
         });
     }
+
+    let plugins = {
+        let dir = kkagent_config::default_config_dir().join("plugins");
+        kkagent_core::PluginManager::discover(&dir).await
+    };
 
     // DI root + telemetry (console/file/cloud appenders)
     let di_root = ServiceContainer::new("kkagent-root");
@@ -364,10 +410,12 @@ async fn run_server_handler<T: kkagent_rpc::transport::AsyncTransport>(
         mcp,
         bash_shells: Arc::new(kkagent_tools::builtin::BackgroundShellManager::new()),
         cron,
+        cron_fires,
         goal_mgr,
         hooks,
         skills,
         web,
+        plugins,
         telemetry: telemetry.clone(),
     });
 
@@ -528,6 +576,12 @@ async fn handle_rpc_call(
                 let section = state.skills.catalog_prompt_section().await;
                 if !section.is_empty() {
                     session.system_prompt.push_str(&section);
+                }
+            }
+            {
+                let plug = state.plugins.prompt_append_all().await;
+                if !plug.is_empty() {
+                    session.system_prompt.push_str(&plug);
                 }
             }
 
@@ -697,6 +751,34 @@ async fn handle_rpc_call(
                 let mut sessions = state.sessions.lock().await;
                 if let Some(session) = sessions.get_mut(&session_id) {
                     session.clear_interrupt();
+                    // Drain due cron-fire XML into the conversation.
+                    let fires = {
+                        let mut g = state.cron_fires.lock().await;
+                        g.drain(..).collect::<Vec<_>>()
+                    };
+                    for xml in fires {
+                        session.add_user_message(xml);
+                    }
+                    // Media @path refs → blob store note.
+                    let media_refs =
+                        kkagent_core::resolve_media_refs(&text, &session.working_dir);
+                    if !media_refs.is_empty() {
+                        let store = kkagent_core::BlobStore::session_store(&session.working_dir);
+                        let mut note = String::from("<system-reminder>\nAttached media paths:\n");
+                        for p in media_refs {
+                            if let Ok(bytes) = std::fs::read(&p) {
+                                let ext = p
+                                    .extension()
+                                    .and_then(|e| e.to_str())
+                                    .unwrap_or("bin");
+                                if let Ok((id, path)) = store.put(&bytes, ext).await {
+                                    note.push_str(&format!("- {} → blob:{id} ({})\n", p.display(), path.display()));
+                                }
+                            }
+                        }
+                        note.push_str("</system-reminder>");
+                        session.add_user_message(note);
+                    }
                     session.add_user_message(text);
                     session.begin_turn();
                 } else {
@@ -1151,6 +1233,20 @@ async fn handle_rpc_call(
                 "message_count": keep,
                 "messages": messages,
             }))
+        }
+        "skills.list" => {
+            let list = state.skills.list().await;
+            let items: Vec<serde_json::Value> = list
+                .into_iter()
+                .map(|e| {
+                    serde_json::json!({"name": e.name, "description": e.description, "path": e.path.display().to_string()})
+                })
+                .collect();
+            Ok(serde_json::json!({"skills": items}))
+        }
+        "plugins.list" => {
+            let list = state.plugins.list().await;
+            Ok(serde_json::json!({"plugins": list}))
         }
         "session.compact" => {
             let session_id = params.as_ref()

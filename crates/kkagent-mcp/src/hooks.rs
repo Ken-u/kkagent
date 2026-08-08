@@ -109,38 +109,90 @@ impl HookManager {
     }
 
     pub async fn fire(&self, event: HookEvent, context: &serde_json::Value) -> Result<()> {
-        for hook in &self.hooks {
-            if hook.event == event {
-                let context_str = serde_json::to_string(context)?;
-                let mut cmd = Command::new(&hook.command);
-                for arg in &hook.args {
-                    cmd.arg(arg);
-                }
-                cmd.env("KKAGENT_HOOK_EVENT", format!("{:?}", hook.event));
-                cmd.env("KKAGENT_HOOK_CONTEXT", &context_str);
-                cmd.current_dir(&self.working_dir);
+        let _ = self.fire_with_control(event, context).await?;
+        Ok(())
+    }
 
-                let timeout = std::time::Duration::from_millis(hook.timeout_ms);
-                match tokio::time::timeout(timeout, cmd.output()).await {
-                    Ok(Ok(output)) => {
-                        if !output.status.success() {
-                            let stderr = String::from_utf8_lossy(&output.stderr);
-                            tracing::warn!("Hook {:?} failed: {}", hook.event, stderr);
+    /// Fire hooks; stdout JSON may `{ "block": true, "reason": "..." }` or `{ "rewrite": {...} }`.
+    pub async fn fire_with_control(
+        &self,
+        event: HookEvent,
+        context: &serde_json::Value,
+    ) -> Result<HookOutcome> {
+        let mut outcome = HookOutcome::default();
+        for hook in &self.hooks {
+            if hook.event != event {
+                continue;
+            }
+            let context_str = serde_json::to_string(context)?;
+            let mut cmd = Command::new(&hook.command);
+            for arg in &hook.args {
+                cmd.arg(arg);
+            }
+            cmd.env("KKAGENT_HOOK_EVENT", format!("{:?}", hook.event));
+            cmd.env("KKAGENT_HOOK_CONTEXT", &context_str);
+            cmd.current_dir(&self.working_dir);
+            cmd.stdout(std::process::Stdio::piped());
+            cmd.stderr(std::process::Stdio::piped());
+
+            let timeout = std::time::Duration::from_millis(hook.timeout_ms);
+            match tokio::time::timeout(timeout, cmd.output()).await {
+                Ok(Ok(output)) => {
+                    if !output.status.success() {
+                        let stderr = String::from_utf8_lossy(&output.stderr);
+                        tracing::warn!("Hook {:?} failed: {}", hook.event, stderr);
+                        // Non-zero exit on PreToolCall can block.
+                        if event == HookEvent::PreToolCall {
+                            outcome.block = true;
+                            outcome.reason = Some(format!("hook failed: {stderr}"));
+                        }
+                    } else {
+                        let stdout = String::from_utf8_lossy(&output.stdout);
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(stdout.trim()) {
+                            if v.get("block").and_then(|b| b.as_bool()) == Some(true) {
+                                outcome.block = true;
+                                outcome.reason = v
+                                    .get("reason")
+                                    .and_then(|r| r.as_str())
+                                    .map(String::from);
+                            }
+                            if let Some(rw) = v.get("rewrite").cloned() {
+                                outcome.rewrite = Some(rw);
+                            }
                         }
                     }
-                    Ok(Err(e)) => {
-                        tracing::warn!("Hook {:?} error: {}", hook.event, e);
-                    }
-                    Err(_) => {
-                        tracing::warn!("Hook {:?} timed out after {}ms", hook.event, hook.timeout_ms);
-                    }
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!("Hook {:?} error: {}", hook.event, e);
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        "Hook {:?} timed out after {}ms",
+                        hook.event,
+                        hook.timeout_ms
+                    );
                 }
             }
         }
-        Ok(())
+        Ok(outcome)
+    }
+
+    pub async fn fire_notification(&self, message: &str) -> Result<()> {
+        self.fire(
+            HookEvent::Notification,
+            &serde_json::json!({"message": message}),
+        )
+        .await
     }
 
     pub fn list(&self) -> &[HookConfig] {
         &self.hooks
     }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct HookOutcome {
+    pub block: bool,
+    pub reason: Option<String>,
+    pub rewrite: Option<serde_json::Value>,
 }

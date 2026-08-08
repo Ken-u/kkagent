@@ -169,6 +169,14 @@ run_in_background. Foreground timeouts detach to background when configured \
             }
         };
 
+        let risk = crate::shell_safety::analyze_shell_command(&command);
+        if let crate::shell_safety::ShellRisk::Dangerous(reason) = &risk {
+            return Ok(ToolOutput::error(format!(
+                "Blocked dangerous shell command ({reason}). Rephrase or ask the user for confirmation with a safer variant."
+            )));
+        }
+        let safety_note = crate::shell_safety::safety_prefix(&risk).unwrap_or_default();
+
         let description = input
             .get("description")
             .and_then(|v| v.as_str())
@@ -196,13 +204,22 @@ run_in_background. Foreground timeouts detach to background when configured \
                     "description is required when run_in_background=true",
                 ));
             }
-            return self
+            let mut out = self
                 .spawn_background(command, description, cwd, timeout_ms)
-                .await;
+                .await?;
+            if !safety_note.is_empty() {
+                out.content = format!("{safety_note}{}", out.content);
+            }
+            return Ok(out);
         }
 
-        self.run_foreground(command, description, cwd, timeout_ms)
-            .await
+        let mut out = self
+            .run_foreground(command, description, cwd, timeout_ms)
+            .await?;
+        if !safety_note.is_empty() {
+            out.content = format!("{safety_note}{}", out.content);
+        }
+        Ok(out)
     }
 }
 

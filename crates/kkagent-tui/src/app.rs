@@ -80,6 +80,12 @@ pub struct AppState {
     pub todos: Vec<TodoItem>,
     /// Expand sticky todo beyond the collapsed max rows.
     pub todos_expanded: bool,
+    /// BTW notes from `/btw`.
+    pub btw_notes: Vec<String>,
+    /// Active model alias (best-effort).
+    pub model_alias: Option<String>,
+    /// Streaming cursor for live assistant deltas.
+    pub stream_cursor: crate::streaming::StreamingCursor,
 }
 
 #[derive(Debug, Clone)]
@@ -251,6 +257,9 @@ impl AppState {
             pending_esc_ms: None,
             todos: Vec::new(),
             todos_expanded: false,
+            btw_notes: Vec::new(),
+            model_alias: None,
+            stream_cursor: crate::streaming::StreamingCursor::default(),
         }
     }
 
@@ -1491,6 +1500,125 @@ impl TuiApp {
                         Err(e) => self.system_message(format!("Failed to set title: {}", e)),
                     }
                 }
+            }
+            "config" => {
+                let models = self.config.models.len();
+                let providers = self.config.providers.len();
+                let mcp = self.config.mcp_servers.len();
+                self.system_message(format!(
+                    "config: providers={} models={} mcp={} default_model={} secondary={:?} trusted={}",
+                    providers,
+                    models,
+                    mcp,
+                    self.config.default_model.as_deref().unwrap_or("-"),
+                    self.config.secondary_model,
+                    self.config.trusted_workspaces.len()
+                ));
+            }
+            "auth" => {
+                let mut lines = String::from("Auth status (secrets redacted):\n");
+                for (name, p) in &self.config.providers {
+                    let has_key = p.api_key.as_ref().map(|k| !k.is_empty()).unwrap_or(false);
+                    lines.push_str(&format!(
+                        "  {name}: type={} api_key={}\n",
+                        p.provider_type,
+                        if has_key { "set" } else { "missing" }
+                    ));
+                }
+                self.system_message(lines);
+            }
+            "plugins" | "plugin" => {
+                match self.client.rpc_call("plugins.list", None).await {
+                    Ok(v) => self.system_message(format!("plugins: {}", v)),
+                    Err(_) => self.system_message(
+                        "plugins: check ~/.kkagent/plugins/*/plugin.json (RPC list optional)"
+                            .into(),
+                    ),
+                }
+            }
+            "skills" | "skill" => {
+                match self.client.rpc_call("skills.list", None).await {
+                    Ok(v) => self.system_message(format!("{v}")),
+                    Err(e) => self.system_message(format!("skills: {e}")),
+                }
+            }
+            "swarm" => {
+                self.open_tasks_panel().await?;
+                self.system_message("swarm: showing tasks/subagents panel".into());
+            }
+            "provider" | "providers" => {
+                let mut lines = String::from("Providers / models:\n");
+                for (alias, m) in &self.config.models {
+                    lines.push_str(&format!(
+                        "  {alias} → {} ({}) ctx={:?}\n",
+                        m.model, m.provider, m.max_context_size
+                    ));
+                }
+                self.system_message(lines);
+            }
+            "reload" => {
+                self.system_message(
+                    "reload: restart kkagent to pick up config.toml changes (hot-reload next)."
+                        .into(),
+                );
+            }
+            "web" => {
+                if args.is_empty() {
+                    self.system_message("Usage: /web <query>".into());
+                } else {
+                    self.state.input.set_text(format!(
+                        "Search the web for: {args}\nUse WebSearch then summarize."
+                    ));
+                    self.system_message("Queued web search prompt in input — press Enter.".into());
+                }
+            }
+            "info" => {
+                let home = dirs::home_dir()
+                    .unwrap_or_else(|| std::path::PathBuf::from("."))
+                    .join(".kkagent");
+                self.system_message(format!(
+                    "kkagent {}\nconfig_dir: {}\nsession: {}\nmessages: {}\napprox_tokens: {}\nmodel: {}",
+                    env!("CARGO_PKG_VERSION"),
+                    home.display(),
+                    self.state.session_id.as_deref().unwrap_or("-"),
+                    self.state.messages.len(),
+                    self.state.approx_tokens,
+                    self.state.model_alias.as_deref().unwrap_or("-"),
+                ));
+            }
+            "add-dir" | "add_dir" => {
+                if args.is_empty() {
+                    self.system_message("Usage: /add-dir <path>".into());
+                } else {
+                    self.system_message(format!(
+                        "Noted extra workdir `{args}` (trusted_workspaces update requires config edit)."
+                    ));
+                }
+            }
+            "btw" => {
+                if args.is_empty() {
+                    self.system_message("Usage: /btw <note>".into());
+                } else {
+                    self.state.btw_notes.push(args.to_string());
+                    self.system_message(format!("btw: {args}"));
+                }
+            }
+            "prompts" | "prompt" => {
+                self.system_message(
+                    "prompts:\n  /init — generate AGENTS.md\n  /compact — compress context\n  /goal — autonomous goal\n  /web — web search"
+                        .into(),
+                );
+            }
+            "experimental-flags" | "flags" => {
+                self.system_message(format!(
+                    "flags:\n  KKAGENT_GIT_WORKTREE={}\n  KKAGENT_TELEMETRY_CLOUD={}\n  auto_compact={:?}",
+                    std::env::var("KKAGENT_GIT_WORKTREE").unwrap_or_else(|_| "0".into()),
+                    std::env::var("KKAGENT_TELEMETRY_CLOUD").unwrap_or_else(|_| "0".into()),
+                    self.config
+                        .loop_control
+                        .as_ref()
+                        .map(|l| l.auto_compact)
+                ));
             }
             "copy" => {
                 let text = self

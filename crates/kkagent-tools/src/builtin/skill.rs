@@ -32,6 +32,10 @@ impl SkillCatalog {
 
     pub async fn rescan(&self, working_dir: &std::path::Path) {
         let mut entries = Vec::new();
+        // Ensure builtin sub-skills exist under ~/.kkagent/skills/
+        if let Err(e) = ensure_builtin_skills().await {
+            tracing::warn!("builtin skills: {e}");
+        }
         let global = kkagent_config::default_config_dir().join("skills");
         scan_dir(&global, &mut entries).await;
         scan_dir(&working_dir.join(".kkagent").join("skills"), &mut entries).await;
@@ -65,6 +69,33 @@ impl SkillCatalog {
         }
         out
     }
+}
+
+async fn ensure_builtin_skills() -> anyhow::Result<()> {
+    let root = kkagent_config::default_config_dir().join("skills");
+    let builtins = [
+        (
+            "consolidate",
+            "# consolidate\n\nSummarize long threads into decisions, open questions, and next actions. Prefer bullets.\n",
+        ),
+        (
+            "review",
+            "# review\n\nReview code changes for correctness, security, and missing tests. Be specific about file:line.\n",
+        ),
+        (
+            "write-goal",
+            "# write-goal\n\nHelp craft a clear CreateGoal description with measurable done criteria and budgets.\n",
+        ),
+    ];
+    for (name, body) in builtins {
+        let dir = root.join(name);
+        let file = dir.join("SKILL.md");
+        if !file.exists() {
+            tokio::fs::create_dir_all(&dir).await?;
+            tokio::fs::write(&file, body).await?;
+        }
+    }
+    Ok(())
 }
 
 async fn scan_dir(dir: &std::path::Path, out: &mut Vec<SkillEntry>) {

@@ -153,6 +153,32 @@ impl Default for CronManager {
     }
 }
 
+/// Render cron-fire XML injection (aligned with ref `cron-fire-xml`).
+pub fn render_cron_fire_xml(
+    job_id: &str,
+    cron_expr: &str,
+    prompt: &str,
+    recurring: bool,
+    coalesced_count: u32,
+    stale: bool,
+) -> String {
+    let job_id = attr(job_id);
+    let cron = attr(cron_expr);
+    format!(
+        "<cron-fire jobId=\"{job_id}\" cron=\"{cron}\" recurring=\"{}\" coalescedCount=\"{coalesced_count}\" stale=\"{}\">\n\
+<prompt>\n\
+{prompt}\n\
+</prompt>\n\
+</cron-fire>",
+        if recurring { "true" } else { "false" },
+        if stale { "true" } else { "false" },
+    )
+}
+
+fn attr(value: &str) -> String {
+    value.replace('&', "&amp;").replace('"', "&quot;")
+}
+
 fn parse_next_run(expr: &str) -> DateTime<Utc> {
     let e = expr.trim().to_lowercase();
     let now = Utc::now();

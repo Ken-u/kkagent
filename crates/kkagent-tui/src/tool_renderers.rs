@@ -52,6 +52,10 @@ impl ToolRenderRegistry {
             "Bash" => lines.extend(bash_summary(output, width, theme, max_preview)),
             "Grep" => lines.extend(grep_summary(output, width, theme, max_preview)),
             "Write" | "Edit" => lines.extend(diffish_summary(output, width, theme, max_preview)),
+            "ReadMediaFile" => lines.extend(media_summary(output, width, theme, max_preview)),
+            "CreateGoal" | "GetGoal" | "UpdateGoal" | "SetGoalBudget" => {
+                lines.extend(goal_summary(output, width, theme, max_preview))
+            }
             _ => lines.extend(default_summary(output, width, theme, max_preview)),
         }
         lines
@@ -155,6 +159,36 @@ fn diffish_summary(
     if all.len() > max_preview {
         lines.push(truncate_hint(all.len() - max_preview, theme));
     }
+    lines
+}
+
+fn media_summary(
+    output: &str,
+    width: u16,
+    theme: &Theme,
+    max_preview: usize,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    lines.push(Line::from(Span::styled(
+        "  [media]",
+        Style::default().fg(Color::Cyan),
+    )));
+    lines.extend(default_summary(output, width, theme, max_preview.min(6)));
+    lines
+}
+
+fn goal_summary(
+    output: &str,
+    width: u16,
+    theme: &Theme,
+    max_preview: usize,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    lines.push(Line::from(Span::styled(
+        "  [goal]",
+        Style::default().fg(Color::Cyan),
+    )));
+    lines.extend(default_summary(output, width, theme, max_preview.min(8)));
     lines
 }
 

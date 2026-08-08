@@ -80,12 +80,22 @@ After launching, continue other work and collect results with TaskOutput / TaskL
             return Ok(ToolOutput::error("Task prompt must not be empty"));
         }
 
+        let agent_id = uuid::Uuid::new_v4().to_string();
+        let mut working_dir = ctx.working_dir.to_string_lossy().to_string();
+        if crate::git_worktree::worktree_enabled() {
+            if let Ok(wt) =
+                crate::git_worktree::create_worktree(&ctx.working_dir, &agent_id, None).await
+            {
+                working_dir = wt.path.display().to_string();
+            }
+        }
+
         let config = SubagentConfig {
-            agent_id: uuid::Uuid::new_v4().to_string(),
+            agent_id,
             description: desc.to_string(),
             prompt: prompt.to_string(),
             model,
-            working_dir: ctx.working_dir.to_string_lossy().to_string(),
+            working_dir,
             profile,
             parent_session_id: Some(ctx.session_id.clone()),
             parent_tool_call_id: ctx.tool_call_id.clone(),

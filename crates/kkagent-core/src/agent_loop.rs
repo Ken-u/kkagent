@@ -1154,13 +1154,31 @@ async fn execute_tool_parallel(
         ));
     }
 
+    let mut input = input.clone();
     if let Some(hooks) = &hooks {
-        let _ = hooks
-            .fire(
+        match hooks
+            .fire_with_control(
                 kkagent_mcp::hooks::HookEvent::PreToolCall,
                 &serde_json::json!({"tool": name, "input": input}),
             )
-            .await;
+            .await
+        {
+            Ok(outcome) if outcome.block => {
+                return ToolOutput::error(
+                    outcome
+                        .reason
+                        .unwrap_or_else(|| "Blocked by PreToolCall hook".into()),
+                );
+            }
+            Ok(outcome) => {
+                if let Some(rw) = outcome.rewrite {
+                    if let Some(new_input) = rw.get("input") {
+                        input = new_input.clone();
+                    }
+                }
+            }
+            Err(e) => tracing::warn!("PreToolCall hook error: {e}"),
+        }
     }
 
     let tool = match tools.get(name) {
@@ -1174,7 +1192,7 @@ async fn execute_tool_parallel(
         tool_call_id,
     };
 
-    match tool.execute(input.clone(), &ctx).await {
+    match tool.execute(input, &ctx).await {
         Ok(output) => output,
         Err(e) => ToolOutput::error(format!("Tool execution error: {}", e)),
     }

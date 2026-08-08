@@ -2,13 +2,20 @@ pub mod registry;
 pub mod builtin;
 pub mod path_policy;
 pub mod accesses;
+pub mod shell_safety;
+pub mod args_validator;
+pub mod display;
+pub mod git_worktree;
 
 pub use accesses::{infer_accesses, tool_accesses, ToolAccesses, ToolResourceAccess};
+pub use display::{builtin_display_schemas, render_chip, SummaryMode, ToolDisplaySchema};
+pub use shell_safety::{analyze_shell_command, ShellRisk};
 
 pub use registry::*;
 pub use builtin::{
     BackgroundShellManager, BashOptions, BashTool, SkillCatalog, CronManager, WebServicesConfig,
 };
+pub use builtin::cron::render_cron_fire_xml;
 
 use async_trait::async_trait;
 use serde_json::Value;

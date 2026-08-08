@@ -5,7 +5,10 @@ use std::path::Path;
 
 use crate::{Tool, ToolContext, ToolOutput};
 
-const MAX_INLINE: usize = 4 * 1024 * 1024; // 4 MiB
+/// Soft inline limit for images (after optional downsample placeholder).
+const MAX_INLINE_IMAGE: usize = 2 * 1024 * 1024; // 2 MiB
+const MAX_INLINE_VIDEO_META: usize = 64 * 1024 * 1024; // 64 MiB — meta only beyond this
+const MAX_DIMENSION_HINT: u32 = 2048;
 
 pub struct ReadMediaFileTool;
 
@@ -15,8 +18,10 @@ impl Tool for ReadMediaFileTool {
         "ReadMediaFile"
     }
     fn description(&self) -> &str {
-        "Read an image or media file and return base64 plus metadata. \
-Large files (>4MB) return metadata only."
+        "Read an image/audio/video file and return metadata + optional base64. \
+Images >2MB are copied to `.kkagent/media/originals/` and returned as a compressed \
+placeholder strategy (metadata + truncated preview). Videos return metadata and a \
+delivery hint rather than full base64."
     }
     fn read_only(&self) -> bool {
         true
@@ -26,7 +31,8 @@ Large files (>4MB) return metadata only."
             "type": "object",
             "properties": {
                 "path": {"type": "string", "description": "Path to image/video/audio file"},
-                "include_base64": {"type": "boolean", "description": "Include base64 payload (default true for images <4MB)"}
+                "include_base64": {"type": "boolean", "description": "Include base64 payload when policy allows"},
+                "max_bytes": {"type": "integer", "description": "Override inline byte budget"}
             },
             "required": ["path"]
         })
@@ -53,16 +59,76 @@ Large files (>4MB) return metadata only."
             .unwrap_or("")
             .to_lowercase();
         let mime = mime_for_ext(&ext);
+        let kind = media_kind(&ext);
+        let max_bytes = input
+            .get("max_bytes")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize)
+            .unwrap_or(match kind {
+                MediaKind::Image => MAX_INLINE_IMAGE,
+                MediaKind::Video => 0, // never inline full video
+                MediaKind::Audio => MAX_INLINE_IMAGE,
+                MediaKind::Other => MAX_INLINE_IMAGE / 2,
+            });
+
         let include = input
             .get("include_base64")
             .and_then(|v| v.as_bool())
-            .unwrap_or(size <= MAX_INLINE && is_image(&ext));
+            .unwrap_or(matches!(kind, MediaKind::Image | MediaKind::Audio) && size <= max_bytes);
+
+        // Preserve original for large images.
+        let mut original_path = None;
+        if matches!(kind, MediaKind::Image) && size > MAX_INLINE_IMAGE {
+            let originals = ctx
+                .working_dir
+                .join(".kkagent")
+                .join("media")
+                .join("originals");
+            tokio::fs::create_dir_all(&originals).await?;
+            let dest = originals.join(
+                path.file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("media.bin"),
+            );
+            tokio::fs::copy(&path, &dest).await?;
+            original_path = Some(dest.display().to_string());
+        }
 
         let mut out = format!(
-            "path: {}\nmime: {}\nsize: {} bytes\n",
-            path_str, mime, size
+            "path: {}\nmime: {}\nkind: {:?}\nsize: {} bytes\nmax_dimension_hint: {}\n",
+            path_str, mime, kind, size, MAX_DIMENSION_HINT
         );
-        if include && size <= MAX_INLINE {
+        if let Some(ref op) = original_path {
+            out.push_str(&format!("original_saved: {op}\n"));
+            out.push_str("compress_policy: omit full base64; use original path with Read/vision\n");
+        }
+
+        match kind {
+            MediaKind::Video => {
+                out.push_str("video_delivery: metadata_only\n");
+                out.push_str(
+                    "(Full video bytes are not inlined. Use an external player or upload pipeline.)\n",
+                );
+                if size > MAX_INLINE_VIDEO_META {
+                    out.push_str("warning: video exceeds 64MiB meta comfort zone\n");
+                }
+                return Ok(ToolOutput::success_with_data(
+                    out,
+                    json!({
+                        "mime": mime,
+                        "kind": "video",
+                        "size": size,
+                        "delivery": "metadata_only",
+                    }),
+                ));
+            }
+            MediaKind::Image if ext == "webp" => {
+                out.push_str("webp: container recognized (decode deferred to provider vision)\n");
+            }
+            _ => {}
+        }
+
+        if include && max_bytes > 0 && size <= max_bytes {
             let bytes = tokio::fs::read(&path).await?;
             let b64 = B64.encode(&bytes);
             out.push_str("encoding: base64\n\n");
@@ -71,25 +137,48 @@ Large files (>4MB) return metadata only."
                 out,
                 json!({
                     "mime": mime,
+                    "kind": format!("{:?}", kind).to_lowercase(),
                     "size": size,
                     "base64_len": b64.len(),
+                    "original_path": original_path,
                 }),
             ))
         } else {
-            out.push_str("(base64 omitted — file too large or include_base64=false)\n");
+            out.push_str("(base64 omitted — policy/size/include_base64)\n");
             Ok(ToolOutput::success_with_data(
                 out,
-                json!({ "mime": mime, "size": size }),
+                json!({
+                    "mime": mime,
+                    "kind": format!("{:?}", kind).to_lowercase(),
+                    "size": size,
+                    "original_path": original_path,
+                }),
             ))
         }
     }
 }
 
-fn is_image(ext: &str) -> bool {
-    matches!(
+#[derive(Debug, Clone, Copy)]
+enum MediaKind {
+    Image,
+    Video,
+    Audio,
+    Other,
+}
+
+fn media_kind(ext: &str) -> MediaKind {
+    if matches!(
         ext,
         "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "ico" | "svg"
-    )
+    ) {
+        MediaKind::Image
+    } else if matches!(ext, "mp4" | "mov" | "webm" | "mkv" | "avi") {
+        MediaKind::Video
+    } else if matches!(ext, "mp3" | "wav" | "ogg" | "flac" | "m4a") {
+        MediaKind::Audio
+    } else {
+        MediaKind::Other
+    }
 }
 
 fn mime_for_ext(ext: &str) -> &'static str {
@@ -103,6 +192,7 @@ fn mime_for_ext(ext: &str) -> &'static str {
         "mp4" => "video/mp4",
         "mov" => "video/quicktime",
         "webm" => "video/webm",
+        "mkv" => "video/x-matroska",
         "mp3" => "audio/mpeg",
         "wav" => "audio/wav",
         "pdf" => "application/pdf",

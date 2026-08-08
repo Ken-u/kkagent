@@ -1,20 +1,15 @@
 [package]
-name = "kkagent-rpc"
+name = "kkagent-acp"
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
 kkagent-protocol = { workspace = true }
+kkagent-config = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-thiserror = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
-futures = { workspace = true }
-bytes = { workspace = true }
+async-trait = { workspace = true }
 uuid = { workspace = true }
-pin-project-lite = { workspace = true }
-chrono = { workspace = true }
-axum = { workspace = true }
-tower-http = { workspace = true }
