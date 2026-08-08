@@ -22,7 +22,7 @@ pub use grep::GrepTool;
 pub use glob::GlobTool;
 pub use bash::{BashTool, BackgroundShellManager, BashOptions};
 pub use todo::TodoListTool;
-pub use goal::{CreateGoalTool, GetGoalTool, UpdateGoalTool};
+pub use goal::{CreateGoalTool, GetGoalTool, SetGoalBudgetTool, UpdateGoalTool};
 pub use task::{
     TaskTool, TaskOutputTool, TaskListTool, TaskStopTool, AgentTool, AgentSwarmTool,
 };

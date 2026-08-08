@@ -3,6 +3,7 @@ use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -21,13 +22,60 @@ pub struct CronJob {
 
 pub struct CronManager {
     jobs: Mutex<HashMap<String, CronJob>>,
+    persist_path: Option<PathBuf>,
 }
 
 impl CronManager {
     pub fn new() -> Self {
         Self {
             jobs: Mutex::new(HashMap::new()),
+            persist_path: None,
         }
+    }
+
+    /// Load from `path` if present; subsequent mutations persist there.
+    pub async fn with_persist(path: PathBuf) -> Self {
+        let mgr = Self {
+            jobs: Mutex::new(HashMap::new()),
+            persist_path: Some(path.clone()),
+        };
+        if let Err(e) = mgr.load_from_disk(&path).await {
+            tracing::warn!("Cron load from {}: {}", path.display(), e);
+        }
+        mgr
+    }
+
+    pub fn persist_path(&self) -> Option<&Path> {
+        self.persist_path.as_deref()
+    }
+
+    async fn load_from_disk(&self, path: &Path) -> anyhow::Result<()> {
+        if !path.exists() {
+            return Ok(());
+        }
+        let text = tokio::fs::read_to_string(path).await?;
+        let jobs: Vec<CronJob> = serde_json::from_str(&text)?;
+        let mut map = self.jobs.lock().await;
+        map.clear();
+        for job in jobs {
+            map.insert(job.id.clone(), job);
+        }
+        Ok(())
+    }
+
+    async fn save_to_disk(&self) -> anyhow::Result<()> {
+        let Some(path) = &self.persist_path else {
+            return Ok(());
+        };
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        let jobs = self.list().await;
+        let text = serde_json::to_string_pretty(&jobs)?;
+        let tmp = path.with_extension("json.tmp");
+        tokio::fs::write(&tmp, text).await?;
+        tokio::fs::rename(&tmp, path).await?;
+        Ok(())
     }
 
     pub async fn list(&self) -> Vec<CronJob> {
@@ -46,11 +94,20 @@ impl CronManager {
             enabled: true,
         };
         self.jobs.lock().await.insert(id, job.clone());
+        if let Err(e) = self.save_to_disk().await {
+            tracing::warn!("Cron persist failed: {}", e);
+        }
         job
     }
 
     pub async fn delete(&self, id: &str) -> bool {
-        self.jobs.lock().await.remove(id).is_some()
+        let removed = self.jobs.lock().await.remove(id).is_some();
+        if removed {
+            if let Err(e) = self.save_to_disk().await {
+                tracing::warn!("Cron persist failed: {}", e);
+            }
+        }
+        removed
     }
 
     /// Return due job prompts and advance/disable them.
@@ -71,14 +128,28 @@ impl CronManager {
                     job.enabled = false;
                     remove.push(id.clone());
                 } else {
-                    job.next_run = now + Duration::hours(1);
+                    // Light jitter (±3 minutes) to avoid thundering herd.
+                    let jitter = (id.as_bytes().iter().map(|b| *b as i64).sum::<i64>() % 7) - 3;
+                    job.next_run = now + Duration::hours(1) + Duration::minutes(jitter);
                 }
             }
         }
         for id in remove {
             jobs.remove(&id);
         }
+        drop(jobs);
+        if !due.is_empty() {
+            if let Err(e) = self.save_to_disk().await {
+                tracing::warn!("Cron persist failed: {}", e);
+            }
+        }
         due
+    }
+}
+
+impl Default for CronManager {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -242,5 +313,24 @@ impl Tool for CronDeleteTool {
         } else {
             Ok(ToolOutput::error(format!("Unknown cron id {}", id)))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn persist_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("kkagent-cron-{}", Uuid::new_v4()));
+        let path = dir.join("cron.json");
+        let mgr = CronManager::with_persist(path.clone()).await;
+        let job = mgr.create("in 5m".into(), "hello".into()).await;
+        drop(mgr);
+        let mgr2 = CronManager::with_persist(path).await;
+        let list = mgr2.list().await;
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].id, job.id);
+        let _ = tokio::fs::remove_dir_all(dir).await;
     }
 }

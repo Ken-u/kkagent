@@ -241,6 +241,7 @@ struct ServerState {
     /// Shared background shell jobs for Bash tool.
     bash_shells: Arc<kkagent_tools::builtin::BackgroundShellManager>,
     cron: Arc<kkagent_tools::CronManager>,
+    goal_mgr: Arc<kkagent_protocol::goal::GoalManager>,
     hooks: Arc<kkagent_mcp::HookManager>,
     skills: Arc<kkagent_tools::SkillCatalog>,
     web: Arc<kkagent_tools::WebServicesConfig>,
@@ -293,11 +294,14 @@ async fn run_server_handler<T: kkagent_rpc::transport::AsyncTransport>(
     }
 
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let mut hooks = kkagent_mcp::HookManager::new(&cwd);
-    hooks.load_from_app_config(&config.hooks).await;
-    let _ = hooks.discover().await;
+    let mut hooks_mgr = kkagent_mcp::HookManager::new(&cwd);
+    hooks_mgr.load_from_app_config(&config.hooks).await;
+    let _ = hooks_mgr.discover().await;
+    let hooks = Arc::new(hooks_mgr);
     let skills = Arc::new(kkagent_tools::SkillCatalog::discover(&cwd).await);
-    let cron = Arc::new(kkagent_tools::CronManager::new());
+    let cron_path = kkagent_config::default_config_dir().join("cron.json");
+    let cron = Arc::new(kkagent_tools::CronManager::with_persist(cron_path).await);
+    let goal_mgr = Arc::new(kkagent_protocol::goal::GoalManager::new());
     let web = Arc::new(kkagent_tools::WebServicesConfig::from_app(&config));
 
     // Background cron poller — fires due prompts into a dedicated channel log for now.
@@ -360,7 +364,8 @@ async fn run_server_handler<T: kkagent_rpc::transport::AsyncTransport>(
         mcp,
         bash_shells: Arc::new(kkagent_tools::builtin::BackgroundShellManager::new()),
         cron,
-        hooks: Arc::new(hooks),
+        goal_mgr,
+        hooks,
         skills,
         web,
         telemetry: telemetry.clone(),
@@ -550,6 +555,16 @@ async fn handle_rpc_call(
                 session.question_tx.clone(),
             );
             state.sessions.lock().await.insert(session_id.clone(), session);
+            let _ = state
+                .hooks
+                .fire(
+                    kkagent_mcp::hooks::HookEvent::SessionStart,
+                    &serde_json::json!({
+                        "session_id": session_id,
+                        "workspace": workspace,
+                    }),
+                )
+                .await;
             Ok(serde_json::json!({"session_id": session_id}))
         }
         "sessions.list" => {
@@ -888,11 +903,19 @@ async fn handle_rpc_call(
             tools.register(Arc::new(kkagent_tools::builtin::TaskStopTool::new(
                 state.subagents.clone(),
             )));
-            // Goal tools if available
-            let goal_mgr = Arc::new(kkagent_protocol::goal::GoalManager::new());
-            tools.register(Arc::new(kkagent_tools::builtin::CreateGoalTool::new(goal_mgr.clone())));
-            tools.register(Arc::new(kkagent_tools::builtin::GetGoalTool::new(goal_mgr.clone())));
-            tools.register(Arc::new(kkagent_tools::builtin::UpdateGoalTool::new(goal_mgr)));
+            // Goal tools (shared across turns)
+            tools.register(Arc::new(kkagent_tools::builtin::CreateGoalTool::new(
+                state.goal_mgr.clone(),
+            )));
+            tools.register(Arc::new(kkagent_tools::builtin::GetGoalTool::new(
+                state.goal_mgr.clone(),
+            )));
+            tools.register(Arc::new(kkagent_tools::builtin::UpdateGoalTool::new(
+                state.goal_mgr.clone(),
+            )));
+            tools.register(Arc::new(kkagent_tools::builtin::SetGoalBudgetTool::new(
+                state.goal_mgr.clone(),
+            )));
             tools.register(Arc::new(kkagent_tools::builtin::SkillTool::new(
                 state.skills.clone(),
             )));
@@ -926,7 +949,8 @@ async fn handle_rpc_call(
                     agent_event_tx.clone(),
                     state.abort_registry.clone(),
                 )
-                .with_hooks(state.hooks.clone()),
+                .with_hooks(state.hooks.clone())
+                .with_goal_manager(state.goal_mgr.clone()),
             );
 
             let state_clone = state.clone();

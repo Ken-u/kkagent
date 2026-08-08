@@ -32,7 +32,7 @@ pub struct ToolDef {
     pub input_schema: serde_json::Value,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct ThinkingParams {
     pub budget_tokens: u32,
 }

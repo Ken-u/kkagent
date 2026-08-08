@@ -53,6 +53,10 @@ pub struct Session {
     pub enabled_tools: Option<std::collections::HashSet<String>>,
     /// Turns since last TodoList write (for reminder).
     pub turns_since_todo: u32,
+    /// Cross-turn tool dedupe tracker.
+    pub tool_dedupe: crate::tool_dedupe::ToolDedupeTracker,
+    /// Session token counter (measured anchors + estimates).
+    pub token_counter: crate::token_counting::TokenCounter,
 }
 
 impl Session {
@@ -90,6 +94,10 @@ impl Session {
             undo_stack: Vec::new(),
             enabled_tools: None,
             turns_since_todo: 0,
+            tool_dedupe: crate::tool_dedupe::ToolDedupeTracker::new(),
+            token_counter: crate::token_counting::TokenCounter::new(
+                crate::token_counting::TokenCountingStrategy::MeasuredPlusEstimated,
+            ),
         }
     }
 

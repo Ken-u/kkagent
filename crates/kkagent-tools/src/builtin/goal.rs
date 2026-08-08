@@ -36,6 +36,10 @@ impl Tool for CreateGoalTool {
                 "token_budget": {
                     "type": "integer",
                     "description": "Max tokens allowed (default: unlimited)"
+                },
+                "wall_clock_budget_ms": {
+                    "type": "integer",
+                    "description": "Max wall-clock milliseconds (default: unlimited)"
                 }
             },
             "required": ["description"]
@@ -50,7 +54,7 @@ impl Tool for CreateGoalTool {
         let budget = GoalBudget {
             turn_budget: input.get("turn_budget").and_then(|v| v.as_u64()).map(|v| v as u32),
             token_budget: input.get("token_budget").and_then(|v| v.as_u64()),
-            wall_clock_budget_ms: None,
+            wall_clock_budget_ms: input.get("wall_clock_budget_ms").and_then(|v| v.as_u64()),
         };
 
         let goal = self.goal_mgr.create_goal(desc, budget).await;
@@ -147,5 +151,74 @@ impl Tool for UpdateGoalTool {
             }
             _ => Ok(ToolOutput::error(format!("Unknown status: {}", status))),
         }
+    }
+}
+
+pub struct SetGoalBudgetTool {
+    goal_mgr: Arc<GoalManager>,
+}
+
+impl SetGoalBudgetTool {
+    pub fn new(goal_mgr: Arc<GoalManager>) -> Self {
+        Self { goal_mgr }
+    }
+}
+
+#[async_trait]
+impl Tool for SetGoalBudgetTool {
+    fn name(&self) -> &str {
+        "SetGoalBudget"
+    }
+    fn description(&self) -> &str {
+        "Update the active goal's turn/token/wall-clock budget without changing its status."
+    }
+    fn parameters_schema(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "turn_budget": {
+                    "type": "integer",
+                    "description": "Max turns (omit to leave unchanged; null to clear)"
+                },
+                "token_budget": {
+                    "type": "integer",
+                    "description": "Max tokens (omit to leave unchanged; null to clear)"
+                },
+                "wall_clock_budget_ms": {
+                    "type": "integer",
+                    "description": "Max wall-clock ms (omit to leave unchanged; null to clear)"
+                }
+            }
+        })
+    }
+
+    async fn execute(&self, input: Value, _ctx: &ToolContext) -> anyhow::Result<ToolOutput> {
+        let Some(mut goal) = self.goal_mgr.get_goal().await else {
+            return Ok(ToolOutput::error("No active goal."));
+        };
+
+        let mut budget = goal.budget.clone();
+        if input.as_object().map(|o| o.contains_key("turn_budget")).unwrap_or(false) {
+            budget.turn_budget = input
+                .get("turn_budget")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u32);
+        }
+        if input.as_object().map(|o| o.contains_key("token_budget")).unwrap_or(false) {
+            budget.token_budget = input.get("token_budget").and_then(|v| v.as_u64());
+        }
+        if input
+            .as_object()
+            .map(|o| o.contains_key("wall_clock_budget_ms"))
+            .unwrap_or(false)
+        {
+            budget.wall_clock_budget_ms = input.get("wall_clock_budget_ms").and_then(|v| v.as_u64());
+        }
+
+        self.goal_mgr.update_budget(budget).await;
+        goal = self.goal_mgr.get_goal().await.unwrap_or(goal);
+        Ok(ToolOutput::success(
+            serde_json::to_string_pretty(&goal).unwrap_or_default(),
+        ))
     }
 }

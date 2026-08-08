@@ -89,7 +89,20 @@ pub struct LoopControlConfig {
     pub reserved_context_size: u64,
     #[serde(default = "default_max_steps")]
     pub max_steps_per_turn: u32,
+    /// Auto-compact when request estimate exceeds usable context.
+    #[serde(default = "default_true")]
+    pub auto_compact: bool,
+    /// Messages to keep when auto-compacting.
+    #[serde(default = "default_compact_keep")]
+    pub compact_keep_last: u32,
+    /// Token counting strategy: measured+estimated | measured | estimated
+    #[serde(default = "default_token_strategy")]
+    pub token_counting: String,
 }
+
+fn default_true() -> bool { true }
+fn default_compact_keep() -> u32 { 8 }
+fn default_token_strategy() -> String { "measured+estimated".into() }
 
 fn default_max_attempts() -> u32 { 10 }
 fn default_reserved_context() -> u64 { 50000 }

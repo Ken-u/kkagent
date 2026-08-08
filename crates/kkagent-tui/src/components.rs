@@ -413,20 +413,14 @@ fn render_tool_call_lines(
     theme: &Theme,
     first_bullet: bool,
 ) {
+    use crate::tool_renderers::ToolRenderRegistry;
+
     if first_bullet {
         lines.push(Line::from(vec![
             Span::styled("● ", Style::default().fg(theme.text)),
             Span::styled(
-                format!("{} {}", status_icon(tc), tc.name),
-                Style::default().fg(if tc.is_error {
-                    theme.error
-                } else {
-                    theme.text_dim
-                }),
-            ),
-            Span::styled(
-                format!("  {}", truncate(&tc.input_summary, 64)),
-                Style::default().fg(theme.text_muted),
+                format!("{} {}", status_icon(tc), ToolRenderRegistry::chip_label(tc)),
+                ToolRenderRegistry::chip_style(tc, theme),
             ),
         ]));
     } else {
@@ -434,31 +428,11 @@ fn render_tool_call_lines(
     }
 
     if !tc.collapsed {
-        if let Some(ref output) = tc.output {
-            let max_preview = 12;
-            let all: Vec<&str> = output.lines().collect();
-            let show = all.len().min(max_preview);
-            for l in &all[..show] {
-                let truncated = truncate(l, width.saturating_sub(4) as usize);
-                lines.push(Line::from(Span::styled(
-                    format!("  {}", truncated),
-                    Style::default().fg(theme.text_muted),
-                )));
-            }
-            if all.len() > max_preview {
-                lines.push(Line::from(Span::styled(
-                    format!(
-                        "  ... ({} more lines, ctrl+o to expand)",
-                        all.len() - max_preview
-                    ),
-                    Style::default().fg(theme.text_muted),
-                )));
-            }
-        }
+        lines.extend(ToolRenderRegistry::summary_lines(tc, width, theme, 12));
     } else if tc.output.as_ref().map(|o| o.lines().count()).unwrap_or(0) > 1 {
         let n = tc.output.as_ref().map(|o| o.lines().count()).unwrap_or(0);
         lines.push(Line::from(Span::styled(
-            format!("  ... ({} more lines, ctrl+o to expand)", n),
+            format!("  … ({n} more lines, ctrl+o to expand)"),
             Style::default().fg(theme.text_muted),
         )));
     }

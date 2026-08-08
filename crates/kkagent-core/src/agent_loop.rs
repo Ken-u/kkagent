@@ -4,12 +4,16 @@ use std::time::Duration;
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::AbortHandle;
 use kkagent_protocol::{AgentEvent, SessionStatus};
+use kkagent_protocol::goal::GoalManager;
 use kkagent_llm::{LlmRequest, StreamEvent, ChatMessage, ChatContent, ToolDef, ThinkingParams, create_provider};
 use kkagent_tools::{infer_accesses, ToolContext, ToolOutput, ToolRegistry};
 use kkagent_config::AppConfig;
 
+use crate::context_projector::{compact_messages, project, project_strict, ProjectOptions};
+use crate::model_capability::ModelCapability;
 use crate::permission::{PermissionChain, PermissionDecision};
 use crate::session::Session;
+use crate::token_counting::TokenCountingStrategy;
 use crate::tool_scheduler::{box_start, ToolCallTask, ToolScheduler};
 
 pub struct AgentLoop {
@@ -21,6 +25,7 @@ pub struct AgentLoop {
     /// Max LLM rounds per top-level run_turn (tool recursion counts).
     max_rounds: u32,
     hooks: Option<Arc<kkagent_mcp::HookManager>>,
+    goal_mgr: Option<Arc<GoalManager>>,
 }
 
 const TOOL_RESULT_INLINE_MAX: usize = 32_000;
@@ -46,6 +51,11 @@ impl AgentLoop {
         self
     }
 
+    pub fn with_goal_manager(mut self, goal_mgr: Arc<GoalManager>) -> Self {
+        self.goal_mgr = Some(goal_mgr);
+        self
+    }
+
     pub fn with_max_rounds(
         config: Arc<AppConfig>,
         tools: Arc<ToolRegistry>,
@@ -62,6 +72,7 @@ impl AgentLoop {
             abort_registry,
             max_rounds: max_rounds.max(1),
             hooks: None,
+            goal_mgr: None,
         }
     }
 
@@ -125,9 +136,56 @@ impl AgentLoop {
             model_alias,
             model_config.model
         );
-        let provider = create_provider(provider_config, model_config);
+        let capability = ModelCapability::from_model(model_config);
 
-        let tool_defs: Vec<ToolDef> = self
+        // Sync token counting strategy from config.
+        if let Some(lc) = &self.config.loop_control {
+            session.token_counter.strategy = TokenCountingStrategy::parse(&lc.token_counting);
+        }
+
+        // Goal budget gate — stop the turn if exhausted.
+        if let Some(goal_mgr) = &self.goal_mgr {
+            if let Some(goal) = goal_mgr.get_goal().await {
+                if goal.status == kkagent_protocol::goal::GoalStatus::Active
+                    && goal.is_budget_exhausted()
+                {
+                    goal_mgr
+                        .fail_goal("Goal budget exhausted (turns/tokens/wall-clock)")
+                        .await;
+                    session.add_user_message(format!(
+                        "<system-reminder>\nActive goal budget exhausted \
+(turns={}/{:?} tokens={}/{:?}). Stop autonomous work and summarize progress.\n</system-reminder>",
+                        goal.turns_used,
+                        goal.budget.turn_budget,
+                        goal.tokens_used,
+                        goal.budget.token_budget
+                    ));
+                    let _ = self
+                        .event_tx
+                        .send(AgentEvent::Error {
+                            session_id: session_id.clone(),
+                            message: "Goal budget exhausted".into(),
+                        })
+                        .await;
+                    return self.finish_turn(session, false).await;
+                }
+                if goal.status == kkagent_protocol::goal::GoalStatus::Active
+                    && !session_has_goal_reminder(session)
+                {
+                    session.add_user_message(format!(
+                        "<system-reminder>\nActive goal: {}\n\
+Progress: turns={}/{:?} tokens={}/{:?}. Continue working toward this goal.\n</system-reminder>",
+                        goal.description,
+                        goal.turns_used,
+                        goal.budget.turn_budget,
+                        goal.tokens_used,
+                        goal.budget.token_budget
+                    ));
+                }
+            }
+        }
+
+        let mut tool_defs: Vec<ToolDef> = self
             .tools
             .tool_definitions()
             .iter()
@@ -138,6 +196,9 @@ impl AgentLoop {
                 input_schema: td.parameters.clone(),
             })
             .collect();
+        if !capability.tools {
+            tool_defs.clear();
+        }
         tracing::debug!("Sending {} tools to LLM", tool_defs.len());
 
         // Todo reminder injection
@@ -160,127 +221,173 @@ Do not mention this reminder to the user.\n</system-reminder>".into(),
                 .await;
         }
 
-        let messages = session.build_messages();
-        tracing::debug!("Conversation has {} messages", messages.len());
+        let system_prompt = session.effective_system_prompt();
+        let messages = self.prepare_messages(session, &tool_defs, &system_prompt);
+        tracing::debug!("Conversation has {} messages (projected)", messages.len());
 
         let thinking = self.config.thinking.as_ref().and_then(|t| {
-            if t.enabled {
+            if t.enabled || capability.thinking {
                 Some(ThinkingParams { budget_tokens: 10000 })
             } else {
                 None
             }
         });
 
-        let request = LlmRequest {
-            model: model_config.model.clone(),
-            messages,
-            tools: tool_defs,
-            max_tokens: model_config.max_output_size.unwrap_or(8192) as u32,
-            system: Some(session.effective_system_prompt()),
-            thinking,
-        };
-
-        let (stream_tx, mut stream_rx) = mpsc::channel::<StreamEvent>(256);
-
-        let handle = tokio::spawn(async move {
-            if let Err(e) = provider.stream_chat(request, stream_tx).await {
-                tracing::error!("LLM stream error: {}", e);
-            }
-        });
-        self.abort_registry
-            .lock()
-            .await
-            .insert(session_id.clone(), handle.abort_handle());
+        let max_attempts = self
+            .config
+            .loop_control
+            .as_ref()
+            .map(|l| l.max_attempts_per_step)
+            .unwrap_or(3)
+            .max(1);
 
         let mut assistant_text = String::new();
         let mut thinking_text = String::new();
         let mut tool_calls: Vec<PendingToolCall> = Vec::new();
-        let mut current_tool: Option<PendingToolCall> = None;
-        let mut tool_input_buf = String::new();
         let mut interrupted = false;
 
-        loop {
-            if session.is_interrupted() {
-                interrupted = true;
-                if let Some(h) = self.abort_registry.lock().await.remove(&session_id) {
-                    h.abort();
+        for attempt in 1..=max_attempts {
+            assistant_text.clear();
+            thinking_text.clear();
+            tool_calls.clear();
+            let mut stream_failed = false;
+            let mut last_stream_error: Option<String> = None;
+
+            let request = LlmRequest {
+                model: model_config.model.clone(),
+                messages: messages.clone(),
+                tools: tool_defs.clone(),
+                max_tokens: model_config.max_output_size.unwrap_or(8192) as u32,
+                system: Some(system_prompt.clone()),
+                thinking: thinking.clone(),
+            };
+
+            let (stream_tx, mut stream_rx) = mpsc::channel::<StreamEvent>(256);
+            let provider = create_provider(provider_config, model_config);
+            let handle = tokio::spawn(async move {
+                if let Err(e) = provider.stream_chat(request, stream_tx).await {
+                    tracing::error!("LLM stream error: {}", e);
                 }
+            });
+            self.abort_registry
+                .lock()
+                .await
+                .insert(session_id.clone(), handle.abort_handle());
+
+            let mut current_tool: Option<PendingToolCall> = None;
+            let mut tool_input_buf = String::new();
+            let mut got_message_end = false;
+
+            loop {
+                if session.is_interrupted() {
+                    interrupted = true;
+                    if let Some(h) = self.abort_registry.lock().await.remove(&session_id) {
+                        h.abort();
+                    }
+                    break;
+                }
+
+                match tokio::time::timeout(Duration::from_millis(100), stream_rx.recv()).await {
+                    Ok(Some(event)) => match event {
+                        StreamEvent::TextDelta(text) => {
+                            assistant_text.push_str(&text);
+                            let _ = self.event_tx.send(AgentEvent::MessageDelta {
+                                session_id: session_id.clone(),
+                                text,
+                            }).await;
+                        }
+                        StreamEvent::ThinkingDelta(text) => {
+                            thinking_text.push_str(&text);
+                            let _ = self.event_tx.send(AgentEvent::ThinkingDelta {
+                                session_id: session_id.clone(),
+                                text,
+                            }).await;
+                        }
+                        StreamEvent::ToolUseStart { id, name } => {
+                            tracing::info!("Tool use start: {} ({})", name, id);
+                            tool_input_buf.clear();
+                            current_tool = Some(PendingToolCall {
+                                id, name, input: serde_json::Value::Null,
+                            });
+                        }
+                        StreamEvent::ToolUseInputDelta(json_chunk) => {
+                            tool_input_buf.push_str(&json_chunk);
+                        }
+                        StreamEvent::ToolUseEnd => {
+                            if let Some(mut tool) = current_tool.take() {
+                                tool.input = serde_json::from_str(&tool_input_buf)
+                                    .unwrap_or(serde_json::Value::String(tool_input_buf.clone()));
+                                tracing::info!(
+                                    "Tool use collected: {} -> {}",
+                                    tool.name,
+                                    serde_json::to_string(&tool.input)
+                                        .unwrap_or_default()
+                                        .chars()
+                                        .take(200)
+                                        .collect::<String>()
+                                );
+                                tool_calls.push(tool);
+                            }
+                            tool_input_buf.clear();
+                        }
+                        StreamEvent::MessageEnd { usage } => {
+                            got_message_end = true;
+                            tracing::debug!(
+                                "Message end: in={} out={}",
+                                usage.input_tokens,
+                                usage.output_tokens
+                            );
+                            session
+                                .token_counter
+                                .record_measured(usage.input_tokens, usage.output_tokens);
+                            let _ = self.event_tx.send(AgentEvent::UsageUpdate {
+                                session_id: session_id.clone(),
+                                usage: kkagent_protocol::TokenUsage {
+                                    input_tokens: usage.input_tokens,
+                                    output_tokens: usage.output_tokens,
+                                    cache_creation_input_tokens: usage.cache_creation_input_tokens,
+                                    cache_read_input_tokens: usage.cache_read_input_tokens,
+                                },
+                            }).await;
+                        }
+                        StreamEvent::Error(msg) => {
+                            tracing::error!("Stream error: {}", msg);
+                            last_stream_error = Some(msg.clone());
+                            stream_failed = true;
+                            let _ = self.event_tx.send(AgentEvent::Error {
+                                session_id: session_id.clone(),
+                                message: msg,
+                            }).await;
+                        }
+                    },
+                    Ok(None) => break,
+                    Err(_) => continue, // timeout — re-check interrupt
+                }
+            }
+
+            self.abort_registry.lock().await.remove(&session_id);
+
+            if interrupted {
                 break;
             }
 
-            match tokio::time::timeout(Duration::from_millis(100), stream_rx.recv()).await {
-                Ok(Some(event)) => match event {
-                    StreamEvent::TextDelta(text) => {
-                        assistant_text.push_str(&text);
-                        let _ = self.event_tx.send(AgentEvent::MessageDelta {
-                            session_id: session_id.clone(),
-                            text,
-                        }).await;
-                    }
-                    StreamEvent::ThinkingDelta(text) => {
-                        thinking_text.push_str(&text);
-                        let _ = self.event_tx.send(AgentEvent::ThinkingDelta {
-                            session_id: session_id.clone(),
-                            text,
-                        }).await;
-                    }
-                    StreamEvent::ToolUseStart { id, name } => {
-                        tracing::info!("Tool use start: {} ({})", name, id);
-                        tool_input_buf.clear();
-                        current_tool = Some(PendingToolCall {
-                            id, name, input: serde_json::Value::Null,
-                        });
-                    }
-                    StreamEvent::ToolUseInputDelta(json_chunk) => {
-                        tool_input_buf.push_str(&json_chunk);
-                    }
-                    StreamEvent::ToolUseEnd => {
-                        if let Some(mut tool) = current_tool.take() {
-                            tool.input = serde_json::from_str(&tool_input_buf)
-                                .unwrap_or(serde_json::Value::String(tool_input_buf.clone()));
-                            tracing::info!(
-                                "Tool use collected: {} -> {}",
-                                tool.name,
-                                serde_json::to_string(&tool.input)
-                                    .unwrap_or_default()
-                                    .chars()
-                                    .take(200)
-                                    .collect::<String>()
-                            );
-                            tool_calls.push(tool);
-                        }
-                        tool_input_buf.clear();
-                    }
-                    StreamEvent::MessageEnd { usage } => {
-                        tracing::debug!(
-                            "Message end: in={} out={}",
-                            usage.input_tokens,
-                            usage.output_tokens
-                        );
-                        let _ = self.event_tx.send(AgentEvent::UsageUpdate {
-                            session_id: session_id.clone(),
-                            usage: kkagent_protocol::TokenUsage {
-                                input_tokens: usage.input_tokens,
-                                output_tokens: usage.output_tokens,
-                                cache_creation_input_tokens: usage.cache_creation_input_tokens,
-                                cache_read_input_tokens: usage.cache_read_input_tokens,
-                            },
-                        }).await;
-                    }
-                    StreamEvent::Error(msg) => {
-                        tracing::error!("Stream error: {}", msg);
-                        let _ = self.event_tx.send(AgentEvent::Error {
-                            session_id: session_id.clone(),
-                            message: msg,
-                        }).await;
-                    }
-                },
-                Ok(None) => break,
-                Err(_) => continue, // timeout — re-check interrupt
+            let empty = assistant_text.is_empty()
+                && thinking_text.is_empty()
+                && tool_calls.is_empty();
+            if stream_failed || (empty && !got_message_end) {
+                if attempt < max_attempts {
+                    tracing::warn!(
+                        "LLM step retry {}/{} ({})",
+                        attempt,
+                        max_attempts,
+                        last_stream_error.as_deref().unwrap_or("empty/incomplete stream")
+                    );
+                    tokio::time::sleep(Duration::from_millis(200 * attempt as u64)).await;
+                    continue;
+                }
             }
+            break;
         }
-
-        self.abort_registry.lock().await.remove(&session_id);
 
         if interrupted {
             if !assistant_text.is_empty() || !thinking_text.is_empty() || !tool_calls.is_empty() {
@@ -339,6 +446,21 @@ Do not mention this reminder to the user.\n</system-reminder>".into(),
         }
 
         if !tool_calls.is_empty() {
+            // Same-step + cross-turn tool dedupe.
+            let call_pairs: Vec<(String, serde_json::Value)> = tool_calls
+                .iter()
+                .map(|t| (t.name.clone(), t.input.clone()))
+                .collect();
+            let dedupe = session.tool_dedupe.observe_step(&call_pairs);
+            if !dedupe.skip_indices.is_empty() {
+                tracing::info!(
+                    "Tool dedupe skipped {} duplicate call(s)",
+                    dedupe.skip_indices.len()
+                );
+            }
+            let dedupe_reminder = dedupe.reminder.clone();
+            let dedupe_force_stop = dedupe.force_stop;
+
             let _ = self.event_tx.send(AgentEvent::StatusUpdate {
                 session_id: session_id.clone(),
                 status: SessionStatus::ToolExecuting,
@@ -351,7 +473,7 @@ Do not mention this reminder to the user.\n</system-reminder>".into(),
             }
             let mut prepared: Vec<(String, String, Prepared)> = Vec::new();
 
-            for tc in &tool_calls {
+            for (idx, tc) in tool_calls.iter().enumerate() {
                 if session.is_interrupted() {
                     return self.finish_interrupted(session).await;
                 }
@@ -362,6 +484,17 @@ Do not mention this reminder to the user.\n</system-reminder>".into(),
                     tool_name: tc.name.clone(),
                     input: tc.input.clone(),
                 }).await;
+
+                if dedupe.skip_indices.contains(&idx) {
+                    prepared.push((
+                        tc.id.clone(),
+                        tc.name.clone(),
+                        Prepared::Done(ToolOutput::success(
+                            "Skipped: duplicate tool call in the same step (identical args).",
+                        )),
+                    ));
+                    continue;
+                }
 
                 let decision = {
                     let perm = self.permission.lock().await;
@@ -565,6 +698,20 @@ Do not mention this reminder to the user.\n</system-reminder>".into(),
                     output.content.len()
                 );
 
+                if let Some(hooks) = &self.hooks {
+                    let _ = hooks
+                        .fire(
+                            kkagent_mcp::hooks::HookEvent::PostToolCall,
+                            &serde_json::json!({
+                                "tool": name,
+                                "tool_call_id": id,
+                                "is_error": output.is_error,
+                                "output_len": output.content.len(),
+                            }),
+                        )
+                        .await;
+                }
+
                 let _ = self.event_tx.send(AgentEvent::ToolResult {
                     session_id: session_id.clone(),
                     tool_call_id: id.clone(),
@@ -610,6 +757,13 @@ Do not mention this reminder to the user.\n</system-reminder>".into(),
                 tool_results.push((id, output));
             }
 
+            // Append dedupe reminder to the last tool result when streak is high.
+            if let Some(reminder) = dedupe_reminder {
+                if let Some((_, output)) = tool_results.last_mut() {
+                    output.content.push_str(&reminder);
+                }
+            }
+
             let result_content: Vec<ChatContent> = tool_results.iter().map(|(id, output)| {
                 ChatContent::ToolResult {
                     tool_use_id: id.clone(),
@@ -627,33 +781,20 @@ Do not mention this reminder to the user.\n</system-reminder>".into(),
                 return self.finish_interrupted(session).await;
             }
 
+            if dedupe_force_stop {
+                tracing::warn!("Tool dedupe force-stop after repeated identical calls");
+                return self.finish_turn(session, true).await;
+            }
+
             tracing::info!("Recursing into next turn ({} rounds left)", rounds_left.saturating_sub(1));
             if rounds_left <= 1 {
                 tracing::warn!("Agent turn limit reached for session {}", session_id);
-                let _ = self.event_tx.send(AgentEvent::StatusUpdate {
-                    session_id: session_id.clone(),
-                    status: SessionStatus::Idle,
-                }).await;
-                let _ = self.event_tx.send(AgentEvent::TurnEnd {
-                    session_id: session_id.clone(),
-                }).await;
-                return Ok(());
+                return self.finish_turn(session, true).await;
             }
             return self.run_turn_inner(session, rounds_left - 1).await;
         }
 
-        let _ = self.event_tx.send(AgentEvent::StatusUpdate {
-            session_id: session_id.clone(),
-            status: SessionStatus::Idle,
-        }).await;
-
-        let _ = self.event_tx.send(AgentEvent::TurnEnd {
-            session_id: session_id.clone(),
-        }).await;
-
-        session.commit_turn();
-        tracing::info!("Turn completed for session {}", session_id);
-        Ok(())
+        self.finish_turn(session, true).await
     }
 
     async fn finish_interrupted(&self, session: &mut Session) -> anyhow::Result<()> {
@@ -668,10 +809,137 @@ Do not mention this reminder to the user.\n</system-reminder>".into(),
             session_id: session_id.clone(),
             status: SessionStatus::Idle,
         }).await;
+        if let Some(hooks) = &self.hooks {
+            let _ = hooks
+                .fire(
+                    kkagent_mcp::hooks::HookEvent::TurnEnd,
+                    &serde_json::json!({"session_id": session_id, "interrupted": true}),
+                )
+                .await;
+        }
         let _ = self.event_tx.send(AgentEvent::TurnEnd {
             session_id,
         }).await;
         Ok(())
+    }
+
+    async fn finish_turn(&self, session: &mut Session, record_goal: bool) -> anyhow::Result<()> {
+        let session_id = session.id.clone();
+        if record_goal {
+            if let Some(goal_mgr) = &self.goal_mgr {
+                let tokens = session.token_counter.session_usage().0
+                    + session.token_counter.session_usage().1;
+                // Prefer last measured step tokens for this turn accounting.
+                let step_tokens = session.token_counter.latest_measured();
+                goal_mgr
+                    .record_turn(if step_tokens > 0 { step_tokens } else { tokens })
+                    .await;
+                if let Some(goal) = goal_mgr.get_goal().await {
+                    if goal.is_budget_exhausted()
+                        && goal.status == kkagent_protocol::goal::GoalStatus::Active
+                    {
+                        goal_mgr
+                            .fail_goal("Goal budget exhausted after turn")
+                            .await;
+                    }
+                }
+            }
+        }
+        session.commit_turn();
+        let _ = self
+            .event_tx
+            .send(AgentEvent::StatusUpdate {
+                session_id: session_id.clone(),
+                status: SessionStatus::Idle,
+            })
+            .await;
+        if let Some(hooks) = &self.hooks {
+            let _ = hooks
+                .fire(
+                    kkagent_mcp::hooks::HookEvent::TurnEnd,
+                    &serde_json::json!({"session_id": session_id}),
+                )
+                .await;
+        }
+        let _ = self
+            .event_tx
+            .send(AgentEvent::TurnEnd {
+                session_id: session_id.clone(),
+            })
+            .await;
+        tracing::info!("Turn completed for session {}", session_id);
+        Ok(())
+    }
+
+    /// Project / auto-compact messages to fit model context budget.
+    fn prepare_messages(
+        &self,
+        session: &mut Session,
+        tools: &[ToolDef],
+        system: &str,
+    ) -> Vec<ChatMessage> {
+        let reserved = self
+            .config
+            .loop_control
+            .as_ref()
+            .map(|l| l.reserved_context_size)
+            .unwrap_or(50_000);
+        let auto_compact = self
+            .config
+            .loop_control
+            .as_ref()
+            .map(|l| l.auto_compact)
+            .unwrap_or(true);
+        let keep_last = self
+            .config
+            .loop_control
+            .as_ref()
+            .map(|l| l.compact_keep_last as usize)
+            .unwrap_or(8)
+            .max(2);
+
+        let max_context = {
+            let alias = session.get_model_alias();
+            self.config
+                .resolve_model(&alias)
+                .and_then(|(m, _)| m.max_context_size)
+                .unwrap_or(200_000)
+        };
+
+        let opts = ProjectOptions::default();
+        let mut messages = project(&session.build_messages(), &opts);
+        let mut req = session
+            .token_counter
+            .request_size(system, tools, &messages);
+
+        if session
+            .token_counter
+            .needs_compaction(max_context, reserved, req)
+        {
+            messages = project_strict(&session.build_messages(), &opts);
+            req = session
+                .token_counter
+                .request_size(system, tools, &messages);
+        }
+
+        if auto_compact
+            && session
+                .token_counter
+                .needs_compaction(max_context, reserved, req)
+            && session.messages.len() > keep_last
+        {
+            let digest = build_local_summary(&session.messages[..session.messages.len() - keep_last]);
+            let dropped = compact_messages(&mut session.messages, keep_last, &digest);
+            tracing::info!(
+                "Auto-compacted session {}: dropped {} messages (est_tokens={})",
+                session.id,
+                dropped,
+                req
+            );
+            messages = project(&session.build_messages(), &opts);
+        }
+
+        messages
     }
 
     async fn execute_tool(
@@ -928,6 +1196,42 @@ fn truncate_tool_output(session: &Session, tool_name: &str, mut output: ToolOutp
         path.display()
     );
     output
+}
+
+fn session_has_goal_reminder(session: &Session) -> bool {
+    session.messages.iter().rev().take(6).any(|m| {
+        m.content.iter().any(|c| match c {
+            ChatContent::Text { text } => text.contains("Active goal:"),
+            _ => false,
+        })
+    })
+}
+
+fn build_local_summary(messages: &[ChatMessage]) -> String {
+    let mut out = String::from("Earlier conversation digest:\n");
+    for m in messages.iter().take(40) {
+        let text: String = m
+            .content
+            .iter()
+            .filter_map(|c| match c {
+                ChatContent::Text { text } => Some(text.as_str()),
+                ChatContent::ToolUse { name, .. } => Some(name.as_str()),
+                ChatContent::ToolResult { content, .. } => Some(content.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        if text.is_empty() {
+            continue;
+        }
+        let snippet: String = text.chars().take(240).collect();
+        out.push_str(&format!("[{}] {}\n", m.role, snippet));
+    }
+    if out.len() > 4_000 {
+        out.chars().take(4_000).collect()
+    } else {
+        out
+    }
 }
 
 fn describe_tool_action(name: &str, input: &serde_json::Value) -> String {
