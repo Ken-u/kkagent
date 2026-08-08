@@ -1,6 +1,6 @@
 # kkagent 与 ref/kimi-code 功能差距清单
 
-> 核对更新（2026-08-09）：除 **Kimi provider** 外，本轮已把清单中可落地的能力补齐到可用水平。标注 `[已完成]` 的项表示已实现最小可用版本。
+> 核对更新（2026-08-09）：MCP SSE/HTTP+OAuth、并行 ToolScheduler、子代理镜像、DI/Wire/云遥测已落地。仍保留 **Kimi provider** 未做。
 
 ## 一、工具集（Tools）
 
@@ -19,7 +19,7 @@
 | ReadMediaFile | **已实现** | base64 + metadata |
 | CronCreate/List/Delete | **已实现** | 内存调度 + 轮询 |
 | SelectTools | **已实现** | 渐进式工具披露 |
-| MCP | **已接入** | stdio `mcp__*`；SSE/HTTP/OAuth 仍简化 |
+| MCP | **已完整** | stdio / SSE / streamable-HTTP + OAuth（DCR/PKCE/凭证落盘） |
 
 ## 二、Agent 核心循环
 
@@ -30,7 +30,7 @@
 | 系统提醒 | plan + date + todo reminder + skills 目录 |
 | Compaction | **LLM 总结**（secondary_model 优先）后再截断 DB |
 | Hooks | **已触发** TurnStart / PreToolCall（config + hooks.json） |
-| 并行 ToolScheduler | 仍串行（安全优先）；可读工具未并发 |
+| 并行 ToolScheduler | **已实现**（ToolAccesses 冲突矩阵，非冲突并发） |
 
 ## 三–四、权限 / 子代理
 
@@ -39,7 +39,7 @@
 | 敏感路径 | 共用 path_policy |
 | Profile 子代理 | explore/coder/general |
 | 任务输出持久化 | `.kkagent/tasks/<id>.md` |
-| 镜像事件 | 占位（事件通道已具备，父级未转发 UI） |
+| 镜像事件 | **已实现** spawned/started/completed/failed + child tool/message → 父 TUI |
 
 ## 五–七、Skill / MCP / 配置
 
@@ -49,6 +49,7 @@
 | secondary_model | **已实现** |
 | 环境变量覆盖 | KKAGENT_* / OPENAI_API_KEY / ANTHROPIC_API_KEY / GOOGLE_API_KEY |
 | trusted_workspaces | **已实现** |
+| MCP `[type]` | `stdio` / `sse` / `http`/`streamable-http` + `url`/`headers`/`oauth` |
 
 ## 八、LLM Provider
 
@@ -66,22 +67,19 @@
 |------|------|
 | Git 上下文注入 | **已实现** |
 | TUI `/tasks` | 详情 Enter + 停止 `x`/`s` |
-| DI / 完整 Wire 多版本 / 云遥测 | 未做（工程化可选） |
+| DI 容器 | **已实现** `kkagent-di` |
+| Wire 多版本迁移 | **已实现** 1.0→1.5 + journal JSONL |
+| 云遥测 | **已实现** console/file + CloudAppender（`KKAGENT_TELEMETRY_CLOUD=1`） |
 
 ## 十四、近期已完成
 
-- [x] MCP / TaskStop / Bash 后台 / AskUserQuestion / TodoList schema / AGENTS.md / Grep-Glob
-- [x] Read/Write/Edit 增强、EnterPlanMode、SelectTools
-- [x] Skill / WebSearch / FetchURL / ReadMediaFile / Cron*
-- [x] Agent + AgentSwarm + profiles + 输出持久化
-- [x] OpenAI + Google providers + LLM 重试（不含 Kimi）
-- [x] loop_control、tool result 截断、hooks、LLM compaction、git 上下文、workspace trust、env 覆盖
-- [x] TUI tasks 详情/停止
+- [x] MCP SSE/HTTP + OAuth（DCR/PKCE/本地 callback/凭证 `~/.kkagent/credentials/mcp/`）
+- [x] 真正并行 ToolScheduler（资源冲突调度）
+- [x] 子代理事件镜像到父 TUI
+- [x] DI / Wire 1.0–1.5 / 云遥测
+- [x] MCP / TaskStop / Bash 后台 / AskUserQuestion / TodoList / Skills / Web / Cron / Agent*
+- [x] OpenAI + Google providers（不含 Kimi）
 
-## 十五、仍可选（非阻塞）
+## 十五、仍可选
 
 1. Kimi 专用 provider / schema / files API
-2. MCP SSE/HTTP + OAuth
-3. 真正的并行 ToolScheduler
-4. 子代理事件镜像到父 TUI
-5. DI 容器 / Wire 多版本迁移 / 云遥测

@@ -1445,7 +1445,21 @@ impl TuiApp {
                 let n = self.config.mcp_servers.len();
                 let mut lines = format!("MCP servers configured: {}\n", n);
                 for (name, cfg) in &self.config.mcp_servers {
-                    lines.push_str(&format!("  {} — {} {:?}\n", name, cfg.command, cfg.args));
+                    let kind = cfg
+                        .transport_type
+                        .as_deref()
+                        .unwrap_or(if cfg.url.is_some() { "http" } else { "stdio" });
+                    let detail = if let Some(url) = &cfg.url {
+                        url.clone()
+                    } else {
+                        format!(
+                            "{} {:?}",
+                            cfg.command.as_deref().unwrap_or("?"),
+                            cfg.args
+                        )
+                    };
+                    let oauth = if cfg.oauth.is_some() { " oauth" } else { "" };
+                    lines.push_str(&format!("  {name} [{kind}{oauth}] — {detail}\n"));
                 }
                 if n == 0 {
                     lines.push_str("  (none — add [mcp_servers.*] in config.toml)");
@@ -1886,7 +1900,90 @@ impl TuiApp {
                     AgentEvent::TurnStart { .. } => {
                         self.state.thinking_text.clear();
                     }
-                    _ => {}
+                    AgentEvent::SubagentSpawned {
+                        subagent_id,
+                        subagent_name,
+                        parent_tool_call_id,
+                        description,
+                        ..
+                    } => {
+                        let desc = description.unwrap_or_default();
+                        self.system_message(format!(
+                            "⊟ subagent spawned [{subagent_name}] id={subagent_id} under {parent_tool_call_id}: {desc}"
+                        ));
+                    }
+                    AgentEvent::SubagentStarted { subagent_id, .. } => {
+                        self.system_message(format!("⊟ subagent started: {subagent_id}"));
+                    }
+                    AgentEvent::SubagentCompleted {
+                        subagent_id,
+                        result_summary,
+                        ..
+                    } => {
+                        self.system_message(format!(
+                            "⊟ subagent completed [{subagent_id}]: {}",
+                            result_summary.chars().take(200).collect::<String>()
+                        ));
+                    }
+                    AgentEvent::SubagentFailed {
+                        subagent_id,
+                        error,
+                        ..
+                    } => {
+                        self.system_message(format!("⊟ subagent failed [{subagent_id}]: {error}"));
+                    }
+                    AgentEvent::SubagentChildEvent {
+                        subagent_id,
+                        event,
+                        ..
+                    } => {
+                        match *event {
+                            AgentEvent::ToolCall {
+                                tool_name, input, ..
+                            } => {
+                                let brief = serde_json::to_string(&input)
+                                    .unwrap_or_default()
+                                    .chars()
+                                    .take(80)
+                                    .collect::<String>();
+                                self.system_message(format!(
+                                    "  ↳ [{subagent_id}] tool {tool_name} {brief}"
+                                ));
+                            }
+                            AgentEvent::ToolResult {
+                                tool_name,
+                                output,
+                                is_error,
+                                ..
+                            } => {
+                                let mark = if is_error { "!" } else { "ok" };
+                                self.system_message(format!(
+                                    "  ↳ [{subagent_id}] {tool_name} [{mark}] {}",
+                                    output.chars().take(120).collect::<String>()
+                                ));
+                            }
+                            AgentEvent::MessageDelta { text, .. } => {
+                                if !text.trim().is_empty() {
+                                    // keep quiet for streaming noise; show short chunks only
+                                }
+                            }
+                            AgentEvent::Error { message, .. } => {
+                                self.system_message(format!(
+                                    "  ↳ [{subagent_id}] error: {message}"
+                                ));
+                            }
+                            _ => {}
+                        }
+                    }
+                    AgentEvent::McpAuthRequired {
+                        server_name,
+                        authorization_url,
+                        ..
+                    } => {
+                        self.system_message(format!(
+                            "MCP OAuth required for `{server_name}`.\nOpen: {authorization_url}"
+                        ));
+                    }
                 }
             }
         }

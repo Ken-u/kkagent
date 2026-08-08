@@ -152,11 +152,45 @@ pub struct ServiceEndpoint {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpServerConfig {
-    pub command: String,
+    /// Transport: `stdio` (default), `sse`, `http`, or `streamable-http`.
+    #[serde(default, rename = "type")]
+    pub transport_type: Option<String>,
+    /// Stdio command (required for stdio transport).
+    #[serde(default)]
+    pub command: Option<String>,
     #[serde(default)]
     pub args: Vec<String>,
     #[serde(default)]
     pub env: HashMap<String, String>,
+    /// Remote URL for sse / http / streamable-http transports.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// Extra HTTP headers for remote transports.
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
+    /// OAuth configuration for remote MCP servers.
+    #[serde(default)]
+    pub oauth: Option<McpOAuthConfig>,
+    /// Request timeout in milliseconds.
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct McpOAuthConfig {
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub client_id: Option<String>,
+    #[serde(default)]
+    pub client_secret: Option<String>,
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    #[serde(default)]
+    pub redirect_uri: Option<String>,
+    /// Optional client label shown during DCR / authorize.
+    #[serde(default)]
+    pub client_label: Option<String>,
 }
 
 impl AppConfig {

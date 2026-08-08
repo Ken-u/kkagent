@@ -11,6 +11,9 @@ members = [
     "crates/kkagent-mcp",
     "crates/kkagent-client",
     "crates/kkagent-tui",
+    "crates/kkagent-di",
+    "crates/kkagent-wire",
+    "crates/kkagent-telemetry",
 ]
 
 [workspace.package]
@@ -52,7 +55,16 @@ which = "7"
 rusqlite = { version = "0.32", features = ["bundled"] }
 
 # MCP
-rmcp = { version = "3.1", default-features = false, features = ["client", "transport-child-process", "transport-async-rw"] }
+rmcp = { version = "3.1", default-features = false, features = [
+    "client",
+    "transport-child-process",
+    "transport-async-rw",
+    "transport-streamable-http-client",
+    "transport-streamable-http-client-reqwest",
+    "client-side-sse",
+    "auth",
+    "reqwest",
+] }
 
 # Logging / tracing
 tracing = "0.1"
@@ -80,3 +92,6 @@ kkagent-tools = { path = "crates/kkagent-tools" }
 kkagent-mcp = { path = "crates/kkagent-mcp" }
 kkagent-client = { path = "crates/kkagent-client" }
 kkagent-tui = { path = "crates/kkagent-tui" }
+kkagent-di = { path = "crates/kkagent-di" }
+kkagent-wire = { path = "crates/kkagent-wire" }
+kkagent-telemetry = { path = "crates/kkagent-telemetry" }

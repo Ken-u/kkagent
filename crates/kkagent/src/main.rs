@@ -17,6 +17,11 @@ use kkagent_tools::ToolRegistry;
 use kkagent_mcp::{McpManager, register_mcp_tools};
 use kkagent_client::KkagentClient;
 use kkagent_tui::TuiApp;
+use kkagent_di::ServiceContainer;
+use kkagent_telemetry::{
+    CloudAppender, CloudAppenderOptions, ConsoleAppender, FileAppender, TelemetryService,
+};
+use kkagent_core::SubagentMirrorContext;
 
 #[derive(Parser)]
 #[command(name = "kkagent", version, about = "AI coding agent for your terminal")]
@@ -239,18 +244,14 @@ struct ServerState {
     hooks: Arc<kkagent_mcp::HookManager>,
     skills: Arc<kkagent_tools::SkillCatalog>,
     web: Arc<kkagent_tools::WebServicesConfig>,
+    telemetry: kkagent_telemetry::TelemetryServiceHandle,
 }
 
 fn mcp_manager_from_config(config: &AppConfig) -> McpManager {
     let configs: Vec<kkagent_mcp::McpServerConfig> = config
         .mcp_servers
         .iter()
-        .map(|(name, cfg)| kkagent_mcp::McpServerConfig {
-            name: name.clone(),
-            command: cfg.command.clone(),
-            args: cfg.args.clone(),
-            env: cfg.env.clone(),
-        })
+        .map(|(name, cfg)| kkagent_mcp::McpServerConfig::from_app(name.clone(), cfg))
         .collect();
     McpManager::new(configs)
 }
@@ -313,6 +314,39 @@ async fn run_server_handler<T: kkagent_rpc::transport::AsyncTransport>(
         });
     }
 
+    // DI root + telemetry (console/file/cloud appenders)
+    let di_root = ServiceContainer::new("kkagent-root");
+    let telemetry = TelemetryService::new();
+    telemetry.add_appender(Arc::new(ConsoleAppender)).await;
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    telemetry
+        .add_appender(Arc::new(FileAppender::new(
+            home.join(".kkagent").join("telemetry").join("events.jsonl"),
+        )))
+        .await;
+    let mut cloud_opts = CloudAppenderOptions::default();
+    cloud_opts.device_id = std::env::var("KKAGENT_DEVICE_ID")
+        .unwrap_or_else(|_| uuid::Uuid::new_v4().to_string());
+    cloud_opts.model = config.default_model.clone();
+    if std::env::var("KKAGENT_TELEMETRY_CLOUD")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+    {
+        telemetry
+            .add_appender(CloudAppender::new(cloud_opts))
+            .await;
+    }
+    let _ = di_root.register_instance(telemetry.clone());
+    let _ = di_root.register_instance(config.clone());
+    telemetry
+        .track_json(
+            "app_started",
+            serde_json::json!({
+                "mcp_servers": config.mcp_servers.len() as u64,
+            }),
+        )
+        .await;
+
     let state = Arc::new(ServerState {
         config: config.clone(),
         sessions: Mutex::new(HashMap::new()),
@@ -329,6 +363,7 @@ async fn run_server_handler<T: kkagent_rpc::transport::AsyncTransport>(
         hooks: Arc::new(hooks),
         skills,
         web,
+        telemetry: telemetry.clone(),
     });
 
     let handler: kkagent_rpc::server::RequestHandler = {
@@ -693,13 +728,50 @@ async fn handle_rpc_call(
                 }
             }
 
-            // Build agent event channel that forwards to RPC transport
+            // Build agent event channel that forwards to RPC transport + wire journal + telemetry
             let (agent_event_tx, mut agent_event_rx) = mpsc::channel::<AgentEvent>(256);
 
             let rpc_tx = rpc_event_tx.clone();
+            let home_dir = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+            let wire_dir = home_dir.join(".kkagent").join("sessions").join(&session_id);
+            let wire = kkagent_wire::WireJournal::open(&wire_dir);
+            let telemetry_fwd = state.telemetry.clone();
             tokio::spawn(async move {
+                let _ = wire.ensure_metadata().await;
                 while let Some(evt) = agent_event_rx.recv().await {
                     let data = serde_json::to_value(&evt).unwrap_or_default();
+                    let evt_type = data
+                        .get("type")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("agent.event")
+                        .to_string();
+                    let record = kkagent_wire::op_to_wire_record(
+                        &evt_type,
+                        data.clone(),
+                        chrono::Utc::now().timestamp_millis(),
+                    );
+                    let _ = wire.append(&record).await;
+                    match &evt {
+                        AgentEvent::TurnStart { .. } => {
+                            telemetry_fwd
+                                .track_json("turn_start", serde_json::json!({}))
+                                .await;
+                        }
+                        AgentEvent::TurnEnd { .. } => {
+                            telemetry_fwd
+                                .track_json("turn_end", serde_json::json!({}))
+                                .await;
+                        }
+                        AgentEvent::SubagentSpawned { subagent_id, .. } => {
+                            telemetry_fwd
+                                .track_json(
+                                    "subagent_created",
+                                    serde_json::json!({"subagent_id": subagent_id}),
+                                )
+                                .await;
+                        }
+                        _ => {}
+                    }
                     let frame = Frame::Event {
                         event: "agent".into(),
                         scope: None,
@@ -747,16 +819,34 @@ async fn handle_rpc_call(
 
             let subagents = state.subagents.clone();
             let cfg_for_sub = state.config.clone();
+            let mirror_tx = agent_event_tx.clone();
             let launch: kkagent_tools::builtin::task::SubagentLaunchFn = Arc::new(move |sub_cfg| {
                 let mgr = subagents.clone();
                 let app_cfg = cfg_for_sub.clone();
                 let id = sub_cfg.agent_id.clone();
                 let mgr_abort = mgr.clone();
                 let id_abort = id.clone();
+                let mirror = match (
+                    sub_cfg.parent_session_id.clone(),
+                    sub_cfg.parent_tool_call_id.clone(),
+                ) {
+                    (Some(parent_session_id), Some(parent_tool_call_id)) => {
+                        Some(SubagentMirrorContext {
+                            parent_session_id,
+                            parent_tool_call_id,
+                            parent_event_tx: mirror_tx.clone(),
+                        })
+                    }
+                    _ => None,
+                };
                 let join = tokio::spawn(async move {
                     tracing::info!("Subagent {} starting: {}", id, sub_cfg.description);
-                    // JoinError / cancel path: TaskStop aborts this task.
-                    let run = kkagent_core::run_subagent(app_cfg, sub_cfg, PermissionMode::Auto);
+                    let run = kkagent_core::run_subagent_mirrored(
+                        app_cfg,
+                        sub_cfg,
+                        PermissionMode::Auto,
+                        mirror,
+                    );
                     match run.await {
                         Ok(result) => {
                             tracing::info!(

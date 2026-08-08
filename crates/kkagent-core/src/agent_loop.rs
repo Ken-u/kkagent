@@ -5,11 +5,12 @@ use tokio::sync::{mpsc, Mutex};
 use tokio::task::AbortHandle;
 use kkagent_protocol::{AgentEvent, SessionStatus};
 use kkagent_llm::{LlmRequest, StreamEvent, ChatMessage, ChatContent, ToolDef, ThinkingParams, create_provider};
-use kkagent_tools::{ToolContext, ToolOutput, ToolRegistry};
+use kkagent_tools::{infer_accesses, ToolContext, ToolOutput, ToolRegistry};
 use kkagent_config::AppConfig;
 
 use crate::permission::{PermissionChain, PermissionDecision};
 use crate::session::Session;
+use crate::tool_scheduler::{box_start, ToolCallTask, ToolScheduler};
 
 pub struct AgentLoop {
     config: Arc<AppConfig>,
@@ -343,7 +344,13 @@ Do not mention this reminder to the user.\n</system-reminder>".into(),
                 status: SessionStatus::ToolExecuting,
             }).await;
 
-            let mut tool_results = Vec::new();
+            // Phase 1: permissions + interactive tools (serial). Phase 2: conflict-aware parallel exec.
+            enum Prepared {
+                Done(ToolOutput),
+                Ready { name: String, input: serde_json::Value },
+            }
+            let mut prepared: Vec<(String, String, Prepared)> = Vec::new();
+
             for tc in &tool_calls {
                 if session.is_interrupted() {
                     return self.finish_interrupted(session).await;
@@ -368,9 +375,26 @@ Do not mention this reminder to the user.\n</system-reminder>".into(),
                 };
                 tracing::info!("Permission for {}: {:?}", tc.name, decision);
 
-                let output = match decision {
+                let prep = match decision {
                     PermissionDecision::Approve => {
-                        self.execute_tool(session, &tc.name, &tc.input).await
+                        if tc.name == "AskUserQuestion" {
+                            Prepared::Done(self.execute_tool(session, &tc.name, &tc.input).await)
+                        } else {
+                            if tc.name == "Write" || tc.name == "Edit" {
+                                if let Some(path_str) = tc.input.get("path").and_then(|v| v.as_str()) {
+                                    let path = if std::path::Path::new(path_str).is_absolute() {
+                                        std::path::PathBuf::from(path_str)
+                                    } else {
+                                        session.working_dir.join(path_str)
+                                    };
+                                    session.record_pre_change(path).await;
+                                }
+                            }
+                            Prepared::Ready {
+                                name: tc.name.clone(),
+                                input: tc.input.clone(),
+                            }
+                        }
                     }
                     PermissionDecision::Ask => {
                         let approval_id = uuid::Uuid::new_v4().to_string();
@@ -400,35 +424,125 @@ Do not mention this reminder to the user.\n</system-reminder>".into(),
                                     let mut perm = self.permission.lock().await;
                                     perm.record_session_approval(&tc.name, &tc.input);
                                 }
-                                self.execute_tool(session, &tc.name, &tc.input).await
+                                if tc.name == "AskUserQuestion" {
+                                    Prepared::Done(self.execute_tool(session, &tc.name, &tc.input).await)
+                                } else {
+                                    if tc.name == "Write" || tc.name == "Edit" {
+                                        if let Some(path_str) = tc.input.get("path").and_then(|v| v.as_str()) {
+                                            let path = if std::path::Path::new(path_str).is_absolute() {
+                                                std::path::PathBuf::from(path_str)
+                                            } else {
+                                                session.working_dir.join(path_str)
+                                            };
+                                            session.record_pre_change(path).await;
+                                        }
+                                    }
+                                    Prepared::Ready {
+                                        name: tc.name.clone(),
+                                        input: tc.input.clone(),
+                                    }
+                                }
                             }
                             kkagent_protocol::ApprovalDecision::Cancelled => {
                                 return self.finish_interrupted(session).await;
                             }
-                            _ => ToolOutput::error("Tool call was rejected by user"),
+                            _ => Prepared::Done(ToolOutput::error("Tool call was rejected by user")),
                         }
                     }
                     PermissionDecision::Deny(reason) => {
-                        ToolOutput::error(format!("Denied: {}", reason))
+                        Prepared::Done(ToolOutput::error(format!("Denied: {}", reason)))
                     }
                 };
+                prepared.push((tc.id.clone(), tc.name.clone(), prep));
+            }
 
+            let _ = self.event_tx.send(AgentEvent::StatusUpdate {
+                session_id: session_id.clone(),
+                status: SessionStatus::ToolExecuting,
+            }).await;
+
+            // Build scheduler tasks for Ready items; keep Done as-is.
+            let mut ready_indices = Vec::new();
+            let mut tasks = Vec::new();
+            for (idx, (tool_call_id, _name, prep)) in prepared.iter().enumerate() {
+                if let Prepared::Ready { name, input } = prep {
+                    ready_indices.push(idx);
+                    let accesses = infer_accesses(name, input, &session.working_dir);
+                    let tools = Arc::clone(&self.tools);
+                    let hooks = self.hooks.clone();
+                    let working_dir = session.working_dir.clone();
+                    let sid = session.id.clone();
+                    let enabled = session.enabled_tools.clone();
+                    let name = name.clone();
+                    let input = input.clone();
+                    let tool_call_id = tool_call_id.clone();
+                    tasks.push(ToolCallTask {
+                        accesses,
+                        start: box_start(move || {
+                            let tools = tools;
+                            let hooks = hooks;
+                            let working_dir = working_dir;
+                            let sid = sid;
+                            let enabled = enabled;
+                            let name = name;
+                            let input = input;
+                            let tool_call_id = tool_call_id;
+                            async move {
+                                execute_tool_parallel(
+                                    tools,
+                                    hooks,
+                                    working_dir,
+                                    sid,
+                                    enabled.as_ref(),
+                                    &name,
+                                    &input,
+                                    Some(tool_call_id),
+                                )
+                                .await
+                            }
+                        }),
+                    });
+                }
+            }
+
+            let parallel_outputs = if tasks.is_empty() {
+                Vec::new()
+            } else {
+                ToolScheduler::run_all(tasks).await
+            };
+            let mut parallel_iter = parallel_outputs.into_iter();
+            let mut resolved: Vec<(String, String, ToolOutput)> = Vec::new();
+            for (i, (id, name, prep)) in prepared.into_iter().enumerate() {
+                let output = match prep {
+                    Prepared::Done(o) => o,
+                    Prepared::Ready { .. } => {
+                        let _ = ready_indices.contains(&i);
+                        parallel_iter
+                            .next()
+                            .unwrap_or_else(|| ToolOutput::error("scheduler missing result"))
+                    }
+                };
+                resolved.push((id, name, output));
+            }
+
+            let mut tool_results = Vec::new();
+            for (id, name, output) in resolved {
                 // ExitPlanMode success → leave plan mode
-                if tc.name == "ExitPlanMode" && !output.is_error {
+                if name == "ExitPlanMode" && !output.is_error {
                     session.plan_mode = false;
                     let _ = self.event_tx.send(AgentEvent::PlanModeChanged {
                         session_id: session_id.clone(),
                         enabled: false,
                     }).await;
                 }
-                if tc.name == "EnterPlanMode" && !output.is_error {
+                if name == "EnterPlanMode" && !output.is_error {
                     session.plan_mode = true;
                     let _ = self.event_tx.send(AgentEvent::PlanModeChanged {
                         session_id: session_id.clone(),
                         enabled: true,
                     }).await;
                 }
-                if tc.name == "SelectTools" && !output.is_error {
+                if name == "SelectTools" && !output.is_error {
                     if let Some(data) = &output.data {
                         if data.get("tools").map(|v| v.is_null()).unwrap_or(false) {
                             session.enabled_tools = None;
@@ -442,24 +556,24 @@ Do not mention this reminder to the user.\n</system-reminder>".into(),
                     }
                 }
 
-                let output = truncate_tool_output(session, &tc.name, output);
+                let output = truncate_tool_output(session, &name, output);
 
                 tracing::info!(
                     "Tool {} result: error={} len={}",
-                    tc.name,
+                    name,
                     output.is_error,
                     output.content.len()
                 );
 
                 let _ = self.event_tx.send(AgentEvent::ToolResult {
                     session_id: session_id.clone(),
-                    tool_call_id: tc.id.clone(),
-                    tool_name: tc.name.clone(),
+                    tool_call_id: id.clone(),
+                    tool_name: name.clone(),
                     output: output.content.clone(),
                     is_error: output.is_error,
                 }).await;
 
-                if !output.is_error && tc.name == "TodoList" {
+                if !output.is_error && name == "TodoList" {
                     session.turns_since_todo = 0;
                     if let Some(items) = todo_items_from_output(&output) {
                         let _ = self
@@ -472,26 +586,28 @@ Do not mention this reminder to the user.\n</system-reminder>".into(),
                     }
                 }
 
-                // After a successful plan-file write, push full content to the TUI.
                 if !output.is_error
                     && session.plan_mode
-                    && (tc.name == "Write" || tc.name == "Edit")
+                    && (name == "Write" || name == "Edit")
                 {
-                    if let Some(content) =
-                        read_plan_file_if_matched(session, &tc.input).await
-                    {
-                        let _ = self
-                            .event_tx
-                            .send(AgentEvent::PlanFileUpdated {
-                                session_id: session_id.clone(),
-                                path: session.plan_file_path.display().to_string(),
-                                content,
-                            })
-                            .await;
+                    // Reconstruct input from tool call list
+                    if let Some(tc) = tool_calls.iter().find(|t| t.id == id) {
+                        if let Some(content) =
+                            read_plan_file_if_matched(session, &tc.input).await
+                        {
+                            let _ = self
+                                .event_tx
+                                .send(AgentEvent::PlanFileUpdated {
+                                    session_id: session_id.clone(),
+                                    path: session.plan_file_path.display().to_string(),
+                                    content,
+                                })
+                                .await;
+                        }
                     }
                 }
 
-                tool_results.push((tc.id.clone(), output));
+                tool_results.push((id, output));
             }
 
             let result_content: Vec<ChatContent> = tool_results.iter().map(|(id, output)| {
@@ -567,22 +683,6 @@ Do not mention this reminder to the user.\n</system-reminder>".into(),
         if name == "AskUserQuestion" {
             return self.run_ask_user_question(session, input).await;
         }
-        if !tool_allowed(session, name) {
-            return ToolOutput::error(format!(
-                "Tool `{name}` is not in the current SelectTools allowlist"
-            ));
-        }
-
-        if let Some(hooks) = &self.hooks {
-            let _ = hooks
-                .fire(
-                    kkagent_mcp::hooks::HookEvent::PreToolCall,
-                    &serde_json::json!({"tool": name, "input": input}),
-                )
-                .await;
-        }
-
-        // Snapshot files before mutating tools so undo can restore them.
         if name == "Write" || name == "Edit" {
             if let Some(path_str) = input.get("path").and_then(|v| v.as_str()) {
                 let path = if std::path::Path::new(path_str).is_absolute() {
@@ -593,21 +693,17 @@ Do not mention this reminder to the user.\n</system-reminder>".into(),
                 session.record_pre_change(path).await;
             }
         }
-
-        let tool = match self.tools.get(name) {
-            Some(t) => t,
-            None => return ToolOutput::error(format!("Unknown tool: {}", name)),
-        };
-
-        let ctx = ToolContext {
-            working_dir: session.working_dir.clone(),
-            session_id: session.id.clone(),
-        };
-
-        match tool.execute(input.clone(), &ctx).await {
-            Ok(output) => output,
-            Err(e) => ToolOutput::error(format!("Tool execution error: {}", e)),
-        }
+        execute_tool_parallel(
+            Arc::clone(&self.tools),
+            self.hooks.clone(),
+            session.working_dir.clone(),
+            session.id.clone(),
+            session.enabled_tools.as_ref(),
+            name,
+            input,
+            None,
+        )
+        .await
     }
 
     async fn run_ask_user_question(
@@ -757,7 +853,11 @@ fn todo_items_from_output(output: &ToolOutput) -> Option<Vec<kkagent_protocol::T
 }
 
 fn tool_allowed(session: &Session, name: &str) -> bool {
-    match &session.enabled_tools {
+    tool_allowed_set(session.enabled_tools.as_ref(), name)
+}
+
+fn tool_allowed_set(enabled: Option<&std::collections::HashSet<String>>, name: &str) -> bool {
+    match enabled {
         None => true,
         Some(set) => {
             set.contains(name)
@@ -767,6 +867,48 @@ fn tool_allowed(session: &Session, name: &str) -> bool {
                 || name == "ExitPlanMode"
                 || name == "EnterPlanMode"
         }
+    }
+}
+
+async fn execute_tool_parallel(
+    tools: Arc<ToolRegistry>,
+    hooks: Option<Arc<kkagent_mcp::HookManager>>,
+    working_dir: std::path::PathBuf,
+    session_id: String,
+    enabled_tools: Option<&std::collections::HashSet<String>>,
+    name: &str,
+    input: &serde_json::Value,
+    tool_call_id: Option<String>,
+) -> ToolOutput {
+    if !tool_allowed_set(enabled_tools, name) {
+        return ToolOutput::error(format!(
+            "Tool `{name}` is not in the current SelectTools allowlist"
+        ));
+    }
+
+    if let Some(hooks) = &hooks {
+        let _ = hooks
+            .fire(
+                kkagent_mcp::hooks::HookEvent::PreToolCall,
+                &serde_json::json!({"tool": name, "input": input}),
+            )
+            .await;
+    }
+
+    let tool = match tools.get(name) {
+        Some(t) => t,
+        None => return ToolOutput::error(format!("Unknown tool: {}", name)),
+    };
+
+    let ctx = ToolContext {
+        working_dir,
+        session_id,
+        tool_call_id,
+    };
+
+    match tool.execute(input.clone(), &ctx).await {
+        Ok(output) => output,
+        Err(e) => ToolOutput::error(format!("Tool execution error: {}", e)),
     }
 }
 

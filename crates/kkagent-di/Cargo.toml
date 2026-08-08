@@ -1,0 +1,9 @@
+[package]
+name = "kkagent-di"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+parking_lot = "0.12"

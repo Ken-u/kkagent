@@ -17,7 +17,12 @@ kkagent-tools = { workspace = true }
 kkagent-mcp = { workspace = true }
 kkagent-client = { workspace = true }
 kkagent-tui = { workspace = true }
+kkagent-di = { workspace = true }
+kkagent-wire = { workspace = true }
+kkagent-telemetry = { workspace = true }
 tokio = { workspace = true }
+dirs = { workspace = true }
+chrono = { workspace = true }
 clap = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

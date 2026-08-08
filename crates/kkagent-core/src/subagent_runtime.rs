@@ -5,18 +5,35 @@ use tokio::task::AbortHandle;
 use std::collections::HashMap;
 
 use kkagent_config::AppConfig;
-use kkagent_protocol::{PermissionMode, subagent::SubagentConfig};
+use kkagent_protocol::{AgentEvent, PermissionMode, subagent::SubagentConfig};
 use kkagent_tools::{ToolRegistry, register_builtin_tools};
 
 use crate::agent_loop::AgentLoop;
 use crate::permission::PermissionChain;
 use crate::session::Session;
 
+/// Parent context used to mirror child agent events into the parent TUI.
+#[derive(Clone)]
+pub struct SubagentMirrorContext {
+    pub parent_session_id: String,
+    pub parent_tool_call_id: String,
+    pub parent_event_tx: mpsc::Sender<AgentEvent>,
+}
+
 /// Run a focused subagent to completion and return its final assistant text.
 pub async fn run_subagent(
     app_config: Arc<AppConfig>,
     sub_cfg: SubagentConfig,
     permission_mode: PermissionMode,
+) -> anyhow::Result<String> {
+    run_subagent_mirrored(app_config, sub_cfg, permission_mode, None).await
+}
+
+pub async fn run_subagent_mirrored(
+    app_config: Arc<AppConfig>,
+    sub_cfg: SubagentConfig,
+    permission_mode: PermissionMode,
+    mirror: Option<SubagentMirrorContext>,
 ) -> anyhow::Result<String> {
     let model = sub_cfg
         .model
@@ -41,7 +58,7 @@ pub async fn run_subagent(
         format!("sub-{}", sub_cfg.agent_id),
         PathBuf::from(&sub_cfg.working_dir),
         permission_mode,
-        model,
+        model.clone(),
     );
     session.inject_workspace_instructions().await;
     session.system_prompt.push_str(&profile_system_addon(&profile));
@@ -49,7 +66,6 @@ pub async fn run_subagent(
 
     let mut tools = ToolRegistry::new();
     register_builtin_tools(&mut tools);
-    // Strip nested Task tools if present — builtins don't include them.
 
     let permission_rules = app_config
         .permission
@@ -58,10 +74,59 @@ pub async fn run_subagent(
         .unwrap_or_default();
     let permission = PermissionChain::new(PermissionMode::Auto, permission_rules);
 
-    let (event_tx, mut event_rx) = mpsc::channel(64);
-    // Optional mirror: drain events (parent can attach later).
+    let (event_tx, mut event_rx) = mpsc::channel(256);
+
+    if let Some(m) = &mirror {
+        let _ = m
+            .parent_event_tx
+            .send(AgentEvent::SubagentSpawned {
+                session_id: m.parent_session_id.clone(),
+                subagent_id: sub_cfg.agent_id.clone(),
+                subagent_name: profile.clone(),
+                parent_tool_call_id: m.parent_tool_call_id.clone(),
+                description: Some(sub_cfg.description.clone()),
+                model: Some(model.clone()),
+                run_in_background: true,
+            })
+            .await;
+        let _ = m
+            .parent_event_tx
+            .send(AgentEvent::SubagentStarted {
+                session_id: m.parent_session_id.clone(),
+                subagent_id: sub_cfg.agent_id.clone(),
+            })
+            .await;
+    }
+
+    let mirror_for_drain = mirror.clone();
+    let child_id = sub_cfg.agent_id.clone();
     tokio::spawn(async move {
-        while event_rx.recv().await.is_some() {}
+        while let Some(ev) = event_rx.recv().await {
+            if let Some(m) = &mirror_for_drain {
+                // Mirror nested lifecycle/content under parent tool call.
+                let nested = match &ev {
+                    AgentEvent::MessageDelta { .. }
+                    | AgentEvent::ThinkingDelta { .. }
+                    | AgentEvent::ToolCall { .. }
+                    | AgentEvent::ToolResult { .. }
+                    | AgentEvent::StatusUpdate { .. }
+                    | AgentEvent::Error { .. }
+                    | AgentEvent::TodoUpdated { .. } => Some(ev.clone()),
+                    _ => None,
+                };
+                if let Some(child_ev) = nested {
+                    let _ = m
+                        .parent_event_tx
+                        .send(AgentEvent::SubagentChildEvent {
+                            session_id: m.parent_session_id.clone(),
+                            subagent_id: child_id.clone(),
+                            parent_tool_call_id: m.parent_tool_call_id.clone(),
+                            event: Box::new(child_ev),
+                        })
+                        .await;
+                }
+            }
+        }
     });
 
     let abort_registry = Arc::new(Mutex::new(HashMap::<String, AbortHandle>::new()));
@@ -79,10 +144,38 @@ pub async fn run_subagent(
         max_rounds,
     );
 
-    agent.run_turn(&mut session).await?;
-    let result = extract_final_assistant_text(&session);
-    persist_subagent_output(&sub_cfg, &result).await;
-    Ok(result)
+    let run_result = agent.run_turn(&mut session).await;
+    match run_result {
+        Ok(()) => {
+            let result = extract_final_assistant_text(&session);
+            persist_subagent_output(&sub_cfg, &result).await;
+            if let Some(m) = &mirror {
+                let summary: String = result.chars().take(400).collect();
+                let _ = m
+                    .parent_event_tx
+                    .send(AgentEvent::SubagentCompleted {
+                        session_id: m.parent_session_id.clone(),
+                        subagent_id: sub_cfg.agent_id.clone(),
+                        result_summary: summary,
+                    })
+                    .await;
+            }
+            Ok(result)
+        }
+        Err(e) => {
+            if let Some(m) = &mirror {
+                let _ = m
+                    .parent_event_tx
+                    .send(AgentEvent::SubagentFailed {
+                        session_id: m.parent_session_id.clone(),
+                        subagent_id: sub_cfg.agent_id.clone(),
+                        error: e.to_string(),
+                    })
+                    .await;
+            }
+            Err(e)
+        }
+    }
 }
 
 fn profile_system_addon(profile: &str) -> String {

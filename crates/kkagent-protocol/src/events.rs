@@ -66,6 +66,43 @@ pub enum AgentEvent {
         session_id: String,
         items: Vec<TodoItemEvent>,
     },
+    /// Subagent lifecycle mirrored onto the parent session/TUI.
+    SubagentSpawned {
+        session_id: String,
+        subagent_id: String,
+        subagent_name: String,
+        parent_tool_call_id: String,
+        description: Option<String>,
+        model: Option<String>,
+        run_in_background: bool,
+    },
+    SubagentStarted {
+        session_id: String,
+        subagent_id: String,
+    },
+    SubagentCompleted {
+        session_id: String,
+        subagent_id: String,
+        result_summary: String,
+    },
+    SubagentFailed {
+        session_id: String,
+        subagent_id: String,
+        error: String,
+    },
+    /// Nested child agent event (message/tool) mirrored under a parent tool call.
+    SubagentChildEvent {
+        session_id: String,
+        subagent_id: String,
+        parent_tool_call_id: String,
+        event: Box<AgentEvent>,
+    },
+    /// MCP OAuth authorization URL for the user to open.
+    McpAuthRequired {
+        session_id: String,
+        server_name: String,
+        authorization_url: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

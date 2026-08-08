@@ -87,6 +87,8 @@ After launching, continue other work and collect results with TaskOutput / TaskL
             model,
             working_dir: ctx.working_dir.to_string_lossy().to_string(),
             profile,
+            parent_session_id: Some(ctx.session_id.clone()),
+            parent_tool_call_id: ctx.tool_call_id.clone(),
         };
 
         match self.subagent_mgr.spawn(config.clone()).await {
@@ -343,6 +345,8 @@ impl Tool for AgentSwarmTool {
                     .and_then(|v| v.as_str())
                     .map(String::from)
                     .or_else(|| Some("explore".into())),
+                parent_session_id: Some(ctx.session_id.clone()),
+                parent_tool_call_id: ctx.tool_call_id.clone(),
             };
             match self.subagent_mgr.spawn(config.clone()).await {
                 Ok(id) => {

@@ -1,6 +1,9 @@
 pub mod registry;
 pub mod builtin;
 pub mod path_policy;
+pub mod accesses;
+
+pub use accesses::{infer_accesses, tool_accesses, ToolAccesses, ToolResourceAccess};
 
 pub use registry::*;
 pub use builtin::{
@@ -23,6 +26,8 @@ pub trait Tool: Send + Sync {
 pub struct ToolContext {
     pub working_dir: std::path::PathBuf,
     pub session_id: String,
+    /// Current tool_use id when available (for subagent mirroring).
+    pub tool_call_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]

@@ -24,6 +24,11 @@ pub struct SubagentConfig {
     /// Optional profile: explore | coder | general (default).
     #[serde(default)]
     pub profile: Option<String>,
+    /// Parent session / tool call for TUI mirroring.
+    #[serde(default)]
+    pub parent_session_id: Option<String>,
+    #[serde(default)]
+    pub parent_tool_call_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
