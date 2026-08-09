@@ -109,7 +109,8 @@ async fn main() -> Result<()> {
             run_server(config, listen, http, token).await
         }
         Some(Commands::Acp) => {
-            let server = kkagent_acp::AcpServer::new();
+            let state = build_server_state(Arc::new(config)).await;
+            let server = kkagent_acp::AcpServer::with_host(Arc::new(AgentAcpHost { state }));
             server.serve_stdio().await
         }
         None => {
@@ -272,6 +273,254 @@ async fn run_server(
 
 struct AgentHttpBackend {
     state: Arc<ServerState>,
+}
+
+struct AgentAcpHost {
+    state: Arc<ServerState>,
+}
+
+#[async_trait::async_trait]
+impl kkagent_acp::AcpHost for AgentAcpHost {
+    async fn create_session(&self, session_id: &str, cwd: &str) -> Result<(), String> {
+        if session_id.is_empty() {
+            return Err("session id must not be empty".into());
+        }
+        let working_dir = std::fs::canonicalize(cwd)
+            .map_err(|e| format!("invalid ACP working directory {cwd}: {e}"))?;
+        let model = self
+            .state
+            .config
+            .default_model_alias()
+            .ok_or_else(|| "default_model is not configured".to_string())?
+            .to_string();
+        let permission_mode = self
+            .state
+            .config
+            .effective_permission_mode()
+            .parse()
+            .map_err(|_| "invalid default permission mode".to_string())?;
+        let session = Session::new(
+            session_id.to_string(),
+            working_dir.clone(),
+            permission_mode,
+            model.clone(),
+        );
+        {
+            let db = self.state.transcript.lock().await;
+            db.create_session(session_id, &model, &working_dir.to_string_lossy())
+                .map_err(|e| e.to_string())?;
+        }
+        session.services.on_created().await;
+        self.state
+            .interrupt_flags
+            .lock()
+            .await
+            .insert(session_id.to_string(), session.interrupted.clone());
+        self.state
+            .model_aliases
+            .lock()
+            .await
+            .insert(session_id.to_string(), session.model_alias.clone());
+        self.state
+            .approval_txs
+            .lock()
+            .await
+            .insert(session_id.to_string(), session.approval_tx.clone());
+        self.state
+            .question_txs
+            .lock()
+            .await
+            .insert(session_id.to_string(), session.question_tx.clone());
+        self.state
+            .sessions
+            .lock()
+            .await
+            .insert(session_id.to_string(), session);
+        Ok(())
+    }
+
+    async fn prompt(&self, session_id: &str, text: &str) -> Result<serde_json::Value, String> {
+        if text.trim().is_empty() {
+            return Err("prompt must not be empty".into());
+        }
+        {
+            let mut sessions = self.state.sessions.lock().await;
+            let session = sessions
+                .get_mut(session_id)
+                .ok_or_else(|| "session not found".to_string())?;
+            session.add_user_message(text.to_string());
+        }
+        run_http_turn(self.state.clone(), session_id)
+            .await
+            .map_err(|e| e.to_string())?;
+        let sessions = self.state.sessions.lock().await;
+        let session = sessions
+            .get(session_id)
+            .ok_or_else(|| "session disappeared after turn".to_string())?;
+        let output = session
+            .messages
+            .iter()
+            .rev()
+            .find(|message| message.role == "assistant")
+            .map(|message| {
+                message
+                    .content
+                    .iter()
+                    .filter_map(|part| match part {
+                        ChatContent::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default();
+        Ok(serde_json::json!({
+            "stopReason": "end_turn",
+            "sessionId": session_id,
+            "content": [{"type": "text", "text": output}],
+        }))
+    }
+
+    async fn cancel(&self, session_id: &str) -> Result<(), String> {
+        let flag = self
+            .state
+            .interrupt_flags
+            .lock()
+            .await
+            .get(session_id)
+            .cloned()
+            .ok_or_else(|| "session not found".to_string())?;
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(handle) = self.state.abort_registry.lock().await.remove(session_id) {
+            handle.abort();
+        }
+        Ok(())
+    }
+
+    async fn set_mode(&self, session_id: &str, mode: &str) -> Result<(), String> {
+        let mut sessions = self.state.sessions.lock().await;
+        let session = sessions
+            .get_mut(session_id)
+            .ok_or_else(|| "session not found".to_string())?;
+        match mode {
+            "agent" => session.plan_mode = false,
+            "plan" => session.plan_mode = true,
+            "manual" => session.permission_mode = PermissionMode::Manual,
+            "yolo" => session.permission_mode = PermissionMode::Yolo,
+            "auto" => session.permission_mode = PermissionMode::Auto,
+            _ => return Err(format!("unsupported ACP mode: {mode}")),
+        }
+        Ok(())
+    }
+
+    async fn set_model(&self, session_id: &str, model: &str) -> Result<(), String> {
+        if self.state.config.resolve_model(model).is_none() {
+            return Err(format!("unknown model alias: {model}"));
+        }
+        let aliases = self.state.model_aliases.lock().await;
+        let alias = aliases
+            .get(session_id)
+            .ok_or_else(|| "session not found".to_string())?;
+        *alias.lock().unwrap_or_else(|e| e.into_inner()) = model.to_string();
+        Ok(())
+    }
+
+    async fn respond_approval(&self, params: &serde_json::Value) -> Result<(), String> {
+        let id = params
+            .get("approvalId")
+            .or_else(|| params.get("approval_id"))
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| "missing approvalId".to_string())?;
+        let decision = match params
+            .get("decision")
+            .and_then(|value| value.as_str())
+            .unwrap_or("cancelled")
+        {
+            "approved" | "approve" | "allow" => kkagent_protocol::ApprovalDecision::Approved,
+            "rejected" | "reject" | "deny" => kkagent_protocol::ApprovalDecision::Rejected,
+            _ => kkagent_protocol::ApprovalDecision::Cancelled,
+        };
+        let response = kkagent_protocol::ApprovalResponse {
+            approval_id: id.to_string(),
+            decision,
+            scope: None,
+            feedback: params
+                .get("feedback")
+                .and_then(|value| value.as_str())
+                .map(str::to_string),
+        };
+        let senders = self.state.approval_txs.lock().await;
+        for sender in senders.values() {
+            let _ = sender.try_send(response.clone());
+        }
+        Ok(())
+    }
+
+    async fn respond_question(&self, params: &serde_json::Value) -> Result<(), String> {
+        let id = params
+            .get("questionId")
+            .or_else(|| params.get("question_id"))
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| "missing questionId".to_string())?;
+        let response = kkagent_protocol::QuestionResponse {
+            question_id: id.to_string(),
+            selected_option_ids: params
+                .get("selectedOptionIds")
+                .or_else(|| params.get("selected_option_ids"))
+                .and_then(|value| value.as_array())
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(|value| value.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            free_text: params
+                .get("freeText")
+                .or_else(|| params.get("free_text"))
+                .and_then(|value| value.as_str())
+                .map(str::to_string),
+            cancelled: params
+                .get("cancelled")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false),
+        };
+        let senders = self.state.question_txs.lock().await;
+        for sender in senders.values() {
+            let _ = sender.try_send(response.clone());
+        }
+        Ok(())
+    }
+
+    async fn list_models(&self) -> serde_json::Value {
+        let models = self
+            .state
+            .config
+            .models
+            .iter()
+            .map(|(alias, model)| {
+                serde_json::json!({
+                    "id": alias,
+                    "model": model.model,
+                    "provider": model.provider,
+                    "capabilities": model.capabilities,
+                })
+            })
+            .collect::<Vec<_>>();
+        serde_json::json!({"models": models})
+    }
+
+    async fn list_mcp(&self) -> serde_json::Value {
+        let tool_count = self.state.mcp.list_tools().await.len();
+        serde_json::json!({
+            "servers": self.state.config.mcp_servers.keys().collect::<Vec<_>>(),
+            "toolCount": tool_count,
+        })
+    }
+
+    fn subscribe_events(&self) -> Option<tokio::sync::broadcast::Receiver<serde_json::Value>> {
+        Some(self.state.events.subscribe())
+    }
 }
 
 #[async_trait::async_trait]

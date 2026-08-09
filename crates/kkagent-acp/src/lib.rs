@@ -49,8 +49,32 @@ impl AcpSessionStore {
 /// Optional host bridge for wiring prompts into AgentLoop.
 #[async_trait::async_trait]
 pub trait AcpHost: Send + Sync {
+    async fn create_session(&self, _session_id: &str, _cwd: &str) -> Result<(), String> {
+        Ok(())
+    }
     async fn prompt(&self, session_id: &str, text: &str) -> Result<Value, String>;
     async fn cancel(&self, session_id: &str) -> Result<(), String>;
+    async fn set_mode(&self, _session_id: &str, _mode: &str) -> Result<(), String> {
+        Ok(())
+    }
+    async fn set_model(&self, _session_id: &str, _model: &str) -> Result<(), String> {
+        Ok(())
+    }
+    async fn respond_approval(&self, _params: &Value) -> Result<(), String> {
+        Ok(())
+    }
+    async fn respond_question(&self, _params: &Value) -> Result<(), String> {
+        Ok(())
+    }
+    async fn list_models(&self) -> Value {
+        json!({"models": default_model_catalog()})
+    }
+    async fn list_mcp(&self) -> Value {
+        json!({"servers": []})
+    }
+    fn subscribe_events(&self) -> Option<tokio::sync::broadcast::Receiver<Value>> {
+        None
+    }
 }
 
 pub struct EchoHost;
@@ -72,7 +96,6 @@ impl AcpHost for EchoHost {
 pub struct AcpServer {
     store: AcpSessionStore,
     host: Arc<dyn AcpHost>,
-    model_catalog: Vec<Value>,
 }
 
 impl AcpServer {
@@ -84,7 +107,6 @@ impl AcpServer {
         Self {
             store: AcpSessionStore::new(),
             host,
-            model_catalog: default_model_catalog(),
         }
     }
 
@@ -117,6 +139,9 @@ impl AcpServer {
                     .or_else(|| req.params.get("workspace"))
                     .and_then(|v| v.as_str())
                     .unwrap_or(".");
+                if let Err(e) = self.host.create_session(&sid, workspace).await {
+                    return err(id, -32000, e);
+                }
                 let sess = json!({
                     "sessionId": sid,
                     "cwd": workspace,
@@ -171,6 +196,9 @@ impl AcpServer {
                     .and_then(|v| v.as_str())
                     .unwrap_or("agent")
                     .to_string();
+                if let Err(e) = self.host.set_mode(&sid, &mode).await {
+                    return err(id, -32000, e);
+                }
                 self.store
                     .modes
                     .lock()
@@ -182,7 +210,7 @@ impl AcpServer {
                 ok(id, json!({"ok": true, "mode": mode}))
             }
             "model/list" | "models/list" | "modelCatalog/list" => {
-                ok(id, json!({"models": self.model_catalog}))
+                ok(id, self.host.list_models().await)
             }
             "session/set_model" => {
                 let sid = req
@@ -197,6 +225,9 @@ impl AcpServer {
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
+                if let Err(e) = self.host.set_model(&sid, &model).await {
+                    return err(id, -32000, e);
+                }
                 if let Some(s) = self.store.sessions.lock().await.get_mut(&sid) {
                     s["model"] = json!(model);
                 }
@@ -344,6 +375,9 @@ impl AcpServer {
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
+                if let Err(e) = self.host.respond_approval(&req.params).await {
+                    return err(id, -32000, e);
+                }
                 self.store
                     .pending_approvals
                     .lock()
@@ -351,15 +385,45 @@ impl AcpServer {
                     .insert(aid.clone(), req.params.clone());
                 ok(id, json!({"ok": true, "approvalId": aid}))
             }
-            "mcp/list" => ok(id, json!({"servers": []})),
+            "question/respond" | "session/question_response" => {
+                if let Err(e) = self.host.respond_question(&req.params).await {
+                    return err(id, -32000, e);
+                }
+                ok(id, json!({"ok": true}))
+            }
+            "mcp/list" => ok(id, self.host.list_mcp().await),
             other => err(id, -32601, format!("Method not found: {other}")),
         }
     }
 
-    pub async fn serve_stdio(&self) -> anyhow::Result<()> {
+    pub async fn serve_stdio(self) -> anyhow::Result<()> {
+        let server = Arc::new(self);
         let stdin = tokio::io::stdin();
         let mut reader = BufReader::new(stdin).lines();
-        let mut stdout = tokio::io::stdout();
+        let stdout = Arc::new(Mutex::new(tokio::io::stdout()));
+        if let Some(mut events) = server.host.subscribe_events() {
+            let event_stdout = stdout.clone();
+            tokio::spawn(async move {
+                while let Ok(event) = events.recv().await {
+                    let notification = map_agent_event(&event).unwrap_or_else(|| {
+                        json!({
+                            "jsonrpc": "2.0",
+                            "method": "session/update",
+                            "params": event,
+                        })
+                    });
+                    let mut writer = event_stdout.lock().await;
+                    if writer
+                        .write_all(format!("{notification}\n").as_bytes())
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                    let _ = writer.flush().await;
+                }
+            });
+        }
         while let Some(line) = reader.next_line().await? {
             if line.trim().is_empty() {
                 continue;
@@ -375,11 +439,17 @@ impl AcpServer {
                 // notification — could map agent events later
                 continue;
             }
-            let resp = self.handle(req).await;
-            let out = serde_json::to_string(&resp)?;
-            stdout.write_all(out.as_bytes()).await?;
-            stdout.write_all(b"\n").await?;
-            stdout.flush().await?;
+            let request_server = server.clone();
+            let request_stdout = stdout.clone();
+            tokio::spawn(async move {
+                let response = request_server.handle(req).await;
+                if let Ok(out) = serde_json::to_string(&response) {
+                    let mut writer = request_stdout.lock().await;
+                    let _ = writer.write_all(out.as_bytes()).await;
+                    let _ = writer.write_all(b"\n").await;
+                    let _ = writer.flush().await;
+                }
+            });
         }
         Ok(())
     }
@@ -455,10 +525,61 @@ pub fn map_agent_event(event: &Value) -> Option<Value> {
 mod tests {
     use super::*;
 
+    struct RecordingHost {
+        created: Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl AcpHost for RecordingHost {
+        async fn create_session(&self, session_id: &str, _cwd: &str) -> Result<(), String> {
+            self.created.lock().await.push(session_id.to_string());
+            Ok(())
+        }
+
+        async fn prompt(&self, session_id: &str, text: &str) -> Result<Value, String> {
+            Ok(json!({"sessionId": session_id, "output": text.to_uppercase()}))
+        }
+
+        async fn cancel(&self, _session_id: &str) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
     #[test]
     fn maps_approval() {
         let ev = json!({"type": "ApprovalRequested", "request": {}});
         let n = map_agent_event(&ev).unwrap();
         assert_eq!(n["method"], "session/request_permission");
+    }
+
+    #[tokio::test]
+    async fn delegates_session_lifecycle_to_host() {
+        let host = Arc::new(RecordingHost {
+            created: Mutex::new(Vec::new()),
+        });
+        let server = AcpServer::with_host(host.clone());
+        let created = server
+            .handle(AcpRequest {
+                jsonrpc: "2.0".into(),
+                id: Some(json!(1)),
+                method: "session/new".into(),
+                params: json!({"cwd": "."}),
+            })
+            .await;
+        let session_id = created.result.unwrap()["sessionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(host.created.lock().await.as_slice(), &[session_id.clone()]);
+
+        let prompted = server
+            .handle(AcpRequest {
+                jsonrpc: "2.0".into(),
+                id: Some(json!(2)),
+                method: "session/prompt".into(),
+                params: json!({"sessionId": session_id, "prompt": "hello"}),
+            })
+            .await;
+        assert_eq!(prompted.result.unwrap()["output"], "HELLO");
     }
 }
