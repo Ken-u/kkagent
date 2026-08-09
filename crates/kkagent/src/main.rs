@@ -899,16 +899,24 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
         &self,
         workspace: Option<String>,
         title: Option<String>,
-    ) -> serde_json::Value {
+    ) -> Result<serde_json::Value, String> {
         let id = uuid::Uuid::new_v4().to_string();
-        let cwd = workspace
+        let requested = workspace
             .map(PathBuf::from)
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+        let cwd = std::fs::canonicalize(&requested)
+            .map_err(|error| format!("invalid workspace {}: {error}", requested.display()))?;
+        if !kkagent_core::is_workspace_trusted(&self.state.config, &cwd) {
+            return Err(format!(
+                "workspace {} is outside trusted_workspaces",
+                cwd.display()
+            ));
+        }
         let model = self
             .state
             .config
             .default_model_alias()
-            .unwrap_or("default")
+            .ok_or_else(|| "default_model is not configured".to_string())?
             .to_string();
         let mut session = Session::new(
             id.clone(),
@@ -917,13 +925,16 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
             model.clone(),
         );
         if let Some(ref t) = title {
-            let _ = session.set_title_persisted(t.clone());
+            session
+                .set_title_persisted(t.clone())
+                .map_err(|error| error.to_string())?;
         }
         {
             let db = self.state.transcript.lock().await;
-            let _ = db.create_session(&id, &model, &cwd.to_string_lossy());
+            db.create_session(&id, &model, &cwd.to_string_lossy())
+                .map_err(|error| error.to_string())?;
             if let Some(ref t) = title {
-                let _ = db.set_title(&id, t);
+                db.set_title(&id, t).map_err(|error| error.to_string())?;
             }
         }
         session.services.on_created().await;
@@ -949,13 +960,13 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
             .insert(id.clone(), session.question_tx.clone());
         let session_dir = session.session_dir().display().to_string();
         self.state.sessions.lock().await.insert(id.clone(), session);
-        serde_json::json!({
+        Ok(serde_json::json!({
             "session_id": id,
             "workspace": cwd.display().to_string(),
             "title": title,
             "session_dir": session_dir,
             "created_at": chrono::Utc::now().to_rfc3339(),
-        })
+        }))
     }
 
     async fn get_session(&self, id: &str) -> Option<serde_json::Value> {
@@ -1143,6 +1154,30 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
         tokio::fs::write(&path, content)
             .await
             .map_err(|e| e.to_string())
+    }
+
+    async fn list_files(&self, path: &str) -> Result<serde_json::Value, String> {
+        let path = resolve_http_fs_path(&self.state.config, path, false)?;
+        let mut directory = tokio::fs::read_dir(&path)
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut entries = Vec::new();
+        while entries.len() < 200 {
+            let Some(entry) = directory
+                .next_entry()
+                .await
+                .map_err(|error| error.to_string())?
+            else {
+                break;
+            };
+            let file_type = entry.file_type().await.map_err(|error| error.to_string())?;
+            entries.push(serde_json::json!({
+                "name": entry.file_name().to_string_lossy(),
+                "path": entry.path().display().to_string(),
+                "is_dir": file_type.is_dir(),
+            }));
+        }
+        Ok(serde_json::json!({"entries": entries}))
     }
 
     async fn search(&self, query: &str) -> serde_json::Value {

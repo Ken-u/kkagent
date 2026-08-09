@@ -23,7 +23,11 @@ pub trait HttpBackend: Send + Sync {
     }
 
     async fn list_sessions(&self) -> Value;
-    async fn create_session(&self, workspace: Option<String>, title: Option<String>) -> Value;
+    async fn create_session(
+        &self,
+        workspace: Option<String>,
+        title: Option<String>,
+    ) -> Result<Value, String>;
     async fn get_session(&self, id: &str) -> Option<Value>;
     async fn delete_session(&self, _id: &str) -> Result<(), String> {
         Err("session deletion is not supported by this backend".into())
@@ -42,6 +46,9 @@ pub trait HttpBackend: Send + Sync {
     ) -> Result<Value, String>;
     async fn fs_read(&self, path: &str) -> Result<String, String>;
     async fn fs_write(&self, path: &str, content: &str) -> Result<(), String>;
+    async fn list_files(&self, _path: &str) -> Result<Value, String> {
+        Err("file listing is not supported by this backend".into())
+    }
     async fn search(&self, query: &str) -> Value;
     async fn workspace_info(&self) -> Value;
     async fn list_questions(&self) -> Value {
@@ -64,7 +71,11 @@ impl HttpBackend for MemoryBackend {
         let map = self.sessions.lock().await;
         json!({"sessions": map.values().cloned().collect::<Vec<_>>()})
     }
-    async fn create_session(&self, workspace: Option<String>, title: Option<String>) -> Value {
+    async fn create_session(
+        &self,
+        workspace: Option<String>,
+        title: Option<String>,
+    ) -> Result<Value, String> {
         let id = uuid::Uuid::new_v4().to_string();
         let sess = json!({
             "session_id": id,
@@ -74,7 +85,7 @@ impl HttpBackend for MemoryBackend {
             "messages": [],
         });
         self.sessions.lock().await.insert(id, sess.clone());
-        sess
+        Ok(sess)
     }
     async fn get_session(&self, id: &str) -> Option<Value> {
         self.sessions.lock().await.get(id).cloned()
@@ -302,7 +313,8 @@ async fn create_session(
     let sess = state
         .backend
         .create_session(body.workspace, body.title)
-        .await;
+        .await
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
     if let Some(id) = sess.get("session_id").and_then(|v| v.as_str()) {
         state.publish(json!({"type": "session.created", "session_id": id}));
     }
@@ -434,6 +446,14 @@ struct FsPathQuery {
     token: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct FilesQuery {
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    token: Option<String>,
+}
+
 async fn fs_read(
     State(state): State<HttpState>,
     Query(path_q): Query<FsPathQuery>,
@@ -467,28 +487,15 @@ async fn fs_write(
 
 async fn files_list(
     State(state): State<HttpState>,
-    Query(q): Query<AuthQuery>,
-    Query(path_q): Query<FsPathQuery>,
+    Query(query): Query<FilesQuery>,
 ) -> Result<Json<Value>, StatusCode> {
-    check_auth(&state, &q)?;
-    let path = if path_q.path.is_empty() {
-        ".".into()
-    } else {
-        path_q.path
-    };
-    let rd = std::fs::read_dir(&path).map_err(|_| StatusCode::NOT_FOUND)?;
-    let entries: Vec<Value> = rd
-        .flatten()
-        .take(200)
-        .map(|e| {
-            json!({
-                "name": e.file_name().to_string_lossy(),
-                "path": e.path().display().to_string(),
-                "is_dir": e.file_type().map(|t| t.is_dir()).unwrap_or(false),
-            })
-        })
-        .collect();
-    Ok(Json(json!({"entries": entries})))
+    check_auth(&state, &AuthQuery { token: query.token })?;
+    state
+        .backend
+        .list_files(query.path.as_deref().unwrap_or("."))
+        .await
+        .map(Json)
+        .map_err(|_| StatusCode::BAD_REQUEST)
 }
 
 #[derive(Deserialize)]
