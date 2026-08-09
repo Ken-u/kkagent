@@ -20,6 +20,7 @@ use crate::components;
 use crate::controllers::SessionEventRouter;
 use crate::input::InputState;
 use crate::pi::{map_key, EditorAction};
+use crate::search::SearchState;
 use crate::slash::{
     self, filter_slash_commands, find_slash_command, is_slash_name_completion, parse_slash_input,
     SlashSuggestion,
@@ -95,6 +96,14 @@ pub struct AppState {
     pub status_bar: StatusBarModel,
     /// Session event router (controllers).
     pub event_router: SessionEventRouter,
+    /// Ctrl-F transcript search overlay.
+    pub search: SearchState,
+    /// Show btw notes as a floating pane.
+    pub show_btw_pane: bool,
+    /// Show activity side hints in footer when streaming.
+    pub last_tool_name: Option<String>,
+    /// Message index to highlight (from search).
+    pub highlight_message: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -276,6 +285,10 @@ impl AppState {
                 ..Default::default()
             },
             event_router: SessionEventRouter::default(),
+            search: SearchState::default(),
+            show_btw_pane: false,
+            last_tool_name: None,
+            highlight_message: None,
         }
     }
 
@@ -506,6 +519,12 @@ impl TuiApp {
             }
 
             self.state.tick = self.state.tick.wrapping_add(1);
+            if matches!(
+                self.state.status,
+                SessionStatus::Thinking | SessionStatus::ToolExecuting
+            ) {
+                self.state.stream_cursor.tick();
+            }
 
             if self.state.should_quit {
                 break;
@@ -555,6 +574,11 @@ impl TuiApp {
     }
 
     async fn handle_key(&mut self, key: KeyEvent) -> anyhow::Result<()> {
+        // Transcript search overlay (Ctrl-F)
+        if self.state.search.active {
+            return self.handle_search_key(key);
+        }
+
         // Handle question panel first
         if self.state.question_pending.is_some() {
             return self.handle_question_key(key).await;
@@ -848,6 +872,18 @@ impl TuiApp {
             KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.state.input.insert_char('\n');
                 self.state.refresh_slash_menu();
+            }
+            // Ctrl-F / Ctrl-S: open transcript search
+            KeyCode::Char('f') | KeyCode::Char('s')
+                if key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                self.state.search.open();
+                self.state.slash_menu = None;
+                self.state.list_picker = None;
+            }
+            // Ctrl-G: toggle btw pane
+            KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.state.show_btw_pane = !self.state.show_btw_pane;
             }
             // Ctrl-O: toggle tool output folding
             KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -1757,6 +1793,16 @@ impl TuiApp {
                     self.system_message(format!("btw: {args}"));
                 }
             }
+            "search" | "find" => {
+                self.state.search.open();
+                if !args.is_empty() {
+                    self.state.search.query = args.to_string();
+                    let msgs = self.state.messages.clone();
+                    self.state.search.recompute(&msgs);
+                }
+                self.state.slash_menu = None;
+                self.state.list_picker = None;
+            }
             "prompts" | "prompt" => {
                 self.system_message(
                     "prompts:\n  /init — generate AGENTS.md\n  /compact — compress context\n  /goal — autonomous goal\n  /web — web search"
@@ -1847,6 +1893,54 @@ impl TuiApp {
                     ));
                 }
             }
+        }
+        Ok(())
+    }
+
+    fn handle_search_key(&mut self, key: KeyEvent) -> anyhow::Result<()> {
+        match key.code {
+            KeyCode::Esc => {
+                self.state.search.close();
+                self.state.highlight_message = None;
+            }
+            KeyCode::Enter => {
+                if let Some(hit) = self.state.search.current().cloned() {
+                    self.state.highlight_message = Some(hit.message_index);
+                    self.state.follow_bottom = false;
+                    // Jump roughly toward the selected message.
+                    let n = self.state.messages.len().max(1);
+                    let from_end = n.saturating_sub(hit.message_index + 1);
+                    let approx_lines = (from_end as u16).saturating_mul(6);
+                    self.state.scroll_up = approx_lines.min(self.state.max_scroll_up());
+                    self.state.search.close();
+                }
+            }
+            KeyCode::Up | KeyCode::BackTab => {
+                self.state.search.prev();
+                if let Some(hit) = self.state.search.current() {
+                    self.state.highlight_message = Some(hit.message_index);
+                }
+            }
+            KeyCode::Down | KeyCode::Tab => {
+                self.state.search.next();
+                if let Some(hit) = self.state.search.current() {
+                    self.state.highlight_message = Some(hit.message_index);
+                }
+            }
+            KeyCode::Backspace => {
+                self.state.search.query.pop();
+                let msgs = self.state.messages.clone();
+                self.state.search.recompute(&msgs);
+            }
+            KeyCode::Char(c)
+                if !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                self.state.search.query.push(c);
+                let msgs = self.state.messages.clone();
+                self.state.search.recompute(&msgs);
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -2029,6 +2123,7 @@ impl TuiApp {
                         self.state.thinking_text.push_str(&text);
                     }
                     AgentEvent::ToolCall { tool_name, input, .. } => {
+                        self.state.last_tool_name = Some(tool_name.clone());
                         let summary = serde_json::to_string(&input)
                             .unwrap_or_default()
                             .chars()
@@ -2301,6 +2396,8 @@ fn slash_help_text() -> String {
   Esc           - Interrupt / dismiss; Esc Esc undo turn\n\
   Shift-Tab     - Toggle plan mode\n\
   !             - Shell mode\n\
+  Ctrl-F / Ctrl-S - Search transcript\n\
+  Ctrl-G        - Toggle btw notes pane\n\
   Ctrl-O        - Fold tool output\n\
   Ctrl-T        - Expand/collapse todo panel\n\
   Mouse wheel   - Scroll history\n\n\

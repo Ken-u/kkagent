@@ -233,6 +233,13 @@ pub const BUILTIN_SLASH_COMMANDS: &[SlashCommand] = &[
         argument_hint: Some("<note>"),
     },
     SlashCommand {
+        name: "search",
+        aliases: &["find"],
+        description: "Search messages in the transcript (Ctrl-F)",
+        priority: 45,
+        argument_hint: Some("<query>"),
+    },
+    SlashCommand {
         name: "prompts",
         aliases: &["prompt"],
         description: "List prompt templates",

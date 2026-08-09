@@ -11,11 +11,15 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::{AppMode, AppState, DisplayPart, ListPickerState, MessageRole, PendingApproval, PendingQuestion, TodoItem};
 use crate::chrome;
+use crate::git_badge;
+use crate::panes::{self, BtwPane};
 use crate::theme::Theme;
 
 const TIPS: &[&str] = &[
     "/compact compresses context when it gets long",
+    "ctrl+f searches the transcript",
     "ctrl+o expands truncated tool output",
+    "ctrl+g toggles btw notes",
     "shift-tab toggles plan mode",
     "! enters shell mode",
     "/yolo auto-approves tools",
@@ -79,11 +83,36 @@ pub fn render_ui(f: &mut Frame, state: &mut AppState, config: &AppConfig) {
     state.status_bar.session_id = state.session_id.clone();
 
     render_messages(f, msg_area, state, &theme);
+    render_scroll_hint(f, msg_area, state, &theme);
     if todo_height > 0 {
         render_todo_panel(f, todo_area, state, &theme);
     }
     render_input(f, input_area, state, &theme);
     render_footer(f, chunks[3], state, config, &theme);
+
+    if state.show_btw_pane {
+        let pane_w = (size.width / 3).clamp(28, 48);
+        let n = state.btw_notes.len().max(1) as u16;
+        let pane_h = (n + 2).clamp(4, size.height.saturating_sub(4));
+        let area = Rect {
+            x: size.width.saturating_sub(pane_w + 1),
+            y: tab_height.saturating_add(1),
+            width: pane_w,
+            height: pane_h,
+        };
+        panes::render_btw(
+            f,
+            area,
+            &BtwPane {
+                notes: if state.btw_notes.is_empty() {
+                    vec!["(empty — /btw <note>)".into()]
+                } else {
+                    state.btw_notes.clone()
+                },
+            },
+            &theme,
+        );
+    }
 
     if let Some(ref mut approval) = state.approval_pending {
         render_approval_panel(f, size, approval, &theme);
@@ -101,6 +130,10 @@ pub fn render_ui(f: &mut Frame, state: &mut AppState, config: &AppConfig) {
 
     if state.tasks_panel.is_some() {
         render_tasks_panel(f, size, state, &theme);
+    }
+
+    if state.search.active {
+        render_search_overlay(f, size, state, &theme);
     }
 }
 
@@ -166,6 +199,10 @@ fn build_transcript_lines(state: &AppState, theme: &Theme, width: u16) -> Vec<Li
                     .fg(theme.primary)
                     .add_modifier(Modifier::BOLD),
             ),
+            Span::styled(
+                format!("  v{}", env!("CARGO_PKG_VERSION")),
+                Style::default().fg(theme.text_muted),
+            ),
         ]));
         lines.push(Line::from(Span::styled(
             "  coding agent for your terminal",
@@ -176,11 +213,28 @@ fn build_transcript_lines(state: &AppState, theme: &Theme, width: u16) -> Vec<Li
             "  type a message · /help · shift-tab plan · ! shell",
             Style::default().fg(theme.text_muted),
         )));
+        lines.push(Line::from(Span::styled(
+            "  ctrl+f search · ctrl+g btw · /compact · /model",
+            Style::default().fg(theme.text_muted),
+        )));
+        lines.push(Line::from(""));
+        let tip = TIPS[(state.tick / 100) % TIPS.len()];
+        lines.push(Line::from(vec![
+            Span::styled("  tip  ", Style::default().fg(theme.accent)),
+            Span::styled(tip.to_string(), Style::default().fg(theme.text_dim)),
+        ]));
         lines.push(Line::from(""));
         return lines;
     }
 
-    for msg in &state.messages {
+    for (msg_idx, msg) in state.messages.iter().enumerate() {
+        let highlight = state.highlight_message == Some(msg_idx);
+        if highlight {
+            lines.push(Line::from(Span::styled(
+                "─".repeat(width.min(40) as usize),
+                Style::default().fg(theme.accent),
+            )));
+        }
         match msg.role {
             MessageRole::User => {
                 // kimi: 用户标记 + 正文均为黄色（与 footer 的 yolo 同色）
@@ -332,6 +386,12 @@ fn build_transcript_lines(state: &AppState, theme: &Theme, width: u16) -> Vec<Li
                 lines.push(Line::from(""));
             }
         }
+        if highlight {
+            lines.push(Line::from(Span::styled(
+                "─".repeat(width.min(40) as usize),
+                Style::default().fg(theme.accent),
+            )));
+        }
     }
 
     match state.status {
@@ -361,20 +421,34 @@ fn build_transcript_lines(state: &AppState, theme: &Theme, width: u16) -> Vec<Li
                         Style::default().fg(theme.text_muted),
                     )));
                 }
-            } else {
                 lines.push(Line::from(Span::styled(
-                    format!("● {} thinking", ch),
-                    Style::default()
-                        .fg(theme.text_dim)
-                        .add_modifier(Modifier::ITALIC),
+                    format!("  {}", state.stream_cursor.glyph()),
+                    Style::default().fg(theme.primary),
                 )));
+            } else {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("● {} thinking ", ch),
+                        Style::default()
+                            .fg(theme.text_dim)
+                            .add_modifier(Modifier::ITALIC),
+                    ),
+                    Span::styled(
+                        state.stream_cursor.glyph().to_string(),
+                        Style::default().fg(theme.primary),
+                    ),
+                ]));
             }
         }
         SessionStatus::ToolExecuting => {
             let frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
             let ch = frames[(state.tick / 2) % frames.len()];
+            let tool = state
+                .last_tool_name
+                .as_deref()
+                .unwrap_or("tool");
             lines.push(Line::from(Span::styled(
-                format!("● {} running", ch),
+                format!("● {} running {tool}", ch),
                 Style::default()
                     .fg(theme.primary)
                     .add_modifier(Modifier::ITALIC),
@@ -738,7 +812,7 @@ fn render_input(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         AppMode::Normal => {
             if matches!(
                 state.status,
-                SessionStatus::Thinking | SessionStatus::ToolExecuting
+                SessionStatus::Thinking | SessionStatus::ToolExecuting | SessionStatus::WaitingApproval
             ) {
                 theme.primary
             } else {
@@ -763,8 +837,21 @@ fn render_input(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         AppMode::Normal => ("> ", Style::default().fg(theme.text)),
     };
 
+    let title = match state.mode {
+        AppMode::Shell => " shell ",
+        AppMode::Plan => " plan ",
+        AppMode::Normal => match state.status {
+            SessionStatus::Thinking => " thinking… ",
+            SessionStatus::ToolExecuting => " running… ",
+            SessionStatus::WaitingApproval => " approval ",
+            _ => " message ",
+        },
+    };
+
     let block = Block::default()
         .borders(Borders::ALL)
+        .title(title)
+        .title_style(Style::default().fg(border))
         .border_style(Style::default().fg(border));
 
     let inner = block.inner(area);
@@ -835,7 +922,7 @@ fn cursor_position(text: &str, cursor: usize, inner: Rect, prefix_w: u16) -> (u1
 }
 
 fn render_footer(f: &mut Frame, area: Rect, state: &AppState, config: &AppConfig, theme: &Theme) {
-    // Line 1: yolo  model  thinking  cwd ............ tip
+    // Line 1: yolo  model  thinking  cwd  git ............ tip
     let mut left: Vec<Span> = Vec::new();
 
     match state.permission_mode {
@@ -870,6 +957,19 @@ fn render_footer(f: &mut Frame, area: Rect, state: &AppState, config: &AppConfig
         left.push(Span::raw("  "));
     }
 
+    // Live spinner when agent is busy
+    if matches!(
+        state.status,
+        SessionStatus::Thinking | SessionStatus::ToolExecuting | SessionStatus::WaitingApproval
+    ) {
+        let frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+        let ch = frames[(state.tick / 2) % frames.len()];
+        left.push(Span::styled(
+            format!("{ch} "),
+            Style::default().fg(theme.primary),
+        ));
+    }
+
     left.push(Span::styled(
         model_label(config),
         Style::default().fg(theme.text),
@@ -889,10 +989,34 @@ fn render_footer(f: &mut Frame, area: Rect, state: &AppState, config: &AppConfig
             shorten_path(&cwd.to_string_lossy()),
             Style::default().fg(theme.text_dim),
         ));
+        let git = git_badge::git_badge(&cwd);
+        if let Some(badge) = git.render() {
+            left.push(Span::raw("  "));
+            left.push(Span::styled(
+                badge,
+                Style::default().fg(if git.dirty {
+                    theme.warning
+                } else {
+                    theme.text_dim
+                }),
+            ));
+        }
+    }
+
+    if !state.btw_notes.is_empty() {
+        left.push(Span::raw("  "));
+        left.push(Span::styled(
+            format!("btw:{}", state.btw_notes.len()),
+            Style::default().fg(theme.accent),
+        ));
     }
 
     let tip = if state.quit_confirm {
         "press ctrl-c again to quit".to_string()
+    } else if state.search.active {
+        "↑↓ navigate · enter jump · esc close".to_string()
+    } else if !state.follow_bottom && state.scroll_up > 0 {
+        format!("↑{} lines · end to follow", state.scroll_up)
     } else {
         TIPS[(state.tick / 80) % TIPS.len()].to_string()
     };
@@ -915,19 +1039,131 @@ fn render_footer(f: &mut Frame, area: Rect, state: &AppState, config: &AppConfig
         ));
     }
 
-    // Line 2: context on the right
+    // Line 2: context on the right (+ session id snip)
     let context = format_context(state, config);
-    let ctx_w = UnicodeWidthStr::width(context.as_str()) as u16;
+    let mut right = context;
+    if let Some(ref sid) = state.session_id {
+        let short = if sid.len() > 8 { &sid[..8] } else { sid.as_str() };
+        right = format!("{right}  ·  {short}");
+    }
+    let ctx_w = UnicodeWidthStr::width(right.as_str()) as u16;
     let pad2 = area.width.saturating_sub(ctx_w);
     let line2 = Line::from(vec![
         Span::raw(" ".repeat(pad2 as usize)),
-        Span::styled(context, Style::default().fg(theme.text)),
+        Span::styled(right, Style::default().fg(theme.text)),
     ]);
 
     f.render_widget(
         Paragraph::new(Text::from(vec![Line::from(line1_spans), line2])),
         area,
     );
+}
+
+fn render_scroll_hint(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    if state.follow_bottom || state.scroll_up == 0 || area.height < 2 {
+        return;
+    }
+    let max = state.max_scroll_up();
+    if max == 0 {
+        return;
+    }
+    let label = format!(" ↑ {} / {} ", state.scroll_up, max);
+    let w = UnicodeWidthStr::width(label.as_str()) as u16;
+    if w >= area.width {
+        return;
+    }
+    let hint_area = Rect {
+        x: area.x + area.width.saturating_sub(w + 1),
+        y: area.y,
+        width: w,
+        height: 1,
+    };
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            label,
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        )),
+        hint_area,
+    );
+}
+
+fn render_search_overlay(f: &mut Frame, size: Rect, state: &AppState, theme: &Theme) {
+    let width = size.width.saturating_sub(4).min(72).max(24);
+    let hit_rows = state.search.hits.len().min(10) as u16;
+    let height = hit_rows + 4; // title + query + hits + hint
+    let area = Rect {
+        x: size.x + (size.width.saturating_sub(width)) / 2,
+        y: size.y + (size.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+    f.render_widget(Clear, area);
+
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(vec![
+        Span::styled(" find ", Style::default().fg(theme.primary).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            format!(" {} ", state.search.query),
+            Style::default().fg(theme.text_strong).bg(theme.border),
+        ),
+        Span::styled(
+            if state.search.query.is_empty() {
+                " type to search…".into()
+            } else {
+                format!("  {}/{}", state.search.selected.saturating_add(1).min(state.search.hits.len().max(1)), state.search.hits.len())
+            },
+            Style::default().fg(theme.text_muted),
+        ),
+    ]));
+    lines.push(Line::from(Span::styled(
+        "─".repeat(width.saturating_sub(2) as usize),
+        Style::default().fg(theme.border),
+    )));
+
+    if state.search.hits.is_empty() {
+        lines.push(Line::from(Span::styled(
+            if state.search.query.is_empty() {
+                "  start typing…"
+            } else {
+                "  no matches"
+            },
+            Style::default().fg(theme.text_muted),
+        )));
+    } else {
+        let start = state.search.selected.saturating_sub(4);
+        for (i, hit) in state.search.hits.iter().enumerate().skip(start).take(10) {
+            let selected = i == state.search.selected;
+            let marker = if selected { "›" } else { " " };
+            let style = if selected {
+                Style::default()
+                    .fg(theme.text_strong)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme.text_dim)
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!(" {marker} "), style),
+                Span::styled(
+                    format!("{:8} ", hit.role),
+                    Style::default().fg(if selected { theme.accent } else { theme.text_muted }),
+                ),
+                Span::styled(truncate(&hit.preview, (width as usize).saturating_sub(14)), style),
+            ]));
+        }
+    }
+
+    lines.push(Line::from(Span::styled(
+        " ↑↓ select · enter jump · esc close",
+        Style::default().fg(theme.text_muted),
+    )));
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.border_focus))
+        .title(" search ");
+    f.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
 }
 
 fn spans_to_string_approx(spans: &[Span]) -> String {

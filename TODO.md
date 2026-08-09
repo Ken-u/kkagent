@@ -24,6 +24,9 @@
 |------|------|
 | pi-tui 编辑器原语 + chrome + reverse-rpc + controllers | **已实现** |
 | **terminal-image**（Kitty / iTerm2 协议编码） | **已实现** |
+| Welcome / footer git 徽章 / 流式光标 / 滚动提示 | **已实现** |
+| Ctrl-F 转录搜索 overlay + `/search` | **已实现** |
+| Ctrl-G btw 侧栏 + 输入框状态标题 | **已实现** |
 
 ## 四、REST / WS / ACP
 

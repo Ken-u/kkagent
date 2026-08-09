@@ -10,5 +10,7 @@ pub mod pi;
 pub mod chrome;
 pub mod reverse_rpc;
 pub mod controllers;
+pub mod git_badge;
+pub mod search;
 
 pub use app::TuiApp;
