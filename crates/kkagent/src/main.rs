@@ -1196,26 +1196,17 @@ async fn handle_rpc_call(
                 .and_then(|v| v.as_u64())
                 .unwrap_or(1) as usize;
 
-            let mut undone = 0usize;
-            let mut keep = 0usize;
-            {
+            let (undone, keep) = {
                 let mut sessions = state.sessions.lock().await;
                 let session = sessions
                     .get_mut(&session_id)
                     .ok_or_else(|| (-32602, format!("Session not found: {}", session_id)))?;
-                for _ in 0..count {
-                    match session.undo_last_turn() {
-                        Ok(n) => {
-                            keep = n;
-                            undone += 1;
-                        }
-                        Err(_) => break,
-                    }
-                }
-                if undone == 0 {
+                let result = kkagent_core::UndoService::undo_turns(session, count);
+                if result.undone_turns == 0 {
                     return Err((-32000, "Nothing to undo".into()));
                 }
-            }
+                (result.undone_turns, result.message_count)
+            };
             {
                 let db = state.transcript.lock().await;
                 let _ = db.truncate_messages(&session_id, keep);
@@ -1317,6 +1308,93 @@ async fn handle_rpc_call(
             }
 
             Ok(serde_json::json!({"ok": true, "deleted": deleted, "summary": summary_text}))
+        }
+        "swarm.enter" => {
+            let session_id = params
+                .as_ref()
+                .and_then(|p| p.get("session_id"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .or_else(|| {
+                    // fall back: first live session
+                    None
+                });
+            let trigger = match params
+                .as_ref()
+                .and_then(|p| p.get("trigger"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("slash")
+            {
+                "tool" => kkagent_core::SwarmModeTrigger::Tool,
+                "auto" => kkagent_core::SwarmModeTrigger::Auto,
+                _ => kkagent_core::SwarmModeTrigger::Slash,
+            };
+            let mut sessions = state.sessions.lock().await;
+            let session = if let Some(id) = session_id {
+                sessions
+                    .get_mut(&id)
+                    .ok_or_else(|| (-32602, format!("Session not found: {id}")))?
+            } else {
+                sessions
+                    .values_mut()
+                    .next()
+                    .ok_or_else(|| (-32000, "No active session".into()))?
+            };
+            let reminder = session.swarm.enter(trigger);
+            if let Some(r) = reminder {
+                session.add_user_message(r.into());
+            }
+            Ok(serde_json::json!({
+                "ok": true,
+                "active": session.swarm.is_active(),
+                "roster": session.swarm.roster().iter().map(|m| {
+                    serde_json::json!({"id": m.id, "role": m.role, "status": m.status})
+                }).collect::<Vec<_>>(),
+            }))
+        }
+        "swarm.exit" => {
+            let session_id = params
+                .as_ref()
+                .and_then(|p| p.get("session_id"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let mut sessions = state.sessions.lock().await;
+            let session = if let Some(id) = session_id {
+                sessions
+                    .get_mut(&id)
+                    .ok_or_else(|| (-32602, format!("Session not found: {id}")))?
+            } else {
+                sessions
+                    .values_mut()
+                    .next()
+                    .ok_or_else(|| (-32000, "No active session".into()))?
+            };
+            let reminder = session.swarm.exit();
+            if let Some(r) = reminder {
+                session.add_user_message(r.into());
+            }
+            Ok(serde_json::json!({"ok": true, "active": false}))
+        }
+        "session.usage" => {
+            let session_id = params
+                .as_ref()
+                .and_then(|p| p.get("session_id"))
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| (-32602, "Missing session_id".into()))?;
+            let sessions = state.sessions.lock().await;
+            let session = sessions
+                .get(session_id)
+                .ok_or_else(|| (-32602, format!("Session not found: {session_id}")))?;
+            let snap = session.usage.snapshot();
+            Ok(serde_json::json!({
+                "input_tokens": snap.input_tokens,
+                "output_tokens": snap.output_tokens,
+                "cache_read_input_tokens": snap.cache_read_input_tokens,
+                "cache_creation_input_tokens": snap.cache_creation_input_tokens,
+                "steps": snap.steps,
+                "turns": snap.turns,
+                "cache_hit_ratio": snap.cache_hit_ratio(),
+            }))
         }
         "tasks.list" => {
             let all = state.subagents.list_all().await;

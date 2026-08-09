@@ -185,6 +185,8 @@ Progress: turns={}/{:?} tokens={}/{:?}. Continue working toward this goal.\n</sy
             }
         }
 
+        session.usage.begin_turn();
+
         let mut tool_defs: Vec<ToolDef> = self
             .tools
             .tool_definitions()
@@ -340,15 +342,20 @@ Do not mention this reminder to the user.\n</system-reminder>".into(),
                             session
                                 .token_counter
                                 .record_measured(usage.input_tokens, usage.output_tokens);
-                            let _ = self.event_tx.send(AgentEvent::UsageUpdate {
-                                session_id: session_id.clone(),
-                                usage: kkagent_protocol::TokenUsage {
-                                    input_tokens: usage.input_tokens,
-                                    output_tokens: usage.output_tokens,
-                                    cache_creation_input_tokens: usage.cache_creation_input_tokens,
-                                    cache_read_input_tokens: usage.cache_read_input_tokens,
-                                },
-                            }).await;
+                            let tu = kkagent_protocol::TokenUsage {
+                                input_tokens: usage.input_tokens,
+                                output_tokens: usage.output_tokens,
+                                cache_creation_input_tokens: usage.cache_creation_input_tokens,
+                                cache_read_input_tokens: usage.cache_read_input_tokens,
+                            };
+                            session.usage.record(&tu);
+                            let _ = self
+                                .event_tx
+                                .send(AgentEvent::UsageUpdate {
+                                    session_id: session_id.clone(),
+                                    usage: tu,
+                                })
+                                .await;
                         }
                         StreamEvent::Error(msg) => {
                             tracing::error!("Stream error: {}", msg);
@@ -446,6 +453,32 @@ Do not mention this reminder to the user.\n</system-reminder>".into(),
         }
 
         if !tool_calls.is_empty() {
+            // AgentSwarm exclusivity (swarm domain).
+            let names: Vec<String> = tool_calls.iter().map(|t| t.name.clone()).collect();
+            if let Some(reason) = crate::swarm::SwarmService::veto_mixed_agent_swarm(&names) {
+                for tc in &tool_calls {
+                    session.messages.push(ChatMessage {
+                        role: "user".into(),
+                        content: vec![ChatContent::ToolResult {
+                            tool_use_id: tc.id.clone(),
+                            content: reason.clone(),
+                            is_error: true,
+                        }],
+                    });
+                    let _ = self
+                        .event_tx
+                        .send(AgentEvent::ToolResult {
+                            session_id: session_id.clone(),
+                            tool_call_id: tc.id.clone(),
+                            tool_name: tc.name.clone(),
+                            output: reason.clone(),
+                            is_error: true,
+                        })
+                        .await;
+                }
+                return self.run_turn_inner(session, rounds_left.saturating_sub(1)).await;
+            }
+
             // Same-step + cross-turn tool dedupe.
             let call_pairs: Vec<(String, serde_json::Value)> = tool_calls
                 .iter()
@@ -679,13 +712,22 @@ Do not mention this reminder to the user.\n</system-reminder>".into(),
                     if let Some(data) = &output.data {
                         if data.get("tools").map(|v| v.is_null()).unwrap_or(false) {
                             session.enabled_tools = None;
+                            session.tool_policy.layers_mut().profile.tools = None;
                         } else if let Some(arr) = data.get("tools").and_then(|v| v.as_array()) {
-                            session.enabled_tools = Some(
-                                arr.iter()
-                                    .filter_map(|v| v.as_str().map(String::from))
-                                    .collect(),
-                            );
+                            let set: std::collections::HashSet<String> = arr
+                                .iter()
+                                .filter_map(|v| v.as_str().map(String::from))
+                                .collect();
+                            session.tool_policy.layers_mut().profile.tools =
+                                Some(set.iter().cloned().collect());
+                            session.enabled_tools = Some(set);
                         }
+                    }
+                }
+                if (name == "AgentSwarm" || name == "Task") && !output.is_error {
+                    if let Some(reminder) = session.swarm.enter(crate::swarm::SwarmModeTrigger::Tool)
+                    {
+                        session.add_user_message(reminder.into());
                     }
                 }
 
@@ -824,6 +866,9 @@ Do not mention this reminder to the user.\n</system-reminder>".into(),
     }
 
     async fn finish_turn(&self, session: &mut Session, record_goal: bool) -> anyhow::Result<()> {
+        if let Some(reminder) = session.swarm.on_turn_end() {
+            session.add_user_message(reminder.into());
+        }
         let session_id = session.id.clone();
         if record_goal {
             if let Some(goal_mgr) = &self.goal_mgr {
@@ -907,7 +952,10 @@ Do not mention this reminder to the user.\n</system-reminder>".into(),
         };
 
         let opts = ProjectOptions::default();
-        let mut messages = project(&session.build_messages(), &opts);
+        // contextMemory: drop vacuous noise + loop-event markers before project.
+        let _ = crate::context_memory::fold_vacuous(&mut session.messages);
+        let projected = crate::context_memory::fold_loop_events(&session.build_messages());
+        let mut messages = project(&projected, &opts);
         let mut req = session
             .token_counter
             .request_size(system, tools, &messages);
@@ -1121,6 +1169,15 @@ fn todo_items_from_output(output: &ToolOutput) -> Option<Vec<kkagent_protocol::T
 }
 
 fn tool_allowed(session: &Session, name: &str) -> bool {
+    if !session.tool_policy.is_active(name) {
+        // Always keep disclosure / interaction primitives available.
+        if !matches!(
+            name,
+            "SelectTools" | "AskUserQuestion" | "TodoList" | "ExitPlanMode" | "EnterPlanMode"
+        ) {
+            return false;
+        }
+    }
     tool_allowed_set(session.enabled_tools.as_ref(), name)
 }
 

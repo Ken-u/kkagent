@@ -10,6 +10,7 @@ use kkagent_protocol::{PermissionMode, SessionStatus};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::{AppMode, AppState, DisplayPart, ListPickerState, MessageRole, PendingApproval, PendingQuestion, TodoItem};
+use crate::chrome;
 use crate::theme::Theme;
 
 const TIPS: &[&str] = &[
@@ -36,20 +37,23 @@ pub fn render_ui(f: &mut Frame, state: &mut AppState, config: &AppConfig) {
     // Sticky todo sits above the input (highest visual priority).
     let todo_height = todo_panel_height(state);
 
-    // kimi 布局：消息区 | todo(可选) | 带边框输入框 | footer 两行
+    // kimi 布局：tabs(可选) | 消息区 | todo(可选) | 带边框输入框 | footer 两行
+    let tab_height = if state.tab_strip.tabs.len() > 1 { 1 } else { 0 };
     let input_inner = input_inner_height(state);
     let input_box = input_inner + 2; // borders
     let bottom_stack = todo_height + input_box + slash_height;
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
+            Constraint::Length(tab_height),
             Constraint::Min(1),
             Constraint::Length(bottom_stack),
             Constraint::Length(2),
         ])
         .split(size);
 
-    let bottom = chunks[1];
+    let msg_area = chunks[1];
+    let bottom = chunks[2];
     let bottom_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -63,12 +67,23 @@ pub fn render_ui(f: &mut Frame, state: &mut AppState, config: &AppConfig) {
     let slash_area = bottom_chunks[1];
     let input_area = bottom_chunks[2];
 
-    render_messages(f, chunks[0], state, &theme);
+    if tab_height > 0 {
+        chrome::draw_tab_strip(f, chunks[0], &state.tab_strip, &theme);
+    }
+    // Keep status_bar in sync for chrome consumers / future status line.
+    state.status_bar.permission = state.permission_mode;
+    state.status_bar.plan_mode = state.plan_mode;
+    state.status_bar.status = state.status.clone();
+    state.status_bar.tokens = state.approx_tokens;
+    state.status_bar.model = state.model_alias.clone();
+    state.status_bar.session_id = state.session_id.clone();
+
+    render_messages(f, msg_area, state, &theme);
     if todo_height > 0 {
         render_todo_panel(f, todo_area, state, &theme);
     }
     render_input(f, input_area, state, &theme);
-    render_footer(f, chunks[2], state, config, &theme);
+    render_footer(f, chunks[3], state, config, &theme);
 
     if let Some(ref mut approval) = state.approval_pending {
         render_approval_panel(f, size, approval, &theme);

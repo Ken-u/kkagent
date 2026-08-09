@@ -1,8 +1,8 @@
 use std::io;
 use crossterm::{
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
-        MouseEventKind,
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, KeyCode, KeyEvent, KeyModifiers, MouseEventKind,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -15,8 +15,11 @@ use kkagent_protocol::{Frame, AgentEvent, PermissionMode, SessionStatus};
 use kkagent_client::KkagentClient;
 use kkagent_config::AppConfig;
 
+use crate::chrome::{StatusBarModel, TabStrip};
 use crate::components;
+use crate::controllers::SessionEventRouter;
 use crate::input::InputState;
+use crate::pi::{map_key, EditorAction};
 use crate::slash::{
     self, filter_slash_commands, find_slash_command, is_slash_name_completion, parse_slash_input,
     SlashSuggestion,
@@ -86,6 +89,12 @@ pub struct AppState {
     pub model_alias: Option<String>,
     /// Streaming cursor for live assistant deltas.
     pub stream_cursor: crate::streaming::StreamingCursor,
+    /// Multi-session tab strip (chrome).
+    pub tab_strip: TabStrip,
+    /// Compact status model for chrome / footer sync.
+    pub status_bar: StatusBarModel,
+    /// Session event router (controllers).
+    pub event_router: SessionEventRouter,
 }
 
 #[derive(Debug, Clone)]
@@ -260,6 +269,13 @@ impl AppState {
             btw_notes: Vec::new(),
             model_alias: None,
             stream_cursor: crate::streaming::StreamingCursor::default(),
+            tab_strip: TabStrip::default(),
+            status_bar: StatusBarModel {
+                permission: permission_mode,
+                plan_mode,
+                ..Default::default()
+            },
+            event_router: SessionEventRouter::default(),
         }
     }
 
@@ -371,6 +387,8 @@ impl TuiApp {
                     .client
                     .create_session(Some(&cwd), Some(self.state.permission_mode))
                     .await?;
+                self.state.tab_strip.ensure_active(&session_id, "main");
+                self.state.status_bar.session_id = Some(session_id.clone());
                 self.state.session_id = Some(session_id);
             }
         } else {
@@ -378,6 +396,8 @@ impl TuiApp {
                 .client
                 .create_session(Some(&cwd), Some(self.state.permission_mode))
                 .await?;
+            self.state.tab_strip.ensure_active(&session_id, "main");
+            self.state.status_bar.session_id = Some(session_id.clone());
             self.state.session_id = Some(session_id);
         }
 
@@ -398,7 +418,12 @@ impl TuiApp {
             )
         })?;
         let mut stdout = io::stdout();
-        if let Err(e) = execute!(stdout, EnterAlternateScreen, EnableMouseCapture) {
+        if let Err(e) = execute!(
+            stdout,
+            EnterAlternateScreen,
+            EnableMouseCapture,
+            EnableBracketedPaste
+        ) {
             let _ = disable_raw_mode();
             return Err(e.into());
         }
@@ -423,6 +448,7 @@ impl TuiApp {
         let _ = disable_raw_mode();
         let _ = execute!(
             terminal.backend_mut(),
+            DisableBracketedPaste,
             LeaveAlternateScreen,
             DisableMouseCapture
         );
@@ -451,8 +477,18 @@ impl TuiApp {
                 match event::read()? {
                     Event::Key(key) => self.handle_key(key).await?,
                     Event::Mouse(mouse) => self.handle_mouse(mouse),
+                    Event::Paste(text) => {
+                        self.state.input.paste_chunk(&text);
+                        self.state.input.force_flush_paste();
+                        self.state.refresh_slash_menu();
+                    }
                     Event::Resize(_, _) => {}
                     _ => {}
+                }
+            } else {
+                // Debounced paste flush (pi-tui paste-burst)
+                if self.state.input.flush_paste() {
+                    self.state.refresh_slash_menu();
                 }
             }
 
@@ -778,10 +814,15 @@ impl TuiApp {
                 }
                 self.state.quit_confirm = false;
             }
+            // Ctrl+Shift-Tab: previous session tab
+            KeyCode::BackTab if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.state.tab_strip.prev();
+            }
             // Shift-Tab: toggle plan mode
             KeyCode::BackTab => {
                 self.state.plan_mode = !self.state.plan_mode;
                 self.state.mode = if self.state.plan_mode { AppMode::Plan } else { AppMode::Normal };
+                self.state.status_bar.plan_mode = self.state.plan_mode;
                 if let Some(sid) = &self.state.session_id {
                     self.client.set_plan_mode(sid, self.state.plan_mode).await?;
                 }
@@ -818,6 +859,62 @@ impl TuiApp {
                     self.state.todos_expanded = !self.state.todos_expanded;
                 }
             }
+            // Emacs/pi-tui editor bindings (kill/yank/undo/word nav)
+            KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.state.input.kill_line();
+                self.state.refresh_slash_menu();
+            }
+            KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.state.input.kill_word();
+                self.state.refresh_slash_menu();
+            }
+            KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.state.input.yank();
+                self.state.refresh_slash_menu();
+            }
+            KeyCode::Char('z') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                let _ = self.state.input.undo_edit();
+                self.state.refresh_slash_menu();
+            }
+            KeyCode::Char('Z') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                let _ = self.state.input.redo_edit();
+                self.state.refresh_slash_menu();
+            }
+            KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.state.input.move_home();
+            }
+            KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.state.input.move_end();
+            }
+            KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.state.input.move_left();
+            }
+            KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.state.input.move_right();
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.state.input.clear();
+                self.state.slash_menu = None;
+            }
+            KeyCode::Left
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    || key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                self.state.input.move_word_left();
+            }
+            KeyCode::Right
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    || key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                self.state.input.move_word_right();
+            }
+            KeyCode::Delete => {
+                self.state.input.delete();
+                self.state.refresh_slash_menu();
+            }
+            KeyCode::Tab if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.state.tab_strip.next();
+            }
             // Normal character input
             KeyCode::Char(c) => {
                 self.state.pending_esc_ms = None;
@@ -827,13 +924,27 @@ impl TuiApp {
                     self.state.mode = AppMode::Shell;
                     self.state.slash_menu = None;
                 } else {
-                    self.state.input.insert_char(c);
-                    self.state.refresh_slash_menu();
+                    // Prefer pi key map for plain inserts
+                    match map_key(key) {
+                        EditorAction::Insert(ch) => {
+                            self.state.input.insert_char(ch);
+                            self.state.refresh_slash_menu();
+                        }
+                        _ => {
+                            self.state.input.insert_char(c);
+                            self.state.refresh_slash_menu();
+                        }
+                    }
                 }
             }
             KeyCode::Backspace => {
                 if self.state.input.is_empty() && self.state.mode == AppMode::Shell {
                     self.state.mode = AppMode::Normal;
+                } else if key.modifiers.contains(KeyModifiers::ALT)
+                    || key.modifiers.contains(KeyModifiers::CONTROL)
+                {
+                    self.state.input.kill_word();
+                    self.state.refresh_slash_menu();
                 } else {
                     self.state.input.backspace();
                     self.state.refresh_slash_menu();
@@ -1297,6 +1408,8 @@ impl TuiApp {
                     .client
                     .create_session(Some(&cwd), Some(self.state.permission_mode))
                     .await?;
+                self.state.tab_strip.ensure_active(&session_id, "main");
+                self.state.status_bar.session_id = Some(session_id.clone());
                 self.state.session_id = Some(session_id);
                 if self.state.plan_mode {
                     if let Some(ref sid) = self.state.session_id.clone() {
@@ -1543,8 +1656,33 @@ impl TuiApp {
                 }
             }
             "swarm" => {
-                self.open_tasks_panel().await?;
-                self.system_message("swarm: showing tasks/subagents panel".into());
+                match args.as_str() {
+                    "enter" | "on" => {
+                        let mut params = serde_json::json!({ "trigger": "slash" });
+                        if let Some(sid) = &self.state.session_id {
+                            params["session_id"] = serde_json::json!(sid);
+                        }
+                        match self.client.rpc_call("swarm.enter", Some(params)).await {
+                            Ok(v) => self.system_message(format!("swarm enter: {v}")),
+                            Err(e) => self.system_message(format!("swarm enter failed: {e}")),
+                        }
+                    }
+                    "exit" | "off" => {
+                        let params = self.state.session_id.as_ref().map(|sid| {
+                            serde_json::json!({ "session_id": sid })
+                        });
+                        match self.client.rpc_call("swarm.exit", params).await {
+                            Ok(v) => self.system_message(format!("swarm exit: {v}")),
+                            Err(e) => self.system_message(format!("swarm exit failed: {e}")),
+                        }
+                    }
+                    _ => {
+                        self.open_tasks_panel().await?;
+                        self.system_message(
+                            "swarm: panel open. Use /swarm enter|exit to toggle mode.".into(),
+                        );
+                    }
+                }
             }
             "provider" | "providers" => {
                 let mut lines = String::from("Providers / models:\n");
@@ -1590,9 +1728,25 @@ impl TuiApp {
                 if args.is_empty() {
                     self.system_message("Usage: /add-dir <path>".into());
                 } else {
-                    self.system_message(format!(
-                        "Noted extra workdir `{args}` (trusted_workspaces update requires config edit)."
-                    ));
+                    let path = std::path::PathBuf::from(args);
+                    let abs = if path.is_absolute() {
+                        path
+                    } else {
+                        std::env::current_dir()
+                            .unwrap_or_else(|_| std::path::PathBuf::from("."))
+                            .join(path)
+                    };
+                    if abs.is_dir() {
+                        // Persist as a soft note for this session + surface to user.
+                        self.state.btw_notes.push(format!("add-dir:{}", abs.display()));
+                        self.system_message(format!(
+                            "Added directory to session notes: {}\n\
+                             Tip: also add under [permissions].trusted_workspaces in config.toml for persistence.",
+                            abs.display()
+                        ));
+                    } else {
+                        self.system_message(format!("Not a directory: {}", abs.display()));
+                    }
                 }
             }
             "btw" => {
@@ -1839,6 +1993,11 @@ impl TuiApp {
     fn handle_server_event(&mut self, frame: Frame) {
         if let Frame::Event { event: _, data, .. } = frame {
             if let Ok(evt) = serde_json::from_value::<AgentEvent>(data) {
+                self.state.event_router.on_event(
+                    &evt,
+                    &mut self.state.tab_strip,
+                    &mut self.state.status_bar,
+                );
                 match evt {
                     AgentEvent::MessageDelta { text, .. } => {
                         let pending_thinking = if !self.state.thinking_text.is_empty() {

@@ -57,6 +57,12 @@ pub struct Session {
     pub tool_dedupe: crate::tool_dedupe::ToolDedupeTracker,
     /// Session token counter (measured anchors + estimates).
     pub token_counter: crate::token_counting::TokenCounter,
+    /// Layered tool activation policy (SelectTools + workspace/session disables).
+    pub tool_policy: crate::tool_policy::ToolPolicyService,
+    /// Swarm mode roster / enter-exit.
+    pub swarm: crate::swarm::SwarmService,
+    /// Aggregated token/step usage.
+    pub usage: crate::usage::UsageService,
 }
 
 impl Session {
@@ -98,6 +104,9 @@ impl Session {
             token_counter: crate::token_counting::TokenCounter::new(
                 crate::token_counting::TokenCountingStrategy::MeasuredPlusEstimated,
             ),
+            tool_policy: crate::tool_policy::ToolPolicyService::new(),
+            swarm: crate::swarm::SwarmService::new(),
+            usage: crate::usage::UsageService::new(),
         }
     }
 
@@ -192,6 +201,30 @@ impl Session {
     }
 
     pub fn add_user_message(&mut self, text: String) {
+        let mut text = text;
+        // media pipeline: annotate @path mentions when files exist & within limits
+        let limits = crate::media_pipeline::MediaLimits::default();
+        for p in crate::media_pipeline::extract_at_paths(&text) {
+            let path = if PathBuf::from(&p).is_absolute() {
+                PathBuf::from(&p)
+            } else {
+                self.working_dir.join(&p)
+            };
+            match crate::media_pipeline::resolve_media(&path, &limits) {
+                Ok(m) => {
+                    text.push_str(&format!(
+                        "\n<media-ref path=\"{}\" kind=\"{:?}\" mime=\"{}\" bytes=\"{}\"/>",
+                        m.path.display(),
+                        m.kind,
+                        m.mime,
+                        m.bytes
+                    ));
+                }
+                Err(e) => {
+                    tracing::debug!("media resolve skipped for {p}: {e}");
+                }
+            }
+        }
         self.messages.push(ChatMessage {
             role: "user".into(),
             content: vec![ChatContent::Text { text }],
