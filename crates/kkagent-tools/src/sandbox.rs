@@ -57,11 +57,18 @@ impl Default for SandboxPolicy {
 impl SandboxPolicy {
     pub fn from_config(config: &kkagent_config::SandboxConfig) -> anyhow::Result<Self> {
         let mode = match config.mode.trim().to_ascii_lowercase().as_str() {
+            "auto" => {
+                if cfg!(target_os = "windows") {
+                    SandboxMode::Process
+                } else {
+                    SandboxMode::Workspace
+                }
+            }
             "disabled" | "off" | "none" => SandboxMode::Disabled,
             "process" => SandboxMode::Process,
             "workspace" | "strict" => SandboxMode::Workspace,
             other => anyhow::bail!(
-                "invalid sandbox.mode {other:?}; expected disabled, process, or workspace"
+                "invalid sandbox.mode {other:?}; expected auto, disabled, process, or workspace"
             ),
         };
         if config.memory_mb < 64 || config.cpu_seconds == 0 || config.max_processes == 0 {
@@ -150,6 +157,7 @@ impl SandboxPolicy {
                     windows_sys::Win32::Foundation::CloseHandle(job);
                     return Err(std::io::Error::last_os_error().into());
                 }
+                resume_process_thread(pid)?;
                 Ok(SandboxProcessGuard(job))
             }
         }
@@ -324,12 +332,50 @@ fn apply_resource_limits(command: &mut Command, policy: &SandboxPolicy) -> anyho
     }
     #[cfg(windows)]
     {
+        use std::os::windows::process::CommandExt;
+        use windows_sys::Win32::System::Threading::CREATE_SUSPENDED;
+        command.as_std_mut().creation_flags(CREATE_SUSPENDED);
         let _ = command;
         if policy.mode == SandboxMode::Workspace {
             anyhow::bail!("workspace sandbox is unavailable on Windows");
         }
     }
     Ok(())
+}
+
+#[cfg(windows)]
+fn resume_process_thread(pid: u32) -> anyhow::Result<()> {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
+    };
+    use windows_sys::Win32::System::Threading::{OpenThread, ResumeThread, THREAD_SUSPEND_RESUME};
+    unsafe {
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        if snapshot == INVALID_HANDLE_VALUE {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let mut entry: THREADENTRY32 = std::mem::zeroed();
+        entry.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
+        let mut found = Thread32First(snapshot, &mut entry) != 0;
+        while found {
+            if entry.th32OwnerProcessID == pid {
+                let thread = OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID);
+                if !thread.is_null() {
+                    let resumed = ResumeThread(thread);
+                    CloseHandle(thread);
+                    CloseHandle(snapshot);
+                    if resumed == u32::MAX {
+                        return Err(std::io::Error::last_os_error().into());
+                    }
+                    return Ok(());
+                }
+            }
+            found = Thread32Next(snapshot, &mut entry) != 0;
+        }
+        CloseHandle(snapshot);
+        anyhow::bail!("cannot locate suspended main thread for process {pid}")
+    }
 }
 
 #[cfg(unix)]

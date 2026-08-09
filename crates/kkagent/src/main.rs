@@ -928,7 +928,7 @@ impl kkagent_acp::AcpHost for AgentAcpHost {
                 .ok_or_else(|| "session not found".to_string())?;
             session.add_user_message(text.to_string());
         }
-        run_http_turn(self.state.clone(), session_id)
+        run_http_turn(self.state.clone(), session_id, None)
             .await
             .map_err(|e| e.to_string())?;
         let sessions = self.state.sessions.lock().await;
@@ -1307,7 +1307,7 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
         let durable_task_id = task_id.map(str::to_string);
         tokio::spawn(async move {
             let _turn_permit = turn_permit;
-            let result = run_http_turn(state.clone(), &sid).await;
+            let result = run_http_turn(state.clone(), &sid, durable_task_id.clone()).await;
             if let Some(task_id) = durable_task_id {
                 match &result {
                     Ok(()) => {
@@ -1423,6 +1423,7 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
             "default_model": self.state.config.default_model,
             "config_dir": kkagent_config::default_config_dir().display().to_string(),
             "mcp_servers": self.state.config.mcp_servers.len(),
+            "sandbox": self.state.sandbox_policy.mode_name(),
         })
     }
 
@@ -1626,16 +1627,22 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
 
     async fn health(&self) -> serde_json::Value {
         let persistence_responding = self.state.transcript.lock().await.list_sessions(1).is_ok();
+        let task_persistence_responding = self.state.durable_http.list_turns(1).is_ok();
         serde_json::json!({
             "status": "ok",
             "uptime_seconds": self.state.started_at.elapsed().as_secs(),
             "persistence": {
                 "durable": self.state.persistence_durable,
                 "responding": persistence_responding,
+                "tasks_responding": task_persistence_responding,
                 "error": self.state.persistence_error,
             },
             "sessions": self.state.sessions.lock().await.len(),
             "mcp_servers": self.state.config.mcp_servers.len(),
+            "sandbox": {
+                "mode": self.state.sandbox_policy.mode_name(),
+                "network": self.state.sandbox_policy.network,
+            },
         })
     }
 
@@ -1653,6 +1660,10 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
             .await
             .list_sessions(1)
             .map_err(|error| format!("transcript persistence unavailable: {error}"))?;
+        self.state
+            .durable_http
+            .list_turns(1)
+            .map_err(|error| format!("task persistence unavailable: {error}"))?;
         Ok(serde_json::json!({
             "status": "ready",
             "persistence": "durable",
@@ -1842,12 +1853,23 @@ async fn build_turn_tool_registry(
     tools
 }
 
-async fn run_http_turn(state: Arc<ServerState>, session_id: &str) -> anyhow::Result<()> {
+async fn run_http_turn(
+    state: Arc<ServerState>,
+    session_id: &str,
+    durable_task_id: Option<String>,
+) -> anyhow::Result<()> {
     let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(64);
     let live_events = state.events.clone();
     let event_state = state.clone();
     tokio::spawn(async move {
         while let Some(event) = event_rx.recv().await {
+            if matches!(event, AgentEvent::ApprovalRequested { .. }) {
+                if let Some(task_id) = durable_task_id.as_deref() {
+                    let _ = event_state
+                        .durable_http
+                        .finish_turn(task_id, "waiting_approval", None);
+                }
+            }
             if let AgentEvent::QuestionAsked {
                 session_id,
                 question,

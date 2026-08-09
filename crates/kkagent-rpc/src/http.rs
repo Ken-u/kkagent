@@ -681,7 +681,7 @@ impl HttpState {
                     "sessions","messages","approvals","ws","tools","tasks","skills",
                     "files","fs","workspaces","config","modelCatalog","search",
                     "terminals","questions","prompts","snapshot","eventReplay","turnStatus",
-                    "health","readiness","metrics"
+                    "health","readiness","metrics","durableEvents","durableTasks","idempotency"
                 ],
             }),
             events,
@@ -2063,7 +2063,59 @@ mod security_tests {
                 store.get_turn(&task_id).unwrap().unwrap().state,
                 "completed"
             );
+            assert!(store.cancel_turn(&task_id).is_err());
+            let (cancelled, _) = store.enqueue_turn("session", "cancel", None).unwrap();
+            store.claim_turn(&cancelled.task_id).unwrap();
+            store.cancel_turn(&cancelled.task_id).unwrap();
+            store
+                .finish_turn(&cancelled.task_id, "completed", None)
+                .unwrap();
+            assert_eq!(
+                store.get_turn(&cancelled.task_id).unwrap().unwrap().state,
+                "cancelled"
+            );
         }
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn message_endpoint_returns_stable_task_for_idempotent_retry() {
+        let path = temporary_database();
+        let backend = Arc::new(MemoryBackend::default());
+        let session = backend.create_session(None, None).await.unwrap();
+        let session_id = session["session_id"].as_str().unwrap().to_string();
+        let state = HttpState::with_backend_security_and_persistence(
+            backend,
+            None,
+            HttpSecurityOptions::default(),
+            Some(DurableHttpStore::open(&path).unwrap()),
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert("idempotency-key", "stable-key".parse().unwrap());
+        let Json(first) = post_message(
+            State(state.clone()),
+            Path(session_id.clone()),
+            Query(AuthQuery::default()),
+            headers.clone(),
+            Json(PostMessageBody {
+                text: "hello".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        let Json(second) = post_message(
+            State(state),
+            Path(session_id),
+            Query(AuthQuery::default()),
+            headers,
+            Json(PostMessageBody {
+                text: "hello".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(first["task_id"], second["task"]["task_id"]);
+        assert_eq!(second["replayed"], true);
         let _ = std::fs::remove_file(path);
     }
 

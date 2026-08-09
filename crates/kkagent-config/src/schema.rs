@@ -163,7 +163,7 @@ fn default_max_tasks() -> u32 {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SandboxConfig {
-    /// disabled | process | workspace. Workspace is the production default.
+    /// auto | disabled | process | workspace. Auto is the cross-platform default.
     #[serde(default = "default_sandbox_mode")]
     pub mode: String,
     /// Permit network access from tool processes.
@@ -196,7 +196,7 @@ impl Default for SandboxConfig {
 }
 
 fn default_sandbox_mode() -> String {
-    "workspace".into()
+    "auto".into()
 }
 
 fn default_sandbox_memory_mb() -> u64 {
