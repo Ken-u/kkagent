@@ -44,6 +44,7 @@ enum ShellStatus {
 
 #[derive(Clone)]
 struct ShellJob {
+    session_id: String,
     description: String,
     command: String,
     status: ShellStatus,
@@ -67,6 +68,7 @@ impl BackgroundShellManager {
     async fn insert_running(
         &self,
         id: &str,
+        session_id: &str,
         description: String,
         command: String,
     ) -> Result<Arc<std::sync::atomic::AtomicBool>, String> {
@@ -93,6 +95,7 @@ impl BackgroundShellManager {
         jobs.insert(
             id.to_string(),
             ShellJob {
+                session_id: session_id.to_string(),
                 description,
                 command,
                 status: ShellStatus::Running,
@@ -102,6 +105,16 @@ impl BackgroundShellManager {
             },
         );
         Ok(cancel)
+    }
+
+    /// Cooperative cancel for every running job belonging to `session_id`.
+    pub async fn cancel_session(&self, session_id: &str) {
+        let jobs = self.jobs.lock().await;
+        for job in jobs.values() {
+            if job.session_id == session_id && job.status == ShellStatus::Running {
+                job.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
     }
 
     async fn append_output(&self, id: &str, chunk: &str) {
@@ -260,7 +273,13 @@ run_in_background. Foreground timeouts detach to background when configured \
                 ));
             }
             let mut out = self
-                .spawn_background(command, description, cwd, timeout_ms)
+                .spawn_background(
+                    ctx.session_id.clone(),
+                    command,
+                    description,
+                    cwd,
+                    timeout_ms,
+                )
                 .await?;
             if !safety_note.is_empty() {
                 out.content = format!("{safety_note}{}", out.content);
@@ -270,6 +289,7 @@ run_in_background. Foreground timeouts detach to background when configured \
 
         let mut out = self
             .run_foreground(
+                ctx.session_id.clone(),
                 command,
                 description,
                 cwd,
@@ -316,6 +336,7 @@ impl BashTool {
 
     async fn spawn_background(
         &self,
+        session_id: String,
         command: String,
         description: String,
         cwd: PathBuf,
@@ -324,7 +345,12 @@ impl BashTool {
         let id = Uuid::new_v4().to_string();
         let cancel = match self
             .backgrounds
-            .insert_running(&id, description.clone(), command.clone())
+            .insert_running(
+                &id,
+                &session_id,
+                description.clone(),
+                command.clone(),
+            )
             .await
         {
             Ok(cancel) => cancel,
@@ -355,6 +381,7 @@ Poll with Bash({{\"shell_id\":\"{id}\"}})."
 
     async fn run_foreground(
         &self,
+        session_id: String,
         command: String,
         description: String,
         cwd: PathBuf,
@@ -448,7 +475,7 @@ Poll with Bash({{\"shell_id\":\"{id}\"}})."
                     let so_far_len = so_far.len();
                     let cancel = match self
                         .backgrounds
-                        .insert_running(&id, desc.clone(), command.clone())
+                        .insert_running(&id, &session_id, desc.clone(), command.clone())
                         .await
                     {
                         Ok(cancel) => cancel,
@@ -861,12 +888,17 @@ mod tests {
         let manager = BackgroundShellManager::new();
         for index in 0..MAX_RUNNING_JOBS {
             manager
-                .insert_running(&format!("job-{index}"), "test".into(), "test".into())
+                .insert_running(
+                    &format!("job-{index}"),
+                    "bash-test",
+                    "test".into(),
+                    "test".into(),
+                )
                 .await
                 .expect("job within limit");
         }
         let error = manager
-            .insert_running("overflow", "test".into(), "test".into())
+            .insert_running("overflow", "bash-test", "test".into(), "test".into())
             .await
             .expect_err("job over limit must fail");
         assert!(error.contains("limit reached"));

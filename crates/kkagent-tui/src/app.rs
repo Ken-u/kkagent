@@ -633,6 +633,35 @@ impl TuiApp {
     }
 
     async fn handle_key(&mut self, key: KeyEvent) -> anyhow::Result<()> {
+        // Busy turn: Esc / Ctrl-C always interrupt first — menus must not swallow cancel.
+        if !matches!(self.state.status, SessionStatus::Idle)
+            && (matches!(key.code, KeyCode::Esc)
+                || (matches!(key.code, KeyCode::Char('c'))
+                    && key.modifiers.contains(KeyModifiers::CONTROL)))
+        {
+            self.state.file_menu = None;
+            self.state.slash_menu = None;
+            self.state.list_picker = None;
+            self.state.tasks_panel = None;
+            if self.state.search.active {
+                self.state.search.close();
+            }
+            // Approval / question panels: cancel them via interrupt channel too.
+            if let Some(sid) = self.state.session_id.clone() {
+                match self.client.interrupt(&sid).await {
+                    Ok(()) => {
+                        self.system_message("Interrupted — cancelling in-flight tools…".into());
+                    }
+                    Err(e) => {
+                        self.system_message(format!("Interrupt failed: {e}"));
+                    }
+                }
+            }
+            self.state.pending_esc_ms = None;
+            self.state.quit_confirm = false;
+            return Ok(());
+        }
+
         // Transcript search overlay (Ctrl-F)
         if self.state.search.active {
             return self.handle_search_key(key);
@@ -1447,6 +1476,9 @@ impl TuiApp {
         if text.is_empty() {
             return Ok(());
         }
+        self.state.slash_menu = None;
+        self.state.file_menu = None;
+        self.state.list_picker = None;
 
         // Handle slash commands
         if text.starts_with('/') {

@@ -3098,25 +3098,36 @@ async fn handle_rpc_call(
                 .ok_or_else(|| (-32602, "Missing session_id".into()))?
                 .to_string();
 
+            // Always flip the cooperative cancel flag first (works while session is out of the map).
             if let Some(flag) = state.interrupt_flags.lock().await.get(&session_id) {
                 flag.store(true, std::sync::atomic::Ordering::SeqCst);
             }
+            // Cancel any in-flight approval / question waiters even mid-turn.
+            if let Some(tx) = state.approval_txs.lock().await.get(&session_id) {
+                let _ = tx.try_send(kkagent_protocol::ApprovalResponse {
+                    approval_id: String::new(),
+                    decision: kkagent_protocol::ApprovalDecision::Cancelled,
+                    scope: None,
+                    feedback: Some("interrupted".into()),
+                });
+            }
+            if let Some(tx) = state.question_txs.lock().await.get(&session_id) {
+                let _ = tx.try_send(kkagent_protocol::QuestionResponse {
+                    question_id: String::new(),
+                    selected_option_ids: Vec::new(),
+                    free_text: None,
+                    cancelled: true,
+                });
+            }
             if let Some(session) = state.sessions.lock().await.get(&session_id) {
                 session.request_interrupt();
-            } else {
-                // Session is mid-turn (removed from map) — still cancel approvals / abort stream
-                if let Some(tx) = state.approval_txs.lock().await.get(&session_id) {
-                    let _ = tx.try_send(kkagent_protocol::ApprovalResponse {
-                        approval_id: String::new(),
-                        decision: kkagent_protocol::ApprovalDecision::Cancelled,
-                        scope: None,
-                        feedback: Some("interrupted".into()),
-                    });
-                }
             }
+            // Abort LLM stream task if still registered (no-op once tools are running).
             if let Some(handle) = state.abort_registry.lock().await.remove(&session_id) {
                 handle.abort();
             }
+            // Kill any background Bash jobs owned by this session.
+            state.bash_shells.cancel_session(&session_id).await;
             Ok(serde_json::json!({"ok": true}))
         }
         "session.set_permission_mode" => {
