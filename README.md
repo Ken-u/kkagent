@@ -10,6 +10,20 @@ TUI 与 Agent Server 可分离，中间走 RPC（当前默认进程内 memory tr
 - 会话持久化：`~/.kkagent/transcripts.db`
 - MCP / Skills / Hooks（配置驱动）
 
+## 文档导航
+
+完整手册见 [docs/README.md](docs/README.md)：
+
+- [安装与快速开始](docs/getting-started.md)
+- [完整配置参考](docs/configuration.md)
+- [CLI 与 TUI](docs/cli-and-tui.md)
+- [工具与权限](docs/tools-and-permissions.md)
+- [Agent Server API](docs/server-api.md)
+- [扩展机制](docs/extensions.md)
+- [安全与运维](docs/security.md)
+- [架构与开发](docs/architecture.md)
+- [故障排查](docs/troubleshooting.md)
+
 ---
 
 ## 1. 怎么编译

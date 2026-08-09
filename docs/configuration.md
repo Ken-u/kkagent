@@ -1,0 +1,179 @@
+# 配置参考
+
+## 加载顺序
+
+kkagent 读取一份 TOML 配置：优先使用 `--config <path>`，否则读取 `~/.kkagent/config.toml`。环境变量会覆盖部分字段。启动时会校验默认模型、Provider 引用、URL、权限模式和数值范围。
+
+## 顶层字段
+
+| 字段 | 类型 | 默认值 | 说明 |
+|---|---:|---:|---|
+| `default_model` | string | 必填 | 默认模型别名，必须存在于 `models`。 |
+| `secondary_model` | string | 无 | 可选的辅助模型别名。 |
+| `default_permission_mode` | string | `manual` | `manual`、`yolo` 或 `auto`。 |
+| `default_plan_mode` | bool | `false` | 新会话是否以 Plan 模式开始。 |
+| `merge_all_available_skills` | bool | `false` | 已纳入 schema 的兼容字段；当前运行时仍按需加载 Skill。 |
+| `extra_skill_dirs` | string[] | `[]` | 已纳入 schema 的兼容字段；当前发现器尚未扫描这些目录。 |
+| `telemetry` | bool | `false` | 是否启用云遥测发送。 |
+| `trusted_workspaces` | string[] | `[]` | HTTP 文件和终端操作允许访问的绝对工作区；为空时只信任 Server 启动目录。 |
+
+## Provider
+
+```toml
+[providers.openai]
+type = "openai-responses"
+api_key = "sk-..."
+base_url = "https://api.openai.com/v1"
+custom_headers = { "X-Organization" = "example" }
+```
+
+| 字段 | 说明 |
+|---|---|
+| `type` | `anthropic`、`kimi`、`openai`/`openai-chat`、`openai-responses`、`google`/`google-genai`/`gemini`。下划线别名也被接受。 |
+| `api_key` | Provider 密钥。不要提交到 Git。 |
+| `base_url` | `http://` 或 `https://` URL；兼容端点可带或不带 `/v1`。 |
+| `custom_headers` | 发送给上游的附加 HTTP Header。 |
+| `oauth` | 托管 OAuth 配置，通常由 `kkagent auth login` 管理。 |
+
+OAuth 子项：`storage` 默认 `file`，`key` 默认 `kimi-code`，`oauth_host` 可覆盖登录服务地址。
+
+## Model
+
+```toml
+[models."openai/coding"]
+provider = "openai"
+model = "upstream-model-id"
+max_context_size = 200000
+max_output_size = 16384
+capabilities = ["tool_use", "thinking"]
+display_name = "Coding model"
+support_efforts = ["low", "medium", "high"]
+default_effort = "medium"
+```
+
+`provider` 必须引用已有 Provider。`max_context_size` 和 `max_output_size` 参与上下文预算。`tool_use` 控制是否向模型发送工具定义；`support_efforts` 和 `default_effort` 描述可用推理强度。
+
+## Thinking
+
+```toml
+[thinking]
+enabled = true
+effort = "high"
+keep = "all"
+```
+
+`keep` 是 Provider 兼容字符串。并非所有端点都支持 thinking 与 tools 同时使用；遇到 400 响应时可先删除 `keep` 并关闭 thinking 验证。
+
+## Agent 循环
+
+```toml
+[loop_control]
+max_attempts_per_step = 10
+reserved_context_size = 50000
+max_steps_per_turn = 64
+auto_compact = true
+compact_keep_last = 8
+token_counting = "measured+estimated"
+```
+
+`token_counting` 可取 `measured+estimated`、`measured` 或 `estimated`。上下文逼近上限时，`auto_compact` 会压缩旧历史。
+
+## 后台任务
+
+```toml
+[background]
+max_running_tasks = 4
+keep_alive_on_exit = false
+bash_auto_background_on_timeout = true
+bash_task_timeout_s = 120
+```
+
+`max_running_tasks` 控制 Agent 后台任务并发；Bash 仍受内部硬性资源上限约束。
+
+## 权限规则
+
+```toml
+[[permission.rules]]
+decision = "allow"
+pattern = "Read"
+scope = "user"
+
+[[permission.rules]]
+decision = "deny"
+pattern = "Bash(rm *)"
+scope = "workspace"
+```
+
+`decision` 为 `allow`、`deny` 或 `ask`。`pattern` 支持工具名、`*`、MCP 工具通配和 `Tool(argument-pattern)` 形式。危险命令的硬阻断不会被允许规则绕过。
+
+## Hooks
+
+```toml
+[[hooks]]
+event = "pre_tool_call"
+matcher = "Bash"
+command = "/absolute/path/to/check.sh"
+timeout = 5
+```
+
+事件支持 `pre_tool_call`、`post_tool_call`、`session_start`、`session_end`、`turn_start`、`turn_end`、`notification`。`matcher` 当前是兼容字段，运行时会触发该 event 下的 Hook，尚未按工具名过滤。JSON Hook 格式见[扩展机制](extensions.md)。
+
+## 服务
+
+```toml
+[services.moonshot_search]
+base_url = "https://example.invalid/search"
+api_key = "..."
+
+[services.moonshot_fetch]
+base_url = "https://example.invalid/fetch"
+api_key = "..."
+```
+
+`moonshot_search` 为内置 `WebSearch` 提供后端。`FetchURL` 也有受 SSRF 防护约束的直接抓取路径。
+
+## MCP Server
+
+stdio：
+
+```toml
+[mcp_servers.filesystem]
+type = "stdio"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "/absolute/path"]
+env = { "LOG_LEVEL" = "warn" }
+timeout_ms = 30000
+```
+
+远程 HTTP：
+
+```toml
+[mcp_servers.remote]
+type = "streamable-http"
+url = "https://mcp.example.com/mcp"
+headers = { "Authorization" = "Bearer ..." }
+timeout_ms = 30000
+
+[mcp_servers.remote.oauth]
+enabled = true
+scopes = ["tools.read", "tools.call"]
+client_label = "kkagent"
+```
+
+远程类型支持 `sse`、`http` 和 `streamable-http`。OAuth 还可配置 `client_id`、`client_secret`、`redirect_uri`。
+
+## 环境变量覆盖
+
+| 环境变量 | 用途 |
+|---|---|
+| `KKAGENT_DEFAULT_MODEL` | 默认模型。 |
+| `KKAGENT_SECONDARY_MODEL` | 辅助模型。 |
+| `KKAGENT_PERMISSION_MODE` | 默认权限模式。 |
+| `ANTHROPIC_API_KEY`、`OPENAI_API_KEY`、`KIMI_API_KEY`、`GOOGLE_API_KEY` | 对应 Provider 密钥。 |
+| `KKAGENT_MOONSHOT_SEARCH_URL` | 搜索服务地址。 |
+| `KKAGENT_MOONSHOT_SEARCH_KEY` 或 `MOONSHOT_API_KEY` | 搜索服务密钥。 |
+| `KKAGENT_HTTP_TOKEN` | Agent Server HTTP/WS Bearer token。 |
+| `KKAGENT_TELEMETRY_ENDPOINT`、`KKAGENT_TELEMETRY_CLOUD` | 云遥测地址和开关。 |
+| `RUST_LOG` | 日志过滤器。 |
+
+完整可复制模板见 [`examples/config.example.toml`](../examples/config.example.toml)。

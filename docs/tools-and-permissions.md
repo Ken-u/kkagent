@@ -1,0 +1,65 @@
+# 工具与权限
+
+## 内置工具
+
+| 类别 | 工具 | 用途 |
+|---|---|---|
+| 文件 | `Read`、`Write`、`Edit` | 读取、创建和精确修改文本文件。 |
+| 搜索 | `Grep`、`Glob` | 搜索内容和路径。 |
+| 命令 | `Bash` | 运行 Shell 命令，支持超时、取消和后台任务。 |
+| 媒体 | `ReadMediaFile` | 读取受限尺寸的图片或视频元数据；SVG 不作为图片解码。 |
+| 规划 | `TodoList`、`EnterPlanMode`、`ExitPlanMode` | 管理步骤和 Plan 模式。 |
+| 交互 | `AskUserQuestion`、`SelectTools` | 请求用户输入或选择工具集。 |
+| 扩展 | `Skill`、动态 MCP 工具 | 加载 Skill 或调用 MCP Server。 |
+| Web | `WebSearch`、`FetchURL` | 搜索和抓取网页；搜索需要配置服务。 |
+| 任务 | `Task`、`Agent`、`AgentSwarm`、`TaskOutput`、`TaskList`、`TaskStop` | 管理子任务和后台执行。 |
+| 目标 | `CreateGoal`、`GetGoal`、`UpdateGoal`、`SetGoalBudget` | 管理跨轮目标。 |
+| 定时 | `CronCreate`、`CronList`、`CronDelete` | 管理会话内定时任务。 |
+
+实际可用集合受模型 capability、配置、当前模式和 MCP 连接状态影响。`GET /api/v1/tools` 或 TUI 状态可查看当前工具。
+
+## 权限模式
+
+| 模式 | 行为 | 建议场景 |
+|---|---|---|
+| `manual` | 只读工具通常直接执行，写入和命令等操作请求批准。 | 首次使用、不熟悉的仓库、高风险环境。 |
+| `yolo` | 常规操作自动批准；敏感路径、Git 控制等仍可询问。 | 本地受版本控制的日常开发。 |
+| `auto` | 除必须交互的情况外尽量自动推进；`AskUserQuestion` 不自动回答。 | 隔离环境中的明确无人值守任务。 |
+
+启动参数 `-y`、`--auto` 可覆盖新会话模式，TUI 可通过 `/permission`、`/yolo`、`/auto` 切换。配置规则会参与最终决策。
+
+## Plan 模式
+
+Plan 模式用于先分析和制定计划。此时写操作仅允许更新当前会话的计划文件 `.kkagent/plans/<session-id>.md`，对源代码的 Write/Edit 会被拒绝。退出 Plan 模式后才进入实施阶段。
+
+Plan 模式不是完整沙箱：只读工具和经过策略允许的其他能力仍可能运行，因此仍应关注工具请求。
+
+## Shell 安全
+
+`Bash` 会解析命令并结合权限策略执行：
+
+- 明显破坏系统的命令（例如针对根目录的递归删除、格式化磁盘、直接写块设备、下载后直接 pipe 到 Shell）会硬阻断。
+- `sudo`、危险删除和 Git hard reset 等会被标记为高风险并进入更严格决策。
+- 命令支持超时和取消，取消时会尝试结束进程树。
+- 后台进程有数量、存活时间和历史记录上限。
+
+这些保护不能替代容器、低权限账户或操作系统沙箱。`yolo` 和 `auto` 下仍不应在包含生产凭据或不可恢复数据的目录运行不可信提示词。
+
+## 文件边界
+
+文件工具会规范化路径，防止通过 `..`、符号链接等绕过工作区和敏感文件策略。`.env`、私钥、常见云凭据和认证目录会受到额外限制。Grep/Glob 也会排除敏感路径。
+
+HTTP 文件 API 受 `trusted_workspaces` 限制；这与 Agent 工具权限是两层独立控制。
+
+## 批准响应
+
+TUI 会展示工具名、参数摘要和风险说明。HTTP 客户端监听到 approval 事件后，可调用：
+
+```http
+POST /api/v1/approvals/<approval-id>
+Content-Type: application/json
+
+{"decision":"approve"}
+```
+
+也可使用拒绝决定并提供 `feedback`。客户端不应根据工具名盲目自动批准，应检查参数、工作目录和会话 ID。

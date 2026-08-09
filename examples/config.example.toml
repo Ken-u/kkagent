@@ -1,58 +1,110 @@
-# 复制到 ~/.kkagent/config.toml 后改 api_key / base_url / default_model
-#
-#   mkdir -p ~/.kkagent
-#   cp examples/config.example.toml ~/.kkagent/config.toml
+# 完整配置模板：复制到 ~/.kkagent/config.toml 后按需取消注释。
+# 密钥也可通过 ANTHROPIC_API_KEY / OPENAI_API_KEY / KIMI_API_KEY / GOOGLE_API_KEY 提供。
 
-# IMPORTANT: default_model 必须是下面 [models."..."] 里存在的别名
-default_model = "local/claude-opus-4-8"
-default_permission_mode = "yolo"   # manual | yolo | auto
+default_model = "local/default"
+# secondary_model = "local/fast"
+default_permission_mode = "manual" # manual | yolo | auto
 default_plan_mode = false
+merge_all_available_skills = false  # 当前为兼容字段，运行时仍按需加载
+extra_skill_dirs = []               # 当前为兼容字段，发现器暂未扫描
 telemetry = false
+# trusted_workspaces = ["/absolute/path/to/project"]
 
 [providers.local]
 type = "anthropic"
 api_key = "sk-your-key-here"
 base_url = "http://127.0.0.1:3000"
+# custom_headers = { "X-Organization" = "example" }
 
-# 别名 "local/claude-opus-4-8" —— 必须与 default_model 一致
-[models."local/claude-opus-4-8"]
+[models."local/default"]
 provider = "local"
-model = "claude-opus-4-8"          # 发给上游的真实 model id
+model = "upstream-model-id"
 max_context_size = 262144
-# 输出上限建议不要过大，否则可能被上游以「context + max_tokens」超限拒绝
 max_output_size = 16384
 capabilities = ["tool_use"]
-display_name = "claude-opus-4-8"
+display_name = "Default coding model"
+# support_efforts = ["low", "medium", "high"]
+# default_effort = "medium"
 
-# 可选：第二个模型
-# [models."local/other"]
-# provider = "local"
-# model = "other-model-id"
-# max_context_size = 131072
-# max_output_size = 8192
-# capabilities = ["tool_use"]
-# display_name = "other"
+# OpenAI Responses 示例
+# [providers.openai]
+# type = "openai-responses"
+# api_key = "sk-..."
+# base_url = "https://api.openai.com/v1"
+#
+# [models."openai/coding"]
+# provider = "openai"
+# model = "upstream-model-id"
+# max_context_size = 200000
+# max_output_size = 16384
+# capabilities = ["tool_use", "thinking"]
+
+# Kimi OAuth Provider 通常由 `kkagent auth login` 自动写入。
+# [providers.kimi]
+# type = "kimi"
+# base_url = "https://api.kimi.com/coding"
+# [providers.kimi.oauth]
+# storage = "file"
+# key = "kimi-code"
+# oauth_host = "https://auth.kimi.com"
 
 [loop_control]
-max_attempts_per_step = 3
+max_attempts_per_step = 10
 reserved_context_size = 50000
+max_steps_per_turn = 64
+auto_compact = true
+compact_keep_last = 8
+token_counting = "measured+estimated" # measured+estimated | measured | estimated
 
 [background]
 max_running_tasks = 4
 keep_alive_on_exit = false
+# bash_auto_background_on_timeout = true
+# bash_task_timeout_s = 120
 
-# 可选：常开权限规则
-# [[permission.rules]]
-# decision = "allow"
-# scope = "user"
-# pattern = "Read"
-
-# 可选：MCP
-# [mcp_servers.filesystem]
-# command = "npx"
-# args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
-
-# 可选：thinking（部分上游对 thinking+tools 组合不稳定，联调时可关掉）
 # [thinking]
-# enabled = false
+# enabled = true
 # effort = "high"
+# keep = "all" # Provider 兼容字符串；不确定时省略
+
+# [[permission.rules]]
+# decision = "allow" # allow | deny | ask
+# pattern = "Read"
+# scope = "user"
+
+# [[hooks]]
+# event = "pre_tool_call"
+# matcher = "Bash"
+# command = "/absolute/path/to/check.sh"
+# timeout = 5
+
+# [services.moonshot_search]
+# base_url = "https://example.invalid/search"
+# api_key = "..."
+#
+# [services.moonshot_fetch]
+# base_url = "https://example.invalid/fetch"
+# api_key = "..."
+
+# stdio MCP
+# [mcp_servers.filesystem]
+# type = "stdio"
+# command = "npx"
+# args = ["-y", "@modelcontextprotocol/server-filesystem", "/absolute/path"]
+# env = { "LOG_LEVEL" = "warn" }
+# timeout_ms = 30000
+
+# 远程 MCP
+# [mcp_servers.remote]
+# type = "streamable-http" # sse | http | streamable-http
+# url = "https://mcp.example.com/mcp"
+# headers = { "Authorization" = "Bearer ..." }
+# timeout_ms = 30000
+#
+# [mcp_servers.remote.oauth]
+# enabled = true
+# client_id = "optional-static-client-id"
+# client_secret = "optional-static-client-secret"
+# scopes = ["tools.read", "tools.call"]
+# redirect_uri = "http://127.0.0.1:8765/callback"
+# client_label = "kkagent"
