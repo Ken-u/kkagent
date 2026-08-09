@@ -50,6 +50,14 @@ struct RateWindow {
     count: u32,
 }
 
+#[derive(Debug, Default)]
+struct HttpMetrics {
+    requests_total: AtomicU64,
+    unauthorized_total: AtomicU64,
+    rate_limited_total: AtomicU64,
+    status_counts: StdMutex<HashMap<u16, u64>>,
+}
+
 /// Pluggable backend so HTTP can bind to the live AgentLoop/ServerState.
 #[async_trait::async_trait]
 pub trait HttpBackend: Send + Sync {
@@ -91,6 +99,12 @@ pub trait HttpBackend: Send + Sync {
     }
     async fn answer_question(&self, _id: &str, _response: Value) -> Result<Value, String> {
         Err("question responses are not supported by this backend".into())
+    }
+    async fn health(&self) -> Value {
+        json!({"status": "ok"})
+    }
+    async fn readiness(&self) -> Result<Value, String> {
+        Ok(json!({"status": "ready"}))
     }
 }
 
@@ -217,6 +231,7 @@ pub struct HttpState {
     security: Arc<HttpSecurityOptions>,
     rate_windows: Arc<StdMutex<HashMap<String, RateWindow>>>,
     audit_lock: Arc<StdMutex<()>>,
+    metrics: Arc<HttpMetrics>,
 }
 
 struct HttpTerminalSlot {
@@ -255,7 +270,8 @@ impl HttpState {
                 "capabilities": [
                     "sessions","messages","approvals","ws","tools","tasks","skills",
                     "files","fs","workspaces","config","modelCatalog","search",
-                    "terminals","questions","prompts","snapshot","eventReplay","turnStatus"
+                    "terminals","questions","prompts","snapshot","eventReplay","turnStatus",
+                    "health","readiness","metrics"
                 ],
             }),
             events,
@@ -270,6 +286,7 @@ impl HttpState {
             security: Arc::new(security),
             rate_windows: Arc::new(StdMutex::new(HashMap::new())),
             audit_lock: Arc::new(StdMutex::new(())),
+            metrics: Arc::new(HttpMetrics::default()),
         };
         if let (Some(upstream), Ok(runtime)) = (upstream, tokio::runtime::Handle::try_current()) {
             let forward_state = state.clone();
@@ -457,21 +474,51 @@ async fn auth_middleware(
     mut request: Request,
     next: Next,
 ) -> impl IntoResponse {
+    state.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
     let path = request.uri().path().to_string();
     let method = request.method().to_string();
+    let request_id = request
+        .headers()
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty() && value.len() <= 128)
+        .map(str::to_string)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     if path.starts_with("/api/v1/terminals") && !state.security.allow_terminal_api {
-        audit_request(&state, "disabled", &method, &path, StatusCode::FORBIDDEN);
+        record_status(&state, StatusCode::FORBIDDEN);
+        audit_request(
+            &state,
+            &request_id,
+            "disabled",
+            &method,
+            &path,
+            StatusCode::FORBIDDEN,
+        );
         return StatusCode::FORBIDDEN.into_response();
     }
     if path == "/api/v1/fs" && method == "POST" && !state.security.allow_fs_write_api {
-        audit_request(&state, "disabled", &method, &path, StatusCode::FORBIDDEN);
+        record_status(&state, StatusCode::FORBIDDEN);
+        audit_request(
+            &state,
+            &request_id,
+            "disabled",
+            &method,
+            &path,
+            StatusCode::FORBIDDEN,
+        );
         return StatusCode::FORBIDDEN.into_response();
     }
     match authorize_request(&state, &mut request) {
         Ok(identity) => {
             if !consume_rate_limit(&state, &identity) {
+                state
+                    .metrics
+                    .rate_limited_total
+                    .fetch_add(1, Ordering::Relaxed);
+                record_status(&state, StatusCode::TOO_MANY_REQUESTS);
                 audit_request(
                     &state,
+                    &request_id,
                     &identity,
                     &method,
                     &path,
@@ -479,12 +526,28 @@ async fn auth_middleware(
                 );
                 return StatusCode::TOO_MANY_REQUESTS.into_response();
             }
-            let response = next.run(request).await;
-            audit_request(&state, &identity, &method, &path, response.status());
+            let mut response = next.run(request).await;
+            if let Ok(value) = axum::http::HeaderValue::from_str(&request_id) {
+                response.headers_mut().insert("x-request-id", value);
+            }
+            record_status(&state, response.status());
+            audit_request(
+                &state,
+                &request_id,
+                &identity,
+                &method,
+                &path,
+                response.status(),
+            );
             response
         }
         Err(status) => {
-            audit_request(&state, "unauthorized", &method, &path, status);
+            state
+                .metrics
+                .unauthorized_total
+                .fetch_add(1, Ordering::Relaxed);
+            record_status(&state, status);
+            audit_request(&state, &request_id, "unauthorized", &method, &path, status);
             status.into_response()
         }
     }
@@ -531,9 +594,17 @@ fn consume_rate_limit(state: &HttpState, identity: &str) -> bool {
     true
 }
 
-fn audit_request(state: &HttpState, identity: &str, method: &str, path: &str, status: StatusCode) {
+fn audit_request(
+    state: &HttpState,
+    request_id: &str,
+    identity: &str,
+    method: &str,
+    path: &str,
+    status: StatusCode,
+) {
     tracing::info!(
         target: "kkagent.http.audit",
+        request_id,
         identity,
         method,
         path,
@@ -551,6 +622,7 @@ fn audit_request(state: &HttpState, identity: &str, method: &str, path: &str, st
     }
     let record = json!({
         "at": chrono::Utc::now().to_rfc3339(),
+        "request_id": request_id,
         "identity": identity,
         "method": method,
         "path": path,
@@ -569,10 +641,78 @@ fn audit_request(state: &HttpState, identity: &str, method: &str, path: &str, st
     }
 }
 
+fn record_status(state: &HttpState, status: StatusCode) {
+    if let Ok(mut counts) = state.metrics.status_counts.lock() {
+        *counts.entry(status.as_u16()).or_default() += 1;
+    }
+}
+
 async fn meta(State(state): State<HttpState>) -> Json<Value> {
     let mut meta = state.meta.clone();
     meta["latest_event_seq"] = json!(state.event_sequence.load(Ordering::SeqCst));
     Json(meta)
+}
+
+async fn health(State(state): State<HttpState>) -> Json<Value> {
+    Json(state.backend.health().await)
+}
+
+async fn readiness(State(state): State<HttpState>) -> impl IntoResponse {
+    match state.backend.readiness().await {
+        Ok(value) => (StatusCode::OK, Json(value)).into_response(),
+        Err(error) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"status": "not_ready", "error": error})),
+        )
+            .into_response(),
+    }
+}
+
+async fn metrics(State(state): State<HttpState>) -> impl IntoResponse {
+    let history_len = state
+        .event_history
+        .lock()
+        .map(|history| history.len())
+        .unwrap_or_default();
+    let turn_states = state
+        .turn_states
+        .lock()
+        .map(|turns| turns.len())
+        .unwrap_or_default();
+    let terminals = state.terminals.lock().await.len();
+    let mut output = format!(
+        "# TYPE kkagent_http_requests_total counter\nkkagent_http_requests_total {}\n\
+# TYPE kkagent_http_unauthorized_total counter\nkkagent_http_unauthorized_total {}\n\
+# TYPE kkagent_http_rate_limited_total counter\nkkagent_http_rate_limited_total {}\n\
+# TYPE kkagent_event_sequence gauge\nkkagent_event_sequence {}\n\
+# TYPE kkagent_event_history_size gauge\nkkagent_event_history_size {}\n\
+# TYPE kkagent_turn_states gauge\nkkagent_turn_states {}\n\
+# TYPE kkagent_http_terminals gauge\nkkagent_http_terminals {}\n",
+        state.metrics.requests_total.load(Ordering::Relaxed),
+        state.metrics.unauthorized_total.load(Ordering::Relaxed),
+        state.metrics.rate_limited_total.load(Ordering::Relaxed),
+        state.event_sequence.load(Ordering::Relaxed),
+        history_len,
+        turn_states,
+        terminals,
+    );
+    if let Ok(status_counts) = state.metrics.status_counts.lock() {
+        output.push_str("# TYPE kkagent_http_responses_total counter\n");
+        let mut counts = status_counts.iter().collect::<Vec<_>>();
+        counts.sort_by_key(|(status, _)| **status);
+        for (status, count) in counts {
+            output.push_str(&format!(
+                "kkagent_http_responses_total{{status=\"{status}\"}} {count}\n"
+            ));
+        }
+    }
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4",
+        )],
+        output,
+    )
 }
 
 #[derive(Deserialize, Default)]
@@ -1208,6 +1348,9 @@ fn event_matches_session(event: &Value, session_id: Option<&str>) -> bool {
 pub fn router(state: HttpState) -> Router {
     Router::new()
         .route("/api/v1/meta", get(meta))
+        .route("/api/v1/health", get(health))
+        .route("/api/v1/ready", get(readiness))
+        .route("/api/v1/metrics", get(metrics))
         .route("/api/v1/events", get(events_history))
         .route("/api/v1/turns/{id}", get(turn_status))
         .route("/api/v1/sessions", get(list_sessions).post(create_session))

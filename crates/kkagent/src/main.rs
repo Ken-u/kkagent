@@ -1380,6 +1380,41 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
             .map_err(|e| e.to_string())?;
         Ok(serde_json::json!({"ok": true, "question_id": id}))
     }
+
+    async fn health(&self) -> serde_json::Value {
+        let persistence_responding = self.state.transcript.lock().await.list_sessions(1).is_ok();
+        serde_json::json!({
+            "status": "ok",
+            "uptime_seconds": self.state.started_at.elapsed().as_secs(),
+            "persistence": {
+                "durable": self.state.persistence_durable,
+                "responding": persistence_responding,
+                "error": self.state.persistence_error,
+            },
+            "sessions": self.state.sessions.lock().await.len(),
+            "mcp_servers": self.state.config.mcp_servers.len(),
+        })
+    }
+
+    async fn readiness(&self) -> Result<serde_json::Value, String> {
+        if !self.state.persistence_durable {
+            return Err(self
+                .state
+                .persistence_error
+                .clone()
+                .unwrap_or_else(|| "transcript persistence is not durable".into()));
+        }
+        self.state
+            .transcript
+            .lock()
+            .await
+            .list_sessions(1)
+            .map_err(|error| format!("transcript persistence unavailable: {error}"))?;
+        Ok(serde_json::json!({
+            "status": "ready",
+            "persistence": "durable",
+        }))
+    }
 }
 
 fn trusted_http_roots(config: &AppConfig) -> Result<Vec<PathBuf>, String> {
@@ -1662,6 +1697,9 @@ struct ServerState {
     pending_questions: Mutex<HashMap<String, serde_json::Value>>,
     background_tasks: Vec<AbortHandle>,
     turn_locks: SessionTurnLocks,
+    persistence_durable: bool,
+    persistence_error: Option<String>,
+    started_at: std::time::Instant,
 }
 
 #[derive(Default)]
@@ -1711,27 +1749,40 @@ fn mcp_manager_from_config(config: &AppConfig) -> McpManager {
     McpManager::new(configs)
 }
 
+fn open_transcript_with_policy(
+    path: &Path,
+    allow_in_memory: bool,
+) -> Result<(TranscriptDb, bool, Option<String>)> {
+    match TranscriptDb::open(path) {
+        Ok(database) => Ok((database, true, None)),
+        Err(error) if allow_in_memory => {
+            tracing::error!(
+                "Failed to open transcript DB: {error}; explicitly entering in-memory degraded mode"
+            );
+            Ok((
+                TranscriptDb::open_in_memory().map_err(|memory_error| {
+                    anyhow::anyhow!(
+                        "cannot open transcript DB (durable={error}, memory={memory_error})"
+                    )
+                })?,
+                false,
+                Some(error.to_string()),
+            ))
+        }
+        Err(error) => Err(anyhow::anyhow!(
+            "cannot open durable transcript DB: {error}; set KKAGENT_ALLOW_IN_MEMORY_TRANSCRIPTS=1 only for explicit degraded operation"
+        )),
+    }
+}
+
 async fn build_server_state(config: Arc<AppConfig>) -> Result<Arc<ServerState>> {
     let (events, _) = tokio::sync::broadcast::channel(1024);
-    let transcript = match TranscriptDb::open_default() {
-        Ok(db) => db,
-        Err(e) => {
-            tracing::error!("Failed to open transcript DB: {} — using in-memory", e);
-            match TranscriptDb::open_in_memory() {
-                Ok(db) => db,
-                Err(e2) => {
-                    tracing::error!("Failed to open in-memory transcript: {}", e2);
-                    let tmp = std::env::temp_dir()
-                        .join(format!("kkagent-transcripts-{}.db", std::process::id()));
-                    TranscriptDb::open(&tmp).map_err(|e3| {
-                        anyhow::anyhow!(
-                            "cannot open transcript DB (default={e}, memory={e2}, fallback={e3})"
-                        )
-                    })?
-                }
-            }
-        }
-    };
+    let allow_in_memory = std::env::var("KKAGENT_ALLOW_IN_MEMORY_TRANSCRIPTS")
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let transcript_path = kkagent_config::default_config_dir().join("transcripts.db");
+    let (transcript, persistence_durable, persistence_error) =
+        open_transcript_with_policy(&transcript_path, allow_in_memory)?;
 
     let mcp = Arc::new(mcp_manager_from_config(&config));
     if !config.mcp_servers.is_empty() {
@@ -1858,6 +1909,9 @@ async fn build_server_state(config: Arc<AppConfig>) -> Result<Arc<ServerState>> 
         pending_questions: Mutex::new(HashMap::new()),
         background_tasks,
         turn_locks: SessionTurnLocks::default(),
+        persistence_durable,
+        persistence_error,
+        started_at: std::time::Instant::now(),
     }))
 }
 
@@ -3106,6 +3160,24 @@ mod http_path_tests {
             trusted_workspaces: vec![root.display().to_string()],
             ..AppConfig::default()
         }
+    }
+
+    #[test]
+    fn transcript_policy_fails_closed_unless_degraded_mode_is_explicit() {
+        let directory =
+            std::env::temp_dir().join(format!("kkagent-db-policy-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let error = match open_transcript_with_policy(&directory, false) {
+            Ok(_) => panic!("directory path unexpectedly opened as a transcript database"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("cannot open durable transcript DB"));
+        let (_, durable, degraded_error) = open_transcript_with_policy(&directory, true).unwrap();
+        assert!(!durable);
+        assert!(degraded_error.is_some());
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
