@@ -29,7 +29,8 @@ pub use agent_loop::*;
 pub use blob_store::{resolve_media_refs, BlobStore};
 pub use context_memory::{fold_loop_events, fold_vacuous, CompactionHandoff};
 pub use context_projector::{
-    compact_messages, fold_old_media, project, project_strict, ProjectOptions,
+    build_compaction_digest, compact_cut_index, compact_messages, fold_old_media, project,
+    project_strict, repair_tool_exchanges, ProjectOptions,
 };
 pub use event_bus::EventBus;
 pub use full_compaction::{compact_full, CompactionStrategy};

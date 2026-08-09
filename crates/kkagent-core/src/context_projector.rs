@@ -171,13 +171,228 @@ fn truncate_chars(s: &str, max: usize) -> String {
     format!("{head}\n…[{} chars truncated]", count - keep)
 }
 
-/// In-place compact: replace everything before `keep_last` with a single summary user message.
+const SYNTHETIC_TOOL_RESULT: &str = "Tool result is not available in the current context. Do not assume the tool completed successfully.";
+
+fn tool_use_ids(msg: &ChatMessage) -> Vec<String> {
+    msg.content
+        .iter()
+        .filter_map(|c| match c {
+            ChatContent::ToolUse { id, .. } => Some(id.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn tool_result_ids(msg: &ChatMessage) -> Vec<String> {
+    msg.content
+        .iter()
+        .filter_map(|c| match c {
+            ChatContent::ToolResult { tool_use_id, .. } => Some(tool_use_id.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn is_tool_result_only(msg: &ChatMessage) -> bool {
+    msg.role == "user"
+        && !msg.content.is_empty()
+        && msg
+            .content
+            .iter()
+            .all(|c| matches!(c, ChatContent::ToolResult { .. }))
+}
+
+fn slice_has_tool_use(msgs: &[ChatMessage], id: &str) -> bool {
+    msgs.iter().any(|m| {
+        m.content
+            .iter()
+            .any(|c| matches!(c, ChatContent::ToolUse { id: tid, .. } if tid == id))
+    })
+}
+
+fn slice_has_tool_result(msgs: &[ChatMessage], id: &str) -> bool {
+    msgs.iter().any(|m| {
+        m.content
+            .iter()
+            .any(|c| matches!(c, ChatContent::ToolResult { tool_use_id, .. } if tool_use_id == id))
+    })
+}
+
+/// Choose a cut that keeps ~`keep_last` messages without splitting a tool exchange.
+///
+/// Mirrors kimi-code compaction boundary rules adapted to Anthropic-style history
+/// (tool results live on user messages):
+/// - Prefer pulling the assistant `tool_use` into the kept tail when its results
+///   would otherwise be orphaned there.
+/// - Push leading orphan tool-result-only messages into the compacted prefix so
+///   they are covered by the digest instead of surviving as wire-invalid orphans.
+pub fn compact_cut_index(messages: &[ChatMessage], keep_last: usize) -> usize {
+    if messages.len() <= keep_last {
+        return 0;
+    }
+    let mut cut = messages.len() - keep_last.max(1);
+
+    // If the message just before the cut is an assistant tool_use whose results
+    // sit in the kept tail, include that assistant so the exchange stays intact.
+    while cut > 0 {
+        let ids = tool_use_ids(&messages[cut - 1]);
+        if ids.is_empty() {
+            break;
+        }
+        let tail = &messages[cut..];
+        if ids.iter().any(|id| slice_has_tool_result(tail, id)) {
+            cut -= 1;
+            continue;
+        }
+        break;
+    }
+
+    // Leading kept messages that are only tool_results for calls outside the
+    // kept region are orphans — fold them into the compacted prefix instead.
+    while cut < messages.len() {
+        let msg = &messages[cut];
+        if !is_tool_result_only(msg) {
+            break;
+        }
+        let ids = tool_result_ids(msg);
+        let kept = &messages[cut..];
+        if ids.iter().all(|id| slice_has_tool_use(kept, id)) {
+            break;
+        }
+        cut += 1;
+    }
+
+    cut
+}
+
+/// Local (no-LLM) digest of a history prefix. Includes tool calls/results so
+/// auto-compact does not silently lose what the model did.
+pub fn build_compaction_digest(messages: &[ChatMessage]) -> String {
+    let mut out = String::from("Earlier conversation digest:\n");
+    for m in messages.iter().take(48) {
+        let mut parts: Vec<String> = Vec::new();
+        for c in &m.content {
+            match c {
+                ChatContent::Text { text } => {
+                    let t = text.trim();
+                    if !t.is_empty() {
+                        parts.push(t.chars().take(240).collect());
+                    }
+                }
+                ChatContent::ToolUse { name, input, .. } => {
+                    let args = serde_json::to_string(input).unwrap_or_default();
+                    let short: String = args.chars().take(160).collect();
+                    parts.push(format!("called {name}({short})"));
+                }
+                ChatContent::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                } => {
+                    let flag = if *is_error { " error" } else { "" };
+                    let body: String = content.chars().take(200).collect();
+                    parts.push(format!("tool_result{flag} {tool_use_id}: {body}"));
+                }
+                ChatContent::Thinking { .. }
+                | ChatContent::Image { .. }
+                | ChatContent::Video { .. } => {}
+            }
+        }
+        if parts.is_empty() {
+            continue;
+        }
+        out.push_str(&format!("[{}] {}\n", m.role, parts.join(" · ")));
+    }
+    if out.chars().count() > 4_500 {
+        out.chars().take(4_500).collect()
+    } else {
+        out
+    }
+}
+
+/// Repair tool_use / tool_result pairing (kimi-code projector compatible).
+///
+/// - Drop tool_results whose tool_use is missing anywhere in `messages`.
+/// - When `synthesize_missing` is true, close unpaired tool_uses with a
+///   synthetic tool_result (needed after compaction slices a delayed result
+///   into the dropped prefix / retained tail).
+pub fn repair_tool_exchanges(messages: &mut Vec<ChatMessage>, synthesize_missing: bool) {
+    let use_ids: std::collections::HashSet<String> = messages
+        .iter()
+        .flat_map(tool_use_ids)
+        .collect();
+
+    // Drop orphan tool_result parts; drop messages left empty.
+    messages.retain_mut(|msg| {
+        msg.content.retain(|c| match c {
+            ChatContent::ToolResult { tool_use_id, .. } => use_ids.contains(tool_use_id),
+            _ => true,
+        });
+        !msg.content.is_empty()
+    });
+
+    if !synthesize_missing {
+        return;
+    }
+
+    let result_ids: std::collections::HashSet<String> = messages
+        .iter()
+        .flat_map(tool_result_ids)
+        .collect();
+
+    let mut inserts: Vec<(usize, ChatMessage)> = Vec::new();
+    for (i, msg) in messages.iter().enumerate() {
+        let missing: Vec<String> = tool_use_ids(msg)
+            .into_iter()
+            .filter(|id| !result_ids.contains(id))
+            .collect();
+        if missing.is_empty() {
+            continue;
+        }
+        let content: Vec<ChatContent> = missing
+            .into_iter()
+            .map(|tool_use_id| ChatContent::ToolResult {
+                tool_use_id,
+                content: SYNTHETIC_TOOL_RESULT.into(),
+                is_error: true,
+            })
+            .collect();
+        inserts.push((
+            i + 1,
+            ChatMessage {
+                role: "user".into(),
+                content,
+            },
+        ));
+    }
+    // Insert from the back so indices stay valid.
+    for (idx, msg) in inserts.into_iter().rev() {
+        messages.insert(idx, msg);
+    }
+}
+
+/// In-place compact: replace everything before a tool-safe cut with a summary.
 pub fn compact_messages(messages: &mut Vec<ChatMessage>, keep_last: usize, summary: &str) -> usize {
     if messages.len() <= keep_last {
         return 0;
     }
-    let drop_n = messages.len() - keep_last;
-    let kept: Vec<ChatMessage> = messages.split_off(drop_n);
+    let cut = compact_cut_index(messages, keep_last);
+    if cut == 0 {
+        return 0;
+    }
+    let drop_n = cut;
+    let mut kept: Vec<ChatMessage> = messages.split_off(cut);
+    // Final safety: drop any remaining leading orphan tool-result-only msgs.
+    while kept
+        .first()
+        .is_some_and(|m| is_tool_result_only(m) && {
+            let ids = tool_result_ids(m);
+            !ids.iter().all(|id| slice_has_tool_use(&kept, id))
+        })
+    {
+        kept.remove(0);
+    }
+    repair_tool_exchanges(&mut kept, true);
     messages.clear();
     messages.push(ChatMessage {
         role: "user".into(),
@@ -275,6 +490,105 @@ mod tests {
         assert!(
             matches!(&msgs[0].content[0], ChatContent::Text { text } if text.contains("summary here"))
         );
+    }
+
+    #[test]
+    fn compact_does_not_orphan_tool_results_at_cut() {
+        let mut msgs = vec![
+            ChatMessage {
+                role: "user".into(),
+                content: vec![ChatContent::Text {
+                    text: "old".into(),
+                }],
+            },
+            ChatMessage {
+                role: "assistant".into(),
+                content: vec![ChatContent::ToolUse {
+                    id: "call-1".into(),
+                    name: "Read".into(),
+                    input: serde_json::json!({"path": "a.rs"}),
+                }],
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: vec![ChatContent::ToolResult {
+                    tool_use_id: "call-1".into(),
+                    content: "fn main() {}".into(),
+                    is_error: false,
+                }],
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: vec![ChatContent::Text {
+                    text: "thanks".into(),
+                }],
+            },
+        ];
+        // Naive keep_last=2 would start on the tool_result. The cut should pull
+        // the matching tool_use into the kept side so the exchange stays intact.
+        let cut = compact_cut_index(&msgs, 2);
+        assert!(cut <= 1, "cut={cut} should include the tool_use with its result");
+        let _ = compact_messages(&mut msgs, 2, "summary");
+        assert!(
+            msgs.iter().any(|m| tool_use_ids(m).iter().any(|id| id == "call-1")),
+            "kept history should retain tool_use call-1"
+        );
+        assert!(
+            msgs.iter()
+                .any(|m| tool_result_ids(m).iter().any(|id| id == "call-1")),
+            "kept history should retain tool_result call-1"
+        );
+        // No orphan: every kept tool_result has a tool_use in the kept history.
+        for m in &msgs {
+            for id in tool_result_ids(m) {
+                assert!(
+                    slice_has_tool_use(&msgs, &id),
+                    "orphan tool_result {id} after compact"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn repair_drops_orphan_results_and_synthesizes_missing() {
+        let mut msgs = vec![
+            ChatMessage {
+                role: "assistant".into(),
+                content: vec![ChatContent::ToolUse {
+                    id: "keep".into(),
+                    name: "Bash".into(),
+                    input: serde_json::json!({"command": "ls"}),
+                }],
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: vec![
+                    ChatContent::ToolResult {
+                        tool_use_id: "keep".into(),
+                        content: "ok".into(),
+                        is_error: false,
+                    },
+                    ChatContent::ToolResult {
+                        tool_use_id: "ghost".into(),
+                        content: "orphan".into(),
+                        is_error: false,
+                    },
+                ],
+            },
+            ChatMessage {
+                role: "assistant".into(),
+                content: vec![ChatContent::ToolUse {
+                    id: "open".into(),
+                    name: "Read".into(),
+                    input: serde_json::json!({"path": "x"}),
+                }],
+            },
+        ];
+        repair_tool_exchanges(&mut msgs, true);
+        let all = format!("{:?}", msgs);
+        assert!(!all.contains("ghost"));
+        assert!(all.contains("open"));
+        assert!(all.contains(SYNTHETIC_TOOL_RESULT));
     }
 
     #[test]

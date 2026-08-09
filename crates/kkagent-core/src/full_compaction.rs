@@ -2,7 +2,7 @@
 
 use kkagent_llm::{ChatContent, ChatMessage};
 
-use crate::context_projector::compact_messages;
+use crate::context_projector::{build_compaction_digest, compact_messages};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompactionStrategy {
@@ -36,14 +36,24 @@ pub fn compact_full(
 ) -> CompactionResult {
     match strategy {
         CompactionStrategy::KeepTail => {
-            let digest = local_digest(messages, keep_last);
+            let cut = crate::context_projector::compact_cut_index(messages, keep_last);
+            let digest = if cut == 0 {
+                "No earlier turns.".into()
+            } else {
+                build_compaction_digest(&messages[..cut])
+            };
             let dropped = compact_messages(messages, keep_last, &digest);
             CompactionResult { dropped, strategy }
         }
         CompactionStrategy::VacuousFold => {
             let before = messages.len();
             messages.retain(|m| !is_vacuous(m));
-            let digest = local_digest(messages, keep_last);
+            let cut = crate::context_projector::compact_cut_index(messages, keep_last);
+            let digest = if cut == 0 {
+                "No earlier turns.".into()
+            } else {
+                build_compaction_digest(&messages[..cut])
+            };
             let dropped_tail = compact_messages(messages, keep_last, &digest);
             CompactionResult {
                 dropped: before.saturating_sub(messages.len()) + dropped_tail,
@@ -116,24 +126,6 @@ fn first_text(m: &ChatMessage) -> Option<&str> {
         ChatContent::Text { text } => Some(text.as_str()),
         _ => None,
     })
-}
-
-fn local_digest(messages: &[ChatMessage], keep_last: usize) -> String {
-    if messages.len() <= keep_last {
-        return "No earlier turns.".into();
-    }
-    let old = &messages[..messages.len() - keep_last];
-    let mut out = String::from("Earlier turns:\n");
-    for m in old.iter().take(30) {
-        if let Some(t) = first_text(m) {
-            out.push_str(&format!(
-                "[{}] {}\n",
-                m.role,
-                t.chars().take(160).collect::<String>()
-            ));
-        }
-    }
-    out.chars().take(3500).collect()
 }
 
 #[cfg(test)]

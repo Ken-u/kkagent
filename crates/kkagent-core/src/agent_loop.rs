@@ -13,6 +13,7 @@ use tokio::task::AbortHandle;
 
 use crate::context_projector::{
     compact_messages, fold_old_media, project, project_strict, ProjectOptions,
+    build_compaction_digest, compact_cut_index,
 };
 use crate::model_capability::ModelCapability;
 use crate::permission::{PermissionChain, PermissionDecision};
@@ -1230,8 +1231,12 @@ Do not mention this reminder to the user.\n</system-reminder>"
                 .needs_compaction(max_context, reserved, req)
             && session.messages.len() > keep_last
         {
-            let digest =
-                build_local_summary(&session.messages[..session.messages.len() - keep_last]);
+            let cut = compact_cut_index(&session.messages, keep_last);
+            let digest = if cut == 0 {
+                String::from("No earlier turns.")
+            } else {
+                build_compaction_digest(&session.messages[..cut])
+            };
             let dropped = compact_messages(&mut session.messages, keep_last, &digest);
             session.transcript_rewrite_required = true;
             tracing::info!(
@@ -1743,33 +1748,6 @@ fn session_has_goal_reminder(session: &Session) -> bool {
             _ => false,
         })
     })
-}
-
-fn build_local_summary(messages: &[ChatMessage]) -> String {
-    let mut out = String::from("Earlier conversation digest:\n");
-    for m in messages.iter().take(40) {
-        let text: String = m
-            .content
-            .iter()
-            .filter_map(|c| match c {
-                ChatContent::Text { text } => Some(text.as_str()),
-                ChatContent::ToolUse { name, .. } => Some(name.as_str()),
-                ChatContent::ToolResult { content, .. } => Some(content.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join(" ");
-        if text.is_empty() {
-            continue;
-        }
-        let snippet: String = text.chars().take(240).collect();
-        out.push_str(&format!("[{}] {}\n", m.role, snippet));
-    }
-    if out.len() > 4_000 {
-        out.chars().take(4_000).collect()
-    } else {
-        out
-    }
 }
 
 fn describe_tool_action(name: &str, input: &serde_json::Value) -> String {

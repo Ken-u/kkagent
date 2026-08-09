@@ -3346,44 +3346,48 @@ async fn handle_rpc_call(
                 if session.messages.len() <= keep_last {
                     return Ok(serde_json::json!({"ok": true, "deleted": 0}));
                 }
-                let old = &session.messages[..session.messages.len() - keep_last];
-                let mut digest = String::from("Summarize the following conversation for future context. Keep decisions, file paths, and unfinished tasks.\n\n");
-                for m in old.iter().take(40) {
-                    let role = &m.role;
-                    let text: String = m
-                        .content
-                        .iter()
-                        .filter_map(|c| match c {
-                            ChatContent::Text { text } => Some(text.as_str()),
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    if !text.is_empty() {
-                        digest.push_str(&format!(
-                            "[{role}] {}\n",
-                            text.chars().take(500).collect::<String>()
-                        ));
-                    }
-                }
+                let cut = kkagent_core::compact_cut_index(&session.messages, keep_last);
+                let old = if cut == 0 {
+                    &session.messages[..0]
+                } else {
+                    &session.messages[..cut]
+                };
+                let mut digest = String::from(
+                    "Summarize the following conversation for future context. \
+                     Keep decisions, file paths, tool outcomes, and unfinished tasks.\n\n",
+                );
+                digest.push_str(&kkagent_core::build_compaction_digest(old));
                 digest
             };
 
             let summary_text = summarize_with_llm(state.config.clone(), &summary)
                 .await
-                .unwrap_or_else(|| "Conversation compacted.".into());
+                .unwrap_or_else(|| {
+                    // No LLM available: keep the tool-aware local digest so tool
+                    // outcomes are not silently discarded (kimi-compatible).
+                    summary.chars().take(4_000).collect()
+                });
 
             let deleted = {
+                let mut sessions = state.sessions.lock().await;
+                let keep = if let Some(session) = sessions.get(&session_id) {
+                    let cut = kkagent_core::compact_cut_index(&session.messages, keep_last);
+                    session.messages.len().saturating_sub(cut).max(1)
+                } else {
+                    keep_last
+                };
+                drop(sessions);
                 let db = state.transcript.lock().await;
-                db.compact_session(&session_id, keep_last, &summary_text)
+                db.compact_session(&session_id, keep, &summary_text)
                     .map_err(|e| (-32000, e.to_string()))?
             };
 
             {
                 let db = state.transcript.lock().await;
                 let records = db.load_messages(&session_id).unwrap_or_default();
-                let msgs = messages_from_records(&records);
+                let mut msgs = messages_from_records(&records);
                 drop(db);
+                kkagent_core::repair_tool_exchanges(&mut msgs, true);
                 let mut sessions = state.sessions.lock().await;
                 if let Some(session) = sessions.get_mut(&session_id) {
                     session.messages = msgs;
