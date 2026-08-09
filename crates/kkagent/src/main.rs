@@ -1338,6 +1338,124 @@ fn resolve_http_fs_path(config: &AppConfig, raw: &str, for_write: bool) -> Resul
     }
 }
 
+async fn build_turn_tool_registry(
+    state: &Arc<ServerState>,
+    event_tx: mpsc::Sender<AgentEvent>,
+) -> ToolRegistry {
+    let mut tools = ToolRegistry::new();
+    kkagent_tools::register_builtin_tools(&mut tools);
+    let auto_background_on_timeout = state
+        .config
+        .background
+        .as_ref()
+        .and_then(|background| background.bash_auto_background_on_timeout)
+        .unwrap_or(true);
+    tools.register(Arc::new(kkagent_tools::builtin::BashTool::new(
+        state.bash_shells.clone(),
+        kkagent_tools::builtin::BashOptions {
+            auto_background_on_timeout,
+        },
+    )));
+    register_mcp_tools(&mut tools, &state.mcp).await;
+
+    let subagents = state.subagents.clone();
+    let config = state.config.clone();
+    let launch: kkagent_tools::builtin::task::SubagentLaunchFn = Arc::new(move |sub_config| {
+        let manager = subagents.clone();
+        let app_config = config.clone();
+        let agent_id = sub_config.agent_id.clone();
+        let abort_manager = manager.clone();
+        let abort_agent_id = agent_id.clone();
+        let mirror = match (
+            sub_config.parent_session_id.clone(),
+            sub_config.parent_tool_call_id.clone(),
+        ) {
+            (Some(parent_session_id), Some(parent_tool_call_id)) => Some(SubagentMirrorContext {
+                parent_session_id,
+                parent_tool_call_id,
+                parent_event_tx: event_tx.clone(),
+            }),
+            _ => None,
+        };
+        let join = tokio::spawn(async move {
+            tracing::info!("Subagent {} starting: {}", agent_id, sub_config.description);
+            match kkagent_core::run_subagent_mirrored(
+                app_config,
+                sub_config,
+                PermissionMode::Auto,
+                mirror,
+            )
+            .await
+            {
+                Ok(result) => {
+                    tracing::info!("Subagent {} complete ({} chars)", agent_id, result.len());
+                    manager.complete(&agent_id, result).await;
+                }
+                Err(error) => {
+                    tracing::error!("Subagent {} failed: {}", agent_id, error);
+                    manager.fail(&agent_id, error.to_string()).await;
+                }
+            }
+        });
+        let abort = join.abort_handle();
+        tokio::spawn(async move {
+            abort_manager.set_abort_handle(&abort_agent_id, abort).await;
+        });
+    });
+    tools.register(Arc::new(kkagent_tools::builtin::TaskTool::new(
+        state.subagents.clone(),
+        launch.clone(),
+    )));
+    tools.register(Arc::new(kkagent_tools::builtin::AgentTool::new(
+        state.subagents.clone(),
+        launch.clone(),
+    )));
+    tools.register(Arc::new(kkagent_tools::builtin::AgentSwarmTool::new(
+        state.subagents.clone(),
+        launch,
+    )));
+    tools.register(Arc::new(kkagent_tools::builtin::TaskOutputTool::new(
+        state.subagents.clone(),
+    )));
+    tools.register(Arc::new(kkagent_tools::builtin::TaskListTool::new(
+        state.subagents.clone(),
+    )));
+    tools.register(Arc::new(kkagent_tools::builtin::TaskStopTool::new(
+        state.subagents.clone(),
+    )));
+    tools.register(Arc::new(kkagent_tools::builtin::CreateGoalTool::new(
+        state.goal_mgr.clone(),
+    )));
+    tools.register(Arc::new(kkagent_tools::builtin::GetGoalTool::new(
+        state.goal_mgr.clone(),
+    )));
+    tools.register(Arc::new(kkagent_tools::builtin::UpdateGoalTool::new(
+        state.goal_mgr.clone(),
+    )));
+    tools.register(Arc::new(kkagent_tools::builtin::SetGoalBudgetTool::new(
+        state.goal_mgr.clone(),
+    )));
+    tools.register(Arc::new(kkagent_tools::builtin::SkillTool::new(
+        state.skills.clone(),
+    )));
+    tools.register(Arc::new(kkagent_tools::builtin::WebSearchTool::new(
+        state.web.clone(),
+    )));
+    tools.register(Arc::new(kkagent_tools::builtin::FetchUrlTool::new(
+        state.web.clone(),
+    )));
+    tools.register(Arc::new(kkagent_tools::builtin::CronCreateTool::new(
+        state.cron.clone(),
+    )));
+    tools.register(Arc::new(kkagent_tools::builtin::CronListTool::new(
+        state.cron.clone(),
+    )));
+    tools.register(Arc::new(kkagent_tools::builtin::CronDeleteTool::new(
+        state.cron.clone(),
+    )));
+    tools
+}
+
 async fn run_http_turn(state: Arc<ServerState>, session_id: &str) -> anyhow::Result<()> {
     let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(64);
     let live_events = state.events.clone();
@@ -1371,23 +1489,7 @@ async fn run_http_turn(state: Arc<ServerState>, session_id: &str) -> anyhow::Res
     };
     session.begin_turn();
 
-    let mut tools = ToolRegistry::new();
-    kkagent_tools::register_builtin_tools(&mut tools);
-    tools.register(Arc::new(kkagent_tools::builtin::BashTool::new(
-        state.bash_shells.clone(),
-        kkagent_tools::builtin::BashOptions {
-            auto_background_on_timeout: true,
-        },
-    )));
-    tools.register(Arc::new(kkagent_tools::builtin::SkillTool::new(
-        state.skills.clone(),
-    )));
-    tools.register(Arc::new(kkagent_tools::builtin::WebSearchTool::new(
-        state.web.clone(),
-    )));
-    tools.register(Arc::new(kkagent_tools::builtin::FetchUrlTool::new(
-        state.web.clone(),
-    )));
+    let tools = build_turn_tool_registry(&state, event_tx.clone()).await;
 
     let permission_rules = state
         .config
@@ -2416,120 +2518,7 @@ async fn handle_rpc_call(
                 return Err((-32000, format!("Model '{}' not found", model_alias)));
             }
 
-            let mut tools = ToolRegistry::new();
-            kkagent_tools::register_builtin_tools(&mut tools);
-            let auto_bg = state
-                .config
-                .background
-                .as_ref()
-                .and_then(|b| b.bash_auto_background_on_timeout)
-                .unwrap_or(true);
-            tools.register(Arc::new(kkagent_tools::builtin::BashTool::new(
-                state.bash_shells.clone(),
-                kkagent_tools::builtin::BashOptions {
-                    auto_background_on_timeout: auto_bg,
-                },
-            )));
-            register_mcp_tools(&mut tools, &state.mcp).await;
-
-            let subagents = state.subagents.clone();
-            let cfg_for_sub = state.config.clone();
-            let mirror_tx = agent_event_tx.clone();
-            let launch: kkagent_tools::builtin::task::SubagentLaunchFn = Arc::new(move |sub_cfg| {
-                let mgr = subagents.clone();
-                let app_cfg = cfg_for_sub.clone();
-                let id = sub_cfg.agent_id.clone();
-                let mgr_abort = mgr.clone();
-                let id_abort = id.clone();
-                let mirror = match (
-                    sub_cfg.parent_session_id.clone(),
-                    sub_cfg.parent_tool_call_id.clone(),
-                ) {
-                    (Some(parent_session_id), Some(parent_tool_call_id)) => {
-                        Some(SubagentMirrorContext {
-                            parent_session_id,
-                            parent_tool_call_id,
-                            parent_event_tx: mirror_tx.clone(),
-                        })
-                    }
-                    _ => None,
-                };
-                let join = tokio::spawn(async move {
-                    tracing::info!("Subagent {} starting: {}", id, sub_cfg.description);
-                    let run = kkagent_core::run_subagent_mirrored(
-                        app_cfg,
-                        sub_cfg,
-                        PermissionMode::Auto,
-                        mirror,
-                    );
-                    match run.await {
-                        Ok(result) => {
-                            tracing::info!("Subagent {} complete ({} chars)", id, result.len());
-                            mgr.complete(&id, result).await;
-                        }
-                        Err(e) => {
-                            tracing::error!("Subagent {} failed: {}", id, e);
-                            mgr.fail(&id, e.to_string()).await;
-                        }
-                    }
-                });
-                let abort = join.abort_handle();
-                tokio::spawn(async move {
-                    mgr_abort.set_abort_handle(&id_abort, abort).await;
-                });
-            });
-            tools.register(Arc::new(kkagent_tools::builtin::TaskTool::new(
-                state.subagents.clone(),
-                launch.clone(),
-            )));
-            tools.register(Arc::new(kkagent_tools::builtin::AgentTool::new(
-                state.subagents.clone(),
-                launch.clone(),
-            )));
-            tools.register(Arc::new(kkagent_tools::builtin::AgentSwarmTool::new(
-                state.subagents.clone(),
-                launch,
-            )));
-            tools.register(Arc::new(kkagent_tools::builtin::TaskOutputTool::new(
-                state.subagents.clone(),
-            )));
-            tools.register(Arc::new(kkagent_tools::builtin::TaskListTool::new(
-                state.subagents.clone(),
-            )));
-            tools.register(Arc::new(kkagent_tools::builtin::TaskStopTool::new(
-                state.subagents.clone(),
-            )));
-            // Goal tools (shared across turns)
-            tools.register(Arc::new(kkagent_tools::builtin::CreateGoalTool::new(
-                state.goal_mgr.clone(),
-            )));
-            tools.register(Arc::new(kkagent_tools::builtin::GetGoalTool::new(
-                state.goal_mgr.clone(),
-            )));
-            tools.register(Arc::new(kkagent_tools::builtin::UpdateGoalTool::new(
-                state.goal_mgr.clone(),
-            )));
-            tools.register(Arc::new(kkagent_tools::builtin::SetGoalBudgetTool::new(
-                state.goal_mgr.clone(),
-            )));
-            tools.register(Arc::new(kkagent_tools::builtin::SkillTool::new(
-                state.skills.clone(),
-            )));
-            tools.register(Arc::new(kkagent_tools::builtin::WebSearchTool::new(
-                state.web.clone(),
-            )));
-            tools.register(Arc::new(kkagent_tools::builtin::FetchUrlTool::new(
-                state.web.clone(),
-            )));
-            tools.register(Arc::new(kkagent_tools::builtin::CronCreateTool::new(
-                state.cron.clone(),
-            )));
-            tools.register(Arc::new(kkagent_tools::builtin::CronListTool::new(
-                state.cron.clone(),
-            )));
-            tools.register(Arc::new(kkagent_tools::builtin::CronDeleteTool::new(
-                state.cron.clone(),
-            )));
+            let tools = build_turn_tool_registry(&state, agent_event_tx.clone()).await;
 
             let permission_rules = state
                 .config
