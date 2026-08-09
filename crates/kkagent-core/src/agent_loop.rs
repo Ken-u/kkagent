@@ -186,6 +186,8 @@ Progress: turns={}/{:?} tokens={}/{:?}. Continue working toward this goal.\n</sy
         }
 
         session.usage.begin_turn();
+        session.services.mark_turn_started();
+        session.begin_turn();
 
         let mut tool_defs: Vec<ToolDef> = self
             .tools
@@ -842,7 +844,7 @@ Do not mention this reminder to the user.\n</system-reminder>".into(),
     async fn finish_interrupted(&self, session: &mut Session) -> anyhow::Result<()> {
         let session_id = session.id.clone();
         tracing::info!("Turn interrupted for session {}", session_id);
-        session.commit_turn();
+        session.note_turn_cancelled();
         let _ = self.event_tx.send(AgentEvent::Error {
             session_id: session_id.clone(),
             message: "Interrupted".into(),
@@ -890,7 +892,26 @@ Do not mention this reminder to the user.\n</system-reminder>".into(),
                 }
             }
         }
-        session.commit_turn();
+        session.note_turn_completed();
+        // Sync sticky todos into session services when present in tool results.
+        if let Some(last) = session.messages.iter().rev().find(|m| {
+            m.content.iter().any(|c| {
+                matches!(c, kkagent_llm::ChatContent::ToolResult { .. })
+            })
+        }) {
+            for part in &last.content {
+                if let kkagent_llm::ChatContent::ToolResult { content, .. } = part {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(content) {
+                        if let Some(todos) = v.get("todos").or_else(|| v.get("items")) {
+                            let items = crate::session::todo::parse_todo_items(todos);
+                            if !items.is_empty() {
+                                session.services.todos.set_todos(items);
+                            }
+                        }
+                    }
+                }
+            }
+        }
         let _ = self
             .event_tx
             .send(AgentEvent::StatusUpdate {
@@ -1169,6 +1190,9 @@ fn todo_items_from_output(output: &ToolOutput) -> Option<Vec<kkagent_protocol::T
 }
 
 fn tool_allowed(session: &Session, name: &str) -> bool {
+    if session.services.tool_policy_gate.session_policy.is_disabled(name) {
+        return false;
+    }
     if !session.tool_policy.is_active(name) {
         // Always keep disclosure / interaction primitives available.
         if !matches!(

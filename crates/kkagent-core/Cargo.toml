@@ -20,3 +20,5 @@ chrono = { workspace = true }
 rusqlite = { workspace = true }
 futures = { workspace = true }
 kkagent-mcp = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }

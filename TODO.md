@@ -17,6 +17,7 @@
 |------|------|
 | contextMemory / toolPolicy / swarm / usage / undo / media / scope | **已实现** |
 | tokenCounting / compact / hooks / dedupe / blob / plugin / … | **已实现** |
+| **Session 子系统对齐**（store/index/workdir-key、metadata `state.json`、lifecycle、activity、interaction、agentLifecycle、todo/btw/cron、toolPolicyGate、swarm batch、subagent、terminal/process、init/instructions、skill+profile catalog、mcp view、export、external hooks；RPC：fork/archive/rename/export） | **已实现** |
 
 ## 三、TUI
 

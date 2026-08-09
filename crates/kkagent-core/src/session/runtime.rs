@@ -6,6 +6,12 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use crate::session::instructions::SessionInstructionsProvider;
+use crate::session::lifecycle::SessionCreateSource;
+use crate::session::metadata::TurnReason;
+use crate::session::services::SessionServices;
+use crate::session::store::{encode_work_dir_key, SessionStore};
+
 /// Pre-write snapshot so undo can restore files.
 #[derive(Debug, Clone)]
 pub struct FileChange {
@@ -63,6 +69,8 @@ pub struct Session {
     pub swarm: crate::swarm::SwarmService,
     /// Aggregated token/step usage.
     pub usage: crate::usage::UsageService,
+    /// Session-scoped services (metadata, agents, activity, store paths, …).
+    pub services: SessionServices,
 }
 
 impl Session {
@@ -72,15 +80,78 @@ impl Session {
         permission_mode: PermissionMode,
         model_alias: String,
     ) -> Self {
+        Self::new_with_source(
+            id,
+            working_dir,
+            permission_mode,
+            model_alias,
+            SessionCreateSource::Startup,
+            None,
+        )
+    }
+
+    pub fn resume(
+        id: String,
+        working_dir: PathBuf,
+        permission_mode: PermissionMode,
+        model_alias: String,
+    ) -> Self {
+        Self::new_with_source(
+            id,
+            working_dir,
+            permission_mode,
+            model_alias,
+            SessionCreateSource::Resume,
+            None,
+        )
+    }
+
+    pub fn new_with_source(
+        id: String,
+        working_dir: PathBuf,
+        permission_mode: PermissionMode,
+        model_alias: String,
+        source: SessionCreateSource,
+        hooks: Option<Arc<kkagent_mcp::HookManager>>,
+    ) -> Self {
         let (approval_tx, approval_rx) = mpsc::channel(16);
         let (question_tx, question_rx) = mpsc::channel(16);
         let plan_file_path = working_dir
             .join(".kkagent")
             .join("plans")
             .join(format!("{}.md", id));
+
+        let (session_dir, workspace_id) = resolve_session_dir(&id, &working_dir, source);
+        let services = SessionServices::bootstrap(
+            &id,
+            working_dir.clone(),
+            session_dir,
+            workspace_id,
+            true,
+            source,
+            hooks,
+        )
+        .unwrap_or_else(|e| {
+            tracing::warn!("session services bootstrap failed: {e}; using ephemeral dir");
+            let ephemeral = std::env::temp_dir().join("kkagent-sessions").join(&id);
+            let _ = std::fs::create_dir_all(&ephemeral);
+            SessionServices::bootstrap(
+                &id,
+                working_dir.clone(),
+                ephemeral,
+                encode_work_dir_key(&working_dir),
+                true,
+                source,
+                None,
+            )
+            .expect("ephemeral session bootstrap")
+        });
+
+        let title = services.metadata.read().title.clone();
+
         Self {
             id,
-            title: None,
+            title,
             messages: Vec::new(),
             system_prompt: default_system_prompt(),
             working_dir,
@@ -107,7 +178,33 @@ impl Session {
             tool_policy: crate::tool_policy::ToolPolicyService::new(),
             swarm: crate::swarm::SwarmService::new(),
             usage: crate::usage::UsageService::new(),
+            services,
         }
+    }
+
+    pub fn session_dir(&self) -> &std::path::Path {
+        &self.services.context.session_dir
+    }
+
+    pub fn set_title_persisted(&mut self, title: impl Into<String>) -> anyhow::Result<()> {
+        let title = title.into();
+        self.title = Some(title.clone());
+        self.services.metadata.set_title(title)
+    }
+
+    pub fn note_turn_started(&mut self) {
+        self.services.mark_turn_started();
+        self.begin_turn();
+    }
+
+    pub fn note_turn_completed(&mut self) {
+        self.commit_turn();
+        self.services.mark_turn_ended(TurnReason::Completed);
+    }
+
+    pub fn note_turn_cancelled(&mut self) {
+        self.commit_turn();
+        self.services.mark_turn_ended(TurnReason::Cancelled);
     }
 
     pub fn begin_turn(&mut self) {
@@ -225,6 +322,7 @@ impl Session {
                 }
             }
         }
+        let _ = self.services.metadata.set_last_prompt(&text);
         self.messages.push(ChatMessage {
             role: "user".into(),
             content: vec![ChatContent::Text { text }],
@@ -328,34 +426,9 @@ impl Session {
 
     /// Append AGENTS.md / `.kkagent/AGENTS.md` into the system prompt (kimi-style workspace instructions).
     pub async fn inject_workspace_instructions(&mut self) {
-        const MAX_CHARS: usize = 80_000;
-        let candidates = [
-            self.working_dir.join("AGENTS.md"),
-            self.working_dir.join(".kkagent").join("AGENTS.md"),
-            self.working_dir.join("CLAUDE.md"),
-        ];
-        for path in &candidates {
-            let Ok(content) = tokio::fs::read_to_string(path).await else {
-                continue;
-            };
-            let content = content.trim();
-            if content.is_empty() {
-                continue;
-            }
-            let truncated: String = content.chars().take(MAX_CHARS).collect();
-            let name = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("instructions");
-            self.system_prompt.push_str(&format!(
-                "\n\n# Project instructions ({name})\n\n{truncated}"
-            ));
-            if content.chars().count() > MAX_CHARS {
-                self.system_prompt
-                    .push_str("\n\n… (truncated; open the file for the full text)");
-            }
-            // Prefer the first existing instructions file.
-            break;
+        if let Some(file) = SessionInstructionsProvider::load(&self.working_dir).await {
+            self.system_prompt
+                .push_str(&SessionInstructionsProvider::format_for_system_prompt(&file));
         }
     }
 
@@ -370,6 +443,52 @@ impl Session {
         self.system_prompt.push_str(&format!(
             "\n\n# Date\n\nToday's date is {today}.\n"
         ));
+    }
+}
+
+fn resolve_session_dir(
+    id: &str,
+    working_dir: &std::path::Path,
+    source: SessionCreateSource,
+) -> (PathBuf, String) {
+    let store = SessionStore::open_default();
+    let workspace_id = encode_work_dir_key(working_dir);
+    match source {
+        SessionCreateSource::Startup => match store.create(id, working_dir) {
+            Ok(summary) => (PathBuf::from(summary.session_dir), workspace_id),
+            Err(_) => {
+                // Already indexed — reuse.
+                if let Ok(summary) = store.get(id) {
+                    (PathBuf::from(summary.session_dir), workspace_id)
+                } else {
+                    let dir = store
+                        .session_dir_for(id, working_dir)
+                        .unwrap_or_else(|_| {
+                            store.sessions_dir.join(&workspace_id).join(id)
+                        });
+                    let _ = std::fs::create_dir_all(&dir);
+                    (dir, workspace_id)
+                }
+            }
+        },
+        SessionCreateSource::Resume | SessionCreateSource::Fork => {
+            if let Ok(summary) = store.get(id) {
+                (PathBuf::from(summary.session_dir), workspace_id)
+            } else {
+                match store.create(id, working_dir) {
+                    Ok(summary) => (PathBuf::from(summary.session_dir), workspace_id),
+                    Err(_) => {
+                        let dir = store
+                            .session_dir_for(id, working_dir)
+                            .unwrap_or_else(|_| {
+                                store.sessions_dir.join(&workspace_id).join(id)
+                            });
+                        let _ = std::fs::create_dir_all(&dir);
+                        (dir, workspace_id)
+                    }
+                }
+            }
+        }
     }
 }
 

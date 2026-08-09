@@ -12,7 +12,10 @@ use kkagent_protocol::{Frame, PermissionMode, AgentEvent};
 use kkagent_protocol::subagent::SubagentManager;
 use kkagent_rpc::{RpcClient, RpcServer, transport::memory::create_memory_pair};
 use kkagent_llm::{ChatMessage, ChatContent};
-use kkagent_core::{AgentLoop, PermissionChain, Session, TranscriptDb};
+use kkagent_core::{
+    AgentLoop, PermissionChain, Session, SessionCloseReason, SessionCreateSource, SessionStore,
+    TranscriptDb,
+};
 use kkagent_tools::ToolRegistry;
 use kkagent_mcp::{McpManager, register_mcp_tools};
 use kkagent_client::KkagentClient;
@@ -309,7 +312,9 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
             .unwrap_or("default")
             .to_string();
         let mut session = Session::new(id.clone(), cwd.clone(), PermissionMode::Manual, model.clone());
-        session.title = title.clone();
+        if let Some(ref t) = title {
+            let _ = session.set_title_persisted(t.clone());
+        }
         {
             let db = self.state.transcript.lock().await;
             let _ = db.create_session(&id, &model, &cwd.to_string_lossy());
@@ -317,6 +322,7 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
                 let _ = db.set_title(&id, t);
             }
         }
+        session.services.on_created().await;
         self.state
             .interrupt_flags
             .lock()
@@ -337,11 +343,13 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
             .lock()
             .await
             .insert(id.clone(), session.question_tx.clone());
+        let session_dir = session.session_dir().display().to_string();
         self.state.sessions.lock().await.insert(id.clone(), session);
         serde_json::json!({
             "session_id": id,
             "workspace": cwd.display().to_string(),
             "title": title,
+            "session_dir": session_dir,
             "created_at": chrono::Utc::now().to_rfc3339(),
         })
     }
@@ -938,6 +946,8 @@ async fn handle_rpc_call(
                 session_id.clone(),
                 session.question_tx.clone(),
             );
+            session.services.on_created().await;
+            let session_dir = session.session_dir().display().to_string();
             state.sessions.lock().await.insert(session_id.clone(), session);
             let _ = state
                 .hooks
@@ -949,13 +959,44 @@ async fn handle_rpc_call(
                     }),
                 )
                 .await;
-            Ok(serde_json::json!({"session_id": session_id}))
+            Ok(serde_json::json!({
+                "session_id": session_id,
+                "session_dir": session_dir,
+            }))
         }
         "sessions.list" => {
             let limit = params.as_ref()
                 .and_then(|p| p.get("limit"))
                 .and_then(|v| v.as_u64())
                 .unwrap_or(20) as usize;
+            let include_archived = params
+                .as_ref()
+                .and_then(|p| p.get("include_archived"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            // Prefer disk session store (kimi-aligned); fall back to transcript DB.
+            let store = SessionStore::open_default();
+            if let Ok(summaries) = store.list(include_archived, limit) {
+                if !summaries.is_empty() {
+                    let list: Vec<_> = summaries
+                        .into_iter()
+                        .map(|s| {
+                            serde_json::json!({
+                                "session_id": s.id,
+                                "title": s.title,
+                                "working_dir": s.work_dir,
+                                "session_dir": s.session_dir,
+                                "archived": s.archived,
+                                "last_prompt": s.last_prompt,
+                                "created_at": s.created_at,
+                                "updated_at": s.updated_at,
+                                "forked_from": s.forked_from,
+                            })
+                        })
+                        .collect();
+                    return Ok(serde_json::json!({"sessions": list}));
+                }
+            }
             let db = state.transcript.lock().await;
             let sessions = db.list_sessions(limit).map_err(|e| (-32000, e.to_string()))?;
             let list: Vec<_> = sessions
@@ -973,6 +1014,108 @@ async fn handle_rpc_call(
                 })
                 .collect();
             Ok(serde_json::json!({"sessions": list}))
+        }
+        "sessions.fork" => {
+            let source_id = params
+                .as_ref()
+                .and_then(|p| p.get("session_id"))
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| (-32602, "Missing session_id".into()))?;
+            let target_id = params
+                .as_ref()
+                .and_then(|p| p.get("target_id"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            let title = params
+                .as_ref()
+                .and_then(|p| p.get("title"))
+                .and_then(|v| v.as_str());
+            let turn_index = params
+                .as_ref()
+                .and_then(|p| p.get("turn_index"))
+                .and_then(|v| v.as_u64())
+                .map(|n| n as usize);
+            let store = SessionStore::open_default();
+            let summary = store
+                .fork(source_id, &target_id, title, turn_index)
+                .map_err(|e| (-32000, e.to_string()))?;
+            Ok(serde_json::json!({
+                "session_id": summary.id,
+                "session_dir": summary.session_dir,
+                "forked_from": summary.forked_from,
+                "title": summary.title,
+            }))
+        }
+        "sessions.archive" => {
+            let session_id = params
+                .as_ref()
+                .and_then(|p| p.get("session_id"))
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| (-32602, "Missing session_id".into()))?;
+            let archived = params
+                .as_ref()
+                .and_then(|p| p.get("archived"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            SessionStore::open_default()
+                .archive(session_id, archived)
+                .map_err(|e| (-32000, e.to_string()))?;
+            if let Some(session) = state.sessions.lock().await.get_mut(session_id) {
+                let _ = session.services.metadata.set_archived(archived);
+                if archived {
+                    session
+                        .services
+                        .on_close(SessionCloseReason::Archive)
+                        .await;
+                }
+            }
+            Ok(serde_json::json!({"session_id": session_id, "archived": archived}))
+        }
+        "sessions.rename" => {
+            let session_id = params
+                .as_ref()
+                .and_then(|p| p.get("session_id"))
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| (-32602, "Missing session_id".into()))?;
+            let title = params
+                .as_ref()
+                .and_then(|p| p.get("title"))
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| (-32602, "Missing title".into()))?;
+            SessionStore::open_default()
+                .rename(session_id, title)
+                .map_err(|e| (-32000, e.to_string()))?;
+            if let Some(session) = state.sessions.lock().await.get_mut(session_id) {
+                let _ = session.set_title_persisted(title);
+            }
+            Ok(serde_json::json!({"session_id": session_id, "title": title}))
+        }
+        "sessions.export" => {
+            let session_id = params
+                .as_ref()
+                .and_then(|p| p.get("session_id"))
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| (-32602, "Missing session_id".into()))?;
+            let store = SessionStore::open_default();
+            let summary = store.get(session_id).map_err(|e| (-32000, e.to_string()))?;
+            let out = params
+                .as_ref()
+                .and_then(|p| p.get("output_path"))
+                .and_then(|v| v.as_str())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| {
+                    std::env::current_dir()
+                        .unwrap_or_else(|_| PathBuf::from("."))
+                        .join(kkagent_core::default_export_dir_name(session_id))
+                });
+            let result = kkagent_core::export_session_directory(&summary, &out)
+                .map_err(|e| (-32000, e.to_string()))?;
+            Ok(serde_json::json!({
+                "output_dir": result.output_dir.display().to_string(),
+                "entries": result.entries,
+                "manifest": result.manifest,
+            }))
         }
         "session.resume" => {
             let query = params.as_ref()
@@ -1016,7 +1159,7 @@ async fn handle_rpc_call(
                 .effective_permission_mode()
                 .parse()
                 .unwrap_or_default();
-            let mut session = Session::new(
+            let mut session = Session::resume(
                 session_id.clone(),
                 PathBuf::from(&record.working_dir),
                 perm_mode,
@@ -1037,7 +1180,11 @@ async fn handle_rpc_call(
             }
             session.messages = messages.clone();
             session.persisted_message_count = messages.len();
-            session.title = record.title.clone();
+            if let Some(ref t) = record.title {
+                let _ = session.set_title_persisted(t.clone());
+            }
+            session.services.create_source = SessionCreateSource::Resume;
+            session.services.on_created().await;
 
             state.interrupt_flags.lock().await.insert(
                 session_id.clone(),
