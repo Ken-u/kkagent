@@ -26,6 +26,16 @@ use kkagent_telemetry::{
 use kkagent_tools::ToolRegistry;
 use kkagent_tui::TuiApp;
 
+struct LocalEndpointGuard(PathBuf);
+
+impl Drop for LocalEndpointGuard {
+    fn drop(&mut self) {
+        if let Err(error) = kkagent_rpc::transport::uds::remove_endpoint(&self.0) {
+            tracing::warn!(path = %self.0.display(), %error, "failed to remove local endpoint");
+        }
+    }
+}
+
 #[derive(Parser)]
 #[command(name = "kkagent", version, about = "AI coding agent for your terminal")]
 struct Cli {
@@ -110,8 +120,14 @@ async fn main() -> Result<()> {
         return run_auth(command, cli.config.as_deref()).await;
     }
 
+    if cli.connect.is_some() && cli.command.is_some() {
+        anyhow::bail!("--connect is only valid for TUI or --prompt mode");
+    }
+
     let mut config = load_config(cli.config.as_deref())?;
-    hydrate_provider_oauth(&mut config).await?;
+    if cli.connect.is_none() {
+        hydrate_provider_oauth(&mut config).await?;
+    }
 
     let permission_mode = if cli.auto {
         PermissionMode::Auto
@@ -134,16 +150,16 @@ async fn main() -> Result<()> {
             run_server(config, listen, http, token).await
         }
         Some(Commands::Acp) => {
-            let state = build_server_state(Arc::new(config)).await;
+            let state = build_server_state(Arc::new(config)).await?;
             let server = kkagent_acp::AcpServer::with_host(Arc::new(AgentAcpHost { state }));
             server.serve_stdio().await
         }
         Some(Commands::Auth { .. }) => unreachable!("auth handled before config startup"),
         None => {
             if let Some(prompt) = cli.prompt {
-                run_print_mode(config, prompt, permission_mode).await
+                run_print_mode(config, prompt, permission_mode, cli.connect).await
             } else {
-                run_tui(config, permission_mode, cli.plan, cli.resume).await
+                run_tui(config, permission_mode, cli.plan, cli.resume, cli.connect).await
             }
         }
     }
@@ -422,23 +438,26 @@ async fn run_tui(
     permission_mode: PermissionMode,
     plan_mode: bool,
     resume: Option<String>,
+    connect: Option<String>,
 ) -> Result<()> {
     // Default TUI: 1:1 in-process pair via memory duplex.
     // This process owns both ends — quitting the TUI aborts the paired server
     // task so a subsequent `kkagent` never talks to a leftover in-process agent.
     // Standalone `kkagent server` (UDS) is a separate process with its own lifetime;
     // only that mode can outlive a TUI, and only when you explicitly start it.
-    let (client_stream, server_stream) = create_memory_pair();
-
     let (event_tx, event_rx) = mpsc::channel::<Frame>(256);
-    let rpc_client = RpcClient::new(client_stream, event_tx);
-
-    let server_config = Arc::new(config.clone());
-    let server_handle = tokio::spawn(async move {
-        run_server_handler(server_stream, server_config).await;
-    });
-    // Let the server task bind the memory transport before the first RPC.
-    tokio::task::yield_now().await;
+    let (rpc_client, server_handle) = if let Some(endpoint) = connect {
+        let stream =
+            kkagent_rpc::transport::uds::connect_uds(std::path::Path::new(&endpoint)).await?;
+        (RpcClient::new(stream, event_tx), None)
+    } else {
+        let (client_stream, server_stream) = create_memory_pair();
+        let server_config = Arc::new(config.clone());
+        let handle =
+            tokio::spawn(async move { run_server_handler(server_stream, server_config).await });
+        tokio::task::yield_now().await;
+        (RpcClient::new(client_stream, event_tx), Some(handle))
+    };
 
     let mut tui_config = config;
     tui_config.default_permission_mode = Some(permission_mode.to_string());
@@ -449,8 +468,10 @@ async fn run_tui(
     let result = app.run(resume).await;
 
     // Drop the paired server (and any in-flight agent/LLM tasks it owns).
-    server_handle.abort();
-    let _ = server_handle.await;
+    if let Some(server_handle) = server_handle {
+        server_handle.abort();
+        let _ = server_handle.await;
+    }
 
     result
 }
@@ -459,17 +480,35 @@ async fn run_print_mode(
     config: AppConfig,
     prompt: String,
     permission_mode: PermissionMode,
+    connect: Option<String>,
 ) -> Result<()> {
-    let (client_stream, server_stream) = create_memory_pair();
     let (event_tx, event_rx) = mpsc::channel::<Frame>(256);
-    let rpc_client = RpcClient::new(client_stream, event_tx);
-
-    let config_arc = Arc::new(config.clone());
-    tokio::spawn(async move {
-        run_server_handler(server_stream, config_arc).await;
-    });
+    let (rpc_client, server_handle) = if let Some(endpoint) = connect {
+        let stream =
+            kkagent_rpc::transport::uds::connect_uds(std::path::Path::new(&endpoint)).await?;
+        (RpcClient::new(stream, event_tx), None)
+    } else {
+        let (client_stream, server_stream) = create_memory_pair();
+        let config_arc = Arc::new(config.clone());
+        let handle =
+            tokio::spawn(async move { run_server_handler(server_stream, config_arc).await });
+        (RpcClient::new(client_stream, event_tx), Some(handle))
+    };
 
     let mut client = KkagentClient::new(rpc_client, event_rx);
+    let result = run_print_client(&mut client, prompt, permission_mode).await;
+    if let Some(server_handle) = server_handle {
+        server_handle.abort();
+        let _ = server_handle.await;
+    }
+    result
+}
+
+async fn run_print_client(
+    client: &mut KkagentClient,
+    prompt: String,
+    permission_mode: PermissionMode,
+) -> Result<()> {
     let cwd = std::env::current_dir()?.to_string_lossy().to_string();
     let session_id = client
         .create_session(Some(&cwd), Some(permission_mode))
@@ -512,29 +551,51 @@ async fn run_server(
     });
 
     tracing::info!("Starting server on {}", socket_path);
-    let listener = kkagent_rpc::transport::uds::bind_uds(std::path::Path::new(&socket_path))?;
+    let endpoint_path = std::path::PathBuf::from(&socket_path);
+    let listener = kkagent_rpc::transport::uds::bind_uds(&endpoint_path)?;
+    let _endpoint_guard = LocalEndpointGuard(endpoint_path.clone());
     let config_arc = Arc::new(config);
-    let state = build_server_state(config_arc.clone()).await;
+    let state = build_server_state(config_arc.clone()).await?;
 
-    if let Some(addr) = http {
+    let http_handle = if let Some(addr) = http {
         let backend: Arc<dyn kkagent_rpc::HttpBackend> = Arc::new(AgentHttpBackend {
             state: state.clone(),
         });
         let token = http_token;
-        tokio::spawn(async move {
-            if let Err(e) = kkagent_rpc::serve_http_with_backend(&addr, backend, token).await {
+        let http_listener = kkagent_rpc::bind_http(&addr, token.as_deref()).await?;
+        Some(tokio::spawn(async move {
+            if let Err(e) =
+                kkagent_rpc::serve_http_listener_with_backend(http_listener, backend, token).await
+            {
                 tracing::error!("HTTP server error: {e}");
             }
-        });
-    }
+        }))
+    } else {
+        None
+    };
 
     loop {
-        let (stream, _) = listener.accept().await?;
-        let st = state.clone();
-        tokio::spawn(async move {
-            run_server_handler_with_state(stream, st).await;
-        });
+        tokio::select! {
+            accepted = listener.accept() => {
+                let (stream, _) = accepted?;
+                let st = state.clone();
+                tokio::spawn(async move {
+                    run_server_handler_with_state(stream, st).await;
+                });
+            }
+            signal = tokio::signal::ctrl_c() => {
+                signal?;
+                tracing::info!("Shutdown signal received");
+                break;
+            }
+        }
     }
+    if let Some(handle) = http_handle {
+        handle.abort();
+        let _ = handle.await;
+    }
+    state.shutdown().await;
+    Ok(())
 }
 
 struct AgentHttpBackend {
@@ -1340,6 +1401,18 @@ struct ServerState {
     telemetry: kkagent_telemetry::TelemetryServiceHandle,
     events: tokio::sync::broadcast::Sender<serde_json::Value>,
     pending_questions: Mutex<HashMap<String, serde_json::Value>>,
+    background_tasks: Vec<AbortHandle>,
+}
+
+impl ServerState {
+    async fn shutdown(&self) {
+        for (_, handle) in self.abort_registry.lock().await.drain() {
+            handle.abort();
+        }
+        for handle in &self.background_tasks {
+            handle.abort();
+        }
+    }
 }
 
 fn mcp_manager_from_config(config: &AppConfig) -> McpManager {
@@ -1351,7 +1424,7 @@ fn mcp_manager_from_config(config: &AppConfig) -> McpManager {
     McpManager::new(configs)
 }
 
-async fn build_server_state(config: Arc<AppConfig>) -> Arc<ServerState> {
+async fn build_server_state(config: Arc<AppConfig>) -> Result<Arc<ServerState>> {
     let (events, _) = tokio::sync::broadcast::channel(1024);
     let transcript = match TranscriptDb::open_default() {
         Ok(db) => db,
@@ -1361,13 +1434,13 @@ async fn build_server_state(config: Arc<AppConfig>) -> Arc<ServerState> {
                 Ok(db) => db,
                 Err(e2) => {
                     tracing::error!("Failed to open in-memory transcript: {}", e2);
-                    let tmp = std::env::temp_dir().join("kkagent-transcripts.db");
-                    TranscriptDb::open(&tmp).unwrap_or_else(|e3| {
-                        panic!(
-                            "Cannot open transcript DB (file={}, mem={}, tmp={})",
-                            e, e2, e3
-                        );
-                    })
+                    let tmp = std::env::temp_dir()
+                        .join(format!("kkagent-transcripts-{}.db", std::process::id()));
+                    TranscriptDb::open(&tmp).map_err(|e3| {
+                        anyhow::anyhow!(
+                            "cannot open transcript DB (default={e}, memory={e2}, fallback={e3})"
+                        )
+                    })?
                 }
             }
         }
@@ -1399,11 +1472,12 @@ async fn build_server_state(config: Arc<AppConfig>) -> Arc<ServerState> {
     let web = Arc::new(kkagent_tools::WebServicesConfig::from_app(&config));
 
     let cron_fires: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let mut background_tasks = Vec::new();
     {
         let cron_bg = cron.clone();
         let fires = cron_fires.clone();
         let hooks_cron = hooks.clone();
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(15)).await;
                 let due = cron_bg.take_due().await;
@@ -1426,6 +1500,7 @@ async fn build_server_state(config: Arc<AppConfig>) -> Arc<ServerState> {
                 }
             }
         });
+        background_tasks.push(task.abort_handle());
     }
 
     let plugins = {
@@ -1465,7 +1540,7 @@ async fn build_server_state(config: Arc<AppConfig>) -> Arc<ServerState> {
         )
         .await;
 
-    Arc::new(ServerState {
+    Ok(Arc::new(ServerState {
         config: config.clone(),
         sessions: Mutex::new(HashMap::new()),
         approval_txs: Mutex::new(HashMap::new()),
@@ -1487,15 +1562,17 @@ async fn build_server_state(config: Arc<AppConfig>) -> Arc<ServerState> {
         telemetry: telemetry.clone(),
         events,
         pending_questions: Mutex::new(HashMap::new()),
-    })
+        background_tasks,
+    }))
 }
 
 async fn run_server_handler<T: kkagent_rpc::transport::AsyncTransport>(
     transport: T,
     config: Arc<AppConfig>,
-) {
-    let state = build_server_state(config).await;
+) -> Result<()> {
+    let state = build_server_state(config).await?;
     run_server_handler_with_state(transport, state).await;
+    Ok(())
 }
 
 async fn run_server_handler_with_state<T: kkagent_rpc::transport::AsyncTransport>(

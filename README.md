@@ -256,7 +256,9 @@ TUI 模式下日志**不会**打印到屏幕（避免破坏布局），而是追
 
 默认 TUI **不会**自动连到残留的 `server.sock`。若感觉「连上了旧对话」，多半是 `--resume` / 历史 transcript，或另开了一个仍在跑的 `kkagent server`，而不是默认 TUI 跨进程复用。
 
-（TUI `--connect` 对接外部 server 的能力预留；默认 TUI 使用进程内 memory RPC。）
+需要复用显式启动的服务时，TUI 和非交互模式均可使用
+`--connect ~/.kkagent/server.sock`。Unix 使用 domain socket；Windows 的同一路径是仅指向
+loopback 随机端口的本地端点文件。默认 TUI 仍使用进程内 memory RPC。
 
 ---
 

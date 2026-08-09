@@ -770,6 +770,11 @@ pub async fn serve_with_backend(
     backend: Arc<dyn HttpBackend>,
     token: Option<String>,
 ) -> anyhow::Result<()> {
+    let listener = bind(addr, token.as_deref()).await?;
+    serve_listener_with_backend(listener, backend, token).await
+}
+
+pub async fn bind(addr: &str, token: Option<&str>) -> anyhow::Result<tokio::net::TcpListener> {
     let token = token.filter(|value| !value.trim().is_empty());
     let resolved: Vec<std::net::SocketAddr> = tokio::net::lookup_host(addr).await?.collect();
     if resolved.is_empty() {
@@ -780,10 +785,19 @@ pub async fn serve_with_backend(
             "refusing to expose unauthenticated HTTP API on non-loopback address {addr}; pass --http-token or KKAGENT_HTTP_TOKEN"
         );
     }
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    Ok(listener)
+}
+
+pub async fn serve_listener_with_backend(
+    listener: tokio::net::TcpListener,
+    backend: Arc<dyn HttpBackend>,
+    token: Option<String>,
+) -> anyhow::Result<()> {
+    let address = listener.local_addr()?;
     let state = HttpState::with_backend(backend, token);
     let app = router(state);
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    tracing::info!("kkagent HTTP listening on http://{addr}");
+    tracing::info!("kkagent HTTP listening on http://{address}");
     axum::serve(listener, app).await?;
     Ok(())
 }

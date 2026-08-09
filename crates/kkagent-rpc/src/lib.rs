@@ -7,8 +7,9 @@ pub mod transport;
 pub use client::RpcClient;
 pub use codec::*;
 pub use http::{
-    serve as serve_http, serve_with_backend as serve_http_with_backend, HttpBackend, HttpState,
-    MemoryBackend,
+    bind as bind_http, serve as serve_http,
+    serve_listener_with_backend as serve_http_listener_with_backend,
+    serve_with_backend as serve_http_with_backend, HttpBackend, HttpState, MemoryBackend,
 };
 pub use server::RpcServer;
 pub use transport::*;

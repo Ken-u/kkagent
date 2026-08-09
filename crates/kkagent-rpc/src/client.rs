@@ -88,6 +88,10 @@ impl RpcClient {
                     Err(_) => break,
                 }
             }
+            let mut map = pending_clone.lock().await;
+            for (_, sender) in map.drain() {
+                let _ = sender.send(Err(RpcError::Closed));
+            }
         });
 
         Self {
@@ -130,5 +134,27 @@ impl RpcClient {
             .send(frame)
             .await
             .map_err(|_| RpcError::Closed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transport::memory::create_memory_pair;
+
+    #[tokio::test]
+    async fn pending_calls_fail_when_the_peer_disconnects() {
+        let (client_transport, server_transport) = create_memory_pair();
+        let (event_tx, _event_rx) = mpsc::channel(8);
+        let client = RpcClient::new(client_transport, event_tx);
+        let call = tokio::spawn(async move { client.call("never.replied", None).await });
+        tokio::task::yield_now().await;
+        drop(server_transport);
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), call)
+            .await
+            .expect("RPC call should be woken on disconnect")
+            .unwrap();
+        assert!(matches!(result, Err(RpcError::Closed)));
     }
 }

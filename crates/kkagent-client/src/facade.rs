@@ -29,7 +29,8 @@ impl KkagentClient {
         let session_id = result
             .get("session_id")
             .and_then(|v| v.as_str())
-            .unwrap_or("unknown")
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("sessions.create response has no session_id"))?
             .to_string();
         Ok(session_id)
     }
