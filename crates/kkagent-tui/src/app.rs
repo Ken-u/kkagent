@@ -916,7 +916,11 @@ impl TuiApp {
 
         match key.code {
             // Kimi-style media paste. Text paste still falls back to the platform clipboard.
-            KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char('v')
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    || (cfg!(target_os = "windows")
+                        && key.modifiers.contains(KeyModifiers::ALT)) =>
+            {
                 match paste_clipboard_into_workspace() {
                     Ok(Some(path)) => {
                         let mention = format!("@{}", path.to_string_lossy());

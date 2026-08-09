@@ -22,7 +22,7 @@
 
 模型配置含 `image_in`（也兼容 `vision`、`image`、`multimodal`）时启用完整图片输入：
 
-- 在提示词中写 `@./screenshot.png`，或在 TUI 按 `Ctrl-V` 粘贴剪贴板图片。
+- 在提示词中写 `@./screenshot.png`，或在 TUI 粘贴剪贴板图片（macOS/Linux 使用 `Ctrl-V`，Windows 使用 `Alt-V`；Windows 也接受 `Ctrl-V`）。
 - `ReadMediaFile` 会返回真正的图片内容，不会把 base64 当作文本塞给模型。
 - `region = { x, y, width, height }` 使用原图像素坐标读取局部细节；`full_resolution = true` 跳过常规缩放，超过 Provider 安全限制时明确报错。
 - MCP 返回的 image block 和 image 类型 blob resource 会统一压缩后传给模型。
