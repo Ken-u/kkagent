@@ -29,6 +29,9 @@ pub struct AppConfig {
     pub thinking: Option<ThinkingConfig>,
     #[serde(default)]
     pub loop_control: Option<LoopControlConfig>,
+    /// Image normalization limits shared by every multimodal input path.
+    #[serde(default)]
+    pub image: ImageConfig,
     #[serde(default)]
     pub background: Option<BackgroundConfig>,
     #[serde(default)]
@@ -41,6 +44,31 @@ pub struct AppConfig {
     pub services: Option<ServicesConfig>,
     #[serde(default)]
     pub mcp_servers: HashMap<String, McpServerConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageConfig {
+    #[serde(default = "default_image_max_edge_px")]
+    pub max_edge_px: u32,
+    #[serde(default = "default_image_read_byte_budget")]
+    pub read_byte_budget: usize,
+}
+
+impl Default for ImageConfig {
+    fn default() -> Self {
+        Self {
+            max_edge_px: default_image_max_edge_px(),
+            read_byte_budget: default_image_read_byte_budget(),
+        }
+    }
+}
+
+fn default_image_max_edge_px() -> u32 {
+    2000
+}
+
+fn default_image_read_byte_budget() -> usize {
+    256 * 1024
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -371,6 +399,12 @@ impl AppConfig {
                 anyhow::bail!("trusted workspace must be absolute: {root}");
             }
         }
+        if self.image.max_edge_px == 0 || self.image.max_edge_px > 16_384 {
+            anyhow::bail!("image.max_edge_px must be between 1 and 16384");
+        }
+        if self.image.read_byte_budget == 0 || self.image.read_byte_budget > 20 * 1024 * 1024 {
+            anyhow::bail!("image.read_byte_budget must be between 1 and 20971520 bytes");
+        }
         for (name, server) in &self.mcp_servers {
             match server.transport_type.as_deref().unwrap_or("stdio") {
                 "stdio" if server.command.as_deref().unwrap_or("").trim().is_empty() => {
@@ -463,5 +497,23 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("not present"));
+    }
+
+    #[test]
+    fn validates_image_limits() {
+        let mut config = valid_config();
+        config.image.max_edge_px = 0;
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("max_edge_px"));
+        config.image.max_edge_px = 2000;
+        config.image.read_byte_budget = 0;
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("read_byte_budget"));
     }
 }

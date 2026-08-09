@@ -67,6 +67,12 @@ pub struct McpToolInfo {
     pub input_schema: Value,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct McpCallOutput {
+    pub text: String,
+    pub images: Vec<kkagent_tools::MediaOutput>,
+}
+
 enum McpConnection {
     Stdio(rmcp::service::RunningService<rmcp::RoleClient, ()>),
     Http(rmcp::service::RunningService<rmcp::RoleClient, ()>),
@@ -348,9 +354,12 @@ impl McpManager {
         server_name: &str,
         tool_name: &str,
         arguments: Value,
-    ) -> Result<String> {
+    ) -> Result<McpCallOutput> {
         if tool_name == "authenticate" {
-            return self.authorize_server(server_name).await;
+            return Ok(McpCallOutput {
+                text: self.authorize_server(server_name).await?,
+                images: Vec::new(),
+            });
         }
 
         let connections = self.connections.lock().await;
@@ -365,14 +374,38 @@ impl McpManager {
                     params = params.with_arguments(map);
                 }
                 let result = client.call_tool(params).await?;
-                let mut output = String::new();
+                let mut output = McpCallOutput::default();
                 for content in &result.content {
                     match content {
                         rmcp::model::ContentBlock::Text(text) => {
-                            output.push_str(&text.text);
+                            output.text.push_str(&text.text);
                         }
+                        rmcp::model::ContentBlock::Image(image) => {
+                            output.images.push(kkagent_tools::MediaOutput {
+                                media_type: image.mime_type.clone(),
+                                data: image.data.clone(),
+                            })
+                        }
+                        rmcp::model::ContentBlock::Resource(resource) => match &resource.resource {
+                            rmcp::model::ResourceContents::TextResourceContents {
+                                text, ..
+                            } => {
+                                output.text.push_str(text);
+                            }
+                            rmcp::model::ResourceContents::BlobResourceContents {
+                                mime_type: Some(mime),
+                                blob,
+                                ..
+                            } if mime.starts_with("image/") => {
+                                output.images.push(kkagent_tools::MediaOutput {
+                                    media_type: mime.clone(),
+                                    data: blob.clone(),
+                                })
+                            }
+                            _ => output.text.push_str("[non-text resource]"),
+                        },
                         _ => {
-                            output.push_str("[non-text content]");
+                            output.text.push_str("[non-text content]");
                         }
                     }
                 }

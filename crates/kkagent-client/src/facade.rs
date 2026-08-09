@@ -36,9 +36,22 @@ impl KkagentClient {
     }
 
     pub async fn send_prompt(&self, session_id: &str, text: &str) -> anyhow::Result<()> {
+        self.send_prompt_with_images(session_id, text, &[]).await
+    }
+
+    pub async fn send_prompt_with_images(
+        &self,
+        session_id: &str,
+        text: &str,
+        images: &[(String, String)],
+    ) -> anyhow::Result<()> {
         let params = serde_json::json!({
             "session_id": session_id,
             "text": text,
+            "images": images.iter().map(|(media_type, data)| serde_json::json!({
+                "media_type": media_type,
+                "data": data,
+            })).collect::<Vec<_>>(),
         });
         self.rpc
             .call("session.prompt", Some(params))

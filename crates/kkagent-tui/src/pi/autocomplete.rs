@@ -13,7 +13,11 @@ pub struct CompletionItem {
 }
 
 impl CompletionItem {
-    pub fn file(label: impl Into<String>, insert: impl Into<String>, detail: Option<String>) -> Self {
+    pub fn file(
+        label: impl Into<String>,
+        insert: impl Into<String>,
+        detail: Option<String>,
+    ) -> Self {
         Self {
             label: label.into(),
             insert: insert.into(),
@@ -22,7 +26,11 @@ impl CompletionItem {
         }
     }
 
-    pub fn dir(label: impl Into<String>, insert: impl Into<String>, detail: Option<String>) -> Self {
+    pub fn dir(
+        label: impl Into<String>,
+        insert: impl Into<String>,
+        detail: Option<String>,
+    ) -> Self {
         Self {
             label: label.into(),
             insert: insert.into(),
@@ -95,7 +103,11 @@ pub fn complete_slash(commands: &[(&str, &str)], prefix: &str) -> Vec<Completion
             }
             Some((
                 m.score,
-                CompletionItem::file(format!("/{name}"), format!("/{name}"), Some((*desc).to_string())),
+                CompletionItem::file(
+                    format!("/{name}"),
+                    format!("/{name}"),
+                    Some((*desc).to_string()),
+                ),
             ))
         })
         .collect();
@@ -325,11 +337,7 @@ fn try_fd_complete(cwd: &Path, query: &str, max: usize) -> Option<Vec<Completion
                 .unwrap_or(&path)
                 .to_string()
         };
-        let insert_path = if is_dir {
-            format!("{path}/")
-        } else {
-            path
-        };
+        let insert_path = if is_dir { format!("{path}/") } else { path };
         items.push(if is_dir {
             CompletionItem::dir(label, format!("@{insert_path}"), None)
         } else {
@@ -367,7 +375,10 @@ fn fd_query(query: &str) -> String {
 fn regex_escape(s: &str) -> String {
     let mut out = String::new();
     for ch in s.chars() {
-        if matches!(ch, '.' | '+' | '*' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '\\' | '^' | '$') {
+        if matches!(
+            ch,
+            '.' | '+' | '*' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '\\' | '^' | '$'
+        ) {
             out.push('\\');
         }
         out.push(ch);
@@ -377,7 +388,13 @@ fn regex_escape(s: &str) -> String {
 
 fn which_fd() -> Option<String> {
     for name in ["fd", "fdfind"] {
-        if Command::new(name).arg("--version").output().ok()?.status.success() {
+        if Command::new(name)
+            .arg("--version")
+            .output()
+            .ok()?
+            .status
+            .success()
+        {
             return Some(name.into());
         }
     }
@@ -500,9 +517,7 @@ pub fn format_at_completion(item: &CompletionItem, quoted: bool) -> (String, boo
         item.insert.clone()
     };
     let keep_open = item.is_directory;
-    let value = if keep_open {
-        value
-    } else if value.ends_with(' ') {
+    let value = if keep_open || value.ends_with(' ') {
         value
     } else {
         format!("{value} ")
@@ -541,7 +556,9 @@ mod tests {
         std::fs::write(dir.join("README.md"), "x").unwrap();
         let items = complete_at_files(&dir, "", 20);
         assert!(items.iter().any(|i| i.insert.contains("README")));
-        assert!(items.iter().any(|i| i.is_directory && i.insert.contains("src")));
+        assert!(items
+            .iter()
+            .any(|i| i.is_directory && i.insert.contains("src")));
         let _ = std::fs::remove_dir_all(dir);
     }
 

@@ -162,6 +162,7 @@ mod tests {
                 &ToolContext {
                     working_dir: dir.clone(),
                     session_id: "glob-test".into(),
+                    image: kkagent_config::ImageConfig::default(),
                     tool_call_id: None,
                     interrupted: None,
                 },

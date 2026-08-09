@@ -38,10 +38,17 @@ pub trait Tool: Send + Sync {
 pub struct ToolContext {
     pub working_dir: std::path::PathBuf,
     pub session_id: String,
+    pub image: kkagent_config::ImageConfig,
     /// Current tool_use id when available (for subagent mirroring).
     pub tool_call_id: Option<String>,
     /// Cooperative cancellation flag owned by the active session.
     pub interrupted: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct MediaOutput {
+    pub media_type: String,
+    pub data: String,
 }
 
 #[derive(Debug, Clone)]
@@ -50,6 +57,8 @@ pub struct ToolOutput {
     pub is_error: bool,
     /// Optional structured payload (e.g. todo items) for the agent loop / TUI.
     pub data: Option<Value>,
+    /// Provider-neutral images to append after this tool result.
+    pub images: Vec<MediaOutput>,
 }
 
 impl ToolOutput {
@@ -58,6 +67,7 @@ impl ToolOutput {
             content: content.into(),
             is_error: false,
             data: None,
+            images: Vec::new(),
         }
     }
 
@@ -66,6 +76,7 @@ impl ToolOutput {
             content: content.into(),
             is_error: false,
             data: Some(data),
+            images: Vec::new(),
         }
     }
 
@@ -74,7 +85,16 @@ impl ToolOutput {
             content: content.into(),
             is_error: true,
             data: None,
+            images: Vec::new(),
         }
+    }
+
+    pub fn with_image(mut self, media_type: impl Into<String>, data: impl Into<String>) -> Self {
+        self.images.push(MediaOutput {
+            media_type: media_type.into(),
+            data: data.into(),
+        });
+        self
     }
 }
 

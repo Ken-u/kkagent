@@ -1,14 +1,14 @@
 //! REST API v1 + WebSocket (kap-server route matrix subset) with AgentLoop backend hooks.
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path, Query, Request, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use rusqlite::{params, Connection, OptionalExtension};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -23,6 +23,7 @@ const MAX_TERMINAL_COMMAND_BYTES: usize = 64 * 1024;
 const MAX_TERMINAL_OUTPUT_BYTES: usize = 1024 * 1024;
 const EVENT_HISTORY_CAPACITY: usize = 2048;
 const DEFAULT_TASK_MAX_ATTEMPTS: u32 = 3;
+const MULTIMODAL_PROMPT_PREFIX: &str = "kkagent:multimodal:v1\n";
 
 #[derive(Debug, Clone)]
 pub struct DurableTurn {
@@ -35,6 +36,23 @@ pub struct DurableTurn {
     pub created_at: String,
     pub updated_at: String,
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HttpImageInput {
+    #[serde(alias = "mime_type")]
+    pub media_type: String,
+    pub data: String,
+}
+
+impl DurableTurn {
+    pub fn message_input(&self) -> (String, Vec<HttpImageInput>) {
+        self.prompt
+            .strip_prefix(MULTIMODAL_PROMPT_PREFIX)
+            .and_then(|payload| serde_json::from_str::<PostMessageBody>(payload).ok())
+            .map(|body| (body.text, body.images))
+            .unwrap_or_else(|| (self.prompt.clone(), Vec::new()))
+    }
 }
 
 impl DurableTurn {
@@ -461,6 +479,7 @@ pub trait HttpBackend: Send + Sync {
         &self,
         id: &str,
         text: &str,
+        images: &[HttpImageInput],
         task_id: Option<&str>,
     ) -> Result<Value, String>;
     async fn list_tools(&self) -> Value;
@@ -533,11 +552,12 @@ impl HttpBackend for MemoryBackend {
         &self,
         id: &str,
         text: &str,
+        images: &[HttpImageInput],
         _task_id: Option<&str>,
     ) -> Result<Value, String> {
         let mut map = self.sessions.lock().await;
         let sess = map.get_mut(id).ok_or_else(|| "not found".to_string())?;
-        let msg = json!({"role": "user", "text": text, "at": chrono::Utc::now().to_rfc3339()});
+        let msg = json!({"role": "user", "text": text, "images": images.len(), "at": chrono::Utc::now().to_rfc3339()});
         if let Some(arr) = sess.get_mut("messages").and_then(|v| v.as_array_mut()) {
             arr.push(msg.clone());
         }
@@ -1278,9 +1298,11 @@ async fn get_session(
         .ok_or(StatusCode::NOT_FOUND)
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct PostMessageBody {
     text: String,
+    #[serde(default)]
+    images: Vec<HttpImageInput>,
 }
 
 async fn post_message(
@@ -1295,8 +1317,16 @@ async fn post_message(
         .get("idempotency-key")
         .and_then(|value| value.to_str().ok());
     let (task_id, replayed) = if let Some(store) = &state.persistence {
+        let durable_prompt = if body.images.is_empty() {
+            body.text.clone()
+        } else {
+            format!(
+                "{MULTIMODAL_PROMPT_PREFIX}{}",
+                serde_json::to_string(&body).map_err(|_| StatusCode::BAD_REQUEST)?
+            )
+        };
         let (turn, replayed) = store
-            .enqueue_turn(&id, &body.text, idempotency_key)
+            .enqueue_turn(&id, &durable_prompt, idempotency_key)
             .map_err(|error| {
                 if error.to_string().contains("different request") {
                     StatusCode::CONFLICT
@@ -1318,7 +1348,7 @@ async fn post_message(
     };
     match state
         .backend
-        .post_message(&id, &body.text, task_id.as_deref())
+        .post_message(&id, &body.text, &body.images, task_id.as_deref())
         .await
     {
         Ok(v) => {
@@ -1902,6 +1932,8 @@ pub fn router(state: HttpState) -> Router {
         )
         .route("/api/v1/connections", get(connections))
         .route("/api/v1/ws", get(ws_handler))
+        // A 100 MiB source image expands by roughly 4/3 when base64 encoded.
+        .layer(DefaultBodyLimit::max(140 * 1024 * 1024))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
@@ -2078,6 +2110,35 @@ mod security_tests {
         let _ = std::fs::remove_file(path);
     }
 
+    #[test]
+    fn durable_multimodal_prompt_roundtrips_without_misreading_plain_json() {
+        let body = PostMessageBody {
+            text: "inspect".into(),
+            images: vec![HttpImageInput {
+                media_type: "image/png".into(),
+                data: "AQID".into(),
+            }],
+        };
+        let turn = DurableTurn {
+            task_id: "task".into(),
+            session_id: "session".into(),
+            prompt: format!(
+                "{MULTIMODAL_PROMPT_PREFIX}{}",
+                serde_json::to_string(&body).unwrap()
+            ),
+            state: "queued".into(),
+            attempts: 0,
+            max_attempts: 3,
+            created_at: String::new(),
+            updated_at: String::new(),
+            error: None,
+        };
+        assert_eq!(turn.message_input(), ("inspect".into(), body.images));
+        let mut plain = turn;
+        plain.prompt = r#"{"text":"literal user JSON","images":[]}"#.into();
+        assert_eq!(plain.message_input().0, plain.prompt);
+    }
+
     #[tokio::test]
     async fn message_endpoint_returns_stable_task_for_idempotent_retry() {
         let path = temporary_database();
@@ -2099,6 +2160,7 @@ mod security_tests {
             headers.clone(),
             Json(PostMessageBody {
                 text: "hello".into(),
+                images: Vec::new(),
             }),
         )
         .await
@@ -2110,6 +2172,7 @@ mod security_tests {
             headers,
             Json(PostMessageBody {
                 text: "hello".into(),
+                images: Vec::new(),
             }),
         )
         .await

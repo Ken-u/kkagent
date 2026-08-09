@@ -21,7 +21,7 @@ provider = "local"
 model = "upstream-model-id"
 max_context_size = 262144
 max_output_size = 16384
-capabilities = ["tool_use"]
+capabilities = ["tool_use", "image_in"]
 display_name = "Default coding model"
 # support_efforts = ["low", "medium", "high"]
 # default_effort = "medium"
@@ -55,6 +55,10 @@ max_steps_per_turn = 64
 auto_compact = true
 compact_keep_last = 8
 token_counting = "measured+estimated" # measured+estimated | measured | estimated
+
+[image]
+max_edge_px = 2000
+read_byte_budget = 262144
 
 [background]
 max_running_tasks = 4

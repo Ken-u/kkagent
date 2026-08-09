@@ -107,6 +107,7 @@ pub fn load_workspace_image(
     path: &Path,
     workspace: &Path,
     limits: &MediaLimits,
+    config: &kkagent_config::ImageConfig,
 ) -> anyhow::Result<ChatContent> {
     let workspace = workspace.canonicalize()?;
     let path = path.canonicalize()?;
@@ -123,16 +124,18 @@ pub fn load_workspace_image(
 
     let bytes = std::fs::read(&path)?;
     let decoded = image::load_from_memory(&bytes)?;
-    let normalized = if decoded.width() > 2048 || decoded.height() > 2048 {
-        decoded.thumbnail(2048, 2048)
-    } else {
-        decoded
-    };
+    let normalized =
+        if decoded.width() > config.max_edge_px || decoded.height() > config.max_edge_px {
+            decoded.thumbnail(config.max_edge_px, config.max_edge_px)
+        } else {
+            decoded
+        };
     let mut encoded = Vec::new();
     JpegEncoder::new_with_quality(&mut encoded, 85).encode_image(&normalized)?;
     if encoded.len() > 5 * 1024 * 1024 {
         encoded.clear();
-        let reduced = normalized.thumbnail(1536, 1536);
+        let reduced_edge = config.max_edge_px.min(1536);
+        let reduced = normalized.thumbnail(reduced_edge, reduced_edge);
         JpegEncoder::new_with_quality(&mut encoded, 70).encode_image(&reduced)?;
     }
     if encoded.len() > 5 * 1024 * 1024 {
@@ -216,7 +219,13 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let path = root.join("wide.png");
         image::RgbImage::new(2400, 32).save(&path).unwrap();
-        let content = load_workspace_image(&path, &root, &MediaLimits::default()).unwrap();
+        let content = load_workspace_image(
+            &path,
+            &root,
+            &MediaLimits::default(),
+            &kkagent_config::ImageConfig::default(),
+        )
+        .unwrap();
         let ChatContent::Image { media_type, data } = content else {
             panic!("expected image content");
         };
@@ -236,9 +245,14 @@ mod tests {
         std::fs::create_dir_all(&workspace).unwrap();
         let outside = base.join("outside.png");
         image::RgbImage::new(1, 1).save(&outside).unwrap();
-        let error = load_workspace_image(&outside, &workspace, &MediaLimits::default())
-            .unwrap_err()
-            .to_string();
+        let error = load_workspace_image(
+            &outside,
+            &workspace,
+            &MediaLimits::default(),
+            &kkagent_config::ImageConfig::default(),
+        )
+        .unwrap_err()
+        .to_string();
         assert!(error.contains("outside the active workspace"));
         std::fs::remove_dir_all(base).unwrap();
     }

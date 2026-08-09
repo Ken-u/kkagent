@@ -160,7 +160,7 @@ provider = "local"
 model = "claude-opus-4-8"
 max_context_size = 262144
 max_output_size = 16384              # 建议 <= 16384，过大易被上游拒绝
-capabilities = ["tool_use"]
+capabilities = ["tool_use", "image_in"]
 display_name = "claude-opus-4-8"
 ```
 
@@ -173,7 +173,7 @@ display_name = "claude-opus-4-8"
 | `providers.*.base_url` | 可带或不带末尾 `/v1`，客户端会避免重复路径 |
 | `providers.*.api_key` | Anthropic 使用 `x-api-key`，OpenAI/Kimi 使用 Bearer token |
 | `models.*.model` | 发给上游的真实 model id |
-| `models.*.capabilities` | 含 `tool_use` 才会带工具定义；`thinking` 可按需开 |
+| `models.*.capabilities` | `tool_use` 启用工具；`image_in` 启用路径附件、粘贴和工具/MCP 图片输入；`thinking` 可按需开 |
 | `default_permission_mode` | `manual` 每次确认；`yolo` 自动批准常规工具；`auto` 更激进 |
 
 ### MCP 服务器（可选）

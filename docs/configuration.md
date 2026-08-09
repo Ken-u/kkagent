@@ -56,13 +56,23 @@ provider = "openai"
 model = "upstream-model-id"
 max_context_size = 200000
 max_output_size = 16384
-capabilities = ["tool_use", "thinking"]
+capabilities = ["tool_use", "thinking", "image_in"]
 display_name = "Coding model"
 support_efforts = ["low", "medium", "high"]
 default_effort = "medium"
 ```
 
-`provider` 必须引用已有 Provider。`max_context_size` 和 `max_output_size` 参与上下文预算。`tool_use` 控制是否向模型发送工具定义；`support_efforts` 和 `default_effort` 描述可用推理强度。
+`provider` 必须引用已有 Provider。`max_context_size` 和 `max_output_size` 参与上下文预算。`tool_use` 控制是否向模型发送工具定义；`image_in`、`video_in`、`audio_in` 声明多模态输入能力；`support_efforts` 和 `default_effort` 描述可用推理强度。
+
+## 图片
+
+```toml
+[image]
+max_edge_px = 2000
+read_byte_budget = 262144
+```
+
+`max_edge_px` 是所有普通图片入口（路径附件、粘贴、工具和 MCP 结果）的最长边限制，范围为 1–16384。`read_byte_budget` 是 Agent 通过 `ReadMediaFile` 或 MCP 自行获得单张图片时的编码预算，默认 256 KiB、最大 20 MiB；`region` 与 `full_resolution` 使用 5 MiB Provider 安全上限。环境变量 `KKAGENT_IMAGE_MAX_EDGE_PX` / `KIMI_IMAGE_MAX_EDGE_PX` 和 `KKAGENT_IMAGE_READ_BYTE_BUDGET` / `KIMI_IMAGE_READ_BYTE_BUDGET` 可覆盖配置。
 
 ## Thinking
 

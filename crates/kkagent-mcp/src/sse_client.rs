@@ -250,7 +250,11 @@ impl SseMcpClient {
             .collect())
     }
 
-    pub async fn call_tool(&self, name: &str, arguments: Value) -> Result<String> {
+    pub async fn call_tool(
+        &self,
+        name: &str,
+        arguments: Value,
+    ) -> Result<crate::client::McpCallOutput> {
         let result = self
             .request(
                 "tools/call",
@@ -260,16 +264,26 @@ impl SseMcpClient {
                 }),
             )
             .await?;
-        let mut output = String::new();
+        let mut output = crate::client::McpCallOutput::default();
         if let Some(content) = result.get("content").and_then(|c| c.as_array()) {
             for block in content {
                 if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
-                    output.push_str(text);
+                    output.text.push_str(text);
+                } else if block.get("type").and_then(|value| value.as_str()) == Some("image") {
+                    if let (Some(data), Some(mime_type)) = (
+                        block.get("data").and_then(Value::as_str),
+                        block.get("mimeType").and_then(Value::as_str),
+                    ) {
+                        output.images.push(kkagent_tools::MediaOutput {
+                            media_type: mime_type.into(),
+                            data: data.into(),
+                        });
+                    }
                 }
             }
         }
-        if output.is_empty() {
-            output = result.to_string();
+        if output.text.is_empty() && output.images.is_empty() {
+            output.text = result.to_string();
         }
         Ok(output)
     }

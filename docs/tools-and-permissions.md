@@ -7,7 +7,7 @@
 | 文件 | `Read`、`Write`、`Edit` | 读取、创建和精确修改文本文件。 |
 | 搜索 | `Grep`、`Glob` | 搜索内容和路径。 |
 | 命令 | `Bash` | 运行 Shell 命令，支持超时、取消和后台任务。 |
-| 媒体 | `ReadMediaFile` | 读取受限尺寸的图片或视频元数据；SVG 不作为图片解码。 |
+| 媒体 | `ReadMediaFile` | 将图片作为多模态内容发送给模型，支持原图坐标裁剪和全分辨率读取。 |
 | 规划 | `TodoList`、`EnterPlanMode`、`ExitPlanMode` | 管理步骤和 Plan 模式。 |
 | 交互 | `AskUserQuestion`、`SelectTools` | 请求用户输入或选择工具集。 |
 | 扩展 | `Skill`、动态 MCP 工具 | 加载 Skill 或调用 MCP Server。 |
@@ -17,6 +17,24 @@
 | 定时 | `CronCreate`、`CronList`、`CronDelete` | 管理会话内定时任务。 |
 
 实际可用集合受模型 capability、配置、当前模式和 MCP 连接状态影响。`GET /api/v1/tools` 或 TUI 状态可查看当前工具。
+
+## 图片输入
+
+模型配置含 `image_in`（也兼容 `vision`、`image`、`multimodal`）时启用完整图片输入：
+
+- 在提示词中写 `@./screenshot.png`，或在 TUI 按 `Ctrl-V` 粘贴剪贴板图片。
+- `ReadMediaFile` 会返回真正的图片内容，不会把 base64 当作文本塞给模型。
+- `region = { x, y, width, height }` 使用原图像素坐标读取局部细节；`full_resolution = true` 跳过常规缩放，超过 Provider 安全限制时明确报错。
+- MCP 返回的 image block 和 image 类型 blob resource 会统一压缩后传给模型。
+- 历史图片会在上下文投影或 HTTP 413 恢复时替换成文本标记，避免重复携带大体积媒体。
+
+示例工具参数：
+
+```json
+{"path":"screenshots/app.png","region":{"x":120,"y":80,"width":640,"height":480}}
+```
+
+支持 PNG、JPEG、GIF、WebP 和 BMP 输入；SVG 必须先光栅化。普通图片会统一编码为有界 JPEG。当前模型未声明 `image_in` 时，最新图片输入会被拒绝并给出可操作提示。
 
 ## 权限模式
 

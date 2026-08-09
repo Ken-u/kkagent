@@ -49,7 +49,13 @@ export class KkagentHttpClient {
         ...this.headers(true),
         ...(options.idempotencyKey ? { "idempotency-key": options.idempotencyKey } : {}),
       },
-      body: JSON.stringify({ text }),
+            body: JSON.stringify({
+                text,
+                images: options.images?.map((image) => ({
+                    media_type: image.mediaType,
+                    data: image.data,
+                })),
+            }),
     });
     if (!res.ok) throw new Error(`postMessage ${res.status}`);
     return res.json();

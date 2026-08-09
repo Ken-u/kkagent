@@ -55,6 +55,7 @@ pub async fn run_subagent_mirrored(
         permission_mode,
         model.clone(),
     );
+    session.image_config = app_config.image.clone();
     session.inject_workspace_instructions().await;
     session
         .system_prompt

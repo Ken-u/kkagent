@@ -4,11 +4,10 @@ use image::codecs::jpeg::JpegEncoder;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
-use crate::{Tool, ToolContext, ToolOutput};
+use crate::{MediaOutput, Tool, ToolContext, ToolOutput};
 
-const MAX_INLINE_BYTES: usize = 2 * 1024 * 1024;
+const MAX_INLINE_BYTES: usize = 5 * 1024 * 1024;
 const MAX_SOURCE_BYTES: u64 = 100 * 1024 * 1024;
-const MAX_IMAGE_DIMENSION: u32 = 2048;
 
 pub struct ReadMediaFileTool;
 
@@ -19,8 +18,9 @@ impl Tool for ReadMediaFileTool {
     }
 
     fn description(&self) -> &str {
-        "Read media metadata. Raster images are decoded and normalized to a bounded JPEG preview; \
-audio can be returned as bounded base64; video is metadata-only. This tool never modifies files."
+        "Send an image to the model as multimodal content. Use region={x,y,width,height} to inspect \
+fine detail in original-image coordinates, or full_resolution=true to avoid ordinary downscaling. \
+Audio and video currently return metadata only. Files are never modified."
     }
 
     fn read_only(&self) -> bool {
@@ -32,8 +32,21 @@ audio can be returned as bounded base64; video is metadata-only. This tool never
             "type": "object",
             "properties": {
                 "path": {"type": "string", "description": "Path to an image, video, or audio file"},
-                "include_base64": {"type": "boolean", "description": "Include a bounded base64 image/audio payload (default: true for images and small audio)"},
-                "max_bytes": {"type": "integer", "minimum": 1, "maximum": MAX_INLINE_BYTES, "description": "Maximum decoded payload bytes, capped at 2 MiB"}
+                "region": {
+                    "type": "object",
+                    "description": "Crop in original-image pixel coordinates",
+                    "properties": {
+                        "x": {"type": "integer", "minimum": 0},
+                        "y": {"type": "integer", "minimum": 0},
+                        "width": {"type": "integer", "minimum": 1},
+                        "height": {"type": "integer", "minimum": 1}
+                    },
+                    "required": ["x", "y", "width", "height"],
+                    "additionalProperties": false
+                },
+                "full_resolution": {"type": "boolean", "description": "Keep original resolution; errors if the encoded image exceeds the provider-safe limit"},
+                "include_base64": {"type": "boolean", "description": "Legacy switch; false returns metadata only"},
+                "max_bytes": {"type": "integer", "minimum": 1, "maximum": MAX_INLINE_BYTES, "description": "Optional encoded image byte budget, capped at 5 MiB"}
             },
             "required": ["path"]
         })
@@ -67,10 +80,31 @@ audio can be returned as bounded base64; video is metadata-only. This tool never
             .to_ascii_lowercase();
         let kind = media_kind(&ext);
         let mime = mime_for_ext(&ext);
+        let region = match input.get("region") {
+            Some(value) => match parse_region(value) {
+                Ok(region) => Some(region),
+                Err(error) => return Ok(ToolOutput::error(error)),
+            },
+            None => None,
+        };
+        let full_resolution = input
+            .get("full_resolution")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if !matches!(kind, MediaKind::Image) && (region.is_some() || full_resolution) {
+            return Ok(ToolOutput::error(
+                "region and full_resolution apply only to image files.",
+            ));
+        }
+        let default_budget = if region.is_some() || full_resolution {
+            MAX_INLINE_BYTES
+        } else {
+            ctx.image.read_byte_budget.min(MAX_INLINE_BYTES)
+        };
         let budget = input
             .get("max_bytes")
             .and_then(Value::as_u64)
-            .unwrap_or(MAX_INLINE_BYTES as u64)
+            .unwrap_or(default_budget as u64)
             .clamp(1, MAX_INLINE_BYTES as u64) as usize;
         let include = input
             .get("include_base64")
@@ -78,7 +112,21 @@ audio can be returned as bounded base64; video is metadata-only. This tool never
             .unwrap_or(matches!(kind, MediaKind::Image | MediaKind::Audio));
 
         match kind {
-            MediaKind::Image => read_image(path, path_str, metadata.len(), include, budget).await,
+            MediaKind::Image => {
+                read_image(
+                    path,
+                    path_str,
+                    metadata.len(),
+                    ImageReadOptions {
+                        include,
+                        budget,
+                        max_edge_px: ctx.image.max_edge_px,
+                        region,
+                        full_resolution,
+                    },
+                )
+                .await
+            }
             MediaKind::Audio => {
                 read_bounded_bytes(
                     path,
@@ -103,10 +151,9 @@ async fn read_image(
     path: PathBuf,
     display_path: &str,
     source_size: u64,
-    include: bool,
-    budget: usize,
+    options: ImageReadOptions,
 ) -> anyhow::Result<ToolOutput> {
-    if !include {
+    if !options.include {
         return Ok(metadata_only(
             display_path,
             mime_for_path(&path),
@@ -121,11 +168,44 @@ async fn read_image(
     }
 
     let bytes = tokio::fs::read(&path).await?;
-    let prepared = tokio::task::spawn_blocking(move || normalize_image(&bytes, budget)).await??;
+    let prepared = tokio::task::spawn_blocking(move || {
+        normalize_image(
+            &bytes,
+            options.budget,
+            options.max_edge_px,
+            options.region,
+            options.full_resolution,
+        )
+    })
+    .await??;
     let encoded = B64.encode(&prepared.bytes);
+    let delivery = if let Some(region) = prepared.region {
+        format!(
+            "crop x={} y={} width={} height={} from {}x{}",
+            region.x,
+            region.y,
+            region.width,
+            region.height,
+            prepared.source_width,
+            prepared.source_height
+        )
+    } else if options.full_resolution {
+        "full_resolution".into()
+    } else {
+        "compressed_preview".into()
+    };
     let content = format!(
-        "path: {display_path}\nmime: image/jpeg\nkind: image\nsource_size: {source_size} bytes\npreview_size: {} bytes\ndimensions: {}x{}\nencoding: base64\n\n{encoded}",
-        prepared.bytes.len(), prepared.width, prepared.height
+        "Image attached from {display_path}. Source: {}x{} ({source_size} bytes). Delivered: {}x{} JPEG ({} bytes, {delivery}).{}",
+        prepared.source_width,
+        prepared.source_height,
+        prepared.width,
+        prepared.height,
+        prepared.bytes.len(),
+        if options.region.is_none() && !options.full_resolution && (prepared.width < prepared.source_width || prepared.height < prepared.source_height) {
+            " Use region to inspect fine detail in original-image coordinates."
+        } else {
+            ""
+        }
     );
     Ok(ToolOutput::success_with_data(
         content,
@@ -136,30 +216,65 @@ async fn read_image(
             "preview_size": prepared.bytes.len(),
             "width": prepared.width,
             "height": prepared.height,
-            "base64_len": encoded.len(),
+            "source_width": prepared.source_width,
+            "source_height": prepared.source_height,
+            "delivery": delivery,
         }),
-    ))
+    )
+    .with_image("image/jpeg", encoded))
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ImageReadOptions {
+    include: bool,
+    budget: usize,
+    max_edge_px: u32,
+    region: Option<ImageRegion>,
+    full_resolution: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ImageRegion {
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
 }
 
 struct PreparedImage {
     bytes: Vec<u8>,
     width: u32,
     height: u32,
+    source_width: u32,
+    source_height: u32,
+    region: Option<ImageRegion>,
 }
 
-fn normalize_image(bytes: &[u8], budget: usize) -> anyhow::Result<PreparedImage> {
+fn normalize_image(
+    bytes: &[u8],
+    budget: usize,
+    max_edge_px: u32,
+    region: Option<ImageRegion>,
+    full_resolution: bool,
+) -> anyhow::Result<PreparedImage> {
     let decoded = image::load_from_memory(bytes)?;
-    let mut image =
-        if decoded.width() > MAX_IMAGE_DIMENSION || decoded.height() > MAX_IMAGE_DIMENSION {
-            decoded.thumbnail(MAX_IMAGE_DIMENSION, MAX_IMAGE_DIMENSION)
-        } else {
-            decoded
-        };
+    let (source_width, source_height) = (decoded.width(), decoded.height());
+    let applied_region = region
+        .map(|region| clamp_region(region, source_width, source_height))
+        .transpose()?;
+    let mut image = if let Some(region) = applied_region {
+        decoded.crop_imm(region.x, region.y, region.width, region.height)
+    } else {
+        decoded
+    };
+    if !full_resolution
+        && applied_region.is_none()
+        && (image.width() > max_edge_px || image.height() > max_edge_px)
+    {
+        image = image.thumbnail(max_edge_px, max_edge_px);
+    }
 
-    for (dimension, quality) in [(2048, 85), (1536, 75), (1024, 65), (768, 55), (512, 45)] {
-        if image.width() > dimension || image.height() > dimension {
-            image = image.thumbnail(dimension, dimension);
-        }
+    for quality in [90, 85, 75, 65, 55, 45, 35] {
         let mut encoded = Vec::new();
         JpegEncoder::new_with_quality(&mut encoded, quality).encode_image(&image)?;
         if encoded.len() <= budget {
@@ -167,10 +282,100 @@ fn normalize_image(bytes: &[u8], budget: usize) -> anyhow::Result<PreparedImage>
                 bytes: encoded,
                 width: image.width(),
                 height: image.height(),
+                source_width,
+                source_height,
+                region: applied_region,
             });
         }
+        if full_resolution || applied_region.is_some() {
+            continue;
+        }
+        let next_edge = image.width().max(image.height()).saturating_mul(3) / 4;
+        if next_edge >= 256 {
+            image = image.thumbnail(next_edge, next_edge);
+        }
+    }
+    if full_resolution {
+        anyhow::bail!("full_resolution image cannot fit within the {budget}-byte provider-safe limit; use region instead")
+    }
+    if applied_region.is_some() {
+        anyhow::bail!("cropped region cannot fit within the {budget}-byte provider-safe limit; choose a smaller region")
     }
     anyhow::bail!("image preview cannot fit within the requested {budget}-byte budget")
+}
+
+/// Normalize an image returned by an external tool before it enters model history.
+pub fn normalize_external_image(
+    data: &str,
+    config: &kkagent_config::ImageConfig,
+) -> anyhow::Result<MediaOutput> {
+    let decoded = B64.decode(data)?;
+    if decoded.len() as u64 > MAX_SOURCE_BYTES {
+        anyhow::bail!("external image exceeds the {MAX_SOURCE_BYTES}-byte source limit");
+    }
+    let prepared = normalize_image(
+        &decoded,
+        config.read_byte_budget.min(MAX_INLINE_BYTES),
+        config.max_edge_px,
+        None,
+        false,
+    )?;
+    Ok(MediaOutput {
+        media_type: "image/jpeg".into(),
+        data: B64.encode(prepared.bytes),
+    })
+}
+
+/// Normalize a user-provided image. User attachments use the provider-safe limit rather than the
+/// smaller model-initiated read budget so screenshots remain legible.
+pub fn normalize_user_image(
+    data: &str,
+    config: &kkagent_config::ImageConfig,
+) -> anyhow::Result<MediaOutput> {
+    let decoded = B64.decode(data)?;
+    if decoded.len() as u64 > MAX_SOURCE_BYTES {
+        anyhow::bail!("user image exceeds the {MAX_SOURCE_BYTES}-byte source limit");
+    }
+    let prepared = normalize_image(&decoded, MAX_INLINE_BYTES, config.max_edge_px, None, false)?;
+    Ok(MediaOutput {
+        media_type: "image/jpeg".into(),
+        data: B64.encode(prepared.bytes),
+    })
+}
+
+fn parse_region(value: &Value) -> Result<ImageRegion, String> {
+    let read = |key: &str| {
+        value
+            .get(key)
+            .and_then(Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok())
+            .ok_or_else(|| format!("region.{key} must be a non-negative integer"))
+    };
+    let region = ImageRegion {
+        x: read("x")?,
+        y: read("y")?,
+        width: read("width")?,
+        height: read("height")?,
+    };
+    if region.width == 0 || region.height == 0 {
+        return Err("region width and height must be at least 1".into());
+    }
+    Ok(region)
+}
+
+fn clamp_region(region: ImageRegion, width: u32, height: u32) -> anyhow::Result<ImageRegion> {
+    if region.x >= width || region.y >= height {
+        anyhow::bail!(
+            "region starts outside the {width}x{height} image (x={}, y={})",
+            region.x,
+            region.y
+        );
+    }
+    Ok(ImageRegion {
+        width: region.width.min(width - region.x),
+        height: region.height.min(height - region.y),
+        ..region
+    })
 }
 
 async fn read_bounded_bytes(
@@ -265,6 +470,7 @@ mod tests {
         ToolContext {
             working_dir: dir.to_path_buf(),
             session_id: "media-test".into(),
+            image: kkagent_config::ImageConfig::default(),
             tool_call_id: None,
             interrupted: None,
         }
@@ -284,9 +490,32 @@ mod tests {
             .unwrap();
         assert!(!output.is_error);
         assert_eq!(output.data.as_ref().unwrap()["mime"], "image/jpeg");
-        assert!(output.data.as_ref().unwrap()["width"].as_u64().unwrap() <= 2048);
+        assert!(output.data.as_ref().unwrap()["width"].as_u64().unwrap() <= 2000);
+        assert_eq!(output.images.len(), 1);
+        assert!(!output.content.contains(&output.images[0].data));
         assert!(!dir.join(".kkagent").exists());
 
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn crops_in_original_pixel_coordinates() {
+        let dir = std::env::temp_dir().join(format!("kkagent-media-crop-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        image::RgbImage::new(800, 600)
+            .save(dir.join("source.png"))
+            .unwrap();
+        let output = ReadMediaFileTool
+            .execute(
+                json!({"path": "source.png", "region": {"x": 700, "y": 500, "width": 200, "height": 200}}),
+                &context(&dir),
+            )
+            .await
+            .unwrap();
+        assert!(!output.is_error);
+        assert_eq!(output.data.as_ref().unwrap()["width"], 100);
+        assert_eq!(output.data.as_ref().unwrap()["height"], 100);
+        assert_eq!(output.images.len(), 1);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -305,5 +534,22 @@ mod tests {
         assert!(!output.is_error);
         assert!(!output.content.contains(&B64.encode(b"fake video")));
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn normalizes_external_user_image_to_jpeg() {
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgb8(image::RgbImage::new(2, 2))
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        let output =
+            normalize_user_image(&B64.encode(png), &kkagent_config::ImageConfig::default())
+                .unwrap();
+        assert_eq!(output.media_type, "image/jpeg");
+        let decoded = B64.decode(output.data).unwrap();
+        assert_eq!(
+            image::guess_format(&decoded).unwrap(),
+            image::ImageFormat::Jpeg
+        );
     }
 }

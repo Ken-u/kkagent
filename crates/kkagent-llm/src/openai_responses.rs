@@ -65,6 +65,9 @@ pub async fn openai_responses_stream(
                 input.push(tc);
             }
         } else if m.role == "user" {
+            for tr in tool_results {
+                input.push(tr);
+            }
             if !images.is_empty() {
                 let mut content: Vec<serde_json::Value> = texts
                     .iter()
@@ -77,9 +80,6 @@ pub async fn openai_responses_stream(
                 }));
             } else if !texts.is_empty() {
                 input.push(json!({"role": "user", "content": texts.join("\n")}));
-            }
-            for tr in tool_results {
-                input.push(tr);
             }
         } else if !texts.is_empty() {
             input.push(json!({

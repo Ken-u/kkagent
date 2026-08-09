@@ -363,6 +363,9 @@ async fn chat_completions_stream(
             }
             messages.push(msg);
         } else if m.role == "user" {
+            for tr in tool_results {
+                messages.push(tr);
+            }
             if !media_parts.is_empty() {
                 let mut content: Vec<serde_json::Value> = text_parts
                     .iter()
@@ -372,9 +375,6 @@ async fn chat_completions_stream(
                 messages.push(json!({"role": "user", "content": content}));
             } else if !text_parts.is_empty() {
                 messages.push(json!({"role": "user", "content": text_parts.join("\n")}));
-            }
-            for tr in tool_results {
-                messages.push(tr);
             }
         } else {
             messages.push(json!({"role": &m.role, "content": text_parts.join("\n")}));
@@ -1028,6 +1028,43 @@ mod tests {
         assert!(captured
             .head
             .starts_with("POST /v1/chat/completions HTTP/1.1"));
+    }
+
+    #[tokio::test]
+    async fn openai_orders_tool_result_before_followup_image() {
+        let sse = "data: [DONE]\n";
+        let (base_url, captured) = serve_once("200 OK", "text/event-stream", sse).await;
+        let mut request = request();
+        request.messages.push(ChatMessage {
+            role: "assistant".into(),
+            content: vec![ChatContent::ToolUse {
+                id: "call-image".into(),
+                name: "ReadMediaFile".into(),
+                input: serde_json::json!({"path":"screen.png"}),
+            }],
+        });
+        request.messages.push(ChatMessage {
+            role: "user".into(),
+            content: vec![
+                ChatContent::ToolResult {
+                    tool_use_id: "call-image".into(),
+                    content: "Image attached.".into(),
+                    is_error: false,
+                },
+                ChatContent::Image {
+                    media_type: "image/jpeg".into(),
+                    data: "AQID".into(),
+                },
+            ],
+        });
+        let (tx, _rx) = mpsc::channel(8);
+        openai_stream(&Client::new(), &base_url, "token", request, tx)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_str(&captured.await.unwrap().body).unwrap();
+        assert_eq!(body["messages"][3]["role"], "tool");
+        assert_eq!(body["messages"][4]["role"], "user");
+        assert_eq!(body["messages"][4]["content"][0]["type"], "image_url");
     }
 
     #[tokio::test]

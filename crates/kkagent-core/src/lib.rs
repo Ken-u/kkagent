@@ -28,7 +28,9 @@ pub use activity_view::{ActivityItem, ActivityView};
 pub use agent_loop::*;
 pub use blob_store::{resolve_media_refs, BlobStore};
 pub use context_memory::{fold_loop_events, fold_vacuous, CompactionHandoff};
-pub use context_projector::{compact_messages, project, project_strict, ProjectOptions};
+pub use context_projector::{
+    compact_messages, fold_old_media, project, project_strict, ProjectOptions,
+};
 pub use event_bus::EventBus;
 pub use full_compaction::{compact_full, CompactionStrategy};
 pub use git_context::{collect_git_context, is_workspace_trusted};

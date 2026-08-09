@@ -1678,6 +1678,7 @@ dependencies = [
  "dirs",
  "futures",
  "ignore",
+ "image",
  "kkagent-client",
  "kkagent-config",
  "kkagent-protocol",

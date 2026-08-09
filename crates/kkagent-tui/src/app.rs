@@ -915,6 +915,27 @@ impl TuiApp {
         }
 
         match key.code {
+            // Kimi-style media paste. Text paste still falls back to the platform clipboard.
+            KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                match paste_clipboard_into_workspace() {
+                    Ok(Some(path)) => {
+                        let mention = format!("@{}", path.to_string_lossy());
+                        self.state.input.insert_str(&mention);
+                        self.state.refresh_slash_menu();
+                        self.system_message(format!(
+                            "Attached clipboard image: {}",
+                            path.display()
+                        ));
+                    }
+                    Ok(None) => {
+                        if let Ok(text) = read_clipboard_text() {
+                            self.state.input.insert_str(&text);
+                            self.state.refresh_slash_menu();
+                        }
+                    }
+                    Err(error) => self.system_message(format!("Image paste failed: {error}")),
+                }
+            }
             // Ctrl-C: interrupt or quit
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if self.state.status != SessionStatus::Idle {
@@ -1204,8 +1225,7 @@ impl TuiApp {
         let token_start = menu.token_start;
         let quoted = menu.quoted;
         let cursor = self.state.input.cursor.min(self.state.input.text.len());
-        let (replacement, keep_open) =
-            crate::pi::autocomplete::format_at_completion(&item, quoted);
+        let (replacement, keep_open) = crate::pi::autocomplete::format_at_completion(&item, quoted);
         // For directories ending with `/`, drop trailing space from format helper when keep_open —
         // format_at_completion already omits space for dirs.
         self.state
@@ -2804,4 +2824,113 @@ fn copy_to_clipboard(text: &str) -> anyhow::Result<()> {
         let _ = text;
         anyhow::bail!("clipboard unsupported on this platform");
     }
+}
+
+fn paste_clipboard_into_workspace() -> anyhow::Result<Option<PathBuf>> {
+    let root = std::env::current_dir()?;
+    let dir = root.join(".kkagent").join("attachments");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("pasted-{}.png", uuid::Uuid::new_v4()));
+
+    let bytes = read_clipboard_png(&path)?;
+    let Some(bytes) = bytes else {
+        let _ = std::fs::remove_file(&path);
+        return Ok(None);
+    };
+    if bytes.len() > 100 * 1024 * 1024 {
+        let _ = std::fs::remove_file(&path);
+        anyhow::bail!("clipboard image exceeds the 100 MiB input limit");
+    }
+    let image = image::load_from_memory(&bytes).map_err(|error| {
+        anyhow::anyhow!("clipboard does not contain a supported image: {error}")
+    })?;
+    image.save_with_format(&path, image::ImageFormat::Png)?;
+    Ok(Some(
+        path.strip_prefix(&root).unwrap_or(&path).to_path_buf(),
+    ))
+}
+
+fn read_clipboard_png(path: &std::path::Path) -> anyhow::Result<Option<Vec<u8>>> {
+    #[cfg(target_os = "macos")]
+    {
+        let script = r#"try
+set pngData to the clipboard as «class PNGf»
+set targetPath to system attribute "KKAGENT_CLIP_PATH"
+set fileRef to open for access POSIX file targetPath with write permission
+set eof fileRef to 0
+write pngData to fileRef
+close access fileRef
+on error
+try
+close access POSIX file (system attribute "KKAGENT_CLIP_PATH")
+end try
+return "no-image"
+end try"#;
+        let status = std::process::Command::new("osascript")
+            .args(["-e", script])
+            .env("KKAGENT_CLIP_PATH", path)
+            .status()?;
+        if !status.success() || !path.is_file() {
+            return Ok(None);
+        }
+        Ok(Some(std::fs::read(path)?))
+    }
+    #[cfg(target_os = "linux")]
+    {
+        for (command, args) in [
+            ("wl-paste", vec!["--no-newline", "--type", "image/png"]),
+            (
+                "xclip",
+                vec!["-selection", "clipboard", "-t", "image/png", "-o"],
+            ),
+        ] {
+            if let Ok(output) = std::process::Command::new(command).args(args).output() {
+                if output.status.success() && !output.stdout.is_empty() {
+                    return Ok(Some(output.stdout));
+                }
+            }
+        }
+        Ok(None)
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let script = "Add-Type -AssemblyName System.Windows.Forms; Add-Type -AssemblyName System.Drawing; $img=[Windows.Forms.Clipboard]::GetImage(); if ($null -eq $img) { exit 2 }; $img.Save($env:KKAGENT_CLIP_PATH,[Drawing.Imaging.ImageFormat]::Png)";
+        let status = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", script])
+            .env("KKAGENT_CLIP_PATH", path)
+            .status()?;
+        if !status.success() || !path.is_file() {
+            return Ok(None);
+        }
+        Ok(Some(std::fs::read(path)?))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        let _ = path;
+        Ok(None)
+    }
+}
+
+fn read_clipboard_text() -> anyhow::Result<String> {
+    #[cfg(target_os = "macos")]
+    let output = std::process::Command::new("pbpaste").output()?;
+    #[cfg(target_os = "linux")]
+    let output = std::process::Command::new("sh")
+        .args(["-c", "command -v wl-paste >/dev/null && wl-paste --no-newline || xclip -selection clipboard -o"])
+        .output()?;
+    #[cfg(target_os = "windows")]
+    let output = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Get-Clipboard -Raw",
+        ])
+        .output()?;
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    anyhow::bail!("clipboard unsupported on this platform");
+    if !output.status.success() {
+        anyhow::bail!("clipboard command failed");
+    }
+    Ok(String::from_utf8(output.stdout)?)
 }

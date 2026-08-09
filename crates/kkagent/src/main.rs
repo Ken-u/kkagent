@@ -774,6 +774,7 @@ struct AgentAcpHost {
 }
 
 async fn initialize_session_context(state: &ServerState, session: &mut Session) {
+    session.image_config = state.config.image.clone();
     session.inject_date_reminder();
     session.inject_workspace_instructions().await;
     session.inject_git_context();
@@ -874,10 +875,12 @@ async fn recover_durable_turns(backend: Arc<AgentHttpBackend>) {
     };
     for turn in turns {
         tracing::warn!(task_id = %turn.task_id, session_id = %turn.session_id, attempts = turn.attempts, "Recovering durable turn");
+        let (text, images) = turn.message_input();
         if let Err(error) = kkagent_rpc::HttpBackend::post_message(
             backend.as_ref(),
             &turn.session_id,
-            &turn.prompt,
+            &text,
+            &images,
             Some(&turn.task_id),
         )
         .await
@@ -1377,10 +1380,11 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
         &self,
         id: &str,
         text: &str,
+        images: &[kkagent_rpc::HttpImageInput],
         task_id: Option<&str>,
     ) -> Result<serde_json::Value, String> {
         // Queue user message and run AgentLoop turn on shared ServerState.
-        if text.trim().is_empty() {
+        if text.trim().is_empty() && images.is_empty() {
             return Err("message text must not be empty".into());
         }
         ensure_http_session_loaded(&self.state, id).await?;
@@ -1395,7 +1399,15 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
         let session = sessions
             .get_mut(id)
             .ok_or_else(|| "session not found".to_string())?;
-        session.add_user_message(text.to_string());
+        session
+            .add_user_message_with_images(
+                text.to_string(),
+                images
+                    .iter()
+                    .map(|image| (image.media_type.clone(), image.data.clone()))
+                    .collect(),
+            )
+            .map_err(|error| format!("invalid image input: {error}"))?;
         let n = session.messages.len();
         drop(sessions);
         let state = self.state.clone();
@@ -2844,7 +2856,30 @@ async fn handle_rpc_call(
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| (-32602, "Missing text".into()))?
                 .to_string();
-            if text.trim().is_empty() {
+            let images = params
+                .as_ref()
+                .and_then(|p| p.get("images"))
+                .and_then(|value| value.as_array())
+                .map(|images| {
+                    images
+                        .iter()
+                        .map(|image| {
+                            let media_type = image
+                                .get("media_type")
+                                .or_else(|| image.get("mime_type"))
+                                .and_then(|value| value.as_str())
+                                .ok_or_else(|| (-32602, "Image is missing media_type".into()))?;
+                            let data = image
+                                .get("data")
+                                .and_then(|value| value.as_str())
+                                .ok_or_else(|| (-32602, "Image is missing base64 data".into()))?;
+                            Ok((media_type.to_string(), data.to_string()))
+                        })
+                        .collect::<Result<Vec<_>, _>>()
+                })
+                .transpose()?
+                .unwrap_or_default();
+            if text.trim().is_empty() && images.is_empty() {
                 return Err((-32602, "Prompt text must not be empty".into()));
             }
             let turn_permit = state
@@ -2885,7 +2920,9 @@ async fn handle_rpc_call(
                         note.push_str("</system-reminder>");
                         session.add_user_message(note);
                     }
-                    session.add_user_message(text);
+                    session
+                        .add_user_message_with_images(text, images)
+                        .map_err(|error| (-32602, format!("Invalid image input: {error}")))?;
                     session.begin_turn();
                 } else {
                     return Err((-32602, format!("Session not found: {}", session_id)));

@@ -101,6 +101,7 @@ mod tests {
         let context = ToolContext {
             working_dir: dir.clone(),
             session_id: "write-test".into(),
+            image: kkagent_config::ImageConfig::default(),
             tool_call_id: None,
             interrupted: None,
         };

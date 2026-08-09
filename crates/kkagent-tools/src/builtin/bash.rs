@@ -345,12 +345,7 @@ impl BashTool {
         let id = Uuid::new_v4().to_string();
         let cancel = match self
             .backgrounds
-            .insert_running(
-                &id,
-                &session_id,
-                description.clone(),
-                command.clone(),
-            )
+            .insert_running(&id, &session_id, description.clone(), command.clone())
             .await
         {
             Ok(cancel) => cancel,
@@ -878,6 +873,7 @@ mod tests {
         ToolContext {
             working_dir: std::env::current_dir().expect("current directory"),
             session_id: "bash-test".to_string(),
+            image: kkagent_config::ImageConfig::default(),
             tool_call_id: None,
             interrupted,
         }

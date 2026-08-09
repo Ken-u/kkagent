@@ -79,17 +79,35 @@ impl Tool for McpProxyTool {
         self.input_schema.clone()
     }
 
-    async fn execute(&self, input: Value, _ctx: &ToolContext) -> anyhow::Result<ToolOutput> {
+    async fn execute(&self, input: Value, ctx: &ToolContext) -> anyhow::Result<ToolOutput> {
         match self
             .manager
             .call_tool(&self.server_name, &self.remote_name, input)
             .await
         {
-            Ok(text) => Ok(ToolOutput::success(if text.is_empty() {
-                "(empty MCP result)".into()
-            } else {
-                text
-            })),
+            Ok(result) => {
+                let mut output = ToolOutput::success(if result.text.is_empty() {
+                    if result.images.is_empty() {
+                        "(empty MCP result)".into()
+                    } else {
+                        format!("MCP returned {} image attachment(s).", result.images.len())
+                    }
+                } else {
+                    result.text
+                });
+                for image in result.images {
+                    match kkagent_tools::builtin::media::normalize_external_image(
+                        &image.data,
+                        &ctx.image,
+                    ) {
+                        Ok(image) => output.images.push(image),
+                        Err(error) => output
+                            .content
+                            .push_str(&format!("\n[MCP image omitted: {error}]")),
+                    }
+                }
+                Ok(output)
+            }
             Err(e) => Ok(ToolOutput::error(format!(
                 "MCP tool {}.{} failed: {}",
                 self.server_name, self.remote_name, e

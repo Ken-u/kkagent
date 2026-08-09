@@ -54,6 +54,36 @@ pub fn project_strict(messages: &[ChatMessage], opts: &ProjectOptions) -> Vec<Ch
     project(messages, &strict)
 }
 
+/// Replace older media with compact text markers while retaining the newest messages.
+/// Used proactively for oversized histories and reactively after HTTP 413 responses.
+pub fn fold_old_media(messages: &mut [ChatMessage], keep_recent_messages: usize) -> usize {
+    let split = messages.len().saturating_sub(keep_recent_messages.max(1));
+    let mut folded = 0;
+    for message in &mut messages[..split] {
+        for part in &mut message.content {
+            let marker = match part {
+                ChatContent::Image { media_type, data } => Some(format!(
+                    "[older image omitted from request: {media_type}, approximately {} bytes]",
+                    data.len().saturating_mul(3) / 4
+                )),
+                ChatContent::Video {
+                    media_type,
+                    filename,
+                    ..
+                } => Some(format!(
+                    "[older video omitted from request: {filename}, {media_type}]"
+                )),
+                _ => None,
+            };
+            if let Some(text) = marker {
+                *part = ChatContent::Text { text };
+                folded += 1;
+            }
+        }
+    }
+    folded
+}
+
 fn fold_message(msg: &ChatMessage, opts: &ProjectOptions, fold_hard: bool) -> ChatMessage {
     let tool_max = if fold_hard {
         opts.tool_result_max_chars.min(600)
@@ -77,12 +107,23 @@ fn fold_message(msg: &ChatMessage, opts: &ProjectOptions, fold_hard: bool) -> Ch
             ChatContent::Text { text } => Some(ChatContent::Text {
                 text: truncate_chars(text, text_max),
             }),
-            ChatContent::Image { .. } if fold_hard => None,
+            ChatContent::Image { media_type, data } if fold_hard => Some(ChatContent::Text {
+                text: format!(
+                    "[older image omitted: {media_type}, approximately {} bytes]",
+                    data.len().saturating_mul(3) / 4
+                ),
+            }),
             ChatContent::Image { media_type, data } => Some(ChatContent::Image {
                 media_type: media_type.clone(),
                 data: data.clone(),
             }),
-            ChatContent::Video { .. } if fold_hard => None,
+            ChatContent::Video {
+                media_type,
+                filename,
+                ..
+            } if fold_hard => Some(ChatContent::Text {
+                text: format!("[older video omitted: {filename}, {media_type}]"),
+            }),
             ChatContent::Video {
                 media_type,
                 path,
@@ -214,5 +255,21 @@ mod tests {
         assert!(
             matches!(&msgs[0].content[0], ChatContent::Text { text } if text.contains("summary here"))
         );
+    }
+
+    #[test]
+    fn folds_only_old_media_into_markers() {
+        let image = || ChatMessage {
+            role: "user".into(),
+            content: vec![ChatContent::Image {
+                media_type: "image/png".into(),
+                data: "AAAA".into(),
+            }],
+        };
+        let mut messages = vec![image(), image(), image()];
+        assert_eq!(fold_old_media(&mut messages, 1), 2);
+        assert!(matches!(messages[0].content[0], ChatContent::Text { .. }));
+        assert!(matches!(messages[1].content[0], ChatContent::Text { .. }));
+        assert!(matches!(messages[2].content[0], ChatContent::Image { .. }));
     }
 }

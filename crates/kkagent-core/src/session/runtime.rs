@@ -33,6 +33,7 @@ pub struct Session {
     pub messages: Vec<ChatMessage>,
     pub system_prompt: String,
     pub working_dir: PathBuf,
+    pub image_config: kkagent_config::ImageConfig,
     pub permission_mode: PermissionMode,
     pub plan_mode: bool,
     /// Only this file may be written/edited while plan_mode is on.
@@ -157,6 +158,7 @@ impl Session {
             messages: Vec::new(),
             system_prompt: default_system_prompt(),
             working_dir,
+            image_config: kkagent_config::ImageConfig::default(),
             permission_mode,
             plan_mode: false,
             plan_file_path,
@@ -315,6 +317,7 @@ impl Session {
                         &path,
                         &self.working_dir,
                         &limits,
+                        &self.image_config,
                     ) {
                         Ok(image) => {
                             text.push_str(&format!(
@@ -363,6 +366,27 @@ impl Session {
             role: "user".into(),
             content,
         });
+    }
+
+    pub fn add_user_message_with_images(
+        &mut self,
+        text: String,
+        images: Vec<(String, String)>,
+    ) -> anyhow::Result<()> {
+        self.add_user_message(text);
+        let message = self
+            .messages
+            .last_mut()
+            .ok_or_else(|| anyhow::anyhow!("user message was not created"))?;
+        for (_media_type, data) in images {
+            let image =
+                kkagent_tools::builtin::media::normalize_user_image(&data, &self.image_config)?;
+            message.content.push(ChatContent::Image {
+                media_type: image.media_type,
+                data: image.data,
+            });
+        }
+        Ok(())
     }
 
     pub fn build_messages(&self) -> Vec<ChatMessage> {

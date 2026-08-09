@@ -50,3 +50,21 @@ test("postMessage sends an idempotency key", async () => {
     globalThis.fetch = originalFetch;
   }
 });
+
+test("postMessage serializes multimodal images", async () => {
+  const originalFetch = globalThis.fetch;
+  let observed;
+  globalThis.fetch = async (_url, options) => {
+    observed = JSON.parse(options.body);
+    return { ok: true, json: async () => ({ task_id: "task-image" }) };
+  };
+  try {
+    const client = new KkagentHttpClient();
+    await client.postMessage("session", "inspect", {
+      images: [{ mediaType: "image/png", data: "AQID" }],
+    });
+    assert.deepEqual(observed.images, [{ media_type: "image/png", data: "AQID" }]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});

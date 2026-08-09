@@ -31,10 +31,10 @@ impl ModelCapability {
         };
         Self {
             tools,
-            vision: has(&["vision", "image", "multimodal"]),
+            vision: has(&["vision", "image", "image_in", "multimodal"]),
             thinking: has(&["thinking", "reasoning", "extended_thinking"]),
-            audio: has(&["audio"]),
-            video: has(&["video"]),
+            audio: has(&["audio", "audio_in"]),
+            video: has(&["video", "video_in"]),
             max_context: model.max_context_size,
             max_output: model.max_output_size,
             raw,
@@ -71,5 +71,23 @@ mod tests {
         assert!(c.thinking);
         assert!(c.tools);
         assert_eq!(c.max_context, Some(200_000));
+    }
+
+    #[test]
+    fn parses_kimi_input_capability_names() {
+        let m = ModelConfig {
+            provider: "p".into(),
+            model: "m".into(),
+            max_context_size: None,
+            max_output_size: None,
+            capabilities: vec!["image_in".into(), "video_in".into(), "audio_in".into()],
+            display_name: None,
+            support_efforts: vec![],
+            default_effort: None,
+        };
+        let c = ModelCapability::from_model(&m);
+        assert!(c.vision);
+        assert!(c.video);
+        assert!(c.audio);
     }
 }

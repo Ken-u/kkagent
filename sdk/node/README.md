@@ -67,6 +67,19 @@ await client.postMessage(
 Agent 的回复和工具执行是异步的。`postMessage()` 表示消息已被 server 接受，不代表
 Agent 已经完成。需要通过 WebSocket 接收增量文本、工具调用、错误和回合结束事件：
 
+也可以发送 base64 图片（模型必须声明 `image_in`）：
+
+```js
+import { readFile } from "node:fs/promises";
+
+await client.postMessage(session.session_id, "解释这个截图", {
+  images: [{
+    mediaType: "image/png",
+    data: (await readFile("screenshot.png")).toString("base64"),
+  }],
+});
+```
+
 ```js
 let lastEventSeq = 0;
 const socket = client.connectEvents((event) => {

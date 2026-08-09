@@ -31,6 +31,8 @@ export interface EventHistory {
 export interface PostMessageOptions {
   /** Stable key used to safely retry the same request after a network failure. */
   idempotencyKey?: string;
+  /** Base64-encoded images sent as native multimodal input. */
+  images?: Array<{ mediaType: string; data: string }>;
 }
 
 export class KkagentHttpClient {
@@ -87,7 +89,13 @@ export class KkagentHttpClient {
         ...this.headers(true),
         ...(options.idempotencyKey ? { "idempotency-key": options.idempotencyKey } : {}),
       },
-      body: JSON.stringify({ text }),
+      body: JSON.stringify({
+        text,
+        images: options.images?.map((image) => ({
+          media_type: image.mediaType,
+          data: image.data,
+        })),
+      }),
     });
     if (!res.ok) throw new Error(`postMessage ${res.status}`);
     return res.json();

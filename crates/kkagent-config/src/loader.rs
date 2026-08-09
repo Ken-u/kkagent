@@ -72,6 +72,8 @@ fn recognized_env_key(name: &str) -> bool {
             "ANTHROPIC_API_KEY"
                 | "OPENAI_API_KEY"
                 | "KIMI_API_KEY"
+                | "KIMI_IMAGE_MAX_EDGE_PX"
+                | "KIMI_IMAGE_READ_BYTE_BUDGET"
                 | "GOOGLE_API_KEY"
                 | "MOONSHOT_API_KEY"
         )
@@ -87,6 +89,16 @@ fn apply_env_overrides(config: &mut AppConfig) {
     }
     if let Ok(v) = std::env::var("KKAGENT_PERMISSION_MODE") {
         config.default_permission_mode = Some(v);
+    }
+    if let Some(value) = env_positive_u32("KKAGENT_IMAGE_MAX_EDGE_PX")
+        .or_else(|| env_positive_u32("KIMI_IMAGE_MAX_EDGE_PX"))
+    {
+        config.image.max_edge_px = value;
+    }
+    if let Some(value) = env_positive_usize("KKAGENT_IMAGE_READ_BYTE_BUDGET")
+        .or_else(|| env_positive_usize("KIMI_IMAGE_READ_BYTE_BUDGET"))
+    {
+        config.image.read_byte_budget = value;
     }
     // Inject API keys into first matching provider if empty
     if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
@@ -136,6 +148,22 @@ fn apply_env_overrides(config: &mut AppConfig) {
             api_key: key,
         });
     }
+}
+
+fn env_positive_u32(name: &str) -> Option<u32> {
+    std::env::var(name)
+        .ok()?
+        .parse()
+        .ok()
+        .filter(|value| *value > 0)
+}
+
+fn env_positive_usize(name: &str) -> Option<usize> {
+    std::env::var(name)
+        .ok()?
+        .parse()
+        .ok()
+        .filter(|value| *value > 0)
 }
 
 pub fn ensure_config_dir() -> Result<PathBuf> {

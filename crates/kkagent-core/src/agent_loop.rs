@@ -11,7 +11,9 @@ use std::time::Duration;
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::AbortHandle;
 
-use crate::context_projector::{compact_messages, project, project_strict, ProjectOptions};
+use crate::context_projector::{
+    compact_messages, fold_old_media, project, project_strict, ProjectOptions,
+};
 use crate::model_capability::ModelCapability;
 use crate::permission::{PermissionChain, PermissionDecision};
 use crate::session::Session;
@@ -94,6 +96,7 @@ impl AgentLoop {
     }
 
     async fn run_turn_body(&self, session: &mut Session, rounds_left: u32) -> anyhow::Result<()> {
+        session.image_config = self.config.image.clone();
         let session_id = session.id.clone();
         tracing::info!("Starting turn for session {}", session_id);
 
@@ -199,7 +202,9 @@ Progress: turns={}/{:?} tokens={}/{:?}. Continue working toward this goal.\n</sy
             .tools
             .tool_definitions()
             .iter()
-            .filter(|td| tool_allowed(session, &td.name))
+            .filter(|td| {
+                tool_allowed(session, &td.name) && (td.name != "ReadMediaFile" || capability.vision)
+            })
             .map(|td| ToolDef {
                 name: td.name.clone(),
                 description: td.description.clone(),
@@ -235,8 +240,25 @@ Do not mention this reminder to the user.\n</system-reminder>"
                 .await;
         }
 
+        if !capability.vision {
+            let latest_has_image = session.messages.last().is_some_and(|message| {
+                message
+                    .content
+                    .iter()
+                    .any(|content| matches!(content, ChatContent::Image { .. }))
+            });
+            if latest_has_image {
+                anyhow::bail!(
+                    "current model does not declare image input support; add `image_in` to its capabilities or select a vision model"
+                );
+            }
+            if fold_old_media(&mut session.messages, 1) > 0 {
+                session.transcript_rewrite_required = true;
+            }
+        }
+
         let system_prompt = session.effective_system_prompt();
-        let messages = self.prepare_messages(session, &tool_defs, &system_prompt);
+        let mut messages = self.prepare_messages(session, &tool_defs, &system_prompt);
         tracing::debug!("Conversation has {} messages (projected)", messages.len());
 
         let thinking = self.config.thinking.as_ref().and_then(|t| {
@@ -417,6 +439,23 @@ Do not mention this reminder to the user.\n</system-reminder>"
             let empty =
                 assistant_text.is_empty() && thinking_text.is_empty() && tool_calls.is_empty();
             let failed = stream_failed || !got_message_end;
+            if failed
+                && empty
+                && attempt < max_attempts
+                && last_stream_error
+                    .as_deref()
+                    .is_some_and(is_request_too_large)
+            {
+                let folded = fold_old_media(&mut session.messages, 2);
+                if folded > 0 {
+                    session.transcript_rewrite_required = true;
+                    messages = self.prepare_messages(session, &tool_defs, &system_prompt);
+                    tracing::warn!(
+                        "LLM request too large; folded {folded} older media block(s) before retry"
+                    );
+                    continue;
+                }
+            }
             if failed && empty && attempt < max_attempts {
                 tracing::warn!(
                     "LLM step retry {}/{} ({})",
@@ -762,6 +801,7 @@ Do not mention this reminder to the user.\n</system-reminder>"
                     let input = input.clone();
                     let tool_call_id = tool_call_id.clone();
                     let interrupted = session.interrupted.clone();
+                    let image = self.config.image.clone();
                     tasks.push(ToolCallTask {
                         accesses,
                         start: box_start(move || {
@@ -779,6 +819,7 @@ Do not mention this reminder to the user.\n</system-reminder>"
                                     hooks,
                                     working_dir,
                                     session_id: sid,
+                                    image,
                                     enabled_tools: enabled,
                                     name,
                                     input,
@@ -934,14 +975,18 @@ Do not mention this reminder to the user.\n</system-reminder>"
                 }
             }
 
-            let result_content: Vec<ChatContent> = tool_results
-                .iter()
-                .map(|(id, output)| ChatContent::ToolResult {
+            let mut result_content = Vec::new();
+            for (id, output) in &tool_results {
+                result_content.push(ChatContent::ToolResult {
                     tool_use_id: id.clone(),
                     content: output.content.clone(),
                     is_error: output.is_error,
-                })
-                .collect();
+                });
+                result_content.extend(output.images.iter().map(|image| ChatContent::Image {
+                    media_type: image.media_type.clone(),
+                    data: image.data.clone(),
+                }));
+            }
 
             session.messages.push(ChatMessage {
                 role: "user".into(),
@@ -1172,6 +1217,7 @@ Do not mention this reminder to the user.\n</system-reminder>"
             hooks: self.hooks.clone(),
             working_dir: session.working_dir.clone(),
             session_id: session.id.clone(),
+            image: self.config.image.clone(),
             enabled_tools: session.enabled_tools.clone(),
             name: name.to_string(),
             input: input.clone(),
@@ -1279,6 +1325,14 @@ Do not mention this reminder to the user.\n</system-reminder>"
     }
 }
 
+fn is_request_too_large(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("http 413")
+        || error.contains("payload too large")
+        || error.contains("request too large")
+        || error.contains("request_too_large")
+}
+
 #[derive(Debug, Clone)]
 struct PendingToolCall {
     id: String,
@@ -1382,6 +1436,7 @@ struct ParallelToolRequest {
     hooks: Option<Arc<kkagent_mcp::HookManager>>,
     working_dir: std::path::PathBuf,
     session_id: String,
+    image: kkagent_config::ImageConfig,
     enabled_tools: Option<std::collections::HashSet<String>>,
     name: String,
     input: serde_json::Value,
@@ -1395,6 +1450,7 @@ async fn execute_tool_parallel(request: ParallelToolRequest) -> ToolOutput {
         hooks,
         working_dir,
         session_id,
+        image,
         enabled_tools,
         name,
         input,
@@ -1447,6 +1503,7 @@ async fn execute_tool_parallel(request: ParallelToolRequest) -> ToolOutput {
     let ctx = ToolContext {
         working_dir,
         session_id,
+        image,
         tool_call_id,
         interrupted: Some(interrupted),
     };
