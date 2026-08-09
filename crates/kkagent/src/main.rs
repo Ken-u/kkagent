@@ -3369,7 +3369,7 @@ async fn handle_rpc_call(
                 });
 
             let deleted = {
-                let mut sessions = state.sessions.lock().await;
+                let sessions = state.sessions.lock().await;
                 let keep = if let Some(session) = sessions.get(&session_id) {
                     let cut = kkagent_core::compact_cut_index(&session.messages, keep_last);
                     session.messages.len().saturating_sub(cut).max(1)
