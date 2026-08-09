@@ -57,7 +57,10 @@ Preserves original CRLF/LF line endings."
         };
 
         if is_sensitive_path(&path) {
-            tracing::warn!("Editing sensitive path: {}", path.display());
+            return Ok(ToolOutput::error(format!(
+                "Refusing to edit sensitive file `{}`.",
+                path_str
+            )));
         }
 
         let raw = tokio::fs::read(&path)
@@ -119,4 +122,32 @@ fn fuzzy_hint(haystack: &str, needle: &str) -> String {
         }
     }
     String::new()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn refuses_sensitive_files_without_changing_them() {
+        let dir = std::env::temp_dir().join(format!("kkagent-edit-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("client.key");
+        std::fs::write(&path, "old secret").unwrap();
+        let context = ToolContext {
+            working_dir: dir.clone(),
+            session_id: "edit-test".into(),
+            tool_call_id: None,
+        };
+        let output = EditTool
+            .execute(
+                json!({"path": "client.key", "old_string": "old", "new_string": "new"}),
+                &context,
+            )
+            .await
+            .unwrap();
+        assert!(output.is_error);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "old secret");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }

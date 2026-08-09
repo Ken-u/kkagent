@@ -47,7 +47,10 @@ impl Tool for WriteTool {
         };
 
         if is_sensitive_path(&path) {
-            tracing::warn!("Writing sensitive path: {}", path.display());
+            return Ok(ToolOutput::error(format!(
+                "Refusing to write sensitive file `{}`.",
+                path_str
+            )));
         }
 
         if let Some(parent) = path.parent() {
@@ -84,5 +87,31 @@ impl Tool for WriteTool {
                 "path": path_str,
             }),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn refuses_sensitive_files_without_creating_them() {
+        let dir = std::env::temp_dir().join(format!("kkagent-write-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let context = ToolContext {
+            working_dir: dir.clone(),
+            session_id: "write-test".into(),
+            tool_call_id: None,
+        };
+        let output = WriteTool
+            .execute(
+                json!({"path": ".env", "content": "API_KEY=secret"}),
+                &context,
+            )
+            .await
+            .unwrap();
+        assert!(output.is_error);
+        assert!(!dir.join(".env").exists());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

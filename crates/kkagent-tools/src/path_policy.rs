@@ -2,22 +2,6 @@
 
 use std::path::Path;
 
-const SENSITIVE_PATTERNS: &[&str] = &[
-    ".env",
-    "id_rsa",
-    "id_ed25519",
-    "id_ecdsa",
-    ".pem",
-    "credentials",
-    "secret",
-    ".key",
-    "token",
-    ".netrc",
-    ".npmrc",
-    "aws/credentials",
-    "gcloud/credentials",
-];
-
 const SENSITIVE_GLOBS: &[&str] = &[
     "!**/.env",
     "!**/.env.*",
@@ -42,8 +26,33 @@ const BINARY_EXTS: &[&str] = &[
 ];
 
 pub fn is_sensitive_path(path: &Path) -> bool {
-    let s = path.to_string_lossy().to_lowercase();
-    SENSITIVE_PATTERNS.iter().any(|p| s.contains(p))
+    let components: Vec<String> = path
+        .components()
+        .filter_map(|part| part.as_os_str().to_str())
+        .map(str::to_ascii_lowercase)
+        .collect();
+    let Some(filename) = components.last() else {
+        return false;
+    };
+
+    let env_file = filename == ".env"
+        || (filename.starts_with(".env.")
+            && !matches!(
+                filename.as_str(),
+                ".env.example" | ".env.sample" | ".env.template"
+            ));
+    let private_key = matches!(filename.as_str(), "id_rsa" | "id_ed25519" | "id_ecdsa")
+        || filename.ends_with(".pem")
+        || filename.ends_with(".key");
+    let credential_file = matches!(
+        filename.as_str(),
+        "credentials" | ".netrc" | ".npmrc" | "secrets.json" | "tokens.json"
+    );
+    let cloud_credentials = components
+        .windows(2)
+        .any(|pair| matches!(pair, [dir, file] if (dir == ".aws" || dir == "aws" || dir == "gcloud") && file == "credentials"));
+
+    env_file || private_key || credential_file || cloud_credentials
 }
 
 pub fn looks_binary_ext(path: &Path) -> bool {
@@ -109,3 +118,18 @@ pub fn decode_text(bytes: &[u8]) -> Result<String, String> {
 }
 
 pub const MAX_LINE_LENGTH: usize = 2000;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sensitive_matching_avoids_source_code_false_positives() {
+        assert!(is_sensitive_path(Path::new("project/.env.local")));
+        assert!(is_sensitive_path(Path::new("keys/client.pem")));
+        assert!(is_sensitive_path(Path::new("~/.aws/credentials")));
+        assert!(!is_sensitive_path(Path::new("project/.env.example")));
+        assert!(!is_sensitive_path(Path::new("src/token_counting.rs")));
+        assert!(!is_sensitive_path(Path::new("src/secretary.rs")));
+    }
+}

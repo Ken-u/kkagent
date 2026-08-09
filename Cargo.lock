@@ -1639,6 +1639,7 @@ dependencies = [
  "dirs",
  "globset",
  "ignore",
+ "image",
  "kkagent-config",
  "kkagent-protocol",
  "reqwest 0.12.28",

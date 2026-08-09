@@ -55,8 +55,10 @@ Rejects binary/image files — use ReadMediaFile for media."
             )));
         }
         if is_sensitive_path(&path) {
-            // Still allow, but annotate — permission layer may have asked already.
-            tracing::warn!("Reading sensitive path: {}", path.display());
+            return Ok(ToolOutput::error(format!(
+                "Refusing to read sensitive file `{}`. Ask the user to provide only the specific non-secret value needed.",
+                path_str
+            )));
         }
 
         let bytes = tokio::fs::read(&path)
@@ -191,6 +193,20 @@ mod tests {
         assert!(!output.is_error);
         assert!(output.content.len() <= MAX_READ_BYTES);
         assert!(std::str::from_utf8(output.content.as_bytes()).is_ok());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn refuses_sensitive_files() {
+        let dir = std::env::temp_dir().join(format!("kkagent-read-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(".env"), "API_KEY=secret\n").unwrap();
+        let output = ReadTool
+            .execute(json!({"path": ".env"}), &context(&dir))
+            .await
+            .unwrap();
+        assert!(output.is_error);
+        assert!(!output.content.contains("API_KEY"));
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
