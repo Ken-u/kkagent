@@ -59,6 +59,8 @@ pub struct ToolOutput {
     pub data: Option<Value>,
     /// Provider-neutral images to append after this tool result.
     pub images: Vec<MediaOutput>,
+    /// When true, the agent loop should end the turn after applying this result.
+    pub stop_turn: bool,
 }
 
 impl ToolOutput {
@@ -68,6 +70,7 @@ impl ToolOutput {
             is_error: false,
             data: None,
             images: Vec::new(),
+            stop_turn: false,
         }
     }
 
@@ -77,6 +80,7 @@ impl ToolOutput {
             is_error: false,
             data: Some(data),
             images: Vec::new(),
+            stop_turn: false,
         }
     }
 
@@ -86,6 +90,17 @@ impl ToolOutput {
             is_error: true,
             data: None,
             images: Vec::new(),
+            stop_turn: false,
+        }
+    }
+
+    pub fn error_stop(content: impl Into<String>) -> Self {
+        Self {
+            content: content.into(),
+            is_error: true,
+            data: None,
+            images: Vec::new(),
+            stop_turn: true,
         }
     }
 

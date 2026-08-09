@@ -17,6 +17,9 @@ use crate::context_projector::{
 };
 use crate::model_capability::ModelCapability;
 use crate::permission::{PermissionChain, PermissionDecision};
+use crate::plan_review::{
+    format_auto_approved_plan, resolve_exit_plan_approval, PlanReviewDisplay,
+};
 use crate::session::Session;
 use crate::token_counting::TokenCountingStrategy;
 use crate::tool_scheduler::{box_start, ToolCallTask, ToolScheduler};
@@ -711,6 +714,10 @@ Do not mention this reminder to the user.\n</system-reminder>"
                     PermissionDecision::Approve => {
                         if tc.name == "AskUserQuestion" {
                             Prepared::Done(self.execute_tool(session, &tc.name, &tc.input).await)
+                        } else if tc.name == "ExitPlanMode" {
+                            Prepared::Done(
+                                self.auto_exit_plan_mode(session, &tc.input).await,
+                            )
                         } else {
                             if tc.name == "Write" || tc.name == "Edit" {
                                 if let Some(path_str) =
@@ -731,6 +738,11 @@ Do not mention this reminder to the user.\n</system-reminder>"
                         }
                     }
                     PermissionDecision::Ask => {
+                        if tc.name == "ExitPlanMode" {
+                            Prepared::Done(
+                                self.review_exit_plan_mode(session, &session_id, &tc).await?,
+                            )
+                        } else {
                         let approval_id = uuid::Uuid::new_v4().to_string();
                         let action = describe_tool_action(&tc.name, &tc.input);
                         let _ = self
@@ -778,6 +790,7 @@ Do not mention this reminder to the user.\n</system-reminder>"
                                 feedback: Some(format!(
                                     "approval timed out after {approval_timeout} seconds"
                                 )),
+                                selected_label: None,
                             },
                         };
                         match response.decision {
@@ -819,6 +832,7 @@ Do not mention this reminder to the user.\n</system-reminder>"
                                 Prepared::Done(ToolOutput::error("Tool call was rejected by user"))
                             }
                         }
+                        } // end else non-ExitPlanMode Ask
                     }
                     PermissionDecision::Deny(reason) => {
                         Prepared::Done(ToolOutput::error(format!("Denied: {}", reason)))
@@ -906,14 +920,14 @@ Do not mention this reminder to the user.\n</system-reminder>"
 
             let mut tool_results = Vec::new();
             for (id, name, output) in resolved {
-                // ExitPlanMode success → leave plan mode
-                if name == "ExitPlanMode" && !output.is_error {
-                    session.plan_mode = false;
+                // ExitPlanMode / EnterPlanMode flip plan_mode inside their helpers /
+                // execute paths; mirror to the TUI here.
+                if name == "ExitPlanMode" {
                     let _ = self
                         .event_tx
                         .send(AgentEvent::PlanModeChanged {
                             session_id: session_id.clone(),
-                            enabled: false,
+                            enabled: session.plan_mode,
                         })
                         .await;
                 }
@@ -1050,6 +1064,11 @@ Do not mention this reminder to the user.\n</system-reminder>"
 
             if dedupe_force_stop {
                 tracing::warn!("Tool dedupe force-stop after repeated identical calls");
+                self.finish_turn(session, true).await?;
+                return Ok(TurnStep::Done);
+            }
+
+            if tool_results.iter().any(|(_, o)| o.stop_turn) {
                 self.finish_turn(session, true).await?;
                 return Ok(TurnStep::Done);
             }
@@ -1249,6 +1268,131 @@ Do not mention this reminder to the user.\n</system-reminder>"
         }
 
         messages
+    }
+
+    async fn auto_exit_plan_mode(
+        &self,
+        session: &mut Session,
+        input: &serde_json::Value,
+    ) -> ToolOutput {
+        if !session.plan_mode {
+            return ToolOutput::error(
+                "ExitPlanMode can only be called while plan mode is active. Use EnterPlanMode (or /plan) first.",
+            );
+        }
+        let path = session.plan_file_path.display().to_string();
+        let plan = tokio::fs::read_to_string(&session.plan_file_path)
+            .await
+            .unwrap_or_default();
+        if plan.trim().is_empty() {
+            return ToolOutput::error(format!(
+                "No plan file found. Write your plan to {path} first, then call ExitPlanMode."
+            ));
+        }
+        let _ = self
+            .event_tx
+            .send(AgentEvent::PlanFileUpdated {
+                session_id: session.id.clone(),
+                path: path.clone(),
+                content: plan.clone(),
+            })
+            .await;
+        let _ = input;
+        session.plan_mode = false;
+        ToolOutput::success(format_auto_approved_plan(&plan, &path))
+    }
+
+    async fn review_exit_plan_mode(
+        &self,
+        session: &mut Session,
+        session_id: &str,
+        tc: &PendingToolCall,
+    ) -> anyhow::Result<ToolOutput> {
+        if !session.plan_mode {
+            return Ok(ToolOutput::error(
+                "ExitPlanMode can only be called while plan mode is active. Use EnterPlanMode (or /plan) first.",
+            ));
+        }
+        let path = session.plan_file_path.display().to_string();
+        let plan = tokio::fs::read_to_string(&session.plan_file_path)
+            .await
+            .unwrap_or_default();
+        if plan.trim().is_empty() {
+            return Ok(ToolOutput::error(format!(
+                "No plan file found. Write your plan to {path} first, then call ExitPlanMode."
+            )));
+        }
+
+        let display = PlanReviewDisplay::from_tool_input(&tc.input, plan.clone(), path.clone());
+        let _ = self
+            .event_tx
+            .send(AgentEvent::PlanFileUpdated {
+                session_id: session_id.to_string(),
+                path: path.clone(),
+                content: plan,
+            })
+            .await;
+
+        let approval_id = uuid::Uuid::new_v4().to_string();
+        let _ = self
+            .event_tx
+            .send(AgentEvent::ApprovalRequested {
+                session_id: session_id.to_string(),
+                request: kkagent_protocol::ApprovalRequest {
+                    approval_id: approval_id.clone(),
+                    session_id: session_id.to_string(),
+                    tool_call_id: tc.id.clone(),
+                    tool_name: "ExitPlanMode".into(),
+                    action: "Ready to build with this plan?".into(),
+                    tool_input_display: Some(display.to_display_json()),
+                    created_at: chrono::Utc::now(),
+                },
+            })
+            .await;
+        let _ = self
+            .event_tx
+            .send(AgentEvent::StatusUpdate {
+                session_id: session_id.to_string(),
+                status: SessionStatus::WaitingApproval,
+            })
+            .await;
+
+        let approval_timeout = self
+            .config
+            .background
+            .as_ref()
+            .and_then(|background| background.approval_timeout_s)
+            .unwrap_or(900)
+            .clamp(1, 86_400);
+        let response = match tokio::time::timeout(
+            std::time::Duration::from_secs(approval_timeout),
+            session.wait_approval(&approval_id),
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(_) => kkagent_protocol::ApprovalResponse {
+                approval_id: approval_id.clone(),
+                decision: kkagent_protocol::ApprovalDecision::Rejected,
+                scope: None,
+                feedback: Some(format!(
+                    "approval timed out after {approval_timeout} seconds"
+                )),
+                selected_label: Some(crate::plan_review::LABEL_REVISE.into()),
+            },
+        };
+
+        if response.decision == kkagent_protocol::ApprovalDecision::Cancelled {
+            return Ok(ToolOutput::success(
+                "Plan approval dismissed. Plan mode remains active.",
+            ));
+        }
+
+        let (output, exit) = resolve_exit_plan_approval(&response, &display);
+        if exit {
+            session.plan_mode = false;
+        }
+        Ok(output)
     }
 
     async fn execute_tool(

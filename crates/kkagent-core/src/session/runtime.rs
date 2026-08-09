@@ -275,6 +275,7 @@ impl Session {
             decision: kkagent_protocol::ApprovalDecision::Cancelled,
             scope: None,
             feedback: Some("interrupted".into()),
+            selected_label: None,
         });
         let _ = self.question_tx.try_send(QuestionResponse {
             question_id: String::new(),
@@ -407,6 +408,7 @@ impl Session {
                     decision: kkagent_protocol::ApprovalDecision::Cancelled,
                     scope: None,
                     feedback: Some("interrupted".into()),
+                    selected_label: None,
                 };
             }
             match tokio::time::timeout(
@@ -429,6 +431,7 @@ impl Session {
                         decision: kkagent_protocol::ApprovalDecision::Rejected,
                         scope: None,
                         feedback: Some("approval channel closed".into()),
+                        selected_label: None,
                     };
                 }
                 Err(_) => continue, // timeout — re-check interrupt
@@ -597,7 +600,7 @@ Tool results and user messages may include `<system-reminder>` tags. These are a
 pub fn plan_mode_reminder(plan_file: &std::path::Path) -> String {
     format!(
         r#"<system-reminder>
-Plan mode is active. You MUST NOT make any edits (with the exception of the current plan file) or otherwise make changes to the system unless a tool request is explicitly approved. Prefer read-only tools. Use Bash only when needed; Bash follows the normal permission mode and rules. This supersedes any other instructions you have received.
+Plan mode is active. You MUST NOT make any edits (with the exception of the current plan file) or otherwise make changes to the system unless a tool request is explicitly approved. Prefer read-only tools. Use Bash only when needed; Bash follows the normal permission mode and rules. This supersedes any other instructions you have received. TaskStop, CronCreate, and CronDelete are also blocked in plan mode — call ExitPlanMode first if you need them.
 
 Plan file: {plan}
 
@@ -605,19 +608,26 @@ Workflow:
   1. Understand — explore the codebase with Glob, Grep, Read.
   2. Design — converge on the best approach; consider trade-offs but aim for a single recommendation.
   3. Review — re-read key files to verify understanding.
-  4. Write Plan — create/update the plan file with Write or Edit (full markdown plan covering goal, approach, steps, risks, and verification).
-  5. Exit — call ExitPlanMode for user approval.
+  4. Write Plan — create/update the plan file with Write or Edit (use Write if it does not exist yet).
+  5. Exit — call ExitPlanMode for user approval (user chooses 执行 / 修改意见 / 拒绝).
 
 ## Plan quality
-Write a COMPLETE plan in the plan file before exiting. Include:
+Write a COMPLETE markdown plan in the plan file before exiting. Include:
 - Goal / problem statement
 - Chosen approach (and briefly why)
-- Concrete implementation steps (files to touch, key changes)
+- Concrete implementation steps (real files, functions, commands — verifiable, ordered)
 - Risks / edge cases
 - How to verify (tests / manual checks)
 
+## Handling multiple approaches
 Keep at most 2-3 meaningfully different approaches. If one is clearly superior, just propose that one.
-Your turn must end with either clarifying questions in text, or ExitPlanMode after writing the plan file.
+When the best approach depends on user preferences you don't have, use AskUserQuestion first.
+When you do include multiple approaches in the plan, you MUST pass them as the `options` parameter when calling ExitPlanMode so the user can select which approach to execute.
+NEVER write multiple approaches and call ExitPlanMode without `options`.
+
+AskUserQuestion is for clarifying missing requirements or preferences that affect the plan.
+Never ask about plan approval via text or AskUserQuestion — the user cannot see the plan until you call ExitPlanMode.
+Your turn must end with either AskUserQuestion (clarifications) or ExitPlanMode (approval). Do NOT end your turn any other way.
 Do NOT start implementing source changes. Do NOT edit files other than the plan file.
 </system-reminder>"#,
         plan = plan_file.display()

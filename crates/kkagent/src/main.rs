@@ -1125,6 +1125,11 @@ impl kkagent_acp::AcpHost for AgentAcpHost {
                 .get("feedback")
                 .and_then(|value| value.as_str())
                 .map(str::to_string),
+            selected_label: params
+                .get("selected_label")
+                .or_else(|| params.get("selectedLabel"))
+                .and_then(|value| value.as_str())
+                .map(str::to_string),
         };
         let senders = self.state.approval_txs.lock().await;
         for sender in senders.values() {
@@ -1551,6 +1556,7 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
             decision: dec,
             scope: None,
             feedback,
+            selected_label: None,
         };
         let txs = self.state.approval_txs.lock().await;
         for tx in txs.values() {
@@ -3146,6 +3152,7 @@ async fn handle_rpc_call(
                     decision: kkagent_protocol::ApprovalDecision::Cancelled,
                     scope: None,
                     feedback: Some("interrupted".into()),
+                    selected_label: None,
                 });
             }
             if let Some(tx) = state.question_txs.lock().await.get(&session_id) {

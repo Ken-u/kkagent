@@ -52,7 +52,7 @@ answer=$(kkagent -p "总结 README" 2>kkagent.err)
 | `Esc` / `Ctrl+C` | 中断当前生成或关闭浮层。 |
 | 空输入时连续两次 `Ctrl+C` | 退出。 |
 | 空输入时 `Ctrl+D` | 退出。 |
-| `Shift+Tab` | 切换 Plan 模式。写入计划后，滚动范围锁定在完整计划内，直到退出 Plan 模式。 |
+| `Shift+Tab` | 切换 Plan 模式。写入计划后滚动锁定在完整计划内；`ExitPlanMode` 后底部可选「执行 / 修改意见 / 拒绝」。 |
 | 空输入时输入 `!` | Shell 输入模式。 |
 | `Ctrl+O` | 折叠或展开工具输出。 |
 | `PgUp` / `PgDn` | 滚动对话记录（Plan 聚焦时仅滚动计划全文）。 |

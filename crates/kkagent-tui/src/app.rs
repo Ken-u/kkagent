@@ -252,12 +252,101 @@ pub struct TodoItem {
 }
 
 #[derive(Debug, Clone)]
+pub struct ApprovalChoice {
+    pub label: String,
+    pub decision: kkagent_protocol::ApprovalDecision,
+    pub selected_label: String,
+    pub requires_feedback: bool,
+    pub scope: Option<kkagent_protocol::ApprovalScope>,
+}
+
+#[derive(Debug, Clone)]
 pub struct PendingApproval {
     pub approval_id: String,
     pub tool_name: String,
     pub action: String,
     pub detail: String,
     pub selected: usize,
+    pub choices: Vec<ApprovalChoice>,
+    pub is_plan_review: bool,
+    pub feedback_mode: bool,
+    pub feedback: String,
+}
+
+impl PendingApproval {
+    pub fn default_tool_choices() -> Vec<ApprovalChoice> {
+        vec![
+            ApprovalChoice {
+                label: "allow once".into(),
+                decision: kkagent_protocol::ApprovalDecision::Approved,
+                selected_label: "allow once".into(),
+                requires_feedback: false,
+                scope: None,
+            },
+            ApprovalChoice {
+                label: "allow for session".into(),
+                decision: kkagent_protocol::ApprovalDecision::Approved,
+                selected_label: "allow for session".into(),
+                requires_feedback: false,
+                scope: Some(kkagent_protocol::ApprovalScope::Session),
+            },
+            ApprovalChoice {
+                label: "reject".into(),
+                decision: kkagent_protocol::ApprovalDecision::Rejected,
+                selected_label: "reject".into(),
+                requires_feedback: false,
+                scope: None,
+            },
+        ]
+    }
+
+    pub fn plan_review_choices(display: &serde_json::Value) -> Vec<ApprovalChoice> {
+        let mut choices = Vec::new();
+        let options = display
+            .get("options")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        if options.len() >= 2 {
+            for opt in options {
+                let label = opt
+                    .get("label")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("option")
+                    .to_string();
+                choices.push(ApprovalChoice {
+                    label: label.clone(),
+                    decision: kkagent_protocol::ApprovalDecision::Approved,
+                    selected_label: label,
+                    requires_feedback: false,
+                    scope: None,
+                });
+            }
+        } else {
+            choices.push(ApprovalChoice {
+                label: "执行".into(),
+                decision: kkagent_protocol::ApprovalDecision::Approved,
+                selected_label: "执行".into(),
+                requires_feedback: false,
+                scope: None,
+            });
+        }
+        choices.push(ApprovalChoice {
+            label: "修改意见".into(),
+            decision: kkagent_protocol::ApprovalDecision::Rejected,
+            selected_label: "修改意见".into(),
+            requires_feedback: true,
+            scope: None,
+        });
+        choices.push(ApprovalChoice {
+            label: "拒绝".into(),
+            decision: kkagent_protocol::ApprovalDecision::Rejected,
+            selected_label: "拒绝".into(),
+            requires_feedback: false,
+            scope: None,
+        });
+        choices
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -819,40 +908,76 @@ impl TuiApp {
 
         // Handle approval panel
         if let Some(ref mut approval) = self.state.approval_pending {
-            match key.code {
-                KeyCode::Char('1') => {
-                    self.respond_approval(kkagent_protocol::ApprovalDecision::Approved, None)
-                        .await?;
+            let n = approval.choices.len().max(1);
+            if approval.feedback_mode {
+                match key.code {
+                    KeyCode::Esc => {
+                        approval.feedback_mode = false;
+                        approval.feedback.clear();
+                    }
+                    KeyCode::Enter => {
+                        let feedback = approval.feedback.clone();
+                        let choice = approval.choices.get(approval.selected).cloned();
+                        if let Some(choice) = choice {
+                            self.respond_approval_choice(choice, Some(feedback)).await?;
+                        }
+                    }
+                    KeyCode::Backspace => {
+                        approval.feedback.pop();
+                    }
+                    KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        approval.feedback.push(c);
+                    }
+                    KeyCode::Up | KeyCode::Down => {
+                        approval.feedback_mode = false;
+                    }
+                    _ => {}
                 }
-                KeyCode::Char('2') => {
-                    self.respond_approval(
-                        kkagent_protocol::ApprovalDecision::Approved,
-                        Some(kkagent_protocol::ApprovalScope::Session),
+                return Ok(());
+            }
+            match key.code {
+                KeyCode::Char(c) if c.is_ascii_digit() => {
+                    let idx = (c as u8 - b'1') as usize;
+                    if idx < approval.choices.len() {
+                        let choice = approval.choices[idx].clone();
+                        if choice.requires_feedback {
+                            approval.selected = idx;
+                            approval.feedback_mode = true;
+                            approval.feedback.clear();
+                        } else {
+                            self.respond_approval_choice(choice, None).await?;
+                        }
+                    }
+                }
+                KeyCode::Esc => {
+                    self.respond_approval_choice(
+                        ApprovalChoice {
+                            label: "cancel".into(),
+                            decision: kkagent_protocol::ApprovalDecision::Cancelled,
+                            selected_label: "cancel".into(),
+                            requires_feedback: false,
+                            scope: None,
+                        },
+                        None,
                     )
                     .await?;
-                }
-                KeyCode::Char('3') | KeyCode::Esc => {
-                    self.respond_approval(kkagent_protocol::ApprovalDecision::Rejected, None)
-                        .await?;
                 }
                 KeyCode::Up if approval.selected > 0 => {
                     approval.selected -= 1;
                 }
-                KeyCode::Down if approval.selected < 2 => {
+                KeyCode::Down if approval.selected + 1 < n => {
                     approval.selected += 1;
                 }
                 KeyCode::Enter => {
-                    let decision = match approval.selected {
-                        0 => kkagent_protocol::ApprovalDecision::Approved,
-                        1 => kkagent_protocol::ApprovalDecision::Approved,
-                        _ => kkagent_protocol::ApprovalDecision::Rejected,
-                    };
-                    let scope = if approval.selected == 1 {
-                        Some(kkagent_protocol::ApprovalScope::Session)
-                    } else {
-                        None
-                    };
-                    self.respond_approval(decision, scope).await?;
+                    let choice = approval.choices.get(approval.selected).cloned();
+                    if let Some(choice) = choice {
+                        if choice.requires_feedback {
+                            approval.feedback_mode = true;
+                            approval.feedback.clear();
+                        } else {
+                            self.respond_approval_choice(choice, None).await?;
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -2325,10 +2450,10 @@ impl TuiApp {
         });
     }
 
-    async fn respond_approval(
+    async fn respond_approval_choice(
         &mut self,
-        decision: kkagent_protocol::ApprovalDecision,
-        scope: Option<kkagent_protocol::ApprovalScope>,
+        choice: ApprovalChoice,
+        feedback: Option<String>,
     ) -> anyhow::Result<()> {
         let Some(approval) = self.state.approval_pending.take() else {
             return Ok(());
@@ -2338,15 +2463,25 @@ impl TuiApp {
             return Ok(());
         };
 
+        let feedback = feedback.and_then(|f| {
+            let t = f.trim().to_string();
+            if t.is_empty() {
+                None
+            } else {
+                Some(t)
+            }
+        });
+
         if let Err(e) = self
             .client
             .respond_approval(
                 &sid,
                 kkagent_protocol::ApprovalResponse {
                     approval_id: approval.approval_id.clone(),
-                    decision,
-                    scope,
-                    feedback: None,
+                    decision: choice.decision,
+                    scope: choice.scope,
+                    feedback,
+                    selected_label: Some(choice.selected_label.clone()),
                 },
             )
             .await
@@ -2549,19 +2684,54 @@ impl TuiApp {
                         self.state.status = status;
                     }
                     AgentEvent::ApprovalRequested { request, .. } => {
-                        let detail = request
-                            .tool_input_display
-                            .as_ref()
-                            .map(|v| {
-                                serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string())
-                            })
-                            .unwrap_or_default();
+                        let display = request.tool_input_display.clone().unwrap_or(serde_json::Value::Null);
+                        let is_plan_review = request.tool_name == "ExitPlanMode"
+                            || display
+                                .get("kind")
+                                .and_then(|v| v.as_str())
+                                == Some("plan_review");
+                        let choices = if is_plan_review {
+                            // Ensure the full plan is focused while reviewing.
+                            if let Some(plan) = display.get("plan").and_then(|v| v.as_str()) {
+                                let path = display
+                                    .get("path")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                if !plan.trim().is_empty() {
+                                    self.state.apply_plan_document(path, plan.to_string());
+                                }
+                            }
+                            PendingApproval::plan_review_choices(&display)
+                        } else {
+                            PendingApproval::default_tool_choices()
+                        };
+                        let detail = if is_plan_review {
+                            String::new()
+                        } else {
+                            request
+                                .tool_input_display
+                                .as_ref()
+                                .map(|v| {
+                                    serde_json::to_string_pretty(v)
+                                        .unwrap_or_else(|_| v.to_string())
+                                })
+                                .unwrap_or_default()
+                        };
                         self.state.approval_pending = Some(PendingApproval {
                             approval_id: request.approval_id,
                             tool_name: request.tool_name.clone(),
-                            action: request.action,
+                            action: if is_plan_review {
+                                "按此计划开始执行？".into()
+                            } else {
+                                request.action
+                            },
                             detail,
                             selected: 0,
+                            choices,
+                            is_plan_review,
+                            feedback_mode: false,
+                            feedback: String::new(),
                         });
                         self.state.status = SessionStatus::WaitingApproval;
                     }

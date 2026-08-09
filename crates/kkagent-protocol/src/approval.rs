@@ -35,4 +35,7 @@ pub struct ApprovalResponse {
     pub scope: Option<ApprovalScope>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub feedback: Option<String>,
+    /// Plan-review / multi-choice label (e.g. "执行", approach name, "修改意见").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_label: Option<String>,
 }

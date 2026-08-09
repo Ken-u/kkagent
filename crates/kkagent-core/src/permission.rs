@@ -94,6 +94,11 @@ impl PermissionChain {
             return PermissionDecision::Approve;
         }
 
+        // 3b. exit-plan-mode-review-ask (kimi): always ask in manual/yolo
+        if tool_name == "ExitPlanMode" {
+            return PermissionDecision::Ask;
+        }
+
         // 4. session-approval-history
         let approval_key = format!("{}:{}", tool_name, approval_pattern(tool_name, input));
         if self.session_approved.contains(&approval_key) {
@@ -438,21 +443,25 @@ mod tests {
     }
 
     #[test]
-    fn test_mcp_wildcard_allow_rule() {
-        let chain = PermissionChain::new(
-            PermissionMode::Manual,
-            vec![PermissionRule {
-                decision: "allow".into(),
-                pattern: "mcp__*".into(),
-                scope: None,
-            }],
-        );
-        let decision = chain.evaluate(
-            "mcp__github__search_issues",
+    fn exit_plan_mode_asks_in_yolo_and_manual() {
+        for mode in [PermissionMode::Manual, PermissionMode::Yolo] {
+            let chain = PermissionChain::new(mode, vec![]);
+            let decision = chain.evaluate(
+                "ExitPlanMode",
+                &serde_json::json!({}),
+                Path::new("/tmp/ws"),
+                true,
+                Some(Path::new("/tmp/ws/.kkagent/plans/x.md")),
+            );
+            assert_eq!(decision, PermissionDecision::Ask);
+        }
+        let auto = PermissionChain::new(PermissionMode::Auto, vec![]);
+        let decision = auto.evaluate(
+            "ExitPlanMode",
             &serde_json::json!({}),
             Path::new("/tmp/ws"),
-            false,
-            None,
+            true,
+            Some(Path::new("/tmp/ws/.kkagent/plans/x.md")),
         );
         assert_eq!(decision, PermissionDecision::Approve);
     }

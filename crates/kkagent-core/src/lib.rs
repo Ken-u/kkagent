@@ -9,6 +9,7 @@ pub mod git_context;
 pub mod media_pipeline;
 pub mod model_capability;
 pub mod permission;
+pub mod plan_review;
 pub mod plugin;
 pub mod replay;
 pub mod scope_context;

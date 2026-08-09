@@ -1890,26 +1890,47 @@ fn wrap_str(s: &str, max_width: usize) -> Vec<String> {
 
 fn render_approval_panel(f: &mut Frame, area: Rect, approval: &mut PendingApproval, theme: &Theme) {
     let panel_width = 72.min(area.width.saturating_sub(4)).max(40);
-    let detail_lines = approval.detail.lines().count().min(8) as u16;
-    let panel_height = (9 + detail_lines)
+    let choice_count = approval.choices.len().max(1) as u16;
+    let detail_lines = if approval.is_plan_review {
+        0
+    } else {
+        approval.detail.lines().count().min(8) as u16
+    };
+    let feedback_extra: u16 = if approval.feedback_mode { 3 } else { 0 };
+    let panel_height = (8 + choice_count + detail_lines + feedback_extra)
         .min(area.height.saturating_sub(2))
         .max(10);
     let x = (area.width.saturating_sub(panel_width)) / 2;
-    let y = (area.height.saturating_sub(panel_height)) / 2;
+    let y = if approval.is_plan_review {
+        // Sit near the bottom so the plan document stays visible above.
+        area.height.saturating_sub(panel_height + 1)
+    } else {
+        (area.height.saturating_sub(panel_height)) / 2
+    };
     let panel_area = Rect::new(x, y, panel_width, panel_height);
 
     f.render_widget(Clear, panel_area);
 
+    let title = if approval.is_plan_review {
+        " plan review "
+    } else {
+        " permission "
+    };
     let block = Block::default()
-        .title(format!(" permission · {} ", approval.tool_name))
+        .title(format!(
+            "{title}· {} ",
+            if approval.is_plan_review {
+                "ExitPlanMode"
+            } else {
+                approval.tool_name.as_str()
+            }
+        ))
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.warning));
-
-    let options = [
-        ("1", "allow once"),
-        ("2", "allow for session"),
-        ("3", "reject"),
-    ];
+        .border_style(Style::default().fg(if approval.is_plan_review {
+            theme.plan_mode
+        } else {
+            theme.warning
+        }));
 
     let mut lines: Vec<Line> = vec![
         Line::from(Span::styled(
@@ -1921,7 +1942,7 @@ fn render_approval_panel(f: &mut Frame, area: Rect, approval: &mut PendingApprov
         Line::from(""),
     ];
 
-    if !approval.detail.is_empty() {
+    if !approval.detail.is_empty() && !approval.is_plan_review {
         for l in approval.detail.lines().take(8) {
             let truncated: String = l
                 .chars()
@@ -1935,7 +1956,7 @@ fn render_approval_panel(f: &mut Frame, area: Rect, approval: &mut PendingApprov
         lines.push(Line::from(""));
     }
 
-    for (i, (key, label)) in options.iter().enumerate() {
+    for (i, choice) in approval.choices.iter().enumerate() {
         let selected = i == approval.selected;
         let style = if selected {
             Style::default()
@@ -1945,18 +1966,39 @@ fn render_approval_panel(f: &mut Frame, area: Rect, approval: &mut PendingApprov
             Style::default().fg(theme.text_dim)
         };
         let marker = if selected { "> " } else { "  " };
+        let key = format!("{}", i + 1);
         lines.push(Line::from(vec![
             Span::styled(marker, style),
-            Span::styled(format!("{}  ", key), Style::default().fg(theme.text_muted)),
-            Span::styled(*label, style),
+            Span::styled(format!("{key}  "), Style::default().fg(theme.text_muted)),
+            Span::styled(choice.label.clone(), style),
         ]));
     }
 
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "  1·2·3 / enter",
-        Style::default().fg(theme.text_muted),
-    )));
+    if approval.feedback_mode {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "  修改意见:",
+            Style::default().fg(theme.accent),
+        )));
+        lines.push(Line::from(Span::styled(
+            format!("  {}▌", approval.feedback),
+            Style::default().fg(theme.text),
+        )));
+        lines.push(Line::from(Span::styled(
+            "  enter 提交 · esc 取消输入",
+            Style::default().fg(theme.text_muted),
+        )));
+    } else {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            if approval.is_plan_review {
+                "  1·2·3… / ↑↓ / enter · esc 取消"
+            } else {
+                "  1·2·3 / enter"
+            },
+            Style::default().fg(theme.text_muted),
+        )));
+    }
 
     f.render_widget(Paragraph::new(Text::from(lines)).block(block), panel_area);
 }
