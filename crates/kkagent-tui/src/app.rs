@@ -115,6 +115,16 @@ pub struct AppState {
     pub last_tool_name: Option<String>,
     /// Message index to highlight (from search).
     pub highlight_message: Option<usize>,
+    /// Latest plan.md snapshot; while `plan_mode` is on, TUI locks scroll to this doc.
+    pub plan_document: Option<PlanDocument>,
+    /// Jump once to the top of the focused plan after it appears / is replaced.
+    pub plan_scroll_to_top: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct PlanDocument {
+    pub path: String,
+    pub content: String,
 }
 
 #[derive(Debug, Clone)]
@@ -316,6 +326,64 @@ impl AppState {
             show_btw_pane: false,
             last_tool_name: None,
             highlight_message: None,
+            plan_document: None,
+            plan_scroll_to_top: false,
+        }
+    }
+
+    /// Plan mode + a written plan → transcript shows only the full plan and
+    /// scroll cannot leave that document until the user exits plan mode.
+    pub fn plan_focus_active(&self) -> bool {
+        self.plan_mode
+            && self
+                .plan_document
+                .as_ref()
+                .is_some_and(|p| !p.content.trim().is_empty())
+    }
+
+    pub fn apply_plan_document(&mut self, path: String, content: String) {
+        let first = self.plan_document.is_none();
+        self.plan_document = Some(PlanDocument {
+            path: path.clone(),
+            content: content.clone(),
+        });
+        self.messages.retain(|m| m.role != MessageRole::Plan);
+        self.messages.push(DisplayMessage {
+            role: MessageRole::Plan,
+            content: format!("file: {}\n\n{}", path, content),
+            thinking: None,
+            parts: Vec::new(),
+            tool_calls: Vec::new(),
+        });
+        if self.plan_mode {
+            if first {
+                self.plan_scroll_to_top = true;
+                self.follow_bottom = false;
+            } else {
+                // Subsequent edits: keep the latest end of the plan in view.
+                self.follow_bottom = true;
+                self.scroll_up = 0;
+            }
+        }
+    }
+
+    pub fn on_plan_mode_changed(&mut self, enabled: bool) {
+        self.plan_mode = enabled;
+        self.mode = if enabled {
+            AppMode::Plan
+        } else {
+            AppMode::Normal
+        };
+        self.status_bar.plan_mode = enabled;
+        if enabled {
+            if self.plan_document.is_some() {
+                self.plan_scroll_to_top = true;
+                self.follow_bottom = false;
+            }
+        } else {
+            self.plan_scroll_to_top = false;
+            self.follow_bottom = true;
+            self.scroll_up = 0;
         }
     }
 
@@ -351,6 +419,12 @@ impl AppState {
     /// - First quick burst while near the bottom: jump to `last_turn_anchor_msg`.
     /// - Further scrolling after the snap: resume normal history scroll.
     pub fn scroll_transcript(&mut self, delta: i32) {
+        // In plan-focus view the transcript *is* the plan — no turn snap.
+        if self.plan_focus_active() {
+            self.scroll_lines(delta);
+            return;
+        }
+
         const FLICK_WINDOW_MS: u128 = 140;
         const FLICK_MIN_LINES: i32 = 6; // ≥2 wheel notches (3 lines each)
         const NEAR_BOTTOM: u16 = 3;
@@ -1091,20 +1165,17 @@ impl TuiApp {
             }
             // Shift-Tab: toggle plan mode
             KeyCode::BackTab => {
-                self.state.plan_mode = !self.state.plan_mode;
-                self.state.mode = if self.state.plan_mode {
-                    AppMode::Plan
-                } else {
-                    AppMode::Normal
-                };
-                self.state.status_bar.plan_mode = self.state.plan_mode;
+                let enabled = !self.state.plan_mode;
+                self.state.on_plan_mode_changed(enabled);
                 if let Some(sid) = &self.state.session_id {
-                    self.client.set_plan_mode(sid, self.state.plan_mode).await?;
+                    self.client.set_plan_mode(sid, enabled).await?;
                 }
-                if self.state.plan_mode {
+                if enabled {
                     self.system_message(
                         "Plan mode ON — explore & write plan only. \
-                         Source edits are denied until you ExitPlanMode."
+                         Source edits are denied until you ExitPlanMode. \
+                         After a plan is written, scroll stays within the plan \
+                         until you exit plan mode."
                             .into(),
                     );
                 } else {
@@ -1562,8 +1633,27 @@ impl TuiApp {
             }
         }
         if let Some(plan) = data.get("plan_mode").and_then(|v| v.as_bool()) {
-            self.state.plan_mode = plan;
-            self.state.mode = if plan { AppMode::Plan } else { AppMode::Normal };
+            self.state.on_plan_mode_changed(plan);
+        }
+        // Restore plan document from transcript so plan-focus scroll works after resume.
+        if let Some(plan_msg) = self
+            .state
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == MessageRole::Plan)
+        {
+            let (path, body) = split_plan_message_content(&plan_msg.content);
+            if !body.trim().is_empty() {
+                self.state.plan_document = Some(PlanDocument {
+                    path,
+                    content: body,
+                });
+                if self.state.plan_mode {
+                    self.state.plan_scroll_to_top = true;
+                    self.state.follow_bottom = false;
+                }
+            }
         }
 
         self.system_message(format!(
@@ -1687,15 +1777,11 @@ impl TuiApp {
             }
             "plan" => {
                 if args.eq_ignore_ascii_case("clear") {
-                    self.state.plan_mode = false;
-                    self.state.mode = AppMode::Normal;
+                    self.state.on_plan_mode_changed(false);
+                    self.state.plan_document = None;
+                    self.state.messages.retain(|m| m.role != MessageRole::Plan);
                 } else {
-                    self.state.plan_mode = !self.state.plan_mode;
-                    self.state.mode = if self.state.plan_mode {
-                        AppMode::Plan
-                    } else {
-                        AppMode::Normal
-                    };
+                    self.state.on_plan_mode_changed(!self.state.plan_mode);
                 }
                 if let Some(sid) = &self.state.session_id {
                     self.client.set_plan_mode(sid, self.state.plan_mode).await?;
@@ -1703,7 +1789,8 @@ impl TuiApp {
                 if self.state.plan_mode {
                     self.system_message(
                         "Plan mode ON — explore & write plan only. \
-                         Source edits are denied until ExitPlanMode."
+                         Source edits are denied until ExitPlanMode. \
+                         Scroll locks to the full plan after it is written."
                             .into(),
                     );
                 } else {
@@ -1718,6 +1805,8 @@ impl TuiApp {
                 self.state.todos.clear();
                 self.state.todos_expanded = false;
                 self.state.thinking_text.clear();
+                self.state.plan_document = None;
+                self.state.plan_scroll_to_top = false;
                 let cwd = std::env::current_dir()?.to_string_lossy().to_string();
                 let session_id = self
                     .client
@@ -2505,28 +2594,14 @@ impl TuiApp {
                         }
                     }
                     AgentEvent::PlanModeChanged { enabled, .. } => {
-                        self.state.plan_mode = enabled;
-                        self.state.mode = if enabled {
-                            AppMode::Plan
-                        } else {
-                            AppMode::Normal
-                        };
+                        self.state.on_plan_mode_changed(enabled);
                         self.system_message(format!(
                             "Plan mode: {}",
                             if enabled { "on" } else { "off" }
                         ));
                     }
                     AgentEvent::PlanFileUpdated { path, content, .. } => {
-                        self.state.messages.retain(|m| m.role != MessageRole::Plan);
-                        self.state.messages.push(DisplayMessage {
-                            role: MessageRole::Plan,
-                            content: format!("file: {}\n\n{}", path, content),
-                            thinking: None,
-                            parts: Vec::new(),
-                            tool_calls: Vec::new(),
-                        });
-                        self.state.scroll_up = 0;
-                        self.state.follow_bottom = true;
+                        self.state.apply_plan_document(path, content);
                     }
                     AgentEvent::TodoUpdated { items, .. } => {
                         self.state.todos = items
@@ -2662,6 +2737,18 @@ impl TuiApp {
     }
 }
 
+fn split_plan_message_content(content: &str) -> (String, String) {
+    let mut body = content;
+    let mut path = String::new();
+    if let Some(rest) = body.strip_prefix("file: ") {
+        if let Some((path_line, rest_body)) = rest.split_once('\n') {
+            path = path_line.trim().to_string();
+            body = rest_body.trim_start_matches('\n');
+        }
+    }
+    (path, body.to_string())
+}
+
 fn slash_help_text() -> String {
     let mut s = String::from(
         "Keyboard shortcuts:\n\
@@ -2669,10 +2756,10 @@ fn slash_help_text() -> String {
   Tab           - Complete slash command\n\
   ↑↓            - Input history / slash menu\n\
   PgUp/PgDn     - Scroll transcript\n\
-  Mouse wheel   - Scroll transcript (quick flick snaps to this turn)\n\
+  Mouse wheel   - Scroll transcript (quick flick snaps to this turn; in plan mode locks to plan)\n\
   Click + drag  - Select/copy (releases mouse; next key restores scroll)\n\
   Esc           - Interrupt / dismiss; Esc Esc undo turn\n\
-  Shift-Tab     - Toggle plan mode\n\
+  Shift-Tab     - Toggle plan mode (scroll locks to full plan until exit)\n\
   !             - Shell mode\n\
   @             - File path picker (Tab/Enter insert)\n\
   Ctrl-F / Ctrl-S - Search transcript\n\

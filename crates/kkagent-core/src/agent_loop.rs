@@ -999,7 +999,7 @@ Do not mention this reminder to the user.\n</system-reminder>"
                     }
                 }
 
-                if !output.is_error && session.plan_mode && (name == "Write" || name == "Edit") {
+                if !output.is_error && (name == "Write" || name == "Edit") {
                     // Reconstruct input from tool call list
                     if let Some(tc) = tool_calls.iter().find(|t| t.id == id) {
                         if let Some(content) = read_plan_file_if_matched(session, &tc.input).await {
@@ -1521,16 +1521,34 @@ async fn read_plan_file_if_matched(session: &Session, input: &serde_json::Value)
         tokio::fs::canonicalize(plan).await,
     ) {
         (Ok(a), Ok(b)) => a == b,
-        _ => {
-            let na = candidate.components().collect::<Vec<_>>();
-            let nb = plan.components().collect::<Vec<_>>();
-            na == nb
-        }
+        _ => normalize_path_lex(&candidate) == normalize_path_lex(plan),
     };
     if !same {
         return None;
     }
-    tokio::fs::read_to_string(plan).await.ok()
+    if let Ok(content) = tokio::fs::read_to_string(plan).await {
+        return Some(content);
+    }
+    // File may be briefly unavailable — fall back to Write payload.
+    input
+        .get("contents")
+        .or_else(|| input.get("content"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
+fn normalize_path_lex(p: &std::path::Path) -> std::path::PathBuf {
+    let mut out = std::path::PathBuf::new();
+    for c in p.components() {
+        match c {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
 }
 
 fn todo_items_from_output(output: &ToolOutput) -> Option<Vec<kkagent_protocol::TodoItemEvent>> {

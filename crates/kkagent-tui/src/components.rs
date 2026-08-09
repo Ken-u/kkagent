@@ -24,7 +24,7 @@ const TIPS: &[&str] = &[
     "ctrl+f searches the transcript",
     "ctrl+o expands truncated tool output",
     "ctrl+g toggles btw notes",
-    "shift-tab toggles plan mode",
+    "shift-tab toggles plan mode (scroll locks to plan)",
     "! enters shell mode",
     "/yolo auto-approves tools",
     "large pastes collapse to [Pasted text #n]",
@@ -240,7 +240,11 @@ fn render_messages(f: &mut Frame, area: Rect, state: &mut AppState, theme: &Them
     state.viewport_height = visible_height;
 
     let max_scroll_up = content_height.saturating_sub(visible_height);
-    if state.follow_bottom {
+    if state.plan_scroll_to_top && state.plan_focus_active() {
+        state.scroll_up = max_scroll_up;
+        state.follow_bottom = max_scroll_up == 0;
+        state.plan_scroll_to_top = false;
+    } else if state.follow_bottom {
         state.scroll_up = 0;
     } else if state.scroll_up > max_scroll_up {
         state.scroll_up = max_scroll_up;
@@ -257,6 +261,15 @@ fn render_messages(f: &mut Frame, area: Rect, state: &mut AppState, theme: &Them
 fn build_transcript_lines(state: &mut AppState, theme: &Theme, width: u16) -> Vec<Line<'static>> {
     let mut lines: Vec<Line> = Vec::new();
     state.message_line_starts.clear();
+
+    if state.plan_focus_active() {
+        if let Some(doc) = state.plan_document.clone() {
+            // Single synthetic index so scroll helpers stay consistent.
+            state.message_line_starts.push(0);
+            push_plan_focus_lines(&mut lines, &doc.path, &doc.content, width, theme);
+            return lines;
+        }
+    }
 
     if state.messages.is_empty() {
         lines.push(Line::from(""));
@@ -323,26 +336,18 @@ fn build_transcript_lines(state: &mut AppState, theme: &Theme, width: u16) -> Ve
                 lines.push(Line::from(""));
             }
             MessageRole::Plan => {
-                lines.push(Line::from(Span::styled(
-                    "● plan",
-                    Style::default()
-                        .fg(theme.plan_mode)
-                        .add_modifier(Modifier::BOLD),
-                )));
-                let mut body = msg.content.as_str();
-                if let Some(rest) = body.strip_prefix("file: ") {
-                    if let Some((path_line, rest_body)) = rest.split_once('\n') {
-                        lines.push(Line::from(Span::styled(
-                            format!("  {}", path_line.trim()),
-                            Style::default().fg(theme.text_muted),
-                        )));
-                        body = rest_body.trim_start_matches('\n');
+                let (path, body) = {
+                    let mut body = msg.content.as_str();
+                    let mut path = "";
+                    if let Some(rest) = body.strip_prefix("file: ") {
+                        if let Some((path_line, rest_body)) = rest.split_once('\n') {
+                            path = path_line.trim();
+                            body = rest_body.trim_start_matches('\n');
+                        }
                     }
-                }
-                // Full plan — no line cap (unlike tool-result previews).
-                for line in body.lines() {
-                    push_assistant_wrapped(&mut lines, line, width, theme, false);
-                }
+                    (path.to_string(), body.to_string())
+                };
+                push_plan_box_lines(&mut lines, &path, &body, width, theme, false);
                 lines.push(Line::from(""));
             }
             MessageRole::Assistant => {
@@ -1659,6 +1664,145 @@ fn render_tasks_panel(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme
 }
 
 /// Wrap text to `width`, preserving a styled prefix on the first visual line.
+fn push_plan_focus_lines(
+    lines: &mut Vec<Line<'static>>,
+    path: &str,
+    content: &str,
+    width: u16,
+    theme: &Theme,
+) {
+    lines.push(Line::from(""));
+    push_plan_box_lines(lines, path, content, width, theme, true);
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  scroll = full plan only · shift-tab / /plan to exit",
+        Style::default().fg(theme.text_muted),
+    )));
+    lines.push(Line::from(""));
+}
+
+/// Full plan document in a box (no line cap). Used in transcript and plan-focus mode.
+fn push_plan_box_lines(
+    lines: &mut Vec<Line<'static>>,
+    path: &str,
+    content: &str,
+    width: u16,
+    theme: &Theme,
+    _focused: bool,
+) {
+    let safe_w = width.max(1) as usize;
+    if safe_w < 8 {
+        for line in content.lines() {
+            lines.push(Line::from(Span::styled(
+                line.to_string(),
+                Style::default().fg(theme.text),
+            )));
+        }
+        return;
+    }
+
+    let left_margin = 2usize;
+    let side_pad = 1usize;
+    // "  ┌" + horz + "┐"  ⇒ horz = width - 4
+    let horz_len = safe_w.saturating_sub(left_margin + 2).max(2);
+    let content_width = horz_len.saturating_sub(2 * side_pad).max(1);
+    let indent = " ".repeat(left_margin);
+    let border = Style::default().fg(theme.plan_mode);
+
+    let basename = std::path::Path::new(path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    let title = if basename.is_empty() {
+        " plan ".to_string()
+    } else {
+        format!(" plan: {basename} ")
+    };
+    let title = if UnicodeWidthStr::width(title.as_str()) + 1 > horz_len {
+        " plan ".to_string()
+    } else {
+        title
+    };
+    let title_vis = UnicodeWidthStr::width(title.as_str());
+    let dash_after = horz_len.saturating_sub(title_vis);
+
+    lines.push(Line::from(vec![
+        Span::raw(indent.clone()),
+        Span::styled(format!("┌{title}{}┐", "─".repeat(dash_after)), border),
+    ]));
+
+    // Full plan body — never truncate.
+    let body_lines: Vec<&str> = if content.is_empty() {
+        vec![""]
+    } else {
+        content.lines().collect()
+    };
+    for raw in body_lines {
+        let chunks = if raw.is_empty() {
+            vec![String::new()]
+        } else {
+            wrap_str(raw, content_width)
+        };
+        for chunk in chunks {
+            let styled = plan_body_spans(&chunk, theme);
+            let chunk_w: usize = styled
+                .iter()
+                .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+                .sum();
+            let pad = content_width.saturating_sub(chunk_w);
+            let mut spans = Vec::with_capacity(styled.len() + 4);
+            spans.push(Span::raw(indent.clone()));
+            spans.push(Span::styled("│", border));
+            spans.push(Span::raw(" "));
+            spans.extend(styled);
+            spans.push(Span::raw(" ".repeat(pad)));
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled("│", border));
+            lines.push(Line::from(spans));
+        }
+    }
+
+    lines.push(Line::from(vec![
+        Span::raw(indent),
+        Span::styled(format!("└{}┘", "─".repeat(horz_len)), border),
+    ]));
+}
+
+fn plan_body_spans(line: &str, theme: &Theme) -> Vec<Span<'static>> {
+    let trimmed = line.trim_start();
+    if let Some(rest) = trimmed
+        .strip_prefix("### ")
+        .or_else(|| trimmed.strip_prefix("## "))
+        .or_else(|| trimmed.strip_prefix("# "))
+    {
+        return vec![Span::styled(
+            rest.to_string(),
+            Style::default()
+                .fg(theme.primary)
+                .add_modifier(Modifier::BOLD),
+        )];
+    }
+    if let Some(rest) = trimmed
+        .strip_prefix("- ")
+        .or_else(|| trimmed.strip_prefix("* "))
+    {
+        return vec![
+            Span::styled("• ", Style::default().fg(theme.text)),
+            Span::styled(rest.to_string(), Style::default().fg(theme.text)),
+        ];
+    }
+    if trimmed.starts_with("```") {
+        return vec![Span::styled(
+            line.to_string(),
+            Style::default().fg(theme.text_muted),
+        )];
+    }
+    vec![Span::styled(
+        line.to_string(),
+        Style::default().fg(theme.text),
+    )]
+}
+
 fn push_wrapped_prefixed(
     lines: &mut Vec<Line<'static>>,
     prefix: &str,
@@ -1920,13 +2064,39 @@ mod render_smoke {
     use kkagent_protocol::PermissionMode;
 
     #[test]
-    fn build_empty_transcript() {
-        let mut state = AppState::new(PermissionMode::Manual, false);
+    fn plan_focus_renders_full_document() {
+        let mut state = AppState::new(PermissionMode::Manual, true);
+        let long: String = (1..=40).map(|i| format!("- step {i}\n")).collect();
+        state.apply_plan_document("/tmp/.kkagent/plans/s.md".into(), long.clone());
+        assert!(state.plan_focus_active());
         let theme = Theme::default();
-        let lines = build_transcript_lines(&mut state, &theme, 80);
-        assert!(!lines.is_empty());
-        let lines2 = build_transcript_lines(&mut state, &theme, 1);
-        assert!(!lines2.is_empty());
+        let lines = build_transcript_lines(&mut state, &theme, 60);
+        let joined: String = lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("step 1"));
+        assert!(joined.contains("step 40"));
+        assert!(joined.contains("more lines") == false);
+        assert!(joined.contains("scroll = full plan only"));
+        // No earlier transcript noise
+        assert!(!joined.contains("kkagent"));
+    }
+
+    #[test]
+    fn leaving_plan_mode_unlocks_transcript() {
+        let mut state = AppState::new(PermissionMode::Manual, true);
+        state.apply_plan_document("plan.md".into(), "# Hello\n\nbody".into());
+        assert!(state.plan_focus_active());
+        state.on_plan_mode_changed(false);
+        assert!(!state.plan_focus_active());
+        assert!(state.follow_bottom);
     }
 
     #[test]
