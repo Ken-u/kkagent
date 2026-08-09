@@ -10,6 +10,8 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
+use tokio::io::AsyncReadExt;
+use tokio::process::Child;
 use tokio::sync::{broadcast, Mutex};
 
 /// Pluggable backend so HTTP can bind to the live AgentLoop/ServerState.
@@ -22,6 +24,9 @@ pub trait HttpBackend: Send + Sync {
     async fn list_sessions(&self) -> Value;
     async fn create_session(&self, workspace: Option<String>, title: Option<String>) -> Value;
     async fn get_session(&self, id: &str) -> Option<Value>;
+    async fn delete_session(&self, _id: &str) -> Result<(), String> {
+        Err("session deletion is not supported by this backend".into())
+    }
     async fn post_message(&self, id: &str, text: &str) -> Result<Value, String>;
     async fn list_tools(&self) -> Value;
     async fn list_tasks(&self) -> Value;
@@ -38,6 +43,12 @@ pub trait HttpBackend: Send + Sync {
     async fn fs_write(&self, path: &str, content: &str) -> Result<(), String>;
     async fn search(&self, query: &str) -> Value;
     async fn workspace_info(&self) -> Value;
+    async fn list_questions(&self) -> Value {
+        json!({"questions": []})
+    }
+    async fn answer_question(&self, _id: &str, _response: Value) -> Result<Value, String> {
+        Err("question responses are not supported by this backend".into())
+    }
 }
 
 /// In-memory demo backend (used when not wired to AgentLoop).
@@ -151,7 +162,14 @@ pub struct HttpState {
     pub meta: Value,
     pub events: broadcast::Sender<Value>,
     pub token: Option<String>,
-    pub terminals: Arc<Mutex<HashMap<String, Value>>>,
+    terminals: Arc<Mutex<HashMap<String, HttpTerminalSlot>>>,
+}
+
+struct HttpTerminalSlot {
+    info: Value,
+    child: Option<Child>,
+    stdout: Arc<Mutex<Vec<u8>>>,
+    stderr: Arc<Mutex<Vec<u8>>>,
 }
 
 impl HttpState {
@@ -464,12 +482,27 @@ async fn prompts(
     ]})))
 }
 
-async fn questions_stub(
+async fn questions(
     State(state): State<HttpState>,
     Query(q): Query<AuthQuery>,
 ) -> Result<Json<Value>, StatusCode> {
     check_auth(&state, &q)?;
-    Ok(Json(json!({"questions": []})))
+    Ok(Json(state.backend.list_questions().await))
+}
+
+async fn answer_question(
+    State(state): State<HttpState>,
+    Path(id): Path<String>,
+    Query(q): Query<AuthQuery>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, StatusCode> {
+    check_auth(&state, &q)?;
+    state
+        .backend
+        .answer_question(&id, body)
+        .await
+        .map(Json)
+        .map_err(|_| StatusCode::BAD_REQUEST)
 }
 
 async fn terminals_list(
@@ -478,9 +511,9 @@ async fn terminals_list(
 ) -> Result<Json<Value>, StatusCode> {
     check_auth(&state, &q)?;
     let map = state.terminals.lock().await;
-    Ok(Json(
-        json!({"terminals": map.values().cloned().collect::<Vec<_>>()}),
-    ))
+    Ok(Json(json!({
+        "terminals": map.values().map(|slot| slot.info.clone()).collect::<Vec<_>>()
+    })))
 }
 
 #[derive(Deserialize)]
@@ -496,14 +529,109 @@ async fn terminals_create(
 ) -> Result<Json<Value>, StatusCode> {
     check_auth(&state, &q)?;
     let id = uuid::Uuid::new_v4().to_string();
-    let t = json!({
-        "terminal_id": id,
-        "command": body.command,
-        "cwd": body.cwd.unwrap_or_else(|| ".".into()),
-        "status": "created",
+    let command_text = body.command.unwrap_or_else(|| {
+        if cfg!(windows) {
+            "echo kkagent-terminal".into()
+        } else {
+            "printf kkagent-terminal".into()
+        }
     });
-    state.terminals.lock().await.insert(id, t.clone());
-    Ok(Json(t))
+    let cwd = body.cwd.unwrap_or_else(|| ".".into());
+    let mut command = if cfg!(windows) {
+        let mut command = tokio::process::Command::new("cmd");
+        command.args(["/C", &command_text]);
+        command
+    } else {
+        let mut command = tokio::process::Command::new("sh");
+        command.args(["-lc", &command_text]);
+        command
+    };
+    command
+        .current_dir(&cwd)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = command.spawn().map_err(|_| StatusCode::BAD_REQUEST)?;
+    let stdout = Arc::new(Mutex::new(Vec::new()));
+    let stderr = Arc::new(Mutex::new(Vec::new()));
+    if let Some(mut pipe) = child.stdout.take() {
+        let output = stdout.clone();
+        tokio::spawn(async move {
+            let mut bytes = Vec::new();
+            let _ = pipe.read_to_end(&mut bytes).await;
+            *output.lock().await = bytes;
+        });
+    }
+    if let Some(mut pipe) = child.stderr.take() {
+        let output = stderr.clone();
+        tokio::spawn(async move {
+            let mut bytes = Vec::new();
+            let _ = pipe.read_to_end(&mut bytes).await;
+            *output.lock().await = bytes;
+        });
+    }
+    let terminal = json!({
+        "terminal_id": id,
+        "command": command_text,
+        "cwd": cwd,
+        "status": "running",
+    });
+    state.terminals.lock().await.insert(
+        id,
+        HttpTerminalSlot {
+            info: terminal.clone(),
+            child: Some(child),
+            stdout,
+            stderr,
+        },
+    );
+    Ok(Json(terminal))
+}
+
+async fn terminal_get(
+    State(state): State<HttpState>,
+    Path(id): Path<String>,
+    Query(q): Query<AuthQuery>,
+) -> Result<Json<Value>, StatusCode> {
+    check_auth(&state, &q)?;
+    let mut terminals = state.terminals.lock().await;
+    let slot = terminals.get_mut(&id).ok_or(StatusCode::NOT_FOUND)?;
+    if let Some(child) = slot.child.as_mut() {
+        if let Ok(Some(status)) = child.try_wait() {
+            slot.info["status"] = json!("exited");
+            slot.info["exit_code"] = json!(status.code());
+            slot.child = None;
+        }
+    }
+    let stdout = String::from_utf8_lossy(&slot.stdout.lock().await).into_owned();
+    let stderr = String::from_utf8_lossy(&slot.stderr.lock().await).into_owned();
+    Ok(Json(json!({
+        "terminal": slot.info,
+        "stdout": stdout,
+        "stderr": stderr,
+    })))
+}
+
+async fn terminal_delete(
+    State(state): State<HttpState>,
+    Path(id): Path<String>,
+    Query(q): Query<AuthQuery>,
+) -> Result<Json<Value>, StatusCode> {
+    check_auth(&state, &q)?;
+    let mut slot = state
+        .terminals
+        .lock()
+        .await
+        .remove(&id)
+        .ok_or(StatusCode::NOT_FOUND)?;
+    if let Some(mut child) = slot.child.take() {
+        child
+            .kill()
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    }
+    Ok(Json(json!({"ok": true, "terminal_id": id})))
 }
 
 async fn connections(
@@ -536,8 +664,12 @@ async fn delete_session(
     Query(q): Query<AuthQuery>,
 ) -> Result<Json<Value>, StatusCode> {
     check_auth(&state, &q)?;
-    // Memory backend has no delete — report ok for API shape.
-    let _ = id;
+    state
+        .backend
+        .delete_session(&id)
+        .await
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+    state.publish(json!({"type": "session.deleted", "session_id": id}));
     Ok(Json(json!({"ok": true})))
 }
 
@@ -614,10 +746,15 @@ pub fn router(state: HttpState) -> Router {
         .route("/api/v1/search", get(search))
         .route("/api/v1/snapshot", get(snapshot))
         .route("/api/v1/prompts", get(prompts))
-        .route("/api/v1/questions", get(questions_stub))
+        .route("/api/v1/questions", get(questions))
+        .route("/api/v1/questions/{id}", post(answer_question))
         .route(
             "/api/v1/terminals",
             get(terminals_list).post(terminals_create),
+        )
+        .route(
+            "/api/v1/terminals/{id}",
+            get(terminal_get).delete(terminal_delete),
         )
         .route("/api/v1/connections", get(connections))
         .route("/api/v1/ws", get(ws_handler))
@@ -663,5 +800,40 @@ mod security_tests {
             .unwrap_err()
             .to_string()
             .contains("refusing to expose unauthenticated"));
+    }
+
+    #[tokio::test]
+    async fn terminal_endpoint_runs_and_captures_output() {
+        let state = HttpState::new(None);
+        let Json(created) = terminals_create(
+            State(state.clone()),
+            Query(AuthQuery::default()),
+            Json(TerminalCreate {
+                command: Some("echo terminal-ok".into()),
+                cwd: None,
+            }),
+        )
+        .await
+        .unwrap();
+        let id = created["terminal_id"].as_str().unwrap().to_string();
+        for _ in 0..50 {
+            let Json(snapshot) = terminal_get(
+                State(state.clone()),
+                Path(id.clone()),
+                Query(AuthQuery::default()),
+            )
+            .await
+            .unwrap();
+            if snapshot["terminal"]["status"] == "exited"
+                && snapshot["stdout"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("terminal-ok")
+            {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("terminal did not exit with captured output");
     }
 }

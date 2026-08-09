@@ -641,6 +641,34 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
         })
     }
 
+    async fn delete_session(&self, id: &str) -> Result<(), String> {
+        let session = self.state.sessions.lock().await.remove(id);
+        if session.is_none() {
+            let exists = self
+                .state
+                .transcript
+                .lock()
+                .await
+                .get_session(id)
+                .map_err(|e| e.to_string())?
+                .is_some();
+            if !exists {
+                return Err("session not found".into());
+            }
+        }
+        self.state.interrupt_flags.lock().await.remove(id);
+        self.state.model_aliases.lock().await.remove(id);
+        self.state.approval_txs.lock().await.remove(id);
+        self.state.question_txs.lock().await.remove(id);
+        self.state
+            .transcript
+            .lock()
+            .await
+            .archive_session(id)
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
     async fn post_message(&self, id: &str, text: &str) -> Result<serde_json::Value, String> {
         // Queue user message and run AgentLoop turn on shared ServerState.
         let mut sessions = self.state.sessions.lock().await;
@@ -776,7 +804,34 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
     }
 
     async fn search(&self, query: &str) -> serde_json::Value {
-        serde_json::json!({"query": query, "hits": [], "note": "use Grep tool via agent turn"})
+        let needle = query.to_lowercase();
+        let sessions = self.state.sessions.lock().await;
+        let mut hits = Vec::new();
+        for session in sessions.values() {
+            for (index, message) in session.messages.iter().enumerate() {
+                for part in &message.content {
+                    let text = match part {
+                        ChatContent::Text { text } | ChatContent::Thinking { thinking: text } => {
+                            text
+                        }
+                        ChatContent::ToolResult { content, .. } => content,
+                        ChatContent::ToolUse { .. } => continue,
+                    };
+                    if text.to_lowercase().contains(&needle) {
+                        hits.push(serde_json::json!({
+                            "session_id": session.id,
+                            "message_index": index,
+                            "role": message.role,
+                            "preview": text.chars().take(240).collect::<String>(),
+                        }));
+                        if hits.len() == 100 {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        serde_json::json!({"query": query, "hits": hits})
     }
 
     async fn workspace_info(&self) -> serde_json::Value {
@@ -784,6 +839,60 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
             "cwd": std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_else(|_| ".".into()),
             "sessions": self.state.sessions.lock().await.len(),
         })
+    }
+
+    async fn list_questions(&self) -> serde_json::Value {
+        let questions = self.state.pending_questions.lock().await;
+        serde_json::json!({"questions": questions.values().cloned().collect::<Vec<_>>()})
+    }
+
+    async fn answer_question(
+        &self,
+        id: &str,
+        response: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let pending = self
+            .state
+            .pending_questions
+            .lock()
+            .await
+            .remove(id)
+            .ok_or_else(|| "question not found".to_string())?;
+        let session_id = pending
+            .get("session_id")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| "pending question has no session".to_string())?;
+        let question_response = kkagent_protocol::QuestionResponse {
+            question_id: id.to_string(),
+            selected_option_ids: response
+                .get("selected_option_ids")
+                .or_else(|| response.get("selectedOptionIds"))
+                .and_then(|value| value.as_array())
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(|value| value.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            free_text: response
+                .get("free_text")
+                .or_else(|| response.get("freeText"))
+                .and_then(|value| value.as_str())
+                .map(str::to_string),
+            cancelled: response
+                .get("cancelled")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false),
+        };
+        let senders = self.state.question_txs.lock().await;
+        let sender = senders
+            .get(session_id)
+            .ok_or_else(|| "session question channel not found".to_string())?;
+        sender
+            .try_send(question_response)
+            .map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({"ok": true, "question_id": id}))
     }
 }
 
@@ -905,8 +1014,22 @@ mod http_path_tests {
 async fn run_http_turn(state: Arc<ServerState>, session_id: &str) -> anyhow::Result<()> {
     let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(64);
     let live_events = state.events.clone();
+    let event_state = state.clone();
     tokio::spawn(async move {
         while let Some(event) = event_rx.recv().await {
+            if let AgentEvent::QuestionAsked {
+                session_id,
+                question,
+            } = &event
+            {
+                event_state.pending_questions.lock().await.insert(
+                    question.question_id.clone(),
+                    serde_json::json!({
+                        "session_id": session_id,
+                        "question": question,
+                    }),
+                );
+            }
             if let Ok(value) = serde_json::to_value(event) {
                 let _ = live_events.send(value);
             }
@@ -1000,6 +1123,7 @@ struct ServerState {
     plugins: Arc<kkagent_core::PluginManager>,
     telemetry: kkagent_telemetry::TelemetryServiceHandle,
     events: tokio::sync::broadcast::Sender<serde_json::Value>,
+    pending_questions: Mutex<HashMap<String, serde_json::Value>>,
 }
 
 fn mcp_manager_from_config(config: &AppConfig) -> McpManager {
@@ -1144,6 +1268,7 @@ async fn build_server_state(config: Arc<AppConfig>) -> Arc<ServerState> {
         plugins,
         telemetry: telemetry.clone(),
         events,
+        pending_questions: Mutex::new(HashMap::new()),
     })
 }
 
