@@ -86,9 +86,27 @@ max_running_tasks = 4
 keep_alive_on_exit = false
 bash_auto_background_on_timeout = true
 bash_task_timeout_s = 120
+approval_timeout_s = 900
 ```
 
-`max_running_tasks` 控制 Agent 后台任务并发；Bash 仍受内部硬性资源上限约束。
+`max_running_tasks` 控制 Agent 后台任务并发；`approval_timeout_s` 到期后按拒绝处理，范围在运行时限制为 1 秒到 24 小时。
+
+## 系统隔离
+
+```toml
+[sandbox]
+mode = "auto"       # auto | workspace | process | disabled
+network = true
+memory_mb = 4096
+cpu_seconds = 600
+max_processes = 128
+extra_read_paths = []
+extra_write_paths = []
+```
+
+`auto` 在 Linux/macOS 选择 `workspace`，在 Windows 选择 `process`。Linux 的工作区模式要求 PATH 中存在 `bwrap`，用 user/mount/PID 等 namespace、只读系统目录、独立 `/tmp` 和可选 network namespace 隔离命令；macOS 使用系统 Seatbelt，默认拒绝用户主目录并重新开放当前 workspace；Windows 的 `process` 模式用 Job Object 限制进程树、内存和进程数。显式选择平台不支持的 `workspace` 会拒绝执行，不会静默降级。
+
+`extra_read_paths`/`extra_write_paths` 必须已经存在。`disabled` 只建议用于受控容器内排障；HTTP terminal 是单独的显式管理接口，不继承 Bash sandbox。
 
 ## 权限规则
 

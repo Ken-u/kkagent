@@ -7,7 +7,8 @@ TUI 与 Agent Server 可分离，中间走 RPC（当前默认进程内 memory tr
 - 支持 Win / macOS / Linux（x86_64 / arm64）
 - 权限模式：`manual` / `yolo` / `auto`
 - 内置工具：Read / Write / Edit / Grep / Glob / Bash / TodoList / Goal / Task
-- 会话持久化：`~/.kkagent/transcripts.db`
+- 会话、事件、turn 队列和后台 Agent 任务统一持久化到 `~/.kkagent/transcripts.db`
+- Bash 系统隔离：Linux Bubblewrap、macOS Seatbelt、Windows Job Object
 - MCP / Skills / Hooks（配置驱动）
 
 ## 文档导航

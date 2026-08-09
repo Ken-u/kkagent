@@ -162,11 +162,12 @@ interface KkagentClientOptions {
 | `meta()` | 查询 server 名称、版本和能力 | 原始 JSON |
 | `listSessions()` | 列出当前 Session | `Session[]` |
 | `createSession(workspace?, title?)` | 创建 Session | `Session` |
-| `postMessage(sessionId, text)` | 提交一条用户消息 | 接受结果 JSON |
+| `postMessage(sessionId, text, {idempotencyKey?})` | 幂等提交一条用户消息 | 含 `task_id` 的接受结果 JSON |
 | `listTools()` | 查询可用工具 | 原始 JSON |
 | `modelCatalog()` | 查询模型目录 | 原始 JSON |
 | `eventsSince(since?, sessionId?, limit?)` | 回放带序号的事件窗口 | `EventHistory` |
-| `turnStatus(sessionId)` | 查询最近 turn 状态 | 原始 JSON |
+| `turnStatus(taskOrSessionId)` | 按任务查询，或按 Session 查询最近 turn | 原始 JSON |
+| `cancelTurn(taskId)` | 取消持久 turn | 原始 JSON |
 | `connectEvents(callback, {since?, sessionId?})` | 连接可恢复、可过滤的 WebSocket 事件流 | `WebSocket` |
 
 ### `JsonRpcClient`
@@ -216,4 +217,4 @@ npm test
 - JavaScript 与 TypeScript 入口目前分别维护。
 
 这些边界意味着它适合内部集成、原型和受控服务调用；若用于长期运行的生产服务，调用方
-需要自行补充任务状态持久化、重试、超时和事件路由。
+需要自行补充自动重连、业务级超时和事件路由；Server 已提供任务/事件持久化与幂等重试基础。

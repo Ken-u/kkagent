@@ -59,11 +59,12 @@ curl -sS -H "$AUTH" -H 'Content-Type: application/json' \
   "$API/sessions"
 
 curl -sS -H "$AUTH" -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: job-20260809-001' \
   -d '{"text":"运行测试并总结失败"}' \
   "$API/sessions/<session-id>/messages"
 ```
 
-发送消息只表示任务已提交。最终回答、工具调用、批准请求和状态变化通过 WebSocket 事件流返回。
+发送消息先把 turn 原子写入 SQLite，再返回稳定的 `task_id`。相同 Session、相同 `Idempotency-Key` 和相同正文会返回原任务；同 key 不同正文返回 `409`。最终回答、工具调用、批准请求和状态变化通过 WebSocket 事件流返回。
 
 ## HTTP 路由
 
@@ -73,8 +74,9 @@ curl -sS -H "$AUTH" -H 'Content-Type: application/json' \
 | `GET /api/v1/health` | 存活、持久化状态、uptime 和 Session 数。 |
 | `GET /api/v1/ready` | 可接流量时返回 200；降级或持久化失败返回 503。 |
 | `GET /api/v1/metrics` | Prometheus 文本指标。 |
-| `GET /api/v1/events?since=&session_id=&limit=` | 回放内存事件窗口。 |
-| `GET /api/v1/turns/{session-id}` | 查询最近 turn 状态和事件序号。 |
+| `GET /api/v1/events?since=&session_id=&limit=` | 从 SQLite 回放持久事件；单次最多 10000 条。 |
+| `GET /api/v1/turns/{task-id}` | 查询持久 turn 状态；也兼容 Session ID 查询最近一项。 |
+| `DELETE /api/v1/turns/{task-id}` | 取消排队/运行/待审批 turn，并中断对应 Session。 |
 | `GET /api/v1/sessions` | 列出会话。 |
 | `POST /api/v1/sessions` | 创建会话；body 为 `{workspace?, title?}`。 |
 | `GET /api/v1/sessions/{id}` | 读取会话。 |
@@ -109,9 +111,9 @@ curl -sS -H "$AUTH" -H 'Content-Type: application/json' \
 ws://127.0.0.1:8787/api/v1/ws?token=<url-encoded-token>&session_id=<id>&since=<seq>
 ```
 
-连接后先收到 hello，其中包含 `latest_event_seq` 和 `history_capacity`。每个事件包含单调递增的 `event_seq` 和 `emitted_at`。`since` 会回放窗口内更新，`session_id` 在服务端过滤。发送 `{"type":"subscribe","session_id":"..."}` 可设置过滤；发送包含 `ping` 的文本会收到 pong。
+连接后先收到 hello，其中包含 `latest_event_seq` 和实时广播窗口 `history_capacity`。每个事件包含由 SQLite 分配、跨进程重启保持单调的 `event_seq` 和 `emitted_at`。`since` 从持久事件表回放，`session_id` 在服务端过滤。发送 `{"type":"subscribe","session_id":"..."}` 可设置过滤；发送包含 `ping` 的文本会收到 pong。
 
-WebSocket 是广播流；慢客户端会收到 `resync_required`，随后应调用 events、turn 和 snapshot 接口恢复。Server 保留最近 2048 个事件，超过窗口的历史不会重放。
+WebSocket 是广播流；慢客户端会收到 `resync_required`，随后应从最后确认的序号调用 events、turn 和 snapshot 恢复。2048 是实时 channel 的内存窗口，不是持久历史上限。
 
 ## 本地 RPC
 
@@ -124,6 +126,7 @@ WebSocket 是广播流；慢客户端会收到 `resync_required`，随后应调�
 - `401`：token 缺失或错误。
 - `404`：会话、终端或批准 ID 不存在。
 - `400`：请求字段、路径或后端操作无效。
+- `409`：幂等键冲突、任务不可取消或 Session 正忙。
 - `413`：终端命令超过限制。
 - `429`：终端数量达到上限。
 

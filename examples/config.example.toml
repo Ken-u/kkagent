@@ -61,6 +61,16 @@ max_running_tasks = 4
 keep_alive_on_exit = false
 # bash_auto_background_on_timeout = true
 # bash_task_timeout_s = 120
+# approval_timeout_s = 900
+
+[sandbox]
+mode = "auto"       # auto | workspace | process | disabled
+network = true
+memory_mb = 4096
+cpu_seconds = 600
+max_processes = 128
+# extra_read_paths = ["/absolute/read-only/input"]
+# extra_write_paths = ["/absolute/writable/cache"]
 
 # [thinking]
 # enabled = true

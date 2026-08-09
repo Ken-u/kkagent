@@ -51,11 +51,12 @@ TUI / prompt / ACP / HTTP+WS
 
 每个 Session 有独立上下文和执行状态。Server 可承载多个 Session；同一 Session 的 prompt、interrupt、approval 和 question 通过 ID 关联。后台 Task 有单独并发控制，Bash 后台进程还有独立硬上限。
 
-HTTP WebSocket 是进程级广播，但 Server 会添加单调事件序号、保留最近 2048 条，并支持服务端 `session_id` 过滤和 `since` 回放。超过窗口时客户端通过 REST event/turn/snapshot 恢复状态。
+HTTP WebSocket 是进程级实时广播；事件先写入 SQLite、再发送给订阅者。Server 使用数据库自增序号，支持服务重启后的 `session_id` 过滤和 `since` 回放；内存中另外保留最近 2048 条作为低延迟窗口。
 
 ## 持久化
 
 - SQLite transcript 保存结构化消息和会话索引数据。
+- 同一 SQLite 数据库保存 HTTP 事件、幂等 turn 队列、租约/重试状态和后台 Agent 配置。启动时 `running`/待审批任务会进入恢复队列，最多尝试三次。
 - session 目录保存事件 journal、元数据和运行产物。
 - workspace 下 `.kkagent/` 保存计划、超大工具结果等项目相关产物。
 - wire 记录包含迁移支持，升级时不应手工编辑。
