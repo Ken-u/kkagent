@@ -99,15 +99,8 @@ async fn main() -> Result<()> {
             http,
             http_token,
         }) => {
-            if let Some(addr) = http {
-                let token = http_token.or_else(|| std::env::var("KKAGENT_HTTP_TOKEN").ok());
-                tokio::spawn(async move {
-                    if let Err(e) = kkagent_rpc::serve_http(&addr, token).await {
-                        tracing::error!("HTTP server error: {e}");
-                    }
-                });
-            }
-            run_server(config, listen).await
+            let token = http_token.or_else(|| std::env::var("KKAGENT_HTTP_TOKEN").ok());
+            run_server(config, listen, http, token).await
         }
         Some(Commands::Acp) => {
             let server = kkagent_acp::AcpServer::new();
@@ -227,7 +220,12 @@ async fn run_print_mode(config: AppConfig, prompt: String, permission_mode: Perm
     Ok(())
 }
 
-async fn run_server(config: AppConfig, listen: Option<String>) -> Result<()> {
+async fn run_server(
+    config: AppConfig,
+    listen: Option<String>,
+    http: Option<String>,
+    http_token: Option<String>,
+) -> Result<()> {
     let socket_path = listen.unwrap_or_else(|| {
         let dir = kkagent_config::default_config_dir();
         dir.join("server.sock").to_string_lossy().to_string()
@@ -236,14 +234,343 @@ async fn run_server(config: AppConfig, listen: Option<String>) -> Result<()> {
     tracing::info!("Starting server on {}", socket_path);
     let listener = kkagent_rpc::transport::uds::bind_uds(std::path::Path::new(&socket_path))?;
     let config_arc = Arc::new(config);
+    let state = build_server_state(config_arc.clone()).await;
+
+    if let Some(addr) = http {
+        let backend: Arc<dyn kkagent_rpc::HttpBackend> =
+            Arc::new(AgentHttpBackend { state: state.clone() });
+        let token = http_token;
+        tokio::spawn(async move {
+            if let Err(e) = kkagent_rpc::serve_http_with_backend(&addr, backend, token).await {
+                tracing::error!("HTTP server error: {e}");
+            }
+        });
+    }
 
     loop {
         let (stream, _) = listener.accept().await?;
-        let cfg = config_arc.clone();
+        let st = state.clone();
         tokio::spawn(async move {
-            run_server_handler(stream, cfg).await;
+            run_server_handler_with_state(stream, st).await;
         });
     }
+}
+
+struct AgentHttpBackend {
+    state: Arc<ServerState>,
+}
+
+#[async_trait::async_trait]
+impl kkagent_rpc::HttpBackend for AgentHttpBackend {
+    async fn list_sessions(&self) -> serde_json::Value {
+        let sessions = self.state.sessions.lock().await;
+        let list: Vec<_> = sessions
+            .values()
+            .map(|s| {
+                serde_json::json!({
+                    "session_id": s.id,
+                    "title": s.title,
+                    "workspace": s.working_dir.display().to_string(),
+                    "messages": s.messages.len(),
+                    "permission_mode": format!("{:?}", s.permission_mode),
+                })
+            })
+            .collect();
+        // Also include transcript DB sessions
+        let db = self.state.transcript.lock().await;
+        let archived = db.list_sessions(50).unwrap_or_default();
+        let archived_json: Vec<_> = archived
+            .into_iter()
+            .map(|r| {
+                serde_json::json!({
+                    "session_id": r.session_id,
+                    "title": r.title,
+                    "working_dir": r.working_dir,
+                    "updated_at": r.updated_at,
+                })
+            })
+            .collect();
+        serde_json::json!({"sessions": list, "transcript": archived_json})
+    }
+
+    async fn create_session(
+        &self,
+        workspace: Option<String>,
+        title: Option<String>,
+    ) -> serde_json::Value {
+        let id = uuid::Uuid::new_v4().to_string();
+        let cwd = workspace
+            .map(PathBuf::from)
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+        let model = self
+            .state
+            .config
+            .default_model_alias()
+            .unwrap_or("default")
+            .to_string();
+        let mut session = Session::new(id.clone(), cwd.clone(), PermissionMode::Manual, model.clone());
+        session.title = title.clone();
+        {
+            let db = self.state.transcript.lock().await;
+            let _ = db.create_session(&id, &model, &cwd.to_string_lossy());
+            if let Some(ref t) = title {
+                let _ = db.set_title(&id, t);
+            }
+        }
+        self.state
+            .interrupt_flags
+            .lock()
+            .await
+            .insert(id.clone(), session.interrupted.clone());
+        self.state
+            .model_aliases
+            .lock()
+            .await
+            .insert(id.clone(), session.model_alias.clone());
+        self.state
+            .approval_txs
+            .lock()
+            .await
+            .insert(id.clone(), session.approval_tx.clone());
+        self.state
+            .question_txs
+            .lock()
+            .await
+            .insert(id.clone(), session.question_tx.clone());
+        self.state.sessions.lock().await.insert(id.clone(), session);
+        serde_json::json!({
+            "session_id": id,
+            "workspace": cwd.display().to_string(),
+            "title": title,
+            "created_at": chrono::Utc::now().to_rfc3339(),
+        })
+    }
+
+    async fn get_session(&self, id: &str) -> Option<serde_json::Value> {
+        let sessions = self.state.sessions.lock().await;
+        sessions.get(id).map(|s| {
+            serde_json::json!({
+                "session_id": s.id,
+                "title": s.title,
+                "workspace": s.working_dir.display().to_string(),
+                "messages": s.messages,
+                "usage": {
+                    "input_tokens": s.usage.snapshot().input_tokens,
+                    "output_tokens": s.usage.snapshot().output_tokens,
+                    "steps": s.usage.snapshot().steps,
+                    "turns": s.usage.snapshot().turns,
+                },
+            })
+        })
+    }
+
+    async fn post_message(&self, id: &str, text: &str) -> Result<serde_json::Value, String> {
+        // Queue user message and run AgentLoop turn on shared ServerState.
+        let mut sessions = self.state.sessions.lock().await;
+        let session = sessions
+            .get_mut(id)
+            .ok_or_else(|| "session not found".to_string())?;
+        session.add_user_message(text.to_string());
+        let n = session.messages.len();
+        drop(sessions);
+        let state = self.state.clone();
+        let sid = id.to_string();
+        tokio::spawn(async move {
+            if let Err(e) = run_http_turn(state, &sid).await {
+                tracing::warn!("HTTP-triggered turn failed: {e}");
+            }
+        });
+        Ok(serde_json::json!({"ok": true, "queued": true, "message_count": n}))
+    }
+
+    async fn list_tools(&self) -> serde_json::Value {
+        let mut reg = ToolRegistry::new();
+        kkagent_tools::register_builtin_tools(&mut reg);
+        let names: Vec<_> = reg
+            .tool_definitions()
+            .iter()
+            .map(|t| serde_json::json!({"name": t.name, "description": t.description}))
+            .collect();
+        serde_json::json!({"tools": names})
+    }
+
+    async fn list_tasks(&self) -> serde_json::Value {
+        let all = self.state.subagents.list_all().await;
+        let tasks: Vec<_> = all
+            .into_iter()
+            .map(|t| {
+                serde_json::json!({
+                    "task_id": t.agent_id,
+                    "description": t.description,
+                    "status": t.status,
+                })
+            })
+            .collect();
+        serde_json::json!({"tasks": tasks})
+    }
+
+    async fn list_skills(&self) -> serde_json::Value {
+        let list = self.state.skills.list().await;
+        let items: Vec<_> = list
+            .into_iter()
+            .map(|e| {
+                serde_json::json!({
+                    "name": e.name,
+                    "description": e.description,
+                })
+            })
+            .collect();
+        serde_json::json!({"skills": items})
+    }
+
+    async fn list_models(&self) -> serde_json::Value {
+        let mut models: Vec<_> = self
+            .state
+            .config
+            .models
+            .iter()
+            .map(|(alias, m)| {
+                serde_json::json!({
+                    "alias": alias,
+                    "model": m.model,
+                    "provider": m.provider,
+                    "max_context_size": m.max_context_size,
+                })
+            })
+            .collect();
+        for e in kkagent_llm::builtin_catalog() {
+            models.push(serde_json::json!({
+                "id": e.id,
+                "provider": e.provider,
+                "context_window": e.context_window,
+                "responses_api": e.responses_api,
+            }));
+        }
+        serde_json::json!({"models": models})
+    }
+
+    async fn get_config(&self) -> serde_json::Value {
+        serde_json::json!({
+            "default_model": self.state.config.default_model,
+            "config_dir": kkagent_config::default_config_dir().display().to_string(),
+            "mcp_servers": self.state.config.mcp_servers.len(),
+        })
+    }
+
+    async fn approve(
+        &self,
+        id: &str,
+        decision: &str,
+        feedback: Option<String>,
+    ) -> Result<serde_json::Value, String> {
+        let dec = match decision {
+            "approved" | "approve" | "allow" => kkagent_protocol::ApprovalDecision::Approved,
+            "rejected" | "reject" | "deny" => kkagent_protocol::ApprovalDecision::Rejected,
+            _ => kkagent_protocol::ApprovalDecision::Cancelled,
+        };
+        let resp = kkagent_protocol::ApprovalResponse {
+            approval_id: id.to_string(),
+            decision: dec,
+            scope: None,
+            feedback,
+        };
+        let txs = self.state.approval_txs.lock().await;
+        for tx in txs.values() {
+            let _ = tx.try_send(resp.clone());
+        }
+        Ok(serde_json::json!({"ok": true, "approval_id": id}))
+    }
+
+    async fn fs_read(&self, path: &str) -> Result<String, String> {
+        tokio::fs::read_to_string(path)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn fs_write(&self, path: &str, content: &str) -> Result<(), String> {
+        if let Some(parent) = std::path::Path::new(path).parent() {
+            let _ = tokio::fs::create_dir_all(parent).await;
+        }
+        tokio::fs::write(path, content)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn search(&self, query: &str) -> serde_json::Value {
+        serde_json::json!({"query": query, "hits": [], "note": "use Grep tool via agent turn"})
+    }
+
+    async fn workspace_info(&self) -> serde_json::Value {
+        serde_json::json!({
+            "cwd": std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_else(|_| ".".into()),
+            "sessions": self.state.sessions.lock().await.len(),
+        })
+    }
+}
+
+async fn run_http_turn(state: Arc<ServerState>, session_id: &str) -> anyhow::Result<()> {
+    let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(64);
+    tokio::spawn(async move {
+        while let Some(_ev) = event_rx.recv().await {}
+    });
+
+    let mut session = {
+        let mut sessions = state.sessions.lock().await;
+        sessions
+            .remove(session_id)
+            .ok_or_else(|| anyhow::anyhow!("session gone"))?
+    };
+    session.begin_turn();
+
+    let mut tools = ToolRegistry::new();
+    kkagent_tools::register_builtin_tools(&mut tools);
+    tools.register(Arc::new(kkagent_tools::builtin::BashTool::new(
+        state.bash_shells.clone(),
+        kkagent_tools::builtin::BashOptions {
+            auto_background_on_timeout: true,
+        },
+    )));
+    tools.register(Arc::new(kkagent_tools::builtin::SkillTool::new(
+        state.skills.clone(),
+    )));
+    tools.register(Arc::new(kkagent_tools::builtin::WebSearchTool::new(
+        state.web.clone(),
+    )));
+    tools.register(Arc::new(kkagent_tools::builtin::FetchUrlTool::new(
+        state.web.clone(),
+    )));
+
+    let permission_rules = state
+        .config
+        .permission
+        .as_ref()
+        .map(|p| p.rules.clone())
+        .unwrap_or_default();
+    let permission = Arc::new(Mutex::new(PermissionChain::new(
+        session.permission_mode,
+        permission_rules,
+    )));
+    let agent = AgentLoop::new(
+        state.config.clone(),
+        Arc::new(tools),
+        permission,
+        event_tx,
+        state.abort_registry.clone(),
+    )
+    .with_hooks(state.hooks.clone())
+    .with_goal_manager(state.goal_mgr.clone());
+
+    let result = agent.run_turn(&mut session).await;
+    {
+        let db = state.transcript.lock().await;
+        persist_session_messages(&db, &mut session);
+    }
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session_id.to_string(), session);
+    result
 }
 
 struct ServerState {
@@ -284,10 +611,7 @@ fn mcp_manager_from_config(config: &AppConfig) -> McpManager {
     McpManager::new(configs)
 }
 
-async fn run_server_handler<T: kkagent_rpc::transport::AsyncTransport>(
-    transport: T,
-    config: Arc<AppConfig>,
-) {
+async fn build_server_state(config: Arc<AppConfig>) -> Arc<ServerState> {
     let transcript = match TranscriptDb::open_default() {
         Ok(db) => db,
         Err(e) => {
@@ -296,7 +620,6 @@ async fn run_server_handler<T: kkagent_rpc::transport::AsyncTransport>(
                 Ok(db) => db,
                 Err(e2) => {
                     tracing::error!("Failed to open in-memory transcript: {}", e2);
-                    // Last resort: still try file path under temp
                     let tmp = std::env::temp_dir().join("kkagent-transcripts.db");
                     TranscriptDb::open(&tmp).unwrap_or_else(|e3| {
                         panic!("Cannot open transcript DB (file={}, mem={}, tmp={})", e, e2, e3);
@@ -332,7 +655,6 @@ async fn run_server_handler<T: kkagent_rpc::transport::AsyncTransport>(
     let web = Arc::new(kkagent_tools::WebServicesConfig::from_app(&config));
 
     let cron_fires: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-    // Background cron poller — enqueue cron-fire XML for session injection.
     {
         let cron_bg = cron.clone();
         let fires = cron_fires.clone();
@@ -351,9 +673,7 @@ async fn run_server_handler<T: kkagent_rpc::transport::AsyncTransport>(
                         prompt.chars().take(80).collect::<String>()
                     );
                     fires.lock().await.push(xml);
-                    let _ = hooks_cron
-                        .fire_notification(&format!("cron:{id}"))
-                        .await;
+                    let _ = hooks_cron.fire_notification(&format!("cron:{id}")).await;
                 }
             }
         });
@@ -364,7 +684,6 @@ async fn run_server_handler<T: kkagent_rpc::transport::AsyncTransport>(
         kkagent_core::PluginManager::discover(&dir).await
     };
 
-    // DI root + telemetry (console/file/cloud appenders)
     let di_root = ServiceContainer::new("kkagent-root");
     let telemetry = TelemetryService::new();
     telemetry.add_appender(Arc::new(ConsoleAppender)).await;
@@ -397,7 +716,7 @@ async fn run_server_handler<T: kkagent_rpc::transport::AsyncTransport>(
         )
         .await;
 
-    let state = Arc::new(ServerState {
+    Arc::new(ServerState {
         config: config.clone(),
         sessions: Mutex::new(HashMap::new()),
         approval_txs: Mutex::new(HashMap::new()),
@@ -417,15 +736,26 @@ async fn run_server_handler<T: kkagent_rpc::transport::AsyncTransport>(
         web,
         plugins,
         telemetry: telemetry.clone(),
-    });
+    })
+}
 
+async fn run_server_handler<T: kkagent_rpc::transport::AsyncTransport>(
+    transport: T,
+    config: Arc<AppConfig>,
+) {
+    let state = build_server_state(config).await;
+    run_server_handler_with_state(transport, state).await;
+}
+
+async fn run_server_handler_with_state<T: kkagent_rpc::transport::AsyncTransport>(
+    transport: T,
+    state: Arc<ServerState>,
+) {
     let handler: kkagent_rpc::server::RequestHandler = {
         let state = state.clone();
         Arc::new(move |_id, method, params, event_tx| {
             let state = state.clone();
-            Box::pin(async move {
-                handle_rpc_call(state, &method, params, event_tx).await
-            })
+            Box::pin(async move { handle_rpc_call(state, &method, params, event_tx).await })
         })
     };
 

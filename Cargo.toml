@@ -15,6 +15,8 @@ members = [
     "crates/kkagent-wire",
     "crates/kkagent-telemetry",
     "crates/kkagent-acp",
+    "crates/kkagent-oauth",
+    "crates/kkagent-kaos",
 ]
 
 [workspace.package]
@@ -103,3 +105,5 @@ kkagent-di = { path = "crates/kkagent-di" }
 kkagent-wire = { path = "crates/kkagent-wire" }
 kkagent-telemetry = { path = "crates/kkagent-telemetry" }
 kkagent-acp = { path = "crates/kkagent-acp" }
+kkagent-oauth = { path = "crates/kkagent-oauth" }
+kkagent-kaos = { path = "crates/kkagent-kaos" }

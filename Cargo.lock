@@ -1293,6 +1293,7 @@ name = "kkagent"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "chrono",
  "clap",
  "dirs",
@@ -1301,8 +1302,10 @@ dependencies = [
  "kkagent-config",
  "kkagent-core",
  "kkagent-di",
+ "kkagent-kaos",
  "kkagent-llm",
  "kkagent-mcp",
+ "kkagent-oauth",
  "kkagent-protocol",
  "kkagent-rpc",
  "kkagent-telemetry",
@@ -1391,6 +1394,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "kkagent-kaos"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "kkagent-llm"
 version = "0.1.0"
 dependencies = [
@@ -1438,6 +1454,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "kkagent-oauth"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "chrono",
+ "dirs",
+ "rand 0.8.7",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+ "url",
+ "uuid",
+]
+
+[[package]]
 name = "kkagent-protocol"
 version = "0.1.0"
 dependencies = [
@@ -1455,9 +1491,11 @@ name = "kkagent-rpc"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "bytes",
  "chrono",
+ "dirs",
  "futures",
  "kkagent-protocol",
  "pin-project-lite",
@@ -1517,6 +1555,7 @@ name = "kkagent-tui"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "crossterm",
  "dirs",
  "futures",

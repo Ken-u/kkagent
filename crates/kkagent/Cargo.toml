@@ -21,6 +21,9 @@ kkagent-di = { workspace = true }
 kkagent-wire = { workspace = true }
 kkagent-telemetry = { workspace = true }
 kkagent-acp = { workspace = true }
+kkagent-oauth = { workspace = true }
+kkagent-kaos = { workspace = true }
+async-trait = { workspace = true }
 tokio = { workspace = true }
 dirs = { workspace = true }
 chrono = { workspace = true }

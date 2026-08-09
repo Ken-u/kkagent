@@ -8,6 +8,7 @@ pub mod word_navigation;
 pub mod keybindings;
 pub mod terminal_colors;
 pub mod autocomplete;
+pub mod terminal_image;
 
 pub use fuzzy::{fuzzy_filter, fuzzy_match, FuzzyMatch};
 pub use kill_ring::KillRing;

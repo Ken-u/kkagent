@@ -1,0 +1,43 @@
+{
+  "name": "kkagent",
+  "displayName": "kkagent",
+  "description": "kkagent IDE bridge (ACP) — minimal VS Code extension",
+  "version": "0.1.0",
+  "publisher": "kkagent",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": ["AI", "Other"],
+  "activationEvents": [
+    "onCommand:kkagent.start",
+    "onCommand:kkagent.prompt"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "kkagent.start",
+        "title": "kkagent: Start ACP bridge"
+      },
+      {
+        "command": "kkagent.prompt",
+        "title": "kkagent: Send prompt"
+      }
+    ],
+    "configuration": {
+      "title": "kkagent",
+      "properties": {
+        "kkagent.binary": {
+          "type": "string",
+          "default": "kkagent",
+          "description": "Path to kkagent binary"
+        },
+        "kkagent.httpUrl": {
+          "type": "string",
+          "default": "http://127.0.0.1:8787",
+          "description": "kkagent HTTP API base URL"
+        }
+      }
+    }
+  }
+}

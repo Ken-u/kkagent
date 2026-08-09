@@ -61,10 +61,20 @@ pub struct OpenAiProvider {
     client: reqwest::Client,
     base_url: String,
     api_key: String,
+    /// Force Responses API (`/v1/responses`) instead of chat completions.
+    responses: bool,
 }
 
 impl OpenAiProvider {
     pub fn new(config: &ProviderConfig) -> Self {
+        Self::with_responses(config, false)
+    }
+
+    pub fn responses(config: &ProviderConfig) -> Self {
+        Self::with_responses(config, true)
+    }
+
+    fn with_responses(config: &ProviderConfig, responses: bool) -> Self {
         let base_url = config
             .base_url
             .as_deref()
@@ -75,6 +85,7 @@ impl OpenAiProvider {
             client: build_client(),
             base_url,
             api_key: config.api_key.clone().unwrap_or_default(),
+            responses,
         }
     }
 }
@@ -86,13 +97,23 @@ impl LlmProvider for OpenAiProvider {
         request: LlmRequest,
         event_tx: mpsc::Sender<StreamEvent>,
     ) -> anyhow::Result<()> {
+        let use_responses =
+            self.responses || crate::catalog::prefers_responses_api(&request.model);
         with_retries(3, || {
             let client = self.client.clone();
             let base = self.base_url.clone();
             let key = self.api_key.clone();
             let req = request.clone();
             let tx = event_tx.clone();
-            async move { crate::stream::openai_stream(&client, &base, &key, req, tx).await }
+            let responses = use_responses;
+            async move {
+                if responses {
+                    crate::openai_responses::openai_responses_stream(&client, &base, &key, req, tx)
+                        .await
+                } else {
+                    crate::stream::openai_stream(&client, &base, &key, req, tx).await
+                }
+            }
         })
         .await
     }
@@ -187,14 +208,23 @@ where
 
 pub fn create_provider(
     provider_config: &ProviderConfig,
-    _model_config: &ModelConfig,
+    model_config: &ModelConfig,
 ) -> Box<dyn LlmProvider> {
     match provider_config.provider_type.as_str() {
-        "openai" | "openai-responses" | "openai-legacy" => {
-            Box::new(OpenAiProvider::new(provider_config))
+        "openai-responses" | "responses" => {
+            Box::new(OpenAiProvider::responses(provider_config))
+        }
+        "openai-legacy" | "openai-chat" => Box::new(OpenAiProvider::new(provider_config)),
+        "openai" => {
+            // Auto-select Responses for reasoning / GPT-4.1+ models.
+            if crate::catalog::prefers_responses_api(&model_config.model) {
+                Box::new(OpenAiProvider::responses(provider_config))
+            } else {
+                Box::new(OpenAiProvider::new(provider_config))
+            }
         }
         "google" | "google-genai" | "gemini" => Box::new(GoogleProvider::new(provider_config)),
-        // Kimi intentionally stays on Anthropic-compatible Messages for now (user request).
+        // Kimi intentionally stays on Anthropic-compatible Messages (user request).
         "anthropic" | "kimi" | _ => Box::new(AnthropicProvider::new(provider_config)),
     }
 }

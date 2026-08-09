@@ -3,12 +3,14 @@ pub mod builtin;
 pub mod path_policy;
 pub mod accesses;
 pub mod shell_safety;
+pub mod bash_ast;
 pub mod args_validator;
 pub mod display;
 pub mod git_worktree;
 
 pub use accesses::{infer_accesses, tool_accesses, ToolAccesses, ToolResourceAccess};
 pub use display::{builtin_display_schemas, render_chip, SummaryMode, ToolDisplaySchema};
+pub use bash_ast::{collect_commands, parse as parse_bash, pipes_into_shell};
 pub use shell_safety::{analyze_shell_command, ShellRisk};
 
 pub use registry::*;
