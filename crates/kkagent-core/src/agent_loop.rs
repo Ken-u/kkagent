@@ -335,6 +335,7 @@ Do not mention this reminder to the user.\n</system-reminder>"
                                         id,
                                         name,
                                         input: serde_json::Value::Null,
+                                        input_error: None,
                                     },
                                     String::new(),
                                 ),
@@ -349,8 +350,7 @@ Do not mention this reminder to the user.\n</system-reminder>"
                         }
                         StreamEvent::ToolUseEnd { id } => {
                             if let Some((mut tool, input)) = active_tools.remove(&id) {
-                                tool.input = serde_json::from_str(&input)
-                                    .unwrap_or(serde_json::Value::String(input));
+                                (tool.input, tool.input_error) = parse_tool_arguments(&input);
                                 tracing::info!(
                                     "Tool use collected: {} -> {}",
                                     tool.name,
@@ -367,8 +367,7 @@ Do not mention this reminder to the user.\n</system-reminder>"
                         }
                         StreamEvent::MessageEnd { usage } => {
                             for (_, (mut tool, input)) in active_tools.drain() {
-                                tool.input = serde_json::from_str(&input)
-                                    .unwrap_or(serde_json::Value::String(input));
+                                (tool.input, tool.input_error) = parse_tool_arguments(&input);
                                 tool_calls.push(tool);
                             }
                             got_message_end = true;
@@ -581,6 +580,18 @@ Do not mention this reminder to the user.\n</system-reminder>"
                         input: tc.input.clone(),
                     })
                     .await;
+
+                if let Some(error) = &tc.input_error {
+                    prepared.push((
+                        tc.id.clone(),
+                        tc.name.clone(),
+                        Prepared::Done(ToolOutput::error(format!(
+                            "Invalid arguments for tool `{}`: {error}",
+                            tc.name
+                        ))),
+                    ));
+                    continue;
+                }
 
                 if dedupe.skip_indices.contains(&idx) {
                     prepared.push((
@@ -1239,6 +1250,21 @@ struct PendingToolCall {
     id: String,
     name: String,
     input: serde_json::Value,
+    input_error: Option<String>,
+}
+
+fn parse_tool_arguments(input: &str) -> (serde_json::Value, Option<String>) {
+    if input.trim().is_empty() {
+        return (serde_json::json!({}), None);
+    }
+    match serde_json::from_str::<serde_json::Value>(input) {
+        Ok(value) if value.is_object() => (value, None),
+        Ok(_) => (
+            serde_json::Value::Null,
+            Some("expected a JSON object".to_string()),
+        ),
+        Err(error) => (serde_json::Value::Null, Some(error.to_string())),
+    }
 }
 
 async fn read_plan_file_if_matched(session: &Session, input: &serde_json::Value) -> Option<String> {
@@ -1396,18 +1422,74 @@ fn truncate_tool_output(session: &Session, tool_name: &str, mut output: ToolOutp
     if output.content.len() <= TOOL_RESULT_INLINE_MAX {
         return output;
     }
-    let dir = session.working_dir.join(".kkagent").join("tool-results");
-    let _ = std::fs::create_dir_all(&dir);
-    let id = uuid::Uuid::new_v4().to_string();
-    let path = dir.join(format!("{}.txt", id));
-    let _ = std::fs::write(&path, &output.content);
+    let full_len = output.content.chars().count();
     let preview: String = output.content.chars().take(4000).collect();
-    output.content = format!(
-        "{preview}\n\n… tool result truncated ({tool_name}, {} chars). Full output saved to {} — use Read on that path if needed.",
-        output.content.len(),
-        path.display()
-    );
+    output.content = match persist_tool_output(&session.working_dir, &output.content) {
+        Ok(path) => format!(
+            "{preview}\n\n… tool result truncated ({tool_name}, {full_len} chars). Full output saved to {} — use Read on that path if needed.",
+            path.display()
+        ),
+        Err(error) => format!(
+            "{preview}\n\n… tool result truncated ({tool_name}, {full_len} chars). The full output could not be saved: {error}"
+        ),
+    };
     output
+}
+
+fn persist_tool_output(
+    working_dir: &std::path::Path,
+    content: &str,
+) -> Result<std::path::PathBuf, String> {
+    let root = std::fs::canonicalize(working_dir)
+        .map_err(|error| format!("workspace is unavailable ({error})"))?;
+    let app_dir = root.join(".kkagent");
+    reject_symlink(&app_dir)?;
+    std::fs::create_dir_all(&app_dir)
+        .map_err(|error| format!("cannot create .kkagent directory ({error})"))?;
+    let dir = app_dir.join("tool-results");
+    reject_symlink(&dir)?;
+    std::fs::create_dir_all(&dir)
+        .map_err(|error| format!("cannot create tool-results directory ({error})"))?;
+
+    let canonical_dir = std::fs::canonicalize(&dir)
+        .map_err(|error| format!("cannot resolve tool-results directory ({error})"))?;
+    if !canonical_dir.starts_with(&root) {
+        return Err("tool-results directory escapes the workspace".into());
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&app_dir, std::fs::Permissions::from_mode(0o700));
+        let _ = std::fs::set_permissions(&canonical_dir, std::fs::Permissions::from_mode(0o700));
+    }
+
+    let path = canonical_dir.join(format!("{}.txt", uuid::Uuid::new_v4()));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&path)
+        .map_err(|error| format!("cannot create result file ({error})"))?;
+    std::io::Write::write_all(&mut file, content.as_bytes())
+        .map_err(|error| format!("cannot write result file ({error})"))?;
+    Ok(path)
+}
+
+fn reject_symlink(path: &std::path::Path) -> Result<(), String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(format!(
+            "refusing symlinked output directory {}",
+            path.display()
+        )),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("cannot inspect {} ({error})", path.display())),
+    }
 }
 
 fn session_has_goal_reminder(session: &Session) -> bool {
@@ -1482,6 +1564,45 @@ mod retry_tests {
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
     };
+
+    #[test]
+    fn tool_arguments_must_be_json_objects() {
+        assert_eq!(parse_tool_arguments("").0, serde_json::json!({}));
+        assert_eq!(
+            parse_tool_arguments("{\"path\":\"a.rs\"}").0,
+            serde_json::json!({"path": "a.rs"})
+        );
+        assert!(parse_tool_arguments("[1,2]").1.is_some());
+        assert!(parse_tool_arguments("{broken").1.is_some());
+    }
+
+    #[test]
+    fn persists_large_tool_results_inside_workspace() {
+        let workspace =
+            std::env::temp_dir().join(format!("kkagent-output-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let path = persist_tool_output(&workspace, "full output").unwrap();
+        assert!(path.starts_with(std::fs::canonicalize(&workspace).unwrap()));
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "full output");
+        std::fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refuses_symlinked_tool_result_directory() {
+        use std::os::unix::fs::symlink;
+        let base =
+            std::env::temp_dir().join(format!("kkagent-output-link-{}", uuid::Uuid::new_v4()));
+        let workspace = base.join("workspace");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, workspace.join(".kkagent")).unwrap();
+        let error = persist_tool_output(&workspace, "must not escape").unwrap_err();
+        assert!(error.contains("symlinked"));
+        assert!(std::fs::read_dir(&outside).unwrap().next().is_none());
+        std::fs::remove_dir_all(base).unwrap();
+    }
 
     #[tokio::test]
     async fn retries_transient_empty_failures_without_publishing_early_error() {

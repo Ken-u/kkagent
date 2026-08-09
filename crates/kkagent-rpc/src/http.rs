@@ -15,6 +15,10 @@ use tokio::io::AsyncReadExt;
 use tokio::process::Child;
 use tokio::sync::{broadcast, Mutex};
 
+const MAX_HTTP_TERMINALS: usize = 64;
+const MAX_TERMINAL_COMMAND_BYTES: usize = 64 * 1024;
+const MAX_TERMINAL_OUTPUT_BYTES: usize = 1024 * 1024;
+
 /// Pluggable backend so HTTP can bind to the live AgentLoop/ServerState.
 #[async_trait::async_trait]
 pub trait HttpBackend: Send + Sync {
@@ -587,6 +591,10 @@ async fn terminals_create(
     Json(body): Json<TerminalCreate>,
 ) -> Result<Json<Value>, StatusCode> {
     check_auth(&state, &q)?;
+    let mut terminals = state.terminals.lock().await;
+    if terminals.len() >= MAX_HTTP_TERMINALS {
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
     let id = uuid::Uuid::new_v4().to_string();
     let command_text = body.command.unwrap_or_else(|| {
         if cfg!(windows) {
@@ -595,6 +603,9 @@ async fn terminals_create(
             "printf kkagent-terminal".into()
         }
     });
+    if command_text.len() > MAX_TERMINAL_COMMAND_BYTES {
+        return Err(StatusCode::PAYLOAD_TOO_LARGE);
+    }
     let cwd = body.cwd.unwrap_or_else(|| ".".into());
     let mut command = if cfg!(windows) {
         let mut command = tokio::process::Command::new("cmd");
@@ -617,17 +628,13 @@ async fn terminals_create(
     if let Some(mut pipe) = child.stdout.take() {
         let output = stdout.clone();
         tokio::spawn(async move {
-            let mut bytes = Vec::new();
-            let _ = pipe.read_to_end(&mut bytes).await;
-            *output.lock().await = bytes;
+            *output.lock().await = read_bounded_output(&mut pipe).await;
         });
     }
     if let Some(mut pipe) = child.stderr.take() {
         let output = stderr.clone();
         tokio::spawn(async move {
-            let mut bytes = Vec::new();
-            let _ = pipe.read_to_end(&mut bytes).await;
-            *output.lock().await = bytes;
+            *output.lock().await = read_bounded_output(&mut pipe).await;
         });
     }
     let terminal = json!({
@@ -636,7 +643,7 @@ async fn terminals_create(
         "cwd": cwd,
         "status": "running",
     });
-    state.terminals.lock().await.insert(
+    terminals.insert(
         id,
         HttpTerminalSlot {
             info: terminal.clone(),
@@ -646,6 +653,29 @@ async fn terminals_create(
         },
     );
     Ok(Json(terminal))
+}
+
+async fn read_bounded_output(reader: &mut (impl tokio::io::AsyncRead + Unpin)) -> Vec<u8> {
+    let mut output = Vec::new();
+    let mut buffer = [0_u8; 8192];
+    let mut truncated = false;
+    loop {
+        let count = match reader.read(&mut buffer).await {
+            Ok(0) | Err(_) => break,
+            Ok(count) => count,
+        };
+        if output.len() < MAX_TERMINAL_OUTPUT_BYTES {
+            let remaining = MAX_TERMINAL_OUTPUT_BYTES - output.len();
+            output.extend_from_slice(&buffer[..count.min(remaining)]);
+            truncated |= count > remaining;
+        } else {
+            truncated = true;
+        }
+    }
+    if truncated {
+        output.extend_from_slice(b"\n... terminal output truncated ...\n");
+    }
+    output
 }
 
 async fn terminal_get(
@@ -939,5 +969,22 @@ mod security_tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         panic!("terminal did not exit with captured output");
+    }
+
+    #[tokio::test]
+    async fn terminal_output_is_bounded_while_the_pipe_is_drained() {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut writer, mut reader) = tokio::io::duplex(16 * 1024);
+        let write = tokio::spawn(async move {
+            let chunk = vec![b'x'; 8192];
+            for _ in 0..((MAX_TERMINAL_OUTPUT_BYTES / chunk.len()) + 8) {
+                writer.write_all(&chunk).await.unwrap();
+            }
+        });
+        let output = read_bounded_output(&mut reader).await;
+        write.await.unwrap();
+        assert!(output.len() <= MAX_TERMINAL_OUTPUT_BYTES + 40);
+        assert!(output.ends_with(b"... terminal output truncated ...\n"));
     }
 }

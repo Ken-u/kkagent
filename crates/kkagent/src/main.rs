@@ -1734,18 +1734,35 @@ async fn summarize_with_llm(config: Arc<AppConfig>, digest: &str) -> Option<Stri
         system: Some("You compress conversation history into a concise factual summary.".into()),
         thinking: None,
     };
-    tokio::spawn(async move {
-        let _ = provider.stream_chat(request, tx).await;
+    let handle = tokio::spawn(async move {
+        if let Err(error) = provider.stream_chat(request, tx.clone()).await {
+            let _ = tx.send(StreamEvent::Error(error.to_string())).await;
+        }
     });
     let mut out = String::new();
-    while let Some(ev) = rx.recv().await {
-        match ev {
-            StreamEvent::TextDelta(t) => out.push_str(&t),
-            StreamEvent::MessageEnd { .. } | StreamEvent::Error(_) => break,
-            _ => {}
+    let mut complete = false;
+    let collected = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        while let Some(ev) = rx.recv().await {
+            match ev {
+                StreamEvent::TextDelta(t) => out.push_str(&t),
+                StreamEvent::MessageEnd { .. } => {
+                    complete = true;
+                    break;
+                }
+                StreamEvent::Error(error) => {
+                    tracing::warn!("compaction summary stream failed: {error}");
+                    break;
+                }
+                _ => {}
+            }
         }
+    })
+    .await;
+    if collected.is_err() {
+        tracing::warn!("compaction summary timed out");
     }
-    if out.trim().is_empty() {
+    handle.abort();
+    if !complete || out.trim().is_empty() {
         None
     } else {
         Some(out)
