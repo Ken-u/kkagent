@@ -102,6 +102,7 @@ mod tests {
             working_dir: dir.clone(),
             session_id: "write-test".into(),
             tool_call_id: None,
+            interrupted: None,
         };
         let output = WriteTool
             .execute(

@@ -163,6 +163,7 @@ mod tests {
                     working_dir: dir.clone(),
                     session_id: "glob-test".into(),
                     tool_call_id: None,
+                    interrupted: None,
                 },
             )
             .await

@@ -39,6 +39,8 @@ pub struct ToolContext {
     pub session_id: String,
     /// Current tool_use id when available (for subagent mirroring).
     pub tool_call_id: Option<String>,
+    /// Cooperative cancellation flag owned by the active session.
+    pub interrupted: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 #[derive(Debug, Clone)]

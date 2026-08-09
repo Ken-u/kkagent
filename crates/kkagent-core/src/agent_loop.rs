@@ -725,6 +725,7 @@ Do not mention this reminder to the user.\n</system-reminder>"
                     let name = name.clone();
                     let input = input.clone();
                     let tool_call_id = tool_call_id.clone();
+                    let interrupted = session.interrupted.clone();
                     tasks.push(ToolCallTask {
                         accesses,
                         start: box_start(move || {
@@ -746,6 +747,7 @@ Do not mention this reminder to the user.\n</system-reminder>"
                                     name,
                                     input,
                                     tool_call_id: Some(tool_call_id),
+                                    interrupted,
                                 })
                                 .await
                             }
@@ -1129,6 +1131,7 @@ Do not mention this reminder to the user.\n</system-reminder>"
             name: name.to_string(),
             input: input.clone(),
             tool_call_id: None,
+            interrupted: session.interrupted.clone(),
         })
         .await
     }
@@ -1323,6 +1326,7 @@ struct ParallelToolRequest {
     name: String,
     input: serde_json::Value,
     tool_call_id: Option<String>,
+    interrupted: Arc<std::sync::atomic::AtomicBool>,
 }
 
 async fn execute_tool_parallel(request: ParallelToolRequest) -> ToolOutput {
@@ -1335,6 +1339,7 @@ async fn execute_tool_parallel(request: ParallelToolRequest) -> ToolOutput {
         name,
         input,
         tool_call_id,
+        interrupted,
     } = request;
     if !tool_allowed_set(enabled_tools.as_ref(), &name) {
         return ToolOutput::error(format!(
@@ -1378,6 +1383,7 @@ async fn execute_tool_parallel(request: ParallelToolRequest) -> ToolOutput {
         working_dir,
         session_id,
         tool_call_id,
+        interrupted: Some(interrupted),
     };
 
     match tool.execute(input, &ctx).await {

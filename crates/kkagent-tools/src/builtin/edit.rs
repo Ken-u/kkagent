@@ -138,6 +138,7 @@ mod tests {
             working_dir: dir.clone(),
             session_id: "edit-test".into(),
             tool_call_id: None,
+            interrupted: None,
         };
         let output = EditTool
             .execute(

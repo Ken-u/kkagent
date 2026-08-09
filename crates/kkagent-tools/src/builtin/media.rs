@@ -266,6 +266,7 @@ mod tests {
             working_dir: dir.to_path_buf(),
             session_id: "media-test".into(),
             tool_call_id: None,
+            interrupted: None,
         }
     }
 
