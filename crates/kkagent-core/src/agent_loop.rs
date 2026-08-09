@@ -292,8 +292,7 @@ Do not mention this reminder to the user.\n</system-reminder>"
                 .await
                 .insert(session_id.clone(), handle.abort_handle());
 
-            let mut current_tool: Option<PendingToolCall> = None;
-            let mut tool_input_buf = String::new();
+            let mut active_tools: HashMap<String, (PendingToolCall, String)> = HashMap::new();
             let mut got_message_end = false;
 
             loop {
@@ -329,20 +328,29 @@ Do not mention this reminder to the user.\n</system-reminder>"
                         }
                         StreamEvent::ToolUseStart { id, name } => {
                             tracing::info!("Tool use start: {} ({})", name, id);
-                            tool_input_buf.clear();
-                            current_tool = Some(PendingToolCall {
-                                id,
-                                name,
-                                input: serde_json::Value::Null,
-                            });
+                            active_tools.insert(
+                                id.clone(),
+                                (
+                                    PendingToolCall {
+                                        id,
+                                        name,
+                                        input: serde_json::Value::Null,
+                                    },
+                                    String::new(),
+                                ),
+                            );
                         }
-                        StreamEvent::ToolUseInputDelta(json_chunk) => {
-                            tool_input_buf.push_str(&json_chunk);
+                        StreamEvent::ToolUseInputDelta { id, delta } => {
+                            if let Some((_, input)) = active_tools.get_mut(&id) {
+                                input.push_str(&delta);
+                            } else {
+                                tracing::warn!("tool input delta for unknown call {id}");
+                            }
                         }
-                        StreamEvent::ToolUseEnd => {
-                            if let Some(mut tool) = current_tool.take() {
-                                tool.input = serde_json::from_str(&tool_input_buf)
-                                    .unwrap_or(serde_json::Value::String(tool_input_buf.clone()));
+                        StreamEvent::ToolUseEnd { id } => {
+                            if let Some((mut tool, input)) = active_tools.remove(&id) {
+                                tool.input = serde_json::from_str(&input)
+                                    .unwrap_or(serde_json::Value::String(input));
                                 tracing::info!(
                                     "Tool use collected: {} -> {}",
                                     tool.name,
@@ -353,10 +361,16 @@ Do not mention this reminder to the user.\n</system-reminder>"
                                         .collect::<String>()
                                 );
                                 tool_calls.push(tool);
+                            } else {
+                                tracing::warn!("tool end for unknown call {id}");
                             }
-                            tool_input_buf.clear();
                         }
                         StreamEvent::MessageEnd { usage } => {
+                            for (_, (mut tool, input)) in active_tools.drain() {
+                                tool.input = serde_json::from_str(&input)
+                                    .unwrap_or(serde_json::Value::String(input));
+                                tool_calls.push(tool);
+                            }
                             got_message_end = true;
                             tracing::debug!(
                                 "Message end: in={} out={}",

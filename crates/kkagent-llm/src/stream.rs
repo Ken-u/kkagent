@@ -102,6 +102,7 @@ pub async fn anthropic_stream(
     let mut stream = resp.bytes_stream();
     let mut buffer = String::new();
     let mut chunk_count = 0u64;
+    let mut tool_blocks = std::collections::HashMap::<u64, String>::new();
 
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
@@ -124,7 +125,7 @@ pub async fn anthropic_stream(
                     return Ok(());
                 }
                 if let Ok(event) = serde_json::from_str::<serde_json::Value>(data) {
-                    if let Some(evt) = parse_sse_event(&event) {
+                    if let Some(evt) = parse_sse_event(&event, &mut tool_blocks) {
                         if event_tx.send(evt).await.is_err() {
                             return Ok(());
                         }
@@ -137,7 +138,10 @@ pub async fn anthropic_stream(
     Ok(())
 }
 
-fn parse_sse_event(event: &serde_json::Value) -> Option<StreamEvent> {
+fn parse_sse_event(
+    event: &serde_json::Value,
+    tool_blocks: &mut std::collections::HashMap<u64, String>,
+) -> Option<StreamEvent> {
     let event_type = event.get("type")?.as_str()?;
     match event_type {
         "content_block_start" => {
@@ -147,6 +151,11 @@ fn parse_sse_event(event: &serde_json::Value) -> Option<StreamEvent> {
                 "tool_use" => {
                     let id = block.get("id")?.as_str()?.to_string();
                     let name = block.get("name")?.as_str()?.to_string();
+                    let index = event
+                        .get("index")
+                        .and_then(|value| value.as_u64())
+                        .unwrap_or(0);
+                    tool_blocks.insert(index, id.clone());
                     Some(StreamEvent::ToolUseStart { id, name })
                 }
                 _ => None,
@@ -165,13 +174,26 @@ fn parse_sse_event(event: &serde_json::Value) -> Option<StreamEvent> {
                     Some(StreamEvent::ThinkingDelta(text))
                 }
                 "input_json_delta" => {
-                    let text = delta.get("partial_json")?.as_str()?.to_string();
-                    Some(StreamEvent::ToolUseInputDelta(text))
+                    let delta = delta.get("partial_json")?.as_str()?.to_string();
+                    let index = event
+                        .get("index")
+                        .and_then(|value| value.as_u64())
+                        .unwrap_or(0);
+                    let id = tool_blocks.get(&index)?.clone();
+                    Some(StreamEvent::ToolUseInputDelta { id, delta })
                 }
                 _ => None,
             }
         }
-        "content_block_stop" => Some(StreamEvent::ToolUseEnd),
+        "content_block_stop" => {
+            let index = event
+                .get("index")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(0);
+            tool_blocks
+                .remove(&index)
+                .map(|id| StreamEvent::ToolUseEnd { id })
+        }
         "message_delta" => {
             let usage = event.get("usage");
             let token_usage = if let Some(u) = usage {
@@ -451,16 +473,27 @@ async fn chat_completions_stream(
                             .and_then(|v| v.as_str())
                         {
                             if !args.is_empty() {
-                                let _ = event_tx
-                                    .send(StreamEvent::ToolUseInputDelta(args.to_string()))
-                                    .await;
+                                if let Some((id, _)) = tool_ids.get(&idx) {
+                                    let _ = event_tx
+                                        .send(StreamEvent::ToolUseInputDelta {
+                                            id: id.clone(),
+                                            delta: args.to_string(),
+                                        })
+                                        .await;
+                                }
                             }
                         }
                     }
                 }
             }
             if choice.get("finish_reason").and_then(|v| v.as_str()) == Some("tool_calls") {
-                let _ = event_tx.send(StreamEvent::ToolUseEnd).await;
+                for index in started.drain() {
+                    if let Some((id, _)) = tool_ids.get(&index) {
+                        let _ = event_tx
+                            .send(StreamEvent::ToolUseEnd { id: id.clone() })
+                            .await;
+                    }
+                }
             }
         }
     }
@@ -608,9 +641,12 @@ pub async fn google_stream(
                         })
                         .await;
                     let _ = event_tx
-                        .send(StreamEvent::ToolUseInputDelta(args.to_string()))
+                        .send(StreamEvent::ToolUseInputDelta {
+                            id: id.clone(),
+                            delta: args.to_string(),
+                        })
                         .await;
-                    let _ = event_tx.send(StreamEvent::ToolUseEnd).await;
+                    let _ = event_tx.send(StreamEvent::ToolUseEnd { id }).await;
                 }
             }
         }
@@ -863,5 +899,38 @@ mod tests {
         assert!(body.get("max_tokens").is_none());
         assert_eq!(body["thinking"]["type"], "enabled");
         assert_eq!(body["stream_options"]["include_usage"], true);
+    }
+
+    #[tokio::test]
+    async fn openai_preserves_ids_for_interleaved_parallel_tool_arguments() {
+        let sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"a\",\"function\":{\"name\":\"One\",\"arguments\":\"{\\\"x\\\":\"}},{\"index\":1,\"id\":\"b\",\"function\":{\"name\":\"Two\",\"arguments\":\"{\\\"y\\\":\"}}]}}]}\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":1,\"function\":{\"arguments\":\"2}\"}},{\"index\":0,\"function\":{\"arguments\":\"1}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n",
+            "data: [DONE]\n"
+        );
+        let (base_url, _captured) = serve_once("200 OK", "text/event-stream", sse).await;
+        let (tx, mut rx) = mpsc::channel(16);
+        openai_stream(&Client::new(), &base_url, "token", request(), tx)
+            .await
+            .unwrap();
+        let mut arguments = std::collections::HashMap::<String, String>::new();
+        let mut ended = std::collections::HashSet::new();
+        while let Some(event) = rx.recv().await {
+            match event {
+                StreamEvent::ToolUseInputDelta { id, delta } => {
+                    arguments.entry(id).or_default().push_str(&delta);
+                }
+                StreamEvent::ToolUseEnd { id } => {
+                    ended.insert(id);
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(arguments.get("a").map(String::as_str), Some("{\"x\":1}"));
+        assert_eq!(arguments.get("b").map(String::as_str), Some("{\"y\":2}"));
+        assert_eq!(
+            ended,
+            std::collections::HashSet::from(["a".into(), "b".into()])
+        );
     }
 }

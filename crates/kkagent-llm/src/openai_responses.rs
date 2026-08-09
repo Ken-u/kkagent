@@ -184,9 +184,14 @@ pub async fn openai_responses_stream(
                 "response.function_call_arguments.delta" => {
                     if let Some(delta) = event.get("delta").and_then(|v| v.as_str()) {
                         arg_buf.push_str(delta);
-                        let _ = event_tx
-                            .send(StreamEvent::ToolUseInputDelta(delta.to_string()))
-                            .await;
+                        if let Some((id, _)) = &active_call {
+                            let _ = event_tx
+                                .send(StreamEvent::ToolUseInputDelta {
+                                    id: id.clone(),
+                                    delta: delta.to_string(),
+                                })
+                                .await;
+                        }
                     }
                 }
                 "response.output_item.added" => {
@@ -219,9 +224,14 @@ pub async fn openai_responses_stream(
                         if item.get("type").and_then(|v| v.as_str()) == Some("function_call") {
                             if let Some(args) = item.get("arguments").and_then(|v| v.as_str()) {
                                 if arg_buf.is_empty() && !args.is_empty() {
-                                    let _ = event_tx
-                                        .send(StreamEvent::ToolUseInputDelta(args.to_string()))
-                                        .await;
+                                    if let Some((id, _)) = &active_call {
+                                        let _ = event_tx
+                                            .send(StreamEvent::ToolUseInputDelta {
+                                                id: id.clone(),
+                                                delta: args.to_string(),
+                                            })
+                                            .await;
+                                    }
                                     arg_buf = args.to_string();
                                 }
                             }
@@ -282,8 +292,8 @@ async fn flush_tool(
     active: &mut Option<(String, String)>,
     args: &mut String,
 ) {
-    if active.take().is_some() {
-        let _ = tx.send(StreamEvent::ToolUseEnd).await;
+    if let Some((id, _)) = active.take() {
+        let _ = tx.send(StreamEvent::ToolUseEnd { id }).await;
     }
     args.clear();
 }

@@ -59,8 +59,8 @@ pub enum StreamEvent {
     TextDelta(String),
     ThinkingDelta(String),
     ToolUseStart { id: String, name: String },
-    ToolUseInputDelta(String),
-    ToolUseEnd,
+    ToolUseInputDelta { id: String, delta: String },
+    ToolUseEnd { id: String },
     MessageEnd { usage: TokenUsage },
     Error(String),
 }
