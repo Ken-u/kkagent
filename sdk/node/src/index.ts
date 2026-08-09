@@ -17,6 +17,17 @@ export interface Session {
   messages?: unknown[];
 }
 
+export interface EventSubscriptionOptions {
+  since?: number;
+  sessionId?: string;
+}
+
+export interface EventHistory {
+  events: unknown[];
+  latest_event_seq: number;
+  history_capacity: number;
+}
+
 export class KkagentHttpClient {
   readonly baseUrl: string;
   readonly token?: string;
@@ -77,9 +88,28 @@ export class KkagentHttpClient {
     return res.json();
   }
 
-  connectEvents(onEvent: (ev: unknown) => void): WebSocket {
+  async eventsSince(since = 0, sessionId?: string, limit = 500): Promise<EventHistory> {
+    const query = new URLSearchParams({ since: String(since), limit: String(limit) });
+    if (sessionId) query.set("session_id", sessionId);
+    const res = await fetch(this.url(`/api/v1/events?${query}`));
+    if (!res.ok) throw new Error(`events ${res.status}`);
+    return (await res.json()) as EventHistory;
+  }
+
+  async turnStatus(sessionId: string): Promise<unknown> {
+    const res = await fetch(this.url(`/api/v1/turns/${sessionId}`));
+    if (!res.ok) throw new Error(`turnStatus ${res.status}`);
+    return res.json();
+  }
+
+  connectEvents(
+    onEvent: (ev: unknown) => void,
+    options: EventSubscriptionOptions = {},
+  ): WebSocket {
     const u = new URL("/api/v1/ws", this.baseUrl.replace(/^http/, "ws") + "/");
     if (this.token) u.searchParams.set("token", this.token);
+    if (options.since !== undefined) u.searchParams.set("since", String(options.since));
+    if (options.sessionId) u.searchParams.set("session_id", options.sessionId);
     const ws = new WebSocket(u);
     ws.addEventListener("message", (msg) => {
       try {

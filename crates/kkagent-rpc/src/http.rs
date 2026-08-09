@@ -9,8 +9,9 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 use tokio::io::AsyncReadExt;
 use tokio::process::Child;
 use tokio::sync::{broadcast, Mutex};
@@ -18,6 +19,7 @@ use tokio::sync::{broadcast, Mutex};
 const MAX_HTTP_TERMINALS: usize = 64;
 const MAX_TERMINAL_COMMAND_BYTES: usize = 64 * 1024;
 const MAX_TERMINAL_OUTPUT_BYTES: usize = 1024 * 1024;
+const EVENT_HISTORY_CAPACITY: usize = 2048;
 
 /// Pluggable backend so HTTP can bind to the live AgentLoop/ServerState.
 #[async_trait::async_trait]
@@ -179,6 +181,9 @@ pub struct HttpState {
     pub events: broadcast::Sender<Value>,
     pub token: Option<String>,
     terminals: Arc<Mutex<HashMap<String, HttpTerminalSlot>>>,
+    event_sequence: Arc<AtomicU64>,
+    event_history: Arc<StdMutex<VecDeque<Value>>>,
+    turn_states: Arc<StdMutex<HashMap<String, Value>>>,
 }
 
 struct HttpTerminalSlot {
@@ -194,11 +199,9 @@ impl HttpState {
     }
 
     pub fn with_backend(backend: Arc<dyn HttpBackend>, token: Option<String>) -> Self {
-        let events = backend.event_sender().unwrap_or_else(|| {
-            let (events, _) = broadcast::channel(512);
-            events
-        });
-        Self {
+        let upstream = backend.event_sender();
+        let (events, _) = broadcast::channel(1024);
+        let state = Self {
             backend,
             meta: json!({
                 "name": "kkagent",
@@ -207,17 +210,119 @@ impl HttpState {
                 "capabilities": [
                     "sessions","messages","approvals","ws","tools","tasks","skills",
                     "files","fs","workspaces","config","modelCatalog","search",
-                    "terminals","questions","prompts","snapshot"
+                    "terminals","questions","prompts","snapshot","eventReplay","turnStatus"
                 ],
             }),
             events,
             token,
             terminals: Arc::new(Mutex::new(HashMap::new())),
+            event_sequence: Arc::new(AtomicU64::new(0)),
+            event_history: Arc::new(StdMutex::new(VecDeque::with_capacity(
+                EVENT_HISTORY_CAPACITY,
+            ))),
+            turn_states: Arc::new(StdMutex::new(HashMap::new())),
+        };
+        if let (Some(upstream), Ok(runtime)) = (upstream, tokio::runtime::Handle::try_current()) {
+            let forward_state = state.clone();
+            runtime.spawn(async move {
+                let mut receiver = upstream.subscribe();
+                loop {
+                    match receiver.recv().await {
+                        Ok(event) => forward_state.publish(event),
+                        Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                            forward_state.publish(json!({
+                                "type": "upstream_lagged",
+                                "skipped": skipped,
+                            }));
+                        }
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            });
         }
+        state
     }
 
     pub fn publish(&self, event: Value) {
+        let sequence = self.event_sequence.fetch_add(1, Ordering::SeqCst) + 1;
+        let emitted_at = chrono::Utc::now().to_rfc3339();
+        let mut event = match event {
+            Value::Object(object) => Value::Object(object),
+            data => json!({"type": "event", "data": data}),
+        };
+        if let Some(object) = event.as_object_mut() {
+            object.insert("event_seq".into(), json!(sequence));
+            object.insert("emitted_at".into(), json!(emitted_at));
+        }
+        self.update_turn_state(&event);
+        if let Ok(mut history) = self.event_history.lock() {
+            if history.len() == EVENT_HISTORY_CAPACITY {
+                history.pop_front();
+            }
+            history.push_back(event.clone());
+        }
         let _ = self.events.send(event);
+    }
+
+    fn update_turn_state(&self, event: &Value) {
+        let Some(session_id) = event.get("session_id").and_then(Value::as_str) else {
+            return;
+        };
+        let event_type = event.get("type").and_then(Value::as_str).unwrap_or("");
+        let sequence = event.get("event_seq").and_then(Value::as_u64).unwrap_or(0);
+        let state = match event_type {
+            "turn_start" => Some("running"),
+            "turn_end" => Some("completed"),
+            "approval_requested" => Some("waiting_approval"),
+            "question_asked" => Some("waiting_question"),
+            "error" => Some("failed"),
+            _ => None,
+        };
+        if let Ok(mut turns) = self.turn_states.lock() {
+            if event_type == "session.deleted" {
+                turns.remove(session_id);
+                return;
+            }
+            let entry = turns
+                .entry(session_id.to_string())
+                .or_insert_with(|| json!({"session_id": session_id, "state": "idle"}));
+            if let Some(object) = entry.as_object_mut() {
+                if let Some(state) = state {
+                    object.insert("state".into(), json!(state));
+                }
+                if event_type == "status_update" {
+                    object.insert(
+                        "status".into(),
+                        event.get("status").cloned().unwrap_or(Value::Null),
+                    );
+                }
+                if event_type == "error" {
+                    object.insert(
+                        "error".into(),
+                        event.get("message").cloned().unwrap_or(Value::Null),
+                    );
+                }
+                object.insert("last_event_seq".into(), json!(sequence));
+                object.insert("updated_at".into(), json!(chrono::Utc::now().to_rfc3339()));
+            }
+        }
+    }
+
+    fn events_since(&self, since: u64, session_id: Option<&str>, limit: usize) -> Vec<Value> {
+        self.event_history
+            .lock()
+            .map(|history| {
+                history
+                    .iter()
+                    .filter(|event| {
+                        event.get("event_seq").and_then(Value::as_u64).unwrap_or(0) > since
+                    })
+                    .filter(|event| event_matches_session(event, session_id))
+                    .take(limit.min(EVENT_HISTORY_CAPACITY))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 }
 
@@ -291,7 +396,53 @@ async fn auth_middleware(
 }
 
 async fn meta(State(state): State<HttpState>) -> Json<Value> {
-    Json(state.meta.clone())
+    let mut meta = state.meta.clone();
+    meta["latest_event_seq"] = json!(state.event_sequence.load(Ordering::SeqCst));
+    Json(meta)
+}
+
+#[derive(Deserialize, Default)]
+struct EventsQuery {
+    #[serde(default)]
+    since: u64,
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default = "default_event_limit")]
+    limit: usize,
+    #[serde(default)]
+    token: Option<String>,
+}
+
+fn default_event_limit() -> usize {
+    500
+}
+
+async fn events_history(
+    State(state): State<HttpState>,
+    Query(query): Query<EventsQuery>,
+) -> Result<Json<Value>, StatusCode> {
+    check_auth(&state, &AuthQuery { token: query.token })?;
+    let events = state.events_since(query.since, query.session_id.as_deref(), query.limit);
+    Ok(Json(json!({
+        "events": events,
+        "latest_event_seq": state.event_sequence.load(Ordering::SeqCst),
+        "history_capacity": EVENT_HISTORY_CAPACITY,
+    })))
+}
+
+async fn turn_status(
+    State(state): State<HttpState>,
+    Path(session_id): Path<String>,
+    Query(query): Query<AuthQuery>,
+) -> Result<Json<Value>, StatusCode> {
+    check_auth(&state, &query)?;
+    state
+        .turn_states
+        .lock()
+        .ok()
+        .and_then(|turns| turns.get(&session_id).cloned())
+        .map(Json)
+        .ok_or(StatusCode::NOT_FOUND)
 }
 
 async fn list_sessions(
@@ -762,32 +913,84 @@ async fn delete_session(
     Ok(Json(json!({"ok": true})))
 }
 
+#[derive(Deserialize, Default)]
+struct WsQuery {
+    #[serde(default)]
+    token: Option<String>,
+    #[serde(default)]
+    since: u64,
+    #[serde(default)]
+    session_id: Option<String>,
+}
+
 async fn ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<HttpState>,
-    Query(q): Query<AuthQuery>,
+    Query(query): Query<WsQuery>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    check_auth(&state, &q)?;
-    Ok(ws.on_upgrade(move |socket| ws_loop(socket, state)))
+    check_auth(&state, &AuthQuery { token: query.token })?;
+    Ok(ws.on_upgrade(move |socket| ws_loop(socket, state, query.since, query.session_id)))
 }
 
-async fn ws_loop(mut socket: WebSocket, state: HttpState) {
+async fn ws_loop(
+    mut socket: WebSocket,
+    state: HttpState,
+    since: u64,
+    mut session_filter: Option<String>,
+) {
     let mut rx = state.events.subscribe();
+    let latest = state.event_sequence.load(Ordering::SeqCst);
     let _ = socket
         .send(Message::Text(
-            json!({"type": "hello", "api": "v1"}).to_string().into(),
+            json!({
+                "type": "hello",
+                "api": "v1",
+                "latest_event_seq": latest,
+                "history_capacity": EVENT_HISTORY_CAPACITY,
+            })
+            .to_string()
+            .into(),
         ))
         .await;
+    let replay = state.events_since(since, session_filter.as_deref(), EVENT_HISTORY_CAPACITY);
+    let replay_through = replay
+        .last()
+        .and_then(|event| event.get("event_seq"))
+        .and_then(Value::as_u64)
+        .unwrap_or(since);
+    for event in replay {
+        if socket
+            .send(Message::Text(event.to_string().into()))
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
     loop {
         tokio::select! {
             evt = rx.recv() => {
                 match evt {
                     Ok(v) => {
+                        let sequence = v.get("event_seq").and_then(Value::as_u64).unwrap_or(0);
+                        if sequence <= replay_through || !event_matches_session(&v, session_filter.as_deref()) {
+                            continue;
+                        }
                         if socket.send(Message::Text(v.to_string().into())).await.is_err() {
                             break;
                         }
                     }
-                    Err(_) => break,
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        let resync = json!({
+                            "type": "resync_required",
+                            "skipped": skipped,
+                            "latest_event_seq": state.event_sequence.load(Ordering::SeqCst),
+                        });
+                        if socket.send(Message::Text(resync.to_string().into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
             msg = socket.recv() => {
@@ -797,8 +1000,18 @@ async fn ws_loop(mut socket: WebSocket, state: HttpState) {
                             let _ = socket.send(Message::Text("{\"type\":\"pong\"}".into())).await;
                         } else if let Ok(v) = serde_json::from_str::<Value>(&t) {
                             if v.get("type").and_then(|x| x.as_str()) == Some("subscribe") {
+                                session_filter = v
+                                    .get("session_id")
+                                    .and_then(Value::as_str)
+                                    .map(str::to_string)
+                                    .or(session_filter);
                                 let _ = socket.send(Message::Text(
-                                    json!({"type":"subscribed","channels":["events","roster","fsWatch"]}).to_string().into()
+                                    json!({
+                                        "type":"subscribed",
+                                        "channels":["events"],
+                                        "session_id": session_filter,
+                                        "latest_event_seq": state.event_sequence.load(Ordering::SeqCst),
+                                    }).to_string().into()
                                 )).await;
                             }
                         }
@@ -811,9 +1024,18 @@ async fn ws_loop(mut socket: WebSocket, state: HttpState) {
     }
 }
 
+fn event_matches_session(event: &Value, session_id: Option<&str>) -> bool {
+    match session_id {
+        None => true,
+        Some(expected) => event.get("session_id").and_then(Value::as_str) == Some(expected),
+    }
+}
+
 pub fn router(state: HttpState) -> Router {
     Router::new()
         .route("/api/v1/meta", get(meta))
+        .route("/api/v1/events", get(events_history))
+        .route("/api/v1/turns/{id}", get(turn_status))
         .route("/api/v1/sessions", get(list_sessions).post(create_session))
         .route(
             "/api/v1/sessions/{id}",
@@ -898,6 +1120,22 @@ pub async fn serve_listener_with_backend(
 #[cfg(test)]
 mod security_tests {
     use super::*;
+
+    #[test]
+    fn event_history_is_sequenced_filtered_and_updates_turn_state() {
+        let state = HttpState::new(Some("secret".into()));
+        state.publish(json!({"type": "turn_start", "session_id": "a"}));
+        state.publish(json!({"type": "message_delta", "session_id": "b", "text": "x"}));
+        state.publish(json!({"type": "turn_end", "session_id": "a"}));
+
+        let events = state.events_since(0, Some("a"), 10);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["event_seq"], 1);
+        assert_eq!(events[1]["event_seq"], 3);
+        let turns = state.turn_states.lock().unwrap();
+        assert_eq!(turns["a"]["state"], "completed");
+        assert_eq!(turns["a"]["last_event_seq"], 3);
+    }
 
     #[tokio::test]
     async fn refuses_unauthenticated_non_loopback_listener() {
