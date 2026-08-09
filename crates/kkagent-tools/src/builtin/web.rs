@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use reqwest::redirect::Policy;
 use serde_json::{json, Value};
 use std::sync::Arc;
 
@@ -116,7 +117,11 @@ impl WebSearchTool {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
         if !status.is_success() {
-            anyhow::bail!("HTTP {}: {}", status, &text[..text.len().min(200)]);
+            anyhow::bail!(
+                "HTTP {}: {}",
+                status,
+                text.chars().take(200).collect::<String>()
+            );
         }
         let parsed: Value = serde_json::from_str(&text).unwrap_or(json!({}));
         let results = parsed
@@ -220,6 +225,8 @@ impl FetchUrlTool {
             cfg,
             client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
+                // Redirect targets must be validated individually to prevent SSRF.
+                .redirect(Policy::none())
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
         }
@@ -260,7 +267,15 @@ impl Tool for FetchUrlTool {
         let max_chars = input
             .get("max_chars")
             .and_then(|v| v.as_u64())
-            .unwrap_or(20_000) as usize;
+            .unwrap_or(20_000)
+            .min(200_000) as usize;
+        let parsed_url = match reqwest::Url::parse(url) {
+            Ok(url) => url,
+            Err(e) => return Ok(ToolOutput::error(format!("Invalid URL: {e}"))),
+        };
+        if let Err(e) = validate_public_http_url(&parsed_url).await {
+            return Ok(ToolOutput::error(format!("FetchURL blocked: {e}")));
+        }
 
         // Prefer moonshot fetch service when configured
         if let Some(base) = &self.cfg.fetch_base_url {
@@ -272,18 +287,25 @@ impl Tool for FetchUrlTool {
             match req.send().await {
                 Ok(resp) => {
                     let status = resp.status();
-                    let text = resp.text().await.unwrap_or_default();
-                    if status.is_success() {
-                        let body = truncate(&strip_tags_light(&text), max_chars);
-                        return Ok(ToolOutput::success(body));
+                    match read_response_limited(resp, 4 * 1024 * 1024).await {
+                        Ok((_, text)) if status.is_success() => {
+                            let body = truncate(&strip_tags_light(&text), max_chars);
+                            return Ok(ToolOutput::success(body));
+                        }
+                        Ok(_) => tracing::warn!(
+                            "moonshot fetch HTTP {}, falling back to direct GET",
+                            status
+                        ),
+                        Err(e) => tracing::warn!(
+                            "moonshot fetch response rejected ({e}), falling back to direct GET"
+                        ),
                     }
-                    tracing::warn!("moonshot fetch HTTP {}, falling back to direct GET", status);
                 }
                 Err(e) => tracing::warn!("moonshot fetch error {}, falling back: {}", e, e),
             }
         }
 
-        match self.client.get(url).send().await {
+        match self.fetch_validated(parsed_url).await {
             Ok(resp) => {
                 let status = resp.status();
                 let ct = resp
@@ -292,12 +314,15 @@ impl Tool for FetchUrlTool {
                     .and_then(|v| v.to_str().ok())
                     .unwrap_or("")
                     .to_string();
-                let text = resp.text().await.unwrap_or_default();
+                let (_, text) = match read_response_limited(resp, 4 * 1024 * 1024).await {
+                    Ok(body) => body,
+                    Err(e) => return Ok(ToolOutput::error(format!("FetchURL failed: {e}"))),
+                };
                 if !status.is_success() {
                     return Ok(ToolOutput::error(format!(
                         "FetchURL HTTP {}: {}",
                         status,
-                        &text[..text.len().min(300)]
+                        text.chars().take(300).collect::<String>()
                     )));
                 }
                 let body = if ct.contains("html") {
@@ -308,6 +333,107 @@ impl Tool for FetchUrlTool {
                 Ok(ToolOutput::success(truncate(&body, max_chars)))
             }
             Err(e) => Ok(ToolOutput::error(format!("FetchURL failed: {}", e))),
+        }
+    }
+}
+
+impl FetchUrlTool {
+    async fn fetch_validated(&self, mut url: reqwest::Url) -> anyhow::Result<reqwest::Response> {
+        const MAX_REDIRECTS: usize = 5;
+        for redirect_count in 0..=MAX_REDIRECTS {
+            validate_public_http_url(&url).await?;
+            let response = self.client.get(url.clone()).send().await?;
+            if !response.status().is_redirection() {
+                return Ok(response);
+            }
+            if redirect_count == MAX_REDIRECTS {
+                anyhow::bail!("too many redirects");
+            }
+            let location = response
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .ok_or_else(|| anyhow::anyhow!("redirect response missing Location header"))?
+                .to_str()?;
+            url = url.join(location)?;
+        }
+        unreachable!("redirect loop always returns or errors")
+    }
+}
+
+async fn read_response_limited(
+    mut response: reqwest::Response,
+    max_bytes: usize,
+) -> anyhow::Result<(usize, String)> {
+    if response
+        .content_length()
+        .is_some_and(|len| len > max_bytes as u64)
+    {
+        anyhow::bail!("response exceeds {max_bytes} byte limit");
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if bytes.len().saturating_add(chunk.len()) > max_bytes {
+            anyhow::bail!("response exceeds {max_bytes} byte limit");
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    let len = bytes.len();
+    Ok((len, String::from_utf8_lossy(&bytes).into_owned()))
+}
+
+async fn validate_public_http_url(url: &reqwest::Url) -> anyhow::Result<()> {
+    if !matches!(url.scheme(), "http" | "https") {
+        anyhow::bail!("only http and https URLs are allowed");
+    }
+    let host = url
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("URL has no host"))?;
+    if host.eq_ignore_ascii_case("localhost") || host.to_ascii_lowercase().ends_with(".localhost") {
+        anyhow::bail!("local hosts are not allowed");
+    }
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(|| anyhow::anyhow!("URL has no usable port"))?;
+    let addresses: Vec<std::net::SocketAddr> =
+        tokio::net::lookup_host((host, port)).await?.collect();
+    if addresses.is_empty() {
+        anyhow::bail!("host resolved to no addresses");
+    }
+    if let Some(blocked) = addresses.iter().find(|addr| !is_public_ip(addr.ip())) {
+        anyhow::bail!("host resolves to blocked address {}", blocked.ip());
+    }
+    Ok(())
+}
+
+fn is_public_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(ip) => {
+            let [a, b, c, _] = ip.octets();
+            !(ip.is_private()
+                || ip.is_loopback()
+                || ip.is_link_local()
+                || ip.is_broadcast()
+                || ip.is_documentation()
+                || ip.is_multicast()
+                || ip.is_unspecified()
+                || a == 0
+                || a >= 240
+                || (a == 100 && (64..=127).contains(&b))
+                || (a == 192 && b == 0 && c == 0)
+                || (a == 192 && b == 88 && c == 99)
+                || (a == 198 && (b == 18 || b == 19)))
+        }
+        std::net::IpAddr::V6(ip) => {
+            if let Some(v4) = ip.to_ipv4_mapped() {
+                return is_public_ip(std::net::IpAddr::V4(v4));
+            }
+            let segments = ip.segments();
+            !(ip.is_loopback()
+                || ip.is_unspecified()
+                || ip.is_multicast()
+                || ip.is_unique_local()
+                || ip.is_unicast_link_local()
+                || (segments[0] == 0x2001 && segments[1] == 0x0db8))
         }
     }
 }
@@ -332,5 +458,36 @@ fn truncate(s: &str, max: usize) -> String {
         format!("{}\n… truncated …", t)
     } else {
         t
+    }
+}
+
+#[cfg(test)]
+mod fetch_security_tests {
+    use super::*;
+
+    #[test]
+    fn blocks_non_public_addresses() {
+        for ip in [
+            "127.0.0.1",
+            "10.0.0.1",
+            "169.254.169.254",
+            "192.168.1.1",
+            "100.64.0.1",
+            "::1",
+            "fc00::1",
+            "fe80::1",
+        ] {
+            assert!(!is_public_ip(ip.parse().unwrap()), "{ip} should be blocked");
+        }
+        assert!(is_public_ip("8.8.8.8".parse().unwrap()));
+        assert!(is_public_ip("2606:4700:4700::1111".parse().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn rejects_localhost_url() {
+        let err = validate_public_http_url(&reqwest::Url::parse("http://localhost/a").unwrap())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("local hosts"));
     }
 }
