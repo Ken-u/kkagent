@@ -71,21 +71,15 @@ impl SseMcpClient {
                         if event_name == "endpoint"
                             || event_name.is_empty() && data.starts_with("http")
                         {
-                            let endpoint = data.trim().to_string();
-                            let absolute = if endpoint.starts_with("http") {
-                                endpoint
-                            } else {
-                                // resolve relative to sse url
-                                match url::Url::parse(&sse_url_owned) {
-                                    Ok(base) => base
-                                        .join(&endpoint)
-                                        .map(|u| u.to_string())
-                                        .unwrap_or(endpoint),
-                                    Err(_) => endpoint,
+                            let absolute = match resolve_sse_endpoint(&sse_url_owned, data.trim()) {
+                                Ok(endpoint) => endpoint,
+                                Err(error) => {
+                                    tracing::warn!("Ignoring invalid SSE endpoint: {error}");
+                                    continue;
                                 }
                             };
                             *post_url_reader.lock().await = Some(absolute.clone());
-                            let _ = endpoint_tx.send(absolute).await;
+                            let _ = endpoint_tx.try_send(absolute);
                         } else {
                             // JSON-RPC response
                             if let Ok(value) = serde_json::from_str::<Value>(&data) {
@@ -103,6 +97,14 @@ impl SseMcpClient {
                         tokio::time::sleep(Duration::from_secs(1)).await;
                     }
                 }
+            }
+            let mut pending = pending_reader.lock().await;
+            for (id, request) in pending.drain() {
+                let _ = request.tx.send(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": {"code": -32000, "message": "SSE connection closed"}
+                }));
             }
         });
 
@@ -154,17 +156,31 @@ impl SseMcpClient {
         for (k, v) in &self.headers {
             req = req.header(k, v);
         }
-        let resp = req.send().await.context("SSE POST")?;
+        let resp = match req.send().await.context("SSE POST") {
+            Ok(response) => response,
+            Err(error) => {
+                self.pending.lock().await.remove(&id);
+                return Err(error);
+            }
+        };
         if !resp.status().is_success() && resp.status().as_u16() != 202 {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
+            self.pending.lock().await.remove(&id);
             anyhow::bail!("SSE POST failed ({status}): {text}");
         }
 
-        let value = timeout(Duration::from_secs(60), rx)
-            .await
-            .context("SSE RPC timeout")?
-            .map_err(|_| anyhow!("SSE RPC cancelled"))?;
+        let value = match timeout(Duration::from_secs(60), rx).await {
+            Ok(Ok(value)) => value,
+            Ok(Err(_)) => {
+                self.pending.lock().await.remove(&id);
+                anyhow::bail!("SSE RPC cancelled");
+            }
+            Err(_) => {
+                self.pending.lock().await.remove(&id);
+                anyhow::bail!("SSE RPC timeout");
+            }
+        };
         if let Some(err) = value.get("error") {
             anyhow::bail!("SSE RPC error: {err}");
         }
@@ -197,7 +213,13 @@ impl SseMcpClient {
         for (k, v) in &self.headers {
             req = req.header(k, v);
         }
-        let _ = req.send().await;
+        let response = req.send().await.context("SSE initialized notification")?;
+        if !response.status().is_success() && response.status().as_u16() != 202 {
+            anyhow::bail!(
+                "SSE initialized notification failed ({})",
+                response.status()
+            );
+        }
         Ok(())
     }
 
@@ -250,5 +272,40 @@ impl SseMcpClient {
             output = result.to_string();
         }
         Ok(output)
+    }
+}
+
+fn resolve_sse_endpoint(sse_url: &str, endpoint: &str) -> Result<String> {
+    let base = url::Url::parse(sse_url).context("parse SSE URL")?;
+    if !matches!(base.scheme(), "http" | "https") {
+        anyhow::bail!("SSE URL must use http or https");
+    }
+    let resolved = base.join(endpoint).context("resolve SSE endpoint")?;
+    if !matches!(resolved.scheme(), "http" | "https") {
+        anyhow::bail!("SSE endpoint must use http or https");
+    }
+    if resolved.origin() != base.origin() {
+        anyhow::bail!("SSE endpoint must have the same origin as the event stream");
+    }
+    Ok(resolved.to_string())
+}
+
+#[cfg(test)]
+mod endpoint_tests {
+    use super::*;
+
+    #[test]
+    fn resolves_relative_same_origin_endpoint() {
+        assert_eq!(
+            resolve_sse_endpoint("https://example.com/mcp/sse", "/messages?id=1").unwrap(),
+            "https://example.com/messages?id=1"
+        );
+    }
+
+    #[test]
+    fn rejects_cross_origin_and_non_http_endpoints() {
+        assert!(resolve_sse_endpoint("https://example.com/sse", "https://evil.test/post").is_err());
+        assert!(resolve_sse_endpoint("https://example.com/sse", "file:///tmp/post").is_err());
+        assert!(resolve_sse_endpoint("file:///tmp/sse", "/post").is_err());
     }
 }
