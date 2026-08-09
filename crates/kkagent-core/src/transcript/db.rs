@@ -134,6 +134,66 @@ impl TranscriptDb {
         Ok(id)
     }
 
+    /// Atomically append a batch of messages in the supplied order.
+    pub fn append_messages(
+        &self,
+        session_id: &str,
+        messages: &[(String, String)],
+    ) -> anyhow::Result<()> {
+        if messages.is_empty() {
+            return Ok(());
+        }
+        let transaction = self.conn.unchecked_transaction()?;
+        let now = Utc::now().to_rfc3339();
+        {
+            let mut statement = transaction.prepare(
+                "INSERT INTO messages (session_id, role, content_json, token_count, created_at)
+                 VALUES (?1, ?2, ?3, NULL, ?4)",
+            )?;
+            for (role, content_json) in messages {
+                statement.execute(params![session_id, role, content_json, now])?;
+            }
+        }
+        transaction.execute(
+            "UPDATE sessions SET message_count = message_count + ?1, updated_at = ?2
+             WHERE session_id = ?3",
+            params![messages.len() as u32, now, session_id],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Atomically replace a session transcript in the supplied order.
+    pub fn replace_messages(
+        &self,
+        session_id: &str,
+        messages: &[(String, String)],
+        summary: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let transaction = self.conn.unchecked_transaction()?;
+        transaction.execute(
+            "DELETE FROM messages WHERE session_id = ?1",
+            params![session_id],
+        )?;
+        let now = Utc::now().to_rfc3339();
+        {
+            let mut statement = transaction.prepare(
+                "INSERT INTO messages (session_id, role, content_json, token_count, created_at)
+                 VALUES (?1, ?2, ?3, NULL, ?4)",
+            )?;
+            for (role, content_json) in messages {
+                statement.execute(params![session_id, role, content_json, now])?;
+            }
+        }
+        transaction.execute(
+            "UPDATE sessions SET summary = ?1, message_count = ?2, updated_at = ?3
+             WHERE session_id = ?4",
+            params![summary, messages.len() as u32, now, session_id],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub fn load_messages(&self, session_id: &str) -> anyhow::Result<Vec<MessageRecord>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, session_id, role, content_json, token_count, created_at
@@ -243,35 +303,17 @@ impl TranscriptDb {
         }
 
         let cutoff = messages.len() - keep_last_n;
-        let cutoff_id = messages[cutoff].id;
-
-        let deleted = self.conn.execute(
-            "DELETE FROM messages WHERE session_id = ?1 AND id < ?2",
-            params![session_id, cutoff_id],
-        )?;
-
-        // Insert summary as system message at the beginning
-        let now = Utc::now().to_rfc3339();
         let summary_json = serde_json::json!([{"type": "text", "text": summary}]).to_string();
-        self.conn.execute(
-            "INSERT INTO messages (session_id, role, content_json, token_count, created_at)
-             VALUES (?1, 'system', ?2, NULL, ?3)",
-            params![session_id, summary_json, now],
-        )?;
+        let mut replacement = Vec::with_capacity(keep_last_n + 1);
+        replacement.push(("system".to_string(), summary_json));
+        replacement.extend(
+            messages[cutoff..]
+                .iter()
+                .map(|message| (message.role.clone(), message.content_json.clone())),
+        );
+        self.replace_messages(session_id, &replacement, Some(summary))?;
 
-        // Update summary in session
-        self.conn.execute(
-            "UPDATE sessions SET summary = ?1, message_count = ?2, updated_at = ?3
-             WHERE session_id = ?4",
-            params![
-                summary,
-                keep_last_n as u32 + 1, // +1 for summary message
-                now,
-                session_id,
-            ],
-        )?;
-
-        Ok(deleted as u32)
+        Ok(cutoff as u32)
     }
 }
 
@@ -361,9 +403,13 @@ mod tests {
 
         let messages = db.load_messages("s1").unwrap();
         assert_eq!(messages.len(), 4); // 3 kept + 1 summary
-                                       // Last 3 original messages are kept, summary is inserted with a new ID
-        let has_summary = messages.iter().any(|m| m.role == "system");
-        assert!(has_summary, "Should have a summary system message");
+        assert_eq!(messages[0].role, "system");
+        assert!(messages[0].content_json.contains("Summary of first 7"));
+        assert!(messages[1].content_json.contains("msg7"));
+        assert!(messages[3].content_json.contains("msg9"));
+
+        let session = db.get_session("s1").unwrap().unwrap();
+        assert_eq!(session.message_count, 4);
     }
 
     #[test]

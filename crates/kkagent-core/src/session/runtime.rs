@@ -42,6 +42,8 @@ pub struct Session {
     pub model_alias: Arc<std::sync::Mutex<String>>,
     /// How many messages have already been written to the transcript DB.
     pub persisted_message_count: usize,
+    /// The in-memory history was compacted and must atomically replace the DB transcript.
+    pub transcript_rewrite_required: bool,
     pub approval_waiters: HashMap<String, oneshot::Sender<ApprovalResponse>>,
     approval_rx: mpsc::Receiver<ApprovalResponse>,
     pub approval_tx: mpsc::Sender<ApprovalResponse>,
@@ -160,6 +162,7 @@ impl Session {
             plan_file_path,
             model_alias: Arc::new(std::sync::Mutex::new(model_alias)),
             persisted_message_count: 0,
+            transcript_rewrite_required: false,
             approval_waiters: HashMap::new(),
             approval_rx,
             approval_tx,

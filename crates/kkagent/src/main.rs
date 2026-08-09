@@ -1671,20 +1671,40 @@ async fn run_server_handler_with_state<T: kkagent_rpc::transport::AsyncTransport
 }
 
 fn persist_session_messages(db: &TranscriptDb, session: &mut Session) {
-    while session.persisted_message_count < session.messages.len() {
-        let msg = &session.messages[session.persisted_message_count];
-        let content_json = match serde_json::to_string(&msg.content) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!("Failed to serialize message: {}", e);
-                break;
+    if session.transcript_rewrite_required {
+        let replacement = match serialize_transcript_messages(&session.messages) {
+            Ok(messages) => messages,
+            Err(error) => {
+                tracing::warn!("Failed to serialize compacted transcript: {error}");
+                return;
             }
         };
-        if let Err(e) = db.append_message(&session.id, &msg.role, &content_json, None) {
-            tracing::warn!("Failed to persist message: {}", e);
-            break;
+        match db.replace_messages(&session.id, &replacement, None) {
+            Ok(()) => {
+                session.persisted_message_count = session.messages.len();
+                session.transcript_rewrite_required = false;
+            }
+            Err(error) => {
+                tracing::warn!("Failed to replace compacted transcript: {error}");
+                return;
+            }
         }
-        session.persisted_message_count += 1;
+    }
+
+    if session.persisted_message_count < session.messages.len() {
+        let pending = &session.messages[session.persisted_message_count..];
+        let serialized = match serialize_transcript_messages(pending) {
+            Ok(messages) => messages,
+            Err(error) => {
+                tracing::warn!("Failed to serialize messages: {error}");
+                return;
+            }
+        };
+        if let Err(error) = db.append_messages(&session.id, &serialized) {
+            tracing::warn!("Failed to persist messages: {error}");
+            return;
+        }
+        session.persisted_message_count = session.messages.len();
     }
 
     // Auto-title from first user text
@@ -1697,6 +1717,20 @@ fn persist_session_messages(db: &TranscriptDb, session: &mut Session) {
             }
         }
     }
+}
+
+fn serialize_transcript_messages(
+    messages: &[ChatMessage],
+) -> anyhow::Result<Vec<(String, String)>> {
+    messages
+        .iter()
+        .map(|message| {
+            Ok((
+                message.role.clone(),
+                serde_json::to_string(&message.content)?,
+            ))
+        })
+        .collect()
 }
 
 fn messages_from_records(records: &[kkagent_core::transcript::MessageRecord]) -> Vec<ChatMessage> {
@@ -2224,38 +2258,56 @@ async fn handle_rpc_call(
                 let snapshot = {
                     let sessions = state.sessions.lock().await;
                     sessions.get(&session_id).map(|s| {
+                        let rewrite = s.transcript_rewrite_required;
+                        let start = if rewrite {
+                            0
+                        } else {
+                            s.persisted_message_count.min(s.messages.len())
+                        };
                         (
-                            s.messages[s.persisted_message_count..].to_vec(),
-                            s.persisted_message_count,
+                            s.messages[start..].to_vec(),
+                            start,
                             s.title.clone(),
+                            rewrite,
                         )
                     })
                 };
-                if let Some((pending, start, title)) = snapshot {
+                if let Some((pending, start, title, rewrite)) = snapshot {
                     let mut new_title = title;
-                    {
+                    let persisted = {
                         let db = state.transcript.lock().await;
-                        for msg in &pending {
-                            let content_json =
-                                serde_json::to_string(&msg.content).unwrap_or_else(|_| "[]".into());
-                            let _ = db.append_message(&session_id, &msg.role, &content_json, None);
-                        }
-                        if new_title.is_none() {
+                        let result = if rewrite {
+                            serialize_transcript_messages(&pending).and_then(|messages| {
+                                db.replace_messages(&session_id, &messages, None)
+                            })
+                        } else {
+                            serialize_transcript_messages(&pending)
+                                .and_then(|messages| db.append_messages(&session_id, &messages))
+                        };
+                        if result.is_ok() && new_title.is_none() {
                             if let Some(ChatContent::Text { text }) = pending
                                 .iter()
-                                .find(|m| m.role == "user")
-                                .and_then(|m| m.content.first())
+                                .find(|message| message.role == "user")
+                                .and_then(|message| message.content.first())
                             {
-                                let t: String = text.chars().take(60).collect();
-                                let _ = db.set_title(&session_id, &t);
-                                new_title = Some(t);
+                                let title: String = text.chars().take(60).collect();
+                                if db.set_title(&session_id, &title).is_ok() {
+                                    new_title = Some(title);
+                                }
                             }
                         }
-                    }
-                    if let Some(session) = state.sessions.lock().await.get_mut(&session_id) {
-                        session.persisted_message_count = start + pending.len();
-                        if session.title.is_none() {
-                            session.title = new_title;
+                        if let Err(error) = &result {
+                            tracing::warn!("Failed to persist session prompt: {error}");
+                        }
+                        result.is_ok()
+                    };
+                    if persisted {
+                        if let Some(session) = state.sessions.lock().await.get_mut(&session_id) {
+                            session.persisted_message_count = start + pending.len();
+                            session.transcript_rewrite_required = false;
+                            if session.title.is_none() {
+                                session.title = new_title;
+                            }
                         }
                     }
                 }
@@ -2993,5 +3045,38 @@ mod http_path_tests {
         drop(first);
         assert!(locks.try_acquire("session-a").await.is_ok());
         drop(other);
+    }
+
+    #[test]
+    fn compacted_in_memory_history_atomically_replaces_transcript() {
+        let workspace =
+            std::env::temp_dir().join(format!("kkagent-persist-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let db = TranscriptDb::open_in_memory().unwrap();
+        db.create_session("persist-test", "model", workspace.to_str().unwrap())
+            .unwrap();
+        let mut session = Session::new(
+            "persist-test".into(),
+            workspace.clone(),
+            PermissionMode::Auto,
+            "model".into(),
+        );
+        for index in 0..6 {
+            session.add_user_message(format!("message {index}"));
+        }
+        persist_session_messages(&db, &mut session);
+        assert_eq!(db.load_messages("persist-test").unwrap().len(), 6);
+
+        kkagent_core::compact_messages(&mut session.messages, 2, "durable digest");
+        session.transcript_rewrite_required = true;
+        persist_session_messages(&db, &mut session);
+
+        let records = db.load_messages("persist-test").unwrap();
+        assert_eq!(records.len(), 3);
+        assert!(records[0].content_json.contains("durable digest"));
+        assert!(records[1].content_json.contains("message 4"));
+        assert!(!session.transcript_rewrite_required);
+        assert_eq!(session.persisted_message_count, 3);
+        std::fs::remove_dir_all(workspace).unwrap();
     }
 }

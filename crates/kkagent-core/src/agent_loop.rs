@@ -1102,6 +1102,7 @@ Do not mention this reminder to the user.\n</system-reminder>"
             let digest =
                 build_local_summary(&session.messages[..session.messages.len() - keep_last]);
             let dropped = compact_messages(&mut session.messages, keep_last, &digest);
+            session.transcript_rewrite_required = true;
             tracing::info!(
                 "Auto-compacted session {}: dropped {} messages (est_tokens={})",
                 session.id,
@@ -1602,6 +1603,50 @@ mod retry_tests {
         assert!(error.contains("symlinked"));
         assert!(std::fs::read_dir(&outside).unwrap().next().is_none());
         std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn automatic_compaction_marks_transcript_for_rewrite() {
+        let config = Arc::new(AppConfig {
+            loop_control: Some(LoopControlConfig {
+                max_attempts_per_step: 1,
+                reserved_context_size: 200_000,
+                max_steps_per_turn: 4,
+                auto_compact: true,
+                compact_keep_last: 2,
+                token_counting: "estimated".into(),
+            }),
+            ..AppConfig::default()
+        });
+        let (event_tx, _) = mpsc::channel(4);
+        let loop_ = AgentLoop::new(
+            config,
+            Arc::new(ToolRegistry::new()),
+            Arc::new(Mutex::new(PermissionChain::new(
+                PermissionMode::Auto,
+                Vec::new(),
+            ))),
+            event_tx,
+            Arc::new(Mutex::new(HashMap::new())),
+        );
+        let workspace =
+            std::env::temp_dir().join(format!("kkagent-compact-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let mut session = Session::new(
+            "compact-test".into(),
+            workspace.clone(),
+            PermissionMode::Auto,
+            "missing/model".into(),
+        );
+        for index in 0..6 {
+            session.add_user_message(format!("message {index}"));
+        }
+
+        let _ = loop_.prepare_messages(&mut session, &[], "system");
+
+        assert!(session.transcript_rewrite_required);
+        assert_eq!(session.messages.len(), 3);
+        std::fs::remove_dir_all(workspace).unwrap();
     }
 
     #[tokio::test]
