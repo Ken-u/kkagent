@@ -1,5 +1,8 @@
 use crossterm::{
-    event::{self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyModifiers},
+    event::{
+        self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyModifiers,
+        MouseEventKind,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -14,6 +17,7 @@ use crate::chrome::{StatusBarModel, TabStrip};
 use crate::components;
 use crate::controllers::SessionEventRouter;
 use crate::input::InputState;
+use crate::mouse_mode::MouseMode;
 use crate::pi::{map_key, EditorAction};
 use crate::search::SearchState;
 use crate::slash::{
@@ -25,6 +29,7 @@ pub struct TuiApp {
     config: AppConfig,
     client: KkagentClient,
     state: AppState,
+    mouse_mode: MouseMode,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -433,6 +438,7 @@ impl TuiApp {
             config,
             client,
             state: AppState::new(permission_mode, plan_mode),
+            mouse_mode: MouseMode::from_env(),
         }
     }
 
@@ -478,9 +484,15 @@ impl TuiApp {
             )
         })?;
         let mut stdout = io::stdout();
-        // Do not EnableMouseCapture: it steals click-drag from the terminal and
-        // breaks native text selection / copy. Scroll with PgUp/PgDn instead.
+        // Default: alternate-scroll (?1007h) — wheel scrolls via Up/Down/PgUp/PgDn
+        // while native drag-select/copy still works. `KKAGENT_MOUSE_MODE=sgr` restores
+        // full mouse capture (Shift/Option+drag to select). `off` disables both.
         if let Err(e) = execute!(stdout, EnterAlternateScreen, EnableBracketedPaste) {
+            let _ = disable_raw_mode();
+            return Err(e.into());
+        }
+        if let Err(e) = self.mouse_mode.enable(&mut stdout) {
+            let _ = execute!(stdout, DisableBracketedPaste, LeaveAlternateScreen);
             let _ = disable_raw_mode();
             return Err(e.into());
         }
@@ -503,6 +515,7 @@ impl TuiApp {
 
         // Always restore the terminal, even if the loop failed.
         let _ = disable_raw_mode();
+        let _ = self.mouse_mode.disable(terminal.backend_mut());
         let _ = execute!(
             terminal.backend_mut(),
             DisableBracketedPaste,
@@ -532,6 +545,9 @@ impl TuiApp {
             if event::poll(std::time::Duration::from_millis(50))? {
                 match event::read()? {
                     Event::Key(key) => self.handle_key(key).await?,
+                    Event::Mouse(mouse) if self.mouse_mode == MouseMode::Sgr => {
+                        self.handle_mouse(mouse);
+                    }
                     Event::Paste(text) => {
                         let fold = self.state.mode != AppMode::Shell;
                         self.state.input.paste_chunk(&text);
@@ -571,6 +587,14 @@ impl TuiApp {
             }
         }
         Ok(())
+    }
+
+    fn handle_mouse(&mut self, mouse: crossterm::event::MouseEvent) {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => self.state.scroll_lines(3),
+            MouseEventKind::ScrollDown => self.state.scroll_lines(-3),
+            _ => {}
+        }
     }
 
     async fn handle_key(&mut self, key: KeyEvent) -> anyhow::Result<()> {
@@ -1011,6 +1035,13 @@ impl TuiApp {
             KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.toggle_tool_folding();
             }
+            // Ctrl-P / Ctrl-N: input history (also used when alternate-scroll maps ↑↓ to transcript)
+            KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.state.history_prev();
+            }
+            KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.state.history_next();
+            }
             // Ctrl-T: expand/collapse sticky todo panel
             KeyCode::Char('t')
                 if key.modifiers.contains(KeyModifiers::CONTROL) && self.state.todos.len() > 5 =>
@@ -1110,7 +1141,8 @@ impl TuiApp {
             }
             KeyCode::Left => self.state.input.move_left(),
             KeyCode::Right => self.state.input.move_right(),
-            // 输入历史 ↑↓；多行编辑时先在输入框内移动
+            // ↑↓: multiline move first; then either scroll transcript (alternate-scroll /
+            // mouse wheel) or browse input history. Ctrl+P/N always browses history.
             KeyCode::Up => {
                 let cursor = self.state.input.cursor.min(self.state.input.text.len());
                 let cursor = {
@@ -1123,6 +1155,8 @@ impl TuiApp {
                 let at_first_line = !self.state.input.text[..cursor].contains('\n');
                 if self.state.input.text.contains('\n') && !at_first_line {
                     self.state.input.move_up();
+                } else if self.mouse_mode == MouseMode::AlternateScroll {
+                    self.state.scroll_lines(3);
                 } else {
                     self.state.history_prev();
                 }
@@ -1140,6 +1174,8 @@ impl TuiApp {
                 let at_last_line = !after.contains('\n');
                 if self.state.input.text.contains('\n') && !at_last_line {
                     self.state.input.move_down();
+                } else if self.mouse_mode == MouseMode::AlternateScroll {
+                    self.state.scroll_lines(-3);
                 } else {
                     self.state.history_next();
                 }
@@ -2528,8 +2564,9 @@ fn slash_help_text() -> String {
         "Keyboard shortcuts:\n\
   Enter         - Submit / confirm slash\n\
   Tab           - Complete slash command\n\
-  ↑↓            - Input history / slash menu\n\
+  ↑↓            - Scroll transcript / slash menu (Ctrl-P/N = input history)\n\
   PgUp/PgDn     - Scroll transcript\n\
+  Mouse wheel   - Scroll transcript (keeps drag-select)\n\
   Esc           - Interrupt / dismiss; Esc Esc undo turn\n\
   Shift-Tab     - Toggle plan mode\n\
   !             - Shell mode\n\
@@ -2538,6 +2575,7 @@ fn slash_help_text() -> String {
   Ctrl-G        - Toggle btw notes pane\n\
   Ctrl-O        - Fold tool output\n\
   Ctrl-T        - Expand/collapse todo panel\n\
+  Ctrl-P / Ctrl-N - Input history\n\
   Drag + copy   - Native terminal text selection\n\
   Large paste   - Collapses to [Pasted text #n] overview\n\n\
 Slash commands:\n",

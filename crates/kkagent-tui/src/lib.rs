@@ -4,6 +4,7 @@ pub mod components;
 pub mod controllers;
 pub mod git_badge;
 pub mod input;
+pub mod mouse_mode;
 pub mod panes;
 pub mod paste_placeholders;
 pub mod pi;
