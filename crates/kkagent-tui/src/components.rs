@@ -2064,6 +2064,16 @@ mod render_smoke {
     use kkagent_protocol::PermissionMode;
 
     #[test]
+    fn build_empty_transcript() {
+        let mut state = AppState::new(PermissionMode::Manual, false);
+        let theme = Theme::default();
+        let lines = build_transcript_lines(&mut state, &theme, 80);
+        assert!(!lines.is_empty());
+        let lines2 = build_transcript_lines(&mut state, &theme, 1);
+        assert!(!lines2.is_empty());
+    }
+
+    #[test]
     fn plan_focus_renders_full_document() {
         let mut state = AppState::new(PermissionMode::Manual, true);
         let long: String = (1..=40).map(|i| format!("- step {i}\n")).collect();
