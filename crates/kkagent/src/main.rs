@@ -613,6 +613,23 @@ struct AgentAcpHost {
     state: Arc<ServerState>,
 }
 
+async fn initialize_session_context(state: &ServerState, session: &mut Session) {
+    session.inject_date_reminder();
+    session.inject_workspace_instructions().await;
+    session.inject_git_context();
+    let skill_section = state
+        .skills
+        .catalog_prompt_section_for(&session.working_dir)
+        .await;
+    if !skill_section.is_empty() {
+        session.system_prompt.push_str(&skill_section);
+    }
+    let plugin_section = state.plugins.prompt_append_all().await;
+    if !plugin_section.is_empty() {
+        session.system_prompt.push_str(&plugin_section);
+    }
+}
+
 #[async_trait::async_trait]
 impl kkagent_acp::AcpHost for AgentAcpHost {
     async fn create_session(&self, session_id: &str, cwd: &str) -> Result<(), String> {
@@ -633,12 +650,13 @@ impl kkagent_acp::AcpHost for AgentAcpHost {
             .effective_permission_mode()
             .parse()
             .map_err(|_| "invalid default permission mode".to_string())?;
-        let session = Session::new(
+        let mut session = Session::new(
             session_id.to_string(),
             working_dir.clone(),
             permission_mode,
             model.clone(),
         );
+        initialize_session_context(&self.state, &mut session).await;
         {
             let db = self.state.transcript.lock().await;
             db.create_session(session_id, &model, &working_dir.to_string_lossy())
@@ -924,6 +942,7 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
             PermissionMode::Manual,
             model.clone(),
         );
+        initialize_session_context(&self.state, &mut session).await;
         if let Some(ref t) = title {
             session
                 .set_title_persisted(t.clone())
@@ -1645,7 +1664,14 @@ async fn build_server_state(config: Arc<AppConfig>) -> Result<Arc<ServerState>> 
     hooks_mgr.load_from_app_config(&config.hooks).await;
     let _ = hooks_mgr.discover().await;
     let hooks = Arc::new(hooks_mgr);
-    let skills = Arc::new(kkagent_tools::SkillCatalog::discover(&cwd).await);
+    let skills = Arc::new(
+        kkagent_tools::SkillCatalog::configured(
+            &cwd,
+            &config.extra_skill_dirs,
+            config.merge_all_available_skills,
+        )
+        .await,
+    );
     let cron_path = kkagent_config::default_config_dir().join("cron.json");
     let cron = Arc::new(kkagent_tools::CronManager::with_persist(cron_path).await);
     let goal_mgr = Arc::new(kkagent_protocol::goal::GoalManager::new());
@@ -1975,21 +2001,7 @@ async fn handle_rpc_call(
                     ),
                 ));
             }
-            session.inject_date_reminder();
-            session.inject_workspace_instructions().await;
-            session.inject_git_context();
-            {
-                let section = state.skills.catalog_prompt_section().await;
-                if !section.is_empty() {
-                    session.system_prompt.push_str(&section);
-                }
-            }
-            {
-                let plug = state.plugins.prompt_append_all().await;
-                if !plug.is_empty() {
-                    session.system_prompt.push_str(&plug);
-                }
-            }
+            initialize_session_context(&state, &mut session).await;
 
             {
                 let db = state.transcript.lock().await;
@@ -2278,15 +2290,7 @@ async fn handle_rpc_call(
                     record.model.clone()
                 },
             );
-            session.inject_workspace_instructions().await;
-            session.inject_date_reminder();
-            session.inject_git_context();
-            {
-                let section = state.skills.catalog_prompt_section().await;
-                if !section.is_empty() {
-                    session.system_prompt.push_str(&section);
-                }
-            }
+            initialize_session_context(&state, &mut session).await;
             session.messages = messages.clone();
             session.persisted_message_count = messages.len();
             if let Some(ref t) = record.title {
