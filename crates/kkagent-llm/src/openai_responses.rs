@@ -141,8 +141,7 @@ pub async fn openai_responses_stream(
     let mut stream = resp.bytes_stream();
     let mut buffer = String::new();
     let mut usage = TokenUsage::default();
-    let mut active_call: Option<(String, String)> = None; // id, name
-    let mut arg_buf = String::new();
+    let mut active_calls = std::collections::HashMap::<String, ActiveCall>::new();
 
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
@@ -158,13 +157,10 @@ pub async fn openai_responses_stream(
                 continue;
             };
             if data == "[DONE]" {
-                flush_tool(&event_tx, &mut active_call, &mut arg_buf).await;
-                let _ = event_tx.send(StreamEvent::MessageEnd { usage }).await;
-                return Ok(());
+                anyhow::bail!("OpenAI Responses stream ended before response.completed");
             }
-            let Ok(event) = serde_json::from_str::<serde_json::Value>(data) else {
-                continue;
-            };
+            let event = serde_json::from_str::<serde_json::Value>(data)
+                .map_err(|error| anyhow::anyhow!("invalid OpenAI Responses SSE JSON: {error}"))?;
             let ty = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
             match ty {
                 "response.output_text.delta" | "response.text.delta" => {
@@ -185,11 +181,12 @@ pub async fn openai_responses_stream(
                 }
                 "response.function_call_arguments.delta" => {
                     if let Some(delta) = event.get("delta").and_then(|v| v.as_str()) {
-                        arg_buf.push_str(delta);
-                        if let Some((id, _)) = &active_call {
+                        let key = response_item_key(&event, None);
+                        if let Some(call) = key.and_then(|key| active_calls.get_mut(&key)) {
+                            call.saw_arguments = true;
                             let _ = event_tx
                                 .send(StreamEvent::ToolUseInputDelta {
-                                    id: id.clone(),
+                                    id: call.id.clone(),
                                     delta: delta.to_string(),
                                 })
                                 .await;
@@ -199,7 +196,6 @@ pub async fn openai_responses_stream(
                 "response.output_item.added" => {
                     if let Some(item) = event.get("item") {
                         if item.get("type").and_then(|v| v.as_str()) == Some("function_call") {
-                            flush_tool(&event_tx, &mut active_call, &mut arg_buf).await;
                             let id = item
                                 .get("call_id")
                                 .or_else(|| item.get("id"))
@@ -217,27 +213,39 @@ pub async fn openai_responses_stream(
                                     name: name.clone(),
                                 })
                                 .await;
-                            active_call = Some((id, name));
+                            let key =
+                                response_item_key(&event, Some(item)).unwrap_or_else(|| id.clone());
+                            active_calls.insert(
+                                key,
+                                ActiveCall {
+                                    id,
+                                    saw_arguments: false,
+                                },
+                            );
                         }
                     }
                 }
                 "response.output_item.done" => {
                     if let Some(item) = event.get("item") {
                         if item.get("type").and_then(|v| v.as_str()) == Some("function_call") {
-                            if let Some(args) = item.get("arguments").and_then(|v| v.as_str()) {
-                                if arg_buf.is_empty() && !args.is_empty() {
-                                    if let Some((id, _)) = &active_call {
+                            let key = response_item_key(&event, Some(item));
+                            if let Some(mut call) = key.and_then(|key| active_calls.remove(&key)) {
+                                if let Some(args) =
+                                    item.get("arguments").and_then(|value| value.as_str())
+                                {
+                                    if !call.saw_arguments && !args.is_empty() {
                                         let _ = event_tx
                                             .send(StreamEvent::ToolUseInputDelta {
-                                                id: id.clone(),
+                                                id: call.id.clone(),
                                                 delta: args.to_string(),
                                             })
                                             .await;
+                                        call.saw_arguments = true;
                                     }
-                                    arg_buf = args.to_string();
                                 }
+                                let _ =
+                                    event_tx.send(StreamEvent::ToolUseEnd { id: call.id }).await;
                             }
-                            flush_tool(&event_tx, &mut active_call, &mut arg_buf).await;
                         }
                     }
                 }
@@ -263,7 +271,7 @@ pub async fn openai_responses_stream(
                             .and_then(|v| v.as_u64())
                             .unwrap_or(0);
                     }
-                    flush_tool(&event_tx, &mut active_call, &mut arg_buf).await;
+                    flush_tools(&event_tx, &mut active_calls).await;
                     let _ = event_tx
                         .send(StreamEvent::MessageEnd {
                             usage: usage.clone(),
@@ -274,28 +282,162 @@ pub async fn openai_responses_stream(
                 "error" | "response.failed" => {
                     let msg = event
                         .get("error")
+                        .or_else(|| {
+                            event
+                                .get("response")
+                                .and_then(|response| response.get("error"))
+                        })
                         .and_then(|e| e.get("message"))
                         .and_then(|v| v.as_str())
                         .unwrap_or("responses API error");
-                    let _ = event_tx.send(StreamEvent::Error(msg.to_string())).await;
-                    return Ok(());
+                    anyhow::bail!("OpenAI Responses stream error: {msg}");
                 }
                 _ => {}
             }
         }
     }
-    flush_tool(&event_tx, &mut active_call, &mut arg_buf).await;
-    let _ = event_tx.send(StreamEvent::MessageEnd { usage }).await;
-    Ok(())
+    anyhow::bail!("OpenAI Responses stream connection closed before response.completed")
 }
 
-async fn flush_tool(
+struct ActiveCall {
+    id: String,
+    saw_arguments: bool,
+}
+
+fn response_item_key(
+    event: &serde_json::Value,
+    item: Option<&serde_json::Value>,
+) -> Option<String> {
+    event
+        .get("output_index")
+        .and_then(|value| value.as_u64())
+        .map(|index| format!("index:{index}"))
+        .or_else(|| {
+            event
+                .get("item_id")
+                .and_then(|value| value.as_str())
+                .map(|id| format!("item:{id}"))
+        })
+        .or_else(|| {
+            item.and_then(|item| item.get("id"))
+                .and_then(|value| value.as_str())
+                .map(|id| format!("item:{id}"))
+        })
+        .or_else(|| {
+            item.and_then(|item| item.get("call_id"))
+                .and_then(|value| value.as_str())
+                .map(|id| format!("call:{id}"))
+        })
+}
+
+async fn flush_tools(
     tx: &mpsc::Sender<StreamEvent>,
-    active: &mut Option<(String, String)>,
-    args: &mut String,
+    active: &mut std::collections::HashMap<String, ActiveCall>,
 ) {
-    if let Some((id, _)) = active.take() {
-        let _ = tx.send(StreamEvent::ToolUseEnd { id }).await;
+    for (_, call) in active.drain() {
+        let _ = tx.send(StreamEvent::ToolUseEnd { id: call.id }).await;
     }
-    args.clear();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{ChatMessage, ToolDef};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
+
+    fn request() -> LlmRequest {
+        LlmRequest {
+            model: "gpt-test".into(),
+            messages: vec![ChatMessage {
+                role: "user".into(),
+                content: vec![ChatContent::Text {
+                    text: "hello".into(),
+                }],
+            }],
+            tools: vec![ToolDef {
+                name: "Read".into(),
+                description: "read".into(),
+                input_schema: json!({"type": "object"}),
+            }],
+            max_tokens: 128,
+            system: None,
+            thinking: None,
+        }
+    }
+
+    async fn serve_sse(body: &'static str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            loop {
+                let mut bytes = [0_u8; 4096];
+                let count = socket.read(&mut bytes).await.unwrap();
+                request.extend_from_slice(&bytes[..count]);
+                if request.windows(4).any(|part| part == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+        format!("http://{address}")
+    }
+
+    #[tokio::test]
+    async fn preserves_parallel_function_call_boundaries() {
+        let sse = concat!(
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"item-a\",\"call_id\":\"a\",\"name\":\"One\"}}\n",
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"type\":\"function_call\",\"id\":\"item-b\",\"call_id\":\"b\",\"name\":\"Two\"}}\n",
+            "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":1,\"delta\":\"{\\\"y\\\":2}\"}\n",
+            "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"delta\":\"{\\\"x\\\":1}\"}\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"call_id\":\"a\",\"arguments\":\"{\\\"x\\\":1}\"}}\n",
+            "data: {\"type\":\"response.output_item.done\",\"output_index\":1,\"item\":{\"type\":\"function_call\",\"call_id\":\"b\",\"arguments\":\"{\\\"y\\\":2}\"}}\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":4,\"output_tokens\":2}}}\n"
+        );
+        let base_url = serve_sse(sse).await;
+        let (tx, mut rx) = mpsc::channel(32);
+        openai_responses_stream(&Client::new(), &base_url, "token", request(), tx)
+            .await
+            .unwrap();
+
+        let mut arguments = std::collections::HashMap::<String, String>::new();
+        let mut ended = std::collections::HashSet::new();
+        while let Some(event) = rx.recv().await {
+            match event {
+                StreamEvent::ToolUseInputDelta { id, delta } => {
+                    arguments.entry(id).or_default().push_str(&delta);
+                }
+                StreamEvent::ToolUseEnd { id } => {
+                    ended.insert(id);
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(arguments.get("a").map(String::as_str), Some("{\"x\":1}"));
+        assert_eq!(arguments.get("b").map(String::as_str), Some("{\"y\":2}"));
+        assert_eq!(
+            ended,
+            std::collections::HashSet::from(["a".into(), "b".into()])
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_truncated_streams() {
+        let base_url =
+            serve_sse("data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n")
+                .await;
+        let (tx, _rx) = mpsc::channel(8);
+        let error = openai_responses_stream(&Client::new(), &base_url, "token", request(), tx)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("connection closed"));
+    }
 }

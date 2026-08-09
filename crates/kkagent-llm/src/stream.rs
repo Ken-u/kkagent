@@ -105,6 +105,8 @@ pub async fn anthropic_stream(
     let mut buffer = String::new();
     let mut chunk_count = 0u64;
     let mut tool_blocks = std::collections::HashMap::<u64, String>::new();
+    let mut usage = TokenUsage::default();
+    let mut completed = false;
 
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
@@ -124,25 +126,42 @@ pub async fn anthropic_stream(
             }
             if let Some(data) = line.strip_prefix("data: ") {
                 if data == "[DONE]" {
-                    return Ok(());
+                    if completed {
+                        return Ok(());
+                    }
+                    anyhow::bail!("Anthropic stream ended before message_stop");
                 }
-                if let Ok(event) = serde_json::from_str::<serde_json::Value>(data) {
-                    if let Some(evt) = parse_sse_event(&event, &mut tool_blocks) {
-                        if event_tx.send(evt).await.is_err() {
-                            return Ok(());
-                        }
+                let event = serde_json::from_str::<serde_json::Value>(data)
+                    .map_err(|error| anyhow::anyhow!("invalid Anthropic SSE JSON: {error}"))?;
+                if event.get("type").and_then(|value| value.as_str()) == Some("error") {
+                    let message = event
+                        .get("error")
+                        .and_then(|error| error.get("message"))
+                        .and_then(|message| message.as_str())
+                        .unwrap_or("unknown Anthropic stream error");
+                    anyhow::bail!("Anthropic stream error: {message}");
+                }
+                if let Some(evt) = parse_sse_event(&event, &mut tool_blocks, &mut usage) {
+                    completed |= matches!(evt, StreamEvent::MessageEnd { .. });
+                    if event_tx.send(evt).await.is_err() {
+                        return Ok(());
                     }
                 }
             }
         }
     }
 
-    Ok(())
+    if completed {
+        Ok(())
+    } else {
+        anyhow::bail!("Anthropic stream connection closed before message_stop")
+    }
 }
 
 fn parse_sse_event(
     event: &serde_json::Value,
     tool_blocks: &mut std::collections::HashMap<u64, String>,
+    usage: &mut TokenUsage,
 ) -> Option<StreamEvent> {
     let event_type = event.get("type")?.as_str()?;
     match event_type {
@@ -197,39 +216,46 @@ fn parse_sse_event(
                 .map(|id| StreamEvent::ToolUseEnd { id })
         }
         "message_delta" => {
-            let usage = event.get("usage");
-            let token_usage = if let Some(u) = usage {
-                TokenUsage {
-                    input_tokens: u.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
-                    output_tokens: u.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
-                    cache_creation_input_tokens: u
-                        .get("cache_creation_input_tokens")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0),
-                    cache_read_input_tokens: u
-                        .get("cache_read_input_tokens")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0),
-                }
-            } else {
-                TokenUsage::default()
-            };
-            Some(StreamEvent::MessageEnd { usage: token_usage })
+            if let Some(value) = event.get("usage") {
+                usage.input_tokens = value
+                    .get("input_tokens")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(usage.input_tokens);
+                usage.output_tokens = value
+                    .get("output_tokens")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(usage.output_tokens);
+                usage.cache_creation_input_tokens = value
+                    .get("cache_creation_input_tokens")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(usage.cache_creation_input_tokens);
+                usage.cache_read_input_tokens = value
+                    .get("cache_read_input_tokens")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(usage.cache_read_input_tokens);
+            }
+            None
         }
+        "message_stop" => Some(StreamEvent::MessageEnd {
+            usage: usage.clone(),
+        }),
         "message_start" => {
-            let _msg = event.get("message")?;
-            let _usage = _msg.get("usage")?;
-            None // we report usage at message_delta end
+            let value = event.get("message")?.get("usage")?;
+            usage.input_tokens = value
+                .get("input_tokens")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(usage.input_tokens);
+            usage.cache_creation_input_tokens = value
+                .get("cache_creation_input_tokens")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(usage.cache_creation_input_tokens);
+            usage.cache_read_input_tokens = value
+                .get("cache_read_input_tokens")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(usage.cache_read_input_tokens);
+            None
         }
-        "error" => {
-            let msg = event
-                .get("error")
-                .and_then(|e| e.get("message"))
-                .and_then(|m| m.as_str())
-                .unwrap_or("unknown error")
-                .to_string();
-            Some(StreamEvent::Error(msg))
-        }
+        "error" => None,
         _ => None,
     }
 }
@@ -411,6 +437,7 @@ async fn chat_completions_stream(
         std::collections::HashMap::new();
     let mut started: std::collections::HashSet<usize> = std::collections::HashSet::new();
     let mut usage = TokenUsage::default();
+    let mut completed = false;
 
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
@@ -426,12 +453,25 @@ async fn chat_completions_stream(
                 continue;
             };
             if data == "[DONE]" {
+                for index in started.drain() {
+                    if let Some((id, _)) = tool_ids.get(&index) {
+                        let _ = event_tx
+                            .send(StreamEvent::ToolUseEnd { id: id.clone() })
+                            .await;
+                    }
+                }
                 let _ = event_tx.send(StreamEvent::MessageEnd { usage }).await;
                 return Ok(());
             }
-            let Ok(event) = serde_json::from_str::<serde_json::Value>(data) else {
-                continue;
-            };
+            let event = serde_json::from_str::<serde_json::Value>(data)
+                .map_err(|error| anyhow::anyhow!("invalid OpenAI SSE JSON: {error}"))?;
+            if let Some(error) = event.get("error") {
+                let message = error
+                    .get("message")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("unknown OpenAI stream error");
+                anyhow::bail!("OpenAI stream error: {message}");
+            }
             if let Some(value) = event.get("usage").or_else(|| {
                 event
                     .get("choices")
@@ -504,7 +544,11 @@ async fn chat_completions_stream(
                     }
                 }
             }
-            if choice.get("finish_reason").and_then(|v| v.as_str()) == Some("tool_calls") {
+            if choice
+                .get("finish_reason")
+                .is_some_and(|reason| !reason.is_null())
+            {
+                completed = true;
                 for index in started.drain() {
                     if let Some((id, _)) = tool_ids.get(&index) {
                         let _ = event_tx
@@ -515,8 +559,12 @@ async fn chat_completions_stream(
             }
         }
     }
-    let _ = event_tx.send(StreamEvent::MessageEnd { usage }).await;
-    Ok(())
+    if completed {
+        let _ = event_tx.send(StreamEvent::MessageEnd { usage }).await;
+        Ok(())
+    } else {
+        anyhow::bail!("OpenAI stream connection closed before [DONE] or finish_reason")
+    }
 }
 
 pub async fn google_stream(
@@ -533,6 +581,16 @@ pub async fn google_stream(
         "{}/v1beta/models/{}:streamGenerateContent?alt=sse&key={}",
         base, request.model, api_key
     );
+
+    let tool_names: std::collections::HashMap<&str, &str> = request
+        .messages
+        .iter()
+        .flat_map(|message| message.content.iter())
+        .filter_map(|content| match content {
+            ChatContent::ToolUse { id, name, .. } => Some((id.as_str(), name.as_str())),
+            _ => None,
+        })
+        .collect();
 
     let mut contents = Vec::new();
     for m in &request.messages {
@@ -551,19 +609,24 @@ pub async fn google_stream(
                 ChatContent::Video { .. } => unreachable!("video inputs rejected above"),
                 ChatContent::Thinking { thinking } => parts.push(json!({"text": thinking})),
                 ChatContent::ToolUse { id, name, input } => {
-                    parts.push(json!({
-                        "functionCall": {"name": name, "args": input},
-                        "thoughtSignature": id,
-                    }));
+                    let mut part = json!({"functionCall": {"name": name, "args": input}});
+                    if let Some(signature) = id.strip_prefix("google-sig:") {
+                        part["thoughtSignature"] = json!(signature);
+                    }
+                    parts.push(part);
                 }
                 ChatContent::ToolResult {
-                    tool_use_id: _,
+                    tool_use_id,
                     content,
                     ..
                 } => {
+                    let name = tool_names
+                        .get(tool_use_id.as_str())
+                        .copied()
+                        .unwrap_or("tool");
                     parts.push(json!({
                         "functionResponse": {
-                            "name": "tool",
+                            "name": name,
                             "response": {"result": content},
                         }
                     }));
@@ -620,6 +683,8 @@ pub async fn google_stream(
 
     let mut stream = resp.bytes_stream();
     let mut buffer = String::new();
+    let mut usage = TokenUsage::default();
+    let mut completed = false;
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
         buffer.push_str(&String::from_utf8_lossy(&chunk));
@@ -630,15 +695,41 @@ pub async fn google_stream(
             let Some(data) = line.strip_prefix("data: ") else {
                 continue;
             };
-            let Ok(event) = serde_json::from_str::<serde_json::Value>(data) else {
-                continue;
-            };
+            let event = serde_json::from_str::<serde_json::Value>(data)
+                .map_err(|error| anyhow::anyhow!("invalid Google SSE JSON: {error}"))?;
+            if let Some(error) = event.get("error") {
+                let message = error
+                    .get("message")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("unknown Google stream error");
+                anyhow::bail!("Google stream error: {message}");
+            }
+            if let Some(value) = event.get("usageMetadata") {
+                usage.input_tokens = value
+                    .get("promptTokenCount")
+                    .and_then(|token| token.as_u64())
+                    .unwrap_or(usage.input_tokens);
+                usage.output_tokens = value
+                    .get("candidatesTokenCount")
+                    .and_then(|token| token.as_u64())
+                    .unwrap_or(usage.output_tokens);
+                usage.cache_read_input_tokens = value
+                    .get("cachedContentTokenCount")
+                    .and_then(|token| token.as_u64())
+                    .unwrap_or(usage.cache_read_input_tokens);
+            }
             let Some(cands) = event.get("candidates").and_then(|c| c.as_array()) else {
                 continue;
             };
-            let Some(parts) = cands
-                .first()
-                .and_then(|c| c.get("content"))
+            let Some(candidate) = cands.first() else {
+                continue;
+            };
+            completed |= candidate
+                .get("finishReason")
+                .and_then(|reason| reason.as_str())
+                .is_some();
+            let Some(parts) = candidate
+                .get("content")
                 .and_then(|c| c.get("parts"))
                 .and_then(|p| p.as_array())
             else {
@@ -653,7 +744,11 @@ pub async fn google_stream(
                 if let Some(fc) = part.get("functionCall") {
                     let name = fc.get("name").and_then(|v| v.as_str()).unwrap_or("tool");
                     let args = fc.get("args").cloned().unwrap_or(json!({}));
-                    let id = format!("google-{}", uuid::Uuid::new_v4());
+                    let id = part
+                        .get("thoughtSignature")
+                        .and_then(|value| value.as_str())
+                        .map(|signature| format!("google-sig:{signature}"))
+                        .unwrap_or_else(|| format!("google-{}", uuid::Uuid::new_v4()));
                     let _ = event_tx
                         .send(StreamEvent::ToolUseStart {
                             id: id.clone(),
@@ -671,12 +766,12 @@ pub async fn google_stream(
             }
         }
     }
-    let _ = event_tx
-        .send(StreamEvent::MessageEnd {
-            usage: TokenUsage::default(),
-        })
-        .await;
-    Ok(())
+    if completed {
+        let _ = event_tx.send(StreamEvent::MessageEnd { usage }).await;
+        Ok(())
+    } else {
+        anyhow::bail!("Google stream connection closed before finishReason")
+    }
 }
 
 fn truncate_utf8(value: &str, max_bytes: usize) -> &str {
@@ -767,7 +862,7 @@ async fn upload_kimi_video(
 
 #[cfg(test)]
 mod tests {
-    use super::{anthropic_stream, kimi_stream, openai_stream, truncate_utf8};
+    use super::{anthropic_stream, google_stream, kimi_stream, openai_stream, truncate_utf8};
     use crate::types::{ChatContent, ChatMessage, LlmRequest, StreamEvent, ThinkingParams};
     use reqwest::Client;
     use tokio::{
@@ -888,7 +983,8 @@ mod tests {
             "data: {\"type\":\"content_block_start\",\"content_block\":{\"type\":\"tool_use\",\"id\":\"call-1\",\"name\":\"Read\"}}\n",
             "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{}\"}}\n",
             "data: {\"type\":\"content_block_stop\"}\n",
-            "data: {\"type\":\"message_delta\",\"usage\":{\"input_tokens\":4,\"output_tokens\":2}}\n"
+            "data: {\"type\":\"message_delta\",\"usage\":{\"input_tokens\":4,\"output_tokens\":2}}\n",
+            "data: {\"type\":\"message_stop\"}\n"
         );
         let (base_url, captured) = serve_once("200 OK", "text/event-stream", sse).await;
         let (tx, mut rx) = mpsc::channel(16);
@@ -932,6 +1028,86 @@ mod tests {
         assert!(captured
             .head
             .starts_with("POST /v1/chat/completions HTTP/1.1"));
+    }
+
+    #[tokio::test]
+    async fn openai_rejects_truncated_streams() {
+        let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n";
+        let (base_url, _captured) = serve_once("200 OK", "text/event-stream", sse).await;
+        let (tx, _rx) = mpsc::channel(8);
+        let error = openai_stream(&Client::new(), &base_url, "token", request(), tx)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("connection closed"));
+    }
+
+    #[tokio::test]
+    async fn google_requires_finish_reason_and_reports_usage() {
+        let sse = concat!(
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hello\"}]}}]}\n",
+            "data: {\"candidates\":[{\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":5,\"candidatesTokenCount\":2}}\n"
+        );
+        let (base_url, captured) = serve_once("200 OK", "text/event-stream", sse).await;
+        let mut request = request();
+        request.messages.push(ChatMessage {
+            role: "assistant".into(),
+            content: vec![ChatContent::ToolUse {
+                id: "google-sig:opaque-signature".into(),
+                name: "Read".into(),
+                input: serde_json::json!({"path": "README.md"}),
+            }],
+        });
+        request.messages.push(ChatMessage {
+            role: "user".into(),
+            content: vec![ChatContent::ToolResult {
+                tool_use_id: "google-sig:opaque-signature".into(),
+                content: "contents".into(),
+                is_error: false,
+            }],
+        });
+        let (tx, mut rx) = mpsc::channel(8);
+        google_stream(&Client::new(), &base_url, "google-key", request, tx)
+            .await
+            .unwrap();
+        assert!(matches!(rx.recv().await, Some(StreamEvent::TextDelta(text)) if text == "hello"));
+        assert!(
+            matches!(rx.recv().await, Some(StreamEvent::MessageEnd { usage }) if usage.input_tokens == 5 && usage.output_tokens == 2)
+        );
+        let captured = captured.await.unwrap();
+        assert!(captured.head.starts_with(
+            "POST /v1beta/models/test-model:streamGenerateContent?alt=sse&key=google-key HTTP/1.1"
+        ));
+        let body: serde_json::Value = serde_json::from_str(&captured.body).unwrap();
+        assert_eq!(
+            body["contents"][1]["parts"][0]["thoughtSignature"],
+            "opaque-signature"
+        );
+        assert_eq!(
+            body["contents"][2]["parts"][0]["functionResponse"]["name"],
+            "Read"
+        );
+    }
+
+    #[tokio::test]
+    async fn google_rejects_truncated_streams() {
+        let sse = "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"partial\"}]}}]}\n";
+        let (base_url, _captured) = serve_once("200 OK", "text/event-stream", sse).await;
+        let (tx, _rx) = mpsc::channel(8);
+        let error = google_stream(&Client::new(), &base_url, "key", request(), tx)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("connection closed"));
+    }
+
+    #[tokio::test]
+    async fn anthropic_rejects_truncated_streams() {
+        let sse = "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n";
+        let (base_url, _captured) = serve_once("200 OK", "text/event-stream", sse).await;
+        let (tx, _rx) = mpsc::channel(8);
+        let error = anthropic_stream(&Client::new(), &base_url, "token", request(), tx)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("connection closed"));
     }
 
     #[tokio::test]
