@@ -4,7 +4,7 @@ use std::sync::Arc;
 use anyhow::{anyhow, Context, Result};
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use rmcp::transport::StreamableHttpClientTransport;
-use rmcp::{ServiceExt, transport::TokioChildProcess};
+use rmcp::{transport::TokioChildProcess, ServiceExt};
 use serde_json::Value;
 use tokio::process::Command;
 use tokio::sync::Mutex;
@@ -37,13 +37,7 @@ impl McpServerConfig {
         let transport = match cfg
             .transport_type
             .as_deref()
-            .unwrap_or_else(|| {
-                if cfg.url.is_some() {
-                    "http"
-                } else {
-                    "stdio"
-                }
-            })
+            .unwrap_or_else(|| if cfg.url.is_some() { "http" } else { "stdio" })
             .to_ascii_lowercase()
             .as_str()
         {
@@ -111,11 +105,7 @@ impl McpManager {
                     config.name,
                     config.transport
                 ),
-                Err(e) => tracing::warn!(
-                    "Failed to connect to MCP server {}: {}",
-                    config.name,
-                    e
-                ),
+                Err(e) => tracing::warn!("Failed to connect to MCP server {}: {}", config.name, e),
             }
         }
         self.refresh_tools().await?;
@@ -161,13 +151,9 @@ impl McpManager {
             .lock()
             .await
             .insert(config.name.clone(), "authorizing".into());
-        let tokens = interactive_oauth_login(
-            &config.name,
-            url,
-            &self.oauth_store,
-            config.oauth.as_ref(),
-        )
-        .await?;
+        let tokens =
+            interactive_oauth_login(&config.name, url, &self.oauth_store, config.oauth.as_ref())
+                .await?;
         self.auth_status
             .lock()
             .await
@@ -235,9 +221,10 @@ impl McpManager {
 
         let transport = StreamableHttpClientTransport::from_config(http_cfg);
 
-        let client = ().serve(transport).await.with_context(|| {
-            format!("streamable HTTP connect to {} ({url})", config.name)
-        })?;
+        let client = ()
+            .serve(transport)
+            .await
+            .with_context(|| format!("streamable HTTP connect to {} ({url})", config.name))?;
         self.connections
             .lock()
             .await
@@ -272,16 +259,14 @@ impl McpManager {
             .url
             .clone()
             .ok_or_else(|| anyhow!("server {server_name} has no url"))?;
-        let tokens = interactive_oauth_login(
-            &config.name,
-            &url,
-            &self.oauth_store,
-            config.oauth.as_ref(),
-        )
-        .await?;
+        let tokens =
+            interactive_oauth_login(&config.name, &url, &self.oauth_store, config.oauth.as_ref())
+                .await?;
         let _ = tokens;
         self.reconnect(server_name).await?;
-        Ok(format!("OAuth completed for {server_name}; tools refreshed"))
+        Ok(format!(
+            "OAuth completed for {server_name}; tools refreshed"
+        ))
     }
 
     pub async fn refresh_tools(&self) -> Result<()> {

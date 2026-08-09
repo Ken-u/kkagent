@@ -114,14 +114,15 @@ fn register_one(registry: &mut ToolRegistry, manager: Arc<McpManager>, info: &Mc
             info.name, info.server_name
         )
     } else {
-        format!(
-            "[MCP:{}] {}",
-            info.server_name, info.description
-        )
+        format!("[MCP:{}] {}", info.server_name, info.description)
     };
 
     let schema = if info.input_schema.is_null()
-        || info.input_schema.as_object().map(|o| o.is_empty()).unwrap_or(false)
+        || info
+            .input_schema
+            .as_object()
+            .map(|o| o.is_empty())
+            .unwrap_or(false)
     {
         serde_json::json!({
             "type": "object",

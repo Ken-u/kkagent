@@ -128,11 +128,7 @@ impl AcpServer {
                     .lock()
                     .await
                     .insert(sid.clone(), sess.clone());
-                self.store
-                    .modes
-                    .lock()
-                    .await
-                    .insert(sid, "agent".into());
+                self.store.modes.lock().await.insert(sid, "agent".into());
                 ok(id, sess)
             }
             "session/prompt" | "prompt" => {
@@ -175,7 +171,11 @@ impl AcpServer {
                     .and_then(|v| v.as_str())
                     .unwrap_or("agent")
                     .to_string();
-                self.store.modes.lock().await.insert(sid.clone(), mode.clone());
+                self.store
+                    .modes
+                    .lock()
+                    .await
+                    .insert(sid.clone(), mode.clone());
                 if let Some(s) = self.store.sessions.lock().await.get_mut(&sid) {
                     s["mode"] = json!(mode);
                 }
@@ -214,14 +214,22 @@ impl AcpServer {
                 ]}),
             ),
             "fs/read_text_file" => {
-                let path = req.params.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                let path = req
+                    .params
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
                 match std::fs::read_to_string(path) {
                     Ok(content) => ok(id, json!({"content": content})),
                     Err(e) => err(id, -32000, e.to_string()),
                 }
             }
             "fs/write_text_file" => {
-                let path = req.params.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                let path = req
+                    .params
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
                 let content = req
                     .params
                     .get("content")

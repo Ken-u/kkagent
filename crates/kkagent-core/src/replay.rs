@@ -37,9 +37,7 @@ impl ReplayBuilder {
                     if let Some(text) = content.as_str() {
                         out.push(ChatMessage {
                             role: role.into(),
-                            content: vec![ChatContent::Text {
-                                text: text.into(),
-                            }],
+                            content: vec![ChatContent::Text { text: text.into() }],
                         });
                     }
                 }

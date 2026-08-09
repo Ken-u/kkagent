@@ -25,7 +25,10 @@ impl Default for SessionEventRouter {
 impl SessionEventRouter {
     pub fn on_event(&mut self, ev: &AgentEvent, tabs: &mut TabStrip, status: &mut StatusBarModel) {
         match ev {
-            AgentEvent::StatusUpdate { session_id, status: s } => {
+            AgentEvent::StatusUpdate {
+                session_id,
+                status: s,
+            } => {
                 self.status = s.clone();
                 status.status = s.clone();
                 tabs.set_status(session_id, s.clone());
@@ -53,8 +56,7 @@ impl SessionEventRouter {
                     .saturating_add(usage.input_tokens.saturating_add(usage.output_tokens));
                 if usage.cache_read_input_tokens > 0 {
                     let total = usage.input_tokens.max(1);
-                    status.cache_hit =
-                        Some(usage.cache_read_input_tokens as f32 / total as f32);
+                    status.cache_hit = Some(usage.cache_read_input_tokens as f32 / total as f32);
                 }
             }
             _ => {}

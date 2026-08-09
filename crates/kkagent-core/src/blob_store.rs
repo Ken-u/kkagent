@@ -40,11 +40,7 @@ pub fn resolve_media_refs(text: &str, cwd: &Path) -> Vec<PathBuf> {
         let t = token.trim_matches(|c: char| c == '`' || c == '"' || c == '\'');
         if let Some(rest) = t.strip_prefix('@') {
             let p = PathBuf::from(rest);
-            let full = if p.is_absolute() {
-                p
-            } else {
-                cwd.join(p)
-            };
+            let full = if p.is_absolute() { p } else { cwd.join(p) };
             if full.exists() {
                 out.push(full);
             }

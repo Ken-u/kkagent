@@ -122,10 +122,8 @@ mod tests {
     #[test]
     fn exclusivity() {
         assert!(SwarmService::veto_mixed_agent_swarm(&["AgentSwarm".into()]).is_none());
-        assert!(SwarmService::veto_mixed_agent_swarm(&[
-            "AgentSwarm".into(),
-            "Read".into()
-        ])
-        .is_some());
+        assert!(
+            SwarmService::veto_mixed_agent_swarm(&["AgentSwarm".into(), "Read".into()]).is_some()
+        );
     }
 }

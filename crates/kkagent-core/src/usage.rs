@@ -45,8 +45,7 @@ impl UsageService {
             steps: 1,
             turns: 0,
         };
-        self.session.input_tokens =
-            self.session.input_tokens.saturating_add(usage.input_tokens);
+        self.session.input_tokens = self.session.input_tokens.saturating_add(usage.input_tokens);
         self.session.output_tokens = self
             .session
             .output_tokens

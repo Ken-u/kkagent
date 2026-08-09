@@ -1,5 +1,6 @@
 //! Chrome: tab strip, status bar — aligned with kimi-code tui/chrome.
 
+use kkagent_protocol::{PermissionMode, SessionStatus};
 use ratatui::{
     layout::Rect,
     style::{Modifier, Style},
@@ -7,7 +8,6 @@ use ratatui::{
     widgets::Paragraph,
     Frame,
 };
-use kkagent_protocol::{PermissionMode, SessionStatus};
 
 use crate::theme::Theme;
 
@@ -176,10 +176,7 @@ impl StatusBarModel {
                 .add_modifier(Modifier::BOLD),
         ));
         if self.plan_mode {
-            spans.push(Span::styled(
-                " plan ",
-                Style::default().fg(theme.warning),
-            ));
+            spans.push(Span::styled(" plan ", Style::default().fg(theme.warning)));
         }
         let status = match self.status {
             SessionStatus::Idle => "idle",

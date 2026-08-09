@@ -1,7 +1,7 @@
 use async_trait::async_trait;
+use kkagent_protocol::subagent::{SubagentConfig, SubagentManager, SubagentStatus};
 use serde_json::Value;
 use std::sync::Arc;
-use kkagent_protocol::subagent::{SubagentManager, SubagentConfig, SubagentStatus};
 
 use crate::{Tool, ToolContext, ToolOutput};
 
@@ -63,10 +63,7 @@ After launching, continue other work and collect results with TaskOutput / TaskL
             .get("description")
             .and_then(|v| v.as_str())
             .unwrap_or("Unnamed task");
-        let prompt = input
-            .get("prompt")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let prompt = input.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
         let model = input
             .get("model")
             .and_then(|v| v.as_str())
@@ -109,7 +106,10 @@ After launching, continue other work and collect results with TaskOutput / TaskL
 Use TaskOutput with this id to fetch results when ready; use TaskList to see status."
                 )))
             }
-            Err(e) => Ok(ToolOutput::error(format!("Failed to launch subagent: {}", e))),
+            Err(e) => Ok(ToolOutput::error(format!(
+                "Failed to launch subagent: {}",
+                e
+            ))),
         }
     }
 }
@@ -225,7 +225,11 @@ impl Tool for TaskListTool {
                     t.agent_id,
                     format!("{:?}", t.status).to_lowercase(),
                     t.description,
-                    if t.result.is_some() { " (has result)" } else { "" }
+                    if t.result.is_some() {
+                        " (has result)"
+                    } else {
+                        ""
+                    }
                 )
             })
             .collect();

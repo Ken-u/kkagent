@@ -110,15 +110,11 @@ mod tests {
         let mut msgs = vec![
             ChatMessage {
                 role: "user".into(),
-                content: vec![ChatContent::Text {
-                    text: "hi".into(),
-                }],
+                content: vec![ChatContent::Text { text: "hi".into() }],
             },
             ChatMessage {
                 role: "assistant".into(),
-                content: vec![ChatContent::Text {
-                    text: "   ".into(),
-                }],
+                content: vec![ChatContent::Text { text: "   ".into() }],
             },
         ];
         assert_eq!(fold_vacuous(&mut msgs), 1);

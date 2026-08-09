@@ -78,9 +78,7 @@ impl TokenCounter {
                 ChatContent::Text { text } => Self::estimate_text(text),
                 ChatContent::Thinking { thinking } => Self::estimate_text(thinking),
                 ChatContent::ToolUse { name, input, .. } => {
-                    Self::estimate_text(name)
-                        + Self::estimate_text(&input.to_string())
-                        + 8
+                    Self::estimate_text(name) + Self::estimate_text(&input.to_string()) + 8
                 }
                 ChatContent::ToolResult { content, .. } => Self::estimate_text(content) + 6,
             };
@@ -104,12 +102,7 @@ impl TokenCounter {
             .sum()
     }
 
-    pub fn request_size(
-        &self,
-        system: &str,
-        tools: &[ToolDef],
-        messages: &[ChatMessage],
-    ) -> u64 {
+    pub fn request_size(&self, system: &str, tools: &[ToolDef], messages: &[ChatMessage]) -> u64 {
         Self::estimate_text(system)
             + Self::estimate_tools(tools)
             + Self::estimate_messages(messages)

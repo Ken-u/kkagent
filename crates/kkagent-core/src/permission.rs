@@ -1,5 +1,5 @@
-use kkagent_protocol::PermissionMode;
 use kkagent_config::PermissionRule;
+use kkagent_protocol::PermissionMode;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -16,14 +16,33 @@ pub struct PermissionChain {
 }
 
 const SENSITIVE_PATTERNS: &[&str] = &[
-    ".env", "id_rsa", "id_ed25519", "id_ecdsa", ".pem",
-    "credentials", "secret", ".key", "token",
+    ".env",
+    "id_rsa",
+    "id_ed25519",
+    "id_ecdsa",
+    ".pem",
+    "credentials",
+    "secret",
+    ".key",
+    "token",
 ];
 
 const READ_ONLY_TOOLS: &[&str] = &[
-    "Read", "Grep", "Glob", "ReadMediaFile", "WebSearch",
-    "FetchURL", "EnterPlanMode", "ExitPlanMode", "TodoList", "GetGoal",
-    "TaskList", "TaskOutput", "CronList", "SelectTools", "Skill",
+    "Read",
+    "Grep",
+    "Glob",
+    "ReadMediaFile",
+    "WebSearch",
+    "FetchURL",
+    "EnterPlanMode",
+    "ExitPlanMode",
+    "TodoList",
+    "GetGoal",
+    "TaskList",
+    "TaskOutput",
+    "CronList",
+    "SelectTools",
+    "Skill",
 ];
 
 impl PermissionChain {
@@ -54,7 +73,7 @@ impl PermissionChain {
         // 1. auto-mode-ask-user-question-deny
         if self.mode == PermissionMode::Auto && tool_name == "AskUserQuestion" {
             return PermissionDecision::Deny(
-                "AskUserQuestion is disabled in auto mode. Make a decision and continue.".into()
+                "AskUserQuestion is disabled in auto mode. Make a decision and continue.".into(),
             );
         }
 
@@ -154,11 +173,7 @@ fn plan_mode_guard(
     None
 }
 
-fn writes_only_plan_file(
-    input: &serde_json::Value,
-    working_dir: &Path,
-    plan_file: &Path,
-) -> bool {
+fn writes_only_plan_file(input: &serde_json::Value, working_dir: &Path, plan_file: &Path) -> bool {
     let Some(raw) = input.get("path").and_then(|v| v.as_str()) else {
         return false;
     };
@@ -261,7 +276,8 @@ fn has_sensitive_file_access(tool_name: &str, input: &serde_json::Value) -> bool
         return false;
     }
 
-    let path_str = input.get("path")
+    let path_str = input
+        .get("path")
         .or_else(|| input.get("command"))
         .and_then(|v| v.as_str())
         .unwrap_or("");
@@ -275,9 +291,7 @@ fn has_sensitive_file_access(tool_name: &str, input: &serde_json::Value) -> bool
 }
 
 fn accesses_git_control_path(_tool_name: &str, input: &serde_json::Value) -> bool {
-    let path_str = input.get("path")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let path_str = input.get("path").and_then(|v| v.as_str()).unwrap_or("");
     path_str.contains(".git/")
 }
 

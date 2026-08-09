@@ -1,6 +1,6 @@
+use anyhow::Result;
 use std::path::Path;
 use tokio::net::{UnixListener, UnixStream};
-use anyhow::Result;
 
 pub async fn connect_uds(path: &Path) -> Result<UnixStream> {
     let stream = UnixStream::connect(path).await?;

@@ -98,10 +98,7 @@ fn resource_accesses_conflict(left: &ToolResourceAccess, right: &ToolResourceAcc
     }
 }
 
-fn file_operations_conflict(
-    left: ToolFileAccessOperation,
-    right: ToolFileAccessOperation,
-) -> bool {
+fn file_operations_conflict(left: ToolFileAccessOperation, right: ToolFileAccessOperation) -> bool {
     file_operation_writes(left) || file_operation_writes(right)
 }
 
@@ -169,7 +166,11 @@ pub fn resolve_tool_path(working_dir: &Path, path: &str) -> String {
 }
 
 /// Default access inference for builtin tools.
-pub fn infer_accesses(tool_name: &str, input: &serde_json::Value, working_dir: &Path) -> ToolAccesses {
+pub fn infer_accesses(
+    tool_name: &str,
+    input: &serde_json::Value,
+    working_dir: &Path,
+) -> ToolAccesses {
     match tool_name {
         "Read" | "ReadMediaFile" => {
             if let Some(p) = input.get("path").and_then(|v| v.as_str()) {

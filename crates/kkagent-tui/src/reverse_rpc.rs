@@ -1,8 +1,6 @@
 //! Reverse-RPC UI layer for approval / question modals (kimi-code tui/reverse-rpc).
 
-use kkagent_protocol::{
-    ApprovalDecision, ApprovalScope, QuestionOption, QuestionPayload,
-};
+use kkagent_protocol::{ApprovalDecision, ApprovalScope, QuestionOption, QuestionPayload};
 
 #[derive(Debug, Clone)]
 pub struct ApprovalPanelData {
@@ -119,10 +117,7 @@ impl ApprovalController {
         let p = self.pending.take()?;
         let (decision, scope) = match p.selected {
             0 => (ApprovalDecision::Approved, None),
-            1 => (
-                ApprovalDecision::Approved,
-                Some(ApprovalScope::Session),
-            ),
+            1 => (ApprovalDecision::Approved, Some(ApprovalScope::Session)),
             _ => (ApprovalDecision::Rejected, None),
         };
         Some(ReverseRpcResponse::Approval {

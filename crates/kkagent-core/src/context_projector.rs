@@ -126,11 +126,7 @@ fn shrink_json(v: &serde_json::Value, max: usize) -> serde_json::Value {
 }
 
 /// In-place compact: replace everything before `keep_last` with a single summary user message.
-pub fn compact_messages(
-    messages: &mut Vec<ChatMessage>,
-    keep_last: usize,
-    summary: &str,
-) -> usize {
+pub fn compact_messages(messages: &mut Vec<ChatMessage>, keep_last: usize, summary: &str) -> usize {
     if messages.len() <= keep_last {
         return 0;
     }
@@ -200,6 +196,8 @@ mod tests {
         let dropped = compact_messages(&mut msgs, 3, "summary here");
         assert_eq!(dropped, 7);
         assert_eq!(msgs.len(), 4); // summary + 3
-        assert!(matches!(&msgs[0].content[0], ChatContent::Text { text } if text.contains("summary here")));
+        assert!(
+            matches!(&msgs[0].content[0], ChatContent::Text { text } if text.contains("summary here"))
+        );
     }
 }

@@ -1,5 +1,5 @@
-use tokio::io::{AsyncRead, AsyncWrite};
 use std::path::PathBuf;
+use tokio::io::{AsyncRead, AsyncWrite};
 
 pub mod memory;
 pub mod uds;
@@ -7,9 +7,13 @@ pub mod uds;
 #[derive(Debug, Clone)]
 pub enum TransportConfig {
     Memory,
-    Uds { path: PathBuf },
+    Uds {
+        path: PathBuf,
+    },
     #[cfg(windows)]
-    NamedPipe { name: String },
+    NamedPipe {
+        name: String,
+    },
 }
 
 pub trait AsyncTransport: AsyncRead + AsyncWrite + Unpin + Send + 'static {}

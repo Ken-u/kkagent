@@ -395,7 +395,8 @@ Poll with Bash({{\"shell_id\":\"{id}\"}})."
                     let _ = child.wait().await;
                     let _ = pump.await;
                     let output = collected.lock().await.clone();
-                    let mut result = format!("Command timed out after {}ms and was killed.", timeout_ms);
+                    let mut result =
+                        format!("Command timed out after {}ms and was killed.", timeout_ms);
                     if !output.is_empty() {
                         result.push_str("\n\n");
                         result.push_str(&truncate_chars(&output, MAX_OUTPUT));
@@ -455,17 +456,15 @@ async fn run_shell_job(
                 (st, code)
             }
             Ok(Err(e)) => {
-                mgr.append_output(&id, &format!("\nwait error: {}", e)).await;
+                mgr.append_output(&id, &format!("\nwait error: {}", e))
+                    .await;
                 (ShellStatus::Failed, None)
             }
             Err(_) => {
                 let _ = child.kill().await;
                 let _ = child.wait().await;
-                mgr.append_output(
-                    &id,
-                    &format!("\n(timed out after {}ms and killed)", ms),
-                )
-                .await;
+                mgr.append_output(&id, &format!("\n(timed out after {}ms and killed)", ms))
+                    .await;
                 (ShellStatus::TimedOut, None)
             }
         }
@@ -481,7 +480,8 @@ async fn run_shell_job(
                 (st, code)
             }
             Err(e) => {
-                mgr.append_output(&id, &format!("\nwait error: {}", e)).await;
+                mgr.append_output(&id, &format!("\nwait error: {}", e))
+                    .await;
                 (ShellStatus::Failed, None)
             }
         }

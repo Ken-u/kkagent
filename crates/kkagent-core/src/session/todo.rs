@@ -36,7 +36,10 @@ impl SessionTodoService {
     }
 
     pub fn clear(&self) {
-        self.todos.write().unwrap_or_else(|e| e.into_inner()).clear();
+        self.todos
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
     }
 
     pub fn render(&self) -> String {

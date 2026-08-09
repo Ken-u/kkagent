@@ -36,7 +36,9 @@ pub mod terminal;
 pub mod todo;
 pub mod workspace_context;
 
-pub use activity::{PendingInteraction, SessionActivityCause, SessionActivityState, SessionActivityView};
+pub use activity::{
+    PendingInteraction, SessionActivityCause, SessionActivityState, SessionActivityView,
+};
 pub use agent_lifecycle::{AgentHandle, AgentLifecycleService, CreateAgentOptions, MAIN_AGENT_ID};
 pub use btw::{SessionBtwService, SIDE_QUESTION_SYSTEM_REMINDER, TOOL_CALL_DISABLED_MESSAGE};
 pub use context::SessionContext;
@@ -60,7 +62,9 @@ pub use profile_catalog::{AgentProfileSummary, SessionAgentProfileCatalog};
 pub use runtime::{messages_for_llm, plan_mode_reminder, FileChange, Session, TurnCheckpoint};
 pub use seed::SessionSeed;
 pub use services::SessionServices;
-pub use session_tool_policy::{SessionToolPolicyDoc, SessionToolPolicyGate, SessionToolPolicyService};
+pub use session_tool_policy::{
+    SessionToolPolicyDoc, SessionToolPolicyGate, SessionToolPolicyService,
+};
 pub use skill_catalog::{SessionSkillCatalog, SkillCatalogEntry};
 pub use state::SessionStateService;
 pub use store::{
@@ -69,7 +73,8 @@ pub use store::{
 };
 pub use subagent::{AgentRunRequest, AgentTaskEvent, SessionSubagentService};
 pub use swarm_batch::{
-    SessionSwarmBatchService, SessionSwarmRunResult, SessionSwarmTask, SwarmRunStatus, SwarmTaskKind,
+    SessionSwarmBatchService, SessionSwarmRunResult, SessionSwarmTask, SwarmRunStatus,
+    SwarmTaskKind,
 };
 pub use terminal::{SessionTerminalService, TerminalHandle};
 pub use todo::{parse_todo_items, render_todo_list, SessionTodoService, TodoItem, TodoStatus};

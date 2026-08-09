@@ -38,10 +38,7 @@ pub fn compact_full(
         CompactionStrategy::KeepTail => {
             let digest = local_digest(messages, keep_last);
             let dropped = compact_messages(messages, keep_last, &digest);
-            CompactionResult {
-                dropped,
-                strategy,
-            }
+            CompactionResult { dropped, strategy }
         }
         CompactionStrategy::VacuousFold => {
             let before = messages.len();
@@ -105,14 +102,11 @@ fn is_vacuous(m: &ChatMessage) -> bool {
     match m.content.as_slice() {
         [ChatContent::Text { text }] => {
             let t = text.trim();
-            t.is_empty()
-                || t == "ok"
-                || t == "OK"
-                || t.starts_with("Skipped: duplicate tool call")
+            t.is_empty() || t == "ok" || t == "OK" || t.starts_with("Skipped: duplicate tool call")
         }
-        [ChatContent::ToolResult { content, is_error, .. }] => {
-            !*is_error && (content.is_empty() || content == "(no output)")
-        }
+        [ChatContent::ToolResult {
+            content, is_error, ..
+        }] => !*is_error && (content.is_empty() || content == "(no output)"),
         _ => false,
     }
 }
@@ -132,7 +126,11 @@ fn local_digest(messages: &[ChatMessage], keep_last: usize) -> String {
     let mut out = String::from("Earlier turns:\n");
     for m in old.iter().take(30) {
         if let Some(t) = first_text(m) {
-            out.push_str(&format!("[{}] {}\n", m.role, t.chars().take(160).collect::<String>()));
+            out.push_str(&format!(
+                "[{}] {}\n",
+                m.role,
+                t.chars().take(160).collect::<String>()
+            ));
         }
     }
     out.chars().take(3500).collect()

@@ -1,14 +1,16 @@
+use crate::path_policy::{detect_crlf, is_sensitive_path, restore_line_endings};
+use crate::{Tool, ToolContext, ToolOutput};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::path::Path;
-use crate::path_policy::{detect_crlf, is_sensitive_path, restore_line_endings};
-use crate::{Tool, ToolContext, ToolOutput};
 
 pub struct EditTool;
 
 #[async_trait]
 impl Tool for EditTool {
-    fn name(&self) -> &str { "Edit" }
+    fn name(&self) -> &str {
+        "Edit"
+    }
     fn description(&self) -> &str {
         "Replace exact string occurrences in a file. old_string must be unique unless replace_all is true. \
 Preserves original CRLF/LF line endings."
@@ -27,13 +29,22 @@ Preserves original CRLF/LF line endings."
     }
 
     async fn execute(&self, input: Value, ctx: &ToolContext) -> anyhow::Result<ToolOutput> {
-        let path_str = input.get("path").and_then(|v| v.as_str())
+        let path_str = input
+            .get("path")
+            .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'path'"))?;
-        let old_string = input.get("old_string").and_then(|v| v.as_str())
+        let old_string = input
+            .get("old_string")
+            .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'old_string'"))?;
-        let new_string = input.get("new_string").and_then(|v| v.as_str())
+        let new_string = input
+            .get("new_string")
+            .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'new_string'"))?;
-        let replace_all = input.get("replace_all").and_then(|v| v.as_bool()).unwrap_or(false);
+        let replace_all = input
+            .get("replace_all")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
         if old_string == new_string {
             return Ok(ToolOutput::error("old_string and new_string are identical"));
@@ -49,7 +60,8 @@ Preserves original CRLF/LF line endings."
             tracing::warn!("Editing sensitive path: {}", path.display());
         }
 
-        let raw = tokio::fs::read(&path).await
+        let raw = tokio::fs::read(&path)
+            .await
             .map_err(|e| anyhow::anyhow!("Failed to read: {}", e))?;
         let content = String::from_utf8_lossy(&raw).into_owned();
         let crlf = detect_crlf(&content);
@@ -65,8 +77,7 @@ Preserves original CRLF/LF line endings."
             let hint = fuzzy_hint(&norm, &old_n);
             return Ok(ToolOutput::error(format!(
                 "old_string not found in {}.{}",
-                path_str,
-                hint
+                path_str, hint
             )));
         }
         if count > 1 && !replace_all {
@@ -100,7 +111,11 @@ fn fuzzy_hint(haystack: &str, needle: &str) -> String {
     }
     for (i, line) in haystack.lines().enumerate() {
         if line.contains(preview.chars().take(12).collect::<String>().as_str()) {
-            return format!(" Closest line {}: {}", i + 1, line.chars().take(120).collect::<String>());
+            return format!(
+                " Closest line {}: {}",
+                i + 1,
+                line.chars().take(120).collect::<String>()
+            );
         }
     }
     String::new()

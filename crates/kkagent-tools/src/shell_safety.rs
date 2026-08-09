@@ -83,7 +83,10 @@ fn walk_dangerous(node: &AstNode) -> Option<ShellRisk> {
             if n == "mkfs" || n.starts_with("mkfs.") {
                 return Some(ShellRisk::Dangerous("filesystem format".into()));
             }
-            if n == "dd" && args.iter().any(|a| a.starts_with("if=") || a.starts_with("of=/dev/"))
+            if n == "dd"
+                && args
+                    .iter()
+                    .any(|a| a.starts_with("if=") || a.starts_with("of=/dev/"))
             {
                 return Some(ShellRisk::Dangerous("raw disk write".into()));
             }
@@ -132,10 +135,16 @@ fn walk_caution(node: &AstNode) -> Option<ShellRisk> {
             if flat.windows(2).any(|w| w == ["reset", "--hard"]) {
                 return Some(ShellRisk::Caution("destructive git reset".into()));
             }
-            if flat.windows(2).any(|w| w == ["push", "--force"] || w == ["push", "-f"]) {
+            if flat
+                .windows(2)
+                .any(|w| w == ["push", "--force"] || w == ["push", "-f"])
+            {
                 return Some(ShellRisk::Caution("force push".into()));
             }
-            if flat.windows(2).any(|w| w == ["clean", "-fd"] || w == ["clean", "-f"]) {
+            if flat
+                .windows(2)
+                .any(|w| w == ["clean", "-fd"] || w == ["clean", "-f"])
+            {
                 return Some(ShellRisk::Caution("git clean removes files".into()));
             }
         }

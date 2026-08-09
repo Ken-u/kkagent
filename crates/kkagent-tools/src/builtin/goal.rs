@@ -1,7 +1,7 @@
 use async_trait::async_trait;
+use kkagent_protocol::goal::{GoalBudget, GoalManager};
 use serde_json::Value;
 use std::sync::Arc;
-use kkagent_protocol::goal::{GoalManager, GoalBudget};
 
 use crate::{Tool, ToolContext, ToolOutput};
 
@@ -17,7 +17,9 @@ impl CreateGoalTool {
 
 #[async_trait]
 impl Tool for CreateGoalTool {
-    fn name(&self) -> &str { "CreateGoal" }
+    fn name(&self) -> &str {
+        "CreateGoal"
+    }
     fn description(&self) -> &str {
         "Create a new multi-turn goal that will drive autonomous execution across many turns."
     }
@@ -47,18 +49,24 @@ impl Tool for CreateGoalTool {
     }
 
     async fn execute(&self, input: Value, _ctx: &ToolContext) -> anyhow::Result<ToolOutput> {
-        let desc = input.get("description")
+        let desc = input
+            .get("description")
             .and_then(|v| v.as_str())
             .unwrap_or("Unnamed goal");
 
         let budget = GoalBudget {
-            turn_budget: input.get("turn_budget").and_then(|v| v.as_u64()).map(|v| v as u32),
+            turn_budget: input
+                .get("turn_budget")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u32),
             token_budget: input.get("token_budget").and_then(|v| v.as_u64()),
             wall_clock_budget_ms: input.get("wall_clock_budget_ms").and_then(|v| v.as_u64()),
         };
 
         let goal = self.goal_mgr.create_goal(desc, budget).await;
-        Ok(ToolOutput::success(serde_json::to_string_pretty(&goal).unwrap_or_default()))
+        Ok(ToolOutput::success(
+            serde_json::to_string_pretty(&goal).unwrap_or_default(),
+        ))
     }
 }
 
@@ -74,7 +82,9 @@ impl GetGoalTool {
 
 #[async_trait]
 impl Tool for GetGoalTool {
-    fn name(&self) -> &str { "GetGoal" }
+    fn name(&self) -> &str {
+        "GetGoal"
+    }
     fn description(&self) -> &str {
         "Get the current goal status, budget usage, and progress."
     }
@@ -84,11 +94,15 @@ impl Tool for GetGoalTool {
             "properties": {}
         })
     }
-    fn read_only(&self) -> bool { true }
+    fn read_only(&self) -> bool {
+        true
+    }
 
     async fn execute(&self, _input: Value, _ctx: &ToolContext) -> anyhow::Result<ToolOutput> {
         match self.goal_mgr.get_goal().await {
-            Some(goal) => Ok(ToolOutput::success(serde_json::to_string_pretty(&goal).unwrap_or_default())),
+            Some(goal) => Ok(ToolOutput::success(
+                serde_json::to_string_pretty(&goal).unwrap_or_default(),
+            )),
             None => Ok(ToolOutput::success("No active goal.")),
         }
     }
@@ -106,7 +120,9 @@ impl UpdateGoalTool {
 
 #[async_trait]
 impl Tool for UpdateGoalTool {
-    fn name(&self) -> &str { "UpdateGoal" }
+    fn name(&self) -> &str {
+        "UpdateGoal"
+    }
     fn description(&self) -> &str {
         "Update the goal status: complete, fail, pause, or resume."
     }
@@ -130,7 +146,10 @@ impl Tool for UpdateGoalTool {
 
     async fn execute(&self, input: Value, _ctx: &ToolContext) -> anyhow::Result<ToolOutput> {
         let status = input.get("status").and_then(|v| v.as_str()).unwrap_or("");
-        let reason = input.get("reason").and_then(|v| v.as_str()).unwrap_or("No reason given");
+        let reason = input
+            .get("reason")
+            .and_then(|v| v.as_str())
+            .unwrap_or("No reason given");
 
         match status {
             "complete" => {
@@ -198,13 +217,21 @@ impl Tool for SetGoalBudgetTool {
         };
 
         let mut budget = goal.budget.clone();
-        if input.as_object().map(|o| o.contains_key("turn_budget")).unwrap_or(false) {
+        if input
+            .as_object()
+            .map(|o| o.contains_key("turn_budget"))
+            .unwrap_or(false)
+        {
             budget.turn_budget = input
                 .get("turn_budget")
                 .and_then(|v| v.as_u64())
                 .map(|v| v as u32);
         }
-        if input.as_object().map(|o| o.contains_key("token_budget")).unwrap_or(false) {
+        if input
+            .as_object()
+            .map(|o| o.contains_key("token_budget"))
+            .unwrap_or(false)
+        {
             budget.token_budget = input.get("token_budget").and_then(|v| v.as_u64());
         }
         if input
@@ -212,7 +239,8 @@ impl Tool for SetGoalBudgetTool {
             .map(|o| o.contains_key("wall_clock_budget_ms"))
             .unwrap_or(false)
         {
-            budget.wall_clock_budget_ms = input.get("wall_clock_budget_ms").and_then(|v| v.as_u64());
+            budget.wall_clock_budget_ms =
+                input.get("wall_clock_budget_ms").and_then(|v| v.as_u64());
         }
 
         self.goal_mgr.update_budget(budget).await;

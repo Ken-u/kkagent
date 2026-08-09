@@ -48,7 +48,10 @@ impl SessionInitService {
     }
 
     /// Write AGENTS.md if missing. Returns path + whether created.
-    pub async fn generate_agents_md(&self, cwd: &Path) -> anyhow::Result<(std::path::PathBuf, bool)> {
+    pub async fn generate_agents_md(
+        &self,
+        cwd: &Path,
+    ) -> anyhow::Result<(std::path::PathBuf, bool)> {
         if self.cancelled.load(std::sync::atomic::Ordering::SeqCst) {
             anyhow::bail!("init cancelled");
         }

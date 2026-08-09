@@ -51,7 +51,9 @@ impl WireMigration for MigrateV10ToV11 {
             return record;
         };
         for tc in arr.iter_mut() {
-            let Some(obj) = tc.as_object_mut() else { continue };
+            let Some(obj) = tc.as_object_mut() else {
+                continue;
+            };
             if let Some(func) = obj.remove("function") {
                 if let Some(f) = func.as_object() {
                     if let Some(name) = f.get("name") {
@@ -135,11 +137,7 @@ impl WireMigration for MigrateV13ToV14 {
                 let mut fields = Map::new();
                 fields.insert(
                     "goalId".into(),
-                    record
-                        .fields
-                        .get("goalId")
-                        .cloned()
-                        .unwrap_or(Value::Null),
+                    record.fields.get("goalId").cloned().unwrap_or(Value::Null),
                 );
                 fields.insert("status".into(), json!("active"));
                 if let Some(t) = record.fields.get("tokensUsed") {
@@ -179,11 +177,7 @@ impl WireMigration for MigrateV14ToV15 {
     fn migrate_record(&self, mut record: WireMigrationRecord) -> WireMigrationRecord {
         let advances = record.record_type == "goal.create"
             || (record.record_type == "goal.update"
-                && (record
-                    .fields
-                    .get("status")
-                    .and_then(|s| s.as_str())
-                    == Some("active")
+                && (record.fields.get("status").and_then(|s| s.as_str()) == Some("active")
                     || (record.fields.get("status").is_none()
                         && record.fields.get("wallClockMs").is_some())));
         if !advances {
@@ -244,7 +238,9 @@ pub fn is_newer_wire_version(read_version: &str) -> bool {
     compare_wire_versions(read_version, WIRE_PROTOCOL_VERSION) > 0
 }
 
-pub fn resolve_wire_migrations(read_version: &str) -> Result<Vec<&'static dyn WireMigration>, WireError> {
+pub fn resolve_wire_migrations(
+    read_version: &str,
+) -> Result<Vec<&'static dyn WireMigration>, WireError> {
     if compare_wire_versions(read_version, WIRE_PROTOCOL_VERSION) >= 0 {
         return Ok(Vec::new());
     }

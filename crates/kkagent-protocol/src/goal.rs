@@ -1,8 +1,8 @@
+use chrono::Utc;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use chrono::Utc;
-use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
@@ -83,11 +83,7 @@ impl GoalManager {
         }
     }
 
-    pub async fn create_goal(
-        &self,
-        description: &str,
-        budget: GoalBudget,
-    ) -> Goal {
+    pub async fn create_goal(&self, description: &str, budget: GoalBudget) -> Goal {
         let now = Utc::now().to_rfc3339();
         let goal = Goal {
             goal_id: uuid::Uuid::new_v4().to_string(),
@@ -135,9 +131,7 @@ impl GoalManager {
     pub async fn should_continue(&self) -> bool {
         let guard = self.current_goal.lock().await;
         match &*guard {
-            Some(goal) => {
-                goal.status == GoalStatus::Active && !goal.is_budget_exhausted()
-            }
+            Some(goal) => goal.status == GoalStatus::Active && !goal.is_budget_exhausted(),
             None => false,
         }
     }

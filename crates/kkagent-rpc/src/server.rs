@@ -1,14 +1,19 @@
+use bytes::BytesMut;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
-use bytes::BytesMut;
 
-use kkagent_protocol::Frame;
 use crate::codec::NdjsonCodec;
 use crate::transport::AsyncTransport;
+use kkagent_protocol::Frame;
 
 pub type RequestHandler = Arc<
-    dyn Fn(String, String, Option<serde_json::Value>, mpsc::Sender<Frame>) -> futures::future::BoxFuture<'static, Result<serde_json::Value, (i32, String)>>
+    dyn Fn(
+            String,
+            String,
+            Option<serde_json::Value>,
+            mpsc::Sender<Frame>,
+        ) -> futures::future::BoxFuture<'static, Result<serde_json::Value, (i32, String)>>
         + Send
         + Sync,
 >;

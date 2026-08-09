@@ -63,7 +63,9 @@ impl SkillCatalog {
         if entries.is_empty() {
             return String::new();
         }
-        let mut out = String::from("\n\n# Available Skills\n\nUse the Skill tool to load a skill by name when relevant.\n");
+        let mut out = String::from(
+            "\n\n# Available Skills\n\nUse the Skill tool to load a skill by name when relevant.\n",
+        );
         for e in entries {
             out.push_str(&format!("- `{}`: {}\n", e.name, e.description));
         }
@@ -190,10 +192,7 @@ impl Tool for SkillTool {
         }
         match self.catalog.load(name).await {
             Ok((entry, content)) => {
-                let args = input
-                    .get("args")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
+                let args = input.get("args").and_then(|v| v.as_str()).unwrap_or("");
                 let mut out = format!("# Skill: {}\n\n{}", entry.name, content);
                 if !args.is_empty() {
                     out.push_str(&format!("\n\n## Invoked with args\n\n{}", args));

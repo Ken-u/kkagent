@@ -63,8 +63,7 @@ pub fn generate_pkce() -> PkcePair {
     let verifier = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw);
     let mut hasher = Sha256::new();
     hasher.update(verifier.as_bytes());
-    let challenge =
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hasher.finalize());
+    let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hasher.finalize());
     PkcePair {
         verifier,
         challenge,
@@ -114,7 +113,11 @@ pub async fn exchange_code(
         let t = resp.text().await.unwrap_or_default();
         return Err(OAuthError::Unauthorized(t));
     }
-    parse_token_response(resp.json().await.map_err(|e| OAuthError::Connection(e.to_string()))?)
+    parse_token_response(
+        resp.json()
+            .await
+            .map_err(|e| OAuthError::Connection(e.to_string()))?,
+    )
 }
 
 pub async fn refresh_access_token(
@@ -140,7 +143,11 @@ pub async fn refresh_access_token(
         let t = resp.text().await.unwrap_or_default();
         return Err(OAuthError::Unauthorized(t));
     }
-    parse_token_response(resp.json().await.map_err(|e| OAuthError::Connection(e.to_string()))?)
+    parse_token_response(
+        resp.json()
+            .await
+            .map_err(|e| OAuthError::Connection(e.to_string()))?,
+    )
 }
 
 pub async fn request_device_authorization(
@@ -162,7 +169,9 @@ pub async fn request_device_authorization(
         .await
         .map_err(|e| OAuthError::Connection(e.to_string()))?;
     if !resp.status().is_success() {
-        return Err(OAuthError::Connection(resp.text().await.unwrap_or_default()));
+        return Err(OAuthError::Connection(
+            resp.text().await.unwrap_or_default(),
+        ));
     }
     let v: serde_json::Value = resp
         .json()
@@ -239,10 +248,7 @@ fn parse_token_response(v: serde_json::Value) -> Result<TokenInfo, OAuthError> {
             .unwrap_or("Bearer")
             .to_string(),
         expires_at: expires_in.map(|s| Utc::now() + chrono::Duration::seconds(s)),
-        scope: v
-            .get("scope")
-            .and_then(|x| x.as_str())
-            .map(str::to_string),
+        scope: v.get("scope").and_then(|x| x.as_str()).map(str::to_string),
     })
 }
 

@@ -127,10 +127,7 @@ impl<R: Send + 'static> ToolScheduler<R> {
         });
     }
 
-    fn start_queued_locked(
-        inner: &Arc<Mutex<SchedulerState<R>>>,
-        state: &mut SchedulerState<R>,
-    ) {
+    fn start_queued_locked(inner: &Arc<Mutex<SchedulerState<R>>>, state: &mut SchedulerState<R>) {
         let queued = std::mem::take(&mut state.queued);
         let mut still = Vec::new();
         for task in queued {

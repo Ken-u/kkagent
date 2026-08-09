@@ -3,14 +3,25 @@
 use std::path::Path;
 
 const SENSITIVE_PATTERNS: &[&str] = &[
-    ".env", "id_rsa", "id_ed25519", "id_ecdsa", ".pem", "credentials", "secret", ".key",
-    "token", ".netrc", ".npmrc", "aws/credentials", "gcloud/credentials",
+    ".env",
+    "id_rsa",
+    "id_ed25519",
+    "id_ecdsa",
+    ".pem",
+    "credentials",
+    "secret",
+    ".key",
+    "token",
+    ".netrc",
+    ".npmrc",
+    "aws/credentials",
+    "gcloud/credentials",
 ];
 
 const BINARY_EXTS: &[&str] = &[
-    "png", "jpg", "jpeg", "gif", "webp", "bmp", "ico", "pdf", "zip", "gz", "tar", "7z",
-    "exe", "dll", "so", "dylib", "bin", "wasm", "mp4", "mov", "avi", "mkv", "mp3", "wav",
-    "woff", "woff2", "ttf", "otf", "class", "o", "a", "pyc", "pyo",
+    "png", "jpg", "jpeg", "gif", "webp", "bmp", "ico", "pdf", "zip", "gz", "tar", "7z", "exe",
+    "dll", "so", "dylib", "bin", "wasm", "mp4", "mov", "avi", "mkv", "mp3", "wav", "woff", "woff2",
+    "ttf", "otf", "class", "o", "a", "pyc", "pyo",
 ];
 
 pub fn is_sensitive_path(path: &Path) -> bool {

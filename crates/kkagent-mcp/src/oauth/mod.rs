@@ -142,9 +142,10 @@ pub async fn exchange_code_for_tokens(
             .get("refresh_token")
             .and_then(|v| v.as_str())
             .map(String::from),
-        expires_at: value.get("expires_in").and_then(|v| v.as_u64()).map(|secs| {
-            chrono::Utc::now().timestamp() + secs as i64
-        }),
+        expires_at: value
+            .get("expires_in")
+            .and_then(|v| v.as_u64())
+            .map(|secs| chrono::Utc::now().timestamp() + secs as i64),
         token_type: value
             .get("token_type")
             .and_then(|v| v.as_str())
@@ -164,17 +165,10 @@ pub async fn discover_auth_metadata(resource_url: &str) -> Result<AuthMetadata> 
     let mut candidates = Vec::new();
     if let Some(host) = base.host_str() {
         let origin = format!("{}://{}", base.scheme(), host);
-        let port = base
-            .port()
-            .map(|p| format!(":{p}"))
-            .unwrap_or_default();
+        let port = base.port().map(|p| format!(":{p}")).unwrap_or_default();
         let origin = format!("{origin}{port}");
-        candidates.push(format!(
-            "{origin}/.well-known/oauth-protected-resource"
-        ));
-        candidates.push(format!(
-            "{origin}/.well-known/oauth-authorization-server"
-        ));
+        candidates.push(format!("{origin}/.well-known/oauth-protected-resource"));
+        candidates.push(format!("{origin}/.well-known/oauth-authorization-server"));
     }
     // Also try path-based well-known
     candidates.push(format!(
@@ -354,8 +348,7 @@ mod sha2_compat {
     }
 
     fn base64url(data: &[u8]) -> String {
-        const T: &[u8] =
-            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
         let mut out = String::new();
         let mut i = 0;
         while i + 3 <= data.len() {
@@ -503,9 +496,7 @@ pub async fn interactive_oauth_login(
 
     let (verifier, challenge) = generate_pkce();
     let state = uuid::Uuid::new_v4().to_string();
-    let scopes = oauth_cfg
-        .map(|c| c.scopes.clone())
-        .unwrap_or_default();
+    let scopes = oauth_cfg.map(|c| c.scopes.clone()).unwrap_or_default();
     let auth_url = build_authorize_url(
         &metadata,
         &client_info.client_id,
@@ -538,9 +529,7 @@ pub async fn interactive_oauth_login(
         Some(&verifier),
     )
     .await?;
-    store
-        .write_tokens(server_name, server_url, &tokens)
-        .await?;
+    store.write_tokens(server_name, server_url, &tokens).await?;
     Ok(tokens)
 }
 

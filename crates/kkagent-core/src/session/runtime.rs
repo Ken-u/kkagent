@@ -1,10 +1,10 @@
-use tokio::sync::{mpsc, oneshot};
-use kkagent_llm::{ChatMessage, ChatContent};
+use kkagent_llm::{ChatContent, ChatMessage};
 use kkagent_protocol::{ApprovalResponse, PermissionMode, QuestionResponse};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::session::instructions::SessionInstructionsProvider;
 use crate::session::lifecycle::SessionCreateSource;
@@ -223,15 +223,12 @@ impl Session {
 
     /// Snapshot file contents before Write/Edit (once per path per turn).
     pub async fn record_pre_change(&mut self, path: PathBuf) {
-        if self
-            .current_turn_changes
-            .iter()
-            .any(|c| c.path == path)
-        {
+        if self.current_turn_changes.iter().any(|c| c.path == path) {
             return;
         }
         let previous = tokio::fs::read(&path).await.ok();
-        self.current_turn_changes.push(FileChange { path, previous });
+        self.current_turn_changes
+            .push(FileChange { path, previous });
     }
 
     /// Undo the last completed turn: restore files + truncate messages.
@@ -358,10 +355,7 @@ impl Session {
                 Ok(Some(resp)) => {
                     if resp.approval_id == approval_id
                         || resp.approval_id.is_empty()
-                        || matches!(
-                            resp.decision,
-                            kkagent_protocol::ApprovalDecision::Cancelled
-                        )
+                        || matches!(resp.decision, kkagent_protocol::ApprovalDecision::Cancelled)
                     {
                         return resp;
                     }
@@ -428,7 +422,9 @@ impl Session {
     pub async fn inject_workspace_instructions(&mut self) {
         if let Some(file) = SessionInstructionsProvider::load(&self.working_dir).await {
             self.system_prompt
-                .push_str(&SessionInstructionsProvider::format_for_system_prompt(&file));
+                .push_str(&SessionInstructionsProvider::format_for_system_prompt(
+                    &file,
+                ));
         }
     }
 
@@ -440,9 +436,8 @@ impl Session {
 
     pub fn inject_date_reminder(&mut self) {
         let today = chrono::Local::now().format("%Y-%m-%d (%A)");
-        self.system_prompt.push_str(&format!(
-            "\n\n# Date\n\nToday's date is {today}.\n"
-        ));
+        self.system_prompt
+            .push_str(&format!("\n\n# Date\n\nToday's date is {today}.\n"));
     }
 }
 
@@ -463,9 +458,7 @@ fn resolve_session_dir(
                 } else {
                     let dir = store
                         .session_dir_for(id, working_dir)
-                        .unwrap_or_else(|_| {
-                            store.sessions_dir.join(&workspace_id).join(id)
-                        });
+                        .unwrap_or_else(|_| store.sessions_dir.join(&workspace_id).join(id));
                     let _ = std::fs::create_dir_all(&dir);
                     (dir, workspace_id)
                 }
@@ -480,9 +473,7 @@ fn resolve_session_dir(
                     Err(_) => {
                         let dir = store
                             .session_dir_for(id, working_dir)
-                            .unwrap_or_else(|_| {
-                                store.sessions_dir.join(&workspace_id).join(id)
-                            });
+                            .unwrap_or_else(|_| store.sessions_dir.join(&workspace_id).join(id));
                         let _ = std::fs::create_dir_all(&dir);
                         (dir, workspace_id)
                     }

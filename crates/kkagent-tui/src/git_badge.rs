@@ -61,7 +61,13 @@ pub fn git_badge(cwd: &Path) -> GitBadge {
 
 fn probe(cwd: &Path) -> GitBadge {
     let branch = Command::new("git")
-        .args(["-C", &cwd.to_string_lossy(), "rev-parse", "--abbrev-ref", "HEAD"])
+        .args([
+            "-C",
+            &cwd.to_string_lossy(),
+            "rev-parse",
+            "--abbrev-ref",
+            "HEAD",
+        ])
         .output()
         .ok()
         .filter(|o| o.status.success())

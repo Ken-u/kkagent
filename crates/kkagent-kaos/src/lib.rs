@@ -208,7 +208,9 @@ impl Environment for SshKaos {
             .await
             .map_err(|e| KaosError::Ssh(e.to_string()))?;
         if !output.status.success() {
-            return Err(KaosError::Ssh(String::from_utf8_lossy(&output.stderr).into()));
+            return Err(KaosError::Ssh(
+                String::from_utf8_lossy(&output.stderr).into(),
+            ));
         }
         let data = tokio::fs::read(&tmp)
             .await
@@ -241,7 +243,9 @@ impl Environment for SshKaos {
             .map_err(|e| KaosError::Ssh(e.to_string()))?;
         let _ = tokio::fs::remove_file(&tmp).await;
         if !output.status.success() {
-            return Err(KaosError::Ssh(String::from_utf8_lossy(&output.stderr).into()));
+            return Err(KaosError::Ssh(
+                String::from_utf8_lossy(&output.stderr).into(),
+            ));
         }
         Ok(())
     }
@@ -249,7 +253,10 @@ impl Environment for SshKaos {
     async fn exists(&self, path: &Path) -> Result<bool, KaosError> {
         let r = self
             .exec(
-                &format!("test -e {} && echo yes || echo no", shell_quote(&path.to_string_lossy())),
+                &format!(
+                    "test -e {} && echo yes || echo no",
+                    shell_quote(&path.to_string_lossy())
+                ),
                 None,
             )
             .await?;

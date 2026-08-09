@@ -102,9 +102,7 @@ pub fn tokenize(input: &str) -> Vec<Token> {
                 let mut s = String::new();
                 while i < chars.len() {
                     let ch = chars[i];
-                    if ch.is_whitespace()
-                        || matches!(ch, '|' | '&' | ';' | '(' | ')' | '<' | '>')
-                    {
+                    if ch.is_whitespace() || matches!(ch, '|' | '&' | ';' | '(' | ')' | '<' | '>') {
                         break;
                     }
                     s.push(ch);
@@ -126,7 +124,10 @@ fn parse_script(tokens: &[Token]) -> AstNode {
     let mut stmts = Vec::new();
     let mut start = 0usize;
     for (i, t) in tokens.iter().enumerate() {
-        if matches!(t, Token::Semi | Token::Newline | Token::AndAnd | Token::OrOr) {
+        if matches!(
+            t,
+            Token::Semi | Token::Newline | Token::AndAnd | Token::OrOr
+        ) {
             if start < i {
                 stmts.push(parse_pipeline(&tokens[start..i]));
             }

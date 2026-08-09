@@ -24,10 +24,7 @@ impl SessionMcpHandle {
     }
 
     pub fn set(&self, connections: Vec<McpConnectionView>) {
-        *self
-            .connections
-            .write()
-            .unwrap_or_else(|e| e.into_inner()) = connections;
+        *self.connections.write().unwrap_or_else(|e| e.into_inner()) = connections;
     }
 
     pub fn list(&self) -> Vec<McpConnectionView> {
@@ -38,9 +35,6 @@ impl SessionMcpHandle {
     }
 
     pub fn tool_names(&self) -> Vec<String> {
-        self.list()
-            .into_iter()
-            .flat_map(|c| c.tools)
-            .collect()
+        self.list().into_iter().flat_map(|c| c.tools).collect()
     }
 }

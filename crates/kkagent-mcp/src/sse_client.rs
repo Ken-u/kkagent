@@ -8,7 +8,7 @@ use anyhow::{anyhow, Context, Result};
 use futures::StreamExt;
 use reqwest_eventsource::{Event, EventSource};
 use serde_json::Value;
-use tokio::sync::{mpsc, Mutex, oneshot};
+use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::time::timeout;
 
 struct Pending {
@@ -68,7 +68,9 @@ impl SseMcpClient {
                     Ok(Event::Message(msg)) => {
                         let event_name = msg.event;
                         let data = msg.data;
-                        if event_name == "endpoint" || event_name.is_empty() && data.starts_with("http") {
+                        if event_name == "endpoint"
+                            || event_name.is_empty() && data.starts_with("http")
+                        {
                             let endpoint = data.trim().to_string();
                             let absolute = if endpoint.starts_with("http") {
                                 endpoint
@@ -200,9 +202,7 @@ impl SseMcpClient {
     }
 
     pub async fn list_tools(&self) -> Result<Vec<crate::client::McpToolInfo>> {
-        let result = self
-            .request("tools/list", serde_json::json!({}))
-            .await?;
+        let result = self.request("tools/list", serde_json::json!({})).await?;
         let tools = result
             .get("tools")
             .and_then(|t| t.as_array())

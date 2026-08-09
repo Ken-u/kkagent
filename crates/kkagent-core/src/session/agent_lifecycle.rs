@@ -152,7 +152,9 @@ mod tests {
     fn main_and_fork() {
         let svc = AgentLifecycleService::new();
         assert!(svc.get(MAIN_AGENT_ID).is_some());
-        let child = svc.fork(MAIN_AGENT_ID, CreateAgentOptions::default()).unwrap();
+        let child = svc
+            .fork(MAIN_AGENT_ID, CreateAgentOptions::default())
+            .unwrap();
         assert_eq!(child.forked_from.as_deref(), Some(MAIN_AGENT_ID));
         assert_eq!(svc.list(None).len(), 2);
     }

@@ -1,6 +1,6 @@
-use rusqlite::{Connection, params};
-use std::path::Path;
 use chrono::Utc;
+use rusqlite::{params, Connection};
+use std::path::Path;
 
 pub struct TranscriptDb {
     conn: Connection,
@@ -83,7 +83,7 @@ impl TranscriptDb {
 
             CREATE INDEX IF NOT EXISTS idx_sessions_updated
                 ON sessions(updated_at DESC);
-            "
+            ",
         )?;
         Ok(())
     }
@@ -137,7 +137,7 @@ impl TranscriptDb {
     pub fn load_messages(&self, session_id: &str) -> anyhow::Result<Vec<MessageRecord>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, session_id, role, content_json, token_count, created_at
-             FROM messages WHERE session_id = ?1 ORDER BY id"
+             FROM messages WHERE session_id = ?1 ORDER BY id",
         )?;
         let rows = stmt.query_map(params![session_id], |row| {
             Ok(MessageRecord {
@@ -161,7 +161,7 @@ impl TranscriptDb {
             "SELECT session_id, title, model, working_dir, created_at, updated_at,
                     message_count, is_archived
              FROM sessions WHERE is_archived = 0
-             ORDER BY updated_at DESC LIMIT ?1"
+             ORDER BY updated_at DESC LIMIT ?1",
         )?;
         let rows = stmt.query_map(params![limit as u32], |row| {
             Ok(SessionRecord {
@@ -186,7 +186,7 @@ impl TranscriptDb {
         let mut stmt = self.conn.prepare(
             "SELECT session_id, title, model, working_dir, created_at, updated_at,
                     message_count, is_archived
-             FROM sessions WHERE session_id = ?1"
+             FROM sessions WHERE session_id = ?1",
         )?;
         let mut rows = stmt.query_map(params![session_id], |row| {
             Ok(SessionRecord {
@@ -300,8 +300,15 @@ mod tests {
         let db = test_db();
         db.create_session("s1", "claude", ".").unwrap();
 
-        db.append_message("s1", "user", r#"[{"type":"text","text":"hello"}]"#, Some(5)).unwrap();
-        db.append_message("s1", "assistant", r#"[{"type":"text","text":"hi"}]"#, Some(3)).unwrap();
+        db.append_message("s1", "user", r#"[{"type":"text","text":"hello"}]"#, Some(5))
+            .unwrap();
+        db.append_message(
+            "s1",
+            "assistant",
+            r#"[{"type":"text","text":"hi"}]"#,
+            Some(3),
+        )
+        .unwrap();
 
         let messages = db.load_messages("s1").unwrap();
         assert_eq!(messages.len(), 2);
@@ -338,15 +345,23 @@ mod tests {
         db.create_session("s1", "claude", ".").unwrap();
 
         for i in 0..10 {
-            db.append_message("s1", "user", &format!(r#"[{{"type":"text","text":"msg{}"}}]"#, i), None).unwrap();
+            db.append_message(
+                "s1",
+                "user",
+                &format!(r#"[{{"type":"text","text":"msg{}"}}]"#, i),
+                None,
+            )
+            .unwrap();
         }
 
-        let deleted = db.compact_session("s1", 3, "Summary of first 7 messages").unwrap();
+        let deleted = db
+            .compact_session("s1", 3, "Summary of first 7 messages")
+            .unwrap();
         assert_eq!(deleted, 7);
 
         let messages = db.load_messages("s1").unwrap();
         assert_eq!(messages.len(), 4); // 3 kept + 1 summary
-        // Last 3 original messages are kept, summary is inserted with a new ID
+                                       // Last 3 original messages are kept, summary is inserted with a new ID
         let has_summary = messages.iter().any(|m| m.role == "system");
         assert!(has_summary, "Should have a summary system message");
     }

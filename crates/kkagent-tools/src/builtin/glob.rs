@@ -1,7 +1,7 @@
+use crate::{Tool, ToolContext, ToolOutput};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::path::Path;
-use crate::{Tool, ToolContext, ToolOutput};
 
 pub struct GlobTool;
 
@@ -9,12 +9,16 @@ const DEFAULT_MAX: usize = 100;
 
 #[async_trait]
 impl Tool for GlobTool {
-    fn name(&self) -> &str { "Glob" }
+    fn name(&self) -> &str {
+        "Glob"
+    }
     fn description(&self) -> &str {
         "Find files matching a glob pattern. Respects .gitignore unless include_ignored is true. \
 Returns paths sorted by modification time (newest first)."
     }
-    fn read_only(&self) -> bool { true }
+    fn read_only(&self) -> bool {
+        true
+    }
     fn parameters_schema(&self) -> Value {
         json!({
             "type": "object",
@@ -29,10 +33,11 @@ Returns paths sorted by modification time (newest first)."
     }
 
     async fn execute(&self, input: Value, ctx: &ToolContext) -> anyhow::Result<ToolOutput> {
-        let pattern = input.get("pattern").and_then(|v| v.as_str())
+        let pattern = input
+            .get("pattern")
+            .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'pattern'"))?;
-        let root = input.get("path").and_then(|v| v.as_str())
-            .unwrap_or(".");
+        let root = input.get("path").and_then(|v| v.as_str()).unwrap_or(".");
         let include_ignored = input
             .get("include_ignored")
             .and_then(|v| v.as_bool())
@@ -82,10 +87,7 @@ Returns paths sorted by modification time (newest first)."
             if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
                 continue;
             }
-            let rel = entry
-                .path()
-                .strip_prefix(&root_dir)
-                .unwrap_or(entry.path());
+            let rel = entry.path().strip_prefix(&root_dir).unwrap_or(entry.path());
             if matcher.is_match(rel) {
                 let mtime = entry
                     .metadata()

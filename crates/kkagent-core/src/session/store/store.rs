@@ -1,7 +1,8 @@
 //! On-disk session store — create / list / fork / archive / rename / delete.
 
 use super::index::{
-    append_session_index_deletion, append_session_index_entry, read_session_index, SessionIndexEntry,
+    append_session_index_deletion, append_session_index_entry, read_session_index,
+    SessionIndexEntry,
 };
 use super::workdir_key::{encode_work_dir_key, is_safe_session_id, normalize_work_dir};
 use crate::session::metadata::{SessionMeta, SessionMetaPatch, SessionMetadataService};
@@ -101,7 +102,11 @@ impl SessionStore {
         Ok(summary_from_meta(id, &dir, &work, meta.read()))
     }
 
-    pub fn list(&self, include_archived: bool, limit: usize) -> anyhow::Result<Vec<SessionSummary>> {
+    pub fn list(
+        &self,
+        include_archived: bool,
+        limit: usize,
+    ) -> anyhow::Result<Vec<SessionSummary>> {
         let index = read_session_index(&self.home_dir, &self.sessions_dir)?;
         let mut out = Vec::new();
         for (id, entry) in index {
@@ -224,7 +229,12 @@ impl SessionStore {
                 work_dir: work.to_string_lossy().into(),
             },
         )?;
-        Ok(summary_from_meta(target_id, &target_dir, &work, meta.read()))
+        Ok(summary_from_meta(
+            target_id,
+            &target_dir,
+            &work,
+            meta.read(),
+        ))
     }
 
     fn find_entry(&self, id: &str) -> anyhow::Result<Option<SessionIndexEntry>> {
@@ -269,17 +279,35 @@ fn truncate_transcript_at_turn(session_dir: &Path, turn_index: usize) -> anyhow:
         let text = std::fs::read_to_string(&journal)?;
         let lines: Vec<&str> = text.lines().collect();
         // Keep roughly first N turn markers; if unknown format, keep first 2*(turn+1) lines.
-        let keep = lines.len().min((turn_index.saturating_add(1)).saturating_mul(8));
+        let keep = lines
+            .len()
+            .min((turn_index.saturating_add(1)).saturating_mul(8));
         let out = lines[..keep].join("\n");
-        std::fs::write(&journal, if out.is_empty() { out } else { format!("{out}\n") })?;
+        std::fs::write(
+            &journal,
+            if out.is_empty() {
+                out
+            } else {
+                format!("{out}\n")
+            },
+        )?;
     }
     let msgs = session_dir.join("messages.jsonl");
     if msgs.is_file() {
         let text = std::fs::read_to_string(&msgs)?;
         let lines: Vec<&str> = text.lines().collect();
-        let keep = lines.len().min(turn_index.saturating_add(1).saturating_mul(2));
+        let keep = lines
+            .len()
+            .min(turn_index.saturating_add(1).saturating_mul(2));
         let out = lines[..keep].join("\n");
-        std::fs::write(&msgs, if out.is_empty() { out } else { format!("{out}\n") })?;
+        std::fs::write(
+            &msgs,
+            if out.is_empty() {
+                out
+            } else {
+                format!("{out}\n")
+            },
+        )?;
     }
     Ok(())
 }

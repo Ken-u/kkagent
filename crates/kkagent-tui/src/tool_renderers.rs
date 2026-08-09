@@ -177,12 +177,7 @@ fn media_summary(
     lines
 }
 
-fn goal_summary(
-    output: &str,
-    width: u16,
-    theme: &Theme,
-    max_preview: usize,
-) -> Vec<Line<'static>> {
+fn goal_summary(output: &str, width: u16, theme: &Theme, max_preview: usize) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     lines.push(Line::from(Span::styled(
         "  [goal]",

@@ -118,10 +118,10 @@ impl CloudAppender {
 
     async fn spill_failed(&self, events: &[EnrichedCloudEvent]) {
         let _ = tokio::fs::create_dir_all(&self.options.spill_dir).await;
-        let path = self
-            .options
-            .spill_dir
-            .join(format!("failed-{}.jsonl", chrono::Utc::now().timestamp_millis()));
+        let path = self.options.spill_dir.join(format!(
+            "failed-{}.jsonl",
+            chrono::Utc::now().timestamp_millis()
+        ));
         let mut body = String::new();
         for e in events {
             if let Ok(line) = serde_json::to_string(e) {

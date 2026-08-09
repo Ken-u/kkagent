@@ -216,16 +216,14 @@ mod tests {
         c.register_instance(Arc::new(Counter(std::sync::atomic::AtomicUsize::new(7))))
             .unwrap();
         let got = c.get::<Counter>().unwrap();
-        assert_eq!(
-            got.0.load(std::sync::atomic::Ordering::SeqCst),
-            7
-        );
+        assert_eq!(got.0.load(std::sync::atomic::Ordering::SeqCst), 7);
     }
 
     #[test]
     fn child_inherits_parent() {
         let root = ServiceContainer::new("root");
-        root.register_instance(Arc::new(String::from("hello"))).unwrap();
+        root.register_instance(Arc::new(String::from("hello")))
+            .unwrap();
         let child = root.create_child("child");
         assert_eq!(child.get::<String>().unwrap().as_str(), "hello");
     }

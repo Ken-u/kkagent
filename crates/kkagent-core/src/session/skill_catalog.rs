@@ -26,7 +26,10 @@ impl SessionSkillCatalog {
     }
 
     pub fn list(&self) -> Vec<SkillCatalogEntry> {
-        self.entries.read().unwrap_or_else(|e| e.into_inner()).clone()
+        self.entries
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     pub fn prompt_section(&self) -> String {

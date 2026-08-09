@@ -1,8 +1,8 @@
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::task::AbortHandle;
-use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
@@ -87,7 +87,10 @@ impl SubagentManager {
     }
 
     pub async fn set_abort_handle(&self, agent_id: &str, handle: AbortHandle) {
-        self.aborts.lock().await.insert(agent_id.to_string(), handle);
+        self.aborts
+            .lock()
+            .await
+            .insert(agent_id.to_string(), handle);
     }
 
     pub async fn complete(&self, agent_id: &str, result: String) {

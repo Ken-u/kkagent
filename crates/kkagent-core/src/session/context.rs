@@ -48,8 +48,16 @@ mod tests {
 
     #[test]
     fn scope_child() {
-        let ctx = SessionContext::new("s1", "wd_x", PathBuf::from("/tmp/s1"), PathBuf::from("/proj"));
+        let ctx = SessionContext::new(
+            "s1",
+            "wd_x",
+            PathBuf::from("/tmp/s1"),
+            PathBuf::from("/proj"),
+        );
         assert_eq!(ctx.scope(None), "sessions/wd_x/s1");
-        assert_eq!(ctx.scope(Some("agents/main")), "sessions/wd_x/s1/agents/main");
+        assert_eq!(
+            ctx.scope(Some("agents/main")),
+            "sessions/wd_x/s1/agents/main"
+        );
     }
 }

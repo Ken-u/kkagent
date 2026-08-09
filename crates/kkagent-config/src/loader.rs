@@ -1,5 +1,5 @@
-use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
+use std::path::{Path, PathBuf};
 
 use crate::AppConfig;
 
@@ -47,7 +47,9 @@ fn apply_env_overrides(config: &mut AppConfig) {
     // Inject API keys into first matching provider if empty
     if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
         for p in config.providers.values_mut() {
-            if p.provider_type == "anthropic" && p.api_key.as_ref().map(|s| s.is_empty()).unwrap_or(true) {
+            if p.provider_type == "anthropic"
+                && p.api_key.as_ref().map(|s| s.is_empty()).unwrap_or(true)
+            {
                 p.api_key = Some(key.clone());
             }
         }
@@ -71,7 +73,8 @@ fn apply_env_overrides(config: &mut AppConfig) {
         }
     }
     if let Ok(url) = std::env::var("KKAGENT_MOONSHOT_SEARCH_URL") {
-        let key = std::env::var("KKAGENT_MOONSHOT_SEARCH_KEY").ok()
+        let key = std::env::var("KKAGENT_MOONSHOT_SEARCH_KEY")
+            .ok()
             .or_else(|| std::env::var("MOONSHOT_API_KEY").ok());
         let services = config.services.get_or_insert_with(Default::default);
         services.moonshot_search = Some(crate::ServiceEndpoint {

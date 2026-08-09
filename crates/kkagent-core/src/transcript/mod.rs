@@ -1,3 +1,3 @@
 pub mod db;
 
-pub use db::{TranscriptDb, MessageRecord, SessionRecord};
+pub use db::{MessageRecord, SessionRecord, TranscriptDb};

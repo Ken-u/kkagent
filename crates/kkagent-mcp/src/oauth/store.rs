@@ -118,11 +118,8 @@ impl McpOAuthStore {
         server_name: &str,
         server_url: &str,
     ) -> Result<Option<DiscoveryState>> {
-        self.read_json(
-            &Self::store_key(server_name, server_url),
-            "-discovery.json",
-        )
-        .await
+        self.read_json(&Self::store_key(server_name, server_url), "-discovery.json")
+            .await
     }
 
     pub async fn write_discovery(

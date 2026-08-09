@@ -126,11 +126,7 @@ fn preview_line(text: &str, query: &str, max: usize) -> String {
     let q = query.to_lowercase();
     let idx = lower.find(&q).unwrap_or(0);
     let start = idx.saturating_sub(20);
-    let slice: String = text
-        .chars()
-        .skip(start)
-        .take(max)
-        .collect();
+    let slice: String = text.chars().skip(start).take(max).collect();
     let mut s = if start > 0 {
         format!("…{slice}")
     } else {

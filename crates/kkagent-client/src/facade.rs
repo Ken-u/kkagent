@@ -1,6 +1,6 @@
-use tokio::sync::mpsc;
-use kkagent_protocol::{Frame, ApprovalResponse, PermissionMode};
+use kkagent_protocol::{ApprovalResponse, Frame, PermissionMode};
 use kkagent_rpc::RpcClient;
+use tokio::sync::mpsc;
 
 pub struct KkagentClient {
     rpc: RpcClient,
@@ -21,9 +21,13 @@ impl KkagentClient {
             "workspace": workspace,
             "permission_mode": permission,
         });
-        let result = self.rpc.call("sessions.create", Some(params)).await
+        let result = self
+            .rpc
+            .call("sessions.create", Some(params))
+            .await
             .map_err(|e| anyhow::anyhow!("{}", e))?;
-        let session_id = result.get("session_id")
+        let session_id = result
+            .get("session_id")
             .and_then(|v| v.as_str())
             .unwrap_or("unknown")
             .to_string();
@@ -35,24 +39,34 @@ impl KkagentClient {
             "session_id": session_id,
             "text": text,
         });
-        self.rpc.call("session.prompt", Some(params)).await
+        self.rpc
+            .call("session.prompt", Some(params))
+            .await
             .map_err(|e| anyhow::anyhow!("{}", e))?;
         Ok(())
     }
 
     pub async fn interrupt(&self, session_id: &str) -> anyhow::Result<()> {
         let params = serde_json::json!({"session_id": session_id});
-        self.rpc.call("session.interrupt", Some(params)).await
+        self.rpc
+            .call("session.interrupt", Some(params))
+            .await
             .map_err(|e| anyhow::anyhow!("{}", e))?;
         Ok(())
     }
 
-    pub async fn set_permission_mode(&self, session_id: &str, mode: PermissionMode) -> anyhow::Result<()> {
+    pub async fn set_permission_mode(
+        &self,
+        session_id: &str,
+        mode: PermissionMode,
+    ) -> anyhow::Result<()> {
         let params = serde_json::json!({
             "session_id": session_id,
             "mode": mode,
         });
-        self.rpc.call("session.set_permission_mode", Some(params)).await
+        self.rpc
+            .call("session.set_permission_mode", Some(params))
+            .await
             .map_err(|e| anyhow::anyhow!("{}", e))?;
         Ok(())
     }
@@ -62,7 +76,9 @@ impl KkagentClient {
             "session_id": session_id,
             "enabled": enabled,
         });
-        self.rpc.call("session.set_plan_mode", Some(params)).await
+        self.rpc
+            .call("session.set_plan_mode", Some(params))
+            .await
             .map_err(|e| anyhow::anyhow!("{}", e))?;
         Ok(())
     }
@@ -76,7 +92,9 @@ impl KkagentClient {
         if let Some(obj) = params.as_object_mut() {
             obj.insert("session_id".into(), serde_json::json!(session_id));
         }
-        self.rpc.call("approval.respond", Some(params)).await
+        self.rpc
+            .call("approval.respond", Some(params))
+            .await
             .map_err(|e| anyhow::anyhow!("{}", e))?;
         Ok(())
     }
@@ -90,7 +108,9 @@ impl KkagentClient {
         if let Some(obj) = params.as_object_mut() {
             obj.insert("session_id".into(), serde_json::json!(session_id));
         }
-        self.rpc.call("question.respond", Some(params)).await
+        self.rpc
+            .call("question.respond", Some(params))
+            .await
             .map_err(|e| anyhow::anyhow!("{}", e))?;
         Ok(())
     }
@@ -100,13 +120,21 @@ impl KkagentClient {
             "session_id": session_id,
             "model": model,
         });
-        self.rpc.call("session.set_model", Some(params)).await
+        self.rpc
+            .call("session.set_model", Some(params))
+            .await
             .map_err(|e| anyhow::anyhow!("{}", e))?;
         Ok(())
     }
 
-    pub async fn rpc_call(&self, method: &str, params: Option<serde_json::Value>) -> anyhow::Result<serde_json::Value> {
-        self.rpc.call(method, params).await
+    pub async fn rpc_call(
+        &self,
+        method: &str,
+        params: Option<serde_json::Value>,
+    ) -> anyhow::Result<serde_json::Value> {
+        self.rpc
+            .call(method, params)
+            .await
             .map_err(|e| anyhow::anyhow!("{}", e))
     }
 }

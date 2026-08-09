@@ -1,5 +1,5 @@
-use std::path::{Path, PathBuf};
 use anyhow::Result;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
 pub struct SkillInfo {
@@ -43,7 +43,11 @@ impl SkillsManager {
                 self.skills.push(SkillInfo {
                     name: "AGENTS.md".to_string(),
                     path: agents_md,
-                    description: content.lines().next().unwrap_or("Project agents file").to_string(),
+                    description: content
+                        .lines()
+                        .next()
+                        .unwrap_or("Project agents file")
+                        .to_string(),
                 });
             }
         }
@@ -59,16 +63,23 @@ impl SkillsManager {
             if path.is_dir() {
                 let skill_file = path.join("SKILL.md");
                 if skill_file.exists() {
-                    let content = tokio::fs::read_to_string(&skill_file).await
+                    let content = tokio::fs::read_to_string(&skill_file)
+                        .await
                         .unwrap_or_default();
-                    let description = content.lines()
+                    let description = content
+                        .lines()
                         .find(|l| !l.trim().is_empty() && !l.starts_with('#'))
                         .unwrap_or("No description")
                         .to_string();
-                    let name = path.file_name()
+                    let name = path
+                        .file_name()
                         .map(|n| n.to_string_lossy().to_string())
                         .unwrap_or_default();
-                    self.skills.push(SkillInfo { name, path: skill_file, description });
+                    self.skills.push(SkillInfo {
+                        name,
+                        path: skill_file,
+                        description,
+                    });
                 }
             }
         }
@@ -80,7 +91,9 @@ impl SkillsManager {
     }
 
     pub async fn load_skill(&self, name: &str) -> Result<String> {
-        let skill = self.skills.iter()
+        let skill = self
+            .skills
+            .iter()
             .find(|s| s.name == name)
             .ok_or_else(|| anyhow::anyhow!("Skill not found: {}", name))?;
         let content = tokio::fs::read_to_string(&skill.path).await?;

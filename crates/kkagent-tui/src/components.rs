@@ -1,15 +1,18 @@
+use kkagent_config::AppConfig;
+use kkagent_protocol::{PermissionMode, SessionStatus};
 use ratatui::{
-    Frame,
     layout::{Constraint, Direction, Layout, Margin, Rect},
     style::{Modifier, Style},
     text::{Line, Span, Text},
     widgets::{Block, Borders, Clear, Paragraph},
+    Frame,
 };
-use kkagent_config::AppConfig;
-use kkagent_protocol::{PermissionMode, SessionStatus};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::app::{AppMode, AppState, DisplayPart, ListPickerState, MessageRole, PendingApproval, PendingQuestion, TodoItem};
+use crate::app::{
+    AppMode, AppState, DisplayPart, ListPickerState, MessageRole, PendingApproval, PendingQuestion,
+    TodoItem,
+};
 use crate::chrome;
 use crate::git_badge;
 use crate::panes::{self, BtwPane};
@@ -326,22 +329,20 @@ fn build_transcript_lines(state: &AppState, theme: &Theme, width: u16) -> Vec<Li
                                 }
                                 for (i, line) in text.lines().enumerate() {
                                     if first_bullet && i == 0 {
-                                        push_assistant_wrapped(&mut lines, line, width, theme, true);
+                                        push_assistant_wrapped(
+                                            &mut lines, line, width, theme, true,
+                                        );
                                         first_bullet = false;
                                     } else {
-                                        push_assistant_wrapped(&mut lines, line, width, theme, false);
+                                        push_assistant_wrapped(
+                                            &mut lines, line, width, theme, false,
+                                        );
                                     }
                                 }
                                 rendered_any = true;
                             }
                             DisplayPart::Tool(tc) => {
-                                render_tool_call_lines(
-                                    &mut lines,
-                                    tc,
-                                    width,
-                                    theme,
-                                    first_bullet,
-                                );
+                                render_tool_call_lines(&mut lines, tc, width, theme, first_bullet);
                                 first_bullet = false;
                                 rendered_any = true;
                             }
@@ -443,10 +444,7 @@ fn build_transcript_lines(state: &AppState, theme: &Theme, width: u16) -> Vec<Li
         SessionStatus::ToolExecuting => {
             let frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
             let ch = frames[(state.tick / 2) % frames.len()];
-            let tool = state
-                .last_tool_name
-                .as_deref()
-                .unwrap_or("tool");
+            let tool = state.last_tool_name.as_deref().unwrap_or("tool");
             lines.push(Line::from(Span::styled(
                 format!("● {} running {tool}", ch),
                 Style::default()
@@ -464,9 +462,7 @@ fn assistant_first_line(line: &str, theme: &Theme) -> Line<'static> {
     let trimmed = line.trim_start();
     // 第一条助手行带 ●
     if trimmed.starts_with('#') {
-        let rest = trimmed
-            .trim_start_matches('#')
-            .trim_start();
+        let rest = trimmed.trim_start_matches('#').trim_start();
         return Line::from(vec![
             Span::styled("● ", Style::default().fg(theme.text)),
             Span::styled(
@@ -615,9 +611,7 @@ fn todo_row_line(todo: &TodoItem, theme: &Theme) -> Line<'static> {
             Style::default()
                 .fg(theme.primary)
                 .add_modifier(Modifier::BOLD),
-            Style::default()
-                .fg(theme.text)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
         ),
         "completed" => (
             "✓",
@@ -782,7 +776,10 @@ fn style_markdown_line(line: &str, theme: &Theme) -> Line<'static> {
                 .add_modifier(Modifier::BOLD),
         ));
     }
-    if let Some(rest) = trimmed.strip_prefix("- ").or_else(|| trimmed.strip_prefix("* ")) {
+    if let Some(rest) = trimmed
+        .strip_prefix("- ")
+        .or_else(|| trimmed.strip_prefix("* "))
+    {
         return Line::from(vec![
             Span::raw("  "),
             Span::styled("• ", Style::default().fg(theme.text)),
@@ -812,7 +809,9 @@ fn render_input(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         AppMode::Normal => {
             if matches!(
                 state.status,
-                SessionStatus::Thinking | SessionStatus::ToolExecuting | SessionStatus::WaitingApproval
+                SessionStatus::Thinking
+                    | SessionStatus::ToolExecuting
+                    | SessionStatus::WaitingApproval
             ) {
                 theme.primary
             } else {
@@ -908,10 +907,7 @@ fn cursor_position(text: &str, cursor: usize, inner: Rect, prefix_w: u16) -> (u1
     while safe_cursor > 0 && !text.is_char_boundary(safe_cursor) {
         safe_cursor -= 1;
     }
-    let line_start = text[..safe_cursor]
-        .rfind('\n')
-        .map(|i| i + 1)
-        .unwrap_or(0);
+    let line_start = text[..safe_cursor].rfind('\n').map(|i| i + 1).unwrap_or(0);
     let before_cursor = &text[line_start..safe_cursor];
     let col = UnicodeWidthStr::width(before_cursor) as u16;
     let line_index = text[..safe_cursor].matches('\n').count() as u16;
@@ -1043,7 +1039,11 @@ fn render_footer(f: &mut Frame, area: Rect, state: &AppState, config: &AppConfig
     let context = format_context(state, config);
     let mut right = context;
     if let Some(ref sid) = state.session_id {
-        let short = if sid.len() > 8 { &sid[..8] } else { sid.as_str() };
+        let short = if sid.len() > 8 {
+            &sid[..8]
+        } else {
+            sid.as_str()
+        };
         right = format!("{right}  ·  {short}");
     }
     let ctx_w = UnicodeWidthStr::width(right.as_str()) as u16;
@@ -1103,7 +1103,12 @@ fn render_search_overlay(f: &mut Frame, size: Rect, state: &AppState, theme: &Th
 
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::from(vec![
-        Span::styled(" find ", Style::default().fg(theme.primary).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            " find ",
+            Style::default()
+                .fg(theme.primary)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled(
             format!(" {} ", state.search.query),
             Style::default().fg(theme.text_strong).bg(theme.border),
@@ -1112,7 +1117,15 @@ fn render_search_overlay(f: &mut Frame, size: Rect, state: &AppState, theme: &Th
             if state.search.query.is_empty() {
                 " type to search…".into()
             } else {
-                format!("  {}/{}", state.search.selected.saturating_add(1).min(state.search.hits.len().max(1)), state.search.hits.len())
+                format!(
+                    "  {}/{}",
+                    state
+                        .search
+                        .selected
+                        .saturating_add(1)
+                        .min(state.search.hits.len().max(1)),
+                    state.search.hits.len()
+                )
             },
             Style::default().fg(theme.text_muted),
         ),
@@ -1147,9 +1160,16 @@ fn render_search_overlay(f: &mut Frame, size: Rect, state: &AppState, theme: &Th
                 Span::styled(format!(" {marker} "), style),
                 Span::styled(
                     format!("{:8} ", hit.role),
-                    Style::default().fg(if selected { theme.accent } else { theme.text_muted }),
+                    Style::default().fg(if selected {
+                        theme.accent
+                    } else {
+                        theme.text_muted
+                    }),
                 ),
-                Span::styled(truncate(&hit.preview, (width as usize).saturating_sub(14)), style),
+                Span::styled(
+                    truncate(&hit.preview, (width as usize).saturating_sub(14)),
+                    style,
+                ),
             ]));
         }
     }
@@ -1187,10 +1207,7 @@ fn thinking_label(config: &AppConfig) -> Option<String> {
     if !t.enabled {
         return None;
     }
-    Some(format!(
-        "thinking: {}",
-        t.effort.as_deref().unwrap_or("on")
-    ))
+    Some(format!("thinking: {}", t.effort.as_deref().unwrap_or("on")))
 }
 
 fn format_context(state: &AppState, config: &AppConfig) -> String {
@@ -1293,7 +1310,10 @@ fn render_slash_menu(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
                 Span::styled(prefix, name_style),
                 Span::styled(padded, name_style),
                 Span::styled(
-                    truncate(&item.description, (inner.width as usize).saturating_sub(primary_w + 4)),
+                    truncate(
+                        &item.description,
+                        (inner.width as usize).saturating_sub(primary_w + 4),
+                    ),
                     Style::default().fg(theme.text_dim),
                 ),
             ]));
@@ -1350,7 +1370,11 @@ fn render_list_picker(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme
             let padded = if item.label.len() < primary_w {
                 format!("{:width$}", item.label, width = primary_w)
             } else {
-                let t: String = item.label.chars().take(primary_w.saturating_sub(1)).collect();
+                let t: String = item
+                    .label
+                    .chars()
+                    .take(primary_w.saturating_sub(1))
+                    .collect();
                 format!("{}…", t)
             };
             lines.push(Line::from(vec![
@@ -1429,13 +1453,19 @@ fn render_tasks_panel(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme
             if selected {
                 if let Some(ref r) = task.result {
                     lines.push(Line::from(Span::styled(
-                        format!("    {}", truncate(r, (inner.width as usize).saturating_sub(4))),
+                        format!(
+                            "    {}",
+                            truncate(r, (inner.width as usize).saturating_sub(4))
+                        ),
                         Style::default().fg(theme.text_dim),
                     )));
                 }
                 if let Some(ref e) = task.error {
                     lines.push(Line::from(Span::styled(
-                        format!("    err: {}", truncate(e, (inner.width as usize).saturating_sub(8))),
+                        format!(
+                            "    err: {}",
+                            truncate(e, (inner.width as usize).saturating_sub(8))
+                        ),
                         Style::default().fg(theme.error),
                     )));
                 }
@@ -1540,7 +1570,9 @@ fn wrap_str(s: &str, max_width: usize) -> Vec<String> {
 fn render_approval_panel(f: &mut Frame, area: Rect, approval: &mut PendingApproval, theme: &Theme) {
     let panel_width = 72.min(area.width.saturating_sub(4)).max(40);
     let detail_lines = approval.detail.lines().count().min(8) as u16;
-    let panel_height = (9 + detail_lines).min(area.height.saturating_sub(2)).max(10);
+    let panel_height = (9 + detail_lines)
+        .min(area.height.saturating_sub(2))
+        .max(10);
     let x = (area.width.saturating_sub(panel_width)) / 2;
     let y = (area.height.saturating_sub(panel_height)) / 2;
     let panel_area = Rect::new(x, y, panel_width, panel_height);
@@ -1571,7 +1603,10 @@ fn render_approval_panel(f: &mut Frame, area: Rect, approval: &mut PendingApprov
 
     if !approval.detail.is_empty() {
         for l in approval.detail.lines().take(8) {
-            let truncated: String = l.chars().take((panel_width.saturating_sub(4)) as usize).collect();
+            let truncated: String = l
+                .chars()
+                .take((panel_width.saturating_sub(4)) as usize)
+                .collect();
             lines.push(Line::from(Span::styled(
                 truncated,
                 Style::default().fg(theme.text_dim),
@@ -1649,7 +1684,10 @@ fn render_question_panel(f: &mut Frame, area: Rect, question: &mut PendingQuesti
         let boxc = if checked { "[x]" } else { "[ ]" };
         lines.push(Line::from(vec![
             Span::styled(marker, style),
-            Span::styled(format!("{} {}  ", i + 1, boxc), Style::default().fg(theme.text_muted)),
+            Span::styled(
+                format!("{} {}  ", i + 1, boxc),
+                Style::default().fg(theme.text_muted),
+            ),
             Span::styled(label.clone(), style),
         ]));
     }

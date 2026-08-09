@@ -26,7 +26,10 @@ pub fn session_index_path(home_dir: &Path) -> PathBuf {
     home_dir.join("session_index.jsonl")
 }
 
-pub fn append_session_index_entry(home_dir: &Path, entry: &SessionIndexEntry) -> anyhow::Result<()> {
+pub fn append_session_index_entry(
+    home_dir: &Path,
+    entry: &SessionIndexEntry,
+) -> anyhow::Result<()> {
     append_line(home_dir, &serde_json::to_string(entry)?)
 }
 

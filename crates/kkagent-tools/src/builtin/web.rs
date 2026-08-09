@@ -129,7 +129,10 @@ impl WebSearchTool {
         }
         let mut lines = Vec::new();
         for (i, r) in results.iter().take(limit).enumerate() {
-            let title = r.get("title").and_then(|v| v.as_str()).unwrap_or("(no title)");
+            let title = r
+                .get("title")
+                .and_then(|v| v.as_str())
+                .unwrap_or("(no title)");
             let url = r.get("url").and_then(|v| v.as_str()).unwrap_or("");
             let snippet = r
                 .get("snippet")
@@ -262,10 +265,7 @@ impl Tool for FetchUrlTool {
         // Prefer moonshot fetch service when configured
         if let Some(base) = &self.cfg.fetch_base_url {
             let endpoint = format!("{}/v1/fetch", base.trim_end_matches('/'));
-            let mut req = self
-                .client
-                .post(&endpoint)
-                .json(&json!({ "url": url }));
+            let mut req = self.client.post(&endpoint).json(&json!({ "url": url }));
             if let Some(key) = &self.cfg.fetch_api_key {
                 req = req.bearer_auth(key);
             }

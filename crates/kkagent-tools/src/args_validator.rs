@@ -29,10 +29,7 @@ pub fn optional_u64(input: &Value, key: &str) -> Result<Option<u64>, ValidationE
 }
 
 pub fn optional_bool(input: &Value, key: &str, default: bool) -> bool {
-    input
-        .get(key)
-        .and_then(|v| v.as_bool())
-        .unwrap_or(default)
+    input.get(key).and_then(|v| v.as_bool()).unwrap_or(default)
 }
 
 pub fn validate_required_keys(input: &Value, keys: &[&str]) -> Result<(), ValidationError> {

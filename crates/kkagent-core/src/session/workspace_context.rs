@@ -41,7 +41,10 @@ impl SessionWorkspaceContext {
     }
 
     pub fn set_git_branch(&self, branch: Option<String>) {
-        self.info.write().unwrap_or_else(|e| e.into_inner()).git_branch = branch;
+        self.info
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .git_branch = branch;
     }
 
     pub fn set_trusted(&self, trusted: bool) {

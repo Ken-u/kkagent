@@ -26,16 +26,17 @@ pub enum SummaryMode {
 
 pub fn builtin_display_schemas() -> HashMap<String, ToolDisplaySchema> {
     let mut m = HashMap::new();
-    let add = |m: &mut HashMap<String, ToolDisplaySchema>, name: &str, chip: &str, mode: SummaryMode| {
-        m.insert(
-            name.into(),
-            ToolDisplaySchema {
-                chip_template: chip.into(),
-                summary_mode: mode,
-                highlight: None,
-            },
-        );
-    };
+    let add =
+        |m: &mut HashMap<String, ToolDisplaySchema>, name: &str, chip: &str, mode: SummaryMode| {
+            m.insert(
+                name.into(),
+                ToolDisplaySchema {
+                    chip_template: chip.into(),
+                    summary_mode: mode,
+                    highlight: None,
+                },
+            );
+        };
     add(&mut m, "Bash", "$ {command}", SummaryMode::Bash);
     add(&mut m, "Read", "Read {path}", SummaryMode::Text);
     add(&mut m, "Write", "Write {path}", SummaryMode::Diff);
@@ -58,7 +59,10 @@ pub fn render_chip(tool: &str, input: &Value) -> String {
         let mut s = schema.chip_template.clone();
         if let Some(obj) = input.as_object() {
             for (k, v) in obj {
-                let val = v.as_str().map(|x| x.to_string()).unwrap_or_else(|| v.to_string());
+                let val = v
+                    .as_str()
+                    .map(|x| x.to_string())
+                    .unwrap_or_else(|| v.to_string());
                 let short: String = val.chars().take(48).collect();
                 s = s.replace(&format!("{{{k}}}"), &short);
             }

@@ -123,11 +123,7 @@ pub fn complete_path(cwd: &Path, partial: &str) -> Vec<CompletionItem> {
             s.push('/');
         }
         items.push(CompletionItem {
-            label: if is_dir {
-                format!("{name}/")
-            } else {
-                name
-            },
+            label: if is_dir { format!("{name}/") } else { name },
             insert: s,
             detail: None,
         });

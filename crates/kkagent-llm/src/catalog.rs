@@ -99,18 +99,16 @@ pub fn builtin_catalog() -> Vec<ModelCapabilityEntry> {
 
 pub fn lookup(model: &str) -> Option<ModelCapabilityEntry> {
     let m = model.to_lowercase();
-    builtin_catalog().into_iter().find(|e| {
-        e.id == model || e.id.to_lowercase() == m || m.contains(&e.id.to_lowercase())
-    })
+    builtin_catalog()
+        .into_iter()
+        .find(|e| e.id == model || e.id.to_lowercase() == m || m.contains(&e.id.to_lowercase()))
 }
 
 pub fn prefers_responses_api(model: &str) -> bool {
-    lookup(model)
-        .map(|e| e.responses_api)
-        .unwrap_or_else(|| {
-            let m = model.to_lowercase();
-            m.starts_with('o') || m.contains("gpt-4.1") || m.contains("gpt-5")
-        })
+    lookup(model).map(|e| e.responses_api).unwrap_or_else(|| {
+        let m = model.to_lowercase();
+        m.starts_with('o') || m.contains("gpt-4.1") || m.contains("gpt-5")
+    })
 }
 
 #[cfg(test)]

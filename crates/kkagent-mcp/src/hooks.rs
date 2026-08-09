@@ -1,5 +1,5 @@
-use std::path::{Path, PathBuf};
 use anyhow::Result;
+use std::path::{Path, PathBuf};
 use tokio::process::Command;
 
 #[derive(Debug, Clone)]
@@ -94,15 +94,32 @@ impl HookManager {
 
         for entry in raw {
             let event_str = entry.get("event").and_then(|v| v.as_str()).unwrap_or("");
-            let command = entry.get("command").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let args: Vec<String> = entry.get("args")
+            let command = entry
+                .get("command")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let args: Vec<String> = entry
+                .get("args")
                 .and_then(|v| v.as_array())
-                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
                 .unwrap_or_default();
-            let timeout_ms = entry.get("timeout_ms").and_then(|v| v.as_u64()).unwrap_or(30000);
+            let timeout_ms = entry
+                .get("timeout_ms")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(30000);
 
             if let Some(event) = HookEvent::from_str(event_str) {
-                hooks.push(HookConfig { event, command, args, timeout_ms });
+                hooks.push(HookConfig {
+                    event,
+                    command,
+                    args,
+                    timeout_ms,
+                });
             }
         }
         Ok(hooks)
@@ -151,10 +168,8 @@ impl HookManager {
                         if let Ok(v) = serde_json::from_str::<serde_json::Value>(stdout.trim()) {
                             if v.get("block").and_then(|b| b.as_bool()) == Some(true) {
                                 outcome.block = true;
-                                outcome.reason = v
-                                    .get("reason")
-                                    .and_then(|r| r.as_str())
-                                    .map(String::from);
+                                outcome.reason =
+                                    v.get("reason").and_then(|r| r.as_str()).map(String::from);
                             }
                             if let Some(rw) = v.get("rewrite").cloned() {
                                 outcome.rewrite = Some(rw);

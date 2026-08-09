@@ -1,8 +1,6 @@
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::pi::{
-    move_word_left, move_word_right, EditorSnapshot, KillRing, PasteBurst, UndoStack,
-};
+use crate::pi::{move_word_left, move_word_right, EditorSnapshot, KillRing, PasteBurst, UndoStack};
 
 /// 输入状态，支持多行与正确的字节级光标（pi-tui editor 对齐）
 #[derive(Debug)]
@@ -155,7 +153,10 @@ impl InputState {
 
     pub fn move_down(&mut self) {
         let (line_start, col) = self.current_line_start_and_col();
-        if let Some(next_line_start) = self.text[line_start..].find('\n').map(|i| line_start + i + 1) {
+        if let Some(next_line_start) = self.text[line_start..]
+            .find('\n')
+            .map(|i| line_start + i + 1)
+        {
             self.cursor = byte_offset_at_col(&self.text, next_line_start, col);
         } else {
             self.cursor = self.text.len();
@@ -190,8 +191,7 @@ impl InputState {
             // at EOL: kill the newline if present
             if self.cursor < self.text.len() && self.text.as_bytes()[self.cursor] == b'\n' {
                 self.push_undo();
-                self.kill_ring
-                    .push("\n", false, self.last_was_kill);
+                self.kill_ring.push("\n", false, self.last_was_kill);
                 self.text.replace_range(self.cursor..self.cursor + 1, "");
                 self.last_was_kill = true;
             }
@@ -199,8 +199,7 @@ impl InputState {
         }
         self.push_undo();
         let killed = self.text[self.cursor..end].to_string();
-        self.kill_ring
-            .push(&killed, false, self.last_was_kill);
+        self.kill_ring.push(&killed, false, self.last_was_kill);
         self.text.replace_range(self.cursor..end, "");
         self.last_was_kill = true;
     }
@@ -213,8 +212,7 @@ impl InputState {
         }
         self.push_undo();
         let killed = self.text[start..self.cursor].to_string();
-        self.kill_ring
-            .push(&killed, true, self.last_was_kill);
+        self.kill_ring.push(&killed, true, self.last_was_kill);
         self.text.replace_range(start..self.cursor, "");
         self.cursor = start;
         self.last_was_kill = true;

@@ -100,13 +100,25 @@ pub struct LoopControlConfig {
     pub token_counting: String,
 }
 
-fn default_true() -> bool { true }
-fn default_compact_keep() -> u32 { 8 }
-fn default_token_strategy() -> String { "measured+estimated".into() }
+fn default_true() -> bool {
+    true
+}
+fn default_compact_keep() -> u32 {
+    8
+}
+fn default_token_strategy() -> String {
+    "measured+estimated".into()
+}
 
-fn default_max_attempts() -> u32 { 10 }
-fn default_reserved_context() -> u64 { 50000 }
-fn default_max_steps() -> u32 { 64 }
+fn default_max_attempts() -> u32 {
+    10
+}
+fn default_reserved_context() -> u64 {
+    50000
+}
+fn default_max_steps() -> u32 {
+    64
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackgroundConfig {
@@ -120,7 +132,9 @@ pub struct BackgroundConfig {
     pub bash_task_timeout_s: Option<u64>,
 }
 
-fn default_max_tasks() -> u32 { 4 }
+fn default_max_tasks() -> u32 {
+    4
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PermissionConfig {
@@ -146,7 +160,9 @@ pub struct HookConfig {
     pub timeout: u64,
 }
 
-fn default_hook_timeout() -> u64 { 5 }
+fn default_hook_timeout() -> u64 {
+    5
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ServicesConfig {

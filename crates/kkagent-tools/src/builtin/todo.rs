@@ -1,7 +1,7 @@
+use crate::{Tool, ToolContext, ToolOutput};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::sync::Mutex;
-use crate::{Tool, ToolContext, ToolOutput};
 
 pub struct TodoListTool {
     todos: Mutex<Vec<TodoItem>>,
@@ -164,7 +164,10 @@ Pass todos to replace the list, omit todos to read, or pass an empty array to cl
 
 impl TodoListTool {
     async fn execute_legacy(&self, input: Value) -> anyhow::Result<ToolOutput> {
-        let action = input.get("action").and_then(|v| v.as_str()).unwrap_or("list");
+        let action = input
+            .get("action")
+            .and_then(|v| v.as_str())
+            .unwrap_or("list");
         match action {
             "list" => {
                 let todos = self.todos.lock().unwrap();
@@ -174,10 +177,7 @@ impl TodoListTool {
                 ))
             }
             "set" => {
-                let merge = input
-                    .get("merge")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(true);
+                let merge = input.get("merge").and_then(|v| v.as_bool()).unwrap_or(true);
                 let new_items = input
                     .get("items")
                     .and_then(|v| v.as_array())

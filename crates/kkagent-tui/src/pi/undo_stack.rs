@@ -23,7 +23,12 @@ impl UndoStack {
     }
 
     pub fn push(&mut self, snap: EditorSnapshot) {
-        if self.undo.last().map(|s| s.text == snap.text).unwrap_or(false) {
+        if self
+            .undo
+            .last()
+            .map(|s| s.text == snap.text)
+            .unwrap_or(false)
+        {
             return;
         }
         self.undo.push(snap);

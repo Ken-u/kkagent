@@ -1,20 +1,24 @@
+use crate::{Tool, ToolContext, ToolOutput};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::Path;
-use crate::{Tool, ToolContext, ToolOutput};
 
 pub struct GrepTool;
 
 #[async_trait]
 impl Tool for GrepTool {
-    fn name(&self) -> &str { "Grep" }
+    fn name(&self) -> &str {
+        "Grep"
+    }
     fn description(&self) -> &str {
         "Search for a regex pattern across files. Supports output_mode \
 (content/files_with_matches/count), context lines (-A/-B/-C), head_limit/offset, \
 glob/type filters, and case_insensitive."
     }
-    fn read_only(&self) -> bool { true }
+    fn read_only(&self) -> bool {
+        true
+    }
     fn parameters_schema(&self) -> Value {
         json!({
             "type": "object",
@@ -41,13 +45,17 @@ glob/type filters, and case_insensitive."
     }
 
     async fn execute(&self, input: Value, ctx: &ToolContext) -> anyhow::Result<ToolOutput> {
-        let pattern = input.get("pattern").and_then(|v| v.as_str())
+        let pattern = input
+            .get("pattern")
+            .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'pattern'"))?;
-        let search_path = input.get("path").and_then(|v| v.as_str())
-            .unwrap_or(".");
+        let search_path = input.get("path").and_then(|v| v.as_str()).unwrap_or(".");
         let glob_pattern = input.get("glob").and_then(|v| v.as_str());
         let file_type = input.get("type").and_then(|v| v.as_str());
-        let case_insensitive = input.get("case_insensitive").and_then(|v| v.as_bool()).unwrap_or(false);
+        let case_insensitive = input
+            .get("case_insensitive")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         let output_mode = input
             .get("output_mode")
             .and_then(|v| v.as_str())
@@ -56,10 +64,7 @@ glob/type filters, and case_insensitive."
             .get("head_limit")
             .and_then(|v| v.as_u64())
             .unwrap_or(200) as usize;
-        let offset = input
-            .get("offset")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as usize;
+        let offset = input.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
         let include_ignored = input
             .get("include_ignored")
             .and_then(|v| v.as_bool())
@@ -153,7 +158,11 @@ glob/type filters, and case_insensitive."
                 .collect();
             file_lines.sort();
             let total_files = file_lines.len();
-            let sliced: Vec<String> = file_lines.into_iter().skip(offset).take(head_limit).collect();
+            let sliced: Vec<String> = file_lines
+                .into_iter()
+                .skip(offset)
+                .take(head_limit)
+                .collect();
             let mut result = format!("Total matches: {}\n{}", total, sliced.join("\n"));
             if offset + sliced.len() < total_files {
                 result.push_str(&format!(

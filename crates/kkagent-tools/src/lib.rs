@@ -1,23 +1,23 @@
-pub mod registry;
-pub mod builtin;
-pub mod path_policy;
 pub mod accesses;
-pub mod shell_safety;
-pub mod bash_ast;
 pub mod args_validator;
+pub mod bash_ast;
+pub mod builtin;
 pub mod display;
 pub mod git_worktree;
+pub mod path_policy;
+pub mod registry;
+pub mod shell_safety;
 
 pub use accesses::{infer_accesses, tool_accesses, ToolAccesses, ToolResourceAccess};
-pub use display::{builtin_display_schemas, render_chip, SummaryMode, ToolDisplaySchema};
 pub use bash_ast::{collect_commands, parse as parse_bash, pipes_into_shell};
+pub use display::{builtin_display_schemas, render_chip, SummaryMode, ToolDisplaySchema};
 pub use shell_safety::{analyze_shell_command, ShellRisk};
 
-pub use registry::*;
-pub use builtin::{
-    BackgroundShellManager, BashOptions, BashTool, SkillCatalog, CronManager, WebServicesConfig,
-};
 pub use builtin::cron::render_cron_fire_xml;
+pub use builtin::{
+    BackgroundShellManager, BashOptions, BashTool, CronManager, SkillCatalog, WebServicesConfig,
+};
+pub use registry::*;
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -27,7 +27,9 @@ pub trait Tool: Send + Sync {
     fn name(&self) -> &str;
     fn description(&self) -> &str;
     fn parameters_schema(&self) -> Value;
-    fn read_only(&self) -> bool { false }
+    fn read_only(&self) -> bool {
+        false
+    }
     async fn execute(&self, input: Value, ctx: &ToolContext) -> anyhow::Result<ToolOutput>;
 }
 

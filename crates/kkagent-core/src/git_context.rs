@@ -9,11 +9,7 @@ pub fn collect_git_context(working_dir: &Path) -> Option<String> {
     }
     let branch = git(working_dir, &["rev-parse", "--abbrev-ref", "HEAD"])?;
     let status = git(working_dir, &["status", "--short"]).unwrap_or_default();
-    let log = git(
-        working_dir,
-        &["log", "-5", "--oneline", "--decorate"],
-    )
-    .unwrap_or_default();
+    let log = git(working_dir, &["log", "-5", "--oneline", "--decorate"]).unwrap_or_default();
     let mut out = String::from("\n\n# Git context\n\n");
     out.push_str(&format!("- branch: `{}`\n", branch.trim()));
     if status.trim().is_empty() {

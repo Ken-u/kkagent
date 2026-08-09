@@ -160,7 +160,11 @@ impl SessionMetadataService {
         &self.data
     }
 
-    pub fn update(&mut self, patch: SessionMetaPatch, touch_updated_at: bool) -> anyhow::Result<()> {
+    pub fn update(
+        &mut self,
+        patch: SessionMetaPatch,
+        touch_updated_at: bool,
+    ) -> anyhow::Result<()> {
         if let Some(v) = patch.title {
             self.data.title = v;
         }

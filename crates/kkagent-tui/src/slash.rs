@@ -18,7 +18,10 @@ impl SlashCommand {
         }
         self.name.starts_with(&q)
             || self.name.contains(&q)
-            || self.aliases.iter().any(|a| a.starts_with(q.as_str()) || a.contains(q.as_str()))
+            || self
+                .aliases
+                .iter()
+                .any(|a| a.starts_with(q.as_str()) || a.contains(q.as_str()))
     }
 
     pub fn accepts_name(&self, name: &str) -> bool {
@@ -292,7 +295,12 @@ pub struct SlashSuggestion {
 
 /// Filter + sort commands for the `/` autocomplete popup.
 pub fn filter_slash_commands(query: &str) -> Vec<SlashSuggestion> {
-    let q = query.trim_start_matches('/').split_whitespace().next().unwrap_or("").to_lowercase();
+    let q = query
+        .trim_start_matches('/')
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_lowercase();
 
     let mut matched: Vec<&SlashCommand> = BUILTIN_SLASH_COMMANDS
         .iter()

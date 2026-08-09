@@ -41,8 +41,16 @@ pub fn create_wire_metadata_record(now_ms: i64) -> WireMetadataRecord {
 
 pub fn is_wire_metadata_record(record: &WireRecord) -> bool {
     record.record_type == "metadata"
-        && record.fields.get("protocol_version").and_then(|v| v.as_str()).is_some()
-        && record.fields.get("created_at").and_then(|v| v.as_i64()).is_some()
+        && record
+            .fields
+            .get("protocol_version")
+            .and_then(|v| v.as_str())
+            .is_some()
+        && record
+            .fields
+            .get("created_at")
+            .and_then(|v| v.as_i64())
+            .is_some()
 }
 
 pub fn op_to_wire_record(op_type: &str, payload: Value, now_ms: i64) -> WireRecord {

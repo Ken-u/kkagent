@@ -1,14 +1,16 @@
+use crate::path_policy::is_sensitive_path;
+use crate::{Tool, ToolContext, ToolOutput};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::path::Path;
-use crate::path_policy::is_sensitive_path;
-use crate::{Tool, ToolContext, ToolOutput};
 
 pub struct WriteTool;
 
 #[async_trait]
 impl Tool for WriteTool {
-    fn name(&self) -> &str { "Write" }
+    fn name(&self) -> &str {
+        "Write"
+    }
     fn description(&self) -> &str {
         "Create or overwrite a file with the given content. Missing parent directories are created automatically."
     }
@@ -25,13 +27,16 @@ impl Tool for WriteTool {
     }
 
     async fn execute(&self, input: Value, ctx: &ToolContext) -> anyhow::Result<ToolOutput> {
-        let path_str = input.get("path")
+        let path_str = input
+            .get("path")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'path'"))?;
-        let content = input.get("content")
+        let content = input
+            .get("content")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'content'"))?;
-        let mode = input.get("mode")
+        let mode = input
+            .get("mode")
             .and_then(|v| v.as_str())
             .unwrap_or("overwrite");
 
@@ -67,7 +72,12 @@ impl Tool for WriteTool {
 
         let line_count = content.lines().count();
         Ok(ToolOutput::success_with_data(
-            format!("Wrote {} lines ({} bytes) to {}", line_count, bytes.len(), path_str),
+            format!(
+                "Wrote {} lines ({} bytes) to {}",
+                line_count,
+                bytes.len(),
+                path_str
+            ),
             json!({
                 "bytesWritten": bytes.len(),
                 "lineCount": line_count,

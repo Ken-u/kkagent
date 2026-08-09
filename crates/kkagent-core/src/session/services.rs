@@ -104,7 +104,10 @@ impl SessionServices {
         };
 
         // Register main agent into durable metadata (no-op if identical on resume).
-        if let Some(main) = svc.agents.get(crate::session::agent_lifecycle::MAIN_AGENT_ID) {
+        if let Some(main) = svc
+            .agents
+            .get(crate::session::agent_lifecycle::MAIN_AGENT_ID)
+        {
             let meta = AgentMeta {
                 kind: Some(AgentKind::Main),
                 ..svc.agents.to_agent_meta(&main)
@@ -139,7 +142,10 @@ impl SessionServices {
 
     pub async fn on_close(&self, reason: SessionCloseReason) {
         self.lifecycle.fire_will_close(reason).await;
-        let _ = self.tool_policy_gate.session_policy.persist(&self.context.session_dir);
+        let _ = self
+            .tool_policy_gate
+            .session_policy
+            .persist(&self.context.session_dir);
         let _ = self.cron.persist(&self.context.session_dir);
         let _ = self.log.flush_to_file(&self.context.session_dir);
         self.external_hooks

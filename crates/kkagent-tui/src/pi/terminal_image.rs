@@ -22,7 +22,9 @@ pub fn detect_capabilities() -> TerminalCapabilities {
         .unwrap_or_default()
         .to_lowercase();
     let term = std::env::var("TERM").unwrap_or_default().to_lowercase();
-    let colorterm = std::env::var("COLORTERM").unwrap_or_default().to_lowercase();
+    let colorterm = std::env::var("COLORTERM")
+        .unwrap_or_default()
+        .to_lowercase();
     let true_color = colorterm == "truecolor" || colorterm == "24bit";
 
     if std::env::var_os("TMUX").is_some() || term.starts_with("tmux") {
@@ -40,8 +42,7 @@ pub fn detect_capabilities() -> TerminalCapabilities {
         };
     }
 
-    let images = if term_program.contains("iterm")
-        || std::env::var_os("ITERM_SESSION_ID").is_some()
+    let images = if term_program.contains("iterm") || std::env::var_os("ITERM_SESSION_ID").is_some()
     {
         Some(ImageProtocol::ITerm2)
     } else if term_program.contains("kitty")

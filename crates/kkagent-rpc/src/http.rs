@@ -25,7 +25,12 @@ pub trait HttpBackend: Send + Sync {
     async fn list_skills(&self) -> Value;
     async fn list_models(&self) -> Value;
     async fn get_config(&self) -> Value;
-    async fn approve(&self, id: &str, decision: &str, feedback: Option<String>) -> Result<Value, String>;
+    async fn approve(
+        &self,
+        id: &str,
+        decision: &str,
+        feedback: Option<String>,
+    ) -> Result<Value, String>;
     async fn fs_read(&self, path: &str) -> Result<String, String>;
     async fn fs_write(&self, path: &str, content: &str) -> Result<(), String>;
     async fn search(&self, query: &str) -> Value;
@@ -66,7 +71,9 @@ impl HttpBackend for MemoryBackend {
         if let Some(arr) = sess.get_mut("messages").and_then(|v| v.as_array_mut()) {
             arr.push(msg.clone());
         }
-        Ok(json!({"ok": true, "message": msg, "note": "memory backend — wire HttpBackend for AgentLoop"}))
+        Ok(
+            json!({"ok": true, "message": msg, "note": "memory backend — wire HttpBackend for AgentLoop"}),
+        )
     }
     async fn list_tools(&self) -> Value {
         json!({"tools": [
@@ -86,7 +93,12 @@ impl HttpBackend for MemoryBackend {
     async fn get_config(&self) -> Value {
         json!({"config_dir": dirs_home(), "api": "v1"})
     }
-    async fn approve(&self, id: &str, decision: &str, feedback: Option<String>) -> Result<Value, String> {
+    async fn approve(
+        &self,
+        id: &str,
+        decision: &str,
+        feedback: Option<String>,
+    ) -> Result<Value, String> {
         Ok(json!({"ok": true, "approval_id": id, "decision": decision, "feedback": feedback}))
     }
     async fn fs_read(&self, path: &str) -> Result<String, String> {
@@ -119,10 +131,15 @@ fn dirs_home() -> String {
 
 fn kkagent_llm_catalog_stub() -> Vec<Value> {
     // Avoid hard dep cycle: inline common catalog ids.
-    ["gpt-4.1", "o4-mini", "claude-sonnet-4-20250514", "gemini-2.5-pro"]
-        .iter()
-        .map(|id| json!({"id": id}))
-        .collect()
+    [
+        "gpt-4.1",
+        "o4-mini",
+        "claude-sonnet-4-20250514",
+        "gemini-2.5-pro",
+    ]
+    .iter()
+    .map(|id| json!({"id": id}))
+    .collect()
 }
 
 #[derive(Clone)]
@@ -455,7 +472,9 @@ async fn terminals_list(
 ) -> Result<Json<Value>, StatusCode> {
     check_auth(&state, &q)?;
     let map = state.terminals.lock().await;
-    Ok(Json(json!({"terminals": map.values().cloned().collect::<Vec<_>>()})))
+    Ok(Json(
+        json!({"terminals": map.values().cloned().collect::<Vec<_>>()}),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -486,7 +505,9 @@ async fn connections(
     Query(q): Query<AuthQuery>,
 ) -> Result<Json<Value>, StatusCode> {
     check_auth(&state, &q)?;
-    Ok(Json(json!({"connections": [{"type": "ws", "path": "/api/v1/ws"}]})))
+    Ok(Json(
+        json!({"connections": [{"type": "ws", "path": "/api/v1/ws"}]}),
+    ))
 }
 
 async fn export_session(

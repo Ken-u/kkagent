@@ -69,7 +69,9 @@ pub fn map_key(key: KeyEvent) -> EditorAction {
         KeyCode::Char('Z') if m.contains(KeyModifiers::CONTROL) => EditorAction::Redo,
         KeyCode::Char('c') if m.contains(KeyModifiers::CONTROL) => EditorAction::Interrupt,
         KeyCode::Char('l') if m.contains(KeyModifiers::CONTROL) => EditorAction::ToggleExpand,
-        KeyCode::Char(c) if !m.contains(KeyModifiers::CONTROL) && !m.contains(KeyModifiers::ALT) => {
+        KeyCode::Char(c)
+            if !m.contains(KeyModifiers::CONTROL) && !m.contains(KeyModifiers::ALT) =>
+        {
             EditorAction::Insert(c)
         }
         _ => EditorAction::None,

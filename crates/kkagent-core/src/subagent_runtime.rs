@@ -1,12 +1,12 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::AbortHandle;
-use std::collections::HashMap;
 
 use kkagent_config::AppConfig;
-use kkagent_protocol::{AgentEvent, PermissionMode, subagent::SubagentConfig};
-use kkagent_tools::{ToolRegistry, register_builtin_tools};
+use kkagent_protocol::{subagent::SubagentConfig, AgentEvent, PermissionMode};
+use kkagent_tools::{register_builtin_tools, ToolRegistry};
 
 use crate::agent_loop::AgentLoop;
 use crate::permission::PermissionChain;
@@ -39,12 +39,7 @@ pub async fn run_subagent_mirrored(
         .model
         .clone()
         .filter(|m| !m.is_empty())
-        .or_else(|| {
-            app_config
-                .secondary_model
-                .clone()
-                .filter(|m| !m.is_empty())
-        })
+        .or_else(|| app_config.secondary_model.clone().filter(|m| !m.is_empty()))
         .or_else(|| app_config.default_model_alias().map(|s| s.to_string()))
         .unwrap_or_else(|| "default".into());
 
@@ -61,7 +56,9 @@ pub async fn run_subagent_mirrored(
         model.clone(),
     );
     session.inject_workspace_instructions().await;
-    session.system_prompt.push_str(&profile_system_addon(&profile));
+    session
+        .system_prompt
+        .push_str(&profile_system_addon(&profile));
     session.add_user_message(sub_cfg.prompt.clone());
 
     let mut tools = ToolRegistry::new();

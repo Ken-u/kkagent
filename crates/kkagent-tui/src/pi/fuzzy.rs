@@ -35,11 +35,8 @@ pub fn fuzzy_match(query: &str, text: &str) -> FuzzyMatch {
             break;
         }
         if ch == q_chars[qi] {
-            let boundary = i == 0
-                || matches!(
-                    t_chars[i - 1],
-                    ' ' | '-' | '_' | '.' | '/' | ':' | '\\'
-                );
+            let boundary =
+                i == 0 || matches!(t_chars[i - 1], ' ' | '-' | '_' | '.' | '/' | ':' | '\\');
             if last == i as isize - 1 {
                 consec += 1;
                 score -= f64::from(consec) * 5.0;
@@ -73,7 +70,10 @@ pub fn fuzzy_match(query: &str, text: &str) -> FuzzyMatch {
     }
 }
 
-pub fn fuzzy_filter<'a>(query: &str, items: impl IntoIterator<Item = &'a str>) -> Vec<(usize, f64)> {
+pub fn fuzzy_filter<'a>(
+    query: &str,
+    items: impl IntoIterator<Item = &'a str>,
+) -> Vec<(usize, f64)> {
     let mut out = Vec::new();
     for (i, item) in items.into_iter().enumerate() {
         let m = fuzzy_match(query, item);

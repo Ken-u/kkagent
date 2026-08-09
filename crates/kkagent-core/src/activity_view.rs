@@ -6,13 +6,34 @@ use std::collections::VecDeque;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ActivityItem {
-    Thinking { text: String },
-    ToolStart { id: String, name: String, summary: String },
-    ToolEnd { id: String, name: String, is_error: bool },
-    Message { role: String, preview: String },
-    Goal { status: String, detail: String },
-    Subagent { id: String, status: String },
-    Note { text: String },
+    Thinking {
+        text: String,
+    },
+    ToolStart {
+        id: String,
+        name: String,
+        summary: String,
+    },
+    ToolEnd {
+        id: String,
+        name: String,
+        is_error: bool,
+    },
+    Message {
+        role: String,
+        preview: String,
+    },
+    Goal {
+        status: String,
+        detail: String,
+    },
+    Subagent {
+        id: String,
+        status: String,
+    },
+    Note {
+        text: String,
+    },
 }
 
 #[derive(Debug, Default)]

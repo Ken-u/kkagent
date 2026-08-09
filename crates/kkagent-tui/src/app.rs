@@ -1,4 +1,3 @@
-use std::io;
 use crossterm::{
     event::{
         self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
@@ -7,13 +6,11 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use ratatui::{
-    backend::CrosstermBackend,
-    Terminal,
-};
-use kkagent_protocol::{Frame, AgentEvent, PermissionMode, SessionStatus};
 use kkagent_client::KkagentClient;
 use kkagent_config::AppConfig;
+use kkagent_protocol::{AgentEvent, Frame, PermissionMode, SessionStatus};
+use ratatui::{backend::CrosstermBackend, Terminal};
+use std::io;
 
 use crate::chrome::{StatusBarModel, TabStrip};
 use crate::components;
@@ -59,7 +56,10 @@ pub struct AppState {
     pub approx_tokens: u64,
     pub approval_pending: Option<PendingApproval>,
     /// Mouse click on approval option — processed in main loop (needs await)
-    pub pending_approval_click: Option<(kkagent_protocol::ApprovalDecision, Option<kkagent_protocol::ApprovalScope>)>,
+    pub pending_approval_click: Option<(
+        kkagent_protocol::ApprovalDecision,
+        Option<kkagent_protocol::ApprovalScope>,
+    )>,
     /// AskUserQuestion panel
     pub question_pending: Option<PendingQuestion>,
     /// `/` command autocomplete popup
@@ -252,7 +252,11 @@ impl AppState {
             permission_mode,
             plan_mode,
             session_id: None,
-            mode: if plan_mode { AppMode::Plan } else { AppMode::Normal },
+            mode: if plan_mode {
+                AppMode::Plan
+            } else {
+                AppMode::Normal
+            },
             should_quit: false,
             quit_confirm: false,
             thinking_text: String::new(),
@@ -293,7 +297,8 @@ impl AppState {
     }
 
     pub fn max_scroll_up(&self) -> u16 {
-        self.content_lines.saturating_sub(self.viewport_height.max(1))
+        self.content_lines
+            .saturating_sub(self.viewport_height.max(1))
     }
 
     pub fn scroll_lines(&mut self, delta: i32) {
@@ -377,7 +382,8 @@ impl AppState {
 
 impl TuiApp {
     pub fn new(config: AppConfig, client: KkagentClient) -> Self {
-        let permission_mode = config.effective_permission_mode()
+        let permission_mode = config
+            .effective_permission_mode()
             .parse()
             .unwrap_or(PermissionMode::Manual);
         let plan_mode = config.default_plan_mode;
@@ -588,13 +594,19 @@ impl TuiApp {
         if let Some(ref mut approval) = self.state.approval_pending {
             match key.code {
                 KeyCode::Char('1') => {
-                    self.respond_approval(kkagent_protocol::ApprovalDecision::Approved, None).await?;
+                    self.respond_approval(kkagent_protocol::ApprovalDecision::Approved, None)
+                        .await?;
                 }
                 KeyCode::Char('2') => {
-                    self.respond_approval(kkagent_protocol::ApprovalDecision::Approved, Some(kkagent_protocol::ApprovalScope::Session)).await?;
+                    self.respond_approval(
+                        kkagent_protocol::ApprovalDecision::Approved,
+                        Some(kkagent_protocol::ApprovalScope::Session),
+                    )
+                    .await?;
                 }
                 KeyCode::Char('3') | KeyCode::Esc => {
-                    self.respond_approval(kkagent_protocol::ApprovalDecision::Rejected, None).await?;
+                    self.respond_approval(kkagent_protocol::ApprovalDecision::Rejected, None)
+                        .await?;
                 }
                 KeyCode::Up => {
                     if approval.selected > 0 {
@@ -612,7 +624,11 @@ impl TuiApp {
                         1 => kkagent_protocol::ApprovalDecision::Approved,
                         _ => kkagent_protocol::ApprovalDecision::Rejected,
                     };
-                    let scope = if approval.selected == 1 { Some(kkagent_protocol::ApprovalScope::Session) } else { None };
+                    let scope = if approval.selected == 1 {
+                        Some(kkagent_protocol::ApprovalScope::Session)
+                    } else {
+                        None
+                    };
                     self.respond_approval(decision, scope).await?;
                 }
                 _ => {}
@@ -646,10 +662,8 @@ impl TuiApp {
                 KeyCode::Enter => {
                     if let Some(ref p) = self.state.tasks_panel {
                         if let Some(t) = p.tasks.get(p.selected) {
-                            let mut detail = format!(
-                                "task {} [{}]\n{}\n",
-                                t.task_id, t.status, t.description
-                            );
+                            let mut detail =
+                                format!("task {} [{}]\n{}\n", t.task_id, t.status, t.description);
                             if let Some(ref r) = t.result {
                                 detail.push_str("\nresult:\n");
                                 detail.push_str(r);
@@ -845,7 +859,11 @@ impl TuiApp {
             // Shift-Tab: toggle plan mode
             KeyCode::BackTab => {
                 self.state.plan_mode = !self.state.plan_mode;
-                self.state.mode = if self.state.plan_mode { AppMode::Plan } else { AppMode::Normal };
+                self.state.mode = if self.state.plan_mode {
+                    AppMode::Plan
+                } else {
+                    AppMode::Normal
+                };
                 self.state.status_bar.plan_mode = self.state.plan_mode;
                 if let Some(sid) = &self.state.session_id {
                     self.client.set_plan_mode(sid, self.state.plan_mode).await?;
@@ -1098,14 +1116,8 @@ impl TuiApp {
                                     other => other.to_string().trim_matches('"').to_string(),
                                 })
                                 .unwrap_or_else(|| "?".into()),
-                            result: t
-                                .get("result")
-                                .and_then(|v| v.as_str())
-                                .map(String::from),
-                            error: t
-                                .get("error")
-                                .and_then(|v| v.as_str())
-                                .map(String::from),
+                            result: t.get("result").and_then(|v| v.as_str()).map(String::from),
+                            error: t.get("error").and_then(|v| v.as_str()).map(String::from),
                         });
                     }
                 }
@@ -1124,9 +1136,7 @@ impl TuiApp {
 
     async fn undo_turns(&mut self, count: usize) -> anyhow::Result<()> {
         if self.state.status != SessionStatus::Idle {
-            self.system_message(
-                "Cannot undo while streaming — press Esc or Ctrl-C first.".into(),
-            );
+            self.system_message("Cannot undo while streaming — press Esc or Ctrl-C first.".into());
             return Ok(());
         }
         let Some(sid) = self.state.session_id.clone() else {
@@ -1229,10 +1239,7 @@ impl TuiApp {
                             .get("title")
                             .and_then(|v| v.as_str())
                             .unwrap_or("(untitled)");
-                        let msgs = s
-                            .get("message_count")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0);
+                        let msgs = s.get("message_count").and_then(|v| v.as_u64()).unwrap_or(0);
                         let short = &id[..8.min(id.len())];
                         items.push(ListPickerItem {
                             id: id.clone(),
@@ -1289,11 +1296,7 @@ impl TuiApp {
         }
         if let Some(plan) = data.get("plan_mode").and_then(|v| v.as_bool()) {
             self.state.plan_mode = plan;
-            self.state.mode = if plan {
-                AppMode::Plan
-            } else {
-                AppMode::Normal
-            };
+            self.state.mode = if plan { AppMode::Plan } else { AppMode::Normal };
         }
 
         self.system_message(format!(
@@ -1367,7 +1370,9 @@ impl TuiApp {
         }
 
         // Resolve aliases via registry
-        let resolved = find_slash_command(&command).map(|c| c.name).unwrap_or(command.as_str());
+        let resolved = find_slash_command(&command)
+            .map(|c| c.name)
+            .unwrap_or(command.as_str());
 
         match resolved {
             "yolo" | "yes" => {
@@ -1541,9 +1546,7 @@ impl TuiApp {
                             });
                             self.system_message(format!("Thinking: on ({})", e));
                         }
-                        _ => self.system_message(
-                            "Usage: /effort [off|low|medium|high]".into(),
-                        ),
+                        _ => self.system_message("Usage: /effort [off|low|medium|high]".into()),
                     }
                 }
             }
@@ -1593,7 +1596,11 @@ impl TuiApp {
                     .and_then(|(m, _)| m.max_context_size)
                     .unwrap_or(256_000);
                 let used = self.state.approx_tokens;
-                let pct = if max > 0 { (used * 100 / max).min(100) } else { 0 };
+                let pct = if max > 0 {
+                    (used * 100 / max).min(100)
+                } else {
+                    0
+                };
                 self.system_message(format!(
                     "context: {}% ({}/{})\napprox tokens used: {}",
                     pct, used, max, used
@@ -1610,11 +1617,7 @@ impl TuiApp {
                     let detail = if let Some(url) = &cfg.url {
                         url.clone()
                     } else {
-                        format!(
-                            "{} {:?}",
-                            cfg.command.as_deref().unwrap_or("?"),
-                            cfg.args
-                        )
+                        format!("{} {:?}", cfg.command.as_deref().unwrap_or("?"), cfg.args)
                     };
                     let oauth = if cfg.oauth.is_some() { " oauth" } else { "" };
                     lines.push_str(&format!("  {name} [{kind}{oauth}] — {detail}\n"));
@@ -1641,10 +1644,17 @@ impl TuiApp {
                         .find(|m| m.role == MessageRole::User)
                         .map(|m| m.content.chars().take(40).collect::<String>())
                         .unwrap_or_else(|| "(untitled)".into());
-                    self.system_message(format!("Current title hint: {}\nUsage: /title <name>", title));
+                    self.system_message(format!(
+                        "Current title hint: {}\nUsage: /title <name>",
+                        title
+                    ));
                 } else if let Some(sid) = &self.state.session_id {
                     let params = serde_json::json!({"session_id": sid, "title": args});
-                    match self.client.rpc_call("session.set_title", Some(params)).await {
+                    match self
+                        .client
+                        .rpc_call("session.set_title", Some(params))
+                        .await
+                    {
                         Ok(_) => self.system_message(format!("Session title set to: {}", args)),
                         Err(e) => self.system_message(format!("Failed to set title: {}", e)),
                     }
@@ -1676,50 +1686,45 @@ impl TuiApp {
                 }
                 self.system_message(lines);
             }
-            "plugins" | "plugin" => {
-                match self.client.rpc_call("plugins.list", None).await {
-                    Ok(v) => self.system_message(format!("plugins: {}", v)),
-                    Err(_) => self.system_message(
-                        "plugins: check ~/.kkagent/plugins/*/plugin.json (RPC list optional)"
-                            .into(),
-                    ),
-                }
-            }
-            "skills" | "skill" => {
-                match self.client.rpc_call("skills.list", None).await {
-                    Ok(v) => self.system_message(format!("{v}")),
-                    Err(e) => self.system_message(format!("skills: {e}")),
-                }
-            }
-            "swarm" => {
-                match args.as_str() {
-                    "enter" | "on" => {
-                        let mut params = serde_json::json!({ "trigger": "slash" });
-                        if let Some(sid) = &self.state.session_id {
-                            params["session_id"] = serde_json::json!(sid);
-                        }
-                        match self.client.rpc_call("swarm.enter", Some(params)).await {
-                            Ok(v) => self.system_message(format!("swarm enter: {v}")),
-                            Err(e) => self.system_message(format!("swarm enter failed: {e}")),
-                        }
+            "plugins" | "plugin" => match self.client.rpc_call("plugins.list", None).await {
+                Ok(v) => self.system_message(format!("plugins: {}", v)),
+                Err(_) => self.system_message(
+                    "plugins: check ~/.kkagent/plugins/*/plugin.json (RPC list optional)".into(),
+                ),
+            },
+            "skills" | "skill" => match self.client.rpc_call("skills.list", None).await {
+                Ok(v) => self.system_message(format!("{v}")),
+                Err(e) => self.system_message(format!("skills: {e}")),
+            },
+            "swarm" => match args.as_str() {
+                "enter" | "on" => {
+                    let mut params = serde_json::json!({ "trigger": "slash" });
+                    if let Some(sid) = &self.state.session_id {
+                        params["session_id"] = serde_json::json!(sid);
                     }
-                    "exit" | "off" => {
-                        let params = self.state.session_id.as_ref().map(|sid| {
-                            serde_json::json!({ "session_id": sid })
-                        });
-                        match self.client.rpc_call("swarm.exit", params).await {
-                            Ok(v) => self.system_message(format!("swarm exit: {v}")),
-                            Err(e) => self.system_message(format!("swarm exit failed: {e}")),
-                        }
-                    }
-                    _ => {
-                        self.open_tasks_panel().await?;
-                        self.system_message(
-                            "swarm: panel open. Use /swarm enter|exit to toggle mode.".into(),
-                        );
+                    match self.client.rpc_call("swarm.enter", Some(params)).await {
+                        Ok(v) => self.system_message(format!("swarm enter: {v}")),
+                        Err(e) => self.system_message(format!("swarm enter failed: {e}")),
                     }
                 }
-            }
+                "exit" | "off" => {
+                    let params = self
+                        .state
+                        .session_id
+                        .as_ref()
+                        .map(|sid| serde_json::json!({ "session_id": sid }));
+                    match self.client.rpc_call("swarm.exit", params).await {
+                        Ok(v) => self.system_message(format!("swarm exit: {v}")),
+                        Err(e) => self.system_message(format!("swarm exit failed: {e}")),
+                    }
+                }
+                _ => {
+                    self.open_tasks_panel().await?;
+                    self.system_message(
+                        "swarm: panel open. Use /swarm enter|exit to toggle mode.".into(),
+                    );
+                }
+            },
             "provider" | "providers" => {
                 let mut lines = String::from("Providers / models:\n");
                 for (alias, m) in &self.config.models {
@@ -1774,7 +1779,9 @@ impl TuiApp {
                     };
                     if abs.is_dir() {
                         // Persist as a soft note for this session + surface to user.
-                        self.state.btw_notes.push(format!("add-dir:{}", abs.display()));
+                        self.state
+                            .btw_notes
+                            .push(format!("add-dir:{}", abs.display()));
                         self.system_message(format!(
                             "Added directory to session notes: {}\n\
                              Tip: also add under [permissions].trusted_workspaces in config.toml for persistence.",
@@ -1968,15 +1975,19 @@ impl TuiApp {
             return Ok(());
         };
 
-        if let Err(e) = self.client.respond_approval(
-            &sid,
-            kkagent_protocol::ApprovalResponse {
-                approval_id: approval.approval_id.clone(),
-                decision,
-                scope,
-                feedback: None,
-            },
-        ).await {
+        if let Err(e) = self
+            .client
+            .respond_approval(
+                &sid,
+                kkagent_protocol::ApprovalResponse {
+                    approval_id: approval.approval_id.clone(),
+                    decision,
+                    scope,
+                    feedback: None,
+                },
+            )
+            .await
+        {
             // Restore panel on failure
             self.state.approval_pending = Some(approval);
             self.system_message(format!("Approval failed: {}", e));
@@ -2122,7 +2133,9 @@ impl TuiApp {
                     AgentEvent::ThinkingDelta { text, .. } => {
                         self.state.thinking_text.push_str(&text);
                     }
-                    AgentEvent::ToolCall { tool_name, input, .. } => {
+                    AgentEvent::ToolCall {
+                        tool_name, input, ..
+                    } => {
                         self.state.last_tool_name = Some(tool_name.clone());
                         let summary = serde_json::to_string(&input)
                             .unwrap_or_default()
@@ -2160,7 +2173,12 @@ impl TuiApp {
                         msg.push_tool(tc);
                         self.state.messages.push(msg);
                     }
-                    AgentEvent::ToolResult { tool_name, output, is_error, .. } => {
+                    AgentEvent::ToolResult {
+                        tool_name,
+                        output,
+                        is_error,
+                        ..
+                    } => {
                         if let Some(last) = self.state.messages.last_mut() {
                             if let Some(tc) = last.find_pending_tool_mut(&tool_name) {
                                 tc.output = Some(output);
@@ -2175,7 +2193,9 @@ impl TuiApp {
                         let detail = request
                             .tool_input_display
                             .as_ref()
-                            .map(|v| serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string()))
+                            .map(|v| {
+                                serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string())
+                            })
                             .unwrap_or_default();
                         self.state.approval_pending = Some(PendingApproval {
                             approval_id: request.approval_id,
@@ -2207,7 +2227,8 @@ impl TuiApp {
                         self.state.status = SessionStatus::WaitingQuestion;
                     }
                     AgentEvent::UsageUpdate { usage, .. } => {
-                        self.state.approx_tokens = usage.input_tokens.saturating_add(usage.output_tokens);
+                        self.state.approx_tokens =
+                            usage.input_tokens.saturating_add(usage.output_tokens);
                     }
                     AgentEvent::Error { message, .. } => {
                         self.state.status = SessionStatus::Idle;
@@ -2308,16 +2329,12 @@ impl TuiApp {
                         ));
                     }
                     AgentEvent::SubagentFailed {
-                        subagent_id,
-                        error,
-                        ..
+                        subagent_id, error, ..
                     } => {
                         self.system_message(format!("⊟ subagent failed [{subagent_id}]: {error}"));
                     }
                     AgentEvent::SubagentChildEvent {
-                        subagent_id,
-                        event,
-                        ..
+                        subagent_id, event, ..
                     } => {
                         match *event {
                             AgentEvent::ToolCall {
@@ -2384,7 +2401,6 @@ impl TuiApp {
         }
     }
 }
-
 
 fn slash_help_text() -> String {
     let mut s = String::from(
@@ -2571,7 +2587,6 @@ fn transcript_messages_to_display(msgs: &[serde_json::Value]) -> Vec<DisplayMess
     }
     out
 }
-
 
 fn copy_to_clipboard(text: &str) -> anyhow::Result<()> {
     #[cfg(target_os = "macos")]

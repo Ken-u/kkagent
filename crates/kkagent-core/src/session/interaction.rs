@@ -100,7 +100,10 @@ impl SessionInteractionService {
     }
 
     pub fn is_recently_resolved(&self, id: &str) -> bool {
-        let mut map = self.recently_resolved.lock().unwrap_or_else(|e| e.into_inner());
+        let mut map = self
+            .recently_resolved
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let Some(at) = map.get(id).copied() else {
             return false;
         };
@@ -166,14 +169,13 @@ impl SessionInteractionService {
     }
 
     fn remember_resolved(&self, id: &str) {
-        let mut map = self.recently_resolved.lock().unwrap_or_else(|e| e.into_inner());
+        let mut map = self
+            .recently_resolved
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         map.insert(id.to_string(), chrono::Utc::now().timestamp_millis());
         if map.len() > RECENTLY_RESOLVED_MAX {
-            if let Some(oldest) = map
-                .iter()
-                .min_by_key(|(_, t)| *t)
-                .map(|(k, _)| k.clone())
-            {
+            if let Some(oldest) = map.iter().min_by_key(|(_, t)| *t).map(|(k, _)| k.clone()) {
                 map.remove(&oldest);
             }
         }

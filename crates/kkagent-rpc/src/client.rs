@@ -1,12 +1,12 @@
+use bytes::BytesMut;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::sync::{mpsc, Mutex, oneshot};
-use bytes::BytesMut;
+use tokio::sync::{mpsc, oneshot, Mutex};
 
-use kkagent_protocol::Frame;
 use crate::codec::NdjsonCodec;
 use crate::transport::AsyncTransport;
+use kkagent_protocol::Frame;
 
 type PendingCall = oneshot::Sender<Result<serde_json::Value, RpcError>>;
 

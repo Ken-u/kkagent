@@ -119,7 +119,10 @@ impl SessionSwarmBatchService {
                         // Actual turn execution is owned by agent_loop / subagent_runtime;
                         // here we only materialize the batch roster.
                         status: SwarmRunStatus::Completed,
-                        result: Some(format!("queued: {}", task.prompt.chars().take(80).collect::<String>())),
+                        result: Some(format!(
+                            "queued: {}",
+                            task.prompt.chars().take(80).collect::<String>()
+                        )),
                         error: None,
                         description: task.description.clone(),
                     });
@@ -147,15 +150,7 @@ impl SessionSwarmBatchService {
             .insert(caller_agent_id.to_string(), true);
     }
 
-    pub fn get_swarm_item(
-        &self,
-        agents: &AgentLifecycleService,
-        agent_id: &str,
-    ) -> Option<String> {
-        agents
-            .get(agent_id)?
-            .labels
-            .get("swarm_item")
-            .cloned()
+    pub fn get_swarm_item(&self, agents: &AgentLifecycleService, agent_id: &str) -> Option<String> {
+        agents.get(agent_id)?.labels.get("swarm_item").cloned()
     }
 }
