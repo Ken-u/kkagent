@@ -21,12 +21,14 @@ const MAX_RUNNING_JOBS: usize = 16;
 pub struct BashOptions {
     /// When a foreground command times out, detach into background instead of killing.
     pub auto_background_on_timeout: bool,
+    pub sandbox: crate::sandbox::SandboxPolicy,
 }
 
 impl Default for BashOptions {
     fn default() -> Self {
         Self {
             auto_background_on_timeout: true,
+            sandbox: crate::sandbox::SandboxPolicy::default(),
         }
     }
 }
@@ -331,8 +333,18 @@ impl BashTool {
 
         let mgr = self.backgrounds.clone();
         let id_clone = id.clone();
+        let sandbox = self.options.sandbox.clone();
         tokio::spawn(async move {
-            run_shell_job(mgr, id_clone, command, cwd, Some(timeout_ms), cancel).await;
+            run_shell_job(
+                mgr,
+                id_clone,
+                command,
+                cwd,
+                Some(timeout_ms),
+                cancel,
+                sandbox,
+            )
+            .await;
         });
 
         Ok(ToolOutput::success(format!(
@@ -350,9 +362,10 @@ Poll with Bash({{\"shell_id\":\"{id}\"}})."
         interrupted: Option<Arc<std::sync::atomic::AtomicBool>>,
     ) -> anyhow::Result<ToolOutput> {
         let (shell, flag) = shell_and_flag();
-        let mut cmd = Command::new(shell);
-        cmd.arg(flag).arg(&command);
-        cmd.current_dir(&cwd);
+        let mut cmd = match self.options.sandbox.command(shell, flag, &command, &cwd) {
+            Ok(command) => command,
+            Err(error) => return Ok(ToolOutput::error(format!("Sandbox setup failed: {error}"))),
+        };
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
         cmd.kill_on_drop(true);
@@ -362,6 +375,15 @@ Poll with Bash({{\"shell_id\":\"{id}\"}})."
         let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => return Ok(ToolOutput::error(format!("Failed to spawn: {}", e))),
+        };
+        let sandbox_guard = match self.options.sandbox.contain_child(&child) {
+            Ok(guard) => guard,
+            Err(error) => {
+                terminate_process_tree(&mut child).await;
+                return Ok(ToolOutput::error(format!(
+                    "Sandbox containment failed: {error}"
+                )));
+            }
         };
 
         let stdout = child.stdout.take();
@@ -452,6 +474,7 @@ Poll with Bash({{\"shell_id\":\"{id}\"}})."
                     let mgr = self.backgrounds.clone();
                     let id_clone = id.clone();
                     tokio::spawn(async move {
+                        let _sandbox_guard = sandbox_guard;
                         let waited = tokio::select! {
                             result = tokio::time::timeout(
                                 tokio::time::Duration::from_millis(MAX_BG_TIMEOUT_MS),
@@ -531,11 +554,18 @@ async fn run_shell_job(
     cwd: PathBuf,
     timeout_ms: Option<u64>,
     cancel: Arc<std::sync::atomic::AtomicBool>,
+    sandbox: crate::sandbox::SandboxPolicy,
 ) {
     let (shell, flag) = shell_and_flag();
-    let mut cmd = Command::new(shell);
-    cmd.arg(flag).arg(&command);
-    cmd.current_dir(&cwd);
+    let mut cmd = match sandbox.command(shell, flag, &command, &cwd) {
+        Ok(command) => command,
+        Err(error) => {
+            mgr.append_output(&id, &format!("Sandbox setup failed: {error}"))
+                .await;
+            mgr.finish(&id, ShellStatus::Failed, None).await;
+            return;
+        }
+    };
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
     cmd.kill_on_drop(true);
@@ -546,6 +576,16 @@ async fn run_shell_job(
         Ok(c) => c,
         Err(e) => {
             mgr.append_output(&id, &format!("Failed to spawn: {}", e))
+                .await;
+            mgr.finish(&id, ShellStatus::Failed, None).await;
+            return;
+        }
+    };
+    let _sandbox_guard = match sandbox.contain_child(&child) {
+        Ok(guard) => guard,
+        Err(error) => {
+            terminate_process_tree(&mut child).await;
+            mgr.append_output(&id, &format!("Sandbox containment failed: {error}"))
                 .await;
             mgr.finish(&id, ShellStatus::Failed, None).await;
             return;

@@ -6,6 +6,7 @@ pub mod display;
 pub mod git_worktree;
 pub mod path_policy;
 pub mod registry;
+pub mod sandbox;
 pub mod shell_safety;
 
 pub use accesses::{infer_accesses, tool_accesses, ToolAccesses, ToolResourceAccess};

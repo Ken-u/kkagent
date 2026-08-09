@@ -32,6 +32,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub background: Option<BackgroundConfig>,
     #[serde(default)]
+    pub sandbox: SandboxConfig,
+    #[serde(default)]
     pub permission: Option<PermissionConfig>,
     #[serde(default)]
     pub hooks: Vec<HookConfig>,
@@ -154,6 +156,56 @@ pub struct BackgroundConfig {
 
 fn default_max_tasks() -> u32 {
     4
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SandboxConfig {
+    /// disabled | process | workspace. Workspace is the production default.
+    #[serde(default = "default_sandbox_mode")]
+    pub mode: String,
+    /// Permit network access from tool processes.
+    #[serde(default = "default_true")]
+    pub network: bool,
+    #[serde(default = "default_sandbox_memory_mb")]
+    pub memory_mb: u64,
+    #[serde(default = "default_sandbox_cpu_seconds")]
+    pub cpu_seconds: u64,
+    #[serde(default = "default_sandbox_processes")]
+    pub max_processes: u32,
+    #[serde(default)]
+    pub extra_read_paths: Vec<String>,
+    #[serde(default)]
+    pub extra_write_paths: Vec<String>,
+}
+
+impl Default for SandboxConfig {
+    fn default() -> Self {
+        Self {
+            mode: default_sandbox_mode(),
+            network: true,
+            memory_mb: default_sandbox_memory_mb(),
+            cpu_seconds: default_sandbox_cpu_seconds(),
+            max_processes: default_sandbox_processes(),
+            extra_read_paths: Vec::new(),
+            extra_write_paths: Vec::new(),
+        }
+    }
+}
+
+fn default_sandbox_mode() -> String {
+    "workspace".into()
+}
+
+fn default_sandbox_memory_mb() -> u64 {
+    4096
+}
+
+fn default_sandbox_cpu_seconds() -> u64 {
+    600
+}
+
+fn default_sandbox_processes() -> u32 {
+    128
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

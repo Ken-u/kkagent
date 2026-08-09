@@ -1496,6 +1496,13 @@ async fn build_turn_tool_registry(
         state.bash_shells.clone(),
         kkagent_tools::builtin::BashOptions {
             auto_background_on_timeout,
+            sandbox: kkagent_tools::sandbox::SandboxPolicy::from_config(&state.config.sandbox)
+                .unwrap_or_else(|error| {
+                    tracing::error!("Invalid sandbox configuration: {error}");
+                    let mut policy = kkagent_tools::sandbox::SandboxPolicy::default();
+                    policy.mode = kkagent_tools::sandbox::SandboxMode::Workspace;
+                    policy
+                }),
         },
     )));
     register_mcp_tools(&mut tools, &state.mcp).await;
