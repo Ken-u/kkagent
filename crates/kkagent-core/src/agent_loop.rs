@@ -32,6 +32,12 @@ pub struct AgentLoop {
     goal_mgr: Option<Arc<GoalManager>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TurnStep {
+    Continue,
+    Done,
+}
+
 const TOOL_RESULT_INLINE_MAX: usize = 32_000;
 
 impl AgentLoop {
@@ -84,24 +90,33 @@ impl AgentLoop {
         &'a self,
         session: &'a mut Session,
     ) -> futures::future::BoxFuture<'a, anyhow::Result<()>> {
-        self.run_turn_inner(session, self.max_rounds)
+        Box::pin(async move {
+            let mut rounds_left = self.max_rounds;
+            loop {
+                match self.run_turn_step(session).await? {
+                    TurnStep::Done => return Ok(()),
+                    TurnStep::Continue if rounds_left <= 1 => {
+                        tracing::warn!("Agent turn limit reached for session {}", session.id);
+                        self.finish_turn(session, true).await?;
+                        return Ok(());
+                    }
+                    TurnStep::Continue => {
+                        rounds_left -= 1;
+                        tracing::info!("Continuing turn ({} rounds left)", rounds_left);
+                    }
+                }
+            }
+        })
     }
 
-    fn run_turn_inner<'a>(
-        &'a self,
-        session: &'a mut Session,
-        rounds_left: u32,
-    ) -> futures::future::BoxFuture<'a, anyhow::Result<()>> {
-        Box::pin(async move { self.run_turn_body(session, rounds_left).await })
-    }
-
-    async fn run_turn_body(&self, session: &mut Session, rounds_left: u32) -> anyhow::Result<()> {
+    async fn run_turn_step(&self, session: &mut Session) -> anyhow::Result<TurnStep> {
         session.image_config = self.config.image.clone();
         let session_id = session.id.clone();
         tracing::info!("Starting turn for session {}", session_id);
 
         if session.is_interrupted() {
-            return self.finish_interrupted(session).await;
+            self.finish_interrupted(session).await?;
+            return Ok(TurnStep::Done);
         }
 
         let _ = self
@@ -176,7 +191,8 @@ impl AgentLoop {
                             message: "Goal budget exhausted".into(),
                         })
                         .await;
-                    return self.finish_turn(session, false).await;
+                    self.finish_turn(session, false).await?;
+                    return Ok(TurnStep::Done);
                 }
                 if goal.status == kkagent_protocol::goal::GoalStatus::Active
                     && !session_has_goal_reminder(session)
@@ -446,7 +462,7 @@ Do not mention this reminder to the user.\n</system-reminder>"
                     .filter(|error| is_tool_call_arguments_object_error(error))
                 {
                     if let Some(mut rollback) =
-                        rollback_rejected_tool_call(&mut session.messages, error)
+                        rollback_rejected_tool_call(&mut session.messages, &messages, error)
                     {
                         rollback.provider_error = error.to_string();
                         session.transcript_rewrite_required = true;
@@ -528,7 +544,8 @@ Do not mention this reminder to the user.\n</system-reminder>"
                     content,
                 });
             }
-            return self.finish_interrupted(session).await;
+            self.finish_interrupted(session).await?;
+            return Ok(TurnStep::Done);
         }
 
         if let Some(rollback) = rejected_tool_call_recovery {
@@ -537,7 +554,9 @@ Do not mention this reminder to the user.\n</system-reminder>"
                 rollback.tool_call_id,
                 truncate_chars_for_event(&rollback.provider_error, 300)
             );
-            return self.finish_interrupted_with_message(session, message).await;
+            self.finish_interrupted_with_message(session, message)
+                .await?;
+            return Ok(TurnStep::Done);
         }
 
         if let Some(error) = terminal_stream_error {
@@ -600,9 +619,7 @@ Do not mention this reminder to the user.\n</system-reminder>"
                         })
                         .await;
                 }
-                return self
-                    .run_turn_inner(session, rounds_left.saturating_sub(1))
-                    .await;
+                return Ok(TurnStep::Continue);
             }
 
             // Same-step + cross-turn tool dedupe.
@@ -640,7 +657,8 @@ Do not mention this reminder to the user.\n</system-reminder>"
 
             for (idx, tc) in tool_calls.iter().enumerate() {
                 if session.is_interrupted() {
-                    return self.finish_interrupted(session).await;
+                    self.finish_interrupted(session).await?;
+                    return Ok(TurnStep::Done);
                 }
 
                 let _ = self
@@ -793,7 +811,8 @@ Do not mention this reminder to the user.\n</system-reminder>"
                                 }
                             }
                             kkagent_protocol::ApprovalDecision::Cancelled => {
-                                return self.finish_interrupted(session).await;
+                                self.finish_interrupted(session).await?;
+                                return Ok(TurnStep::Done);
                             }
                             _ => {
                                 Prepared::Done(ToolOutput::error("Tool call was rejected by user"))
@@ -1024,26 +1043,21 @@ Do not mention this reminder to the user.\n</system-reminder>"
             });
 
             if session.is_interrupted() {
-                return self.finish_interrupted(session).await;
+                self.finish_interrupted(session).await?;
+                return Ok(TurnStep::Done);
             }
 
             if dedupe_force_stop {
                 tracing::warn!("Tool dedupe force-stop after repeated identical calls");
-                return self.finish_turn(session, true).await;
+                self.finish_turn(session, true).await?;
+                return Ok(TurnStep::Done);
             }
 
-            tracing::info!(
-                "Recursing into next turn ({} rounds left)",
-                rounds_left.saturating_sub(1)
-            );
-            if rounds_left <= 1 {
-                tracing::warn!("Agent turn limit reached for session {}", session_id);
-                return self.finish_turn(session, true).await;
-            }
-            return self.run_turn_inner(session, rounds_left - 1).await;
+            return Ok(TurnStep::Continue);
         }
 
-        self.finish_turn(session, true).await
+        self.finish_turn(session, true).await?;
+        Ok(TurnStep::Done)
     }
 
     async fn finish_interrupted(&self, session: &mut Session) -> anyhow::Result<()> {
@@ -1402,11 +1416,12 @@ fn rejected_tool_call_id(error: &str) -> Option<String> {
 
 fn rollback_rejected_tool_call(
     messages: &mut Vec<ChatMessage>,
+    projected_messages: &[ChatMessage],
     error: &str,
 ) -> Option<ToolCallRollback> {
     let requested_id = rejected_tool_call_id(error);
     let exact_exists = requested_id.as_deref().is_some_and(|id| {
-        messages.iter().any(|message| {
+        projected_messages.iter().any(|message| {
             message.content.iter().any(
                 |part| matches!(part, ChatContent::ToolUse { id: candidate, .. } if candidate == id),
             )
@@ -1415,12 +1430,18 @@ fn rollback_rejected_tool_call(
     let tool_call_id = if exact_exists {
         requested_id?
     } else {
-        messages.iter().rev().find_map(|message| {
-            message.content.iter().rev().find_map(|part| match part {
-                ChatContent::ToolUse { id, input, .. } if !input.is_object() => Some(id.clone()),
-                _ => None,
+        projected_messages
+            .iter()
+            .rev()
+            .find_map(|message| {
+                message.content.iter().rev().find_map(|part| match part {
+                    ChatContent::ToolUse { id, input, .. } if !input.is_object() => {
+                        Some(id.clone())
+                    }
+                    _ => None,
+                })
             })
-        })?
+            .or_else(|| latest_tool_call_id(projected_messages))?
     };
 
     let rollback_index = messages.iter().rposition(|message| {
@@ -1438,6 +1459,15 @@ fn rollback_rejected_tool_call(
         tool_call_id,
         removed_blocks,
         provider_error: String::new(),
+    })
+}
+
+fn latest_tool_call_id(messages: &[ChatMessage]) -> Option<String> {
+    messages.iter().rev().find_map(|message| {
+        message.content.iter().rev().find_map(|part| match part {
+            ChatContent::ToolUse { id, .. } => Some(id.clone()),
+            _ => None,
+        })
     })
 }
 
@@ -1838,7 +1868,8 @@ mod retry_tests {
             "HTTP 400 Bad Request: status_code=400, Assistant tool call {bad_id}.arguments must be a JSON object."
         );
         assert!(is_tool_call_arguments_object_error(&error));
-        let rollback = rollback_rejected_tool_call(&mut messages, &error).unwrap();
+        let projected = messages.clone();
+        let rollback = rollback_rejected_tool_call(&mut messages, &projected, &error).unwrap();
         assert_eq!(rollback.tool_call_id, bad_id);
         assert_eq!(rollback.removed_blocks, 5);
         assert_eq!(messages.len(), 1);
@@ -1859,9 +1890,48 @@ mod retry_tests {
             }],
         }];
         let error = "status_code=400, Assistant tool call ***.arguments must be a JSON object.";
-        let rollback = rollback_rejected_tool_call(&mut messages, error).unwrap();
+        let projected = messages.clone();
+        let rollback = rollback_rejected_tool_call(&mut messages, &projected, error).unwrap();
         assert_eq!(rollback.tool_call_id, "actual-call");
         assert!(messages.is_empty());
+    }
+
+    #[test]
+    fn masked_provider_id_uses_corruption_from_projected_request() {
+        let mut messages = vec![
+            ChatMessage {
+                role: "user".into(),
+                content: vec![ChatContent::Text {
+                    text: "work".into(),
+                }],
+            },
+            ChatMessage {
+                role: "assistant".into(),
+                content: vec![ChatContent::ToolUse {
+                    id: "functions.Edit:9".into(),
+                    name: "Edit".into(),
+                    input: serde_json::json!({"old_string": "x", "new_string": "y"}),
+                }],
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: vec![ChatContent::ToolResult {
+                    tool_use_id: "functions.Edit:9".into(),
+                    content: "edited".into(),
+                    is_error: false,
+                }],
+            },
+        ];
+        let mut projected = messages.clone();
+        let ChatContent::ToolUse { input, .. } = &mut projected[1].content[0] else {
+            panic!("expected tool use");
+        };
+        *input = serde_json::Value::String("truncated arguments".into());
+
+        let error = "status_code=400, Assistant tool call ***.arguments must be a JSON object.";
+        let rollback = rollback_rejected_tool_call(&mut messages, &projected, error).unwrap();
+        assert_eq!(rollback.tool_call_id, "functions.Edit:9");
+        assert_eq!(messages.len(), 1);
     }
 
     #[test]
@@ -2034,6 +2104,102 @@ mod retry_tests {
                 .content
                 .iter()
                 .any(|content| matches!(content, ChatContent::Text { text } if text == "recovered"))
+        }));
+        std::fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn many_tool_steps_complete_without_recursive_stack_growth() {
+        const TOOL_STEPS: usize = 32;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            for step in 0..=TOOL_STEPS {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0_u8; 16_384];
+                let _ = socket.read(&mut request).await.unwrap();
+                let body = if step < TOOL_STEPS {
+                    format!(
+                        "data: {{\"choices\":[{{\"delta\":{{\"tool_calls\":[{{\"index\":0,\"id\":\"call-{step}\",\"function\":{{\"name\":\"MissingTool\",\"arguments\":\"{{\\\"step\\\":{step}}}\"}}}}]}}}}]}}\n\
+                         data: [DONE]\n"
+                    )
+                } else {
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"completed\"}}]}\n\
+                     data: [DONE]\n"
+                        .into()
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+
+        let mut config = AppConfig {
+            default_model: Some("test/model".into()),
+            loop_control: Some(LoopControlConfig {
+                max_attempts_per_step: 1,
+                reserved_context_size: 1_000,
+                max_steps_per_turn: 40,
+                auto_compact: false,
+                compact_keep_last: 4,
+                token_counting: "estimated".into(),
+            }),
+            ..AppConfig::default()
+        };
+        config.providers.insert(
+            "test".into(),
+            ProviderConfig {
+                provider_type: "openai-chat".into(),
+                api_key: Some("token".into()),
+                base_url: Some(base_url),
+                custom_headers: HashMap::new(),
+                oauth: None,
+            },
+        );
+        config.models.insert(
+            "test/model".into(),
+            ModelConfig {
+                provider: "test".into(),
+                model: "test-model".into(),
+                max_context_size: Some(1_000_000),
+                max_output_size: Some(1_000),
+                capabilities: vec!["tool_use".into()],
+                display_name: None,
+                support_efforts: Vec::new(),
+                default_effort: None,
+            },
+        );
+        let (event_tx, _) = mpsc::channel(512);
+        let loop_ = AgentLoop::new(
+            Arc::new(config),
+            Arc::new(ToolRegistry::new()),
+            Arc::new(Mutex::new(PermissionChain::new(
+                PermissionMode::Auto,
+                Vec::new(),
+            ))),
+            event_tx,
+            Arc::new(Mutex::new(HashMap::new())),
+        );
+        let workspace =
+            std::env::temp_dir().join(format!("kkagent-many-steps-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let mut session = Session::new(
+            "many-steps-test".into(),
+            workspace.clone(),
+            PermissionMode::Auto,
+            "test/model".into(),
+        );
+        session.add_user_message("keep working".into());
+
+        loop_.run_turn(&mut session).await.unwrap();
+        server.await.unwrap();
+        assert!(session.messages.iter().any(|message| {
+            message
+                .content
+                .iter()
+                .any(|content| matches!(content, ChatContent::Text { text } if text == "completed"))
         }));
         std::fs::remove_dir_all(workspace).unwrap();
     }

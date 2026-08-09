@@ -134,15 +134,13 @@ fn fold_message(msg: &ChatMessage, opts: &ProjectOptions, fold_hard: bool) -> Ch
                 filename: filename.clone(),
             }),
             ChatContent::ToolUse { id, name, input } => {
-                let input = if fold_hard {
-                    shrink_json(input, 400)
-                } else {
-                    input.clone()
-                };
                 Some(ChatContent::ToolUse {
                     id: id.clone(),
                     name: name.clone(),
-                    input,
+                    // Provider protocols require tool input to remain a JSON object.
+                    // Truncating its serialized form into a string corrupts historical
+                    // tool calls and makes the next request fail validation.
+                    input: input.clone(),
                 })
             }
             ChatContent::ToolResult {
@@ -171,14 +169,6 @@ fn truncate_chars(s: &str, max: usize) -> String {
     let keep = max.saturating_sub(40);
     let head: String = s.chars().take(keep).collect();
     format!("{head}\n…[{} chars truncated]", count - keep)
-}
-
-fn shrink_json(v: &serde_json::Value, max: usize) -> serde_json::Value {
-    let s = v.to_string();
-    if s.len() <= max {
-        return v.clone();
-    }
-    serde_json::Value::String(truncate_chars(&s, max))
 }
 
 /// In-place compact: replace everything before `keep_last` with a single summary user message.
@@ -237,6 +227,36 @@ mod tests {
         };
         assert!(old_len < recent_len);
         assert!(old_len < 800);
+    }
+
+    #[test]
+    fn project_preserves_large_tool_input_as_an_object() {
+        let large_input = serde_json::json!({
+            "path": "example.txt",
+            "old_string": "x".repeat(1_000),
+            "new_string": "y".repeat(1_000),
+        });
+        let mut messages = vec![ChatMessage {
+            role: "assistant".into(),
+            content: vec![ChatContent::ToolUse {
+                id: "functions.Edit:0".into(),
+                name: "Edit".into(),
+                input: large_input.clone(),
+            }],
+        }];
+        messages.extend((0..20).map(|index| ChatMessage {
+            role: "user".into(),
+            content: vec![ChatContent::Text {
+                text: format!("later message {index}"),
+            }],
+        }));
+
+        let projected = project(&messages, &ProjectOptions::default());
+        let ChatContent::ToolUse { input, .. } = &projected[0].content[0] else {
+            panic!("expected tool use");
+        };
+        assert!(input.is_object());
+        assert_eq!(input, &large_input);
     }
 
     #[test]

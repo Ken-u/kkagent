@@ -286,12 +286,22 @@ fn macos_profile(policy: &SandboxPolicy, cwd: &Path) -> anyhow::Result<String> {
     let mut profile = String::from(
         "(version 1)\n(deny default)\n(allow process*)\n(allow sysctl-read)\n(allow mach-lookup)\n\
          (deny mach-lookup (global-name \"com.apple.SecurityServer\") \
-         (global-name \"com.apple.securityd\"))\n(allow file-read*)\n\
+         (global-name \"com.apple.securityd\"))\n\
          (allow file-write* (subpath \"/private/tmp\") (subpath \"/tmp\") (subpath \"/dev\"))\n",
     );
     if let Some(home) = dirs::home_dir() {
         let home = literal(&std::fs::canonicalize(home)?)?;
-        profile.push_str(&format!("(deny file-read* file-write* (subpath {home}))\n"));
+        // A broad deny for HOME cannot be overridden by the later workspace
+        // allow when the workspace itself lives under HOME. Exclude HOME from
+        // the general read permission, then add narrow workspace/extra paths.
+        // Metadata access is needed to resolve a workspace path through its
+        // ancestors (Node.js performs this lstat/realpath walk at startup).
+        profile.push_str(&format!("(allow file-read-metadata (subpath {home}))\n"));
+        profile.push_str(&format!(
+            "(allow file-read* (require-not (subpath {home})))\n"
+        ));
+    } else {
+        profile.push_str("(allow file-read*)\n");
     }
     let cwd = literal(cwd)?;
     profile.push_str(&format!("(allow file-read* file-write* (subpath {cwd}))\n"));
@@ -318,12 +328,18 @@ fn apply_resource_limits(command: &mut Command, policy: &SandboxPolicy) -> anyho
         #[cfg(target_os = "linux")]
         let memory = policy.memory_mb.saturating_mul(1024 * 1024);
         let cpu = policy.cpu_seconds;
+        #[cfg(target_os = "linux")]
         let processes = policy.max_processes as u64;
         unsafe {
             command.as_std_mut().pre_exec(move || {
                 #[cfg(target_os = "linux")]
                 set_limit(libc::RLIMIT_AS as libc::c_int, memory)?;
                 set_limit(libc::RLIMIT_CPU as libc::c_int, cpu)?;
+                // macOS accounts RLIMIT_NPROC across the entire user rather than
+                // the sandboxed process tree. Applying a per-command value there
+                // prevents ordinary shell commands from forking as soon as the
+                // desktop user owns more processes than the configured limit.
+                #[cfg(target_os = "linux")]
                 set_limit(libc::RLIMIT_NPROC as libc::c_int, processes)?;
                 #[cfg(target_os = "linux")]
                 if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
@@ -455,6 +471,60 @@ mod tests {
             "allowed"
         );
         assert!(!outside.exists());
+        std::fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn mac_process_limit_does_not_block_shell_children() {
+        let workspace =
+            std::env::temp_dir().join(format!("kkagent-sandbox-fork-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let policy = SandboxPolicy {
+            mode: SandboxMode::Workspace,
+            max_processes: 1,
+            ..Default::default()
+        };
+        let mut command = policy
+            .command("/bin/bash", "-c", "/bin/echo child-process-ran", &workspace)
+            .unwrap();
+        let output = command.output().await.unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "child-process-ran"
+        );
+        std::fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn mac_workspace_below_home_remains_accessible() {
+        let workspace = dirs::home_dir().unwrap().join(format!(
+            ".kkagent-sandbox-home-workspace-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("visible.txt"), "visible").unwrap();
+        let policy = SandboxPolicy {
+            mode: SandboxMode::Workspace,
+            ..Default::default()
+        };
+        let mut command = policy
+            .command(
+                "/bin/bash",
+                "-c",
+                "/bin/realpath . && /bin/ls visible.txt",
+                &workspace,
+            )
+            .unwrap();
+        let output = command.output().await.unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("visible.txt"));
         std::fs::remove_dir_all(workspace).unwrap();
     }
 }
