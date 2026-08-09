@@ -1,5 +1,6 @@
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use crate::paste_placeholders::PastePlaceholders;
 use crate::pi::{move_word_left, move_word_right, EditorSnapshot, KillRing, PasteBurst, UndoStack};
 
 /// 输入状态，支持多行与正确的字节级光标（pi-tui editor 对齐）
@@ -13,6 +14,8 @@ pub struct InputState {
     pub kill_ring: KillRing,
     pub undo: UndoStack,
     pub paste: PasteBurst,
+    /// Kimi-style folded paste payloads keyed by marker id.
+    pub pastes: PastePlaceholders,
     last_was_kill: bool,
 }
 
@@ -31,6 +34,7 @@ impl Clone for InputState {
             kill_ring: KillRing::new(),
             undo: UndoStack::new(64),
             paste: PasteBurst::new(),
+            pastes: self.pastes.clone(),
             last_was_kill: false,
         }
     }
@@ -45,6 +49,7 @@ impl InputState {
             kill_ring: KillRing::new(),
             undo: UndoStack::new(64),
             paste: PasteBurst::new(),
+            pastes: PastePlaceholders::new(),
             last_was_kill: false,
         }
     }
@@ -256,20 +261,55 @@ impl InputState {
         self.paste.push(chunk);
     }
 
-    pub fn flush_paste(&mut self) -> bool {
+    pub fn flush_paste(&mut self, fold: bool) -> bool {
         if let Some(s) = self.paste.take() {
-            self.insert_str(&s);
+            self.insert_paste(&s, fold);
             true
         } else {
             false
         }
     }
 
-    pub fn force_flush_paste(&mut self) {
+    pub fn force_flush_paste(&mut self, fold: bool) {
         let s = self.paste.force_take();
         if !s.is_empty() {
-            self.insert_str(&s);
+            self.insert_paste(&s, fold);
         }
+    }
+
+    /// Insert clipboard/bracketed paste. Large pastes fold into a one-line overview
+    /// when `fold` is true (agent/plan mode). If the cursor sits on an existing
+    /// paste marker, expand that marker instead (kimi second-paste behavior).
+    pub fn insert_paste(&mut self, raw: &str, fold: bool) {
+        if raw.is_empty() {
+            return;
+        }
+        if self.expand_paste_marker_at_cursor() {
+            return;
+        }
+        let insert = if fold {
+            self.pastes.maybe_fold(raw)
+        } else {
+            crate::paste_placeholders::normalize_pasted_text(raw)
+        };
+        self.insert_str(&insert);
+    }
+
+    /// Expand the paste marker under the cursor back to full text.
+    pub fn expand_paste_marker_at_cursor(&mut self) -> bool {
+        let Some((start, end, id)) = self.pastes.marker_at_cursor(&self.text, self.cursor) else {
+            return false;
+        };
+        let Some(full) = self.pastes.get(id).map(|s| s.to_string()) else {
+            return false;
+        };
+        self.replace_range(start, end, &full);
+        true
+    }
+
+    /// Expand folded paste markers for submit / history display.
+    pub fn expand_pastes(&self, text: &str) -> String {
+        self.pastes.expand(text)
     }
 
     pub fn clear(&mut self) {
@@ -394,5 +434,28 @@ mod tests {
         s.yank();
         assert_eq!(s.text, "hello world");
         assert!(s.undo_edit());
+    }
+
+    #[test]
+    fn large_paste_folds_to_overview() {
+        let mut s = InputState::new();
+        let big = "line\n".repeat(20);
+        s.insert_paste(&big, true);
+        assert!(s.text.starts_with("[Pasted text #1"));
+        assert!(s.text.contains("lines]"));
+        let expanded = s.expand_pastes(&s.text);
+        assert!(expanded.lines().count() >= 20);
+    }
+
+    #[test]
+    fn second_paste_expands_marker() {
+        let mut s = InputState::new();
+        let big = "alpha\n".repeat(16);
+        s.insert_paste(&big, true);
+        let marker = s.text.clone();
+        s.cursor = marker.len() / 2;
+        assert!(s.expand_paste_marker_at_cursor());
+        assert!(s.text.contains("alpha"));
+        assert!(!s.text.contains("[Pasted text"));
     }
 }

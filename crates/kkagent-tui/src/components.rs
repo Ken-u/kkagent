@@ -27,6 +27,7 @@ const TIPS: &[&str] = &[
     "shift-tab toggles plan mode",
     "! enters shell mode",
     "/yolo auto-approves tools",
+    "large pastes collapse to [Pasted text #n]",
     "scroll to review earlier messages",
 ];
 
@@ -48,7 +49,7 @@ pub fn render_ui(f: &mut Frame, state: &mut AppState, config: &AppConfig) {
 
     // kimi 布局：tabs(可选) | 消息区 | todo(可选) | 带边框输入框 | footer 两行
     let tab_height = if state.tab_strip.tabs.len() > 1 { 1 } else { 0 };
-    let input_inner = input_inner_height(state);
+    let input_inner = input_inner_height(state, size.width);
     let input_box = input_inner + 2; // borders
     let bottom_stack = todo_height + input_box + slash_height;
     let chunks = Layout::default()
@@ -174,9 +175,59 @@ fn picker_height(picker: &ListPickerState) -> u16 {
     rows + 2
 }
 
-fn input_inner_height(state: &AppState) -> u16 {
-    let lines = state.input.text.lines().count().max(1) as u16;
-    lines.clamp(1, 6)
+fn input_prefix_str(state: &AppState) -> &'static str {
+    match state.mode {
+        AppMode::Shell => "! ",
+        AppMode::Plan => "plan > ",
+        AppMode::Normal => "> ",
+    }
+}
+
+/// Logical lines for the editor (`split` keeps a trailing empty line after final `\n`).
+fn input_logical_lines(text: &str) -> Vec<&str> {
+    if text.is_empty() {
+        vec![""]
+    } else {
+        text.split('\n').collect()
+    }
+}
+
+/// Soft-wrap a single logical line into visual rows of at most `width` columns.
+fn soft_wrap_line(line: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![line.to_string()];
+    }
+    if line.is_empty() {
+        return vec![String::new()];
+    }
+    wrap_str(line, width)
+}
+
+/// Total visual rows for input text given content width (after prefix indent).
+fn input_visual_row_count(text: &str, content_width: usize) -> u16 {
+    let width = content_width.max(1);
+    let mut rows = 0u16;
+    for line in input_logical_lines(text) {
+        let n = soft_wrap_line(line, width).len() as u16;
+        rows = rows.saturating_add(n.max(1));
+    }
+    rows.max(1)
+}
+
+fn input_inner_height(state: &AppState, terminal_width: u16) -> u16 {
+    let prefix_w = UnicodeWidthStr::width(input_prefix_str(state));
+    // borders take 2 columns
+    let inner_width = terminal_width.saturating_sub(2);
+    let content_width = inner_width.saturating_sub(prefix_w as u16).max(1) as usize;
+    let rows = input_visual_row_count(&state.input.text, content_width);
+    let (_, cursor_y) = cursor_position(
+        &state.input.text,
+        state.input.cursor,
+        content_width,
+        prefix_w as u16,
+    );
+    // Include the cursor row (exact wrap boundary may need one extra visual line).
+    rows.max(cursor_y.saturating_add(1)).clamp(1, 8)
 }
 
 fn render_messages(f: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) {
@@ -870,65 +921,102 @@ fn render_input(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let prefix_w = UnicodeWidthStr::width(prefix) as u16;
+    let prefix_w = UnicodeWidthStr::width(prefix);
+    let content_width = (inner.width as usize).saturating_sub(prefix_w).max(1);
+    let indent = " ".repeat(prefix_w);
 
-    // Build text lines, prefixing only the first line and indenting continuations
-    let lines: Vec<Line> = state
-        .input
-        .text
-        .lines()
-        .enumerate()
-        .map(|(i, line)| {
-            if i == 0 {
-                Line::from(vec![
+    // Soft-wrap each logical line; prefix only the first visual row of the buffer.
+    let mut visual: Vec<Line> = Vec::new();
+    for (li, logical) in input_logical_lines(&state.input.text).into_iter().enumerate() {
+        let chunks = soft_wrap_line(logical, content_width);
+        for (ci, chunk) in chunks.into_iter().enumerate() {
+            if li == 0 && ci == 0 {
+                visual.push(Line::from(vec![
                     Span::styled(prefix, prefix_style),
-                    Span::styled(line.to_string(), Style::default().fg(theme.text)),
-                ])
+                    Span::styled(chunk, Style::default().fg(theme.text)),
+                ]));
             } else {
-                Line::from(vec![
-                    Span::raw(" ".repeat(prefix_w as usize)),
-                    Span::styled(line.to_string(), Style::default().fg(theme.text)),
-                ])
+                visual.push(Line::from(vec![
+                    Span::raw(indent.clone()),
+                    Span::styled(chunk, Style::default().fg(theme.text)),
+                ]));
             }
-        })
-        .collect();
+        }
+    }
+    if visual.is_empty() {
+        visual.push(Line::from(vec![Span::styled(prefix, prefix_style)]));
+    }
 
-    // Handle empty input so we still show the prefix/cursor
-    let paragraph = if lines.is_empty() {
-        Paragraph::new(Line::from(vec![Span::styled(prefix, prefix_style)]))
+    let (cursor_x, cursor_y) =
+        cursor_position(&state.input.text, state.input.cursor, content_width, prefix_w as u16);
+    // Exact wrap boundary can place the cursor on a fresh visual row — pad so it paints.
+    while (visual.len() as u16) <= cursor_y {
+        visual.push(Line::from(vec![
+            Span::raw(indent.clone()),
+            Span::styled(String::new(), Style::default().fg(theme.text)),
+        ]));
+    }
+
+    let view_h = inner.height.max(1);
+    let scroll = if cursor_y + 1 > view_h {
+        cursor_y + 1 - view_h
     } else {
-        Paragraph::new(Text::from(lines))
+        0
     };
+
+    let paragraph = Paragraph::new(Text::from(visual)).scroll((scroll, 0));
     f.render_widget(paragraph, inner);
 
-    // Cursor position: support multi-line wrapping within the input box
-    let (cursor_x, cursor_y) =
-        cursor_position(&state.input.text, state.input.cursor, inner, prefix_w);
     let abs_x = inner.x + cursor_x;
-    let abs_y = inner.y + cursor_y;
+    let abs_y = inner.y + cursor_y.saturating_sub(scroll);
     if abs_x < inner.x + inner.width && abs_y < inner.y + inner.height {
         f.set_cursor_position((abs_x, abs_y));
     }
 }
 
-/// Compute (x, y) relative to `inner` for the input cursor.
-fn cursor_position(text: &str, cursor: usize, inner: Rect, prefix_w: u16) -> (u16, u16) {
+/// Compute (x, y) relative to the input inner area for the cursor, with soft-wrap.
+fn cursor_position(text: &str, cursor: usize, content_width: usize, prefix_w: u16) -> (u16, u16) {
+    let width = content_width.max(1);
     if text.is_empty() {
-        return (prefix_w.min(inner.width.saturating_sub(1)), 0);
+        return (prefix_w, 0);
     }
-    // Ensure we never slice mid-codepoint (would panic).
-    let mut safe_cursor = cursor.min(text.len());
-    while safe_cursor > 0 && !text.is_char_boundary(safe_cursor) {
-        safe_cursor -= 1;
+    let mut safe = cursor.min(text.len());
+    while safe > 0 && !text.is_char_boundary(safe) {
+        safe -= 1;
     }
-    let line_start = text[..safe_cursor].rfind('\n').map(|i| i + 1).unwrap_or(0);
-    let before_cursor = &text[line_start..safe_cursor];
-    let col = UnicodeWidthStr::width(before_cursor) as u16;
-    let line_index = text[..safe_cursor].matches('\n').count() as u16;
-    let width = inner.width.saturating_sub(prefix_w).max(1);
-    let x = prefix_w + (col % width);
-    let y = line_index + (col / width);
-    (x, y)
+
+    let lines = input_logical_lines(text);
+    let mut y: u16 = 0;
+    let mut pos = 0;
+    for (idx, logical) in lines.iter().enumerate() {
+        let line_start = pos;
+        let line_end = pos + logical.len();
+        let on_this = if idx + 1 < lines.len() {
+            // Non-final logical line owns [start, end] (not the trailing `\n`).
+            safe >= line_start && safe <= line_end
+        } else {
+            safe >= line_start
+        };
+
+        if on_this {
+            let mut col_end = safe.min(line_end).saturating_sub(line_start);
+            while col_end > 0 && !logical.is_char_boundary(col_end) {
+                col_end -= 1;
+            }
+            let col = UnicodeWidthStr::width(&logical[..col_end]);
+            let wrap_row = (col / width) as u16;
+            let x = prefix_w + (col % width) as u16;
+            return (x, y.saturating_add(wrap_row));
+        }
+
+        let rows = soft_wrap_line(logical, width).len() as u16;
+        y = y.saturating_add(rows.max(1));
+        pos = line_end;
+        if pos < text.len() && text.as_bytes()[pos] == b'\n' {
+            pos += 1;
+        }
+    }
+    (prefix_w, y.saturating_sub(1))
 }
 
 fn render_footer(f: &mut Frame, area: Rect, state: &AppState, config: &AppConfig, theme: &Theme) {
@@ -1842,5 +1930,31 @@ mod render_smoke {
         let s = "你好世界abcdef";
         let parts = wrap_str(s, 4);
         assert!(!parts.is_empty());
+    }
+
+    #[test]
+    fn input_soft_wrap_cursor_and_rows() {
+        let text = "abcdefghijklmnopqrstuvwxyz";
+        // content width 10 → three visual rows
+        assert_eq!(input_visual_row_count(text, 10), 3);
+        let (x, y) = cursor_position(text, text.len(), 10, 2);
+        // 26 cols → wrap_row 2, x_off 6 + prefix 2
+        assert_eq!(y, 2);
+        assert_eq!(x, 2 + 6);
+
+        let multi = "short\nabcdefghijklmnopqrstuvwxyz";
+        let rows = input_visual_row_count(multi, 10);
+        assert_eq!(rows, 1 + 3);
+        let (_, y) = cursor_position(multi, multi.len(), 10, 2);
+        assert_eq!(y, 1 + 2);
+    }
+
+    #[test]
+    fn trailing_newline_keeps_empty_visual_row() {
+        let text = "hi\n";
+        assert_eq!(input_logical_lines(text), vec!["hi", ""]);
+        assert_eq!(input_visual_row_count(text, 40), 2);
+        let (x, y) = cursor_position(text, text.len(), 40, 2);
+        assert_eq!((x, y), (2, 1));
     }
 }

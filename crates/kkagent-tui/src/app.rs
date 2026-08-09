@@ -533,8 +533,9 @@ impl TuiApp {
                 match event::read()? {
                     Event::Key(key) => self.handle_key(key).await?,
                     Event::Paste(text) => {
+                        let fold = self.state.mode != AppMode::Shell;
                         self.state.input.paste_chunk(&text);
-                        self.state.input.force_flush_paste();
+                        self.state.input.force_flush_paste(fold);
                         self.state.refresh_slash_menu();
                     }
                     Event::Resize(_, _) => {}
@@ -542,7 +543,8 @@ impl TuiApp {
                 }
             } else {
                 // Debounced paste flush (pi-tui paste-burst)
-                if self.state.input.flush_paste() {
+                let fold = self.state.mode != AppMode::Shell;
+                if self.state.input.flush_paste(fold) {
                     self.state.refresh_slash_menu();
                 }
             }
@@ -872,7 +874,8 @@ impl TuiApp {
                     }
                     Ok(None) => {
                         if let Ok(text) = read_clipboard_text() {
-                            self.state.input.insert_str(&text);
+                            let fold = self.state.mode != AppMode::Shell;
+                            self.state.input.insert_paste(&text, fold);
                             self.state.refresh_slash_menu();
                         }
                     }
@@ -1435,10 +1438,12 @@ impl TuiApp {
     }
 
     async fn submit_input(&mut self) -> anyhow::Result<()> {
-        let text = self.state.input.take();
-        if text.is_empty() {
+        let raw = self.state.input.take();
+        if raw.is_empty() {
             return Ok(());
         }
+        // Expand kimi-style `[Pasted text #n]` markers before send / display.
+        let text = self.state.input.expand_pastes(&raw);
         self.state.slash_menu = None;
         self.state.file_menu = None;
         self.state.list_picker = None;
@@ -2533,7 +2538,8 @@ fn slash_help_text() -> String {
   Ctrl-G        - Toggle btw notes pane\n\
   Ctrl-O        - Fold tool output\n\
   Ctrl-T        - Expand/collapse todo panel\n\
-  Drag + copy   - Native terminal text selection\n\n\
+  Drag + copy   - Native terminal text selection\n\
+  Large paste   - Collapses to [Pasted text #n] overview\n\n\
 Slash commands:\n",
     );
     for cmd in slash::BUILTIN_SLASH_COMMANDS {
