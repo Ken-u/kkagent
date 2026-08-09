@@ -276,7 +276,7 @@ Do not mention this reminder to the user.\n</system-reminder>"
             };
 
             let (stream_tx, mut stream_rx) = mpsc::channel::<StreamEvent>(256);
-            let provider = create_provider(provider_config, model_config);
+            let provider = create_provider(provider_config, model_config)?;
             let stream_error_tx = stream_tx.clone();
             let handle = tokio::spawn(async move {
                 if let Err(e) = provider.stream_chat(request, stream_tx).await {

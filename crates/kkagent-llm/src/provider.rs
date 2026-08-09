@@ -170,8 +170,8 @@ fn build_client() -> reqwest::Client {
 pub fn create_provider(
     provider_config: &ProviderConfig,
     model_config: &ModelConfig,
-) -> Box<dyn LlmProvider> {
-    match provider_config.provider_type.as_str() {
+) -> anyhow::Result<Box<dyn LlmProvider>> {
+    let provider: Box<dyn LlmProvider> = match provider_config.provider_type.as_str() {
         "openai-responses" | "responses" => Box::new(OpenAiProvider::responses(provider_config)),
         "openai-legacy" | "openai-chat" => Box::new(OpenAiProvider::new(provider_config)),
         "openai" => {
@@ -183,7 +183,8 @@ pub fn create_provider(
             }
         }
         "google" | "google-genai" | "gemini" => Box::new(GoogleProvider::new(provider_config)),
-        // Kimi intentionally stays on Anthropic-compatible Messages (user request).
-        "anthropic" | "kimi" | _ => Box::new(AnthropicProvider::new(provider_config)),
-    }
+        "anthropic" | "kimi" => Box::new(AnthropicProvider::new(provider_config)),
+        other => anyhow::bail!("unsupported LLM provider type: {other}"),
+    };
+    Ok(provider)
 }

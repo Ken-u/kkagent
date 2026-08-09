@@ -223,6 +223,87 @@ pub struct McpOAuthConfig {
 }
 
 impl AppConfig {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        let default_model = self
+            .default_model
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| anyhow::anyhow!("default_model must be configured"))?;
+        if !matches!(self.effective_permission_mode(), "manual" | "yolo" | "auto") {
+            anyhow::bail!(
+                "default_permission_mode must be one of manual, yolo, auto (got {})",
+                self.effective_permission_mode()
+            );
+        }
+        for (name, provider) in &self.providers {
+            if !matches!(
+                provider.provider_type.as_str(),
+                "anthropic"
+                    | "kimi"
+                    | "openai"
+                    | "openai-responses"
+                    | "responses"
+                    | "openai-legacy"
+                    | "openai-chat"
+                    | "google"
+                    | "google-genai"
+                    | "gemini"
+            ) {
+                anyhow::bail!(
+                    "provider {name} has unsupported type {}",
+                    provider.provider_type
+                );
+            }
+            if let Some(base_url) = provider.base_url.as_deref() {
+                if !(base_url.starts_with("http://") || base_url.starts_with("https://")) {
+                    anyhow::bail!("provider {name} base_url must use http or https");
+                }
+            }
+        }
+        for (alias, model) in &self.models {
+            if model.model.trim().is_empty() {
+                anyhow::bail!("model {alias} has an empty upstream model id");
+            }
+            if !self.providers.contains_key(&model.provider) {
+                anyhow::bail!(
+                    "model {alias} references missing provider {}",
+                    model.provider
+                );
+            }
+            if model.max_context_size == Some(0) || model.max_output_size == Some(0) {
+                anyhow::bail!("model {alias} token limits must be greater than zero");
+            }
+        }
+        if !self.models.contains_key(default_model) {
+            anyhow::bail!("default_model {default_model} is not present in [models]");
+        }
+        if let Some(secondary) = self.secondary_model.as_deref() {
+            if !self.models.contains_key(secondary) {
+                anyhow::bail!("secondary_model {secondary} is not present in [models]");
+            }
+        }
+        for root in &self.trusted_workspaces {
+            if !std::path::Path::new(root).is_absolute() {
+                anyhow::bail!("trusted workspace must be absolute: {root}");
+            }
+        }
+        for (name, server) in &self.mcp_servers {
+            match server.transport_type.as_deref().unwrap_or("stdio") {
+                "stdio" if server.command.as_deref().unwrap_or("").trim().is_empty() => {
+                    anyhow::bail!("MCP server {name} requires command for stdio transport")
+                }
+                "sse" | "http" | "streamable-http"
+                    if server.url.as_deref().unwrap_or("").trim().is_empty() =>
+                {
+                    anyhow::bail!("MCP server {name} requires url for remote transport")
+                }
+                "stdio" | "sse" | "http" | "streamable-http" => {}
+                other => anyhow::bail!("MCP server {name} has unsupported transport {other}"),
+            }
+        }
+        Ok(())
+    }
+
     pub fn resolve_model(&self, alias: &str) -> Option<(&ModelConfig, &ProviderConfig)> {
         let model = self.models.get(alias)?;
         let provider = self.providers.get(&model.provider)?;
@@ -235,5 +316,67 @@ impl AppConfig {
 
     pub fn effective_permission_mode(&self) -> &str {
         self.default_permission_mode.as_deref().unwrap_or("manual")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn valid_config() -> AppConfig {
+        let mut config = AppConfig {
+            default_model: Some("test/model".into()),
+            ..AppConfig::default()
+        };
+        config.providers.insert(
+            "test".into(),
+            ProviderConfig {
+                provider_type: "openai".into(),
+                api_key: None,
+                base_url: Some("https://example.test".into()),
+                custom_headers: HashMap::new(),
+            },
+        );
+        config.models.insert(
+            "test/model".into(),
+            ModelConfig {
+                provider: "test".into(),
+                model: "upstream-model".into(),
+                max_context_size: Some(100_000),
+                max_output_size: Some(4_096),
+                capabilities: vec!["tool_use".into()],
+                display_name: None,
+                support_efforts: Vec::new(),
+                default_effort: None,
+            },
+        );
+        config
+    }
+
+    #[test]
+    fn accepts_consistent_configuration() {
+        valid_config().validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_unknown_provider_type() {
+        let mut config = valid_config();
+        config.providers.get_mut("test").unwrap().provider_type = "typo".into();
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("unsupported type"));
+    }
+
+    #[test]
+    fn rejects_missing_default_model() {
+        let mut config = valid_config();
+        config.default_model = Some("missing".into());
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("not present"));
     }
 }

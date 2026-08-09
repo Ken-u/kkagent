@@ -30,6 +30,9 @@ pub fn load_config(path: Option<&Path>) -> Result<AppConfig> {
     };
 
     apply_env_overrides(&mut config);
+    config
+        .validate()
+        .with_context(|| format!("Invalid kkagent configuration: {:?}", config_path))?;
     Ok(config)
 }
 

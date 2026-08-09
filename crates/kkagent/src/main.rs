@@ -1345,7 +1345,7 @@ async fn summarize_with_llm(config: Arc<AppConfig>, digest: &str) -> Option<Stri
         .clone()
         .or_else(|| config.default_model_alias().map(|s| s.to_string()))?;
     let (model_cfg, provider_cfg) = config.resolve_model(&alias)?;
-    let provider = create_provider(provider_cfg, model_cfg);
+    let provider = create_provider(provider_cfg, model_cfg).ok()?;
     let (tx, mut rx) = mpsc::channel(64);
     let request = LlmRequest {
         model: model_cfg.model.clone(),
