@@ -1,11 +1,11 @@
-//! Mouse protocol for the TUI.
+//! Mouse capture for wheel scroll, with click-to-release for native selection.
 //!
-//! Full SGR mouse capture (`?1000h`) gives wheel scroll but steals drag-select
-//! from the terminal. Alternate-scroll (`?1007h`) is the compatible default:
-//! the terminal turns the wheel into Up/Down (or PgUp/PgDn) keys while leaving
-//! click-drag selection native.
+//! Enabling SGR mouse capture lets the app handle the wheel, but blocks the
+//! terminal's drag-select. On left-click we temporarily disable capture so the
+//! same gesture (or the next drag) can select text; the next keypress restores
+//! capture. ↑↓ stay bound to input history.
 //!
-//! Override with `KKAGENT_MOUSE_MODE=alternate-scroll|sgr|off`.
+//! Set `KKAGENT_MOUSE_MODE=off` to disable mouse reporting entirely.
 
 use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
 use crossterm::execute;
@@ -13,45 +13,36 @@ use std::io::{self, Write};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MouseMode {
-    /// Wheel → cursor/page keys; native drag-select works.
-    AlternateScroll,
-    /// Full mouse capture; wheel is `Event::Mouse`; use Shift/Option+drag to select.
-    Sgr,
-    /// No mouse reporting.
+    /// Wheel scroll via `Event::Mouse`; left-click releases capture for select.
+    Capture,
+    /// No mouse reporting (PgUp/PgDn only).
     Off,
 }
 
 impl MouseMode {
-    pub fn from_env() -> Self {
-        match std::env::var("KKAGENT_MOUSE_MODE")
-            .unwrap_or_default()
-            .to_ascii_lowercase()
-            .as_str()
-        {
-            "sgr" | "capture" | "full" => Self::Sgr,
+    pub fn parse(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
             "off" | "none" | "0" => Self::Off,
-            _ => Self::AlternateScroll,
+            // legacy aliases from earlier builds
+            "alternate-scroll" | "alt-scroll" | "1007" => Self::Off,
+            _ => Self::Capture,
         }
+    }
+
+    pub fn from_env() -> Self {
+        Self::parse(&std::env::var("KKAGENT_MOUSE_MODE").unwrap_or_default())
     }
 
     pub fn enable(self, out: &mut impl Write) -> io::Result<()> {
         match self {
-            Self::AlternateScroll => {
-                out.write_all(b"\x1b[?1007h")?;
-                out.flush()
-            }
-            Self::Sgr => execute!(out, EnableMouseCapture),
+            Self::Capture => execute!(out, EnableMouseCapture),
             Self::Off => Ok(()),
         }
     }
 
     pub fn disable(self, out: &mut impl Write) -> io::Result<()> {
         match self {
-            Self::AlternateScroll => {
-                out.write_all(b"\x1b[?1007l")?;
-                out.flush()
-            }
-            Self::Sgr => execute!(out, DisableMouseCapture),
+            Self::Capture => execute!(out, DisableMouseCapture),
             Self::Off => Ok(()),
         }
     }
@@ -62,8 +53,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_is_alternate_scroll() {
-        // Ensure unknown values fall back without panicking.
-        assert_eq!(MouseMode::from_env(), MouseMode::AlternateScroll);
+    fn parse_modes() {
+        assert_eq!(MouseMode::parse(""), MouseMode::Capture);
+        assert_eq!(MouseMode::parse("sgr"), MouseMode::Capture);
+        assert_eq!(MouseMode::parse("off"), MouseMode::Off);
+        assert_eq!(MouseMode::parse("alternate-scroll"), MouseMode::Off);
     }
 }
