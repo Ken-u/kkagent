@@ -41,12 +41,15 @@ TUI 问题同时查看 `~/.kkagent/kkagent.log`。分享日志前删除 token、
 | 现象 | 原因与处理 |
 |---|---|
 | HTTP `401` | Bearer token 与 Server 启动 token 不一致。 |
+| HTTP `403` | token scope 不足，或 fs write / terminal API 未通过启动参数开启。 |
+| HTTP `429` | 当前 token 达到每分钟请求限制；降低频率或调整 `--http-rate-limit`。 |
 | 连接旧会话 | 检查 `--resume`、`--connect` 和仍运行的 Server。 |
 | `server.sock` 连不上 | 确认无进程监听后再删除残留 endpoint 并重启。 |
 | POST 后没有最终文本 | POST 只提交任务；连接 WS，并按 `session_id` 等事件。 |
 | WS 断线后缺事件 | 事件流不保证重放；重新读取 session/snapshot。 |
 | fs/terminal 返回 400 | 路径不可信、cwd 不存在或命令创建失败。 |
 | terminal `429` | 删除已完成 terminal，降低并发。 |
+| `/ready` 返回 503 | 检查 transcript DB；显式内存降级模式始终不进入 ready。 |
 
 ## ACP、MCP、Hooks
 

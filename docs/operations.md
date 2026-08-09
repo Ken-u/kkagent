@@ -13,6 +13,7 @@
 | `~/.kkagent/server.sock` | Unix socket，或 Windows 本地 endpoint 文件。 |
 | `~/.kkagent/skills/`、`plugins/`、`hooks.json` | 用户扩展。 |
 | `~/.kkagent/telemetry/events.jsonl` | 本地遥测事件。 |
+| `~/.kkagent/http-audit.jsonl` | HTTP 请求审计日志，不记录原始 token。 |
 | `<workspace>/.kkagent/plans/` | Session 计划。 |
 | `<workspace>/.kkagent/tool-results/` | 被外置保存的超大工具结果。 |
 
@@ -31,10 +32,12 @@ debug 日志可能包含上游错误和工具参数，收集后应脱敏。长�
 ```bash
 curl --fail --silent \
   -H "Authorization: Bearer $KKAGENT_HTTP_TOKEN" \
-  http://127.0.0.1:8787/api/v1/meta
+  http://127.0.0.1:8787/api/v1/ready
 ```
 
-`meta` 只证明 HTTP 进程可用。完整健康检查还应创建临时 Session、向低成本模型发送短 prompt，并确认 WebSocket 收到终止事件；避免高频执行实网 LLM 检查。
+`health` 是存活探针，`ready` 会检查持久化并在显式内存降级时返回 503。`metrics` 输出 Prometheus 文本。完整端到端检查还应创建临时 Session、向低成本模型发送短 prompt，并确认事件序号连续；避免高频执行实网 LLM 检查。
+
+Transcript DB 默认打不开时进程启动失败，防止静默丢会话。只有明确接受非持久化运行时才设置 `KKAGENT_ALLOW_IN_MEMORY_TRANSCRIPTS=1`；此时 health 会标记 `durable=false`，ready 保持 503。
 
 ## 备份与恢复
 

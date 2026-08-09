@@ -261,6 +261,10 @@ TUI 模式下日志**不会**打印到屏幕（避免破坏布局），而是追
 ./target/release/kkagent server --http 127.0.0.1:8787 --http-token "$KKAGENT_HTTP_TOKEN"
 ```
 
+直接 HTTP 文件写和 terminal API 默认关闭；只有确实需要时才增加
+`--allow-fs-write-api` / `--allow-terminal-api`。服务提供 `/api/v1/health`、
+`/api/v1/ready`、`/api/v1/metrics` 和带序号的事件回放。
+
 HTTP/WS API 始终启用认证：优先使用 `Authorization: Bearer <token>`，也兼容
 `?token=<token>`。如果未传 `--http-token` 且环境变量中没有
 `KKAGENT_HTTP_TOKEN`，服务会为本次进程生成高熵 token 并打印到 stderr。

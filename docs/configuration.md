@@ -12,8 +12,8 @@ kkagent 读取一份 TOML 配置：优先使用 `--config <path>`，否则读取
 | `secondary_model` | string | 无 | 可选的辅助模型别名。 |
 | `default_permission_mode` | string | `manual` | `manual`、`yolo` 或 `auto`。 |
 | `default_plan_mode` | bool | `false` | 新会话是否以 Plan 模式开始。 |
-| `merge_all_available_skills` | bool | `false` | 已纳入 schema 的兼容字段；当前运行时仍按需加载 Skill。 |
-| `extra_skill_dirs` | string[] | `[]` | 已纳入 schema 的兼容字段；当前发现器尚未扫描这些目录。 |
+| `merge_all_available_skills` | bool | `false` | 把全部 Skill 正文合入初始上下文；默认只注入目录并按需加载。 |
+| `extra_skill_dirs` | string[] | `[]` | 额外 Skill 根目录；相对路径基于 Server 启动目录。 |
 | `telemetry` | bool | `false` | 是否启用云遥测发送。 |
 | `trusted_workspaces` | string[] | `[]` | HTTP 文件和终端操作允许访问的绝对工作区；为空时只信任 Server 启动目录。 |
 
@@ -116,7 +116,7 @@ command = "/absolute/path/to/check.sh"
 timeout = 5
 ```
 
-事件支持 `pre_tool_call`、`post_tool_call`、`session_start`、`session_end`、`turn_start`、`turn_end`、`notification`。`matcher` 当前是兼容字段，运行时会触发该 event 下的 Hook，尚未按工具名过滤。JSON Hook 格式见[扩展机制](extensions.md)。
+事件支持 `pre_tool_call`、`post_tool_call`、`session_start`、`session_end`、`turn_start`、`turn_end`、`notification`。`matcher` 支持精确工具名和 `*` 通配；带 matcher 的非工具事件不会触发。JSON Hook 格式见[扩展机制](extensions.md)。
 
 ## 服务
 
@@ -173,6 +173,10 @@ client_label = "kkagent"
 | `KKAGENT_MOONSHOT_SEARCH_URL` | 搜索服务地址。 |
 | `KKAGENT_MOONSHOT_SEARCH_KEY` 或 `MOONSHOT_API_KEY` | 搜索服务密钥。 |
 | `KKAGENT_HTTP_TOKEN` | Agent Server HTTP/WS Bearer token。 |
+| `KKAGENT_HTTP_READ_TOKEN` | 只读 API token。 |
+| `KKAGENT_HTTP_WRITE_TOKEN` | read + 非 terminal 写操作 token。 |
+| `KKAGENT_HTTP_TERMINAL_TOKEN` | read + terminal token。 |
+| `KKAGENT_ALLOW_IN_MEMORY_TRANSCRIPTS` | 显式允许 transcript 非持久化降级；readiness 会保持失败。 |
 | `KKAGENT_TELEMETRY_ENDPOINT`、`KKAGENT_TELEMETRY_CLOUD` | 云遥测地址和开关。 |
 | `RUST_LOG` | 日志过滤器。 |
 

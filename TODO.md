@@ -56,6 +56,12 @@
 - [x] Transcript 批量事务、压缩重写、fork/archive/rename 一致性
 - [x] Kimi 视频 Files API / 托管账号 OAuth identity（自动刷新、私有原子存储、模型目录配置）
 - [x] Linux/macOS/Windows x86_64/arm64 CI 检查矩阵与 Rust 1.88 MSRV
+- [x] RPC/HTTP/ACP 共用完整 Turn 工具装配
+- [x] per-workspace Skill 热加载、frontmatter、额外目录与受限资源读取
+- [x] Hook 配置合并、matcher、workspace 隔离、超时清理与输出上限
+- [x] 事件序号、回放窗口、Session 过滤与 turn 状态查询
+- [x] HTTP scoped token、限流、审计和危险 API 显式开关
+- [x] Transcript fail-closed、health/readiness、Prometheus 指标和 request ID
 
 ## 七、验证
 

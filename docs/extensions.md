@@ -41,7 +41,22 @@ Skill 是一个目录中的 `SKILL.md`。发现顺序包括：
 再按正确性、安全性、跨平台和测试覆盖率输出问题。
 ```
 
-Skill 只提供指令和资源，不会自动绕过工具权限。当前 Agent 按需要选择和加载，以减少上下文占用；配置 schema 中的 `extra_skill_dirs` 和 `merge_all_available_skills` 暂未接入发现器。
+Skill 可使用简单 frontmatter：
+
+```markdown
+---
+name: rust-review
+description: Review Rust changes before release
+version: 1.0.0
+triggers: [review, release]
+---
+
+按 references/checklist.md 执行检查。
+```
+
+Skill 名只能包含 ASCII 字母、数字、`-`、`_`。`SKILL.md` 最大 256 KiB；目录中的资源会被列给模型，`Skill` 工具可用 `resource` 参数读取最大 1 MiB 的 UTF-8 文本资源，并阻止绝对路径、`..` 和符号链接逃逸。每次列出或加载都会重新扫描，因此编辑无需重启。
+
+同名优先级为项目 `.kkagent` > 项目 `.kimi` > `extra_skill_dirs` > 用户目录。独立 Server 会按每个 Session workspace 单独发现。Skill 不会绕过工具权限；`merge_all_available_skills = true` 会增加初始上下文占用。
 
 ## Hooks
 
@@ -69,7 +84,7 @@ Hook 进程工作目录是当前 workspace，并收到 `KKAGENT_HOOK_EVENT` 和 
 {"block": true, "reason": "production deploy is disabled"}
 ```
 
-或返回 `{"rewrite": {...}}` 改写上下文。`pre_tool_call` 非零退出可阻断工具；其他失败和超时主要记录警告。TOML Hook 的 `matcher` 当前尚未用于过滤。Hook 本身是本机可执行代码，项目 Hook 只应在可信仓库中启用。
+或返回 `{"rewrite": {...}}` 改写上下文。TOML、用户 JSON 和项目 JSON 会合并；项目 Hook 按 Session workspace 动态读取。`matcher` 支持 `Bash`、`mcp_*` 等模式。`pre_tool_call` 启动失败、非零退出或超时会阻断工具；stdout/stderr 会持续排空并各限制为 64 KiB，timeout 最大 300 秒。Hook 本身是本机可执行代码，项目 Hook 只应在可信仓库中启用。
 
 ## 插件
 

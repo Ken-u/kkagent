@@ -17,15 +17,34 @@ kkagent server --listen ~/.kkagent/server.sock --http 127.0.0.1:8787
 kkagent --connect ~/.kkagent/server.sock
 ```
 
+`POST /api/v1/fs` 和 terminal API 默认关闭。确实需要时显式启用：
+
+```bash
+kkagent server --http 127.0.0.1:8787 \
+  --allow-fs-write-api \
+  --allow-terminal-api \
+  --http-rate-limit 600
+```
+
 ## 认证
 
-所有 HTTP 路由使用同一认证：
+主 token 拥有 `admin` scope：
 
 ```http
 Authorization: Bearer <token>
 ```
 
 也兼容 `?token=<token>`，主要用于不方便设置 Header 的 WebSocket 客户端。查询参数可能进入日志和代理记录，普通 HTTP 请求应优先使用 Header。
+
+还可用环境变量配置最小权限 token：
+
+| 环境变量 | scope |
+|---|---|
+| `KKAGENT_HTTP_READ_TOKEN` | GET、WebSocket、health、metrics。 |
+| `KKAGENT_HTTP_WRITE_TOKEN` | read + Session、消息、批准和直接文件写等非 terminal 写操作。 |
+| `KKAGENT_HTTP_TERMINAL_TOKEN` | read + terminal；不能创建 Agent Session。 |
+
+每个 token 默认每分钟最多 600 个请求；`--http-rate-limit 0` 可关闭。请求会获得 `x-request-id`，脱敏 token 指纹、方法、路径、状态码和 request ID 默认写入 `~/.kkagent/http-audit.jsonl`。
 
 ## 最小流程
 
@@ -51,6 +70,11 @@ curl -sS -H "$AUTH" -H 'Content-Type: application/json' \
 | 方法与路径 | 说明 |
 |---|---|
 | `GET /api/v1/meta` | 名称、版本、API 和 capability。 |
+| `GET /api/v1/health` | 存活、持久化状态、uptime 和 Session 数。 |
+| `GET /api/v1/ready` | 可接流量时返回 200；降级或持久化失败返回 503。 |
+| `GET /api/v1/metrics` | Prometheus 文本指标。 |
+| `GET /api/v1/events?since=&session_id=&limit=` | 回放内存事件窗口。 |
+| `GET /api/v1/turns/{session-id}` | 查询最近 turn 状态和事件序号。 |
 | `GET /api/v1/sessions` | 列出会话。 |
 | `POST /api/v1/sessions` | 创建会话；body 为 `{workspace?, title?}`。 |
 | `GET /api/v1/sessions/{id}` | 读取会话。 |
@@ -75,19 +99,19 @@ curl -sS -H "$AUTH" -H 'Content-Type: application/json' \
 | `GET /api/v1/connections` | 可用实时连接。 |
 | `GET /api/v1/ws` | WebSocket 事件流。 |
 
-终端创建 body 为 `{command?, cwd?}`。最多同时保留 64 个 HTTP terminal，命令最大 64 KiB，stdout 和 stderr 各最多保留约 1 MiB。该接口能执行任意已认证命令，是部署时最高风险的接口之一。
+终端创建 body 为 `{command?, cwd?}`。API 必须用 `--allow-terminal-api` 开启并持有 `terminal` 或 `admin` scope。最多同时保留 64 个 HTTP terminal，命令最大 64 KiB，stdout 和 stderr 各最多保留约 1 MiB。
 
 ## WebSocket
 
 连接示例：
 
 ```text
-ws://127.0.0.1:8787/api/v1/ws?token=<url-encoded-token>
+ws://127.0.0.1:8787/api/v1/ws?token=<url-encoded-token>&session_id=<id>&since=<seq>
 ```
 
-连接后先收到 `{"type":"hello","api":"v1"}`。发送 `{"type":"subscribe"}` 会收到订阅确认；发送包含 `ping` 的文本会收到 pong。随后 Server 推送全局 Agent 事件。事件通常含 `type`，会话相关事件通常含 `session_id`；客户端应自行按会话过滤并忽略未知字段和未知事件类型。
+连接后先收到 hello，其中包含 `latest_event_seq` 和 `history_capacity`。每个事件包含单调递增的 `event_seq` 和 `emitted_at`。`since` 会回放窗口内更新，`session_id` 在服务端过滤。发送 `{"type":"subscribe","session_id":"..."}` 可设置过滤；发送包含 `ping` 的文本会收到 pong。
 
-WebSocket 是广播流，慢客户端可能丢失事件。持久状态应通过会话、任务和 snapshot HTTP API 重新读取，不应只依赖事件重放。
+WebSocket 是广播流；慢客户端会收到 `resync_required`，随后应调用 events、turn 和 snapshot 接口恢复。Server 保留最近 2048 个事件，超过窗口的历史不会重放。
 
 ## 本地 RPC
 

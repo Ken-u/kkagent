@@ -17,7 +17,9 @@
 ## 子命令
 
 ```bash
-kkagent server [--listen <path>] [--http <addr>] [--http-token <token>]
+kkagent server [--listen <path>] [--http <addr>] [--http-token <token>] \
+  [--allow-terminal-api] [--allow-fs-write-api] \
+  [--http-rate-limit <requests-per-minute>] [--http-audit-log <path>]
 kkagent acp
 kkagent auth login [--oauth-host <url>] [--base-url <url>]
 kkagent auth logout

@@ -17,16 +17,16 @@ kkagent 能读取和修改文件、运行 Shell、访问网络和调用第三方
 
 ## Server 暴露
 
-HTTP token 持有者能够创建 Agent 会话、读写可信工作区文件，并通过 terminal API 运行命令。若监听非 loopback 地址：
+主 HTTP token 是 admin。部署时优先给调用方发 read/write/terminal scoped token，并保持直接 fs write 和 terminal API 关闭。若监听非 loopback 地址：
 
 - 在前面部署 TLS 反向代理；
 - 限制来源 IP 或使用私有网络；
 - 不把 token 放进 URL；
 - 禁止代理缓存 API 响应；
-- 记录和审计 terminal、fs、approval 请求；
+- 保留并轮转 `~/.kkagent/http-audit.jsonl`；
 - 把 `trusted_workspaces` 限定为必要的绝对路径。
 
-WebSocket query token 是兼容机制，可能被访问日志记录。能设置 Header 的客户端应使用 Bearer Header。
+WebSocket query token 是兼容机制，可能被访问日志记录；普通 HTTP 和 Node SDK 使用 Bearer Header。terminal API 即使有 token 也必须通过 `--allow-terminal-api` 显式打开。
 
 ## 凭据和敏感文件
 

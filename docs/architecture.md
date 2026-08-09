@@ -51,7 +51,7 @@ TUI / prompt / ACP / HTTP+WS
 
 每个 Session 有独立上下文和执行状态。Server 可承载多个 Session；同一 Session 的 prompt、interrupt、approval 和 question 通过 ID 关联。后台 Task 有单独并发控制，Bash 后台进程还有独立硬上限。
 
-HTTP WebSocket 是进程级广播，不是每 Session 一条可靠队列；客户端负责按 `session_id` 过滤，并通过 REST 快照恢复状态。
+HTTP WebSocket 是进程级广播，但 Server 会添加单调事件序号、保留最近 2048 条，并支持服务端 `session_id` 过滤和 `since` 回放。超过窗口时客户端通过 REST event/turn/snapshot 恢复状态。
 
 ## 持久化
 

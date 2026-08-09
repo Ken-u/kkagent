@@ -68,13 +68,15 @@ Agent 的回复和工具执行是异步的。`postMessage()` 表示消息已被 
 Agent 已经完成。需要通过 WebSocket 接收增量文本、工具调用、错误和回合结束事件：
 
 ```js
+let lastEventSeq = 0;
 const socket = client.connectEvents((event) => {
   console.log("agent event:", event);
+  if (event?.event_seq) lastEventSeq = event.event_seq;
 
   if (event?.type === "turn_end") {
     console.log("Agent 本轮执行完成");
   }
-});
+}, { sessionId: session.session_id, since: lastEventSeq });
 
 socket.addEventListener("open", () => {
   console.log("event stream connected");
@@ -163,7 +165,9 @@ interface KkagentClientOptions {
 | `postMessage(sessionId, text)` | 提交一条用户消息 | 接受结果 JSON |
 | `listTools()` | 查询可用工具 | 原始 JSON |
 | `modelCatalog()` | 查询模型目录 | 原始 JSON |
-| `connectEvents(callback)` | 连接全局 WebSocket 事件流 | `WebSocket` |
+| `eventsSince(since?, sessionId?, limit?)` | 回放带序号的事件窗口 | `EventHistory` |
+| `turnStatus(sessionId)` | 查询最近 turn 状态 | 原始 JSON |
+| `connectEvents(callback, {since?, sessionId?})` | 连接可恢复、可过滤的 WebSocket 事件流 | `WebSocket` |
 
 ### `JsonRpcClient`
 
@@ -184,11 +188,11 @@ const result = await rpc.call("sessions.list", { limit: 20 });
 
 ## 认证与安全
 
-- SDK 当前通过 `?token=` 向 HTTP/WS API 传递 token；server 同时支持标准 Bearer 认证。
+- SDK 对 HTTP 使用标准 Bearer Header；WebSocket 因浏览器 API 限制使用 URL token。
 - token 不应写入源码或提交到 Git，建议通过环境变量传入。
 - `workspace` 指向 server 机器上的目录，不是浏览器或调用方机器上的目录。
 - 建议设置 `trusted_workspaces`，限制 Agent 可以创建 Session 的根目录。
-- 公网部署应在 kkagent 前增加 TLS、身份认证、请求限流和网络访问控制。
+- Server 已有 token scope、基础限流和审计；公网部署仍应增加 TLS 和网络访问控制。
 
 ## 构建与测试
 
@@ -207,7 +211,7 @@ npm test
 
 - 尚未封装审批、问题回答、文件、终端、任务、导出和 Session 删除等接口。
 - 尚未提供自动启动/停止本地 `kkagent` 子进程的能力。
-- WebSocket 尚未内置重连、心跳、Session 过滤和完成态 Promise。
+- WebSocket 支持 Session 过滤和 `since` 回放，但尚未自动重连、心跳和提供完成态 Promise；调用方可配合 `eventsSince()`、`turnStatus()` 恢复。
 - HTTP 错误目前主要包含状态码，尚未统一解析结构化错误响应。
 - JavaScript 与 TypeScript 入口目前分别维护。
 

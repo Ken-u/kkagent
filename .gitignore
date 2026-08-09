@@ -6,6 +6,7 @@
 .env
 .env.*
 !.env.example
+/.kkagent/
 
 # IDE / OS
 .DS_Store
@@ -17,6 +18,10 @@
 /ref/
 /tmp/
 *.log
+
+# Node build artifacts
+**/node_modules/
+sdk/node/dist/
 
 # Release dist
 /target/release-dist/
