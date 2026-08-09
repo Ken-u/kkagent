@@ -1661,7 +1661,6 @@ fn render_approval_panel(f: &mut Frame, area: Rect, approval: &mut PendingApprov
     let x = (area.width.saturating_sub(panel_width)) / 2;
     let y = (area.height.saturating_sub(panel_height)) / 2;
     let panel_area = Rect::new(x, y, panel_width, panel_height);
-    approval.panel_rect = Some((x, y, panel_width, panel_height));
 
     f.render_widget(Clear, panel_area);
 
@@ -1719,7 +1718,7 @@ fn render_approval_panel(f: &mut Frame, area: Rect, approval: &mut PendingApprov
 
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "  click / 1·2·3 / enter",
+        "  1·2·3 / enter",
         Style::default().fg(theme.text_muted),
     )));
 
@@ -1736,7 +1735,6 @@ fn render_question_panel(f: &mut Frame, area: Rect, question: &mut PendingQuesti
     let x = (area.width.saturating_sub(panel_width)) / 2;
     let y = (area.height.saturating_sub(panel_height)) / 2;
     let panel_area = Rect::new(x, y, panel_width, panel_height);
-    question.panel_rect = Some((x, y, panel_width, panel_height));
 
     f.render_widget(Clear, panel_area);
 

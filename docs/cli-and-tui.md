@@ -55,6 +55,8 @@ answer=$(kkagent -p "总结 README" 2>kkagent.err)
 | `Shift+Tab` | 切换 Plan 模式。 |
 | 空输入时输入 `!` | Shell 输入模式。 |
 | `Ctrl+O` | 折叠或展开工具输出。 |
+| `PgUp` / `PgDn` | 滚动对话记录。 |
+| 鼠标拖选 | 原生选中并复制文字（终端快捷键复制）。 |
 
 ## 斜杠命令
 

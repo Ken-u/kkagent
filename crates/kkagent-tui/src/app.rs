@@ -1,8 +1,5 @@
 use crossterm::{
-    event::{
-        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event, KeyCode, KeyEvent, KeyModifiers, MouseEventKind,
-    },
+    event::{self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -56,11 +53,6 @@ pub struct AppState {
     pub follow_bottom: bool,
     pub approx_tokens: u64,
     pub approval_pending: Option<PendingApproval>,
-    /// Mouse click on approval option — processed in main loop (needs await)
-    pub pending_approval_click: Option<(
-        kkagent_protocol::ApprovalDecision,
-        Option<kkagent_protocol::ApprovalScope>,
-    )>,
     /// AskUserQuestion panel
     pub question_pending: Option<PendingQuestion>,
     /// `/` command autocomplete popup
@@ -240,8 +232,6 @@ pub struct PendingApproval {
     pub action: String,
     pub detail: String,
     pub selected: usize,
-    /// Panel screen rect for mouse hit-testing (updated each frame)
-    pub panel_rect: Option<(u16, u16, u16, u16)>, // x, y, w, h
 }
 
 #[derive(Debug, Clone)]
@@ -253,7 +243,6 @@ pub struct PendingQuestion {
     pub selected: usize,
     pub toggled: Vec<bool>,
     pub free_text: String,
-    pub panel_rect: Option<(u16, u16, u16, u16)>,
 }
 
 impl AppState {
@@ -279,7 +268,6 @@ impl AppState {
             follow_bottom: true,
             approx_tokens: 0,
             approval_pending: None,
-            pending_approval_click: None,
             question_pending: None,
             slash_menu: None,
             file_menu: None,
@@ -490,12 +478,9 @@ impl TuiApp {
             )
         })?;
         let mut stdout = io::stdout();
-        if let Err(e) = execute!(
-            stdout,
-            EnterAlternateScreen,
-            EnableMouseCapture,
-            EnableBracketedPaste
-        ) {
+        // Do not EnableMouseCapture: it steals click-drag from the terminal and
+        // breaks native text selection / copy. Scroll with PgUp/PgDn instead.
+        if let Err(e) = execute!(stdout, EnterAlternateScreen, EnableBracketedPaste) {
             let _ = disable_raw_mode();
             return Err(e.into());
         }
@@ -521,8 +506,7 @@ impl TuiApp {
         let _ = execute!(
             terminal.backend_mut(),
             DisableBracketedPaste,
-            LeaveAlternateScreen,
-            DisableMouseCapture
+            LeaveAlternateScreen
         );
         let _ = terminal.show_cursor();
 
@@ -548,7 +532,6 @@ impl TuiApp {
             if event::poll(std::time::Duration::from_millis(50))? {
                 match event::read()? {
                     Event::Key(key) => self.handle_key(key).await?,
-                    Event::Mouse(mouse) => self.handle_mouse(mouse),
                     Event::Paste(text) => {
                         self.state.input.paste_chunk(&text);
                         self.state.input.force_flush_paste();
@@ -562,10 +545,6 @@ impl TuiApp {
                 if self.state.input.flush_paste() {
                     self.state.refresh_slash_menu();
                 }
-            }
-
-            if let Some((decision, scope)) = self.state.pending_approval_click.take() {
-                self.respond_approval(decision, scope).await?;
             }
 
             if let Some(prompt) = self.state.pending_prompt.take() {
@@ -590,46 +569,6 @@ impl TuiApp {
             }
         }
         Ok(())
-    }
-
-    fn handle_mouse(&mut self, mouse: crossterm::event::MouseEvent) {
-        match mouse.kind {
-            MouseEventKind::ScrollUp => self.state.scroll_lines(3),
-            MouseEventKind::ScrollDown => self.state.scroll_lines(-3),
-            MouseEventKind::Down(event::MouseButton::Left) => {
-                if let Some(ref mut approval) = self.state.approval_pending {
-                    if let Some((x, y, w, h)) = approval.panel_rect {
-                        if mouse.column >= x
-                            && mouse.column < x.saturating_add(w)
-                            && mouse.row >= y
-                            && mouse.row < y.saturating_add(h)
-                        {
-                            // Option lines start ~3 rows below panel top (title + action + blank)
-                            let rel = mouse.row.saturating_sub(y.saturating_add(3));
-                            if rel < 3 {
-                                approval.selected = rel as usize;
-                                // Click selects; require Enter/1/2/3 to confirm — or auto-confirm on click
-                                let selected = approval.selected;
-                                let decision = match selected {
-                                    0 => kkagent_protocol::ApprovalDecision::Approved,
-                                    1 => kkagent_protocol::ApprovalDecision::Approved,
-                                    _ => kkagent_protocol::ApprovalDecision::Rejected,
-                                };
-                                let scope = if selected == 1 {
-                                    Some(kkagent_protocol::ApprovalScope::Session)
-                                } else {
-                                    None
-                                };
-                                // Can't await here — set a flag via spawn pattern: use blocking approach
-                                // Store pending click decision
-                                self.state.pending_approval_click = Some((decision, scope));
-                            }
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
     }
 
     async fn handle_key(&mut self, key: KeyEvent) -> anyhow::Result<()> {
@@ -2390,7 +2329,6 @@ impl TuiApp {
                             action: request.action,
                             detail,
                             selected: 0,
-                            panel_rect: None,
                         });
                         self.state.status = SessionStatus::WaitingApproval;
                     }
@@ -2409,7 +2347,6 @@ impl TuiApp {
                             selected: 0,
                             toggled,
                             free_text: String::new(),
-                            panel_rect: None,
                         });
                         self.state.status = SessionStatus::WaitingQuestion;
                     }
@@ -2596,7 +2533,7 @@ fn slash_help_text() -> String {
   Ctrl-G        - Toggle btw notes pane\n\
   Ctrl-O        - Fold tool output\n\
   Ctrl-T        - Expand/collapse todo panel\n\
-  Mouse wheel   - Scroll history\n\n\
+  Drag + copy   - Native terminal text selection\n\n\
 Slash commands:\n",
     );
     for cmd in slash::BUILTIN_SLASH_COMMANDS {
