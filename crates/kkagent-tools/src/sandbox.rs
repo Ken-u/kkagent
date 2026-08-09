@@ -157,7 +157,10 @@ impl SandboxPolicy {
                     windows_sys::Win32::Foundation::CloseHandle(job);
                     return Err(std::io::Error::last_os_error().into());
                 }
-                resume_process_thread(pid)?;
+                if let Err(error) = resume_process_thread(pid) {
+                    windows_sys::Win32::Foundation::CloseHandle(job);
+                    return Err(error);
+                }
                 Ok(SandboxProcessGuard(job))
             }
         }
