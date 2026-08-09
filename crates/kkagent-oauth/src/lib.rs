@@ -131,6 +131,14 @@ fn request_headers(cfg: &OAuthFlowConfig) -> Result<reqwest::header::HeaderMap, 
     Ok(headers)
 }
 
+fn oauth_client() -> Result<reqwest::Client, OAuthError> {
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .map_err(|error| OAuthError::Connection(error.to_string()))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeviceAuthorization {
     pub device_code: String,
@@ -182,7 +190,7 @@ pub async fn exchange_code(
     code: &str,
     pkce: &PkcePair,
 ) -> Result<TokenInfo, OAuthError> {
-    let client = reqwest::Client::new();
+    let client = oauth_client()?;
     let mut form = vec![
         ("grant_type", "authorization_code".to_string()),
         ("code", code.to_string()),
@@ -215,7 +223,7 @@ pub async fn refresh_access_token(
     cfg: &OAuthFlowConfig,
     refresh_token: &str,
 ) -> Result<TokenInfo, OAuthError> {
-    let client = reqwest::Client::new();
+    let client = oauth_client()?;
     let mut form = vec![
         ("grant_type", "refresh_token".to_string()),
         ("refresh_token", refresh_token.to_string()),
@@ -224,22 +232,56 @@ pub async fn refresh_access_token(
     if let Some(secret) = &cfg.client_secret {
         form.push(("client_secret", secret.clone()));
     }
-    let resp = client
-        .post(&cfg.token_url)
-        .headers(request_headers(cfg)?)
-        .form(&form)
-        .send()
-        .await
-        .map_err(|e| OAuthError::Connection(e.to_string()))?;
-    if !resp.status().is_success() {
-        let t = resp.text().await.unwrap_or_default();
-        return Err(OAuthError::Unauthorized(t));
-    }
-    parse_token_response(
-        resp.json()
+    for attempt in 0..3_u32 {
+        let response = match client
+            .post(&cfg.token_url)
+            .headers(request_headers(cfg)?)
+            .form(&form)
+            .send()
             .await
-            .map_err(|e| OAuthError::Connection(e.to_string()))?,
-    )
+        {
+            Ok(response) => response,
+            Err(error) if attempt < 2 => {
+                tokio::time::sleep(std::time::Duration::from_millis(250 * 2_u64.pow(attempt)))
+                    .await;
+                tracing::warn!(attempt = attempt + 1, %error, "OAuth refresh transport retry");
+                continue;
+            }
+            Err(error) => return Err(OAuthError::Connection(error.to_string())),
+        };
+        let status = response.status();
+        let retry_after = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(|seconds| std::time::Duration::from_secs(seconds.min(30)));
+        if status.is_success() {
+            return parse_token_response(
+                response
+                    .json()
+                    .await
+                    .map_err(|error| OAuthError::Connection(error.to_string()))?,
+            );
+        }
+        let body = response.text().await.unwrap_or_default();
+        if (status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error())
+            && attempt < 2
+        {
+            let delay = retry_after
+                .unwrap_or_else(|| std::time::Duration::from_millis(250 * 2_u64.pow(attempt)));
+            tracing::warn!(attempt = attempt + 1, %status, "OAuth refresh HTTP retry");
+            tokio::time::sleep(delay).await;
+            continue;
+        }
+        if status.is_client_error() {
+            return Err(OAuthError::Unauthorized(body));
+        }
+        return Err(OAuthError::Connection(format!("HTTP {status}: {body}")));
+    }
+    Err(OAuthError::Connection(
+        "OAuth refresh exhausted retries".into(),
+    ))
 }
 
 pub async fn request_device_authorization(
@@ -249,7 +291,7 @@ pub async fn request_device_authorization(
         .device_auth_url
         .clone()
         .ok_or_else(|| OAuthError::Other(anyhow::anyhow!("device_auth_url not configured")))?;
-    let client = reqwest::Client::new();
+    let client = oauth_client()?;
     let scope = cfg.scopes.join(" ");
     let resp = client
         .post(&url)
@@ -270,10 +312,13 @@ pub async fn request_device_authorization(
         .json()
         .await
         .map_err(|e| OAuthError::Connection(e.to_string()))?;
+    let device_code = required_string(&v, "device_code")?;
+    let user_code = required_string(&v, "user_code")?;
+    let verification_uri = required_string(&v, "verification_uri")?;
     Ok(DeviceAuthorization {
-        device_code: v["device_code"].as_str().unwrap_or("").into(),
-        user_code: v["user_code"].as_str().unwrap_or("").into(),
-        verification_uri: v["verification_uri"].as_str().unwrap_or("").into(),
+        device_code,
+        user_code,
+        verification_uri,
         verification_uri_complete: v
             .get("verification_uri_complete")
             .and_then(|x| x.as_str())
@@ -287,13 +332,14 @@ pub async fn poll_device_token(
     cfg: &OAuthFlowConfig,
     device: &DeviceAuthorization,
 ) -> Result<TokenInfo, OAuthError> {
-    let client = reqwest::Client::new();
+    let client = oauth_client()?;
     let started = std::time::Instant::now();
+    let mut interval = device.interval.max(1);
     loop {
         if started.elapsed().as_secs() > device.expires_in {
             return Err(OAuthError::DeviceTimeout);
         }
-        tokio::time::sleep(std::time::Duration::from_secs(device.interval.max(1))).await;
+        tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
         let resp = client
             .post(&cfg.token_url)
             .headers(request_headers(cfg)?)
@@ -306,6 +352,10 @@ pub async fn poll_device_token(
             .await
             .map_err(|e| OAuthError::Connection(e.to_string()))?;
         let status = resp.status();
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
+            interval = (interval + 1).min(30);
+            continue;
+        }
         let v: serde_json::Value = resp
             .json()
             .await
@@ -315,13 +365,26 @@ pub async fn poll_device_token(
         }
         let err = v.get("error").and_then(|e| e.as_str()).unwrap_or("");
         match err {
-            "authorization_pending" | "slow_down" => continue,
+            "authorization_pending" => continue,
+            "slow_down" => {
+                interval = (interval + 5).min(30);
+                continue;
+            }
             "expired_token" => return Err(OAuthError::DeviceExpired),
             other => {
                 return Err(OAuthError::Unauthorized(other.to_string()));
             }
         }
     }
+}
+
+fn required_string(value: &serde_json::Value, field: &str) -> Result<String, OAuthError> {
+    value
+        .get(field)
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| OAuthError::Connection(format!("OAuth response missing {field}")))
 }
 
 fn parse_token_response(v: serde_json::Value) -> Result<TokenInfo, OAuthError> {
@@ -384,8 +447,21 @@ impl FileTokenStorage {
     }
 
     pub fn load(&self) -> Option<TokenInfo> {
-        let data = std::fs::read_to_string(&self.path).ok()?;
-        serde_json::from_str(&data).ok()
+        self.load_result().ok().flatten()
+    }
+
+    pub fn load_result(&self) -> anyhow::Result<Option<TokenInfo>> {
+        let data = match std::fs::read_to_string(&self.path) {
+            Ok(data) => data,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        serde_json::from_str(&data).map(Some).map_err(|error| {
+            anyhow::anyhow!(
+                "invalid OAuth credential file {}: {error}",
+                self.path.display()
+            )
+        })
     }
 
     pub fn save(&self, token: &TokenInfo) -> anyhow::Result<()> {
@@ -430,8 +506,11 @@ impl FileTokenStorage {
     }
 
     pub fn clear(&self) -> anyhow::Result<()> {
-        let _ = std::fs::remove_file(&self.path);
-        Ok(())
+        match std::fs::remove_file(&self.path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
     }
 }
 
@@ -451,7 +530,7 @@ pub async fn load_fresh_kimi_token(
     storage: &FileTokenStorage,
     oauth_host: Option<&str>,
 ) -> Result<Option<TokenInfo>, OAuthError> {
-    let Some(token) = storage.load() else {
+    let Some(token) = storage.load_result().map_err(OAuthError::Other)? else {
         return Ok(None);
     };
     let needs_refresh = token
@@ -464,7 +543,10 @@ pub async fn load_fresh_kimi_token(
         .refresh_token
         .as_deref()
         .ok_or_else(|| OAuthError::Unauthorized("OAuth token has no refresh_token".into()))?;
-    let refreshed = refresh_access_token(&kimi_oauth_config(oauth_host), refresh).await?;
+    let mut refreshed = refresh_access_token(&kimi_oauth_config(oauth_host), refresh).await?;
+    if refreshed.refresh_token.is_none() {
+        refreshed.refresh_token = token.refresh_token;
+    }
     storage.save(&refreshed).map_err(OAuthError::Other)?;
     Ok(Some(refreshed))
 }
@@ -472,6 +554,10 @@ pub async fn load_fresh_kimi_token(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
 
     #[test]
     fn pkce_shape() {
@@ -521,6 +607,73 @@ mod tests {
                 0o700
             );
         }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn corrupt_token_storage_is_reported() {
+        let root = std::env::temp_dir().join(format!("kkagent-oauth-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("credential.json");
+        std::fs::write(&path, "not-json").unwrap();
+        let error = FileTokenStorage::new(path)
+            .load_result()
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("invalid OAuth credential file"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn refresh_retries_transient_failure_and_preserves_rotating_credential() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let host = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            for (status, body) in [
+                ("503 Service Unavailable", r#"{"error":"temporary"}"#),
+                (
+                    "200 OK",
+                    r#"{"access_token":"new-access","token_type":"Bearer","expires_in":3600}"#,
+                ),
+            ] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0_u8; 4096];
+                let _ = socket.read(&mut request).await.unwrap();
+                let response = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+
+        let root = std::env::temp_dir().join(format!("kkagent-oauth-{}", uuid::Uuid::new_v4()));
+        let storage = FileTokenStorage::new(root.join("credential.json"));
+        storage
+            .save(&TokenInfo {
+                access_token: "expired".into(),
+                refresh_token: Some("stable-refresh".into()),
+                token_type: "Bearer".into(),
+                expires_at: Some(Utc::now() - chrono::Duration::minutes(1)),
+                scope: None,
+            })
+            .unwrap();
+
+        let token = load_fresh_kimi_token(&storage, Some(&host))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(token.access_token, "new-access");
+        assert_eq!(token.refresh_token.as_deref(), Some("stable-refresh"));
+        assert_eq!(
+            storage
+                .load_result()
+                .unwrap()
+                .unwrap()
+                .refresh_token
+                .as_deref(),
+            Some("stable-refresh")
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 }

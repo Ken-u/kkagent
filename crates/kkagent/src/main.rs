@@ -213,7 +213,7 @@ async fn run_auth(command: &AuthCommands, config_path: Option<&std::path::Path>)
             Ok(())
         }
         AuthCommands::Status => {
-            let status = match storage.load() {
+            let status = match storage.load_result()? {
                 Some(token) if token.expires_at.is_some_and(|at| at <= chrono::Utc::now()) => {
                     "expired"
                 }
