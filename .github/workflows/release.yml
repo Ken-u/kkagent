@@ -125,7 +125,7 @@ jobs:
           Copy-Item "target/${{ matrix.target }}/release/kkagent.exe" dist/package/
           Copy-Item README.md, LICENSE dist/package/
           Compress-Archive -Path dist/package/* -DestinationPath "dist/kkagent-${{ matrix.target }}.zip"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: kkagent-${{ matrix.target }}
           path: dist/kkagent-*
@@ -141,7 +141,7 @@ jobs:
       contents: write
       id-token: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
