@@ -677,6 +677,7 @@ impl kkagent_acp::AcpHost for AgentAcpHost {
         if text.trim().is_empty() {
             return Err("prompt must not be empty".into());
         }
+        let _turn_permit = self.state.turn_locks.try_acquire(session_id).await?;
         {
             let mut sessions = self.state.sessions.lock().await;
             let session = sessions
@@ -976,6 +977,7 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
     }
 
     async fn delete_session(&self, id: &str) -> Result<(), String> {
+        let _turn_permit = self.state.turn_locks.try_acquire(id).await?;
         let session = self.state.sessions.lock().await.remove(id);
         if session.is_none() {
             let exists = self
@@ -994,6 +996,7 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
         self.state.model_aliases.lock().await.remove(id);
         self.state.approval_txs.lock().await.remove(id);
         self.state.question_txs.lock().await.remove(id);
+        self.state.turn_locks.remove(id).await;
         self.state
             .transcript
             .lock()
@@ -1005,6 +1008,10 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
 
     async fn post_message(&self, id: &str, text: &str) -> Result<serde_json::Value, String> {
         // Queue user message and run AgentLoop turn on shared ServerState.
+        if text.trim().is_empty() {
+            return Err("message text must not be empty".into());
+        }
+        let turn_permit = self.state.turn_locks.try_acquire(id).await?;
         let mut sessions = self.state.sessions.lock().await;
         let session = sessions
             .get_mut(id)
@@ -1015,6 +1022,7 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
         let state = self.state.clone();
         let sid = id.to_string();
         tokio::spawn(async move {
+            let _turn_permit = turn_permit;
             if let Err(e) = run_http_turn(state, &sid).await {
                 tracing::warn!("HTTP-triggered turn failed: {e}");
             }
@@ -1409,6 +1417,34 @@ struct ServerState {
     events: tokio::sync::broadcast::Sender<serde_json::Value>,
     pending_questions: Mutex<HashMap<String, serde_json::Value>>,
     background_tasks: Vec<AbortHandle>,
+    turn_locks: SessionTurnLocks,
+}
+
+#[derive(Default)]
+struct SessionTurnLocks {
+    entries: Mutex<HashMap<String, Arc<tokio::sync::Semaphore>>>,
+}
+
+impl SessionTurnLocks {
+    async fn try_acquire(
+        &self,
+        session_id: &str,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit, String> {
+        let semaphore = self
+            .entries
+            .lock()
+            .await
+            .entry(session_id.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(1)))
+            .clone();
+        semaphore
+            .try_acquire_owned()
+            .map_err(|_| format!("session {session_id} is busy with another turn"))
+    }
+
+    async fn remove(&self, session_id: &str) {
+        self.entries.lock().await.remove(session_id);
+    }
 }
 
 impl ServerState {
@@ -1570,6 +1606,7 @@ async fn build_server_state(config: Arc<AppConfig>) -> Result<Arc<ServerState>> 
         events,
         pending_questions: Mutex::new(HashMap::new()),
         background_tasks,
+        turn_locks: SessionTurnLocks::default(),
     }))
 }
 
@@ -2083,6 +2120,14 @@ async fn handle_rpc_call(
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| (-32602, "Missing text".into()))?
                 .to_string();
+            if text.trim().is_empty() {
+                return Err((-32602, "Prompt text must not be empty".into()));
+            }
+            let turn_permit = state
+                .turn_locks
+                .try_acquire(&session_id)
+                .await
+                .map_err(|message| (-32001, message))?;
 
             {
                 let mut sessions = state.sessions.lock().await;
@@ -2376,6 +2421,7 @@ async fn handle_rpc_call(
             let state_clone = state.clone();
             let sid = session_id.clone();
             tokio::spawn(async move {
+                let _turn_permit = turn_permit;
                 // Take session out so we do NOT hold the sessions mutex while
                 // waiting for tool approval (would deadlock approval.respond).
                 let mut session = {
@@ -2884,5 +2930,16 @@ mod http_path_tests {
                 .join("file.txt")
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn serializes_turns_per_session_but_not_across_sessions() {
+        let locks = SessionTurnLocks::default();
+        let first = locks.try_acquire("session-a").await.unwrap();
+        assert!(locks.try_acquire("session-a").await.is_err());
+        let other = locks.try_acquire("session-b").await.unwrap();
+        drop(first);
+        assert!(locks.try_acquire("session-a").await.is_ok());
+        drop(other);
     }
 }
