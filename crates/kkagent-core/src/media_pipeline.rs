@@ -173,14 +173,21 @@ pub fn load_workspace_video(
     })
 }
 
-/// Extract `@path` media mentions from user text.
+/// Extract `@path` media / attachment mentions from user text.
 pub fn extract_at_paths(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     for token in text.split_whitespace() {
+        let token = token.trim_matches(|c| c == ',' || c == ';' || c == ')' || c == '(');
         if let Some(rest) = token.strip_prefix('@') {
-            if rest.contains('/') || rest.contains('.') {
-                out.push(rest.trim_matches(|c| c == '"' || c == '\'').to_string());
+            let rest = rest.trim_matches(|c| c == '"' || c == '\'');
+            if rest.is_empty() {
+                continue;
             }
+            // Skip obvious non-paths (mentions / emails handled earlier by token split).
+            if rest.starts_with('#') || rest.contains('@') {
+                continue;
+            }
+            out.push(rest.to_string());
         }
     }
     out

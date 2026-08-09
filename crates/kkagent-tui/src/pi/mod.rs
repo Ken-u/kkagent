@@ -10,7 +10,10 @@ pub mod terminal_image;
 pub mod undo_stack;
 pub mod word_navigation;
 
-pub use autocomplete::{complete_path, complete_slash, Autocomplete, CompletionItem};
+pub use autocomplete::{
+    complete_at_files, complete_path, complete_slash, extract_at_token, format_at_completion,
+    Autocomplete, CompletionItem,
+};
 pub use fuzzy::{fuzzy_filter, fuzzy_match, FuzzyMatch};
 pub use keybindings::{map_key, EditorAction};
 pub use kill_ring::KillRing;

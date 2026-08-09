@@ -290,6 +290,24 @@ impl InputState {
         self.last_was_kill = false;
     }
 
+    /// Replace `text[start..end]` with `insert` and place cursor after the insert.
+    pub fn replace_range(&mut self, start: usize, end: usize, insert: &str) {
+        let start = start.min(self.text.len());
+        let mut end = end.min(self.text.len()).max(start);
+        while end < self.text.len() && !self.text.is_char_boundary(end) {
+            end += 1;
+        }
+        self.push_undo();
+        let mut new = String::with_capacity(self.text.len() - (end - start) + insert.len());
+        new.push_str(&self.text[..start]);
+        new.push_str(insert);
+        new.push_str(&self.text[end..]);
+        self.cursor = start + insert.len();
+        self.text = new;
+        self.horizontal_scroll = 0;
+        self.last_was_kill = false;
+    }
+
     pub fn take(&mut self) -> String {
         let text = std::mem::take(&mut self.text);
         self.cursor = 0;

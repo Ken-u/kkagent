@@ -11,6 +11,7 @@ use kkagent_config::AppConfig;
 use kkagent_protocol::{AgentEvent, Frame, PermissionMode, SessionStatus};
 use ratatui::{backend::CrosstermBackend, Terminal};
 use std::io;
+use std::path::PathBuf;
 
 use crate::chrome::{StatusBarModel, TabStrip};
 use crate::components;
@@ -64,6 +65,8 @@ pub struct AppState {
     pub question_pending: Option<PendingQuestion>,
     /// `/` command autocomplete popup
     pub slash_menu: Option<SlashMenuState>,
+    /// `@` file path autocomplete popup
+    pub file_menu: Option<FileMenuState>,
     /// Model / session list picker overlay
     pub list_picker: Option<ListPickerState>,
     /// Background tasks browser overlay
@@ -110,6 +113,16 @@ pub struct AppState {
 pub struct SlashMenuState {
     pub items: Vec<SlashSuggestion>,
     pub selected: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct FileMenuState {
+    pub items: Vec<crate::pi::autocomplete::CompletionItem>,
+    pub selected: usize,
+    /// Byte offset of the `@` that started this token.
+    pub token_start: usize,
+    pub query: String,
+    pub quoted: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -269,6 +282,7 @@ impl AppState {
             pending_approval_click: None,
             question_pending: None,
             slash_menu: None,
+            file_menu: None,
             list_picker: None,
             tasks_panel: None,
             pending_prompt: None,
@@ -361,8 +375,11 @@ impl AppState {
         let text = self.input.text.clone();
         if !is_slash_name_completion(&text) {
             self.slash_menu = None;
+            // Fall through to @ file completion when not in slash mode.
+            self.refresh_file_menu();
             return;
         }
+        self.file_menu = None;
         let items = filter_slash_commands(&text);
         if items.is_empty() {
             self.slash_menu = Some(SlashMenuState {
@@ -377,6 +394,42 @@ impl AppState {
                 .unwrap_or(0);
             self.slash_menu = Some(SlashMenuState { items, selected });
         }
+    }
+
+    pub fn refresh_file_menu(&mut self) {
+        if self.mode == AppMode::Shell {
+            self.file_menu = None;
+            return;
+        }
+        let text = self.input.text.clone();
+        let cursor = self.input.cursor.min(text.len());
+        let Some((token_start, query)) = crate::pi::autocomplete::extract_at_token(&text, cursor)
+        else {
+            self.file_menu = None;
+            return;
+        };
+        let quoted = text[token_start..].starts_with("@\"");
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let items = crate::pi::autocomplete::complete_at_files(&cwd, &query, 24);
+        let selected = self
+            .file_menu
+            .as_ref()
+            .filter(|m| m.token_start == token_start)
+            .map(|m| {
+                if items.is_empty() {
+                    0
+                } else {
+                    m.selected.min(items.len() - 1)
+                }
+            })
+            .unwrap_or(0);
+        self.file_menu = Some(FileMenuState {
+            items,
+            selected,
+            token_start,
+            query,
+            quoted,
+        });
     }
 }
 
@@ -739,6 +792,61 @@ impl TuiApp {
             }
         }
 
+        // `@` file autocomplete popup
+        if self.state.file_menu.is_some() && self.state.slash_menu.is_none() {
+            match key.code {
+                KeyCode::Up => {
+                    if let Some(ref mut menu) = self.state.file_menu {
+                        if menu.selected > 0 {
+                            menu.selected -= 1;
+                        } else if !menu.items.is_empty() {
+                            menu.selected = menu.items.len() - 1;
+                        }
+                    }
+                    return Ok(());
+                }
+                KeyCode::Down => {
+                    if let Some(ref mut menu) = self.state.file_menu {
+                        if !menu.items.is_empty() {
+                            menu.selected = (menu.selected + 1) % menu.items.len();
+                        }
+                    }
+                    return Ok(());
+                }
+                KeyCode::Tab => {
+                    if self
+                        .state
+                        .file_menu
+                        .as_ref()
+                        .map(|m| !m.items.is_empty())
+                        .unwrap_or(false)
+                    {
+                        self.apply_file_completion()?;
+                    }
+                    return Ok(());
+                }
+                KeyCode::Enter if !key.modifiers.contains(KeyModifiers::SHIFT) => {
+                    if self
+                        .state
+                        .file_menu
+                        .as_ref()
+                        .map(|m| !m.items.is_empty())
+                        .unwrap_or(false)
+                    {
+                        self.apply_file_completion()?;
+                        return Ok(());
+                    }
+                    // No matches — dismiss menu and fall through to submit.
+                    self.state.file_menu = None;
+                }
+                KeyCode::Esc => {
+                    self.state.file_menu = None;
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
+
         // Slash command autocomplete popup
         if self.state.slash_menu.is_some() {
             match key.code {
@@ -794,6 +902,7 @@ impl TuiApp {
                 } else {
                     self.state.input.clear();
                     self.state.slash_menu = None;
+                    self.state.file_menu = None;
                     self.state.list_picker = None;
                 }
             }
@@ -813,6 +922,8 @@ impl TuiApp {
                     self.state.tasks_panel = None;
                 } else if self.state.list_picker.is_some() {
                     self.state.list_picker = None;
+                } else if self.state.file_menu.is_some() {
+                    self.state.file_menu = None;
                 } else if self.state.slash_menu.is_some() {
                     self.state.slash_menu = None;
                 } else if self.state.status != SessionStatus::Idle {
@@ -893,6 +1004,7 @@ impl TuiApp {
             {
                 self.state.search.open();
                 self.state.slash_menu = None;
+                self.state.file_menu = None;
                 self.state.list_picker = None;
             }
             // Ctrl-G: toggle btw pane
@@ -1047,6 +1159,33 @@ impl TuiApp {
                 self.state.follow_bottom = true;
             }
             _ => {}
+        }
+        Ok(())
+    }
+
+    /// Apply selected `@` file suggestion into the input buffer.
+    fn apply_file_completion(&mut self) -> anyhow::Result<()> {
+        let Some(menu) = self.state.file_menu.as_ref() else {
+            return Ok(());
+        };
+        if menu.items.is_empty() {
+            return Ok(());
+        }
+        let item = menu.items[menu.selected.min(menu.items.len() - 1)].clone();
+        let token_start = menu.token_start;
+        let quoted = menu.quoted;
+        let cursor = self.state.input.cursor.min(self.state.input.text.len());
+        let (replacement, keep_open) =
+            crate::pi::autocomplete::format_at_completion(&item, quoted);
+        // For directories ending with `/`, drop trailing space from format helper when keep_open —
+        // format_at_completion already omits space for dirs.
+        self.state
+            .input
+            .replace_range(token_start, cursor, &replacement);
+        if keep_open {
+            self.state.refresh_file_menu();
+        } else {
+            self.state.file_menu = None;
         }
         Ok(())
     }
@@ -2396,6 +2535,7 @@ fn slash_help_text() -> String {
   Esc           - Interrupt / dismiss; Esc Esc undo turn\n\
   Shift-Tab     - Toggle plan mode\n\
   !             - Shell mode\n\
+  @             - File path picker (Tab/Enter insert)\n\
   Ctrl-F / Ctrl-S - Search transcript\n\
   Ctrl-G        - Toggle btw notes pane\n\
   Ctrl-O        - Fold tool output\n\

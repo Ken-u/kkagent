@@ -20,6 +20,7 @@ use crate::theme::Theme;
 
 const TIPS: &[&str] = &[
     "/compact compresses context when it gets long",
+    "@ opens file picker — tab to insert a path",
     "ctrl+f searches the transcript",
     "ctrl+o expands truncated tool output",
     "ctrl+g toggles btw notes",
@@ -38,6 +39,7 @@ pub fn render_ui(f: &mut Frame, state: &mut AppState, config: &AppConfig) {
         .slash_menu
         .as_ref()
         .map(menu_height)
+        .or_else(|| state.file_menu.as_ref().map(file_menu_height))
         .or_else(|| state.list_picker.as_ref().map(picker_height))
         .unwrap_or(0);
 
@@ -127,6 +129,8 @@ pub fn render_ui(f: &mut Frame, state: &mut AppState, config: &AppConfig) {
 
     if state.slash_menu.is_some() {
         render_slash_menu(f, slash_area, state, &theme);
+    } else if state.file_menu.is_some() {
+        render_file_menu(f, slash_area, state, &theme);
     } else if state.list_picker.is_some() {
         render_list_picker(f, slash_area, state, &theme);
     }
@@ -148,6 +152,16 @@ fn menu_height(menu_state: &crate::app::SlashMenuState) -> u16 {
         (menu_state.items.len() as u16).min(max_visible)
     };
     rows + 2 // borders
+}
+
+fn file_menu_height(menu: &crate::app::FileMenuState) -> u16 {
+    let max_visible = 10u16;
+    let rows = if menu.items.is_empty() {
+        1
+    } else {
+        (menu.items.len() as u16).min(max_visible)
+    };
+    rows + 2
 }
 
 fn picker_height(picker: &ListPickerState) -> u16 {
@@ -213,7 +227,7 @@ fn build_transcript_lines(state: &AppState, theme: &Theme, width: u16) -> Vec<Li
         )));
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            "  type a message · /help · shift-tab plan · ! shell",
+            "  type a message · @file · /help · shift-tab plan · ! shell",
             Style::default().fg(theme.text_muted),
         )));
         lines.push(Line::from(Span::styled(
@@ -1315,6 +1329,77 @@ fn render_slash_menu(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
                         (inner.width as usize).saturating_sub(primary_w + 4),
                     ),
                     Style::default().fg(theme.text_dim),
+                ),
+            ]));
+        }
+    }
+
+    f.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
+}
+
+fn render_file_menu(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    let Some(menu) = state.file_menu.as_ref() else {
+        return;
+    };
+
+    let max_visible = 10u16;
+    let rows = if menu.items.is_empty() {
+        1u16
+    } else {
+        (menu.items.len() as u16).min(max_visible)
+    };
+
+    let inner = area.inner(Margin::new(1, 1));
+    f.render_widget(Clear, area);
+
+    let title = if menu.query.is_empty() {
+        " @ files ".to_string()
+    } else {
+        format!(" @ {} ", truncate(&menu.query, 40))
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.border_focus))
+        .title(title);
+
+    let mut lines: Vec<Line> = Vec::new();
+    if menu.items.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "No matching files",
+            Style::default().fg(theme.text_muted),
+        )));
+    } else {
+        let start = menu
+            .selected
+            .saturating_sub(max_visible as usize - 1)
+            .min(menu.items.len().saturating_sub(rows as usize));
+        let end = (start + rows as usize).min(menu.items.len());
+        for (i, item) in menu.items[start..end].iter().enumerate() {
+            let idx = start + i;
+            let selected = idx == menu.selected;
+            let marker = if selected { "›" } else { " " };
+            let style = if selected {
+                Style::default()
+                    .fg(theme.text_strong)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme.text)
+            };
+            let kind = if item.is_directory { "dir " } else { "file" };
+            let path = item.insert.trim_start_matches('@');
+            lines.push(Line::from(vec![
+                Span::styled(format!(" {marker} "), style),
+                Span::styled(
+                    format!("{kind} "),
+                    Style::default().fg(if selected {
+                        theme.accent
+                    } else {
+                        theme.text_muted
+                    }),
+                ),
+                Span::styled(
+                    truncate(path, (inner.width as usize).saturating_sub(10)),
+                    style,
                 ),
             ]));
         }
