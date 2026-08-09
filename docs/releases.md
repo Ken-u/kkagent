@@ -2,7 +2,7 @@
 
 ## 支持的产物
 
-推送 `v*` tag 后，GitHub Actions 在对应系统 runner 上执行锁定依赖的 release 构建：
+修改 `[workspace.package].version` 并推送到 `main` 后，Release workflow 会等待同一提交的 CI 成功，再在对应系统 runner 上执行锁定依赖的 release 构建。若 `v<version>` Release 已存在，自动任务会安全跳过，不重复发布；CI 失败不会发版：
 
 | 系统 | 架构 | Rust target | 资产 |
 |---|---|---|---|
@@ -61,9 +61,9 @@ cosign verify-blob \
 
 ## 发布操作
 
-1. 确保 CI、真实 Provider 冒烟和文档检查通过。
-2. 创建并推送带 `v` 前缀的 tag，例如 `v0.1.0`。
-3. 等待 `Release` workflow 的六个 build job 和 publish job 全部成功。
+1. 确保本地测试、真实 Provider 冒烟和文档检查通过。
+2. 提升根 `Cargo.toml` 的 `[workspace.package].version` 并推送到 `main`；例如 `0.1.0` 升为 `0.1.1`。
+3. 等待同一提交的 CI，以及 `Release` workflow 的版本解析、六个 build job 和 publish job 全部成功。
 4. 在 GitHub Release 中确认六个包、校验清单、Sigstore bundle 和自动 release notes。
 
-需要重新发布已有 tag 的资产时，可手动运行 workflow 并填写现有 tag；上传使用覆盖模式。正式版本不应移动已经对外发布的 tag。
+发布任务会在最后创建 `v<version>` tag 和 Release。需要重新构建已有版本资产时，可手动运行 workflow 并填写现有 tag；上传使用覆盖模式。正式版本不应移动已经对外发布的 tag。

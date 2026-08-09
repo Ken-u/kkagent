@@ -1,14 +1,18 @@
 name: Release
 
 on:
-  push:
-    tags:
-      - "v*"
+  workflow_run:
+    workflows:
+      - CI
+    types:
+      - completed
+    branches:
+      - main
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing v-prefixed tag to publish
-        required: true
+        description: Optional existing v-prefixed tag to rebuild
+        required: false
         type: string
 
 permissions:
@@ -18,8 +22,51 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  prepare:
+    name: Resolve workspace version
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-24.04
+    outputs:
+      release_tag: ${{ steps.version.outputs.release_tag }}
+      release_sha: ${{ steps.version.outputs.release_sha }}
+      should_release: ${{ steps.version.outputs.should_release }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.tag || github.event.workflow_run.head_sha || github.sha }}
+      - name: Resolve version and release state
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          REQUESTED_TAG: ${{ inputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\([^"]*\)"/\1/p' Cargo.toml)
+          if [ -z "$version" ]; then
+            echo "workspace.package.version is missing" >&2
+            exit 1
+          fi
+          release_tag=${REQUESTED_TAG:-v$version}
+          if [ "$release_tag" != "v$version" ]; then
+            echo "requested tag $release_tag does not match workspace version $version" >&2
+            exit 1
+          fi
+          release_sha=$(git rev-parse HEAD)
+          should_release=true
+          if gh release view "$release_tag" >/dev/null 2>&1 && [ "${{ github.event_name }}" != "workflow_dispatch" ]; then
+            should_release=false
+            echo "$release_tag already exists; skipping duplicate automatic release"
+          fi
+          echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
+          echo "release_sha=$release_sha" >> "$GITHUB_OUTPUT"
+          echo "should_release=$should_release" >> "$GITHUB_OUTPUT"
+
   build:
     name: Build ${{ matrix.name }}
+    needs: prepare
+    if: needs.prepare.outputs.should_release == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -52,7 +99,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ inputs.tag || github.ref }}
+          ref: ${{ needs.prepare.outputs.release_sha }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -86,7 +133,9 @@ jobs:
 
   publish:
     name: Publish signed release
-    needs: build
+    needs:
+      - prepare
+      - build
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -108,7 +157,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
+          RELEASE_SHA: ${{ needs.prepare.outputs.release_sha }}
         run: |
           set -euo pipefail
           case "$RELEASE_TAG" in
@@ -118,5 +168,5 @@ jobs:
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             gh release upload "$RELEASE_TAG" dist/* --clobber
           else
-            gh release create "$RELEASE_TAG" dist/* --verify-tag --generate-notes --title "$RELEASE_TAG"
+            gh release create "$RELEASE_TAG" dist/* --target "$RELEASE_SHA" --generate-notes --title "$RELEASE_TAG"
           fi
