@@ -14,6 +14,7 @@ pub fn default_config_path() -> PathBuf {
 }
 
 pub fn load_config(path: Option<&Path>) -> Result<AppConfig> {
+    let _ = load_workspace_dotenv()?;
     let config_path = match path {
         Some(p) => p.to_path_buf(),
         None => default_config_path(),
@@ -34,6 +35,46 @@ pub fn load_config(path: Option<&Path>) -> Result<AppConfig> {
         .validate()
         .with_context(|| format!("Invalid kkagent configuration: {config_path:?}"))?;
     Ok(config)
+}
+
+/// Load only kkagent/model-provider variables from `<cwd>/.env` without
+/// overriding variables already supplied by the parent process.
+pub fn load_workspace_dotenv() -> Result<Option<PathBuf>> {
+    let path = std::env::current_dir()?.join(".env");
+    if !path.is_file() {
+        return Ok(None);
+    }
+    // Older kkagent workspaces sometimes used `.env` as a TOML config file.
+    // Keep accepting `--config .env` without trying to interpret TOML tables as
+    // dotenv declarations.
+    let content = std::fs::read_to_string(&path)
+        .with_context(|| format!("Failed to read workspace environment: {path:?}"))?;
+    if content
+        .lines()
+        .map(str::trim)
+        .any(|line| line.starts_with('['))
+    {
+        return Ok(Some(path));
+    }
+    for item in dotenvy::from_read_iter(content.as_bytes()) {
+        let (name, value) = item?;
+        if recognized_env_key(&name) && std::env::var_os(&name).is_none() {
+            std::env::set_var(name, value);
+        }
+    }
+    Ok(Some(path))
+}
+
+fn recognized_env_key(name: &str) -> bool {
+    name.starts_with("KKAGENT_")
+        || matches!(
+            name,
+            "ANTHROPIC_API_KEY"
+                | "OPENAI_API_KEY"
+                | "KIMI_API_KEY"
+                | "GOOGLE_API_KEY"
+                | "MOONSHOT_API_KEY"
+        )
 }
 
 /// Apply KKAGENT_* / common env overrides (kimi-compatible subset).

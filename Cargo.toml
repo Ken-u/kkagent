@@ -87,6 +87,8 @@ pin-project-lite = "0.2"
 sha2 = "0.10"
 hex = "0.4"
 base64 = "0.22"
+dotenvy = "0.15"
+rpassword = "7.5"
 image = { version = "0.25", default-features = false, features = ["gif", "jpeg", "png", "webp", "bmp"] }
 
 # HTTP / WebSocket server

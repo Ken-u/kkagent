@@ -1,6 +1,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::collections::HashMap;
+use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -25,6 +26,9 @@ use kkagent_telemetry::{
 };
 use kkagent_tools::ToolRegistry;
 use kkagent_tui::TuiApp;
+
+mod onboarding;
+use onboarding::{run_config, run_doctor, run_init};
 
 struct LocalEndpointGuard(PathBuf);
 
@@ -104,6 +108,53 @@ enum Commands {
         #[command(subcommand)]
         command: AuthCommands,
     },
+    /// Create a minimal working configuration (interactive by default)
+    Init {
+        /// safe | default | full-auto
+        #[arg(long, default_value = "default")]
+        preset: String,
+        /// openai | anthropic | kimi | google | custom
+        #[arg(long)]
+        provider: Option<String>,
+        /// Provider model id
+        #[arg(long)]
+        model: Option<String>,
+        /// Override provider base URL
+        #[arg(long)]
+        base_url: Option<String>,
+        /// Replace an existing config file
+        #[arg(long)]
+        force: bool,
+        /// Never prompt; missing required values are errors
+        #[arg(long)]
+        non_interactive: bool,
+    },
+    /// Inspect and edit configuration
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommands,
+    },
+    /// Check configuration, provider, sandbox, storage, and common tools
+    Doctor {
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
+        /// Also probe the configured provider endpoint
+        #[arg(long)]
+        live: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum ConfigCommands {
+    /// Print the effective config with secrets redacted
+    Show,
+    /// Read a dotted config key
+    Get { key: String },
+    /// Set a dotted config key to a TOML value
+    Set { key: String, value: String },
+    /// Apply safe, default, or full-auto runtime defaults
+    Preset { name: String },
 }
 
 #[derive(Subcommand)]
@@ -131,12 +182,54 @@ async fn main() -> Result<()> {
     if let Some(Commands::Auth { command }) = &cli.command {
         return run_auth(command, cli.config.as_deref()).await;
     }
+    match &cli.command {
+        Some(Commands::Init {
+            preset,
+            provider,
+            model,
+            base_url,
+            force,
+            non_interactive,
+        }) => {
+            return run_init(
+                cli.config.as_deref(),
+                preset,
+                provider.as_deref(),
+                model.as_deref(),
+                base_url.as_deref(),
+                *force,
+                *non_interactive,
+            )
+        }
+        Some(Commands::Config { command }) => {
+            return run_config(command, cli.config.as_deref());
+        }
+        Some(Commands::Doctor { json, live }) => {
+            return run_doctor(cli.config.as_deref(), *json, *live).await;
+        }
+        _ => {}
+    }
 
     if cli.connect.is_some() && cli.command.is_some() {
         anyhow::bail!("--connect is only valid for TUI or --prompt mode");
     }
 
-    let mut config = load_config(cli.config.as_deref())?;
+    let config_path = cli
+        .config
+        .clone()
+        .unwrap_or_else(kkagent_config::default_config_path);
+    if !config_path.exists() {
+        if cli.config.is_none() && io::stdin().is_terminal() && io::stdout().is_terminal() {
+            println!("No kkagent config found. Starting first-run setup.\n");
+            run_init(None, "default", None, None, None, false, false)?;
+        } else {
+            anyhow::bail!(
+                "configuration not found at {}; run `kkagent init` first",
+                config_path.display()
+            );
+        }
+    }
+    let mut config = load_config(Some(&config_path))?;
     if cli.connect.is_none() {
         hydrate_provider_oauth(&mut config).await?;
     }
@@ -203,6 +296,9 @@ async fn main() -> Result<()> {
             server.serve_stdio().await
         }
         Some(Commands::Auth { .. }) => unreachable!("auth handled before config startup"),
+        Some(Commands::Init { .. } | Commands::Config { .. } | Commands::Doctor { .. }) => {
+            unreachable!("setup commands handled before runtime startup")
+        }
         None => {
             if let Some(prompt) = cli.prompt {
                 run_print_mode(config, prompt, permission_mode, cli.connect).await
