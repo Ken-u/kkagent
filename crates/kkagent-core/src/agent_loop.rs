@@ -768,7 +768,8 @@ Do not mention this reminder to the user.\n</system-reminder>"
                         let _ = ready_indices.contains(&i);
                         parallel_iter
                             .next()
-                            .unwrap_or_else(|| ToolOutput::error("scheduler missing result"))
+                            .unwrap_or_else(|| Err("scheduler missing result".into()))
+                            .unwrap_or_else(ToolOutput::error)
                     }
                 };
                 resolved.push((id, name, output));

@@ -4,6 +4,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use futures::FutureExt;
 use kkagent_tools::accesses::{tool_accesses, ToolAccesses};
 use tokio::sync::{oneshot, Mutex};
 
@@ -18,7 +19,7 @@ struct ScheduledTask<R> {
     id: u64,
     accesses: ToolAccesses,
     start: Option<Box<dyn FnOnce() -> BoxFuture<R> + Send>>,
-    result_tx: Option<oneshot::Sender<R>>,
+    result_tx: Option<oneshot::Sender<Result<R, String>>>,
 }
 
 struct ActiveSlot {
@@ -48,7 +49,7 @@ impl<R: Send + 'static> ToolScheduler<R> {
         }
     }
 
-    pub async fn add(&self, task: ToolCallTask<R>) -> R {
+    pub async fn add(&self, task: ToolCallTask<R>) -> Result<R, String> {
         let (tx, rx) = oneshot::channel();
         let scheduled = {
             let mut state = self.inner.lock().await;
@@ -71,11 +72,12 @@ impl<R: Send + 'static> ToolScheduler<R> {
             }
         }
 
-        rx.await.expect("tool scheduler result channel closed")
+        rx.await
+            .map_err(|_| "tool scheduler result channel closed".to_string())?
     }
 
     /// Schedule many tasks and wait for all results in the original order.
-    pub async fn run_all(tasks: Vec<ToolCallTask<R>>) -> Vec<R> {
+    pub async fn run_all(tasks: Vec<ToolCallTask<R>>) -> Vec<Result<R, String>> {
         let scheduler = Self::new();
         let mut handles = Vec::with_capacity(tasks.len());
         for task in tasks {
@@ -84,7 +86,10 @@ impl<R: Send + 'static> ToolScheduler<R> {
         }
         let mut results = Vec::with_capacity(handles.len());
         for h in handles {
-            results.push(h.await.expect("scheduler join"));
+            results.push(match h.await {
+                Ok(result) => result,
+                Err(error) => Err(format!("tool scheduler task failed: {error}")),
+            });
         }
         results
     }
@@ -117,7 +122,10 @@ impl<R: Send + 'static> ToolScheduler<R> {
         let result_tx = task.result_tx.take().expect("result tx");
         let inner = Arc::clone(inner);
         tokio::spawn(async move {
-            let result = start().await;
+            let result = std::panic::AssertUnwindSafe(start())
+                .catch_unwind()
+                .await
+                .map_err(panic_message);
             let _ = result_tx.send(result);
             let mut state = inner.lock().await;
             if let Some(idx) = state.active.iter().position(|a| a.id == id) {
@@ -139,6 +147,15 @@ impl<R: Send + 'static> ToolScheduler<R> {
         }
         state.queued = still;
     }
+}
+
+fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    let message = payload
+        .downcast_ref::<&str>()
+        .map(|message| (*message).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "unknown panic".into());
+    format!("tool execution panicked: {message}")
 }
 
 impl<R: Send + 'static> Clone for ToolScheduler<R> {
@@ -212,7 +229,10 @@ mod tests {
             },
         ];
         let results = ToolScheduler::run_all(tasks).await;
-        assert_eq!(results, vec![1, 2]);
+        assert_eq!(
+            results.into_iter().collect::<Result<Vec<_>, _>>().unwrap(),
+            vec![1, 2]
+        );
         assert!(max.load(Ordering::SeqCst) >= 2);
     }
 
@@ -256,7 +276,32 @@ mod tests {
             },
         ];
         let results = ToolScheduler::run_all(tasks).await;
-        assert_eq!(results, vec![1, 2]);
+        assert_eq!(
+            results.into_iter().collect::<Result<Vec<_>, _>>().unwrap(),
+            vec![1, 2]
+        );
         assert_eq!(max.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn panic_does_not_deadlock_conflicting_queued_tasks() {
+        let tasks = vec![
+            ToolCallTask {
+                accesses: tool_accesses::write_file("/a"),
+                start: box_start(|| async move { panic!("boom") }),
+            },
+            ToolCallTask {
+                accesses: tool_accesses::read_file("/a"),
+                start: box_start(|| async move { 2 }),
+            },
+        ];
+        let results = tokio::time::timeout(Duration::from_secs(1), ToolScheduler::run_all(tasks))
+            .await
+            .expect("queued task should be released after a panic");
+        assert!(results[0]
+            .as_ref()
+            .unwrap_err()
+            .contains("tool execution panicked: boom"));
+        assert_eq!(results[1], Ok(2));
     }
 }
