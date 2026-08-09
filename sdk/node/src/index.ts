@@ -28,6 +28,11 @@ export interface EventHistory {
   history_capacity: number;
 }
 
+export interface PostMessageOptions {
+  /** Stable key used to safely retry the same request after a network failure. */
+  idempotencyKey?: string;
+}
+
 export class KkagentHttpClient {
   readonly baseUrl: string;
   readonly token?: string;
@@ -71,10 +76,17 @@ export class KkagentHttpClient {
     return (await res.json()) as Session;
   }
 
-  async postMessage(sessionId: string, text: string): Promise<unknown> {
+  async postMessage(
+    sessionId: string,
+    text: string,
+    options: PostMessageOptions = {},
+  ): Promise<unknown> {
     const res = await fetch(this.url(`/api/v1/sessions/${sessionId}/messages`), {
       method: "POST",
-      headers: this.headers(true),
+      headers: {
+        ...this.headers(true),
+        ...(options.idempotencyKey ? { "idempotency-key": options.idempotencyKey } : {}),
+      },
       body: JSON.stringify({ text }),
     });
     if (!res.ok) throw new Error(`postMessage ${res.status}`);
@@ -101,9 +113,18 @@ export class KkagentHttpClient {
     return (await res.json()) as EventHistory;
   }
 
-  async turnStatus(sessionId: string): Promise<unknown> {
-    const res = await fetch(this.url(`/api/v1/turns/${sessionId}`), { headers: this.headers() });
+  async turnStatus(taskOrSessionId: string): Promise<unknown> {
+    const res = await fetch(this.url(`/api/v1/turns/${taskOrSessionId}`), { headers: this.headers() });
     if (!res.ok) throw new Error(`turnStatus ${res.status}`);
+    return res.json();
+  }
+
+  async cancelTurn(taskId: string): Promise<unknown> {
+    const res = await fetch(this.url(`/api/v1/turns/${taskId}`), {
+      method: "DELETE",
+      headers: this.headers(),
+    });
+    if (!res.ok) throw new Error(`cancelTurn ${res.status}`);
     return res.json();
   }
 

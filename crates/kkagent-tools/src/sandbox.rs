@@ -359,17 +359,21 @@ mod tests {
 
     #[test]
     fn validates_config() {
-        let mut config = kkagent_config::SandboxConfig::default();
-        config.mode = "invalid".into();
+        let config = kkagent_config::SandboxConfig {
+            mode: "invalid".into(),
+            ..Default::default()
+        };
         assert!(SandboxPolicy::from_config(&config).is_err());
     }
 
     #[cfg(target_os = "macos")]
     #[test]
     fn mac_profile_scopes_workspace_and_network() {
-        let mut policy = SandboxPolicy::default();
-        policy.mode = SandboxMode::Workspace;
-        policy.network = false;
+        let policy = SandboxPolicy {
+            mode: SandboxMode::Workspace,
+            network: false,
+            ..Default::default()
+        };
         let profile = macos_profile(&policy, Path::new("/tmp/work")).unwrap();
         assert!(profile.contains("/tmp/work"));
         assert!(!profile.contains("allow network"));
@@ -384,8 +388,10 @@ mod tests {
         let outside = dirs::home_dir()
             .unwrap()
             .join(format!(".kkagent-outside-{}", uuid::Uuid::new_v4()));
-        let mut policy = SandboxPolicy::default();
-        policy.mode = SandboxMode::Workspace;
+        let policy = SandboxPolicy {
+            mode: SandboxMode::Workspace,
+            ..Default::default()
+        };
         let script = format!(
             "printf allowed > inside.txt; printf denied > {}",
             outside.display()

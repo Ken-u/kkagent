@@ -152,6 +152,9 @@ pub struct BackgroundConfig {
     pub bash_auto_background_on_timeout: Option<bool>,
     #[serde(default)]
     pub bash_task_timeout_s: Option<u64>,
+    /// Maximum time a turn may wait for an approval before rejecting it.
+    #[serde(default)]
+    pub approval_timeout_s: Option<u64>,
 }
 
 fn default_max_tasks() -> u32 {

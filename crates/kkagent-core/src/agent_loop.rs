@@ -669,7 +669,29 @@ Do not mention this reminder to the user.\n</system-reminder>"
                             })
                             .await;
 
-                        let response = session.wait_approval(&approval_id).await;
+                        let approval_timeout = self
+                            .config
+                            .background
+                            .as_ref()
+                            .and_then(|background| background.approval_timeout_s)
+                            .unwrap_or(900)
+                            .clamp(1, 86_400);
+                        let response = match tokio::time::timeout(
+                            std::time::Duration::from_secs(approval_timeout),
+                            session.wait_approval(&approval_id),
+                        )
+                        .await
+                        {
+                            Ok(response) => response,
+                            Err(_) => kkagent_protocol::ApprovalResponse {
+                                approval_id: approval_id.clone(),
+                                decision: kkagent_protocol::ApprovalDecision::Rejected,
+                                scope: None,
+                                feedback: Some(format!(
+                                    "approval timed out after {approval_timeout} seconds"
+                                )),
+                            },
+                        };
                         match response.decision {
                             kkagent_protocol::ApprovalDecision::Approved => {
                                 if response.scope == Some(kkagent_protocol::ApprovalScope::Session)

@@ -37,6 +37,7 @@ impl TranscriptDb {
             }
         }
         let conn = Connection::open(db_path)?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         let db = Self { conn };
         db.migrate()?;
         Ok(db)
@@ -57,7 +58,9 @@ impl TranscriptDb {
 
     fn migrate(&self) -> anyhow::Result<()> {
         self.conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS sessions (
+            "PRAGMA journal_mode = WAL;
+            PRAGMA synchronous = FULL;
+            CREATE TABLE IF NOT EXISTS sessions (
                 session_id TEXT PRIMARY KEY,
                 title TEXT,
                 model TEXT NOT NULL DEFAULT '',

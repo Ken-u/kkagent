@@ -33,3 +33,20 @@ test("jsonrpc shapes request", async () => {
   const r = await rpc.call("ping");
   assert.deepEqual(r, { ok: true });
 });
+
+test("postMessage sends an idempotency key", async () => {
+  const originalFetch = globalThis.fetch;
+  let observed;
+  globalThis.fetch = async (_url, options) => {
+    observed = options;
+    return { ok: true, json: async () => ({ task_id: "task-1" }) };
+  };
+  try {
+    const client = new KkagentHttpClient();
+    const result = await client.postMessage("session", "hello", { idempotencyKey: "request-1" });
+    assert.equal(observed.headers["idempotency-key"], "request-1");
+    assert.equal(result.task_id, "task-1");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});

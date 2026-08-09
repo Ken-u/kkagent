@@ -42,10 +42,13 @@ export class KkagentHttpClient {
     return res.json();
   }
 
-  async postMessage(sessionId, text) {
+  async postMessage(sessionId, text, options = {}) {
     const res = await fetch(this.url(`/api/v1/sessions/${sessionId}/messages`), {
       method: "POST",
-      headers: this.headers(true),
+      headers: {
+        ...this.headers(true),
+        ...(options.idempotencyKey ? { "idempotency-key": options.idempotencyKey } : {}),
+      },
       body: JSON.stringify({ text }),
     });
     if (!res.ok) throw new Error(`postMessage ${res.status}`);
@@ -72,9 +75,18 @@ export class KkagentHttpClient {
     return res.json();
   }
 
-  async turnStatus(sessionId) {
-    const res = await fetch(this.url(`/api/v1/turns/${sessionId}`), { headers: this.headers() });
+  async turnStatus(taskOrSessionId) {
+    const res = await fetch(this.url(`/api/v1/turns/${taskOrSessionId}`), { headers: this.headers() });
     if (!res.ok) throw new Error(`turnStatus ${res.status}`);
+    return res.json();
+  }
+
+  async cancelTurn(taskId) {
+    const res = await fetch(this.url(`/api/v1/turns/${taskId}`), {
+      method: "DELETE",
+      headers: this.headers(),
+    });
+    if (!res.ok) throw new Error(`cancelTurn ${res.status}`);
     return res.json();
   }
 

@@ -606,18 +606,27 @@ async fn run_server(
     let config_arc = Arc::new(config);
     let state = build_server_state(config_arc.clone()).await?;
 
+    let mut recovery_backend = None;
+    let mut http_ready = None;
     let http_handle = if let Some(addr) = http {
-        let backend: Arc<dyn kkagent_rpc::HttpBackend> = Arc::new(AgentHttpBackend {
+        let concrete_backend = Arc::new(AgentHttpBackend {
             state: state.clone(),
         });
+        recovery_backend = Some(concrete_backend.clone());
+        let backend: Arc<dyn kkagent_rpc::HttpBackend> = concrete_backend;
         let token = http_token;
+        let durable_http = state.durable_http.clone();
         let http_listener = kkagent_rpc::bind_http(&addr, token.as_deref()).await?;
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        http_ready = Some(ready_rx);
         Some(tokio::spawn(async move {
-            if let Err(e) = kkagent_rpc::serve_http_listener_with_backend_and_security(
+            if let Err(e) = kkagent_rpc::serve_http_listener_with_backend_security_and_persistence(
                 http_listener,
                 backend,
                 token,
                 http_security,
+                durable_http,
+                Some(ready_tx),
             )
             .await
             {
@@ -627,6 +636,14 @@ async fn run_server(
     } else {
         None
     };
+    if let Some(ready) = http_ready {
+        ready
+            .await
+            .map_err(|_| anyhow::anyhow!("HTTP server stopped before initialization"))?;
+    }
+    if let Some(backend) = recovery_backend {
+        recover_durable_turns(backend).await;
+    }
 
     loop {
         tokio::select! {
@@ -674,6 +691,142 @@ async fn initialize_session_context(state: &ServerState, session: &mut Session) 
     let plugin_section = state.plugins.prompt_append_all().await;
     if !plugin_section.is_empty() {
         session.system_prompt.push_str(&plugin_section);
+    }
+}
+
+async fn ensure_http_session_loaded(
+    state: &Arc<ServerState>,
+    session_id: &str,
+) -> Result<(), String> {
+    if state.sessions.lock().await.contains_key(session_id) {
+        return Ok(());
+    }
+    let (record, messages) = {
+        let database = state.transcript.lock().await;
+        let record = database
+            .get_session(session_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "session not found".to_string())?;
+        let records = database
+            .load_messages(session_id)
+            .map_err(|error| error.to_string())?;
+        (record, messages_from_records(&records))
+    };
+    let permission_mode = state
+        .config
+        .effective_permission_mode()
+        .parse()
+        .unwrap_or_default();
+    let model = if record.model.is_empty() {
+        state
+            .config
+            .default_model_alias()
+            .unwrap_or("default")
+            .to_string()
+    } else {
+        record.model
+    };
+    let mut session = Session::resume(
+        session_id.to_string(),
+        PathBuf::from(record.working_dir),
+        permission_mode,
+        model,
+    );
+    initialize_session_context(state, &mut session).await;
+    session.messages = messages;
+    session.persisted_message_count = session.messages.len();
+    if let Some(title) = record.title {
+        let _ = session.set_title_persisted(title);
+    }
+    session.services.create_source = SessionCreateSource::Resume;
+    session.services.on_created().await;
+    state
+        .interrupt_flags
+        .lock()
+        .await
+        .insert(session_id.to_string(), session.interrupted.clone());
+    state
+        .model_aliases
+        .lock()
+        .await
+        .insert(session_id.to_string(), session.model_alias.clone());
+    state
+        .approval_txs
+        .lock()
+        .await
+        .insert(session_id.to_string(), session.approval_tx.clone());
+    state
+        .question_txs
+        .lock()
+        .await
+        .insert(session_id.to_string(), session.question_tx.clone());
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session_id.to_string(), session);
+    Ok(())
+}
+
+async fn recover_durable_turns(backend: Arc<AgentHttpBackend>) {
+    let turns = match backend.state.durable_http.recoverable_turns() {
+        Ok(turns) => turns,
+        Err(error) => {
+            tracing::error!("Failed to load durable turn queue: {error}");
+            return;
+        }
+    };
+    for turn in turns {
+        tracing::warn!(task_id = %turn.task_id, session_id = %turn.session_id, attempts = turn.attempts, "Recovering durable turn");
+        if let Err(error) = kkagent_rpc::HttpBackend::post_message(
+            backend.as_ref(),
+            &turn.session_id,
+            &turn.prompt,
+            Some(&turn.task_id),
+        )
+        .await
+        {
+            let _ = backend
+                .state
+                .durable_http
+                .finish_turn(&turn.task_id, "failed", Some(&error));
+        }
+    }
+}
+
+async fn recover_subagents(state: Arc<ServerState>) {
+    let configs = match state.subagents.recoverable_configs().await {
+        Ok(configs) => configs,
+        Err(error) => {
+            tracing::error!("Failed to load durable subagents: {error}");
+            return;
+        }
+    };
+    for config in configs {
+        let agent_id = config.agent_id.clone();
+        if let Err(error) = state.subagents.resume(&agent_id).await {
+            tracing::error!("Failed to claim recovered subagent {agent_id}: {error}");
+            continue;
+        }
+        let manager = state.subagents.clone();
+        let app_config = state.config.clone();
+        let abort_manager = manager.clone();
+        let abort_agent_id = agent_id.clone();
+        let join = tokio::spawn(async move {
+            match kkagent_core::run_subagent_mirrored(
+                app_config,
+                config,
+                PermissionMode::Auto,
+                None,
+            )
+            .await
+            {
+                Ok(result) => manager.complete(&agent_id, result).await,
+                Err(error) => manager.fail(&agent_id, error.to_string()).await,
+            }
+        });
+        let abort = join.abort_handle();
+        abort_manager.set_abort_handle(&abort_agent_id, abort).await;
     }
 }
 
@@ -1124,12 +1277,24 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
         Ok(())
     }
 
-    async fn post_message(&self, id: &str, text: &str) -> Result<serde_json::Value, String> {
+    async fn post_message(
+        &self,
+        id: &str,
+        text: &str,
+        task_id: Option<&str>,
+    ) -> Result<serde_json::Value, String> {
         // Queue user message and run AgentLoop turn on shared ServerState.
         if text.trim().is_empty() {
             return Err("message text must not be empty".into());
         }
+        ensure_http_session_loaded(&self.state, id).await?;
         let turn_permit = self.state.turn_locks.try_acquire(id).await?;
+        if let Some(task_id) = task_id {
+            self.state
+                .durable_http
+                .claim_turn(task_id)
+                .map_err(|error| error.to_string())?;
+        }
         let mut sessions = self.state.sessions.lock().await;
         let session = sessions
             .get_mut(id)
@@ -1139,9 +1304,29 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
         drop(sessions);
         let state = self.state.clone();
         let sid = id.to_string();
+        let durable_task_id = task_id.map(str::to_string);
         tokio::spawn(async move {
             let _turn_permit = turn_permit;
-            if let Err(e) = run_http_turn(state, &sid).await {
+            let result = run_http_turn(state.clone(), &sid).await;
+            if let Some(task_id) = durable_task_id {
+                match &result {
+                    Ok(()) => {
+                        if let Err(error) =
+                            state.durable_http.finish_turn(&task_id, "completed", None)
+                        {
+                            tracing::error!("Failed to complete durable task {task_id}: {error}");
+                        }
+                    }
+                    Err(error) => {
+                        let _ = state.durable_http.finish_turn(
+                            &task_id,
+                            "failed",
+                            Some(&error.to_string()),
+                        );
+                    }
+                }
+            }
+            if let Err(e) = result {
                 tracing::warn!("HTTP-triggered turn failed: {e}");
             }
         });
@@ -1171,7 +1356,26 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
                 })
             })
             .collect();
-        serde_json::json!({"tasks": tasks})
+        let turns = self
+            .state
+            .durable_http
+            .list_turns(200)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|turn| {
+                serde_json::json!({
+                    "task_id": turn.task_id,
+                    "session_id": turn.session_id,
+                    "description": "agent turn",
+                    "status": turn.state,
+                    "attempts": turn.attempts,
+                    "updated_at": turn.updated_at,
+                    "error": turn.error,
+                    "kind": "turn",
+                })
+            })
+            .collect::<Vec<_>>();
+        serde_json::json!({"tasks": tasks, "turns": turns})
     }
 
     async fn list_skills(&self) -> serde_json::Value {
@@ -1244,6 +1448,45 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
             let _ = tx.try_send(resp.clone());
         }
         Ok(serde_json::json!({"ok": true, "approval_id": id}))
+    }
+
+    async fn cancel_turn(&self, task_id: &str) -> Result<serde_json::Value, String> {
+        let turn = self
+            .state
+            .durable_http
+            .get_turn(task_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "task not found".to_string())?;
+        let cancelled = self
+            .state
+            .durable_http
+            .cancel_turn(task_id)
+            .map_err(|error| error.to_string())?;
+        if let Some(flag) = self
+            .state
+            .interrupt_flags
+            .lock()
+            .await
+            .get(&turn.session_id)
+            .cloned()
+        {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        if let Some(handle) = self
+            .state
+            .abort_registry
+            .lock()
+            .await
+            .remove(&turn.session_id)
+        {
+            handle.abort();
+        }
+        Ok(serde_json::json!({
+            "ok": true,
+            "task_id": cancelled.task_id,
+            "session_id": cancelled.session_id,
+            "state": cancelled.state,
+        }))
     }
 
     async fn fs_read(&self, path: &str) -> Result<String, String> {
@@ -1496,13 +1739,7 @@ async fn build_turn_tool_registry(
         state.bash_shells.clone(),
         kkagent_tools::builtin::BashOptions {
             auto_background_on_timeout,
-            sandbox: kkagent_tools::sandbox::SandboxPolicy::from_config(&state.config.sandbox)
-                .unwrap_or_else(|error| {
-                    tracing::error!("Invalid sandbox configuration: {error}");
-                    let mut policy = kkagent_tools::sandbox::SandboxPolicy::default();
-                    policy.mode = kkagent_tools::sandbox::SandboxMode::Workspace;
-                    policy
-                }),
+            sandbox: state.sandbox_policy.clone(),
         },
     )));
     register_mcp_tools(&mut tools, &state.mcp).await;
@@ -1661,20 +1898,22 @@ async fn run_http_turn(state: Arc<ServerState>, session_id: &str) -> anyhow::Res
     .with_goal_manager(state.goal_mgr.clone());
 
     let result = agent.run_turn(&mut session).await;
-    {
+    let persist_result = {
         let db = state.transcript.lock().await;
-        persist_session_messages(&db, &mut session);
-    }
+        persist_session_messages(&db, &mut session)
+    };
     state
         .sessions
         .lock()
         .await
         .insert(session_id.to_string(), session);
-    result
+    result?;
+    persist_result
 }
 
 struct ServerState {
     config: Arc<AppConfig>,
+    sandbox_policy: kkagent_tools::sandbox::SandboxPolicy,
     sessions: Mutex<HashMap<String, Session>>,
     /// Session approval senders — must not require holding `sessions` lock
     /// (agent loop may be waiting on approval while holding the session).
@@ -1686,6 +1925,7 @@ struct ServerState {
     model_aliases: Mutex<HashMap<String, Arc<std::sync::Mutex<String>>>>,
     abort_registry: Arc<Mutex<HashMap<String, AbortHandle>>>,
     transcript: Mutex<TranscriptDb>,
+    durable_http: kkagent_rpc::DurableHttpStore,
     subagents: Arc<SubagentManager>,
     /// Connected MCP servers; tools registered per turn from this manager.
     mcp: Arc<McpManager>,
@@ -1790,6 +2030,12 @@ async fn build_server_state(config: Arc<AppConfig>) -> Result<Arc<ServerState>> 
     let transcript_path = kkagent_config::default_config_dir().join("transcripts.db");
     let (transcript, persistence_durable, persistence_error) =
         open_transcript_with_policy(&transcript_path, allow_in_memory)?;
+    let durable_http = if persistence_durable {
+        kkagent_rpc::DurableHttpStore::open(&transcript_path)?
+    } else {
+        kkagent_rpc::DurableHttpStore::open_in_memory()?
+    };
+    let sandbox_policy = kkagent_tools::sandbox::SandboxPolicy::from_config(&config.sandbox)?;
 
     let mcp = Arc::new(mcp_manager_from_config(&config));
     if !config.mcp_servers.is_empty() {
@@ -1892,8 +2138,14 @@ async fn build_server_state(config: Arc<AppConfig>) -> Result<Arc<ServerState>> 
         )
         .await;
 
-    Ok(Arc::new(ServerState {
+    let subagents = if persistence_durable {
+        Arc::new(SubagentManager::new_persistent(4, &transcript_path)?)
+    } else {
+        Arc::new(SubagentManager::new(4))
+    };
+    let state = Arc::new(ServerState {
         config: config.clone(),
+        sandbox_policy,
         sessions: Mutex::new(HashMap::new()),
         approval_txs: Mutex::new(HashMap::new()),
         question_txs: Mutex::new(HashMap::new()),
@@ -1901,7 +2153,8 @@ async fn build_server_state(config: Arc<AppConfig>) -> Result<Arc<ServerState>> 
         model_aliases: Mutex::new(HashMap::new()),
         abort_registry: Arc::new(Mutex::new(HashMap::new())),
         transcript: Mutex::new(transcript),
-        subagents: Arc::new(SubagentManager::new(4)),
+        durable_http,
+        subagents,
         mcp,
         bash_shells: Arc::new(kkagent_tools::builtin::BackgroundShellManager::new()),
         cron,
@@ -1919,7 +2172,9 @@ async fn build_server_state(config: Arc<AppConfig>) -> Result<Arc<ServerState>> 
         persistence_durable,
         persistence_error,
         started_at: std::time::Instant::now(),
-    }))
+    });
+    recover_subagents(state.clone()).await;
+    Ok(state)
 }
 
 async fn run_server_handler<T: kkagent_rpc::transport::AsyncTransport>(
@@ -1947,40 +2202,18 @@ async fn run_server_handler_with_state<T: kkagent_rpc::transport::AsyncTransport
     server.serve(transport).await;
 }
 
-fn persist_session_messages(db: &TranscriptDb, session: &mut Session) {
+fn persist_session_messages(db: &TranscriptDb, session: &mut Session) -> anyhow::Result<()> {
     if session.transcript_rewrite_required {
-        let replacement = match serialize_transcript_messages(&session.messages) {
-            Ok(messages) => messages,
-            Err(error) => {
-                tracing::warn!("Failed to serialize compacted transcript: {error}");
-                return;
-            }
-        };
-        match db.replace_messages(&session.id, &replacement, None) {
-            Ok(()) => {
-                session.persisted_message_count = session.messages.len();
-                session.transcript_rewrite_required = false;
-            }
-            Err(error) => {
-                tracing::warn!("Failed to replace compacted transcript: {error}");
-                return;
-            }
-        }
+        let replacement = serialize_transcript_messages(&session.messages)?;
+        db.replace_messages(&session.id, &replacement, None)?;
+        session.persisted_message_count = session.messages.len();
+        session.transcript_rewrite_required = false;
     }
 
     if session.persisted_message_count < session.messages.len() {
         let pending = &session.messages[session.persisted_message_count..];
-        let serialized = match serialize_transcript_messages(pending) {
-            Ok(messages) => messages,
-            Err(error) => {
-                tracing::warn!("Failed to serialize messages: {error}");
-                return;
-            }
-        };
-        if let Err(error) = db.append_messages(&session.id, &serialized) {
-            tracing::warn!("Failed to persist messages: {error}");
-            return;
-        }
+        let serialized = serialize_transcript_messages(pending)?;
+        db.append_messages(&session.id, &serialized)?;
         session.persisted_message_count = session.messages.len();
     }
 
@@ -1989,11 +2222,12 @@ fn persist_session_messages(db: &TranscriptDb, session: &mut Session) {
         if let Some(first_user) = session.messages.iter().find(|m| m.role == "user") {
             if let Some(ChatContent::Text { text }) = first_user.content.first() {
                 let title: String = text.chars().take(60).collect();
-                let _ = db.set_title(&session.id, &title);
+                db.set_title(&session.id, &title)?;
                 session.title = Some(title);
             }
         }
     }
+    Ok(())
 }
 
 fn serialize_transcript_messages(
@@ -2724,7 +2958,13 @@ async fn handle_rpc_call(
 
                 {
                     let db = state_clone.transcript.lock().await;
-                    persist_session_messages(&db, &mut session);
+                    if let Err(error) = persist_session_messages(&db, &mut session) {
+                        tracing::error!("Failed to persist completed turn: {error}");
+                        let _ = agent_event_tx.try_send(AgentEvent::Error {
+                            session_id: sid.clone(),
+                            message: format!("turn persistence failed: {error}"),
+                        });
+                    }
                 }
 
                 state_clone.sessions.lock().await.insert(sid, session);
@@ -3255,12 +3495,12 @@ mod http_path_tests {
         for index in 0..6 {
             session.add_user_message(format!("message {index}"));
         }
-        persist_session_messages(&db, &mut session);
+        persist_session_messages(&db, &mut session).unwrap();
         assert_eq!(db.load_messages("persist-test").unwrap().len(), 6);
 
         kkagent_core::compact_messages(&mut session.messages, 2, "durable digest");
         session.transcript_rewrite_required = true;
-        persist_session_messages(&db, &mut session);
+        persist_session_messages(&db, &mut session).unwrap();
 
         let records = db.load_messages("persist-test").unwrap();
         assert_eq!(records.len(), 3);

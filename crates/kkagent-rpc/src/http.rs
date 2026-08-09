@@ -2,11 +2,12 @@
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, Request, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
@@ -21,6 +22,387 @@ const MAX_HTTP_TERMINALS: usize = 64;
 const MAX_TERMINAL_COMMAND_BYTES: usize = 64 * 1024;
 const MAX_TERMINAL_OUTPUT_BYTES: usize = 1024 * 1024;
 const EVENT_HISTORY_CAPACITY: usize = 2048;
+const DEFAULT_TASK_MAX_ATTEMPTS: u32 = 3;
+
+#[derive(Debug, Clone)]
+pub struct DurableTurn {
+    pub task_id: String,
+    pub session_id: String,
+    pub prompt: String,
+    pub state: String,
+    pub attempts: u32,
+    pub max_attempts: u32,
+    pub created_at: String,
+    pub updated_at: String,
+    pub error: Option<String>,
+}
+
+impl DurableTurn {
+    fn as_json(&self) -> Value {
+        json!({
+            "task_id": self.task_id,
+            "session_id": self.session_id,
+            "state": self.state,
+            "attempts": self.attempts,
+            "max_attempts": self.max_attempts,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+            "error": self.error,
+        })
+    }
+}
+
+#[derive(Clone)]
+pub struct DurableHttpStore {
+    connection: Arc<StdMutex<Connection>>,
+}
+
+impl DurableHttpStore {
+    pub fn open(path: &std::path::Path) -> anyhow::Result<Self> {
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            std::fs::create_dir_all(parent)?;
+        }
+        Self::from_connection(Connection::open(path)?)
+    }
+
+    pub fn open_in_memory() -> anyhow::Result<Self> {
+        Self::from_connection(Connection::open_in_memory()?)
+    }
+
+    fn from_connection(connection: Connection) -> anyhow::Result<Self> {
+        connection.busy_timeout(std::time::Duration::from_secs(5))?;
+        connection.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             PRAGMA synchronous = FULL;
+             CREATE TABLE IF NOT EXISTS http_events (
+                event_seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT,
+                event_json TEXT NOT NULL,
+                emitted_at TEXT NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_http_events_session_seq
+                ON http_events(session_id, event_seq);
+             CREATE TABLE IF NOT EXISTS durable_turns (
+                task_id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                prompt TEXT NOT NULL,
+                prompt_hash TEXT NOT NULL,
+                idempotency_key TEXT,
+                state TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                max_attempts INTEGER NOT NULL DEFAULT 3,
+                lease_expires_at INTEGER,
+                error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+             );
+             CREATE UNIQUE INDEX IF NOT EXISTS idx_durable_turns_idempotency
+                ON durable_turns(session_id, idempotency_key)
+                WHERE idempotency_key IS NOT NULL;
+             CREATE INDEX IF NOT EXISTS idx_durable_turns_recovery
+                ON durable_turns(state, lease_expires_at, created_at);",
+        )?;
+        Ok(Self {
+            connection: Arc::new(StdMutex::new(connection)),
+        })
+    }
+
+    fn append_event(&self, event: Value) -> anyhow::Result<Value> {
+        let emitted_at = chrono::Utc::now().to_rfc3339();
+        let session_id = event
+            .get("session_id")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("durable HTTP store lock poisoned"))?;
+        let transaction = connection.transaction()?;
+        transaction.execute(
+            "INSERT INTO http_events(session_id, event_json, emitted_at) VALUES (?1, '', ?2)",
+            params![session_id, emitted_at],
+        )?;
+        let sequence = transaction.last_insert_rowid() as u64;
+        let mut event = match event {
+            Value::Object(object) => Value::Object(object),
+            data => json!({"type": "event", "data": data}),
+        };
+        if let Some(object) = event.as_object_mut() {
+            object.insert("event_seq".into(), json!(sequence));
+            object.insert("emitted_at".into(), json!(emitted_at));
+        }
+        transaction.execute(
+            "UPDATE http_events SET event_json = ?1 WHERE event_seq = ?2",
+            params![serde_json::to_string(&event)?, sequence],
+        )?;
+        transaction.commit()?;
+        Ok(event)
+    }
+
+    fn latest_event_sequence(&self) -> anyhow::Result<u64> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("durable HTTP store lock poisoned"))?;
+        Ok(connection.query_row(
+            "SELECT COALESCE(MAX(event_seq), 0) FROM http_events",
+            [],
+            |row| row.get(0),
+        )?)
+    }
+
+    fn events_since(
+        &self,
+        since: u64,
+        session_id: Option<&str>,
+        limit: usize,
+    ) -> anyhow::Result<Vec<Value>> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("durable HTTP store lock poisoned"))?;
+        let mut events = Vec::new();
+        if let Some(session_id) = session_id {
+            let mut statement = connection.prepare(
+                "SELECT event_json FROM http_events WHERE event_seq > ?1 AND session_id = ?2 ORDER BY event_seq LIMIT ?3",
+            )?;
+            let rows = statement.query_map(params![since, session_id, limit as u64], |row| {
+                row.get::<_, String>(0)
+            })?;
+            for row in rows {
+                events.push(serde_json::from_str(&row?)?);
+            }
+        } else {
+            let mut statement = connection.prepare(
+                "SELECT event_json FROM http_events WHERE event_seq > ?1 ORDER BY event_seq LIMIT ?2",
+            )?;
+            let rows =
+                statement.query_map(params![since, limit as u64], |row| row.get::<_, String>(0))?;
+            for row in rows {
+                events.push(serde_json::from_str(&row?)?);
+            }
+        }
+        Ok(events)
+    }
+
+    pub fn enqueue_turn(
+        &self,
+        session_id: &str,
+        prompt: &str,
+        idempotency_key: Option<&str>,
+    ) -> anyhow::Result<(DurableTurn, bool)> {
+        use sha2::{Digest, Sha256};
+        let prompt_hash = hex::encode(Sha256::digest(prompt.as_bytes()));
+        let key = idempotency_key.map(str::trim).filter(|key| !key.is_empty());
+        if key.is_some_and(|key| key.len() > 256) {
+            anyhow::bail!("idempotency key exceeds 256 bytes");
+        }
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("durable HTTP store lock poisoned"))?;
+        let transaction = connection.transaction()?;
+        if let Some(key) = key {
+            let existing = transaction
+                .query_row(
+                    "SELECT task_id, session_id, prompt, state, attempts, max_attempts, created_at, updated_at, error, prompt_hash
+                     FROM durable_turns WHERE session_id = ?1 AND idempotency_key = ?2",
+                    params![session_id, key],
+                    |row| Ok((read_turn(row)?, row.get::<_, String>(9)?)),
+                )
+                .optional()?;
+            if let Some((turn, existing_hash)) = existing {
+                if existing_hash != prompt_hash {
+                    anyhow::bail!("idempotency key was already used with a different request");
+                }
+                transaction.commit()?;
+                return Ok((turn, true));
+            }
+        }
+        let task_id = uuid::Uuid::new_v4().to_string();
+        let now = chrono::Utc::now().to_rfc3339();
+        transaction.execute(
+            "INSERT INTO durable_turns(task_id, session_id, prompt, prompt_hash, idempotency_key, state, attempts, max_attempts, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'queued', 0, ?6, ?7, ?7)",
+            params![task_id, session_id, prompt, prompt_hash, key, DEFAULT_TASK_MAX_ATTEMPTS, now],
+        )?;
+        transaction.commit()?;
+        Ok((
+            DurableTurn {
+                task_id,
+                session_id: session_id.into(),
+                prompt: prompt.into(),
+                state: "queued".into(),
+                attempts: 0,
+                max_attempts: DEFAULT_TASK_MAX_ATTEMPTS,
+                created_at: now.clone(),
+                updated_at: now,
+                error: None,
+            },
+            false,
+        ))
+    }
+
+    pub fn claim_turn(&self, task_id: &str) -> anyhow::Result<DurableTurn> {
+        let now_unix = chrono::Utc::now().timestamp();
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("durable HTTP store lock poisoned"))?;
+        let transaction = connection.transaction()?;
+        let changed = transaction.execute(
+            "UPDATE durable_turns SET state = 'running', attempts = attempts + 1, lease_expires_at = ?1, updated_at = ?2, error = NULL
+             WHERE task_id = ?3 AND state IN ('queued', 'recovery_pending') AND attempts < max_attempts",
+            params![now_unix + 900, now, task_id],
+        )?;
+        if changed == 0 {
+            anyhow::bail!("task {task_id} is not claimable");
+        }
+        let turn = query_turn(&transaction, task_id)?
+            .ok_or_else(|| anyhow::anyhow!("task disappeared after claim"))?;
+        transaction.commit()?;
+        Ok(turn)
+    }
+
+    pub fn finish_turn(
+        &self,
+        task_id: &str,
+        state: &str,
+        error: Option<&str>,
+    ) -> anyhow::Result<()> {
+        if !matches!(
+            state,
+            "completed" | "failed" | "cancelled" | "waiting_approval"
+        ) {
+            anyhow::bail!("invalid durable turn state {state}");
+        }
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("durable HTTP store lock poisoned"))?;
+        let changed = connection.execute(
+            "UPDATE durable_turns SET state = ?1, lease_expires_at = NULL, error = ?2, updated_at = ?3
+             WHERE task_id = ?4 AND state != 'cancelled'",
+            params![state, error, chrono::Utc::now().to_rfc3339(), task_id],
+        )?;
+        if changed == 0 {
+            let existing: Option<String> = connection
+                .query_row(
+                    "SELECT state FROM durable_turns WHERE task_id = ?1",
+                    params![task_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if existing.as_deref() == Some("cancelled") {
+                return Ok(());
+            }
+            anyhow::bail!("unknown task {task_id}");
+        }
+        Ok(())
+    }
+
+    pub fn recoverable_turns(&self) -> anyhow::Result<Vec<DurableTurn>> {
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("durable HTTP store lock poisoned"))?;
+        let transaction = connection.transaction()?;
+        transaction.execute(
+            "UPDATE durable_turns SET state = CASE WHEN attempts < max_attempts THEN 'recovery_pending' ELSE 'failed' END,
+             error = CASE WHEN attempts < max_attempts THEN 'recovered after unclean shutdown' ELSE 'retry limit exhausted after unclean shutdown' END,
+             lease_expires_at = NULL, updated_at = ?1 WHERE state IN ('running', 'waiting_approval')",
+            params![chrono::Utc::now().to_rfc3339()],
+        )?;
+        let mut statement = transaction.prepare(
+            "SELECT task_id, session_id, prompt, state, attempts, max_attempts, created_at, updated_at, error
+             FROM durable_turns WHERE state IN ('queued', 'recovery_pending') AND attempts < max_attempts ORDER BY created_at",
+        )?;
+        let rows = statement.query_map([], read_turn)?;
+        let mut turns = Vec::new();
+        for row in rows {
+            turns.push(row?);
+        }
+        drop(statement);
+        transaction.commit()?;
+        Ok(turns)
+    }
+
+    pub fn get_turn(&self, task_or_session_id: &str) -> anyhow::Result<Option<DurableTurn>> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("durable HTTP store lock poisoned"))?;
+        if let Some(turn) = query_turn(&connection, task_or_session_id)? {
+            return Ok(Some(turn));
+        }
+        Ok(connection.query_row(
+            "SELECT task_id, session_id, prompt, state, attempts, max_attempts, created_at, updated_at, error
+             FROM durable_turns WHERE session_id = ?1 ORDER BY created_at DESC LIMIT 1",
+            params![task_or_session_id], read_turn,
+        ).optional()?)
+    }
+
+    pub fn list_turns(&self, limit: usize) -> anyhow::Result<Vec<DurableTurn>> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("durable HTTP store lock poisoned"))?;
+        let mut statement = connection.prepare(
+            "SELECT task_id, session_id, prompt, state, attempts, max_attempts, created_at, updated_at, error
+             FROM durable_turns ORDER BY created_at DESC LIMIT ?1",
+        )?;
+        let rows = statement.query_map(params![limit.min(1000) as u64], read_turn)?;
+        let mut turns = Vec::new();
+        for row in rows {
+            turns.push(row?);
+        }
+        Ok(turns)
+    }
+
+    pub fn cancel_turn(&self, task_id: &str) -> anyhow::Result<DurableTurn> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("durable HTTP store lock poisoned"))?;
+        let changed = connection.execute(
+            "UPDATE durable_turns SET state = 'cancelled', lease_expires_at = NULL,
+             error = 'cancelled by client', updated_at = ?1
+             WHERE task_id = ?2 AND state IN ('queued', 'recovery_pending', 'running', 'waiting_approval')",
+            params![chrono::Utc::now().to_rfc3339(), task_id],
+        )?;
+        if changed == 0 {
+            anyhow::bail!("task {task_id} is not cancellable");
+        }
+        drop(connection);
+        self.get_turn(task_id)?
+            .ok_or_else(|| anyhow::anyhow!("task disappeared after cancellation"))
+    }
+}
+
+fn read_turn(row: &rusqlite::Row<'_>) -> rusqlite::Result<DurableTurn> {
+    Ok(DurableTurn {
+        task_id: row.get(0)?,
+        session_id: row.get(1)?,
+        prompt: row.get(2)?,
+        state: row.get(3)?,
+        attempts: row.get(4)?,
+        max_attempts: row.get(5)?,
+        created_at: row.get(6)?,
+        updated_at: row.get(7)?,
+        error: row.get(8)?,
+    })
+}
+
+fn query_turn(connection: &Connection, task_id: &str) -> anyhow::Result<Option<DurableTurn>> {
+    Ok(connection.query_row(
+        "SELECT task_id, session_id, prompt, state, attempts, max_attempts, created_at, updated_at, error FROM durable_turns WHERE task_id = ?1",
+        params![task_id], read_turn,
+    ).optional()?)
+}
 
 #[derive(Debug, Clone)]
 pub struct HttpSecurityOptions {
@@ -75,7 +457,12 @@ pub trait HttpBackend: Send + Sync {
     async fn delete_session(&self, _id: &str) -> Result<(), String> {
         Err("session deletion is not supported by this backend".into())
     }
-    async fn post_message(&self, id: &str, text: &str) -> Result<Value, String>;
+    async fn post_message(
+        &self,
+        id: &str,
+        text: &str,
+        task_id: Option<&str>,
+    ) -> Result<Value, String>;
     async fn list_tools(&self) -> Value;
     async fn list_tasks(&self) -> Value;
     async fn list_skills(&self) -> Value;
@@ -87,6 +474,9 @@ pub trait HttpBackend: Send + Sync {
         decision: &str,
         feedback: Option<String>,
     ) -> Result<Value, String>;
+    async fn cancel_turn(&self, _task_id: &str) -> Result<Value, String> {
+        Err("turn cancellation is not supported by this backend".into())
+    }
     async fn fs_read(&self, path: &str) -> Result<String, String>;
     async fn fs_write(&self, path: &str, content: &str) -> Result<(), String>;
     async fn list_files(&self, _path: &str) -> Result<Value, String> {
@@ -139,7 +529,12 @@ impl HttpBackend for MemoryBackend {
     async fn get_session(&self, id: &str) -> Option<Value> {
         self.sessions.lock().await.get(id).cloned()
     }
-    async fn post_message(&self, id: &str, text: &str) -> Result<Value, String> {
+    async fn post_message(
+        &self,
+        id: &str,
+        text: &str,
+        _task_id: Option<&str>,
+    ) -> Result<Value, String> {
         let mut map = self.sessions.lock().await;
         let sess = map.get_mut(id).ok_or_else(|| "not found".to_string())?;
         let msg = json!({"role": "user", "text": text, "at": chrono::Utc::now().to_rfc3339()});
@@ -232,6 +627,8 @@ pub struct HttpState {
     rate_windows: Arc<StdMutex<HashMap<String, RateWindow>>>,
     audit_lock: Arc<StdMutex<()>>,
     metrics: Arc<HttpMetrics>,
+    persistence: Option<DurableHttpStore>,
+    persistence_error: Arc<StdMutex<Option<String>>>,
 }
 
 struct HttpTerminalSlot {
@@ -255,12 +652,25 @@ impl HttpState {
         token: Option<String>,
         security: HttpSecurityOptions,
     ) -> Self {
+        Self::with_backend_security_and_persistence(backend, token, security, None)
+    }
+
+    pub fn with_backend_security_and_persistence(
+        backend: Arc<dyn HttpBackend>,
+        token: Option<String>,
+        security: HttpSecurityOptions,
+        persistence: Option<DurableHttpStore>,
+    ) -> Self {
         let upstream = backend.event_sender();
         let (events, _) = broadcast::channel(1024);
         let mut token_scopes = security.scoped_tokens.clone();
         if let Some(token) = token.as_ref().filter(|token| !token.trim().is_empty()) {
             token_scopes.insert(token.clone(), vec!["admin".into()]);
         }
+        let latest_sequence = persistence
+            .as_ref()
+            .and_then(|store| store.latest_event_sequence().ok())
+            .unwrap_or(0);
         let state = Self {
             backend,
             meta: json!({
@@ -277,7 +687,7 @@ impl HttpState {
             events,
             token,
             terminals: Arc::new(Mutex::new(HashMap::new())),
-            event_sequence: Arc::new(AtomicU64::new(0)),
+            event_sequence: Arc::new(AtomicU64::new(latest_sequence)),
             event_history: Arc::new(StdMutex::new(VecDeque::with_capacity(
                 EVENT_HISTORY_CAPACITY,
             ))),
@@ -287,6 +697,8 @@ impl HttpState {
             rate_windows: Arc::new(StdMutex::new(HashMap::new())),
             audit_lock: Arc::new(StdMutex::new(())),
             metrics: Arc::new(HttpMetrics::default()),
+            persistence,
+            persistence_error: Arc::new(StdMutex::new(None)),
         };
         if let (Some(upstream), Ok(runtime)) = (upstream, tokio::runtime::Handle::try_current()) {
             let forward_state = state.clone();
@@ -310,16 +722,32 @@ impl HttpState {
     }
 
     pub fn publish(&self, event: Value) {
-        let sequence = self.event_sequence.fetch_add(1, Ordering::SeqCst) + 1;
-        let emitted_at = chrono::Utc::now().to_rfc3339();
-        let mut event = match event {
-            Value::Object(object) => Value::Object(object),
-            data => json!({"type": "event", "data": data}),
+        let event = if let Some(store) = &self.persistence {
+            match store.append_event(event) {
+                Ok(event) => event,
+                Err(error) => {
+                    tracing::error!("failed to persist HTTP event: {error}");
+                    if let Ok(mut state) = self.persistence_error.lock() {
+                        *state = Some(error.to_string());
+                    }
+                    return;
+                }
+            }
+        } else {
+            let sequence = self.event_sequence.fetch_add(1, Ordering::SeqCst) + 1;
+            let emitted_at = chrono::Utc::now().to_rfc3339();
+            let mut event = match event {
+                Value::Object(object) => Value::Object(object),
+                data => json!({"type": "event", "data": data}),
+            };
+            if let Some(object) = event.as_object_mut() {
+                object.insert("event_seq".into(), json!(sequence));
+                object.insert("emitted_at".into(), json!(emitted_at));
+            }
+            event
         };
-        if let Some(object) = event.as_object_mut() {
-            object.insert("event_seq".into(), json!(sequence));
-            object.insert("emitted_at".into(), json!(emitted_at));
-        }
+        let sequence = event.get("event_seq").and_then(Value::as_u64).unwrap_or(0);
+        self.event_sequence.store(sequence, Ordering::SeqCst);
         self.update_turn_state(&event);
         if let Ok(mut history) = self.event_history.lock() {
             if history.len() == EVENT_HISTORY_CAPACITY {
@@ -375,6 +803,18 @@ impl HttpState {
     }
 
     fn events_since(&self, since: u64, session_id: Option<&str>, limit: usize) -> Vec<Value> {
+        if let Some(store) = &self.persistence {
+            match store.events_since(since, session_id, limit.min(10_000)) {
+                Ok(events) => return events,
+                Err(error) => {
+                    tracing::error!("failed to read durable HTTP events: {error}");
+                    if let Ok(mut state) = self.persistence_error.lock() {
+                        *state = Some(error.to_string());
+                    }
+                    return Vec::new();
+                }
+            }
+        }
         self.event_history
             .lock()
             .map(|history| {
@@ -658,6 +1098,18 @@ async fn health(State(state): State<HttpState>) -> Json<Value> {
 }
 
 async fn readiness(State(state): State<HttpState>) -> impl IntoResponse {
+    if let Some(error) = state
+        .persistence_error
+        .lock()
+        .ok()
+        .and_then(|error| error.clone())
+    {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"status": "not_ready", "error": error})),
+        )
+            .into_response();
+    }
     match state.backend.readiness().await {
         Ok(value) => (StatusCode::OK, Json(value)).into_response(),
         Err(error) => (
@@ -750,6 +1202,13 @@ async fn turn_status(
     Query(query): Query<AuthQuery>,
 ) -> Result<Json<Value>, StatusCode> {
     check_auth(&state, &query)?;
+    if let Some(store) = &state.persistence {
+        return store
+            .get_turn(&session_id)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .map(|turn| Json(turn.as_json()))
+            .ok_or(StatusCode::NOT_FOUND);
+    }
     state
         .turn_states
         .lock()
@@ -757,6 +1216,21 @@ async fn turn_status(
         .and_then(|turns| turns.get(&session_id).cloned())
         .map(Json)
         .ok_or(StatusCode::NOT_FOUND)
+}
+
+async fn cancel_turn(
+    State(state): State<HttpState>,
+    Path(task_id): Path<String>,
+    Query(query): Query<AuthQuery>,
+) -> Result<Json<Value>, StatusCode> {
+    check_auth(&state, &query)?;
+    let result = state
+        .backend
+        .cancel_turn(&task_id)
+        .await
+        .map_err(|_| StatusCode::CONFLICT)?;
+    state.publish(json!({"type": "turn_cancelled", "task_id": task_id}));
+    Ok(Json(result))
 }
 
 async fn list_sessions(
@@ -813,15 +1287,57 @@ async fn post_message(
     State(state): State<HttpState>,
     Path(id): Path<String>,
     Query(q): Query<AuthQuery>,
+    headers: HeaderMap,
     Json(body): Json<PostMessageBody>,
 ) -> Result<Json<Value>, StatusCode> {
     check_auth(&state, &q)?;
-    match state.backend.post_message(&id, &body.text).await {
-        Ok(v) => {
-            state.publish(json!({"type": "message", "session_id": id, "text": body.text}));
-            Ok(Json(v))
+    let idempotency_key = headers
+        .get("idempotency-key")
+        .and_then(|value| value.to_str().ok());
+    let (task_id, replayed) = if let Some(store) = &state.persistence {
+        let (turn, replayed) = store
+            .enqueue_turn(&id, &body.text, idempotency_key)
+            .map_err(|error| {
+                if error.to_string().contains("different request") {
+                    StatusCode::CONFLICT
+                } else {
+                    StatusCode::BAD_REQUEST
+                }
+            })?;
+        if replayed {
+            return Ok(Json(json!({
+                "ok": true,
+                "queued": turn.state == "queued" || turn.state == "recovery_pending",
+                "replayed": true,
+                "task": turn.as_json(),
+            })));
         }
-        Err(_) => Err(StatusCode::NOT_FOUND),
+        (Some(turn.task_id), false)
+    } else {
+        (None, false)
+    };
+    match state
+        .backend
+        .post_message(&id, &body.text, task_id.as_deref())
+        .await
+    {
+        Ok(v) => {
+            state.publish(
+                json!({"type": "message", "session_id": id, "task_id": task_id, "text": body.text}),
+            );
+            let mut response = v;
+            if let Some(object) = response.as_object_mut() {
+                object.insert("task_id".into(), json!(task_id));
+                object.insert("replayed".into(), json!(replayed));
+            }
+            Ok(Json(response))
+        }
+        Err(error) => {
+            if let (Some(store), Some(task_id)) = (&state.persistence, task_id.as_deref()) {
+                let _ = store.finish_turn(task_id, "failed", Some(&error));
+            }
+            Err(StatusCode::NOT_FOUND)
+        }
     }
 }
 
@@ -1352,7 +1868,7 @@ pub fn router(state: HttpState) -> Router {
         .route("/api/v1/ready", get(readiness))
         .route("/api/v1/metrics", get(metrics))
         .route("/api/v1/events", get(events_history))
-        .route("/api/v1/turns/{id}", get(turn_status))
+        .route("/api/v1/turns/{id}", get(turn_status).delete(cancel_turn))
         .route("/api/v1/sessions", get(list_sessions).post(create_session))
         .route(
             "/api/v1/sessions/{id}",
@@ -1449,9 +1965,107 @@ pub async fn serve_listener_with_backend_and_security(
     Ok(())
 }
 
+pub async fn serve_listener_with_backend_security_and_persistence(
+    listener: tokio::net::TcpListener,
+    backend: Arc<dyn HttpBackend>,
+    token: Option<String>,
+    security: HttpSecurityOptions,
+    persistence: DurableHttpStore,
+    ready: Option<tokio::sync::oneshot::Sender<()>>,
+) -> anyhow::Result<()> {
+    let address = listener.local_addr()?;
+    let state = HttpState::with_backend_security_and_persistence(
+        backend,
+        token,
+        security,
+        Some(persistence),
+    );
+    let app = router(state);
+    if let Some(ready) = ready {
+        let _ = ready.send(());
+    }
+    tracing::info!("kkagent HTTP listening on http://{address} with durable events/tasks");
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod security_tests {
     use super::*;
+
+    fn temporary_database() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("kkagent-http-{}.db", uuid::Uuid::new_v4()))
+    }
+
+    #[test]
+    fn durable_events_survive_restart() {
+        let path = temporary_database();
+        {
+            let store = DurableHttpStore::open(&path).unwrap();
+            let state = HttpState::with_backend_security_and_persistence(
+                Arc::new(MemoryBackend::default()),
+                None,
+                HttpSecurityOptions::default(),
+                Some(store),
+            );
+            state.publish(json!({"type": "turn_start", "session_id": "durable"}));
+            state.publish(json!({"type": "turn_end", "session_id": "durable"}));
+            assert_eq!(state.event_sequence.load(Ordering::SeqCst), 2);
+        }
+        {
+            let store = DurableHttpStore::open(&path).unwrap();
+            let state = HttpState::with_backend_security_and_persistence(
+                Arc::new(MemoryBackend::default()),
+                None,
+                HttpSecurityOptions::default(),
+                Some(store),
+            );
+            let events = state.events_since(0, Some("durable"), 10);
+            assert_eq!(events.len(), 2);
+            assert_eq!(events[1]["event_seq"], 2);
+            assert_eq!(state.event_sequence.load(Ordering::SeqCst), 2);
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn durable_turns_are_idempotent_and_recoverable() {
+        let path = temporary_database();
+        let task_id;
+        {
+            let store = DurableHttpStore::open(&path).unwrap();
+            let (turn, replayed) = store
+                .enqueue_turn("session", "hello", Some("key-1"))
+                .unwrap();
+            assert!(!replayed);
+            task_id = turn.task_id.clone();
+            let (same, replayed) = store
+                .enqueue_turn("session", "hello", Some("key-1"))
+                .unwrap();
+            assert!(replayed);
+            assert_eq!(same.task_id, task_id);
+            assert!(store
+                .enqueue_turn("session", "different", Some("key-1"))
+                .is_err());
+            let claimed = store.claim_turn(&task_id).unwrap();
+            assert_eq!(claimed.state, "running");
+            assert_eq!(claimed.attempts, 1);
+        }
+        {
+            let store = DurableHttpStore::open(&path).unwrap();
+            let pending = store.recoverable_turns().unwrap();
+            assert_eq!(pending.len(), 1);
+            assert_eq!(pending[0].state, "recovery_pending");
+            let claimed = store.claim_turn(&task_id).unwrap();
+            assert_eq!(claimed.attempts, 2);
+            store.finish_turn(&task_id, "completed", None).unwrap();
+            assert_eq!(
+                store.get_turn(&task_id).unwrap().unwrap().state,
+                "completed"
+            );
+        }
+        let _ = std::fs::remove_file(path);
+    }
 
     #[test]
     fn event_history_is_sequenced_filtered_and_updates_turn_state() {
