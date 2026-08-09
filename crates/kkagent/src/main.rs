@@ -1,7 +1,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
@@ -630,6 +630,24 @@ async fn initialize_session_context(state: &ServerState, session: &mut Session) 
     }
 }
 
+async fn fire_session_hook(
+    state: &ServerState,
+    event: kkagent_mcp::HookEvent,
+    session_id: &str,
+    workspace: &Path,
+) {
+    let _ = state
+        .hooks
+        .fire(
+            event,
+            &serde_json::json!({
+                "session_id": session_id,
+                "workspace": workspace,
+            }),
+        )
+        .await;
+}
+
 #[async_trait::async_trait]
 impl kkagent_acp::AcpHost for AgentAcpHost {
     async fn create_session(&self, session_id: &str, cwd: &str) -> Result<(), String> {
@@ -663,6 +681,13 @@ impl kkagent_acp::AcpHost for AgentAcpHost {
                 .map_err(|e| e.to_string())?;
         }
         session.services.on_created().await;
+        fire_session_hook(
+            &self.state,
+            kkagent_mcp::HookEvent::SessionStart,
+            &session.id,
+            &session.working_dir,
+        )
+        .await;
         self.state
             .interrupt_flags
             .lock()
@@ -957,6 +982,13 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
             }
         }
         session.services.on_created().await;
+        fire_session_hook(
+            &self.state,
+            kkagent_mcp::HookEvent::SessionStart,
+            &session.id,
+            &session.working_dir,
+        )
+        .await;
         self.state
             .interrupt_flags
             .lock()
@@ -1033,6 +1065,15 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
             .await
             .archive_session(id)
             .map_err(|e| e.to_string())?;
+        if let Some(session) = session.as_ref() {
+            fire_session_hook(
+                &self.state,
+                kkagent_mcp::HookEvent::SessionEnd,
+                &session.id,
+                &session.working_dir,
+            )
+            .await;
+        }
         Ok(())
     }
 
@@ -2036,16 +2077,13 @@ async fn handle_rpc_call(
                 .lock()
                 .await
                 .insert(session_id.clone(), session);
-            let _ = state
-                .hooks
-                .fire(
-                    kkagent_mcp::hooks::HookEvent::SessionStart,
-                    &serde_json::json!({
-                        "session_id": session_id,
-                        "workspace": workspace.display().to_string(),
-                    }),
-                )
-                .await;
+            fire_session_hook(
+                &state,
+                kkagent_mcp::HookEvent::SessionStart,
+                &session_id,
+                &workspace,
+            )
+            .await;
             Ok(serde_json::json!({
                 "session_id": session_id,
                 "session_dir": session_dir,

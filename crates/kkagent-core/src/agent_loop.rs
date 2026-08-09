@@ -227,7 +227,10 @@ Do not mention this reminder to the user.\n</system-reminder>"
             let _ = hooks
                 .fire(
                     kkagent_mcp::hooks::HookEvent::TurnStart,
-                    &serde_json::json!({"session_id": session_id}),
+                    &serde_json::json!({
+                        "session_id": session_id,
+                        "workspace": session.working_dir,
+                    }),
                 )
                 .await;
         }
@@ -853,6 +856,7 @@ Do not mention this reminder to the user.\n</system-reminder>"
                                 "tool_call_id": id,
                                 "is_error": output.is_error,
                                 "output_len": output.content.len(),
+                                "workspace": session.working_dir,
                             }),
                         )
                         .await;
@@ -967,7 +971,11 @@ Do not mention this reminder to the user.\n</system-reminder>"
             let _ = hooks
                 .fire(
                     kkagent_mcp::hooks::HookEvent::TurnEnd,
-                    &serde_json::json!({"session_id": session_id, "interrupted": true}),
+                    &serde_json::json!({
+                        "session_id": session_id,
+                        "workspace": session.working_dir,
+                        "interrupted": true,
+                    }),
                 )
                 .await;
         }
@@ -1029,7 +1037,10 @@ Do not mention this reminder to the user.\n</system-reminder>"
             let _ = hooks
                 .fire(
                     kkagent_mcp::hooks::HookEvent::TurnEnd,
-                    &serde_json::json!({"session_id": session_id}),
+                    &serde_json::json!({
+                        "session_id": session_id,
+                        "workspace": session.working_dir,
+                    }),
                 )
                 .await;
         }
@@ -1379,7 +1390,12 @@ async fn execute_tool_parallel(request: ParallelToolRequest) -> ToolOutput {
         match hooks
             .fire_with_control(
                 kkagent_mcp::hooks::HookEvent::PreToolCall,
-                &serde_json::json!({"tool": name, "input": input}),
+                &serde_json::json!({
+                    "tool": name,
+                    "input": input,
+                    "session_id": session_id,
+                    "workspace": working_dir,
+                }),
             )
             .await
         {
