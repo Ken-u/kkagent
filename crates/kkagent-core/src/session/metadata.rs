@@ -6,18 +6,13 @@ use std::path::{Path, PathBuf};
 
 pub const SESSION_META_VERSION: u32 = 2;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum AgentKind {
+    #[default]
     Main,
     Sub,
     Independent,
-}
-
-impl Default for AgentKind {
-    fn default() -> Self {
-        Self::Main
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]

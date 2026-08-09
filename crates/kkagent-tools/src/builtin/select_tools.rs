@@ -22,6 +22,12 @@ impl SelectToolsTool {
     }
 }
 
+impl Default for SelectToolsTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[async_trait]
 impl Tool for SelectToolsTool {
     fn name(&self) -> &str {

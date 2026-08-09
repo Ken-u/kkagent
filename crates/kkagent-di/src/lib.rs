@@ -22,6 +22,8 @@ pub enum DiError {
 }
 
 pub type DiResult<T> = Result<T, DiError>;
+type ErasedService = Arc<dyn Any + Send + Sync>;
+type ServiceFactory = Arc<dyn Fn(&ServiceContainer) -> DiResult<ErasedService> + Send + Sync>;
 
 /// Marker for services that should be disposed when a scope ends.
 pub trait Disposable: Send + Sync {
@@ -49,8 +51,8 @@ impl ServiceId {
 }
 
 enum ServiceEntry {
-    Instance(Arc<dyn Any + Send + Sync>),
-    Factory(Arc<dyn Fn(&ServiceContainer) -> DiResult<Arc<dyn Any + Send + Sync>> + Send + Sync>),
+    Instance(ErasedService),
+    Factory(ServiceFactory),
 }
 
 /// Root or child service container.

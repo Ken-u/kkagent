@@ -129,7 +129,7 @@ impl SessionStore {
                 .unwrap_or(work);
             out.push(summary_from_meta(&id, &dir, &work, meta.read()));
         }
-        out.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        out.sort_by_key(|item| std::cmp::Reverse(item.updated_at));
         if out.len() > limit {
             out.truncate(limit);
         }

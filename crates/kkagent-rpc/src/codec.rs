@@ -1,4 +1,4 @@
-use bytes::{Buf, BytesMut};
+use bytes::BytesMut;
 use kkagent_protocol::Frame;
 use serde_json;
 

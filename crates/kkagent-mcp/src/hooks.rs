@@ -22,7 +22,7 @@ pub enum HookEvent {
 }
 
 impl HookEvent {
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse(s: &str) -> Option<Self> {
         match s {
             "pre_tool_call" => Some(Self::PreToolCall),
             "post_tool_call" => Some(Self::PostToolCall),
@@ -51,7 +51,7 @@ impl HookManager {
 
     pub async fn load_from_app_config(&mut self, hooks: &[kkagent_config::HookConfig]) {
         for h in hooks {
-            if let Some(event) = HookEvent::from_str(&h.event) {
+            if let Some(event) = HookEvent::parse(&h.event) {
                 self.hooks.push(HookConfig {
                     event,
                     command: h.command.clone(),
@@ -113,7 +113,7 @@ impl HookManager {
                 .and_then(|v| v.as_u64())
                 .unwrap_or(30000);
 
-            if let Some(event) = HookEvent::from_str(event_str) {
+            if let Some(event) = HookEvent::parse(event_str) {
                 hooks.push(HookConfig {
                     event,
                     command,

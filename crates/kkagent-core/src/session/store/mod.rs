@@ -1,6 +1,7 @@
 //! Disk-backed session store (kimi-code `session/store`).
 
 mod index;
+#[allow(clippy::module_inception)]
 mod store;
 mod workdir_key;
 

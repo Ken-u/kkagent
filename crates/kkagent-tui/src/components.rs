@@ -80,7 +80,7 @@ pub fn render_ui(f: &mut Frame, state: &mut AppState, config: &AppConfig) {
     // Keep status_bar in sync for chrome consumers / future status line.
     state.status_bar.permission = state.permission_mode;
     state.status_bar.plan_mode = state.plan_mode;
-    state.status_bar.status = state.status.clone();
+    state.status_bar.status = state.status;
     state.status_bar.tokens = state.approx_tokens;
     state.status_bar.model = state.model_alias.clone();
     state.status_bar.session_id = state.session_id.clone();
@@ -162,7 +162,7 @@ fn picker_height(picker: &ListPickerState) -> u16 {
 
 fn input_inner_height(state: &AppState) -> u16 {
     let lines = state.input.text.lines().count().max(1) as u16;
-    lines.min(6).max(1)
+    lines.clamp(1, 6)
 }
 
 fn render_messages(f: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) {
@@ -1090,7 +1090,7 @@ fn render_scroll_hint(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme
 }
 
 fn render_search_overlay(f: &mut Frame, size: Rect, state: &AppState, theme: &Theme) {
-    let width = size.width.saturating_sub(4).min(72).max(24);
+    let width = size.width.saturating_sub(4).clamp(24, 72);
     let hit_rows = state.search.hits.len().min(10) as u16;
     let height = hit_rows + 4; // title + query + hits + hint
     let area = Rect {
@@ -1223,11 +1223,11 @@ fn format_context(state: &AppState, config: &AppConfig) -> String {
         .map(|m| m.content.len() as u64 / 4)
         .sum::<u64>()
         .saturating_add(state.approx_tokens);
-    let pct = if max > 0 {
-        ((used * 100) / max).min(100)
-    } else {
-        0
-    };
+    let pct = used
+        .saturating_mul(100)
+        .checked_div(max)
+        .unwrap_or(0)
+        .min(100);
     format!(
         "context: {}% ({}/{})",
         pct,
@@ -1399,8 +1399,8 @@ fn render_tasks_panel(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme
         return;
     };
 
-    let panel_w = area.width.saturating_sub(4).max(40).min(90);
-    let panel_h = area.height.saturating_sub(4).max(12).min(28);
+    let panel_w = area.width.saturating_sub(4).clamp(40, 90);
+    let panel_h = area.height.saturating_sub(4).clamp(12, 28);
     let x = (area.width.saturating_sub(panel_w)) / 2;
     let y = (area.height.saturating_sub(panel_h)) / 2;
     let panel_area = Rect::new(x, y, panel_w, panel_h);

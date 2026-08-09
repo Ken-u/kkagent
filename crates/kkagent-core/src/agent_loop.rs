@@ -272,7 +272,7 @@ Do not mention this reminder to the user.\n</system-reminder>"
                 tools: tool_defs.clone(),
                 max_tokens: model_config.max_output_size.unwrap_or(8192) as u32,
                 system: Some(system_prompt.clone()),
-                thinking: thinking.clone(),
+                thinking,
             };
 
             let (stream_tx, mut stream_rx) = mpsc::channel::<StreamEvent>(256);
@@ -406,19 +406,17 @@ Do not mention this reminder to the user.\n</system-reminder>"
 
             let empty =
                 assistant_text.is_empty() && thinking_text.is_empty() && tool_calls.is_empty();
-            if stream_failed || (empty && !got_message_end) {
-                if attempt < max_attempts {
-                    tracing::warn!(
-                        "LLM step retry {}/{} ({})",
-                        attempt,
-                        max_attempts,
-                        last_stream_error
-                            .as_deref()
-                            .unwrap_or("empty/incomplete stream")
-                    );
-                    tokio::time::sleep(Duration::from_millis(200 * attempt as u64)).await;
-                    continue;
-                }
+            if (stream_failed || (empty && !got_message_end)) && attempt < max_attempts {
+                tracing::warn!(
+                    "LLM step retry {}/{} ({})",
+                    attempt,
+                    max_attempts,
+                    last_stream_error
+                        .as_deref()
+                        .unwrap_or("empty/incomplete stream")
+                );
+                tokio::time::sleep(Duration::from_millis(200 * attempt as u64)).await;
+                continue;
             }
             break;
         }
@@ -715,16 +713,16 @@ Do not mention this reminder to the user.\n</system-reminder>"
                             let input = input;
                             let tool_call_id = tool_call_id;
                             async move {
-                                execute_tool_parallel(
+                                execute_tool_parallel(ParallelToolRequest {
                                     tools,
                                     hooks,
                                     working_dir,
-                                    sid,
-                                    enabled.as_ref(),
-                                    &name,
-                                    &input,
-                                    Some(tool_call_id),
-                                )
+                                    session_id: sid,
+                                    enabled_tools: enabled,
+                                    name,
+                                    input,
+                                    tool_call_id: Some(tool_call_id),
+                                })
                                 .await
                             }
                         }),
@@ -1097,16 +1095,16 @@ Do not mention this reminder to the user.\n</system-reminder>"
                 session.record_pre_change(path).await;
             }
         }
-        execute_tool_parallel(
-            Arc::clone(&self.tools),
-            self.hooks.clone(),
-            session.working_dir.clone(),
-            session.id.clone(),
-            session.enabled_tools.as_ref(),
-            name,
-            input,
-            None,
-        )
+        execute_tool_parallel(ParallelToolRequest {
+            tools: Arc::clone(&self.tools),
+            hooks: self.hooks.clone(),
+            working_dir: session.working_dir.clone(),
+            session_id: session.id.clone(),
+            enabled_tools: session.enabled_tools.clone(),
+            name: name.to_string(),
+            input: input.clone(),
+            tool_call_id: None,
+        })
         .await
     }
 
@@ -1291,23 +1289,35 @@ fn tool_allowed_set(enabled: Option<&std::collections::HashSet<String>>, name: &
     }
 }
 
-async fn execute_tool_parallel(
+struct ParallelToolRequest {
     tools: Arc<ToolRegistry>,
     hooks: Option<Arc<kkagent_mcp::HookManager>>,
     working_dir: std::path::PathBuf,
     session_id: String,
-    enabled_tools: Option<&std::collections::HashSet<String>>,
-    name: &str,
-    input: &serde_json::Value,
+    enabled_tools: Option<std::collections::HashSet<String>>,
+    name: String,
+    input: serde_json::Value,
     tool_call_id: Option<String>,
-) -> ToolOutput {
-    if !tool_allowed_set(enabled_tools, name) {
+}
+
+async fn execute_tool_parallel(request: ParallelToolRequest) -> ToolOutput {
+    let ParallelToolRequest {
+        tools,
+        hooks,
+        working_dir,
+        session_id,
+        enabled_tools,
+        name,
+        input,
+        tool_call_id,
+    } = request;
+    if !tool_allowed_set(enabled_tools.as_ref(), &name) {
         return ToolOutput::error(format!(
             "Tool `{name}` is not in the current SelectTools allowlist"
         ));
     }
 
-    let mut input = input.clone();
+    let mut input = input;
     if let Some(hooks) = &hooks {
         match hooks
             .fire_with_control(
@@ -1334,7 +1344,7 @@ async fn execute_tool_parallel(
         }
     }
 
-    let tool = match tools.get(name) {
+    let tool = match tools.get(&name) {
         Some(t) => t,
         None => return ToolOutput::error(format!("Unknown tool: {}", name)),
     };

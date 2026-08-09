@@ -38,3 +38,9 @@ impl ToolRegistry {
             .collect()
     }
 }
+
+impl Default for ToolRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}

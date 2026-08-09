@@ -122,7 +122,7 @@ Returns paths sorted by modification time (newest first)."
                 .map(|Reverse((mtime, path))| (path, mtime))
                 .collect()
         };
-        results.sort_by(|a, b| b.1.cmp(&a.1));
+        results.sort_by_key(|item| Reverse(item.1));
         let truncated = head_limit > 0 && total_matches > head_limit;
 
         if results.is_empty() {

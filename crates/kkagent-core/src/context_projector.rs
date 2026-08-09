@@ -48,7 +48,7 @@ pub fn project(messages: &[ChatMessage], opts: &ProjectOptions) -> Vec<ChatMessa
 /// Aggressive projection used when still over budget after a soft project.
 pub fn project_strict(messages: &[ChatMessage], opts: &ProjectOptions) -> Vec<ChatMessage> {
     let mut strict = opts.clone();
-    strict.keep_recent = opts.keep_recent.min(6).max(2);
+    strict.keep_recent = opts.keep_recent.clamp(2, 6);
     strict.tool_result_max_chars = 400;
     strict.text_max_chars = 1_500;
     project(messages, &strict)

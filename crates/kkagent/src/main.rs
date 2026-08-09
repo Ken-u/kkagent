@@ -959,58 +959,6 @@ fn resolve_http_fs_path(config: &AppConfig, raw: &str, for_write: bool) -> Resul
     }
 }
 
-#[cfg(test)]
-mod http_path_tests {
-    use super::*;
-
-    fn config_with_root(root: &std::path::Path) -> AppConfig {
-        AppConfig {
-            trusted_workspaces: vec![root.display().to_string()],
-            ..AppConfig::default()
-        }
-    }
-
-    #[test]
-    fn rejects_paths_outside_trusted_workspace() {
-        let root = std::env::temp_dir().join(format!("kkagent-http-root-{}", uuid::Uuid::new_v4()));
-        let outside =
-            std::env::temp_dir().join(format!("kkagent-http-out-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&root).unwrap();
-        std::fs::create_dir_all(&outside).unwrap();
-        std::fs::write(outside.join("secret.txt"), "secret").unwrap();
-        let err = resolve_http_fs_path(
-            &config_with_root(&root),
-            &outside.join("secret.txt").display().to_string(),
-            false,
-        )
-        .unwrap_err();
-        assert!(err.contains("outside trusted workspaces"));
-        std::fs::remove_dir_all(root).unwrap();
-        std::fs::remove_dir_all(outside).unwrap();
-    }
-
-    #[test]
-    fn allows_new_files_below_trusted_workspace() {
-        let root = std::env::temp_dir().join(format!("kkagent-http-root-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&root).unwrap();
-        let expected = root.join("new").join("file.txt");
-        let actual = resolve_http_fs_path(
-            &config_with_root(&root),
-            &expected.display().to_string(),
-            true,
-        )
-        .unwrap();
-        assert_eq!(
-            actual,
-            std::fs::canonicalize(&root)
-                .unwrap()
-                .join("new")
-                .join("file.txt")
-        );
-        std::fs::remove_dir_all(root).unwrap();
-    }
-}
-
 async fn run_http_turn(state: Arc<ServerState>, session_id: &str) -> anyhow::Result<()> {
     let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(64);
     let live_events = state.events.clone();
@@ -1226,10 +1174,12 @@ async fn build_server_state(config: Arc<AppConfig>) -> Arc<ServerState> {
             home.join(".kkagent").join("telemetry").join("events.jsonl"),
         )))
         .await;
-    let mut cloud_opts = CloudAppenderOptions::default();
-    cloud_opts.device_id =
-        std::env::var("KKAGENT_DEVICE_ID").unwrap_or_else(|_| uuid::Uuid::new_v4().to_string());
-    cloud_opts.model = config.default_model.clone();
+    let cloud_opts = CloudAppenderOptions {
+        device_id: std::env::var("KKAGENT_DEVICE_ID")
+            .unwrap_or_else(|_| uuid::Uuid::new_v4().to_string()),
+        model: config.default_model.clone(),
+        ..CloudAppenderOptions::default()
+    };
     if std::env::var("KKAGENT_TELEMETRY_CLOUD")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
@@ -1924,10 +1874,6 @@ async fn handle_rpc_call(
                     .get(&session_id)
                     .map(|a| a.lock().unwrap_or_else(|e| e.into_inner()).clone())
                     .filter(|a| !a.is_empty())
-                    .or_else(|| {
-                        // Fallback if map missing
-                        None
-                    })
                     .or_else(|| state.config.default_model_alias().map(|s| s.to_string()))
                     .ok_or_else(|| (-32000, "No default_model in config".into()))?
             };
@@ -2372,11 +2318,7 @@ async fn handle_rpc_call(
                 .as_ref()
                 .and_then(|p| p.get("session_id"))
                 .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-                .or_else(|| {
-                    // fall back: first live session
-                    None
-                });
+                .map(|s| s.to_string());
             let trigger = match params
                 .as_ref()
                 .and_then(|p| p.get("trigger"))
@@ -2538,5 +2480,57 @@ async fn handle_rpc_call(
             Err((-32602, "Invalid question response".into()))
         }
         _ => Err((-32601, format!("Method not found: {}", method))),
+    }
+}
+
+#[cfg(test)]
+mod http_path_tests {
+    use super::*;
+
+    fn config_with_root(root: &std::path::Path) -> AppConfig {
+        AppConfig {
+            trusted_workspaces: vec![root.display().to_string()],
+            ..AppConfig::default()
+        }
+    }
+
+    #[test]
+    fn rejects_paths_outside_trusted_workspace() {
+        let root = std::env::temp_dir().join(format!("kkagent-http-root-{}", uuid::Uuid::new_v4()));
+        let outside =
+            std::env::temp_dir().join(format!("kkagent-http-out-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), "secret").unwrap();
+        let err = resolve_http_fs_path(
+            &config_with_root(&root),
+            &outside.join("secret.txt").display().to_string(),
+            false,
+        )
+        .unwrap_err();
+        assert!(err.contains("outside trusted workspaces"));
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[test]
+    fn allows_new_files_below_trusted_workspace() {
+        let root = std::env::temp_dir().join(format!("kkagent-http-root-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let expected = root.join("new").join("file.txt");
+        let actual = resolve_http_fs_path(
+            &config_with_root(&root),
+            &expected.display().to_string(),
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            actual,
+            std::fs::canonicalize(&root)
+                .unwrap()
+                .join("new")
+                .join("file.txt")
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

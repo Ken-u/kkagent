@@ -100,3 +100,9 @@ impl SkillsManager {
         Ok(content)
     }
 }
+
+impl Default for SkillsManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}

@@ -152,8 +152,10 @@ mod tests {
             parts: vec![],
             tool_calls: vec![],
         }];
-        let mut s = SearchState::default();
-        s.query = "login".into();
+        let mut s = SearchState {
+            query: "login".into(),
+            ..SearchState::default()
+        };
         s.recompute(&msgs);
         assert_eq!(s.hits.len(), 1);
     }

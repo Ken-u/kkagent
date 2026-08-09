@@ -77,7 +77,7 @@ pub fn render_chip(tool: &str, input: &Value) -> String {
         }
         return s.trim().to_string();
     }
-    format!("{tool}")
+    tool.to_string()
 }
 
 #[cfg(test)]

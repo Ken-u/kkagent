@@ -570,7 +570,10 @@ mod tests {
             .as_str()
             .unwrap()
             .to_string();
-        assert_eq!(host.created.lock().await.as_slice(), &[session_id.clone()]);
+        assert_eq!(
+            host.created.lock().await.as_slice(),
+            std::slice::from_ref(&session_id)
+        );
 
         let prompted = server
             .handle(AcpRequest {

@@ -25,7 +25,6 @@ pub enum RpcError {
 pub struct RpcClient {
     write_tx: mpsc::Sender<Frame>,
     pending: Arc<Mutex<HashMap<String, PendingCall>>>,
-    event_tx: mpsc::Sender<Frame>,
     seq: Arc<std::sync::atomic::AtomicU64>,
 }
 
@@ -94,7 +93,6 @@ impl RpcClient {
         Self {
             write_tx,
             pending,
-            event_tx,
             seq: Arc::new(std::sync::atomic::AtomicU64::new(1)),
         }
     }

@@ -2,9 +2,10 @@
 
 use kkagent_llm::{ChatContent, ChatMessage, ToolDef};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum TokenCountingStrategy {
     /// Live estimate floored by last measured total (default).
+    #[default]
     MeasuredPlusEstimated,
     /// Latest measured anchor only.
     Measured,
@@ -35,12 +36,6 @@ pub struct TokenCounter {
     latest_measured: u64,
     session_input: u64,
     session_output: u64,
-}
-
-impl Default for TokenCountingStrategy {
-    fn default() -> Self {
-        Self::MeasuredPlusEstimated
-    }
 }
 
 impl TokenCounter {

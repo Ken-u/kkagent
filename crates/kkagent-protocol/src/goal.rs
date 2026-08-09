@@ -1,6 +1,5 @@
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -14,21 +13,11 @@ pub enum GoalStatus {
     Failed,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GoalBudget {
     pub turn_budget: Option<u32>,
     pub token_budget: Option<u64>,
     pub wall_clock_budget_ms: Option<u64>,
-}
-
-impl Default for GoalBudget {
-    fn default() -> Self {
-        Self {
-            turn_budget: None,
-            token_budget: None,
-            wall_clock_budget_ms: None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -184,5 +173,11 @@ impl GoalManager {
             goal.budget = budget;
             goal.updated_at = Utc::now().to_rfc3339();
         }
+    }
+}
+
+impl Default for GoalManager {
+    fn default() -> Self {
+        Self::new()
     }
 }

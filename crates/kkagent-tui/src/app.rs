@@ -608,15 +608,11 @@ impl TuiApp {
                     self.respond_approval(kkagent_protocol::ApprovalDecision::Rejected, None)
                         .await?;
                 }
-                KeyCode::Up => {
-                    if approval.selected > 0 {
-                        approval.selected -= 1;
-                    }
+                KeyCode::Up if approval.selected > 0 => {
+                    approval.selected -= 1;
                 }
-                KeyCode::Down => {
-                    if approval.selected < 2 {
-                        approval.selected += 1;
-                    }
+                KeyCode::Down if approval.selected < 2 => {
+                    approval.selected += 1;
                 }
                 KeyCode::Enter => {
                     let decision = match approval.selected {
@@ -802,13 +798,13 @@ impl TuiApp {
                 }
             }
             // Ctrl-D: quit if empty
-            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if self.state.input.is_empty() {
-                    if self.state.quit_confirm {
-                        self.state.should_quit = true;
-                    } else {
-                        self.state.quit_confirm = true;
-                    }
+            KeyCode::Char('d')
+                if key.modifiers.contains(KeyModifiers::CONTROL) && self.state.input.is_empty() =>
+            {
+                if self.state.quit_confirm {
+                    self.state.should_quit = true;
+                } else {
+                    self.state.quit_confirm = true;
                 }
             }
             // Escape: interrupt / dismiss / double-Esc undo
@@ -908,10 +904,10 @@ impl TuiApp {
                 self.toggle_tool_folding();
             }
             // Ctrl-T: expand/collapse sticky todo panel
-            KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if self.state.todos.len() > 5 {
-                    self.state.todos_expanded = !self.state.todos_expanded;
-                }
+            KeyCode::Char('t')
+                if key.modifiers.contains(KeyModifiers::CONTROL) && self.state.todos.len() > 5 =>
+            {
+                self.state.todos_expanded = !self.state.todos_expanded;
             }
             // Emacs/pi-tui editor bindings (kill/yank/undo/word nav)
             KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -1596,11 +1592,11 @@ impl TuiApp {
                     .and_then(|(m, _)| m.max_context_size)
                     .unwrap_or(256_000);
                 let used = self.state.approx_tokens;
-                let pct = if max > 0 {
-                    (used * 100 / max).min(100)
-                } else {
-                    0
-                };
+                let pct = used
+                    .saturating_mul(100)
+                    .checked_div(max)
+                    .unwrap_or(0)
+                    .min(100);
                 self.system_message(format!(
                     "context: {}% ({}/{})\napprox tokens used: {}",
                     pct, used, max, used
@@ -2007,15 +2003,11 @@ impl TuiApp {
             KeyCode::Esc => {
                 self.respond_question(true).await?;
             }
-            KeyCode::Up => {
-                if q.selected > 0 {
-                    q.selected -= 1;
-                }
+            KeyCode::Up if q.selected > 0 => {
+                q.selected -= 1;
             }
-            KeyCode::Down => {
-                if q.selected < max_row {
-                    q.selected += 1;
-                }
+            KeyCode::Down if q.selected < max_row => {
+                q.selected += 1;
             }
             KeyCode::Char(' ') if q.selected < n => {
                 if let Some(t) = q.toggled.get_mut(q.selected) {
@@ -2335,45 +2327,37 @@ impl TuiApp {
                     }
                     AgentEvent::SubagentChildEvent {
                         subagent_id, event, ..
-                    } => {
-                        match *event {
-                            AgentEvent::ToolCall {
-                                tool_name, input, ..
-                            } => {
-                                let brief = serde_json::to_string(&input)
-                                    .unwrap_or_default()
-                                    .chars()
-                                    .take(80)
-                                    .collect::<String>();
-                                self.system_message(format!(
-                                    "  ↳ [{subagent_id}] tool {tool_name} {brief}"
-                                ));
-                            }
-                            AgentEvent::ToolResult {
-                                tool_name,
-                                output,
-                                is_error,
-                                ..
-                            } => {
-                                let mark = if is_error { "!" } else { "ok" };
-                                self.system_message(format!(
-                                    "  ↳ [{subagent_id}] {tool_name} [{mark}] {}",
-                                    output.chars().take(120).collect::<String>()
-                                ));
-                            }
-                            AgentEvent::MessageDelta { text, .. } => {
-                                if !text.trim().is_empty() {
-                                    // keep quiet for streaming noise; show short chunks only
-                                }
-                            }
-                            AgentEvent::Error { message, .. } => {
-                                self.system_message(format!(
-                                    "  ↳ [{subagent_id}] error: {message}"
-                                ));
-                            }
-                            _ => {}
+                    } => match *event {
+                        AgentEvent::ToolCall {
+                            tool_name, input, ..
+                        } => {
+                            let brief = serde_json::to_string(&input)
+                                .unwrap_or_default()
+                                .chars()
+                                .take(80)
+                                .collect::<String>();
+                            self.system_message(format!(
+                                "  ↳ [{subagent_id}] tool {tool_name} {brief}"
+                            ));
                         }
-                    }
+                        AgentEvent::ToolResult {
+                            tool_name,
+                            output,
+                            is_error,
+                            ..
+                        } => {
+                            let mark = if is_error { "!" } else { "ok" };
+                            self.system_message(format!(
+                                "  ↳ [{subagent_id}] {tool_name} [{mark}] {}",
+                                output.chars().take(120).collect::<String>()
+                            ));
+                        }
+                        AgentEvent::MessageDelta { .. } => {}
+                        AgentEvent::Error { message, .. } => {
+                            self.system_message(format!("  ↳ [{subagent_id}] error: {message}"));
+                        }
+                        _ => {}
+                    },
                     AgentEvent::McpAuthRequired {
                         server_name,
                         authorization_url,

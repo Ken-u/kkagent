@@ -73,6 +73,12 @@ impl SkillCatalog {
     }
 }
 
+impl Default for SkillCatalog {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 async fn ensure_builtin_skills() -> anyhow::Result<()> {
     let root = kkagent_config::default_config_dir().join("skills");
     let builtins = [

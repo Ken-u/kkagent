@@ -32,7 +32,7 @@ impl TodoListTool {
     fn display_status(status: &str) -> &'static str {
         match status {
             "done" => "completed",
-            other if other == "in_progress" => "in_progress",
+            "in_progress" => "in_progress",
             "cancelled" => "cancelled",
             _ => "pending",
         }
@@ -71,6 +71,12 @@ impl TodoListTool {
             })
             .collect();
         format!("Current todo list:\n{}", lines.join("\n"))
+    }
+}
+
+impl Default for TodoListTool {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

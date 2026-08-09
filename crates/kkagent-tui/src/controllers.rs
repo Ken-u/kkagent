@@ -29,9 +29,9 @@ impl SessionEventRouter {
                 session_id,
                 status: s,
             } => {
-                self.status = s.clone();
-                status.status = s.clone();
-                tabs.set_status(session_id, s.clone());
+                self.status = *s;
+                status.status = *s;
+                tabs.set_status(session_id, *s);
                 if matches!(s, SessionStatus::Idle | SessionStatus::Compacting) {
                     self.turn_active = false;
                 }
