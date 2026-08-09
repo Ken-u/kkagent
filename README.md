@@ -264,6 +264,28 @@ HTTP/WS API 始终启用认证：优先使用 `Authorization: Bearer <token>`，
 `--connect ~/.kkagent/server.sock`。Unix 使用 domain socket；Windows 的同一路径是仅指向
 loopback 随机端口的本地端点文件。默认 TUI 仍使用进程内 memory RPC。
 
+### Node.js SDK
+
+`sdk/node` 用于让 Node.js 后台、自动化脚本或编辑器扩展控制已经启动的
+`kkagent server`。它通过 HTTP 创建 Session、发送任务，并通过 WebSocket 接收 Agent
+回复与工具执行事件；它本身不在 Node.js 中运行模型或工具。
+
+```js
+import { KkagentClient } from "./sdk/node/src/index.js";
+
+const client = new KkagentClient({
+  baseUrl: "http://127.0.0.1:8787",
+  token: process.env.KKAGENT_HTTP_TOKEN,
+});
+
+const session = await client.createSession("/absolute/path/to/project", "代码检查");
+await client.postMessage(session.session_id, "运行测试并总结问题");
+client.connectEvents((event) => console.log(event));
+```
+
+完整的启动步骤、API、事件订阅、安全说明和当前能力边界见
+[Node.js SDK 文档](sdk/node/README.md)。
+
 ---
 
 ## 4. 怎么测试
