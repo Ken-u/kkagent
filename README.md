@@ -1,6 +1,6 @@
 # kkagent
 
-用 Rust 实现的终端 Coding Agent（接近完整复刻 kimi-code CLI）。  
+用 Rust 实现、面向生产使用的终端 Coding Agent，核心交互与运行时对齐 kimi-code CLI。
 TUI 与 Agent Server 可分离，中间走 RPC（当前默认进程内 memory transport；也支持独立 `server` 模式）。
 
 - 低内存、高性能
@@ -42,7 +42,7 @@ make build
 
 ```bash
 cargo build --release
-# 产物：target/release/kkagent  （当前约 8MB）
+# 产物：target/release/kkagent
 ```
 
 或：
@@ -72,8 +72,7 @@ cargo build --release --target aarch64-apple-darwin
 cargo build --release --target x86_64-unknown-linux-musl
 cargo build --release --target x86_64-pc-windows-gnu
 
-# 或一次性打到 target/release-dist/
-make dist
+# CI 会在 Linux/macOS/Windows 的 x86_64/arm64 组合上执行原生或交叉检查
 ```
 
 > Windows / Linux musl 交叉编译可能还需要对应 linker；本机原生 `cargo build --release` 最稳。
@@ -203,7 +202,7 @@ pattern = "Read"
 | `/resume <id>` | 恢复会话 |
 | `/compact` | 压缩历史 |
 | `/undo` | 撤销上一轮 |
-| `/model` | 查看/切换模型（切换能力仍在完善） |
+| `/model` | 查看/切换模型 |
 | `/help` | 帮助 |
 | `/exit` | 退出 |
 
@@ -272,24 +271,26 @@ loopback 随机端口的本地端点文件。默认 TUI 仍使用进程内 memor
 ### 单元 / 集成测试（不依赖外网）
 
 ```bash
-cargo test
+cargo test --workspace --all-targets
 # 或
 make test
 ```
 
 当前主要覆盖：
 
-- 权限链（manual / yolo / auto、敏感文件等）— `kkagent-core`
-- SQLite transcript（create / append / compact / archive）— `kkagent-core`
-- RPC codec — `kkagent-rpc`
+- LLM 方言与流终止校验（Anthropic/OpenAI Responses/Kimi/Google）
+- 工具安全边界、取消、进程树、输出上限与敏感文件保护
+- 权限链、并行调度、panic 隔离、自动压缩与 SQLite transcript 原子持久化
+- RPC/HTTP/WS/ACP、认证、会话并发、文件边界和本地 IPC
+- Kimi OAuth 刷新、私有凭据存储、视频上传和模型配置
 
 期望：全部 `ok`，无 FAILED。
 
-### Lint / 格式（可选）
+### Lint / 格式
 
 ```bash
 make fmt
-make lint   # clippy -D warnings，可能因既有 warning 未全清而失败
+make lint   # clippy -D warnings
 ```
 
 ---
@@ -297,8 +298,6 @@ make lint   # clippy -D warnings，可能因既有 warning 未全清而失败
 ## 5. 怎么验证（实网烟雾测试）
 
 前提：`config.toml` 里 `base_url` / `api_key` / `default_model` 可用。  
-推荐模型：`claude-opus-4-8`（短任务稳定；`claude-opus-4-6` 当前上游可能有问题）。
-
 ### A. 纯对话
 
 ```bash
@@ -314,7 +313,7 @@ make lint   # clippy -D warnings，可能因既有 warning 未全清而失败
   -p "Read ./Cargo.toml and tell me how many workspace members there are"
 ```
 
-**通过标准**：回复里出现约 **10** 个 workspace members（`kkagent`、`kkagent-protocol` …）。
+**通过标准**：回复给出的数量与根目录 `Cargo.toml` 的 `workspace.members` 一致。
 
 ### C. Shell 工具
 
@@ -398,4 +397,4 @@ cargo test
   -p "Read ./Cargo.toml and count workspace members"
 ```
 
-三项都过，即可认为当前版本可用。
+三项都过，才能进入目标平台的发布候选验证；正式发布还应以 CI 的全平台矩阵通过为准。

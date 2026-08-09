@@ -1,12 +1,12 @@
-# kkagent 与 ref/kimi-code 功能差距清单
+# kkagent 核心功能与生产就绪清单
 
-> 核对更新（2026-08-09）：Kimi 专用方言、视频 Files API 与托管账号 OAuth 已落地。
+> 核对更新（2026-08-09）：以下是当前 Rust coding-agent 核心范围的实现状态；不把示例、占位后端或未经测试的平台写成“已验证”。
 
 ## 一、工具集（Tools）
 
 | 工具 | 状态 |
 |------|------|
-| Read / Write / Edit / Grep / Glob / Bash | **已实现**（Bash **AST** + 启发式安全） |
+| Read / Write / Edit / Grep / Glob / Bash | **已实现**（轻量 Bash AST + 启发式安全、进程树取消、后台上限） |
 | TodoList / Plan / Goal* / SetGoalBudget | **已实现** |
 | Task* / Agent* / AskUserQuestion | **已实现** |
 | Skill / WebSearch / FetchURL / ReadMediaFile / Cron* / SelectTools / MCP | **已实现** |
@@ -17,7 +17,7 @@
 |------|------|
 | contextMemory / toolPolicy / swarm / usage / undo / media / scope | **已实现** |
 | tokenCounting / compact / hooks / dedupe / blob / plugin / … | **已实现** |
-| **Session 子系统对齐**（store/index/workdir-key、metadata `state.json`、lifecycle、activity、interaction、agentLifecycle、todo/btw/cron、toolPolicyGate、swarm batch、subagent、terminal/process、init/instructions、skill+profile catalog、mcp view、export、external hooks；RPC：fork/archive/rename/export） | **已实现** |
+| **Session 子系统**（store/index/workdir-key、metadata、lifecycle、interaction、todo/cron、tool policy、usage、terminal/process、instructions、export；RPC：fork/archive/rename/export） | **已实现并覆盖持久化一致性** |
 
 ## 三、TUI
 
@@ -42,22 +42,29 @@
 | 包 | 状态 |
 |------|------|
 | **OpenAI Responses API**（`/v1/responses` + catalog 自动选择） | **已实现** |
-| **kkagent-oauth**（PKCE / device code / token storage，无 Kimi 身份） | **已实现** |
+| **kkagent-oauth**（PKCE / device code / Kimi managed identity / token storage） | **已实现** |
 | **kkagent-kaos**（local + SSH via system ssh/scp） | **已实现** |
 | **sdk/node**（`@kkagent/sdk` HTTP + JSON-RPC） | **已实现** |
 | **apps/vscode**（ACP/HTTP 最小扩展） | **已实现** |
-| Bash AST（`bash_ast`，tree-sitter-bash 语义对齐） | **已实现** |
+| Bash AST（`bash_ast`，用于安全分析的轻量子集） | **已实现；不宣称完整 shell parser** |
 
-## 六、仍需完成
+## 六、生产加固
 
-- [x] **Kimi 专用 provider**（`max_completion_tokens`、thinking/reasoning、Moonshot usage 方言）
-- [x] **Kimi 视频 Files API / 托管账号 OAuth identity**（device code、自动刷新、私有原子存储、模型目录配置）
+- [x] Provider 严格流终止、并行 tool call 边界与可观测重试
+- [x] HTTP 强制认证、受信工作区文件边界、SSRF 防护与终端输出上限
+- [x] Shell/Grep 超时、取消、进程树清理、后台任务上限
+- [x] Transcript 批量事务、压缩重写、fork/archive/rename 一致性
+- [x] Kimi 视频 Files API / 托管账号 OAuth identity（自动刷新、私有原子存储、模型目录配置）
+- [x] Linux/macOS/Windows x86_64/arm64 CI 检查矩阵与 Rust 1.88 MSRV
 
 ## 七、验证
 
 ```
-cargo test -p kkagent-core -p kkagent-tools -p kkagent-llm -p kkagent-tui -p kkagent-oauth -p kkagent-kaos -p kkagent-acp -p kkagent-rpc --lib
-cargo build -p kkagent
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace --all-targets
+cargo +1.88.0 check --workspace --all-targets --locked
+cargo build --release -p kkagent
 kkagent server --http 127.0.0.1:8787
 kkagent acp
 ```
