@@ -1,0 +1,44 @@
+param(
+    [string]$InstallDir = $(if ($env:KKAGENT_INSTALL_DIR) { $env:KKAGENT_INSTALL_DIR } else { Join-Path $env:LOCALAPPDATA "Programs\kkagent" })
+)
+
+$ErrorActionPreference = "Stop"
+$repository = if ($env:KKAGENT_REPOSITORY) { $env:KKAGENT_REPOSITORY } else { "bianjinchen/kkagent" }
+$baseUrl = if ($env:KKAGENT_RELEASE_BASE_URL) { $env:KKAGENT_RELEASE_BASE_URL } else { "https://github.com/$repository/releases/latest/download" }
+$architecture = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
+$target = switch ($architecture) {
+    "X64" { "x86_64-pc-windows-msvc" }
+    "Arm64" { "aarch64-pc-windows-msvc" }
+    default { throw "Unsupported Windows architecture: $architecture" }
+}
+$archive = "kkagent-$target.zip"
+$tempDir = Join-Path ([System.IO.Path]::GetTempPath()) ("kkagent-install-" + [guid]::NewGuid())
+
+try {
+    New-Item -ItemType Directory -Force $tempDir | Out-Null
+    Invoke-WebRequest -Uri "$baseUrl/$archive" -OutFile (Join-Path $tempDir $archive)
+    Invoke-WebRequest -Uri "$baseUrl/SHA256SUMS" -OutFile (Join-Path $tempDir "SHA256SUMS")
+    $line = Get-Content (Join-Path $tempDir "SHA256SUMS") | Where-Object { $_ -match "\s+$([regex]::Escape($archive))$" } | Select-Object -First 1
+    if (-not $line) { throw "$archive is missing from SHA256SUMS" }
+    $expected = ($line -split "\s+")[0].ToLowerInvariant()
+    $actual = (Get-FileHash -Algorithm SHA256 (Join-Path $tempDir $archive)).Hash.ToLowerInvariant()
+    if ($actual -ne $expected) { throw "Checksum verification failed for $archive" }
+
+    $packageDir = Join-Path $tempDir "package"
+    Expand-Archive -Path (Join-Path $tempDir $archive) -DestinationPath $packageDir
+    New-Item -ItemType Directory -Force $InstallDir | Out-Null
+    Copy-Item (Join-Path $packageDir "kkagent.exe") (Join-Path $InstallDir "kkagent.exe.new") -Force
+    Move-Item (Join-Path $InstallDir "kkagent.exe.new") (Join-Path $InstallDir "kkagent.exe") -Force
+
+    $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+    $parts = @($userPath -split ";" | Where-Object { $_ })
+    if ($parts -notcontains $InstallDir) {
+        [Environment]::SetEnvironmentVariable("Path", (($parts + $InstallDir) -join ";"), "User")
+        Write-Host "Added $InstallDir to the user PATH; open a new terminal to use it."
+    }
+    Write-Host "Installed kkagent to $(Join-Path $InstallDir 'kkagent.exe')"
+    & (Join-Path $InstallDir "kkagent.exe") --version
+}
+finally {
+    if (Test-Path $tempDir) { Remove-Item -Recurse -Force $tempDir }
+}

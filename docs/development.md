@@ -13,7 +13,7 @@ cargo test --workspace --all-targets
 
 ## 实网测试
 
-当前目录的 `.env` 可作为本机测试配置来源，但内容是 TOML，并不会被默认自动加载：
+当前目录的 `.env` 是旧格式本机测试配置，内容是 TOML，因此不会被当成 dotenv 变量加载；可显式作为配置使用：
 
 ```bash
 cargo run -p kkagent -- --config .env -p "只回复 ok"
@@ -44,7 +44,7 @@ x86_64-pc-windows-msvc / gnu
 aarch64-pc-windows-msvc
 ```
 
-本机原生构建最可靠。交叉编译需先 `rustup target add <target>`，并安装对应 linker、SDK 或 musl 工具链。`make dist` 只列出部分发布目标，不能代替完整 CI 矩阵。
+本机原生构建最可靠。交叉编译需先 `rustup target add <target>`，并安装对应 linker、SDK 或 musl 工具链。GitHub `Release` workflow 在六种 runner/target 组合上构建并打包；本地 `make dist` 只适合已有对应 linker 的开发机，不能代替完整 CI 矩阵。
 
 ## Node SDK
 
@@ -76,3 +76,4 @@ git status --short
 - HTTP token、WS、ACP、恢复会话、MCP 失败降级通过。
 - macOS、Linux、Windows 的 x86_64/arm64 CI 矩阵通过。
 - 文档、示例配置、版本和 release notes 已同步。
+- Release 资产包含六个平台压缩包、`SHA256SUMS` 和 GitHub OIDC 生成的 Sigstore bundle。

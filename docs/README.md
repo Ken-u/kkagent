@@ -5,6 +5,7 @@
 ## 使用者
 
 - [安装与快速开始](getting-started.md)：编译、配置、首轮对话、恢复会话。
+- [发布与安装包](releases.md)：六平台产物、校验、签名和安装脚本。
 - [配置参考](configuration.md)：全部 TOML 配置项、环境变量、Provider、Model、MCP、Hooks。
 - [CLI 与 TUI](cli-and-tui.md)：命令行参数、快捷键、斜杠命令、非交互模式。
 - [工具与权限](tools-and-permissions.md)：内置工具、三种权限模式、Plan 模式和安全边界。

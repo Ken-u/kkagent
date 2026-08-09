@@ -24,9 +24,15 @@ kkagent acp
 kkagent auth login [--oauth-host <url>] [--base-url <url>]
 kkagent auth logout
 kkagent auth status
+kkagent init [--preset safe|default|full-auto] [--provider <name>] [--model <id>]
+kkagent config show
+kkagent config get <dotted-key>
+kkagent config set <dotted-key> <toml-value>
+kkagent config preset <safe|default|full-auto>
+kkagent doctor [--json] [--live]
 ```
 
-`server` 运行独立服务；`acp` 在 stdin/stdout 上运行 ACP NDJSON 桥；`auth` 管理 Kimi 托管凭据。
+`server` 运行独立服务；`acp` 在 stdin/stdout 上运行 ACP NDJSON 桥；`auth` 管理 Kimi 托管凭据。`init` 创建最小配置且默认不覆盖已有文件；`config show/get` 会隐藏密钥，`config set` 写入前会对完整配置重新校验；`doctor` 检查配置、凭据、工作区、持久化目录、常用工具与系统隔离，`--live` 才会访问模型服务。发现阻断问题时 `doctor` 返回非零退出码。
 
 ## 非交互模式
 

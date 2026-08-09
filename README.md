@@ -16,6 +16,7 @@ TUI 与 Agent Server 可分离，中间走 RPC（当前默认进程内 memory tr
 完整手册见 [docs/README.md](docs/README.md)：
 
 - [安装与快速开始](docs/getting-started.md)
+- [发布与安装包](docs/releases.md)
 - [完整配置参考](docs/configuration.md)
 - [CLI 与 TUI](docs/cli-and-tui.md)
 - [工具与权限](docs/tools-and-permissions.md)
@@ -66,7 +67,25 @@ cargo build --release
 make release
 ```
 
-### 安装到 PATH（可选）
+### 从 GitHub Release 安装
+
+macOS / Linux：
+
+```bash
+curl -fsSLO https://raw.githubusercontent.com/bianjinchen/kkagent/main/install.sh
+sh install.sh
+```
+
+Windows PowerShell：
+
+```powershell
+irm https://raw.githubusercontent.com/bianjinchen/kkagent/main/install.ps1 -OutFile install.ps1
+./install.ps1
+```
+
+安装器会自动选择 x86_64/arm64 产物，并在安装前校验 `SHA256SUMS`。如果仓库地址不同，通过 `KKAGENT_REPOSITORY=owner/repository` 覆盖。完整产物、签名验证和自定义安装目录见[发布与安装包](docs/releases.md)。
+
+### 从源码安装到 PATH（可选）
 
 ```bash
 make install
@@ -80,17 +99,15 @@ make install
 ```bash
 # 单目标示例
 rustup target add aarch64-apple-darwin
-rustup target add x86_64-unknown-linux-musl
-rustup target add x86_64-pc-windows-gnu
-
 cargo build --release --target aarch64-apple-darwin
-cargo build --release --target x86_64-unknown-linux-musl
-cargo build --release --target x86_64-pc-windows-gnu
 
-# CI 会在 Linux/macOS/Windows 的 x86_64/arm64 组合上执行原生或交叉检查
+# Release workflow 会构建以下六个目标
+# x86_64-apple-darwin / aarch64-apple-darwin
+# x86_64-unknown-linux-gnu / aarch64-unknown-linux-gnu
+# x86_64-pc-windows-msvc / aarch64-pc-windows-msvc
 ```
 
-> Windows / Linux musl 交叉编译可能还需要对应 linker；本机原生 `cargo build --release` 最稳。
+> 交叉编译可能还需要对应 linker 或 SDK；正式发布由各系统的 GitHub runner 构建，本机原生 `cargo build --release` 最稳。
 
 ---
 
@@ -103,7 +120,20 @@ cargo build --release --target x86_64-pc-windows-gnu
 1. 命令行 `--config /path/to/config.toml`
 2. 默认：`~/.kkagent/config.toml`
 
-首次使用建议：
+首次使用直接运行向导：
+
+```bash
+kkagent init
+kkagent doctor
+```
+
+无人值守环境可以显式给出参数：
+
+```bash
+kkagent init --provider openai --model gpt-example --preset safe --non-interactive
+```
+
+也可以从模板手工创建：
 
 ```bash
 mkdir -p ~/.kkagent
@@ -111,7 +141,7 @@ cp examples/config.example.toml ~/.kkagent/config.toml
 # 再编辑 api_key / base_url / default_model
 ```
 
-仓库根目录的 `.env` 是本机调试用 TOML 样例（名字叫 `.env`，内容实际是 TOML）。正式用法请放进 `~/.kkagent/config.toml`，不要把密钥提交进 git。
+正式配置请放进 `~/.kkagent/config.toml`，不要把密钥提交进 git。工作区 `.env` 支持标准 `KEY=value` 密钥注入；为兼容旧开发环境，内容为 TOML 的 `.env` 仍可通过 `--config .env` 显式使用。
 
 ### 最小可用配置
 

@@ -62,6 +62,8 @@
 - [x] 事件序号、回放窗口、Session 过滤与 turn 状态查询
 - [x] HTTP scoped token、限流、审计和危险 API 显式开关
 - [x] Transcript fail-closed、health/readiness、Prometheus 指标和 request ID
+- [x] 首次运行向导、配置 get/set/show、三种安全预设与 `doctor`/JSON/实网诊断
+- [x] 六平台 Release 产物、SHA-256 清单、Sigstore keyless 签名和校验安装器
 
 ## 七、验证
 

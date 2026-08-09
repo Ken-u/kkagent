@@ -2,7 +2,18 @@
 
 ## 加载顺序
 
-kkagent 读取一份 TOML 配置：优先使用 `--config <path>`，否则读取 `~/.kkagent/config.toml`。环境变量会覆盖部分字段。启动时会校验默认模型、Provider 引用、URL、权限模式和数值范围。
+kkagent 读取一份 TOML 配置：优先使用 `--config <path>`，否则读取 `~/.kkagent/config.toml`。配置不存在时，交互终端会启动首次运行向导；非交互运行会提示先执行 `kkagent init`。环境变量会覆盖部分字段。启动时会校验默认模型、Provider 引用、URL、权限模式和数值范围。
+
+常用维护命令：
+
+```bash
+kkagent config show
+kkagent config get sandbox.mode
+kkagent config set sandbox.network false
+kkagent config preset safe
+```
+
+`config show/get` 输出的是应用环境变量覆盖后的有效配置，并递归隐藏 API key、token、secret、header 和 MCP env。`config set` 的值使用 TOML 语法，例如字符串需要写成 `\"manual\"`；它通过临时文件原子替换并在 Unix 上使用 `0600` 权限。
 
 ## 顶层字段
 
@@ -181,6 +192,8 @@ client_label = "kkagent"
 远程类型支持 `sse`、`http` 和 `streamable-http`。OAuth 还可配置 `client_id`、`client_secret`、`redirect_uri`。
 
 ## 环境变量覆盖
+
+启动时会读取当前工作区的 `.env`，但只导入 `KKAGENT_*` 和下表中的模型 Provider 密钥，并且不会覆盖父进程已经设置的变量。标准格式为 `KEY=value`。旧版本把 TOML 配置命名为 `.env` 的工作区不会被当成 dotenv 解析，仍可使用 `kkagent --config .env ...`。
 
 | 环境变量 | 用途 |
 |---|---|

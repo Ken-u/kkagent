@@ -1,9 +1,12 @@
 VERSION := $(shell grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
 NAME := kkagent
 TARGETS := \
+	x86_64-apple-darwin \
 	aarch64-apple-darwin \
-	x86_64-unknown-linux-musl \
-	x86_64-pc-windows-gnu
+	x86_64-unknown-linux-gnu \
+	aarch64-unknown-linux-gnu \
+	x86_64-pc-windows-msvc \
+	aarch64-pc-windows-msvc
 
 RELEASE_DIR := target/release-dist
 
@@ -15,7 +18,7 @@ help:
 	@echo "  make build     - Debug build (current platform)"
 	@echo "  make release   - Release build (current platform)"
 	@echo "  make test      - Run all tests"
-	@echo "  make dist      - Build release for all targets"
+	@echo "  make dist      - Build six release targets (requires their SDKs/linkers)"
 	@echo "  make clean     - Clean build artifacts"
 
 build:

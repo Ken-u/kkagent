@@ -8,6 +8,26 @@
 
 ## 构建和安装
 
+### 预编译安装包
+
+macOS / Linux：
+
+```bash
+curl -fsSLO https://raw.githubusercontent.com/bianjinchen/kkagent/main/install.sh
+sh install.sh
+```
+
+Windows PowerShell：
+
+```powershell
+irm https://raw.githubusercontent.com/bianjinchen/kkagent/main/install.ps1 -OutFile install.ps1
+./install.ps1
+```
+
+默认从 `bianjinchen/kkagent` 的最新 GitHub Release 下载并校验 SHA-256。镜像、fork 和自定义安装目录见[发布与安装包](releases.md)。
+
+### 从源码构建
+
 ```bash
 git clone <repository-url> kkagent
 cd kkagent
@@ -18,6 +38,23 @@ cargo build --release
 也可以执行 `make release`。`make install` 会写入 `/usr/local/bin`，需要当前用户拥有对应权限。Windows 产物为 `target/release/kkagent.exe`。
 
 ## 配置模型
+
+推荐用首次运行向导创建权限为 `0600` 的默认配置：
+
+```bash
+kkagent init
+kkagent doctor
+```
+
+向导支持 OpenAI、Anthropic、Kimi、Google 和兼容 OpenAI Responses 的自定义端点。API key 输入不会回显。CI 中使用：
+
+```bash
+kkagent init --provider openai --model gpt-example --preset safe --non-interactive
+```
+
+`safe` 禁止工具进程联网；`default` 保留人工批准并允许联网；`full-auto` 使用自动批准。三种预设都保持系统隔离为 `auto`。
+
+### 手工配置
 
 创建默认配置：
 
@@ -76,6 +113,14 @@ kkagent -y -p "运行测试并总结失败原因"
 
 ```bash
 kkagent --config /absolute/path/to/config.toml
+```
+
+检查配置和依赖：
+
+```bash
+kkagent doctor
+kkagent doctor --json
+kkagent doctor --live   # 额外请求 Provider 的 models 端点
 ```
 
 ## 会话恢复

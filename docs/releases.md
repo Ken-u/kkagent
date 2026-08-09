@@ -1,0 +1,69 @@
+# 发布与安装包
+
+## 支持的产物
+
+推送 `v*` tag 后，GitHub Actions 在对应系统 runner 上执行锁定依赖的 release 构建：
+
+| 系统 | 架构 | Rust target | 资产 |
+|---|---|---|---|
+| Linux | x86_64 | `x86_64-unknown-linux-gnu` | `.tar.gz` |
+| Linux | arm64 | `aarch64-unknown-linux-gnu` | `.tar.gz` |
+| macOS | x86_64 | `x86_64-apple-darwin` | `.tar.gz` |
+| macOS | arm64 | `aarch64-apple-darwin` | `.tar.gz` |
+| Windows | x86_64 | `x86_64-pc-windows-msvc` | `.zip` |
+| Windows | arm64 | `aarch64-pc-windows-msvc` | `.zip` |
+
+每个包包含可执行文件、README 和 MIT License。发布任务等待六个构建全部成功，随后生成 `SHA256SUMS`，使用 GitHub Actions OIDC 对清单执行 Cosign keyless 签名，并上传 `SHA256SUMS.sigstore.json`。
+
+## 安装
+
+macOS / Linux：
+
+```bash
+sh install.sh
+```
+
+默认写入 `/usr/local/bin`。没有该目录权限时选择用户可写目录，并确保它在 PATH 中：
+
+```bash
+KKAGENT_INSTALL_DIR=/absolute/writable/bin sh install.sh
+```
+
+Windows PowerShell 默认写入 `%LOCALAPPDATA%\Programs\kkagent`，并在缺失时加入用户 PATH：
+
+```powershell
+./install.ps1
+./install.ps1 -InstallDir 'D:\Tools\kkagent'
+```
+
+fork 或镜像设置：
+
+```bash
+KKAGENT_REPOSITORY=owner/repository sh install.sh
+KKAGENT_RELEASE_BASE_URL=https://mirror.example/kkagent/latest sh install.sh
+```
+
+PowerShell 使用同名环境变量。两个安装器都会先下载 `SHA256SUMS`，校验目标包，然后通过临时文件替换可执行文件；校验失败不会安装。
+
+## 独立验证签名
+
+安装 Cosign 后，在下载资产的目录执行：
+
+```bash
+cosign verify-blob \
+  --bundle SHA256SUMS.sigstore.json \
+  --certificate-identity-regexp 'https://github.com/.*/kkagent/.github/workflows/release.yml@.*' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  SHA256SUMS
+```
+
+签名验证证明清单来自该 GitHub Actions workflow；随后仍应对下载的压缩包执行清单里的 SHA-256 校验。安装脚本默认完成后一步，离线或高信任场景可先手工完成两步验证。
+
+## 发布操作
+
+1. 确保 CI、真实 Provider 冒烟和文档检查通过。
+2. 创建并推送带 `v` 前缀的 tag，例如 `v0.1.0`。
+3. 等待 `Release` workflow 的六个 build job 和 publish job 全部成功。
+4. 在 GitHub Release 中确认六个包、校验清单、Sigstore bundle 和自动 release notes。
+
+需要重新发布已有 tag 的资产时，可手动运行 workflow 并填写现有 tag；上传使用覆盖模式。正式版本不应移动已经对外发布的 tag。
