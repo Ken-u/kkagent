@@ -77,6 +77,11 @@ fn fold_message(msg: &ChatMessage, opts: &ProjectOptions, fold_hard: bool) -> Ch
             ChatContent::Text { text } => Some(ChatContent::Text {
                 text: truncate_chars(text, text_max),
             }),
+            ChatContent::Image { .. } if fold_hard => None,
+            ChatContent::Image { media_type, data } => Some(ChatContent::Image {
+                media_type: media_type.clone(),
+                data: data.clone(),
+            }),
             ChatContent::ToolUse { id, name, input } => {
                 let input = if fold_hard {
                     shrink_json(input, 400)

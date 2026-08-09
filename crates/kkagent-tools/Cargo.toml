@@ -21,4 +21,4 @@ uuid = { workspace = true }
 reqwest = { workspace = true }
 chrono = { workspace = true }
 dirs = { workspace = true }
-base64 = "0.22"
+base64 = { workspace = true }

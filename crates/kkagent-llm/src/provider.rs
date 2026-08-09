@@ -20,7 +20,7 @@ pub struct AnthropicProvider {
 }
 
 impl AnthropicProvider {
-    pub fn new(config: &ProviderConfig) -> Self {
+    pub fn new(config: &ProviderConfig) -> anyhow::Result<Self> {
         let base_url = config
             .base_url
             .as_deref()
@@ -28,11 +28,11 @@ impl AnthropicProvider {
             .trim_end_matches('/')
             .to_string();
         let api_key = config.api_key.clone().unwrap_or_default();
-        Self {
-            client: build_client(),
+        Ok(Self {
+            client: build_client(config)?,
             base_url,
             api_key,
-        }
+        })
     }
 }
 
@@ -63,27 +63,27 @@ pub struct OpenAiProvider {
 }
 
 impl OpenAiProvider {
-    pub fn new(config: &ProviderConfig) -> Self {
+    pub fn new(config: &ProviderConfig) -> anyhow::Result<Self> {
         Self::with_responses(config, false)
     }
 
-    pub fn responses(config: &ProviderConfig) -> Self {
+    pub fn responses(config: &ProviderConfig) -> anyhow::Result<Self> {
         Self::with_responses(config, true)
     }
 
-    fn with_responses(config: &ProviderConfig, responses: bool) -> Self {
+    fn with_responses(config: &ProviderConfig, responses: bool) -> anyhow::Result<Self> {
         let base_url = config
             .base_url
             .as_deref()
             .unwrap_or("https://api.openai.com")
             .trim_end_matches('/')
             .to_string();
-        Self {
-            client: build_client(),
+        Ok(Self {
+            client: build_client(config)?,
             base_url,
             api_key: config.api_key.clone().unwrap_or_default(),
             responses,
-        }
+        })
     }
 }
 
@@ -123,19 +123,58 @@ pub struct GoogleProvider {
     api_key: String,
 }
 
+pub struct KimiProvider {
+    client: reqwest::Client,
+    base_url: String,
+    api_key: String,
+}
+
+impl KimiProvider {
+    pub fn new(config: &ProviderConfig) -> anyhow::Result<Self> {
+        Ok(Self {
+            client: build_client(config)?,
+            base_url: config
+                .base_url
+                .as_deref()
+                .unwrap_or("https://api.moonshot.ai/v1")
+                .trim_end_matches('/')
+                .to_string(),
+            api_key: config.api_key.clone().unwrap_or_default(),
+        })
+    }
+}
+
+#[async_trait]
+impl LlmProvider for KimiProvider {
+    async fn stream_chat(
+        &self,
+        request: LlmRequest,
+        event_tx: mpsc::Sender<StreamEvent>,
+    ) -> anyhow::Result<()> {
+        crate::stream::kimi_stream(
+            &self.client,
+            &self.base_url,
+            &self.api_key,
+            request,
+            event_tx,
+        )
+        .await
+    }
+}
+
 impl GoogleProvider {
-    pub fn new(config: &ProviderConfig) -> Self {
+    pub fn new(config: &ProviderConfig) -> anyhow::Result<Self> {
         let base_url = config
             .base_url
             .as_deref()
             .unwrap_or("https://generativelanguage.googleapis.com")
             .trim_end_matches('/')
             .to_string();
-        Self {
-            client: build_client(),
+        Ok(Self {
+            client: build_client(config)?,
             base_url,
             api_key: config.api_key.clone().unwrap_or_default(),
-        }
+        })
     }
 }
 
@@ -157,14 +196,21 @@ impl LlmProvider for GoogleProvider {
     }
 }
 
-fn build_client() -> reqwest::Client {
-    reqwest::Client::builder()
+fn build_client(config: &ProviderConfig) -> anyhow::Result<reqwest::Client> {
+    let mut headers = reqwest::header::HeaderMap::new();
+    for (name, value) in &config.custom_headers {
+        let name = reqwest::header::HeaderName::from_bytes(name.as_bytes())?;
+        let mut value = reqwest::header::HeaderValue::from_str(value)?;
+        value.set_sensitive(true);
+        headers.insert(name, value);
+    }
+    Ok(reqwest::Client::builder()
+        .default_headers(headers)
         .connect_timeout(std::time::Duration::from_secs(30))
         .timeout(std::time::Duration::from_secs(300))
         .pool_max_idle_per_host(0)
         .http1_only()
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new())
+        .build()?)
 }
 
 pub fn create_provider(
@@ -172,18 +218,21 @@ pub fn create_provider(
     model_config: &ModelConfig,
 ) -> anyhow::Result<Box<dyn LlmProvider>> {
     let provider: Box<dyn LlmProvider> = match provider_config.provider_type.as_str() {
-        "openai-responses" | "responses" => Box::new(OpenAiProvider::responses(provider_config)),
-        "openai-legacy" | "openai-chat" => Box::new(OpenAiProvider::new(provider_config)),
+        "openai-responses" | "openai_responses" | "responses" => {
+            Box::new(OpenAiProvider::responses(provider_config)?)
+        }
+        "openai-legacy" | "openai-chat" => Box::new(OpenAiProvider::new(provider_config)?),
         "openai" => {
             // Auto-select Responses for reasoning / GPT-4.1+ models.
             if crate::catalog::prefers_responses_api(&model_config.model) {
-                Box::new(OpenAiProvider::responses(provider_config))
+                Box::new(OpenAiProvider::responses(provider_config)?)
             } else {
-                Box::new(OpenAiProvider::new(provider_config))
+                Box::new(OpenAiProvider::new(provider_config)?)
             }
         }
-        "google" | "google-genai" | "gemini" => Box::new(GoogleProvider::new(provider_config)),
-        "anthropic" | "kimi" => Box::new(AnthropicProvider::new(provider_config)),
+        "google" | "google-genai" | "gemini" => Box::new(GoogleProvider::new(provider_config)?),
+        "anthropic" => Box::new(AnthropicProvider::new(provider_config)?),
+        "kimi" => Box::new(KimiProvider::new(provider_config)?),
         other => anyhow::bail!("unsupported LLM provider type: {other}"),
     };
     Ok(provider)

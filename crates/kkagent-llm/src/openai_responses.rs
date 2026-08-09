@@ -14,16 +14,22 @@ pub async fn openai_responses_stream(
     request: LlmRequest,
     event_tx: mpsc::Sender<StreamEvent>,
 ) -> anyhow::Result<()> {
-    let url = format!("{}/v1/responses", base_url.trim_end_matches('/'));
+    let url = crate::stream::api_endpoint(base_url, "responses");
 
     let mut input: Vec<serde_json::Value> = Vec::new();
     for m in &request.messages {
         let mut texts = Vec::new();
+        let mut images = Vec::new();
         let mut tool_calls = Vec::new();
         let mut tool_results = Vec::new();
         for c in &m.content {
             match c {
                 ChatContent::Text { text } => texts.push(text.clone()),
+                ChatContent::Image { media_type, data } => images.push(json!({
+                    "type": "input_image",
+                    "image_url": format!("data:{media_type};base64,{data}"),
+                    "detail": "auto",
+                })),
                 ChatContent::Thinking { thinking } => texts.push(thinking.clone()),
                 ChatContent::ToolUse { id, name, input } => {
                     tool_calls.push(json!({
@@ -57,11 +63,18 @@ pub async fn openai_responses_stream(
                 input.push(tc);
             }
         } else if m.role == "user" {
-            if !texts.is_empty() {
+            if !images.is_empty() {
+                let mut content: Vec<serde_json::Value> = texts
+                    .iter()
+                    .map(|text| json!({"type": "input_text", "text": text}))
+                    .collect();
+                content.extend(images);
                 input.push(json!({
                     "role": "user",
-                    "content": texts.join("\n"),
+                    "content": content,
                 }));
+            } else if !texts.is_empty() {
+                input.push(json!({"role": "user", "content": texts.join("\n")}));
             }
             for tr in tool_results {
                 input.push(tr);

@@ -16,7 +16,7 @@ TUI 与 Agent Server 可分离，中间走 RPC（当前默认进程内 memory tr
 
 ### 依赖
 
-- Rust **1.75+**（建议 1.88+；本仓库在 1.95 验证过）
+- Rust **1.88+**（仓库通过 `rust-toolchain.toml` 固定最低工具链）
 - 系统：macOS / Linux / Windows
 
 ```bash
@@ -125,9 +125,9 @@ display_name = "claude-opus-4-8"
 | 字段 | 含义 |
 |------|------|
 | `default_model` | 模型别名，必须对应 `models."别名"` |
-| `providers.*.type` | 当前走 Anthropic Messages：`anthropic` / `openai` / `kimi` 都会走同一套流式客户端 |
-| `providers.*.base_url` | 不要带尾斜杠；请求会打到 `{base_url}/v1/messages` |
-| `providers.*.api_key` | `x-api-key` |
+| `providers.*.type` | `anthropic`、`openai`、`openai_responses`、`kimi`、`google-genai` 使用各自的流式协议 |
+| `providers.*.base_url` | 可带或不带末尾 `/v1`，客户端会避免重复路径 |
+| `providers.*.api_key` | Anthropic 使用 `x-api-key`，OpenAI/Kimi 使用 Bearer token |
 | `models.*.model` | 发给上游的真实 model id |
 | `models.*.capabilities` | 含 `tool_use` 才会带工具定义；`thinking` 可按需开 |
 | `default_permission_mode` | `manual` 每次确认；`yolo` 自动批准常规工具；`auto` 更激进 |

@@ -76,6 +76,9 @@ impl TokenCounter {
                     Self::estimate_text(name) + Self::estimate_text(&input.to_string()) + 8
                 }
                 ChatContent::ToolResult { content, .. } => Self::estimate_text(content) + 6,
+                // Provider image tokenization varies by model and detail mode.
+                // A conservative fixed estimate keeps compaction from ignoring it.
+                ChatContent::Image { .. } => 1_600,
             };
         }
         n

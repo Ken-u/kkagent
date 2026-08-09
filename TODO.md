@@ -1,6 +1,6 @@
 # kkagent 与 ref/kimi-code 功能差距清单
 
-> 核对更新（2026-08-09）：除 **Kimi provider** 外，TODO 第五节缺口已落地。
+> 核对更新（2026-08-09）：Kimi OpenAI-compatible provider 已按专用方言落地；托管账号 OAuth 与视频 Files API 仍待完成。
 
 ## 一、工具集（Tools）
 
@@ -48,9 +48,10 @@
 | **apps/vscode**（ACP/HTTP 最小扩展） | **已实现** |
 | Bash AST（`bash_ast`，tree-sitter-bash 语义对齐） | **已实现** |
 
-## 六、保留未做
+## 六、仍需完成
 
-- [ ] **Kimi 专用 provider / files API / Kimi OAuth identity**（按用户要求保留）
+- [x] **Kimi 专用 provider**（`max_completion_tokens`、thinking/reasoning、Moonshot usage 方言）
+- [ ] **Kimi 视频 Files API / 托管账号 OAuth identity**
 
 ## 七、验证
 

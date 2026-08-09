@@ -2,6 +2,10 @@
 
 use std::path::{Path, PathBuf};
 
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use image::codecs::jpeg::JpegEncoder;
+use kkagent_llm::ChatContent;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MediaKind {
     Image,
@@ -60,6 +64,7 @@ pub fn mime_for(kind: MediaKind, path: &Path) -> String {
         (MediaKind::Image, "jpg" | "jpeg") => "image/jpeg".into(),
         (MediaKind::Image, "gif") => "image/gif".into(),
         (MediaKind::Image, "webp") => "image/webp".into(),
+        (MediaKind::Image, "svg") => "image/svg+xml".into(),
         (MediaKind::Image, _) => "image/*".into(),
         (MediaKind::Audio, "mp3") => "audio/mpeg".into(),
         (MediaKind::Audio, "wav") => "audio/wav".into(),
@@ -95,6 +100,50 @@ pub fn resolve_media(path: &Path, limits: &MediaLimits) -> anyhow::Result<MediaR
     })
 }
 
+/// Load an image below `workspace`, normalize it to a bounded JPEG, and return
+/// a provider-neutral multimodal content block. Canonicalizing both paths also
+/// prevents absolute paths and symlinks from escaping the active workspace.
+pub fn load_workspace_image(
+    path: &Path,
+    workspace: &Path,
+    limits: &MediaLimits,
+) -> anyhow::Result<ChatContent> {
+    let workspace = workspace.canonicalize()?;
+    let path = path.canonicalize()?;
+    if !path.starts_with(&workspace) {
+        anyhow::bail!(
+            "media path is outside the active workspace: {}",
+            path.display()
+        );
+    }
+    let media = resolve_media(&path, limits)?;
+    if media.kind != MediaKind::Image || media.mime == "image/svg+xml" {
+        anyhow::bail!("unsupported vision input: {}", path.display());
+    }
+
+    let bytes = std::fs::read(&path)?;
+    let decoded = image::load_from_memory(&bytes)?;
+    let normalized = if decoded.width() > 2048 || decoded.height() > 2048 {
+        decoded.thumbnail(2048, 2048)
+    } else {
+        decoded
+    };
+    let mut encoded = Vec::new();
+    JpegEncoder::new_with_quality(&mut encoded, 85).encode_image(&normalized)?;
+    if encoded.len() > 5 * 1024 * 1024 {
+        encoded.clear();
+        let reduced = normalized.thumbnail(1536, 1536);
+        JpegEncoder::new_with_quality(&mut encoded, 70).encode_image(&reduced)?;
+    }
+    if encoded.len() > 5 * 1024 * 1024 {
+        anyhow::bail!("normalized image still exceeds the 5 MiB provider budget");
+    }
+    Ok(ChatContent::Image {
+        media_type: "image/jpeg".into(),
+        data: BASE64.encode(encoded),
+    })
+}
+
 /// Extract `@path` media mentions from user text.
 pub fn extract_at_paths(text: &str) -> Vec<String> {
     let mut out = Vec::new();
@@ -111,6 +160,7 @@ pub fn extract_at_paths(text: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine;
 
     #[test]
     fn sniff() {
@@ -122,5 +172,38 @@ mod tests {
     fn at_paths() {
         let v = extract_at_paths("see @./shot.png and @/tmp/a.mp4");
         assert_eq!(v.len(), 2);
+    }
+
+    #[test]
+    fn loads_and_bounds_workspace_images() {
+        let root = std::env::temp_dir().join(format!("kkagent-media-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("wide.png");
+        image::RgbImage::new(2400, 32).save(&path).unwrap();
+        let content = load_workspace_image(&path, &root, &MediaLimits::default()).unwrap();
+        let ChatContent::Image { media_type, data } = content else {
+            panic!("expected image content");
+        };
+        assert_eq!(media_type, "image/jpeg");
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(data)
+            .unwrap();
+        let image = image::load_from_memory(&bytes).unwrap();
+        assert!(image.width() <= 2048);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rejects_images_outside_workspace() {
+        let base = std::env::temp_dir().join(format!("kkagent-media-{}", uuid::Uuid::new_v4()));
+        let workspace = base.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let outside = base.join("outside.png");
+        image::RgbImage::new(1, 1).save(&outside).unwrap();
+        let error = load_workspace_image(&outside, &workspace, &MediaLimits::default())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("outside the active workspace"));
+        std::fs::remove_dir_all(base).unwrap();
     }
 }

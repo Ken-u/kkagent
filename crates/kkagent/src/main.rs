@@ -815,7 +815,7 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
                             text
                         }
                         ChatContent::ToolResult { content, .. } => content,
-                        ChatContent::ToolUse { .. } => continue,
+                        ChatContent::ToolUse { .. } | ChatContent::Image { .. } => continue,
                     };
                     if text.to_lowercase().contains(&needle) {
                         hits.push(serde_json::json!({

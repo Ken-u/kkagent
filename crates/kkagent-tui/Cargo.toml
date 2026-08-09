@@ -18,4 +18,4 @@ tracing = { workspace = true }
 futures = { workspace = true }
 dirs = { workspace = true }
 unicode-width = "0.2"
-base64 = "0.22"
+base64 = { workspace = true }

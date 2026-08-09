@@ -12,7 +12,7 @@ pub async fn anthropic_stream(
     request: LlmRequest,
     event_tx: mpsc::Sender<StreamEvent>,
 ) -> anyhow::Result<()> {
-    let url = format!("{}/v1/messages", base_url);
+    let url = api_endpoint(base_url, "messages");
 
     let messages: Vec<serde_json::Value> = request
         .messages
@@ -20,6 +20,10 @@ pub async fn anthropic_stream(
         .map(|m| {
             let content: Vec<serde_json::Value> = m.content.iter().map(|c| match c {
                 ChatContent::Text { text } => json!({"type": "text", "text": text}),
+                ChatContent::Image { media_type, data } => json!({
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": media_type, "data": data}
+                }),
                 ChatContent::ToolUse { id, name, input } => {
                     json!({"type": "tool_use", "id": id, "name": name, "input": input})
                 }
@@ -213,7 +217,28 @@ pub async fn openai_stream(
     request: LlmRequest,
     event_tx: mpsc::Sender<StreamEvent>,
 ) -> anyhow::Result<()> {
-    let url = format!("{}/v1/chat/completions", base_url.trim_end_matches('/'));
+    chat_completions_stream(client, base_url, api_key, request, event_tx, false).await
+}
+
+pub async fn kimi_stream(
+    client: &Client,
+    base_url: &str,
+    api_key: &str,
+    request: LlmRequest,
+    event_tx: mpsc::Sender<StreamEvent>,
+) -> anyhow::Result<()> {
+    chat_completions_stream(client, base_url, api_key, request, event_tx, true).await
+}
+
+async fn chat_completions_stream(
+    client: &Client,
+    base_url: &str,
+    api_key: &str,
+    request: LlmRequest,
+    event_tx: mpsc::Sender<StreamEvent>,
+    kimi: bool,
+) -> anyhow::Result<()> {
+    let url = api_endpoint(base_url, "chat/completions");
 
     let mut messages: Vec<serde_json::Value> = Vec::new();
     if let Some(system) = &request.system {
@@ -222,11 +247,22 @@ pub async fn openai_stream(
     for m in &request.messages {
         // Flatten content blocks into OpenAI-ish messages.
         let mut text_parts = Vec::new();
+        let mut thinking_parts = Vec::new();
+        let mut media_parts = Vec::new();
         let mut tool_calls = Vec::new();
         let mut tool_results = Vec::new();
         for c in &m.content {
             match c {
                 ChatContent::Text { text } => text_parts.push(text.clone()),
+                ChatContent::Image { media_type, data } => {
+                    media_parts.push(json!({
+                        "type": "image_url",
+                        "image_url": {"url": format!("data:{media_type};base64,{data}")}
+                    }));
+                }
+                ChatContent::Thinking { thinking } if kimi => {
+                    thinking_parts.push(thinking.clone());
+                }
                 ChatContent::Thinking { thinking } => text_parts.push(thinking.clone()),
                 ChatContent::ToolUse { id, name, input } => {
                     tool_calls.push(json!({
@@ -256,9 +292,19 @@ pub async fn openai_stream(
             if !tool_calls.is_empty() {
                 msg["tool_calls"] = json!(tool_calls);
             }
+            if kimi && !thinking_parts.is_empty() {
+                msg["reasoning_content"] = json!(thinking_parts.join("\n"));
+            }
             messages.push(msg);
         } else if m.role == "user" {
-            if !text_parts.is_empty() {
+            if !media_parts.is_empty() {
+                let mut content: Vec<serde_json::Value> = text_parts
+                    .iter()
+                    .map(|text| json!({"type": "text", "text": text}))
+                    .collect();
+                content.extend(media_parts);
+                messages.push(json!({"role": "user", "content": content}));
+            } else if !text_parts.is_empty() {
                 messages.push(json!({"role": "user", "content": text_parts.join("\n")}));
             }
             for tr in tool_results {
@@ -287,9 +333,17 @@ pub async fn openai_stream(
     let mut body = json!({
         "model": &request.model,
         "messages": messages,
-        "max_tokens": request.max_tokens.min(16384),
         "stream": true,
+        "stream_options": {"include_usage": true},
     });
+    if kimi {
+        body["max_completion_tokens"] = json!(request.max_tokens);
+        if request.thinking.is_some() {
+            body["thinking"] = json!({"type": "enabled"});
+        }
+    } else {
+        body["max_tokens"] = json!(request.max_tokens.min(16384));
+    }
     if !tools.is_empty() {
         body["tools"] = json!(tools);
     }
@@ -316,6 +370,7 @@ pub async fn openai_stream(
     let mut tool_ids: std::collections::HashMap<usize, (String, String)> =
         std::collections::HashMap::new();
     let mut started: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut usage = TokenUsage::default();
 
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
@@ -331,16 +386,20 @@ pub async fn openai_stream(
                 continue;
             };
             if data == "[DONE]" {
-                let _ = event_tx
-                    .send(StreamEvent::MessageEnd {
-                        usage: TokenUsage::default(),
-                    })
-                    .await;
+                let _ = event_tx.send(StreamEvent::MessageEnd { usage }).await;
                 return Ok(());
             }
             let Ok(event) = serde_json::from_str::<serde_json::Value>(data) else {
                 continue;
             };
+            if let Some(value) = event.get("usage").or_else(|| {
+                event
+                    .get("choices")
+                    .and_then(|choices| choices.get(0))
+                    .and_then(|choice| choice.get("usage"))
+            }) {
+                update_openai_usage(&mut usage, value);
+            }
             let Some(choices) = event.get("choices").and_then(|c| c.as_array()) else {
                 continue;
             };
@@ -353,6 +412,16 @@ pub async fn openai_stream(
                         let _ = event_tx
                             .send(StreamEvent::TextDelta(content.to_string()))
                             .await;
+                    }
+                }
+                for key in ["reasoning_content", "reasoning_details", "reasoning"] {
+                    if let Some(content) = delta.get(key).and_then(|v| v.as_str()) {
+                        if !content.is_empty() {
+                            let _ = event_tx
+                                .send(StreamEvent::ThinkingDelta(content.to_string()))
+                                .await;
+                        }
+                        break;
                     }
                 }
                 if let Some(tcs) = delta.get("tool_calls").and_then(|v| v.as_array()) {
@@ -395,6 +464,7 @@ pub async fn openai_stream(
             }
         }
     }
+    let _ = event_tx.send(StreamEvent::MessageEnd { usage }).await;
     Ok(())
 }
 
@@ -423,6 +493,9 @@ pub async fn google_stream(
         for c in &m.content {
             match c {
                 ChatContent::Text { text } => parts.push(json!({"text": text})),
+                ChatContent::Image { media_type, data } => parts.push(json!({
+                    "inlineData": {"mimeType": media_type, "data": data}
+                })),
                 ChatContent::Thinking { thinking } => parts.push(json!({"text": thinking})),
                 ChatContent::ToolUse { id, name, input } => {
                     parts.push(json!({
@@ -561,13 +634,234 @@ fn truncate_utf8(value: &str, max_bytes: usize) -> &str {
     &value[..end]
 }
 
+pub(crate) fn api_endpoint(base_url: &str, resource: &str) -> String {
+    let base = base_url.trim_end_matches('/');
+    if base.ends_with("/v1") {
+        format!("{base}/{resource}")
+    } else {
+        format!("{base}/v1/{resource}")
+    }
+}
+
+fn update_openai_usage(usage: &mut TokenUsage, value: &serde_json::Value) {
+    usage.input_tokens = value
+        .get("prompt_tokens")
+        .or_else(|| value.get("input_tokens"))
+        .and_then(|token| token.as_u64())
+        .unwrap_or(usage.input_tokens);
+    usage.output_tokens = value
+        .get("completion_tokens")
+        .or_else(|| value.get("output_tokens"))
+        .and_then(|token| token.as_u64())
+        .unwrap_or(usage.output_tokens);
+    usage.cache_read_input_tokens = value
+        .get("prompt_tokens_details")
+        .or_else(|| value.get("input_tokens_details"))
+        .and_then(|details| details.get("cached_tokens"))
+        .and_then(|token| token.as_u64())
+        .unwrap_or(usage.cache_read_input_tokens);
+}
+
 #[cfg(test)]
-mod utf8_tests {
-    use super::truncate_utf8;
+mod tests {
+    use super::{anthropic_stream, kimi_stream, openai_stream, truncate_utf8};
+    use crate::types::{ChatContent, ChatMessage, LlmRequest, StreamEvent, ThinkingParams};
+    use reqwest::Client;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+        sync::{mpsc, oneshot},
+    };
+
+    struct CapturedRequest {
+        head: String,
+        body: String,
+    }
+
+    async fn serve_once(
+        status: &str,
+        content_type: &str,
+        body: &str,
+    ) -> (String, oneshot::Receiver<CapturedRequest>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let response = format!(
+            "HTTP/1.1 {status}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let (request_tx, request_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            let mut expected = None;
+            loop {
+                let mut chunk = [0_u8; 4096];
+                let count = socket.read(&mut chunk).await.unwrap();
+                if count == 0 {
+                    break;
+                }
+                bytes.extend_from_slice(&chunk[..count]);
+                if expected.is_none() {
+                    if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&bytes[..end]);
+                        let length = head
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().ok())
+                                    .flatten()
+                            })
+                            .unwrap_or(0);
+                        expected = Some(end + 4 + length);
+                    }
+                }
+                if expected.is_some_and(|length| bytes.len() >= length) {
+                    break;
+                }
+            }
+            let header_end = bytes
+                .windows(4)
+                .position(|part| part == b"\r\n\r\n")
+                .unwrap();
+            let captured = CapturedRequest {
+                head: String::from_utf8_lossy(&bytes[..header_end]).into_owned(),
+                body: String::from_utf8_lossy(&bytes[header_end + 4..]).into_owned(),
+            };
+            let _ = request_tx.send(captured);
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+        (format!("http://{address}"), request_rx)
+    }
+
+    fn request() -> LlmRequest {
+        LlmRequest {
+            model: "test-model".into(),
+            messages: vec![ChatMessage {
+                role: "user".into(),
+                content: vec![ChatContent::Text {
+                    text: "hello".into(),
+                }],
+            }],
+            tools: Vec::new(),
+            max_tokens: 128,
+            system: Some("be helpful".into()),
+            thinking: None,
+        }
+    }
 
     #[test]
     fn truncates_at_character_boundary() {
         assert_eq!(truncate_utf8("中文错误", 5), "中");
         assert_eq!(truncate_utf8("plain", 50), "plain");
+    }
+
+    #[tokio::test]
+    async fn anthropic_rejects_http_error_and_preserves_unicode() {
+        let (base_url, captured) =
+            serve_once("429 Too Many Requests", "application/json", "中文限流").await;
+        let (tx, _rx) = mpsc::channel(8);
+        let error = anthropic_stream(&Client::new(), &base_url, "secret", request(), tx)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("429"));
+        assert!(error.to_string().contains("中文限流"));
+        let captured = captured.await.unwrap();
+        assert!(captured.head.starts_with("POST /v1/messages HTTP/1.1"));
+        assert!(captured
+            .head
+            .to_ascii_lowercase()
+            .contains("x-api-key: secret"));
+    }
+
+    #[tokio::test]
+    async fn anthropic_streams_text_tool_and_usage() {
+        let sse = concat!(
+            "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n",
+            "data: {\"type\":\"content_block_start\",\"content_block\":{\"type\":\"tool_use\",\"id\":\"call-1\",\"name\":\"Read\"}}\n",
+            "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{}\"}}\n",
+            "data: {\"type\":\"content_block_stop\"}\n",
+            "data: {\"type\":\"message_delta\",\"usage\":{\"input_tokens\":4,\"output_tokens\":2}}\n"
+        );
+        let (base_url, captured) = serve_once("200 OK", "text/event-stream", sse).await;
+        let (tx, mut rx) = mpsc::channel(16);
+        anthropic_stream(&Client::new(), &base_url, "secret", request(), tx)
+            .await
+            .unwrap();
+        let mut events = Vec::new();
+        while let Some(event) = rx.recv().await {
+            events.push(event);
+        }
+        assert!(matches!(&events[0], StreamEvent::TextDelta(text) if text == "hi"));
+        assert!(events.iter().any(|event| matches!(event, StreamEvent::ToolUseStart { id, name } if id == "call-1" && name == "Read")));
+        assert!(events.iter().any(|event| matches!(event, StreamEvent::MessageEnd { usage } if usage.input_tokens == 4 && usage.output_tokens == 2)));
+        let captured = captured.await.unwrap();
+        let body: serde_json::Value = serde_json::from_str(&captured.body).unwrap();
+        assert_eq!(body["system"], "be helpful");
+        assert_eq!(body["messages"][0]["content"][0]["text"], "hello");
+    }
+
+    #[tokio::test]
+    async fn openai_uses_bearer_auth_and_streams_events() {
+        let sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n",
+            "data: [DONE]\n"
+        );
+        let (base_url, captured) = serve_once("200 OK", "text/event-stream", sse).await;
+        let (tx, mut rx) = mpsc::channel(8);
+        openai_stream(&Client::new(), &base_url, "token", request(), tx)
+            .await
+            .unwrap();
+        assert!(matches!(rx.recv().await, Some(StreamEvent::TextDelta(text)) if text == "hello"));
+        assert!(matches!(
+            rx.recv().await,
+            Some(StreamEvent::MessageEnd { .. })
+        ));
+        let captured = captured.await.unwrap();
+        assert!(captured
+            .head
+            .to_ascii_lowercase()
+            .contains("authorization: bearer token"));
+        assert!(captured
+            .head
+            .starts_with("POST /v1/chat/completions HTTP/1.1"));
+    }
+
+    #[tokio::test]
+    async fn kimi_uses_native_request_reasoning_and_usage_contract() {
+        let sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"think\"}}]}\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"answer\"},\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":3}}]}\n",
+            "data: [DONE]\n"
+        );
+        let (base_url, captured) = serve_once("200 OK", "text/event-stream", sse).await;
+        let mut request = request();
+        request.thinking = Some(ThinkingParams { budget_tokens: 32 });
+        let (tx, mut rx) = mpsc::channel(8);
+        kimi_stream(
+            &Client::new(),
+            &format!("{base_url}/v1"),
+            "kimi-token",
+            request,
+            tx,
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(rx.recv().await, Some(StreamEvent::ThinkingDelta(text)) if text == "think")
+        );
+        assert!(matches!(rx.recv().await, Some(StreamEvent::TextDelta(text)) if text == "answer"));
+        assert!(
+            matches!(rx.recv().await, Some(StreamEvent::MessageEnd { usage }) if usage.input_tokens == 7 && usage.output_tokens == 3)
+        );
+        let captured = captured.await.unwrap();
+        assert!(captured
+            .head
+            .starts_with("POST /v1/chat/completions HTTP/1.1"));
+        let body: serde_json::Value = serde_json::from_str(&captured.body).unwrap();
+        assert_eq!(body["max_completion_tokens"], 128);
+        assert!(body.get("max_tokens").is_none());
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert_eq!(body["stream_options"]["include_usage"], true);
     }
 }

@@ -242,6 +242,7 @@ impl AppConfig {
                     | "kimi"
                     | "openai"
                     | "openai-responses"
+                    | "openai_responses"
                     | "responses"
                     | "openai-legacy"
                     | "openai-chat"

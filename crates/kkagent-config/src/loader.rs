@@ -24,15 +24,15 @@ pub fn load_config(path: Option<&Path>) -> Result<AppConfig> {
         AppConfig::default()
     } else {
         let content = std::fs::read_to_string(&config_path)
-            .with_context(|| format!("Failed to read config: {:?}", config_path))?;
+            .with_context(|| format!("Failed to read config: {config_path:?}"))?;
         toml::from_str(&content)
-            .with_context(|| format!("Failed to parse config: {:?}", config_path))?
+            .with_context(|| format!("Failed to parse config: {config_path:?}"))?
     };
 
     apply_env_overrides(&mut config);
     config
         .validate()
-        .with_context(|| format!("Invalid kkagent configuration: {:?}", config_path))?;
+        .with_context(|| format!("Invalid kkagent configuration: {config_path:?}"))?;
     Ok(config)
 }
 
@@ -59,8 +59,18 @@ fn apply_env_overrides(config: &mut AppConfig) {
     }
     if let Ok(key) = std::env::var("OPENAI_API_KEY") {
         for p in config.providers.values_mut() {
-            if (p.provider_type == "openai" || p.provider_type == "openai-responses")
-                && p.api_key.as_ref().map(|s| s.is_empty()).unwrap_or(true)
+            if matches!(
+                p.provider_type.as_str(),
+                "openai" | "openai-responses" | "openai_responses"
+            ) && p.api_key.as_ref().map(|s| s.is_empty()).unwrap_or(true)
+            {
+                p.api_key = Some(key.clone());
+            }
+        }
+    }
+    if let Ok(key) = std::env::var("KIMI_API_KEY") {
+        for p in config.providers.values_mut() {
+            if p.provider_type == "kimi" && p.api_key.as_ref().map(|s| s.is_empty()).unwrap_or(true)
             {
                 p.api_key = Some(key.clone());
             }

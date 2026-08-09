@@ -296,7 +296,9 @@ impl Session {
 
     pub fn add_user_message(&mut self, text: String) {
         let mut text = text;
-        // media pipeline: annotate @path mentions when files exist & within limits
+        let mut media_content = Vec::new();
+        // Resolve image mentions into real multimodal blocks. Invalid, oversized,
+        // and out-of-workspace paths stay as plain user text.
         let limits = crate::media_pipeline::MediaLimits::default();
         for p in crate::media_pipeline::extract_at_paths(&text) {
             let path = if PathBuf::from(&p).is_absolute() {
@@ -305,24 +307,38 @@ impl Session {
                 self.working_dir.join(&p)
             };
             match crate::media_pipeline::resolve_media(&path, &limits) {
-                Ok(m) => {
-                    text.push_str(&format!(
-                        "\n<media-ref path=\"{}\" kind=\"{:?}\" mime=\"{}\" bytes=\"{}\"/>",
-                        m.path.display(),
-                        m.kind,
-                        m.mime,
-                        m.bytes
-                    ));
+                Ok(m) if m.kind == crate::media_pipeline::MediaKind::Image => {
+                    match crate::media_pipeline::load_workspace_image(
+                        &path,
+                        &self.working_dir,
+                        &limits,
+                    ) {
+                        Ok(image) => {
+                            text.push_str(&format!(
+                                "\n<image-attached name=\"{}\" bytes=\"{}\"/>",
+                                m.path
+                                    .file_name()
+                                    .and_then(|name| name.to_str())
+                                    .unwrap_or("image"),
+                                m.bytes
+                            ));
+                            media_content.push(image);
+                        }
+                        Err(e) => tracing::debug!("image attach skipped for {p}: {e}"),
+                    }
                 }
+                Ok(_) => tracing::debug!("non-image media attach skipped for {p}"),
                 Err(e) => {
                     tracing::debug!("media resolve skipped for {p}: {e}");
                 }
             }
         }
         let _ = self.services.metadata.set_last_prompt(&text);
+        let mut content = vec![ChatContent::Text { text }];
+        content.extend(media_content);
         self.messages.push(ChatMessage {
             role: "user".into(),
-            content: vec![ChatContent::Text { text }],
+            content,
         });
     }
 

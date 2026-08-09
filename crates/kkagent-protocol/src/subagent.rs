@@ -120,7 +120,7 @@ impl SubagentManager {
         let mut agents = self.agents.lock().await;
         let agent = agents
             .get_mut(agent_id)
-            .ok_or_else(|| anyhow::anyhow!("Unknown task_id: {}", agent_id))?;
+            .ok_or_else(|| anyhow::anyhow!("Unknown task_id: {agent_id}"))?;
 
         match agent.status {
             SubagentStatus::Running | SubagentStatus::Pending => {
@@ -134,9 +134,7 @@ impl SubagentManager {
                 Ok(snapshot)
             }
             other => Err(anyhow::anyhow!(
-                "Task {} is not running (status={:?})",
-                agent_id,
-                other
+                "Task {agent_id} is not running (status={other:?})"
             )),
         }
     }
