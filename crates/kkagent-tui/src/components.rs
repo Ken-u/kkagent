@@ -254,8 +254,9 @@ fn render_messages(f: &mut Frame, area: Rect, state: &mut AppState, theme: &Them
     f.render_widget(paragraph, area);
 }
 
-fn build_transcript_lines(state: &AppState, theme: &Theme, width: u16) -> Vec<Line<'static>> {
+fn build_transcript_lines(state: &mut AppState, theme: &Theme, width: u16) -> Vec<Line<'static>> {
     let mut lines: Vec<Line> = Vec::new();
+    state.message_line_starts.clear();
 
     if state.messages.is_empty() {
         lines.push(Line::from(""));
@@ -296,6 +297,9 @@ fn build_transcript_lines(state: &AppState, theme: &Theme, width: u16) -> Vec<Li
     }
 
     for (msg_idx, msg) in state.messages.iter().enumerate() {
+        state
+            .message_line_starts
+            .push(lines.len().min(u16::MAX as usize) as u16);
         let highlight = state.highlight_message == Some(msg_idx);
         if highlight {
             lines.push(Line::from(Span::styled(
@@ -1917,11 +1921,11 @@ mod render_smoke {
 
     #[test]
     fn build_empty_transcript() {
-        let state = AppState::new(PermissionMode::Manual, false);
+        let mut state = AppState::new(PermissionMode::Manual, false);
         let theme = Theme::default();
-        let lines = build_transcript_lines(&state, &theme, 80);
+        let lines = build_transcript_lines(&mut state, &theme, 80);
         assert!(!lines.is_empty());
-        let lines2 = build_transcript_lines(&state, &theme, 1);
+        let lines2 = build_transcript_lines(&mut state, &theme, 1);
         assert!(!lines2.is_empty());
     }
 

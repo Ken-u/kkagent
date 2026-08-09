@@ -58,6 +58,15 @@ pub struct AppState {
     pub viewport_height: u16,
     /// When true, keep transcript pinned to the latest content.
     pub follow_bottom: bool,
+    /// Line index (from top) where each `messages[i]` starts — updated each frame.
+    pub message_line_starts: Vec<u16>,
+    /// Message index of the latest turn's output start (usually the user prompt).
+    pub last_turn_anchor_msg: Option<usize>,
+    /// Already snapped to `last_turn_anchor_msg` for the current bottom-view gesture.
+    pub scroll_snap_consumed: bool,
+    /// Burst tracking for flick vs gentle wheel detection.
+    pub scroll_burst_at: Option<std::time::Instant>,
+    pub scroll_burst_lines: i32,
     pub approx_tokens: u64,
     pub approval_pending: Option<PendingApproval>,
     /// AskUserQuestion panel
@@ -273,6 +282,11 @@ impl AppState {
             content_lines: 0,
             viewport_height: 0,
             follow_bottom: true,
+            message_line_starts: Vec::new(),
+            last_turn_anchor_msg: None,
+            scroll_snap_consumed: false,
+            scroll_burst_at: None,
+            scroll_burst_lines: 0,
             approx_tokens: 0,
             approval_pending: None,
             question_pending: None,
@@ -318,6 +332,70 @@ impl AppState {
             self.scroll_up = self.scroll_up.saturating_sub((-delta) as u16);
         }
         self.follow_bottom = self.scroll_up == 0;
+        if self.scroll_up == 0 {
+            self.scroll_snap_consumed = false;
+            self.scroll_burst_lines = 0;
+        }
+    }
+
+    /// `scroll_up` that places `messages[msg_idx]` at the top of the viewport.
+    pub fn scroll_up_for_message(&self, msg_idx: usize) -> Option<u16> {
+        let start = *self.message_line_starts.get(msg_idx)?;
+        let max = self.max_scroll_up();
+        Some(max.saturating_sub(start))
+    }
+
+    /// Wheel / trackpad scroll with flick-snap to the latest turn start.
+    ///
+    /// - Gentle isolated notches: normal line scroll.
+    /// - First quick burst while near the bottom: jump to `last_turn_anchor_msg`.
+    /// - Further scrolling after the snap: resume normal history scroll.
+    pub fn scroll_transcript(&mut self, delta: i32) {
+        const FLICK_WINDOW_MS: u128 = 140;
+        const FLICK_MIN_LINES: i32 = 6; // ≥2 wheel notches (3 lines each)
+        const NEAR_BOTTOM: u16 = 3;
+
+        let now = std::time::Instant::now();
+        if delta <= 0 {
+            // Downward / idle motion ends an upward flick burst.
+            self.scroll_burst_lines = 0;
+            self.scroll_burst_at = Some(now);
+            self.scroll_lines(delta);
+            return;
+        }
+
+        if let Some(last) = self.scroll_burst_at {
+            if now.duration_since(last).as_millis() > FLICK_WINDOW_MS {
+                self.scroll_burst_lines = 0;
+            }
+        }
+        self.scroll_burst_at = Some(now);
+        self.scroll_burst_lines = self.scroll_burst_lines.saturating_add(delta);
+
+        let near_bottom = self.scroll_up <= NEAR_BOTTOM;
+        let flick_up = self.scroll_burst_lines >= FLICK_MIN_LINES;
+
+        if flick_up && near_bottom && !self.scroll_snap_consumed {
+            if let Some(idx) = self.last_turn_anchor_msg {
+                if let Some(target) = self.scroll_up_for_message(idx) {
+                    // Only snap when it actually moves us past a small nudge.
+                    if target > self.scroll_up.saturating_add(NEAR_BOTTOM) {
+                        self.scroll_up = target.min(self.max_scroll_up());
+                        self.follow_bottom = false;
+                        self.scroll_snap_consumed = true;
+                        self.scroll_burst_lines = 0;
+                        return;
+                    }
+                }
+            }
+        }
+
+        self.scroll_lines(delta);
+    }
+
+    pub fn mark_turn_anchor(&mut self, msg_idx: usize) {
+        self.last_turn_anchor_msg = Some(msg_idx);
+        self.scroll_snap_consumed = false;
     }
 
     pub fn push_input_history(&mut self, text: &str) {
@@ -618,8 +696,8 @@ impl TuiApp {
 
     fn handle_mouse(&mut self, mouse: crossterm::event::MouseEvent) {
         match mouse.kind {
-            MouseEventKind::ScrollUp => self.state.scroll_lines(3),
-            MouseEventKind::ScrollDown => self.state.scroll_lines(-3),
+            MouseEventKind::ScrollUp => self.state.scroll_transcript(3),
+            MouseEventKind::ScrollDown => self.state.scroll_transcript(-3),
             MouseEventKind::Down(MouseButton::Left) => self.release_mouse_for_select(),
             _ => {}
         }
@@ -1530,6 +1608,8 @@ impl TuiApp {
             parts: Vec::new(),
             tool_calls: Vec::new(),
         });
+        self.state
+            .mark_turn_anchor(self.state.messages.len().saturating_sub(1));
         self.state.status = SessionStatus::Thinking;
         self.state.thinking_text.clear();
         self.state.scroll_up = 0;
@@ -2589,7 +2669,7 @@ fn slash_help_text() -> String {
   Tab           - Complete slash command\n\
   ↑↓            - Input history / slash menu\n\
   PgUp/PgDn     - Scroll transcript\n\
-  Mouse wheel   - Scroll transcript\n\
+  Mouse wheel   - Scroll transcript (quick flick snaps to this turn)\n\
   Click + drag  - Select/copy (releases mouse; next key restores scroll)\n\
   Esc           - Interrupt / dismiss; Esc Esc undo turn\n\
   Shift-Tab     - Toggle plan mode\n\
@@ -2941,4 +3021,63 @@ fn read_clipboard_text() -> anyhow::Result<String> {
         anyhow::bail!("clipboard command failed");
     }
     Ok(String::from_utf8(output.stdout)?)
+}
+
+#[cfg(test)]
+mod scroll_snap_tests {
+    use super::*;
+
+    fn state_with_anchor() -> AppState {
+        let mut state = AppState::new(PermissionMode::Manual, false);
+        state.content_lines = 200;
+        state.viewport_height = 20;
+        state.scroll_up = 0;
+        state.follow_bottom = true;
+        // message 0 at line 0, message 1 (latest turn) at line 150
+        state.message_line_starts = vec![0, 150];
+        state.last_turn_anchor_msg = Some(1);
+        state.scroll_snap_consumed = false;
+        state
+    }
+
+    #[test]
+    fn gentle_single_notch_does_not_snap() {
+        let mut state = state_with_anchor();
+        state.scroll_transcript(3);
+        assert_eq!(state.scroll_up, 3);
+        assert!(!state.scroll_snap_consumed);
+    }
+
+    #[test]
+    fn quick_burst_snaps_to_turn_anchor() {
+        let mut state = state_with_anchor();
+        state.scroll_transcript(3);
+        state.scroll_transcript(3); // burst = 6 within window
+        // max_scroll = 180; start=150 → scroll_up = 30
+        assert_eq!(state.scroll_up, 30);
+        assert!(state.scroll_snap_consumed);
+        assert!(!state.follow_bottom);
+    }
+
+    #[test]
+    fn second_flick_after_snap_scrolls_normally() {
+        let mut state = state_with_anchor();
+        state.scroll_transcript(3);
+        state.scroll_transcript(3);
+        let after_snap = state.scroll_up;
+        state.scroll_transcript(3);
+        state.scroll_transcript(3);
+        assert_eq!(state.scroll_up, after_snap + 6);
+    }
+
+    #[test]
+    fn returning_to_bottom_rearms_snap() {
+        let mut state = state_with_anchor();
+        state.scroll_transcript(3);
+        state.scroll_transcript(3);
+        assert!(state.scroll_snap_consumed);
+        state.scroll_lines(-(state.scroll_up as i32));
+        assert_eq!(state.scroll_up, 0);
+        assert!(!state.scroll_snap_consumed);
+    }
 }
