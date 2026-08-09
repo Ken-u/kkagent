@@ -82,6 +82,16 @@ fn fold_message(msg: &ChatMessage, opts: &ProjectOptions, fold_hard: bool) -> Ch
                 media_type: media_type.clone(),
                 data: data.clone(),
             }),
+            ChatContent::Video { .. } if fold_hard => None,
+            ChatContent::Video {
+                media_type,
+                path,
+                filename,
+            } => Some(ChatContent::Video {
+                media_type: media_type.clone(),
+                path: path.clone(),
+                filename: filename.clone(),
+            }),
             ChatContent::ToolUse { id, name, input } => {
                 let input = if fold_hard {
                     shrink_json(input, 400)

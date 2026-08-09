@@ -144,6 +144,35 @@ pub fn load_workspace_image(
     })
 }
 
+pub fn load_workspace_video(
+    path: &Path,
+    workspace: &Path,
+    limits: &MediaLimits,
+) -> anyhow::Result<ChatContent> {
+    let workspace = workspace.canonicalize()?;
+    let path = path.canonicalize()?;
+    if !path.starts_with(&workspace) {
+        anyhow::bail!(
+            "media path is outside the active workspace: {}",
+            path.display()
+        );
+    }
+    let media = resolve_media(&path, limits)?;
+    if media.kind != MediaKind::Video {
+        anyhow::bail!("unsupported video input: {}", path.display());
+    }
+    let filename = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow::anyhow!("video filename is not valid UTF-8"))?
+        .to_string();
+    Ok(ChatContent::Video {
+        media_type: media.mime,
+        path: path.to_string_lossy().into_owned(),
+        filename,
+    })
+}
+
 /// Extract `@path` media mentions from user text.
 pub fn extract_at_paths(text: &str) -> Vec<String> {
     let mut out = Vec::new();

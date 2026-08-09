@@ -77,6 +77,26 @@ enum Commands {
     },
     /// Serve Agent Client Protocol over stdio (IDE bridge)
     Acp,
+    /// Manage Kimi Code managed-account authentication
+    Auth {
+        #[command(subcommand)]
+        command: AuthCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum AuthCommands {
+    /// Sign in with the Kimi device-code flow and provision managed models
+    Login {
+        #[arg(long)]
+        oauth_host: Option<String>,
+        #[arg(long)]
+        base_url: Option<String>,
+    },
+    /// Remove the locally stored Kimi credential
+    Logout,
+    /// Show whether a Kimi credential is available
+    Status,
 }
 
 #[tokio::main]
@@ -86,7 +106,12 @@ async fn main() -> Result<()> {
     let is_tui = cli.command.is_none() && cli.prompt.is_none();
     init_logging(is_tui)?;
 
-    let config = load_config(cli.config.as_deref())?;
+    if let Some(Commands::Auth { command }) = &cli.command {
+        return run_auth(command, cli.config.as_deref()).await;
+    }
+
+    let mut config = load_config(cli.config.as_deref())?;
+    hydrate_provider_oauth(&mut config).await?;
 
     let permission_mode = if cli.auto {
         PermissionMode::Auto
@@ -113,6 +138,7 @@ async fn main() -> Result<()> {
             let server = kkagent_acp::AcpServer::with_host(Arc::new(AgentAcpHost { state }));
             server.serve_stdio().await
         }
+        Some(Commands::Auth { .. }) => unreachable!("auth handled before config startup"),
         None => {
             if let Some(prompt) = cli.prompt {
                 run_print_mode(config, prompt, permission_mode).await
@@ -147,6 +173,246 @@ fn init_logging(tui_mode: bool) -> Result<()> {
             .with_env_filter(filter)
             .with_writer(std::io::stderr)
             .init();
+    }
+    Ok(())
+}
+
+async fn run_auth(command: &AuthCommands, config_path: Option<&std::path::Path>) -> Result<()> {
+    let storage = kkagent_oauth::FileTokenStorage::for_key("kimi-code")?;
+    match command {
+        AuthCommands::Login {
+            oauth_host,
+            base_url,
+        } => {
+            let flow = kkagent_oauth::kimi_oauth_config(oauth_host.as_deref());
+            let device = kkagent_oauth::request_device_authorization(&flow).await?;
+            let verification = device
+                .verification_uri_complete
+                .as_deref()
+                .unwrap_or(&device.verification_uri);
+            println!("Open this URL to sign in:\n{verification}");
+            println!("Device code: {}", device.user_code);
+            let token = kkagent_oauth::poll_device_token(&flow, &device).await?;
+            storage.save(&token)?;
+            let base_url = base_url
+                .as_deref()
+                .unwrap_or(kkagent_oauth::DEFAULT_KIMI_CODE_BASE_URL);
+            provision_managed_kimi_config(
+                config_path.unwrap_or(&kkagent_config::default_config_path()),
+                base_url,
+                oauth_host.as_deref(),
+                &token.access_token,
+            )
+            .await?;
+            println!("Kimi login succeeded and managed models were written to config.");
+            Ok(())
+        }
+        AuthCommands::Logout => {
+            storage.clear()?;
+            println!("Kimi credential removed.");
+            Ok(())
+        }
+        AuthCommands::Status => {
+            let status = match storage.load() {
+                Some(token) if token.expires_at.is_some_and(|at| at <= chrono::Utc::now()) => {
+                    "expired"
+                }
+                Some(_) => "authenticated",
+                None => "not authenticated",
+            };
+            println!("Kimi OAuth: {status}");
+            Ok(())
+        }
+    }
+}
+
+async fn hydrate_provider_oauth(config: &mut AppConfig) -> Result<()> {
+    for (name, provider) in &mut config.providers {
+        let Some(oauth) = provider.oauth.as_ref() else {
+            continue;
+        };
+        if provider
+            .api_key
+            .as_deref()
+            .is_some_and(|key| !key.is_empty())
+        {
+            continue;
+        }
+        let storage = kkagent_oauth::FileTokenStorage::for_key(&oauth.key)?;
+        let token = kkagent_oauth::load_fresh_kimi_token(&storage, oauth.oauth_host.as_deref())
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "provider {name} requires Kimi OAuth login; run `kkagent auth login`"
+                )
+            })?;
+        provider.api_key = Some(token.access_token);
+        for (header, value) in kkagent_oauth::kimi_identity_headers() {
+            provider.custom_headers.entry(header).or_insert(value);
+        }
+    }
+    Ok(())
+}
+
+async fn provision_managed_kimi_config(
+    config_path: &std::path::Path,
+    base_url: &str,
+    oauth_host: Option<&str>,
+    access_token: &str,
+) -> Result<()> {
+    let base_url = base_url.trim_end_matches('/');
+    let mut request = reqwest::Client::new()
+        .get(format!("{base_url}/models"))
+        .bearer_auth(access_token)
+        .header("accept", "application/json");
+    for (name, value) in kkagent_oauth::kimi_identity_headers() {
+        request = request.header(name, value);
+    }
+    let response = request.send().await?;
+    let status = response.status();
+    let body = response.text().await?;
+    if !status.is_success() {
+        anyhow::bail!("Kimi model catalog failed with HTTP {status}: {body}");
+    }
+    let payload: serde_json::Value = serde_json::from_str(&body)?;
+    let models = payload
+        .get("data")
+        .and_then(|data| data.as_array())
+        .ok_or_else(|| anyhow::anyhow!("Kimi model catalog response has no data array"))?;
+    let mut config: AppConfig = if config_path.exists() {
+        toml::from_str(&std::fs::read_to_string(config_path)?)?
+    } else {
+        AppConfig::default()
+    };
+    let provider_name = "managed:kimi-code".to_string();
+    config.providers.insert(
+        provider_name.clone(),
+        kkagent_config::ProviderConfig {
+            provider_type: "kimi".into(),
+            api_key: None,
+            base_url: Some(base_url.into()),
+            custom_headers: HashMap::new(),
+            oauth: Some(kkagent_config::ProviderOAuthConfig {
+                storage: "file".into(),
+                key: "kimi-code".into(),
+                oauth_host: oauth_host.map(str::to_string),
+            }),
+        },
+    );
+    let mut first_alias = None;
+    for model in models {
+        let Some(id) = model.get("id").and_then(|id| id.as_str()) else {
+            continue;
+        };
+        let context_length = model
+            .get("context_length")
+            .and_then(|value| value.as_u64())
+            .filter(|value| *value > 0)
+            .ok_or_else(|| anyhow::anyhow!("Kimi model {id} has no positive context_length"))?;
+        let mut capabilities = Vec::new();
+        if model
+            .get("supports_tool_use")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(true)
+        {
+            capabilities.push("tool_use".into());
+        }
+        if model
+            .get("supports_reasoning")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false)
+        {
+            capabilities.push("thinking".into());
+        }
+        if model
+            .get("supports_image_in")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false)
+        {
+            capabilities.push("image_in".into());
+        }
+        if model
+            .get("supports_video_in")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false)
+        {
+            capabilities.push("video_in".into());
+        }
+        let alias = format!("kimi-code/{id}");
+        first_alias.get_or_insert_with(|| alias.clone());
+        config.models.insert(
+            alias,
+            kkagent_config::ModelConfig {
+                provider: provider_name.clone(),
+                model: id.into(),
+                max_context_size: Some(context_length),
+                max_output_size: None,
+                capabilities,
+                display_name: model
+                    .get("display_name")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string),
+                support_efforts: model
+                    .get("think_efforts")
+                    .and_then(|value| value.get("valid_efforts"))
+                    .and_then(|value| value.as_array())
+                    .map(|values| {
+                        values
+                            .iter()
+                            .filter_map(|value| value.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                default_effort: model
+                    .get("think_efforts")
+                    .and_then(|value| value.get("default_effort"))
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string),
+            },
+        );
+    }
+    let first_alias = first_alias.ok_or_else(|| anyhow::anyhow!("Kimi returned no models"))?;
+    if config.default_model.is_none()
+        || config
+            .default_model
+            .as_deref()
+            .is_some_and(|model| model.starts_with("kimi-code/"))
+    {
+        config.default_model = Some(first_alias);
+    }
+    config.validate()?;
+    if let Some(parent) = config_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    write_private_config(config_path, toml::to_string_pretty(&config)?.as_bytes())?;
+    Ok(())
+}
+
+fn write_private_config(path: &std::path::Path, contents: &[u8]) -> Result<()> {
+    let tmp = path.with_extension(format!(
+        "tmp-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    let mut options = std::fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&tmp)?;
+    use std::io::Write;
+    file.write_all(contents)?;
+    file.sync_all()?;
+    drop(file);
+    #[cfg(windows)]
+    if path.exists() {
+        std::fs::remove_file(path)?;
+    }
+    if let Err(error) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error.into());
     }
     Ok(())
 }
@@ -815,7 +1081,9 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
                             text
                         }
                         ChatContent::ToolResult { content, .. } => content,
-                        ChatContent::ToolUse { .. } | ChatContent::Image { .. } => continue,
+                        ChatContent::ToolUse { .. }
+                        | ChatContent::Image { .. }
+                        | ChatContent::Video { .. } => continue,
                     };
                     if text.to_lowercase().contains(&needle) {
                         hits.push(serde_json::json!({

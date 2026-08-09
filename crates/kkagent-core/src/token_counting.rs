@@ -79,6 +79,7 @@ impl TokenCounter {
                 // Provider image tokenization varies by model and detail mode.
                 // A conservative fixed estimate keeps compaction from ignoring it.
                 ChatContent::Image { .. } => 1_600,
+                ChatContent::Video { .. } => 4_000,
             };
         }
         n

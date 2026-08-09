@@ -51,6 +51,26 @@ pub struct ProviderConfig {
     pub base_url: Option<String>,
     #[serde(default)]
     pub custom_headers: HashMap<String, String>,
+    #[serde(default)]
+    pub oauth: Option<ProviderOAuthConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderOAuthConfig {
+    #[serde(default = "default_oauth_storage")]
+    pub storage: String,
+    #[serde(default = "default_kimi_oauth_key")]
+    pub key: String,
+    #[serde(default)]
+    pub oauth_host: Option<String>,
+}
+
+fn default_oauth_storage() -> String {
+    "file".into()
+}
+
+fn default_kimi_oauth_key() -> String {
+    "kimi-code".into()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -260,6 +280,14 @@ impl AppConfig {
                     anyhow::bail!("provider {name} base_url must use http or https");
                 }
             }
+            if let Some(oauth) = &provider.oauth {
+                if provider.provider_type != "kimi" {
+                    anyhow::bail!("provider {name} uses oauth but is not a Kimi provider");
+                }
+                if oauth.storage != "file" || oauth.key.trim().is_empty() {
+                    anyhow::bail!("provider {name} has an invalid oauth configuration");
+                }
+            }
         }
         for (alias, model) in &self.models {
             if model.model.trim().is_empty() {
@@ -336,6 +364,7 @@ mod tests {
                 api_key: None,
                 base_url: Some("https://example.test".into()),
                 custom_headers: HashMap::new(),
+                oauth: None,
             },
         );
         config.models.insert(

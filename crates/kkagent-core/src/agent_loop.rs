@@ -1522,6 +1522,7 @@ mod retry_tests {
                 api_key: Some("token".into()),
                 base_url: Some(base_url),
                 custom_headers: HashMap::new(),
+                oauth: None,
             },
         );
         config.models.insert(

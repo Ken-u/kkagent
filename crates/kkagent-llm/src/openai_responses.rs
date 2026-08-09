@@ -15,6 +15,7 @@ pub async fn openai_responses_stream(
     event_tx: mpsc::Sender<StreamEvent>,
 ) -> anyhow::Result<()> {
     let url = crate::stream::api_endpoint(base_url, "responses");
+    crate::stream::reject_video_inputs(&request, "OpenAI Responses")?;
 
     let mut input: Vec<serde_json::Value> = Vec::new();
     for m in &request.messages {
@@ -30,6 +31,7 @@ pub async fn openai_responses_stream(
                     "image_url": format!("data:{media_type};base64,{data}"),
                     "detail": "auto",
                 })),
+                ChatContent::Video { .. } => unreachable!("video inputs rejected above"),
                 ChatContent::Thinking { thinking } => texts.push(thinking.clone()),
                 ChatContent::ToolUse { id, name, input } => {
                     tool_calls.push(json!({

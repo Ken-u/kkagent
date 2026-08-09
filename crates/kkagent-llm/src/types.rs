@@ -16,6 +16,11 @@ pub enum ChatContent {
         media_type: String,
         data: String,
     },
+    Video {
+        media_type: String,
+        path: String,
+        filename: String,
+    },
     ToolUse {
         id: String,
         name: String,

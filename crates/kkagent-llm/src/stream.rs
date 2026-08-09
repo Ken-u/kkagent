@@ -13,6 +13,7 @@ pub async fn anthropic_stream(
     event_tx: mpsc::Sender<StreamEvent>,
 ) -> anyhow::Result<()> {
     let url = api_endpoint(base_url, "messages");
+    reject_video_inputs(&request, "Anthropic")?;
 
     let messages: Vec<serde_json::Value> = request
         .messages
@@ -24,6 +25,7 @@ pub async fn anthropic_stream(
                     "type": "image",
                     "source": {"type": "base64", "media_type": media_type, "data": data}
                 }),
+                ChatContent::Video { .. } => unreachable!("video inputs rejected above"),
                 ChatContent::ToolUse { id, name, input } => {
                     json!({"type": "tool_use", "id": id, "name": name, "input": input})
                 }
@@ -282,6 +284,22 @@ async fn chat_completions_stream(
                         "image_url": {"url": format!("data:{media_type};base64,{data}")}
                     }));
                 }
+                ChatContent::Video {
+                    media_type,
+                    path,
+                    filename,
+                } => {
+                    if !kimi {
+                        anyhow::bail!("video input requires the Kimi provider");
+                    }
+                    let file_id =
+                        upload_kimi_video(client, base_url, api_key, media_type, path, filename)
+                            .await?;
+                    media_parts.push(json!({
+                        "type": "video_url",
+                        "video_url": {"url": format!("ms://{file_id}"), "id": file_id}
+                    }));
+                }
                 ChatContent::Thinking { thinking } if kimi => {
                     thinking_parts.push(thinking.clone());
                 }
@@ -509,6 +527,7 @@ pub async fn google_stream(
     event_tx: mpsc::Sender<StreamEvent>,
 ) -> anyhow::Result<()> {
     // Google Generative Language API (streamGenerateContent)
+    reject_video_inputs(&request, "Google GenAI")?;
     let base = base_url.trim_end_matches('/');
     let url = format!(
         "{}/v1beta/models/{}:streamGenerateContent?alt=sse&key={}",
@@ -529,6 +548,7 @@ pub async fn google_stream(
                 ChatContent::Image { media_type, data } => parts.push(json!({
                     "inlineData": {"mimeType": media_type, "data": data}
                 })),
+                ChatContent::Video { .. } => unreachable!("video inputs rejected above"),
                 ChatContent::Thinking { thinking } => parts.push(json!({"text": thinking})),
                 ChatContent::ToolUse { id, name, input } => {
                     parts.push(json!({
@@ -698,6 +718,53 @@ fn update_openai_usage(usage: &mut TokenUsage, value: &serde_json::Value) {
         .unwrap_or(usage.cache_read_input_tokens);
 }
 
+pub(crate) fn reject_video_inputs(request: &LlmRequest, provider: &str) -> anyhow::Result<()> {
+    if request.messages.iter().any(|message| {
+        message
+            .content
+            .iter()
+            .any(|content| matches!(content, ChatContent::Video { .. }))
+    }) {
+        anyhow::bail!("{provider} provider does not support local video uploads");
+    }
+    Ok(())
+}
+
+async fn upload_kimi_video(
+    client: &Client,
+    base_url: &str,
+    api_key: &str,
+    media_type: &str,
+    path: &str,
+    filename: &str,
+) -> anyhow::Result<String> {
+    let bytes = tokio::fs::read(path).await?;
+    let part = reqwest::multipart::Part::bytes(bytes)
+        .file_name(filename.to_string())
+        .mime_str(media_type)?;
+    let response = client
+        .post(api_endpoint(base_url, "files"))
+        .bearer_auth(api_key)
+        .multipart(
+            reqwest::multipart::Form::new()
+                .text("purpose", "video")
+                .part("file", part),
+        )
+        .send()
+        .await?;
+    let status = response.status();
+    let body = response.text().await?;
+    if !status.is_success() {
+        anyhow::bail!("Kimi video upload failed with HTTP {status}: {body}");
+    }
+    serde_json::from_str::<serde_json::Value>(&body)?
+        .get("id")
+        .and_then(|id| id.as_str())
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| anyhow::anyhow!("Kimi video upload response did not contain a file id"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{anthropic_stream, kimi_stream, openai_stream, truncate_utf8};
@@ -714,6 +781,45 @@ mod tests {
         body: String,
     }
 
+    async fn capture_request(socket: &mut tokio::net::TcpStream) -> CapturedRequest {
+        let mut bytes = Vec::new();
+        let mut expected = None;
+        loop {
+            let mut chunk = [0_u8; 4096];
+            let count = socket.read(&mut chunk).await.unwrap();
+            if count == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&chunk[..count]);
+            if expected.is_none() {
+                if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&bytes[..end]);
+                    let length = head
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+                    expected = Some(end + 4 + length);
+                }
+            }
+            if expected.is_some_and(|length| bytes.len() >= length) {
+                break;
+            }
+        }
+        let header_end = bytes
+            .windows(4)
+            .position(|part| part == b"\r\n\r\n")
+            .unwrap();
+        CapturedRequest {
+            head: String::from_utf8_lossy(&bytes[..header_end]).into_owned(),
+            body: String::from_utf8_lossy(&bytes[header_end + 4..]).into_owned(),
+        }
+    }
+
     async fn serve_once(
         status: &str,
         content_type: &str,
@@ -728,42 +834,7 @@ mod tests {
         let (request_tx, request_rx) = oneshot::channel();
         tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
-            let mut bytes = Vec::new();
-            let mut expected = None;
-            loop {
-                let mut chunk = [0_u8; 4096];
-                let count = socket.read(&mut chunk).await.unwrap();
-                if count == 0 {
-                    break;
-                }
-                bytes.extend_from_slice(&chunk[..count]);
-                if expected.is_none() {
-                    if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
-                        let head = String::from_utf8_lossy(&bytes[..end]);
-                        let length = head
-                            .lines()
-                            .find_map(|line| {
-                                let (name, value) = line.split_once(':')?;
-                                name.eq_ignore_ascii_case("content-length")
-                                    .then(|| value.trim().parse::<usize>().ok())
-                                    .flatten()
-                            })
-                            .unwrap_or(0);
-                        expected = Some(end + 4 + length);
-                    }
-                }
-                if expected.is_some_and(|length| bytes.len() >= length) {
-                    break;
-                }
-            }
-            let header_end = bytes
-                .windows(4)
-                .position(|part| part == b"\r\n\r\n")
-                .unwrap();
-            let captured = CapturedRequest {
-                head: String::from_utf8_lossy(&bytes[..header_end]).into_owned(),
-                body: String::from_utf8_lossy(&bytes[header_end + 4..]).into_owned(),
-            };
+            let captured = capture_request(&mut socket).await;
             let _ = request_tx.send(captured);
             socket.write_all(response.as_bytes()).await.unwrap();
         });
@@ -899,6 +970,64 @@ mod tests {
         assert!(body.get("max_tokens").is_none());
         assert_eq!(body["thinking"]["type"], "enabled");
         assert_eq!(body["stream_options"]["include_usage"], true);
+    }
+
+    #[tokio::test]
+    async fn kimi_uploads_video_then_uses_ms_file_reference() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let (capture_tx, capture_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let (mut upload_socket, _) = listener.accept().await.unwrap();
+            let upload = capture_request(&mut upload_socket).await;
+            let upload_body = r#"{"id":"file-1"}"#;
+            let upload_response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{upload_body}",
+                upload_body.len()
+            );
+            upload_socket
+                .write_all(upload_response.as_bytes())
+                .await
+                .unwrap();
+
+            let (mut chat_socket, _) = listener.accept().await.unwrap();
+            let chat = capture_request(&mut chat_socket).await;
+            let sse = "data: [DONE]\n";
+            let chat_response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{sse}",
+                sse.len()
+            );
+            chat_socket
+                .write_all(chat_response.as_bytes())
+                .await
+                .unwrap();
+            let _ = capture_tx.send((upload, chat));
+        });
+
+        let video_path = std::env::temp_dir().join(format!("kkagent-{}.mp4", uuid::Uuid::new_v4()));
+        std::fs::write(&video_path, b"fake-video-payload").unwrap();
+        let mut request = request();
+        request.messages[0].content.push(ChatContent::Video {
+            media_type: "video/mp4".into(),
+            path: video_path.to_string_lossy().into_owned(),
+            filename: "clip.mp4".into(),
+        });
+        let (tx, _rx) = mpsc::channel(8);
+        kimi_stream(&Client::new(), &base_url, "kimi-token", request, tx)
+            .await
+            .unwrap();
+        let (upload, chat) = capture_rx.await.unwrap();
+        assert!(upload.head.starts_with("POST /v1/files HTTP/1.1"));
+        assert!(upload.body.contains("name=\"purpose\""));
+        assert!(upload.body.contains("video"));
+        assert!(upload.body.contains("fake-video-payload"));
+        assert!(chat.head.starts_with("POST /v1/chat/completions HTTP/1.1"));
+        let body: serde_json::Value = serde_json::from_str(&chat.body).unwrap();
+        let content = body["messages"][1]["content"].as_array().unwrap();
+        assert!(content.iter().any(|part| {
+            part["type"] == "video_url" && part["video_url"]["url"] == "ms://file-1"
+        }));
+        std::fs::remove_file(video_path).unwrap();
     }
 
     #[tokio::test]

@@ -1,6 +1,6 @@
 # kkagent 与 ref/kimi-code 功能差距清单
 
-> 核对更新（2026-08-09）：Kimi OpenAI-compatible provider 已按专用方言落地；托管账号 OAuth 与视频 Files API 仍待完成。
+> 核对更新（2026-08-09）：Kimi 专用方言、视频 Files API 与托管账号 OAuth 已落地。
 
 ## 一、工具集（Tools）
 
@@ -51,7 +51,7 @@
 ## 六、仍需完成
 
 - [x] **Kimi 专用 provider**（`max_completion_tokens`、thinking/reasoning、Moonshot usage 方言）
-- [ ] **Kimi 视频 Files API / 托管账号 OAuth identity**
+- [x] **Kimi 视频 Files API / 托管账号 OAuth identity**（device code、自动刷新、私有原子存储、模型目录配置）
 
 ## 七、验证
 

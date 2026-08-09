@@ -12,7 +12,9 @@ pub fn is_vacuous_part(part: &ChatContent) -> bool {
         ChatContent::Text { text } => is_vacuous_text(text),
         ChatContent::Thinking { thinking } => is_vacuous_text(thinking),
         ChatContent::ToolResult { content, .. } => is_vacuous_text(content),
-        ChatContent::ToolUse { .. } | ChatContent::Image { .. } => false,
+        ChatContent::ToolUse { .. } | ChatContent::Image { .. } | ChatContent::Video { .. } => {
+            false
+        }
     }
 }
 

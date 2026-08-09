@@ -223,6 +223,18 @@ RUST_LOG=kkagent_core=info,kkagent_llm=debug \
   ./target/release/kkagent --config ~/.kkagent/config.toml -p "Say hello"
 ```
 
+### Kimi 托管账号登录
+
+```bash
+kkagent auth login
+kkagent auth status
+kkagent auth logout
+```
+
+登录使用 Kimi device-code OAuth。凭据以 `0600` 权限原子写入
+`~/.kkagent/credentials/kimi-code.json`，访问令牌过期前会自动刷新；登录成功后会从
+Kimi managed `/models` 拉取模型并更新 `~/.kkagent/config.toml`（使用 `--config` 时更新指定文件）。
+
 TUI 模式下日志**不会**打印到屏幕（避免破坏布局），而是追加写入：
 
 ```text

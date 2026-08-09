@@ -327,6 +327,26 @@ impl Session {
                         Err(e) => tracing::debug!("image attach skipped for {p}: {e}"),
                     }
                 }
+                Ok(m) if m.kind == crate::media_pipeline::MediaKind::Video => {
+                    match crate::media_pipeline::load_workspace_video(
+                        &path,
+                        &self.working_dir,
+                        &limits,
+                    ) {
+                        Ok(video) => {
+                            text.push_str(&format!(
+                                "\n<video-attached name=\"{}\" bytes=\"{}\"/>",
+                                m.path
+                                    .file_name()
+                                    .and_then(|name| name.to_str())
+                                    .unwrap_or("video"),
+                                m.bytes
+                            ));
+                            media_content.push(video);
+                        }
+                        Err(e) => tracing::debug!("video attach skipped for {p}: {e}"),
+                    }
+                }
                 Ok(_) => tracing::debug!("non-image media attach skipped for {p}"),
                 Err(e) => {
                     tracing::debug!("media resolve skipped for {p}: {e}");
