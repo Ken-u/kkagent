@@ -1,30 +1,30 @@
+use anyhow::Result;
+use clap::{Parser, Subcommand};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
-use std::collections::HashMap;
-use clap::{Parser, Subcommand};
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::AbortHandle;
-use anyhow::Result;
 
+use kkagent_client::KkagentClient;
 use kkagent_config::{load_config, AppConfig};
-use kkagent_protocol::{Frame, PermissionMode, AgentEvent};
-use kkagent_protocol::subagent::SubagentManager;
-use kkagent_rpc::{RpcClient, RpcServer, transport::memory::create_memory_pair};
-use kkagent_llm::{ChatMessage, ChatContent};
+use kkagent_core::SubagentMirrorContext;
 use kkagent_core::{
     AgentLoop, PermissionChain, Session, SessionCloseReason, SessionCreateSource, SessionStore,
     TranscriptDb,
 };
-use kkagent_tools::ToolRegistry;
-use kkagent_mcp::{McpManager, register_mcp_tools};
-use kkagent_client::KkagentClient;
-use kkagent_tui::TuiApp;
 use kkagent_di::ServiceContainer;
+use kkagent_llm::{ChatContent, ChatMessage};
+use kkagent_mcp::{register_mcp_tools, McpManager};
+use kkagent_protocol::subagent::SubagentManager;
+use kkagent_protocol::{AgentEvent, Frame, PermissionMode};
+use kkagent_rpc::{transport::memory::create_memory_pair, RpcClient, RpcServer};
 use kkagent_telemetry::{
     CloudAppender, CloudAppenderOptions, ConsoleAppender, FileAppender, TelemetryService,
 };
-use kkagent_core::SubagentMirrorContext;
+use kkagent_tools::ToolRegistry;
+use kkagent_tui::TuiApp;
 
 #[derive(Parser)]
 #[command(name = "kkagent", version, about = "AI coding agent for your terminal")]
@@ -93,7 +93,10 @@ async fn main() -> Result<()> {
     } else if cli.yolo {
         PermissionMode::Yolo
     } else {
-        config.effective_permission_mode().parse().unwrap_or(PermissionMode::Manual)
+        config
+            .effective_permission_mode()
+            .parse()
+            .unwrap_or(PermissionMode::Manual)
     };
 
     match cli.command {
@@ -185,7 +188,11 @@ async fn run_tui(
     result
 }
 
-async fn run_print_mode(config: AppConfig, prompt: String, permission_mode: PermissionMode) -> Result<()> {
+async fn run_print_mode(
+    config: AppConfig,
+    prompt: String,
+    permission_mode: PermissionMode,
+) -> Result<()> {
     let (client_stream, server_stream) = create_memory_pair();
     let (event_tx, event_rx) = mpsc::channel::<Frame>(256);
     let rpc_client = RpcClient::new(client_stream, event_tx);
@@ -197,7 +204,9 @@ async fn run_print_mode(config: AppConfig, prompt: String, permission_mode: Perm
 
     let mut client = KkagentClient::new(rpc_client, event_rx);
     let cwd = std::env::current_dir()?.to_string_lossy().to_string();
-    let session_id = client.create_session(Some(&cwd), Some(permission_mode)).await?;
+    let session_id = client
+        .create_session(Some(&cwd), Some(permission_mode))
+        .await?;
     client.send_prompt(&session_id, &prompt).await?;
 
     while let Some(frame) = client.event_rx.recv().await {
@@ -209,18 +218,19 @@ async fn run_print_mode(config: AppConfig, prompt: String, permission_mode: Perm
                     }
                     AgentEvent::TurnEnd { .. } => {
                         println!();
-                        break;
+                        return Ok(());
                     }
                     AgentEvent::Error { message, .. } => {
-                        eprintln!("Error: {}", message);
-                        break;
+                        return Err(anyhow::anyhow!("Agent turn failed: {message}"));
                     }
                     _ => {}
                 }
             }
         }
     }
-    Ok(())
+    Err(anyhow::anyhow!(
+        "Agent event stream closed before the turn completed"
+    ))
 }
 
 async fn run_server(
@@ -240,8 +250,9 @@ async fn run_server(
     let state = build_server_state(config_arc.clone()).await;
 
     if let Some(addr) = http {
-        let backend: Arc<dyn kkagent_rpc::HttpBackend> =
-            Arc::new(AgentHttpBackend { state: state.clone() });
+        let backend: Arc<dyn kkagent_rpc::HttpBackend> = Arc::new(AgentHttpBackend {
+            state: state.clone(),
+        });
         let token = http_token;
         tokio::spawn(async move {
             if let Err(e) = kkagent_rpc::serve_http_with_backend(&addr, backend, token).await {
@@ -311,7 +322,12 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
             .default_model_alias()
             .unwrap_or("default")
             .to_string();
-        let mut session = Session::new(id.clone(), cwd.clone(), PermissionMode::Manual, model.clone());
+        let mut session = Session::new(
+            id.clone(),
+            cwd.clone(),
+            PermissionMode::Manual,
+            model.clone(),
+        );
         if let Some(ref t) = title {
             let _ = session.set_title_persisted(t.clone());
         }
@@ -518,9 +534,7 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
 
 async fn run_http_turn(state: Arc<ServerState>, session_id: &str) -> anyhow::Result<()> {
     let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(64);
-    tokio::spawn(async move {
-        while let Some(_ev) = event_rx.recv().await {}
-    });
+    tokio::spawn(async move { while let Some(_ev) = event_rx.recv().await {} });
 
     let mut session = {
         let mut sessions = state.sessions.lock().await;
@@ -630,7 +644,10 @@ async fn build_server_state(config: Arc<AppConfig>) -> Arc<ServerState> {
                     tracing::error!("Failed to open in-memory transcript: {}", e2);
                     let tmp = std::env::temp_dir().join("kkagent-transcripts.db");
                     TranscriptDb::open(&tmp).unwrap_or_else(|e3| {
-                        panic!("Cannot open transcript DB (file={}, mem={}, tmp={})", e, e2, e3);
+                        panic!(
+                            "Cannot open transcript DB (file={}, mem={}, tmp={})",
+                            e, e2, e3
+                        );
                     })
                 }
             }
@@ -673,7 +690,12 @@ async fn build_server_state(config: Arc<AppConfig>) -> Arc<ServerState> {
                 let due = cron_bg.take_due().await;
                 for (id, prompt) in due {
                     let xml = kkagent_tools::render_cron_fire_xml(
-                        &id, "scheduled", &prompt, false, 1, false,
+                        &id,
+                        "scheduled",
+                        &prompt,
+                        false,
+                        1,
+                        false,
                     );
                     tracing::info!(
                         "Cron job {} due: {}",
@@ -702,16 +724,14 @@ async fn build_server_state(config: Arc<AppConfig>) -> Arc<ServerState> {
         )))
         .await;
     let mut cloud_opts = CloudAppenderOptions::default();
-    cloud_opts.device_id = std::env::var("KKAGENT_DEVICE_ID")
-        .unwrap_or_else(|_| uuid::Uuid::new_v4().to_string());
+    cloud_opts.device_id =
+        std::env::var("KKAGENT_DEVICE_ID").unwrap_or_else(|_| uuid::Uuid::new_v4().to_string());
     cloud_opts.model = config.default_model.clone();
     if std::env::var("KKAGENT_TELEMETRY_CLOUD")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
     {
-        telemetry
-            .add_appender(CloudAppender::new(cloud_opts))
-            .await;
+        telemetry.add_appender(CloudAppender::new(cloud_opts)).await;
     }
     let _ = di_root.register_instance(telemetry.clone());
     let _ = di_root.register_instance(config.clone());
@@ -800,9 +820,7 @@ fn persist_session_messages(db: &TranscriptDb, session: &mut Session) {
     }
 }
 
-fn messages_from_records(
-    records: &[kkagent_core::transcript::MessageRecord],
-) -> Vec<ChatMessage> {
+fn messages_from_records(records: &[kkagent_core::transcript::MessageRecord]) -> Vec<ChatMessage> {
     records
         .iter()
         .filter_map(|r| {
@@ -880,17 +898,29 @@ async fn handle_rpc_call(
     match method {
         "sessions.create" => {
             let session_id = uuid::Uuid::new_v4().to_string();
-            let workspace = params.as_ref()
+            let workspace = params
+                .as_ref()
                 .and_then(|p| p.get("workspace"))
                 .and_then(|v| v.as_str())
                 .unwrap_or(".")
                 .to_string();
-            let perm_mode: PermissionMode = params.as_ref()
+            let perm_mode: PermissionMode = params
+                .as_ref()
                 .and_then(|p| p.get("permission_mode"))
                 .and_then(|v| serde_json::from_value(v.clone()).ok())
-                .unwrap_or_else(|| state.config.effective_permission_mode().parse().unwrap_or_default());
+                .unwrap_or_else(|| {
+                    state
+                        .config
+                        .effective_permission_mode()
+                        .parse()
+                        .unwrap_or_default()
+                });
 
-            let model_alias = state.config.default_model_alias().unwrap_or("default").to_string();
+            let model_alias = state
+                .config
+                .default_model_alias()
+                .unwrap_or("default")
+                .to_string();
 
             let mut session = Session::new(
                 session_id.clone(),
@@ -930,25 +960,33 @@ async fn handle_rpc_call(
                 }
             }
 
-            state.interrupt_flags.lock().await.insert(
-                session_id.clone(),
-                session.interrupted.clone(),
-            );
-            state.model_aliases.lock().await.insert(
-                session_id.clone(),
-                session.model_alias.clone(),
-            );
-            state.approval_txs.lock().await.insert(
-                session_id.clone(),
-                session.approval_tx.clone(),
-            );
-            state.question_txs.lock().await.insert(
-                session_id.clone(),
-                session.question_tx.clone(),
-            );
+            state
+                .interrupt_flags
+                .lock()
+                .await
+                .insert(session_id.clone(), session.interrupted.clone());
+            state
+                .model_aliases
+                .lock()
+                .await
+                .insert(session_id.clone(), session.model_alias.clone());
+            state
+                .approval_txs
+                .lock()
+                .await
+                .insert(session_id.clone(), session.approval_tx.clone());
+            state
+                .question_txs
+                .lock()
+                .await
+                .insert(session_id.clone(), session.question_tx.clone());
             session.services.on_created().await;
             let session_dir = session.session_dir().display().to_string();
-            state.sessions.lock().await.insert(session_id.clone(), session);
+            state
+                .sessions
+                .lock()
+                .await
+                .insert(session_id.clone(), session);
             let _ = state
                 .hooks
                 .fire(
@@ -965,7 +1003,8 @@ async fn handle_rpc_call(
             }))
         }
         "sessions.list" => {
-            let limit = params.as_ref()
+            let limit = params
+                .as_ref()
                 .and_then(|p| p.get("limit"))
                 .and_then(|v| v.as_u64())
                 .unwrap_or(20) as usize;
@@ -998,7 +1037,9 @@ async fn handle_rpc_call(
                 }
             }
             let db = state.transcript.lock().await;
-            let sessions = db.list_sessions(limit).map_err(|e| (-32000, e.to_string()))?;
+            let sessions = db
+                .list_sessions(limit)
+                .map_err(|e| (-32000, e.to_string()))?;
             let list: Vec<_> = sessions
                 .into_iter()
                 .map(|s| {
@@ -1064,10 +1105,7 @@ async fn handle_rpc_call(
             if let Some(session) = state.sessions.lock().await.get_mut(session_id) {
                 let _ = session.services.metadata.set_archived(archived);
                 if archived {
-                    session
-                        .services
-                        .on_close(SessionCloseReason::Archive)
-                        .await;
+                    session.services.on_close(SessionCloseReason::Archive).await;
                 }
             }
             Ok(serde_json::json!({"session_id": session_id, "archived": archived}))
@@ -1118,7 +1156,8 @@ async fn handle_rpc_call(
             }))
         }
         "session.resume" => {
-            let query = params.as_ref()
+            let query = params
+                .as_ref()
                 .and_then(|p| p.get("session_id"))
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| (-32602, "Missing session_id".into()))?
@@ -1164,7 +1203,11 @@ async fn handle_rpc_call(
                 PathBuf::from(&record.working_dir),
                 perm_mode,
                 if record.model.is_empty() {
-                    state.config.default_model_alias().unwrap_or("default").to_string()
+                    state
+                        .config
+                        .default_model_alias()
+                        .unwrap_or("default")
+                        .to_string()
                 } else {
                     record.model.clone()
                 },
@@ -1186,23 +1229,31 @@ async fn handle_rpc_call(
             session.services.create_source = SessionCreateSource::Resume;
             session.services.on_created().await;
 
-            state.interrupt_flags.lock().await.insert(
-                session_id.clone(),
-                session.interrupted.clone(),
-            );
-            state.model_aliases.lock().await.insert(
-                session_id.clone(),
-                session.model_alias.clone(),
-            );
-            state.approval_txs.lock().await.insert(
-                session_id.clone(),
-                session.approval_tx.clone(),
-            );
-            state.question_txs.lock().await.insert(
-                session_id.clone(),
-                session.question_tx.clone(),
-            );
-            state.sessions.lock().await.insert(session_id.clone(), session);
+            state
+                .interrupt_flags
+                .lock()
+                .await
+                .insert(session_id.clone(), session.interrupted.clone());
+            state
+                .model_aliases
+                .lock()
+                .await
+                .insert(session_id.clone(), session.model_alias.clone());
+            state
+                .approval_txs
+                .lock()
+                .await
+                .insert(session_id.clone(), session.approval_tx.clone());
+            state
+                .question_txs
+                .lock()
+                .await
+                .insert(session_id.clone(), session.question_tx.clone());
+            state
+                .sessions
+                .lock()
+                .await
+                .insert(session_id.clone(), session);
 
             Ok(serde_json::json!({
                 "session_id": session_id,
@@ -1213,12 +1264,14 @@ async fn handle_rpc_call(
             }))
         }
         "session.prompt" => {
-            let session_id = params.as_ref()
+            let session_id = params
+                .as_ref()
                 .and_then(|p| p.get("session_id"))
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| (-32602, "Missing session_id".into()))?
                 .to_string();
-            let text = params.as_ref()
+            let text = params
+                .as_ref()
                 .and_then(|p| p.get("text"))
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| (-32602, "Missing text".into()))?
@@ -1237,19 +1290,19 @@ async fn handle_rpc_call(
                         session.add_user_message(xml);
                     }
                     // Media @path refs → blob store note.
-                    let media_refs =
-                        kkagent_core::resolve_media_refs(&text, &session.working_dir);
+                    let media_refs = kkagent_core::resolve_media_refs(&text, &session.working_dir);
                     if !media_refs.is_empty() {
                         let store = kkagent_core::BlobStore::session_store(&session.working_dir);
                         let mut note = String::from("<system-reminder>\nAttached media paths:\n");
                         for p in media_refs {
                             if let Ok(bytes) = std::fs::read(&p) {
-                                let ext = p
-                                    .extension()
-                                    .and_then(|e| e.to_str())
-                                    .unwrap_or("bin");
+                                let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("bin");
                                 if let Ok((id, path)) = store.put(&bytes, ext).await {
-                                    note.push_str(&format!("- {} → blob:{id} ({})\n", p.display(), path.display()));
+                                    note.push_str(&format!(
+                                        "- {} → blob:{id} ({})\n",
+                                        p.display(),
+                                        path.display()
+                                    ));
                                 }
                             }
                         }
@@ -1284,8 +1337,10 @@ async fn handle_rpc_call(
                             let _ = db.append_message(&session_id, &msg.role, &content_json, None);
                         }
                         if new_title.is_none() {
-                            if let Some(ChatContent::Text { text }) =
-                                pending.iter().find(|m| m.role == "user").and_then(|m| m.content.first())
+                            if let Some(ChatContent::Text { text }) = pending
+                                .iter()
+                                .find(|m| m.role == "user")
+                                .and_then(|m| m.content.first())
                             {
                                 let t: String = text.chars().take(60).collect();
                                 let _ = db.set_title(&session_id, &t);
@@ -1423,11 +1478,7 @@ async fn handle_rpc_call(
                     );
                     match run.await {
                         Ok(result) => {
-                            tracing::info!(
-                                "Subagent {} complete ({} chars)",
-                                id,
-                                result.len()
-                            );
+                            tracing::info!("Subagent {} complete ({} chars)", id, result.len());
                             mgr.complete(&id, result).await;
                         }
                         Err(e) => {
@@ -1494,10 +1545,17 @@ async fn handle_rpc_call(
                 state.cron.clone(),
             )));
 
-            let permission_rules = state.config.permission.as_ref()
+            let permission_rules = state
+                .config
+                .permission
+                .as_ref()
                 .map(|p| p.rules.clone())
                 .unwrap_or_default();
-            let perm_mode: PermissionMode = state.config.effective_permission_mode().parse().unwrap_or_default();
+            let perm_mode: PermissionMode = state
+                .config
+                .effective_permission_mode()
+                .parse()
+                .unwrap_or_default();
             let permission = PermissionChain::new(perm_mode, permission_rules);
 
             let agent_loop = Arc::new(
@@ -1530,10 +1588,12 @@ async fn handle_rpc_call(
 
                 if let Err(e) = agent_loop.run_turn(&mut session).await {
                     tracing::error!("Agent loop error: {}", e);
-                    let _ = agent_event_tx.send(AgentEvent::Error {
-                        session_id: sid.clone(),
-                        message: e.to_string(),
-                    }).await;
+                    let _ = agent_event_tx
+                        .send(AgentEvent::Error {
+                            session_id: sid.clone(),
+                            message: e.to_string(),
+                        })
+                        .await;
                 }
 
                 {
@@ -1547,7 +1607,8 @@ async fn handle_rpc_call(
             Ok(serde_json::json!({"ok": true}))
         }
         "session.interrupt" => {
-            let session_id = params.as_ref()
+            let session_id = params
+                .as_ref()
                 .and_then(|p| p.get("session_id"))
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| (-32602, "Missing session_id".into()))?
@@ -1575,12 +1636,14 @@ async fn handle_rpc_call(
             Ok(serde_json::json!({"ok": true}))
         }
         "session.set_permission_mode" => {
-            let session_id = params.as_ref()
+            let session_id = params
+                .as_ref()
                 .and_then(|p| p.get("session_id"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            let mode: PermissionMode = params.as_ref()
+            let mode: PermissionMode = params
+                .as_ref()
                 .and_then(|p| p.get("mode"))
                 .and_then(|v| serde_json::from_value(v.clone()).ok())
                 .unwrap_or_default();
@@ -1591,12 +1654,14 @@ async fn handle_rpc_call(
             Ok(serde_json::json!({"ok": true}))
         }
         "session.set_plan_mode" => {
-            let session_id = params.as_ref()
+            let session_id = params
+                .as_ref()
                 .and_then(|p| p.get("session_id"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            let enabled = params.as_ref()
+            let enabled = params
+                .as_ref()
                 .and_then(|p| p.get("enabled"))
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
@@ -1612,12 +1677,14 @@ async fn handle_rpc_call(
             Ok(serde_json::json!({"ok": true}))
         }
         "session.set_model" => {
-            let session_id = params.as_ref()
+            let session_id = params
+                .as_ref()
                 .and_then(|p| p.get("session_id"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            let model = params.as_ref()
+            let model = params
+                .as_ref()
                 .and_then(|p| p.get("model"))
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| (-32602, "Missing model".into()))?
@@ -1642,12 +1709,14 @@ async fn handle_rpc_call(
             Ok(serde_json::json!({"ok": true, "model": model}))
         }
         "session.set_title" => {
-            let session_id = params.as_ref()
+            let session_id = params
+                .as_ref()
                 .and_then(|p| p.get("session_id"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            let title = params.as_ref()
+            let title = params
+                .as_ref()
                 .and_then(|p| p.get("title"))
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| (-32602, "Missing title".into()))?
@@ -1663,12 +1732,14 @@ async fn handle_rpc_call(
             Ok(serde_json::json!({"ok": true, "title": title}))
         }
         "session.undo" => {
-            let session_id = params.as_ref()
+            let session_id = params
+                .as_ref()
                 .and_then(|p| p.get("session_id"))
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| (-32602, "Missing session_id".into()))?
                 .to_string();
-            let count = params.as_ref()
+            let count = params
+                .as_ref()
                 .and_then(|p| p.get("count"))
                 .and_then(|v| v.as_u64())
                 .unwrap_or(1) as usize;
@@ -1717,12 +1788,14 @@ async fn handle_rpc_call(
             Ok(serde_json::json!({"plugins": list}))
         }
         "session.compact" => {
-            let session_id = params.as_ref()
+            let session_id = params
+                .as_ref()
                 .and_then(|p| p.get("session_id"))
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| (-32602, "Missing session_id".into()))?
                 .to_string();
-            let keep_last = params.as_ref()
+            let keep_last = params
+                .as_ref()
                 .and_then(|p| p.get("keep_last"))
                 .and_then(|v| v.as_u64())
                 .unwrap_or(6) as usize;
@@ -1755,7 +1828,10 @@ async fn handle_rpc_call(
                         .collect::<Vec<_>>()
                         .join(" ");
                     if !text.is_empty() {
-                        digest.push_str(&format!("[{role}] {}\n", text.chars().take(500).collect::<String>()));
+                        digest.push_str(&format!(
+                            "[{role}] {}\n",
+                            text.chars().take(500).collect::<String>()
+                        ));
                     }
                 }
                 digest
@@ -1907,7 +1983,9 @@ async fn handle_rpc_call(
         }
         "approval.respond" => {
             if let Some(params) = params {
-                if let Ok(response) = serde_json::from_value::<kkagent_protocol::ApprovalResponse>(params.clone()) {
+                if let Ok(response) =
+                    serde_json::from_value::<kkagent_protocol::ApprovalResponse>(params.clone())
+                {
                     // Prefer session_id from params if present
                     let session_id = params
                         .get("session_id")
@@ -1954,8 +2032,6 @@ async fn handle_rpc_call(
             }
             Err((-32602, "Invalid question response".into()))
         }
-        _ => {
-            Err((-32601, format!("Method not found: {}", method)))
-        }
+        _ => Err((-32601, format!("Method not found: {}", method))),
     }
 }

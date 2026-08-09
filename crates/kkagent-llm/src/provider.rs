@@ -43,16 +43,13 @@ impl LlmProvider for AnthropicProvider {
         request: LlmRequest,
         event_tx: mpsc::Sender<StreamEvent>,
     ) -> anyhow::Result<()> {
-        with_retries(3, || {
-            let client = self.client.clone();
-            let base = self.base_url.clone();
-            let key = self.api_key.clone();
-            let req = request.clone();
-            let tx = event_tx.clone();
-            async move {
-                crate::stream::anthropic_stream(&client, &base, &key, req, tx).await
-            }
-        })
+        crate::stream::anthropic_stream(
+            &self.client,
+            &self.base_url,
+            &self.api_key,
+            request,
+            event_tx,
+        )
         .await
     }
 }
@@ -97,25 +94,26 @@ impl LlmProvider for OpenAiProvider {
         request: LlmRequest,
         event_tx: mpsc::Sender<StreamEvent>,
     ) -> anyhow::Result<()> {
-        let use_responses =
-            self.responses || crate::catalog::prefers_responses_api(&request.model);
-        with_retries(3, || {
-            let client = self.client.clone();
-            let base = self.base_url.clone();
-            let key = self.api_key.clone();
-            let req = request.clone();
-            let tx = event_tx.clone();
-            let responses = use_responses;
-            async move {
-                if responses {
-                    crate::openai_responses::openai_responses_stream(&client, &base, &key, req, tx)
-                        .await
-                } else {
-                    crate::stream::openai_stream(&client, &base, &key, req, tx).await
-                }
-            }
-        })
-        .await
+        let use_responses = self.responses || crate::catalog::prefers_responses_api(&request.model);
+        if use_responses {
+            crate::openai_responses::openai_responses_stream(
+                &self.client,
+                &self.base_url,
+                &self.api_key,
+                request,
+                event_tx,
+            )
+            .await
+        } else {
+            crate::stream::openai_stream(
+                &self.client,
+                &self.base_url,
+                &self.api_key,
+                request,
+                event_tx,
+            )
+            .await
+        }
     }
 }
 
@@ -148,14 +146,13 @@ impl LlmProvider for GoogleProvider {
         request: LlmRequest,
         event_tx: mpsc::Sender<StreamEvent>,
     ) -> anyhow::Result<()> {
-        with_retries(3, || {
-            let client = self.client.clone();
-            let base = self.base_url.clone();
-            let key = self.api_key.clone();
-            let req = request.clone();
-            let tx = event_tx.clone();
-            async move { crate::stream::google_stream(&client, &base, &key, req, tx).await }
-        })
+        crate::stream::google_stream(
+            &self.client,
+            &self.base_url,
+            &self.api_key,
+            request,
+            event_tx,
+        )
         .await
     }
 }
@@ -170,50 +167,12 @@ fn build_client() -> reqwest::Client {
         .unwrap_or_else(|_| reqwest::Client::new())
 }
 
-async fn with_retries<F, Fut>(max: u32, mut make: F) -> anyhow::Result<()>
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = anyhow::Result<()>>,
-{
-    let mut attempt = 0u32;
-    loop {
-        attempt += 1;
-        match make().await {
-            Ok(()) => return Ok(()),
-            Err(e) => {
-                let msg = e.to_string();
-                let retryable = msg.contains("429")
-                    || msg.contains("500")
-                    || msg.contains("502")
-                    || msg.contains("503")
-                    || msg.contains("timeout")
-                    || msg.contains("timed out")
-                    || msg.contains("connection");
-                if !retryable || attempt >= max {
-                    return Err(e);
-                }
-                let backoff = std::time::Duration::from_millis(400 * attempt as u64);
-                tracing::warn!(
-                    "LLM request failed (attempt {}/{}): {}; retrying in {:?}",
-                    attempt,
-                    max,
-                    msg,
-                    backoff
-                );
-                tokio::time::sleep(backoff).await;
-            }
-        }
-    }
-}
-
 pub fn create_provider(
     provider_config: &ProviderConfig,
     model_config: &ModelConfig,
 ) -> Box<dyn LlmProvider> {
     match provider_config.provider_type.as_str() {
-        "openai-responses" | "responses" => {
-            Box::new(OpenAiProvider::responses(provider_config))
-        }
+        "openai-responses" | "responses" => Box::new(OpenAiProvider::responses(provider_config)),
         "openai-legacy" | "openai-chat" => Box::new(OpenAiProvider::new(provider_config)),
         "openai" => {
             // Auto-select Responses for reasoning / GPT-4.1+ models.

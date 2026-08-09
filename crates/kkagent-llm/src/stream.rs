@@ -3,7 +3,7 @@ use reqwest::Client;
 use serde_json::json;
 use tokio::sync::mpsc;
 
-use crate::types::{LlmRequest, StreamEvent, TokenUsage, ChatContent};
+use crate::types::{ChatContent, LlmRequest, StreamEvent, TokenUsage};
 
 pub async fn anthropic_stream(
     client: &Client,
@@ -68,8 +68,12 @@ pub async fn anthropic_stream(
     }
 
     tracing::debug!("LLM request URL: {}", url);
-    tracing::debug!("LLM request model: {}, tools: {}, thinking: {}", 
-        request.model, request.tools.len(), request.thinking.is_some());
+    tracing::debug!(
+        "LLM request model: {}, tools: {}, thinking: {}",
+        request.model,
+        request.tools.len(),
+        request.thinking.is_some()
+    );
 
     let resp = client
         .post(&url)
@@ -87,11 +91,8 @@ pub async fn anthropic_stream(
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        tracing::error!("LLM error: HTTP {} - {}", status, &text[..text.len().min(500)]);
-        let _ = event_tx
-            .send(StreamEvent::Error(format!("HTTP {}: {}", status, text)))
-            .await;
-        return Ok(());
+        tracing::error!("LLM error: HTTP {} - {}", status, truncate_utf8(&text, 500));
+        anyhow::bail!("HTTP {}: {}", status, text);
     }
 
     let mut stream = resp.bytes_stream();
@@ -193,7 +194,8 @@ fn parse_sse_event(event: &serde_json::Value) -> Option<StreamEvent> {
             None // we report usage at message_delta end
         }
         "error" => {
-            let msg = event.get("error")
+            let msg = event
+                .get("error")
                 .and_then(|e| e.get("message"))
                 .and_then(|m| m.as_str())
                 .unwrap_or("unknown error")
@@ -236,7 +238,11 @@ pub async fn openai_stream(
                         }
                     }));
                 }
-                ChatContent::ToolResult { tool_use_id, content, .. } => {
+                ChatContent::ToolResult {
+                    tool_use_id,
+                    content,
+                    ..
+                } => {
                     tool_results.push(json!({
                         "role": "tool",
                         "tool_call_id": tool_use_id,
@@ -301,16 +307,14 @@ pub async fn openai_stream(
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        let _ = event_tx
-            .send(StreamEvent::Error(format!("HTTP {}: {}", status, text)))
-            .await;
-        return Ok(());
+        anyhow::bail!("HTTP {}: {}", status, text);
     }
 
     let mut stream = resp.bytes_stream();
     let mut buffer = String::new();
     // Track partial tool call argument deltas by index
-    let mut tool_ids: std::collections::HashMap<usize, (String, String)> = std::collections::HashMap::new();
+    let mut tool_ids: std::collections::HashMap<usize, (String, String)> =
+        std::collections::HashMap::new();
     let mut started: std::collections::HashSet<usize> = std::collections::HashSet::new();
 
     while let Some(chunk) = stream.next().await {
@@ -323,7 +327,9 @@ pub async fn openai_stream(
             if line.is_empty() || line.starts_with(':') {
                 continue;
             }
-            let Some(data) = line.strip_prefix("data: ") else { continue };
+            let Some(data) = line.strip_prefix("data: ") else {
+                continue;
+            };
             if data == "[DONE]" {
                 let _ = event_tx
                     .send(StreamEvent::MessageEnd {
@@ -338,11 +344,15 @@ pub async fn openai_stream(
             let Some(choices) = event.get("choices").and_then(|c| c.as_array()) else {
                 continue;
             };
-            let Some(choice) = choices.first() else { continue };
+            let Some(choice) = choices.first() else {
+                continue;
+            };
             if let Some(delta) = choice.get("delta") {
                 if let Some(content) = delta.get("content").and_then(|v| v.as_str()) {
                     if !content.is_empty() {
-                        let _ = event_tx.send(StreamEvent::TextDelta(content.to_string())).await;
+                        let _ = event_tx
+                            .send(StreamEvent::TextDelta(content.to_string()))
+                            .await;
                     }
                 }
                 if let Some(tcs) = delta.get("tool_calls").and_then(|v| v.as_array()) {
@@ -404,7 +414,11 @@ pub async fn google_stream(
 
     let mut contents = Vec::new();
     for m in &request.messages {
-        let role = if m.role == "assistant" { "model" } else { "user" };
+        let role = if m.role == "assistant" {
+            "model"
+        } else {
+            "user"
+        };
         let mut parts = Vec::new();
         for c in &m.content {
             match c {
@@ -416,7 +430,11 @@ pub async fn google_stream(
                         "thoughtSignature": id,
                     }));
                 }
-                ChatContent::ToolResult { tool_use_id: _, content, .. } => {
+                ChatContent::ToolResult {
+                    tool_use_id: _,
+                    content,
+                    ..
+                } => {
                     parts.push(json!({
                         "functionResponse": {
                             "name": "tool",
@@ -471,10 +489,7 @@ pub async fn google_stream(
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        let _ = event_tx
-            .send(StreamEvent::Error(format!("HTTP {}: {}", status, text)))
-            .await;
-        return Ok(());
+        anyhow::bail!("HTTP {}: {}", status, text);
     }
 
     let mut stream = resp.bytes_stream();
@@ -486,7 +501,9 @@ pub async fn google_stream(
             let line = buffer[..pos].to_string();
             buffer = buffer[pos + 1..].to_string();
             let line = line.trim();
-            let Some(data) = line.strip_prefix("data: ") else { continue };
+            let Some(data) = line.strip_prefix("data: ") else {
+                continue;
+            };
             let Ok(event) = serde_json::from_str::<serde_json::Value>(data) else {
                 continue;
             };
@@ -503,7 +520,9 @@ pub async fn google_stream(
             };
             for part in parts {
                 if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
-                    let _ = event_tx.send(StreamEvent::TextDelta(text.to_string())).await;
+                    let _ = event_tx
+                        .send(StreamEvent::TextDelta(text.to_string()))
+                        .await;
                 }
                 if let Some(fc) = part.get("functionCall") {
                     let name = fc.get("name").and_then(|v| v.as_str()).unwrap_or("tool");
@@ -529,4 +548,26 @@ pub async fn google_stream(
         })
         .await;
     Ok(())
+}
+
+fn truncate_utf8(value: &str, max_bytes: usize) -> &str {
+    if value.len() <= max_bytes {
+        return value;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
+}
+
+#[cfg(test)]
+mod utf8_tests {
+    use super::truncate_utf8;
+
+    #[test]
+    fn truncates_at_character_boundary() {
+        assert_eq!(truncate_utf8("中文错误", 5), "中");
+        assert_eq!(truncate_utf8("plain", 50), "plain");
+    }
 }

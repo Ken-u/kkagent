@@ -120,10 +120,7 @@ pub async fn openai_responses_stream(
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        let _ = event_tx
-            .send(StreamEvent::Error(format!("HTTP {status}: {text}")))
-            .await;
-        return Ok(());
+        anyhow::bail!("HTTP {status}: {text}");
     }
 
     let mut stream = resp.bytes_stream();
@@ -158,7 +155,9 @@ pub async fn openai_responses_stream(
                 "response.output_text.delta" | "response.text.delta" => {
                     if let Some(delta) = event.get("delta").and_then(|v| v.as_str()) {
                         if !delta.is_empty() {
-                            let _ = event_tx.send(StreamEvent::TextDelta(delta.to_string())).await;
+                            let _ = event_tx
+                                .send(StreamEvent::TextDelta(delta.to_string()))
+                                .await;
                         }
                     }
                 }

@@ -1,13 +1,15 @@
+use kkagent_config::AppConfig;
+use kkagent_llm::{
+    create_provider, ChatContent, ChatMessage, LlmRequest, StreamEvent, ThinkingParams, ToolDef,
+};
+use kkagent_protocol::goal::GoalManager;
+use kkagent_protocol::{AgentEvent, SessionStatus};
+use kkagent_tools::{infer_accesses, ToolContext, ToolOutput, ToolRegistry};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::AbortHandle;
-use kkagent_protocol::{AgentEvent, SessionStatus};
-use kkagent_protocol::goal::GoalManager;
-use kkagent_llm::{LlmRequest, StreamEvent, ChatMessage, ChatContent, ToolDef, ThinkingParams, create_provider};
-use kkagent_tools::{infer_accesses, ToolContext, ToolOutput, ToolRegistry};
-use kkagent_config::AppConfig;
 
 use crate::context_projector::{compact_messages, project, project_strict, ProjectOptions};
 use crate::model_capability::ModelCapability;
@@ -88,16 +90,10 @@ impl AgentLoop {
         session: &'a mut Session,
         rounds_left: u32,
     ) -> futures::future::BoxFuture<'a, anyhow::Result<()>> {
-        Box::pin(async move {
-            self.run_turn_body(session, rounds_left).await
-        })
+        Box::pin(async move { self.run_turn_body(session, rounds_left).await })
     }
 
-    async fn run_turn_body(
-        &self,
-        session: &mut Session,
-        rounds_left: u32,
-    ) -> anyhow::Result<()> {
+    async fn run_turn_body(&self, session: &mut Session, rounds_left: u32) -> anyhow::Result<()> {
         let session_id = session.id.clone();
         tracing::info!("Starting turn for session {}", session_id);
 
@@ -105,14 +101,20 @@ impl AgentLoop {
             return self.finish_interrupted(session).await;
         }
 
-        let _ = self.event_tx.send(AgentEvent::TurnStart {
-            session_id: session_id.clone(),
-        }).await;
+        let _ = self
+            .event_tx
+            .send(AgentEvent::TurnStart {
+                session_id: session_id.clone(),
+            })
+            .await;
 
-        let _ = self.event_tx.send(AgentEvent::StatusUpdate {
-            session_id: session_id.clone(),
-            status: SessionStatus::Thinking,
-        }).await;
+        let _ = self
+            .event_tx
+            .send(AgentEvent::StatusUpdate {
+                session_id: session_id.clone(),
+                status: SessionStatus::Thinking,
+            })
+            .await;
 
         // Keep permission chain in sync with session mode (/yolo /auto toggles)
         {
@@ -123,12 +125,16 @@ impl AgentLoop {
         let model_alias = {
             let alias = session.get_model_alias();
             if alias.is_empty() {
-                self.config.default_model_alias().unwrap_or("default").to_string()
+                self.config
+                    .default_model_alias()
+                    .unwrap_or("default")
+                    .to_string()
             } else {
                 alias
             }
         };
-        let (model_config, provider_config) = self.config
+        let (model_config, provider_config) = self
+            .config
             .resolve_model(&model_alias)
             .ok_or_else(|| anyhow::anyhow!("Model '{}' not found", model_alias))?;
         tracing::info!(
@@ -211,7 +217,8 @@ Progress: turns={}/{:?} tokens={}/{:?}. Continue working toward this goal.\n</sy
             session.add_user_message(
                 "<system-reminder>\nThe TodoList tool has not been updated recently. \
 If you are working on multi-step tasks, consider updating TodoList. \
-Do not mention this reminder to the user.\n</system-reminder>".into(),
+Do not mention this reminder to the user.\n</system-reminder>"
+                    .into(),
             );
             session.turns_since_todo = 0;
         }
@@ -231,7 +238,9 @@ Do not mention this reminder to the user.\n</system-reminder>".into(),
 
         let thinking = self.config.thinking.as_ref().and_then(|t| {
             if t.enabled || capability.thinking {
-                Some(ThinkingParams { budget_tokens: 10000 })
+                Some(ThinkingParams {
+                    budget_tokens: 10000,
+                })
             } else {
                 None
             }
@@ -268,9 +277,13 @@ Do not mention this reminder to the user.\n</system-reminder>".into(),
 
             let (stream_tx, mut stream_rx) = mpsc::channel::<StreamEvent>(256);
             let provider = create_provider(provider_config, model_config);
+            let stream_error_tx = stream_tx.clone();
             let handle = tokio::spawn(async move {
                 if let Err(e) = provider.stream_chat(request, stream_tx).await {
                     tracing::error!("LLM stream error: {}", e);
+                    let _ = stream_error_tx
+                        .send(StreamEvent::Error(e.to_string()))
+                        .await;
                 }
             });
             self.abort_registry
@@ -295,23 +308,31 @@ Do not mention this reminder to the user.\n</system-reminder>".into(),
                     Ok(Some(event)) => match event {
                         StreamEvent::TextDelta(text) => {
                             assistant_text.push_str(&text);
-                            let _ = self.event_tx.send(AgentEvent::MessageDelta {
-                                session_id: session_id.clone(),
-                                text,
-                            }).await;
+                            let _ = self
+                                .event_tx
+                                .send(AgentEvent::MessageDelta {
+                                    session_id: session_id.clone(),
+                                    text,
+                                })
+                                .await;
                         }
                         StreamEvent::ThinkingDelta(text) => {
                             thinking_text.push_str(&text);
-                            let _ = self.event_tx.send(AgentEvent::ThinkingDelta {
-                                session_id: session_id.clone(),
-                                text,
-                            }).await;
+                            let _ = self
+                                .event_tx
+                                .send(AgentEvent::ThinkingDelta {
+                                    session_id: session_id.clone(),
+                                    text,
+                                })
+                                .await;
                         }
                         StreamEvent::ToolUseStart { id, name } => {
                             tracing::info!("Tool use start: {} ({})", name, id);
                             tool_input_buf.clear();
                             current_tool = Some(PendingToolCall {
-                                id, name, input: serde_json::Value::Null,
+                                id,
+                                name,
+                                input: serde_json::Value::Null,
                             });
                         }
                         StreamEvent::ToolUseInputDelta(json_chunk) => {
@@ -363,10 +384,13 @@ Do not mention this reminder to the user.\n</system-reminder>".into(),
                             tracing::error!("Stream error: {}", msg);
                             last_stream_error = Some(msg.clone());
                             stream_failed = true;
-                            let _ = self.event_tx.send(AgentEvent::Error {
-                                session_id: session_id.clone(),
-                                message: msg,
-                            }).await;
+                            let _ = self
+                                .event_tx
+                                .send(AgentEvent::Error {
+                                    session_id: session_id.clone(),
+                                    message: msg,
+                                })
+                                .await;
                         }
                     },
                     Ok(None) => break,
@@ -380,16 +404,17 @@ Do not mention this reminder to the user.\n</system-reminder>".into(),
                 break;
             }
 
-            let empty = assistant_text.is_empty()
-                && thinking_text.is_empty()
-                && tool_calls.is_empty();
+            let empty =
+                assistant_text.is_empty() && thinking_text.is_empty() && tool_calls.is_empty();
             if stream_failed || (empty && !got_message_end) {
                 if attempt < max_attempts {
                     tracing::warn!(
                         "LLM step retry {}/{} ({})",
                         attempt,
                         max_attempts,
-                        last_stream_error.as_deref().unwrap_or("empty/incomplete stream")
+                        last_stream_error
+                            .as_deref()
+                            .unwrap_or("empty/incomplete stream")
                     );
                     tokio::time::sleep(Duration::from_millis(200 * attempt as u64)).await;
                     continue;
@@ -435,10 +460,14 @@ Do not mention this reminder to the user.\n</system-reminder>".into(),
         // Record assistant message
         let mut content = Vec::new();
         if !thinking_text.is_empty() {
-            content.push(ChatContent::Thinking { thinking: thinking_text });
+            content.push(ChatContent::Thinking {
+                thinking: thinking_text,
+            });
         }
         if !assistant_text.is_empty() {
-            content.push(ChatContent::Text { text: assistant_text });
+            content.push(ChatContent::Text {
+                text: assistant_text,
+            });
         }
         for tc in &tool_calls {
             content.push(ChatContent::ToolUse {
@@ -478,7 +507,9 @@ Do not mention this reminder to the user.\n</system-reminder>".into(),
                         })
                         .await;
                 }
-                return self.run_turn_inner(session, rounds_left.saturating_sub(1)).await;
+                return self
+                    .run_turn_inner(session, rounds_left.saturating_sub(1))
+                    .await;
             }
 
             // Same-step + cross-turn tool dedupe.
@@ -496,15 +527,21 @@ Do not mention this reminder to the user.\n</system-reminder>".into(),
             let dedupe_reminder = dedupe.reminder.clone();
             let dedupe_force_stop = dedupe.force_stop;
 
-            let _ = self.event_tx.send(AgentEvent::StatusUpdate {
-                session_id: session_id.clone(),
-                status: SessionStatus::ToolExecuting,
-            }).await;
+            let _ = self
+                .event_tx
+                .send(AgentEvent::StatusUpdate {
+                    session_id: session_id.clone(),
+                    status: SessionStatus::ToolExecuting,
+                })
+                .await;
 
             // Phase 1: permissions + interactive tools (serial). Phase 2: conflict-aware parallel exec.
             enum Prepared {
                 Done(ToolOutput),
-                Ready { name: String, input: serde_json::Value },
+                Ready {
+                    name: String,
+                    input: serde_json::Value,
+                },
             }
             let mut prepared: Vec<(String, String, Prepared)> = Vec::new();
 
@@ -513,12 +550,15 @@ Do not mention this reminder to the user.\n</system-reminder>".into(),
                     return self.finish_interrupted(session).await;
                 }
 
-                let _ = self.event_tx.send(AgentEvent::ToolCall {
-                    session_id: session_id.clone(),
-                    tool_call_id: tc.id.clone(),
-                    tool_name: tc.name.clone(),
-                    input: tc.input.clone(),
-                }).await;
+                let _ = self
+                    .event_tx
+                    .send(AgentEvent::ToolCall {
+                        session_id: session_id.clone(),
+                        tool_call_id: tc.id.clone(),
+                        tool_name: tc.name.clone(),
+                        input: tc.input.clone(),
+                    })
+                    .await;
 
                 if dedupe.skip_indices.contains(&idx) {
                     prepared.push((
@@ -549,7 +589,9 @@ Do not mention this reminder to the user.\n</system-reminder>".into(),
                             Prepared::Done(self.execute_tool(session, &tc.name, &tc.input).await)
                         } else {
                             if tc.name == "Write" || tc.name == "Edit" {
-                                if let Some(path_str) = tc.input.get("path").and_then(|v| v.as_str()) {
+                                if let Some(path_str) =
+                                    tc.input.get("path").and_then(|v| v.as_str())
+                                {
                                     let path = if std::path::Path::new(path_str).is_absolute() {
                                         std::path::PathBuf::from(path_str)
                                     } else {
@@ -567,41 +609,53 @@ Do not mention this reminder to the user.\n</system-reminder>".into(),
                     PermissionDecision::Ask => {
                         let approval_id = uuid::Uuid::new_v4().to_string();
                         let action = describe_tool_action(&tc.name, &tc.input);
-                        let _ = self.event_tx.send(AgentEvent::ApprovalRequested {
-                            session_id: session_id.clone(),
-                            request: kkagent_protocol::ApprovalRequest {
-                                approval_id: approval_id.clone(),
+                        let _ = self
+                            .event_tx
+                            .send(AgentEvent::ApprovalRequested {
                                 session_id: session_id.clone(),
-                                tool_call_id: tc.id.clone(),
-                                tool_name: tc.name.clone(),
-                                action,
-                                tool_input_display: Some(tc.input.clone()),
-                                created_at: chrono::Utc::now(),
-                            },
-                        }).await;
+                                request: kkagent_protocol::ApprovalRequest {
+                                    approval_id: approval_id.clone(),
+                                    session_id: session_id.clone(),
+                                    tool_call_id: tc.id.clone(),
+                                    tool_name: tc.name.clone(),
+                                    action,
+                                    tool_input_display: Some(tc.input.clone()),
+                                    created_at: chrono::Utc::now(),
+                                },
+                            })
+                            .await;
 
-                        let _ = self.event_tx.send(AgentEvent::StatusUpdate {
-                            session_id: session_id.clone(),
-                            status: SessionStatus::WaitingApproval,
-                        }).await;
+                        let _ = self
+                            .event_tx
+                            .send(AgentEvent::StatusUpdate {
+                                session_id: session_id.clone(),
+                                status: SessionStatus::WaitingApproval,
+                            })
+                            .await;
 
                         let response = session.wait_approval(&approval_id).await;
                         match response.decision {
                             kkagent_protocol::ApprovalDecision::Approved => {
-                                if response.scope == Some(kkagent_protocol::ApprovalScope::Session) {
+                                if response.scope == Some(kkagent_protocol::ApprovalScope::Session)
+                                {
                                     let mut perm = self.permission.lock().await;
                                     perm.record_session_approval(&tc.name, &tc.input);
                                 }
                                 if tc.name == "AskUserQuestion" {
-                                    Prepared::Done(self.execute_tool(session, &tc.name, &tc.input).await)
+                                    Prepared::Done(
+                                        self.execute_tool(session, &tc.name, &tc.input).await,
+                                    )
                                 } else {
                                     if tc.name == "Write" || tc.name == "Edit" {
-                                        if let Some(path_str) = tc.input.get("path").and_then(|v| v.as_str()) {
-                                            let path = if std::path::Path::new(path_str).is_absolute() {
-                                                std::path::PathBuf::from(path_str)
-                                            } else {
-                                                session.working_dir.join(path_str)
-                                            };
+                                        if let Some(path_str) =
+                                            tc.input.get("path").and_then(|v| v.as_str())
+                                        {
+                                            let path =
+                                                if std::path::Path::new(path_str).is_absolute() {
+                                                    std::path::PathBuf::from(path_str)
+                                                } else {
+                                                    session.working_dir.join(path_str)
+                                                };
                                             session.record_pre_change(path).await;
                                         }
                                     }
@@ -614,7 +668,9 @@ Do not mention this reminder to the user.\n</system-reminder>".into(),
                             kkagent_protocol::ApprovalDecision::Cancelled => {
                                 return self.finish_interrupted(session).await;
                             }
-                            _ => Prepared::Done(ToolOutput::error("Tool call was rejected by user")),
+                            _ => {
+                                Prepared::Done(ToolOutput::error("Tool call was rejected by user"))
+                            }
                         }
                     }
                     PermissionDecision::Deny(reason) => {
@@ -624,10 +680,13 @@ Do not mention this reminder to the user.\n</system-reminder>".into(),
                 prepared.push((tc.id.clone(), tc.name.clone(), prep));
             }
 
-            let _ = self.event_tx.send(AgentEvent::StatusUpdate {
-                session_id: session_id.clone(),
-                status: SessionStatus::ToolExecuting,
-            }).await;
+            let _ = self
+                .event_tx
+                .send(AgentEvent::StatusUpdate {
+                    session_id: session_id.clone(),
+                    status: SessionStatus::ToolExecuting,
+                })
+                .await;
 
             // Build scheduler tasks for Ready items; keep Done as-is.
             let mut ready_indices = Vec::new();
@@ -698,17 +757,23 @@ Do not mention this reminder to the user.\n</system-reminder>".into(),
                 // ExitPlanMode success → leave plan mode
                 if name == "ExitPlanMode" && !output.is_error {
                     session.plan_mode = false;
-                    let _ = self.event_tx.send(AgentEvent::PlanModeChanged {
-                        session_id: session_id.clone(),
-                        enabled: false,
-                    }).await;
+                    let _ = self
+                        .event_tx
+                        .send(AgentEvent::PlanModeChanged {
+                            session_id: session_id.clone(),
+                            enabled: false,
+                        })
+                        .await;
                 }
                 if name == "EnterPlanMode" && !output.is_error {
                     session.plan_mode = true;
-                    let _ = self.event_tx.send(AgentEvent::PlanModeChanged {
-                        session_id: session_id.clone(),
-                        enabled: true,
-                    }).await;
+                    let _ = self
+                        .event_tx
+                        .send(AgentEvent::PlanModeChanged {
+                            session_id: session_id.clone(),
+                            enabled: true,
+                        })
+                        .await;
                 }
                 if name == "SelectTools" && !output.is_error {
                     if let Some(data) = &output.data {
@@ -727,7 +792,8 @@ Do not mention this reminder to the user.\n</system-reminder>".into(),
                     }
                 }
                 if (name == "AgentSwarm" || name == "Task") && !output.is_error {
-                    if let Some(reminder) = session.swarm.enter(crate::swarm::SwarmModeTrigger::Tool)
+                    if let Some(reminder) =
+                        session.swarm.enter(crate::swarm::SwarmModeTrigger::Tool)
                     {
                         session.add_user_message(reminder.into());
                     }
@@ -756,13 +822,16 @@ Do not mention this reminder to the user.\n</system-reminder>".into(),
                         .await;
                 }
 
-                let _ = self.event_tx.send(AgentEvent::ToolResult {
-                    session_id: session_id.clone(),
-                    tool_call_id: id.clone(),
-                    tool_name: name.clone(),
-                    output: output.content.clone(),
-                    is_error: output.is_error,
-                }).await;
+                let _ = self
+                    .event_tx
+                    .send(AgentEvent::ToolResult {
+                        session_id: session_id.clone(),
+                        tool_call_id: id.clone(),
+                        tool_name: name.clone(),
+                        output: output.content.clone(),
+                        is_error: output.is_error,
+                    })
+                    .await;
 
                 if !output.is_error && name == "TodoList" {
                     session.turns_since_todo = 0;
@@ -777,15 +846,10 @@ Do not mention this reminder to the user.\n</system-reminder>".into(),
                     }
                 }
 
-                if !output.is_error
-                    && session.plan_mode
-                    && (name == "Write" || name == "Edit")
-                {
+                if !output.is_error && session.plan_mode && (name == "Write" || name == "Edit") {
                     // Reconstruct input from tool call list
                     if let Some(tc) = tool_calls.iter().find(|t| t.id == id) {
-                        if let Some(content) =
-                            read_plan_file_if_matched(session, &tc.input).await
-                        {
+                        if let Some(content) = read_plan_file_if_matched(session, &tc.input).await {
                             let _ = self
                                 .event_tx
                                 .send(AgentEvent::PlanFileUpdated {
@@ -808,13 +872,14 @@ Do not mention this reminder to the user.\n</system-reminder>".into(),
                 }
             }
 
-            let result_content: Vec<ChatContent> = tool_results.iter().map(|(id, output)| {
-                ChatContent::ToolResult {
+            let result_content: Vec<ChatContent> = tool_results
+                .iter()
+                .map(|(id, output)| ChatContent::ToolResult {
                     tool_use_id: id.clone(),
                     content: output.content.clone(),
                     is_error: output.is_error,
-                }
-            }).collect();
+                })
+                .collect();
 
             session.messages.push(ChatMessage {
                 role: "user".into(),
@@ -830,7 +895,10 @@ Do not mention this reminder to the user.\n</system-reminder>".into(),
                 return self.finish_turn(session, true).await;
             }
 
-            tracing::info!("Recursing into next turn ({} rounds left)", rounds_left.saturating_sub(1));
+            tracing::info!(
+                "Recursing into next turn ({} rounds left)",
+                rounds_left.saturating_sub(1)
+            );
             if rounds_left <= 1 {
                 tracing::warn!("Agent turn limit reached for session {}", session_id);
                 return self.finish_turn(session, true).await;
@@ -845,14 +913,20 @@ Do not mention this reminder to the user.\n</system-reminder>".into(),
         let session_id = session.id.clone();
         tracing::info!("Turn interrupted for session {}", session_id);
         session.note_turn_cancelled();
-        let _ = self.event_tx.send(AgentEvent::Error {
-            session_id: session_id.clone(),
-            message: "Interrupted".into(),
-        }).await;
-        let _ = self.event_tx.send(AgentEvent::StatusUpdate {
-            session_id: session_id.clone(),
-            status: SessionStatus::Idle,
-        }).await;
+        let _ = self
+            .event_tx
+            .send(AgentEvent::Error {
+                session_id: session_id.clone(),
+                message: "Interrupted".into(),
+            })
+            .await;
+        let _ = self
+            .event_tx
+            .send(AgentEvent::StatusUpdate {
+                session_id: session_id.clone(),
+                status: SessionStatus::Idle,
+            })
+            .await;
         if let Some(hooks) = &self.hooks {
             let _ = hooks
                 .fire(
@@ -861,9 +935,7 @@ Do not mention this reminder to the user.\n</system-reminder>".into(),
                 )
                 .await;
         }
-        let _ = self.event_tx.send(AgentEvent::TurnEnd {
-            session_id,
-        }).await;
+        let _ = self.event_tx.send(AgentEvent::TurnEnd { session_id }).await;
         Ok(())
     }
 
@@ -885,9 +957,7 @@ Do not mention this reminder to the user.\n</system-reminder>".into(),
                     if goal.is_budget_exhausted()
                         && goal.status == kkagent_protocol::goal::GoalStatus::Active
                     {
-                        goal_mgr
-                            .fail_goal("Goal budget exhausted after turn")
-                            .await;
+                        goal_mgr.fail_goal("Goal budget exhausted after turn").await;
                     }
                 }
             }
@@ -895,9 +965,9 @@ Do not mention this reminder to the user.\n</system-reminder>".into(),
         session.note_turn_completed();
         // Sync sticky todos into session services when present in tool results.
         if let Some(last) = session.messages.iter().rev().find(|m| {
-            m.content.iter().any(|c| {
-                matches!(c, kkagent_llm::ChatContent::ToolResult { .. })
-            })
+            m.content
+                .iter()
+                .any(|c| matches!(c, kkagent_llm::ChatContent::ToolResult { .. }))
         }) {
             for part in &last.content {
                 if let kkagent_llm::ChatContent::ToolResult { content, .. } = part {
@@ -977,18 +1047,14 @@ Do not mention this reminder to the user.\n</system-reminder>".into(),
         let _ = crate::context_memory::fold_vacuous(&mut session.messages);
         let projected = crate::context_memory::fold_loop_events(&session.build_messages());
         let mut messages = project(&projected, &opts);
-        let mut req = session
-            .token_counter
-            .request_size(system, tools, &messages);
+        let mut req = session.token_counter.request_size(system, tools, &messages);
 
         if session
             .token_counter
             .needs_compaction(max_context, reserved, req)
         {
             messages = project_strict(&session.build_messages(), &opts);
-            req = session
-                .token_counter
-                .request_size(system, tools, &messages);
+            req = session.token_counter.request_size(system, tools, &messages);
         }
 
         if auto_compact
@@ -997,7 +1063,8 @@ Do not mention this reminder to the user.\n</system-reminder>".into(),
                 .needs_compaction(max_context, reserved, req)
             && session.messages.len() > keep_last
         {
-            let digest = build_local_summary(&session.messages[..session.messages.len() - keep_last]);
+            let digest =
+                build_local_summary(&session.messages[..session.messages.len() - keep_last]);
             let dropped = compact_messages(&mut session.messages, keep_last, &digest);
             tracing::info!(
                 "Auto-compacted session {}: dropped {} messages (est_tokens={})",
@@ -1125,7 +1192,10 @@ Do not mention this reminder to the user.\n</system-reminder>".into(),
             if allow_multiple {
                 parts.push(format!("Selected: {}", labels.join(", ")));
             } else {
-                parts.push(format!("Selected: {}", labels.first().cloned().unwrap_or_default()));
+                parts.push(format!(
+                    "Selected: {}",
+                    labels.first().cloned().unwrap_or_default()
+                ));
             }
         }
         if let Some(text) = response.free_text.filter(|t| !t.trim().is_empty()) {
@@ -1145,10 +1215,7 @@ struct PendingToolCall {
     input: serde_json::Value,
 }
 
-async fn read_plan_file_if_matched(
-    session: &Session,
-    input: &serde_json::Value,
-) -> Option<String> {
+async fn read_plan_file_if_matched(session: &Session, input: &serde_json::Value) -> Option<String> {
     let path_str = input.get("path").and_then(|v| v.as_str())?;
     let candidate = if std::path::Path::new(path_str).is_absolute() {
         std::path::PathBuf::from(path_str)
@@ -1190,7 +1257,12 @@ fn todo_items_from_output(output: &ToolOutput) -> Option<Vec<kkagent_protocol::T
 }
 
 fn tool_allowed(session: &Session, name: &str) -> bool {
-    if session.services.tool_policy_gate.session_policy.is_disabled(name) {
+    if session
+        .services
+        .tool_policy_gate
+        .session_policy
+        .is_disabled(name)
+    {
         return false;
     }
     if !session.tool_policy.is_active(name) {
