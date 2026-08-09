@@ -276,6 +276,10 @@ struct AgentHttpBackend {
 
 #[async_trait::async_trait]
 impl kkagent_rpc::HttpBackend for AgentHttpBackend {
+    fn event_sender(&self) -> Option<tokio::sync::broadcast::Sender<serde_json::Value>> {
+        Some(self.state.events.clone())
+    }
+
     async fn list_sessions(&self) -> serde_json::Value {
         let sessions = self.state.sessions.lock().await;
         let list: Vec<_> = sessions
@@ -651,7 +655,14 @@ mod http_path_tests {
 
 async fn run_http_turn(state: Arc<ServerState>, session_id: &str) -> anyhow::Result<()> {
     let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(64);
-    tokio::spawn(async move { while let Some(_ev) = event_rx.recv().await {} });
+    let live_events = state.events.clone();
+    tokio::spawn(async move {
+        while let Some(event) = event_rx.recv().await {
+            if let Ok(value) = serde_json::to_value(event) {
+                let _ = live_events.send(value);
+            }
+        }
+    });
 
     let mut session = {
         let mut sessions = state.sessions.lock().await;
@@ -739,6 +750,7 @@ struct ServerState {
     web: Arc<kkagent_tools::WebServicesConfig>,
     plugins: Arc<kkagent_core::PluginManager>,
     telemetry: kkagent_telemetry::TelemetryServiceHandle,
+    events: tokio::sync::broadcast::Sender<serde_json::Value>,
 }
 
 fn mcp_manager_from_config(config: &AppConfig) -> McpManager {
@@ -751,6 +763,7 @@ fn mcp_manager_from_config(config: &AppConfig) -> McpManager {
 }
 
 async fn build_server_state(config: Arc<AppConfig>) -> Arc<ServerState> {
+    let (events, _) = tokio::sync::broadcast::channel(1024);
     let transcript = match TranscriptDb::open_default() {
         Ok(db) => db,
         Err(e) => {
@@ -881,6 +894,7 @@ async fn build_server_state(config: Arc<AppConfig>) -> Arc<ServerState> {
         web,
         plugins,
         telemetry: telemetry.clone(),
+        events,
     })
 }
 

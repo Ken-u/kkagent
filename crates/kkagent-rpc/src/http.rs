@@ -15,6 +15,10 @@ use tokio::sync::{broadcast, Mutex};
 /// Pluggable backend so HTTP can bind to the live AgentLoop/ServerState.
 #[async_trait::async_trait]
 pub trait HttpBackend: Send + Sync {
+    fn event_sender(&self) -> Option<broadcast::Sender<Value>> {
+        None
+    }
+
     async fn list_sessions(&self) -> Value;
     async fn create_session(&self, workspace: Option<String>, title: Option<String>) -> Value;
     async fn get_session(&self, id: &str) -> Option<Value>;
@@ -156,7 +160,10 @@ impl HttpState {
     }
 
     pub fn with_backend(backend: Arc<dyn HttpBackend>, token: Option<String>) -> Self {
-        let (events, _) = broadcast::channel(512);
+        let events = backend.event_sender().unwrap_or_else(|| {
+            let (events, _) = broadcast::channel(512);
+            events
+        });
         Self {
             backend,
             meta: json!({
