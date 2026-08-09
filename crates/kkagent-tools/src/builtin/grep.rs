@@ -4,7 +4,13 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+use tokio::process::{Child, Command};
+
+const DEFAULT_TIMEOUT_MS: u64 = 60_000;
+const MAX_TIMEOUT_MS: u64 = 120_000;
+const MAX_STDERR_BYTES: usize = 64 * 1024;
 
 pub struct GrepTool;
 
@@ -40,7 +46,8 @@ glob/type filters, and case_insensitive."
                 "context_after": {"type": "integer", "description": "Lines after each match (-A)"},
                 "head_limit": {"type": "integer", "description": "Max results to return (default 200)"},
                 "offset": {"type": "integer", "description": "Skip first N results"},
-                "include_ignored": {"type": "boolean", "description": "Search ignored files (default false)"}
+                "include_ignored": {"type": "boolean", "description": "Search ignored files (default false)"},
+                "timeout_ms": {"type": "integer", "description": "Timeout in milliseconds (default 60000, max 120000)"}
             },
             "required": ["pattern"]
         })
@@ -74,6 +81,14 @@ glob/type filters, and case_insensitive."
         let context = input.get("context").and_then(|v| v.as_u64());
         let context_before = input.get("context_before").and_then(|v| v.as_u64());
         let context_after = input.get("context_after").and_then(|v| v.as_u64());
+        let timeout_ms = input
+            .get("timeout_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or(DEFAULT_TIMEOUT_MS)
+            .min(MAX_TIMEOUT_MS);
+        if is_interrupted(ctx.interrupted.as_ref()) {
+            return Ok(ToolOutput::error("Search was interrupted"));
+        }
 
         let search_dir = if Path::new(search_path).is_absolute() {
             std::path::PathBuf::from(search_path)
@@ -81,7 +96,7 @@ glob/type filters, and case_insensitive."
             ctx.working_dir.join(search_path)
         };
 
-        let mut cmd = tokio::process::Command::new("rg");
+        let mut cmd = Command::new("rg");
         cmd.arg("--color=never");
 
         match output_mode {
@@ -127,6 +142,8 @@ glob/type filters, and case_insensitive."
         cmd.arg(pattern).arg(&search_dir);
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
+        cmd.kill_on_drop(true);
+        configure_process_group(&mut cmd);
 
         let mut child = cmd.spawn()?;
         let stdout = child
@@ -139,7 +156,17 @@ glob/type filters, and case_insensitive."
             .ok_or_else(|| anyhow::anyhow!("failed to capture ripgrep stderr"))?;
         let stderr_task = tokio::spawn(async move {
             let mut bytes = Vec::new();
-            let _ = stderr_pipe.read_to_end(&mut bytes).await;
+            let mut buffer = [0_u8; 4096];
+            loop {
+                match stderr_pipe.read(&mut buffer).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(count) if bytes.len() < MAX_STDERR_BYTES => {
+                        let remaining = MAX_STDERR_BYTES - bytes.len();
+                        bytes.extend_from_slice(&buffer[..count.min(remaining)]);
+                    }
+                    Ok(_) => {}
+                }
+            }
             String::from_utf8_lossy(&bytes).into_owned()
         });
         let fetch = if head_limit == 0 {
@@ -151,8 +178,25 @@ glob/type filters, and case_insensitive."
         let mut lines = Vec::new();
         let mut captured_bytes = 0usize;
         let mut output_truncated = false;
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(timeout_ms);
         const MAX_CAPTURE_BYTES: usize = 10 * 1024 * 1024;
-        while let Some(line) = reader.next_line().await? {
+        loop {
+            let line = tokio::select! {
+                result = reader.next_line() => result?,
+                _ = tokio::time::sleep_until(deadline) => {
+                    terminate_process_tree(&mut child).await;
+                    let _ = stderr_task.await;
+                    return Ok(ToolOutput::error(format!("Search timed out after {timeout_ms}ms")));
+                }
+                _ = wait_for_interrupt(ctx.interrupted.clone()) => {
+                    terminate_process_tree(&mut child).await;
+                    let _ = stderr_task.await;
+                    return Ok(ToolOutput::error("Search was interrupted"));
+                }
+            };
+            let Some(line) = line else {
+                break;
+            };
             captured_bytes = captured_bytes.saturating_add(line.len() + 1);
             if captured_bytes > MAX_CAPTURE_BYTES {
                 output_truncated = true;
@@ -164,17 +208,30 @@ glob/type filters, and case_insensitive."
                 break;
             }
         }
-        if output_truncated {
-            let _ = child.kill().await;
-        }
-        let status = child.wait().await?;
+        let status = if output_truncated {
+            terminate_process_tree(&mut child).await;
+            None
+        } else {
+            Some(child.wait().await?)
+        };
         let stderr = stderr_task.await.unwrap_or_default();
 
-        if !status.success() && lines.is_empty() {
+        if let Some(status) = status.filter(|status| !status.success()) {
             if stderr.contains("regex parse error") {
                 return Ok(ToolOutput::error(format!("Invalid regex: {}", stderr)));
             }
-            return Ok(ToolOutput::success("No matches found.".to_string()));
+            if status.code() == Some(1) && lines.is_empty() {
+                return Ok(ToolOutput::success("No matches found.".to_string()));
+            }
+            let detail = stderr.trim();
+            return Ok(ToolOutput::error(if detail.is_empty() {
+                format!(
+                    "Search failed with exit code {}",
+                    status.code().unwrap_or(-1)
+                )
+            } else {
+                format!("Search failed: {detail}")
+            }));
         }
 
         if output_mode == "count" {
@@ -245,6 +302,51 @@ glob/type filters, and case_insensitive."
     }
 }
 
+fn is_interrupted(flag: Option<&Arc<std::sync::atomic::AtomicBool>>) -> bool {
+    flag.map(|flag| flag.load(std::sync::atomic::Ordering::SeqCst))
+        .unwrap_or(false)
+}
+
+async fn wait_for_interrupt(flag: Option<Arc<std::sync::atomic::AtomicBool>>) {
+    let Some(flag) = flag else {
+        std::future::pending::<()>().await;
+        return;
+    };
+    loop {
+        if flag.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    }
+}
+
+fn configure_process_group(command: &mut Command) {
+    #[cfg(unix)]
+    command.process_group(0);
+}
+
+async fn terminate_process_tree(child: &mut Child) {
+    let pid = child.id();
+    #[cfg(unix)]
+    if let Some(pid) = pid {
+        unsafe {
+            libc::kill(-(pid as i32), libc::SIGKILL);
+        }
+    }
+    #[cfg(windows)]
+    if let Some(pid) = pid {
+        let _ = tokio::time::timeout(
+            tokio::time::Duration::from_secs(5),
+            Command::new("taskkill")
+                .args(["/PID", &pid.to_string(), "/T", "/F"])
+                .status(),
+        )
+        .await;
+    }
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -289,6 +391,35 @@ mod tests {
             2
         );
         assert!(!output.content.contains("credentials"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn interruption_is_reported_before_spawning_search() {
+        let interrupted = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let mut ctx = context(std::path::Path::new("."));
+        ctx.interrupted = Some(interrupted);
+        let output = GrepTool
+            .execute(json!({"pattern": "needle"}), &ctx)
+            .await
+            .unwrap();
+        assert!(output.is_error);
+        assert!(output.content.contains("interrupted"));
+    }
+
+    #[tokio::test]
+    async fn ripgrep_operational_failures_are_not_reported_as_no_matches() {
+        let dir = std::env::temp_dir().join(format!("kkagent-grep-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let output = GrepTool
+            .execute(
+                json!({"pattern": "needle", "path": "missing-directory"}),
+                &context(&dir),
+            )
+            .await
+            .unwrap();
+        assert!(output.is_error, "{}", output.content);
+        assert!(output.content.contains("Search failed"));
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
