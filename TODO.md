@@ -76,3 +76,12 @@ cargo build --release -p kkagent
 kkagent server --http 127.0.0.1:8787
 kkagent acp
 ```
+
+## 八、后续重点（基于 ref/kimi-code v2 差距）
+
+- [ ] 扩展 `kkagent-di`：补齐 dependency graph、cascade engine、collection view、scope lifecycle ledger
+- [ ] 重构/拆分 `kkagent-core`：按 `agent-core-v2` 的模块结构拆分（goal/task/state/context/permission/llmRequester/swarm 等）
+- [ ] 补齐 CLI 命令：`doctor`、`export`、`login`、`provider`、`vis`、`web` 等
+- [ ] 建立独立 `tests/` 集成测试目录
+- [ ] 补全 crate `Cargo.toml` 元数据（authors、description、repository）
+- [ ] 扩展 VSCode 扩展（`editors/vscode`）从占位到完整实现
