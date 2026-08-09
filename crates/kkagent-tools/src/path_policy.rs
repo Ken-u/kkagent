@@ -18,6 +18,23 @@ const SENSITIVE_PATTERNS: &[&str] = &[
     "gcloud/credentials",
 ];
 
+const SENSITIVE_GLOBS: &[&str] = &[
+    "!**/.env",
+    "!**/.env.*",
+    "!**/id_rsa",
+    "!**/id_ed25519",
+    "!**/id_ecdsa",
+    "!**/*.pem",
+    "!**/*.key",
+    "!**/.netrc",
+    "!**/.npmrc",
+    "!**/credentials",
+];
+
+pub fn sensitive_glob_excludes() -> &'static [&'static str] {
+    SENSITIVE_GLOBS
+}
+
 const BINARY_EXTS: &[&str] = &[
     "png", "jpg", "jpeg", "gif", "webp", "bmp", "ico", "pdf", "zip", "gz", "tar", "7z", "exe",
     "dll", "so", "dylib", "bin", "wasm", "mp4", "mov", "avi", "mkv", "mp3", "wav", "woff", "woff2",

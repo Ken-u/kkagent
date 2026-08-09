@@ -1,8 +1,10 @@
+use crate::path_policy::sensitive_glob_excludes;
 use crate::{Tool, ToolContext, ToolOutput};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::Path;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 
 pub struct GrepTool;
 
@@ -103,6 +105,9 @@ glob/type filters, and case_insensitive."
         if let Some(glob) = glob_pattern {
             cmd.arg("--glob").arg(glob);
         }
+        for exclude in sensitive_glob_excludes() {
+            cmd.arg("--glob").arg(exclude);
+        }
         if let Some(t) = file_type {
             cmd.arg("--type").arg(t);
         }
@@ -119,26 +124,58 @@ glob/type filters, and case_insensitive."
             }
         }
 
-        // Fetch enough lines to apply offset + head_limit client-side.
-        let fetch = offset.saturating_add(head_limit).saturating_add(1);
-        cmd.arg("--max-count").arg(fetch.to_string());
-
         cmd.arg(pattern).arg(&search_dir);
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
 
-        let output = cmd.output().await?;
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        let mut child = cmd.spawn()?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("failed to capture ripgrep stdout"))?;
+        let mut stderr_pipe = child
+            .stderr
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("failed to capture ripgrep stderr"))?;
+        let stderr_task = tokio::spawn(async move {
+            let mut bytes = Vec::new();
+            let _ = stderr_pipe.read_to_end(&mut bytes).await;
+            String::from_utf8_lossy(&bytes).into_owned()
+        });
+        let fetch = if head_limit == 0 {
+            usize::MAX
+        } else {
+            offset.saturating_add(head_limit).saturating_add(1)
+        };
+        let mut reader = BufReader::new(stdout).lines();
+        let mut lines = Vec::new();
+        let mut captured_bytes = 0usize;
+        let mut output_truncated = false;
+        const MAX_CAPTURE_BYTES: usize = 10 * 1024 * 1024;
+        while let Some(line) = reader.next_line().await? {
+            captured_bytes = captured_bytes.saturating_add(line.len() + 1);
+            if captured_bytes > MAX_CAPTURE_BYTES {
+                output_truncated = true;
+                break;
+            }
+            lines.push(line);
+            if output_mode != "count" && lines.len() >= fetch {
+                output_truncated = true;
+                break;
+            }
+        }
+        if output_truncated {
+            let _ = child.kill().await;
+        }
+        let status = child.wait().await?;
+        let stderr = stderr_task.await.unwrap_or_default();
 
-        if !output.status.success() && stdout.is_empty() {
+        if !status.success() && lines.is_empty() {
             if stderr.contains("regex parse error") {
                 return Ok(ToolOutput::error(format!("Invalid regex: {}", stderr)));
             }
             return Ok(ToolOutput::success("No matches found.".to_string()));
         }
-
-        let mut lines: Vec<&str> = stdout.lines().collect();
 
         if output_mode == "count" {
             // Aggregate: path:count → total / per-file
@@ -158,11 +195,12 @@ glob/type filters, and case_insensitive."
                 .collect();
             file_lines.sort();
             let total_files = file_lines.len();
-            let sliced: Vec<String> = file_lines
-                .into_iter()
-                .skip(offset)
-                .take(head_limit)
-                .collect();
+            let take = if head_limit == 0 {
+                usize::MAX
+            } else {
+                head_limit
+            };
+            let sliced: Vec<String> = file_lines.into_iter().skip(offset).take(take).collect();
             let mut result = format!("Total matches: {}\n{}", total, sliced.join("\n"));
             if offset + sliced.len() < total_files {
                 result.push_str(&format!(
@@ -170,11 +208,24 @@ glob/type filters, and case_insensitive."
                     total_files.saturating_sub(offset + sliced.len())
                 ));
             }
+            if output_truncated {
+                result.push_str("\n... count output truncated at 10 MiB safety limit ...");
+            }
             return Ok(ToolOutput::success(result));
         }
 
         let total = lines.len();
-        let sliced: Vec<&str> = lines.drain(..).skip(offset).take(head_limit).collect();
+        let take = if head_limit == 0 {
+            usize::MAX
+        } else {
+            head_limit
+        };
+        let sliced: Vec<&str> = lines
+            .iter()
+            .map(String::as_str)
+            .skip(offset)
+            .take(take)
+            .collect();
         let mut result = sliced.join("\n");
         if offset + sliced.len() < total {
             result.push_str(&format!(
@@ -187,6 +238,56 @@ glob/type filters, and case_insensitive."
         if result.is_empty() {
             result = "No matches found.".into();
         }
+        if output_truncated && head_limit == 0 {
+            result.push_str("\n... output truncated at 10 MiB safety limit ...");
+        }
         Ok(ToolOutput::success(result))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn context(dir: &std::path::Path) -> ToolContext {
+        ToolContext {
+            working_dir: dir.to_path_buf(),
+            session_id: "grep-test".into(),
+            tool_call_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn applies_global_limit_and_filters_sensitive_files() {
+        let dir = std::env::temp_dir().join(format!("kkagent-grep-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("visible.txt"),
+            "needle one\nneedle two\nneedle three\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("credentials"), "needle secret\n").unwrap();
+        let output = GrepTool
+            .execute(
+                json!({
+                    "pattern": "needle",
+                    "output_mode": "content",
+                    "head_limit": 2,
+                    "include_ignored": true
+                }),
+                &context(&dir),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            output
+                .content
+                .lines()
+                .filter(|line| line.contains("visible.txt"))
+                .count(),
+            2
+        );
+        assert!(!output.content.contains("credentials"));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

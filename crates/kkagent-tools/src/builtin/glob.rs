@@ -1,6 +1,9 @@
+use crate::path_policy::is_sensitive_path;
 use crate::{Tool, ToolContext, ToolOutput};
 use async_trait::async_trait;
 use serde_json::{json, Value};
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
 use std::path::Path;
 
 pub struct GlobTool;
@@ -80,11 +83,16 @@ Returns paths sorted by modification time (newest first)."
             true
         });
 
-        let mut results: Vec<(std::path::PathBuf, std::time::SystemTime)> = Vec::new();
-        let mut truncated = false;
+        let mut newest: BinaryHeap<Reverse<(std::time::SystemTime, std::path::PathBuf)>> =
+            BinaryHeap::new();
+        let mut unlimited = Vec::new();
+        let mut total_matches = 0usize;
 
         for entry in walker.build().filter_map(|e| e.ok()) {
             if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                continue;
+            }
+            if is_sensitive_path(entry.path()) {
                 continue;
             }
             let rel = entry.path().strip_prefix(&root_dir).unwrap_or(entry.path());
@@ -94,19 +102,28 @@ Returns paths sorted by modification time (newest first)."
                     .ok()
                     .and_then(|m| m.modified().ok())
                     .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-                results.push((rel.to_path_buf(), mtime));
-                if results.len() > head_limit {
-                    truncated = true;
-                    break;
+                total_matches += 1;
+                if head_limit == 0 {
+                    unlimited.push((rel.to_path_buf(), mtime));
+                } else {
+                    newest.push(Reverse((mtime, rel.to_path_buf())));
+                    if newest.len() > head_limit {
+                        newest.pop();
+                    }
                 }
             }
         }
 
+        let mut results: Vec<(std::path::PathBuf, std::time::SystemTime)> = if head_limit == 0 {
+            unlimited
+        } else {
+            newest
+                .into_iter()
+                .map(|Reverse((mtime, path))| (path, mtime))
+                .collect()
+        };
         results.sort_by(|a, b| b.1.cmp(&a.1));
-        if results.len() > head_limit {
-            results.truncate(head_limit);
-            truncated = true;
-        }
+        let truncated = head_limit > 0 && total_matches > head_limit;
 
         if results.is_empty() {
             return Ok(ToolOutput::success("No files matched.".to_string()));
@@ -124,5 +141,33 @@ Returns paths sorted by modification time (newest first)."
         }
 
         Ok(ToolOutput::success(output.join("\n")))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn limit_is_applied_after_global_mtime_sort() {
+        let dir = std::env::temp_dir().join(format!("kkagent-glob-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["a-old.rs", "b-mid.rs", "z-new.rs"] {
+            std::fs::write(dir.join(name), name).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(15));
+        }
+        let output = GlobTool
+            .execute(
+                json!({"pattern": "*.rs", "head_limit": 1}),
+                &ToolContext {
+                    working_dir: dir.clone(),
+                    session_id: "glob-test".into(),
+                    tool_call_id: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(output.content.lines().next().unwrap().ends_with("z-new.rs"));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
