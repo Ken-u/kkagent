@@ -21,3 +21,5 @@ tower-http = { workspace = true }
 async-trait = { workspace = true }
 dirs = { workspace = true }
 url = "2"
+sha2 = { workspace = true }
+hex = { workspace = true }

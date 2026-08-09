@@ -38,19 +38,24 @@ export class KkagentHttpClient {
   }
 
   private url(path: string): string {
-    const u = new URL(path, this.baseUrl + "/");
-    if (this.token) u.searchParams.set("token", this.token);
-    return u.toString();
+    return new URL(path, this.baseUrl + "/").toString();
+  }
+
+  private headers(json = false): Record<string, string> {
+    return {
+      ...(json ? { "content-type": "application/json" } : {}),
+      ...(this.token ? { authorization: `Bearer ${this.token}` } : {}),
+    };
   }
 
   async meta(): Promise<unknown> {
-    const res = await fetch(this.url("/api/v1/meta"));
+    const res = await fetch(this.url("/api/v1/meta"), { headers: this.headers() });
     if (!res.ok) throw new Error(`meta ${res.status}`);
     return res.json();
   }
 
   async listSessions(): Promise<Session[]> {
-    const res = await fetch(this.url("/api/v1/sessions"));
+    const res = await fetch(this.url("/api/v1/sessions"), { headers: this.headers() });
     if (!res.ok) throw new Error(`sessions ${res.status}`);
     const body = (await res.json()) as { sessions?: Session[] };
     return body.sessions ?? [];
@@ -59,7 +64,7 @@ export class KkagentHttpClient {
   async createSession(workspace?: string, title?: string): Promise<Session> {
     const res = await fetch(this.url("/api/v1/sessions"), {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: this.headers(true),
       body: JSON.stringify({ workspace, title }),
     });
     if (!res.ok) throw new Error(`createSession ${res.status}`);
@@ -69,7 +74,7 @@ export class KkagentHttpClient {
   async postMessage(sessionId: string, text: string): Promise<unknown> {
     const res = await fetch(this.url(`/api/v1/sessions/${sessionId}/messages`), {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: this.headers(true),
       body: JSON.stringify({ text }),
     });
     if (!res.ok) throw new Error(`postMessage ${res.status}`);
@@ -77,13 +82,13 @@ export class KkagentHttpClient {
   }
 
   async listTools(): Promise<unknown> {
-    const res = await fetch(this.url("/api/v1/tools"));
+    const res = await fetch(this.url("/api/v1/tools"), { headers: this.headers() });
     if (!res.ok) throw new Error(`tools ${res.status}`);
     return res.json();
   }
 
   async modelCatalog(): Promise<unknown> {
-    const res = await fetch(this.url("/api/v1/modelCatalog"));
+    const res = await fetch(this.url("/api/v1/modelCatalog"), { headers: this.headers() });
     if (!res.ok) throw new Error(`modelCatalog ${res.status}`);
     return res.json();
   }
@@ -91,13 +96,13 @@ export class KkagentHttpClient {
   async eventsSince(since = 0, sessionId?: string, limit = 500): Promise<EventHistory> {
     const query = new URLSearchParams({ since: String(since), limit: String(limit) });
     if (sessionId) query.set("session_id", sessionId);
-    const res = await fetch(this.url(`/api/v1/events?${query}`));
+    const res = await fetch(this.url(`/api/v1/events?${query}`), { headers: this.headers() });
     if (!res.ok) throw new Error(`events ${res.status}`);
     return (await res.json()) as EventHistory;
   }
 
   async turnStatus(sessionId: string): Promise<unknown> {
-    const res = await fetch(this.url(`/api/v1/turns/${sessionId}`));
+    const res = await fetch(this.url(`/api/v1/turns/${sessionId}`), { headers: this.headers() });
     if (!res.ok) throw new Error(`turnStatus ${res.status}`);
     return res.json();
   }

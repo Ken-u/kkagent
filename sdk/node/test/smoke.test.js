@@ -7,6 +7,23 @@ test("client constructs", () => {
   assert.equal(c.baseUrl, "http://127.0.0.1:8787");
 });
 
+test("HTTP requests use bearer authorization instead of query tokens", async () => {
+  const originalFetch = globalThis.fetch;
+  let observed;
+  globalThis.fetch = async (url, options) => {
+    observed = { url: String(url), options };
+    return { ok: true, json: async () => ({ ok: true }) };
+  };
+  try {
+    const client = new KkagentHttpClient({ token: "secret" });
+    await client.meta();
+    assert.equal(new URL(observed.url).searchParams.has("token"), false);
+    assert.equal(observed.options.headers.authorization, "Bearer secret");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("jsonrpc shapes request", async () => {
   const rpc = new JsonRpcClient(async (line) => {
     const req = JSON.parse(line);

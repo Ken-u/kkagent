@@ -12,6 +12,7 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncReadExt;
 use tokio::process::Child;
 use tokio::sync::{broadcast, Mutex};
@@ -20,6 +21,34 @@ const MAX_HTTP_TERMINALS: usize = 64;
 const MAX_TERMINAL_COMMAND_BYTES: usize = 64 * 1024;
 const MAX_TERMINAL_OUTPUT_BYTES: usize = 1024 * 1024;
 const EVENT_HISTORY_CAPACITY: usize = 2048;
+
+#[derive(Debug, Clone)]
+pub struct HttpSecurityOptions {
+    /// Additional token -> scopes. Scopes: read, write, terminal, admin.
+    pub scoped_tokens: HashMap<String, Vec<String>>,
+    pub allow_terminal_api: bool,
+    pub allow_fs_write_api: bool,
+    pub requests_per_minute: u32,
+    pub audit_log: Option<std::path::PathBuf>,
+}
+
+impl Default for HttpSecurityOptions {
+    fn default() -> Self {
+        Self {
+            scoped_tokens: HashMap::new(),
+            allow_terminal_api: true,
+            allow_fs_write_api: true,
+            requests_per_minute: 600,
+            audit_log: None,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct RateWindow {
+    minute: u64,
+    count: u32,
+}
 
 /// Pluggable backend so HTTP can bind to the live AgentLoop/ServerState.
 #[async_trait::async_trait]
@@ -184,6 +213,10 @@ pub struct HttpState {
     event_sequence: Arc<AtomicU64>,
     event_history: Arc<StdMutex<VecDeque<Value>>>,
     turn_states: Arc<StdMutex<HashMap<String, Value>>>,
+    token_scopes: Arc<HashMap<String, Vec<String>>>,
+    security: Arc<HttpSecurityOptions>,
+    rate_windows: Arc<StdMutex<HashMap<String, RateWindow>>>,
+    audit_lock: Arc<StdMutex<()>>,
 }
 
 struct HttpTerminalSlot {
@@ -199,8 +232,20 @@ impl HttpState {
     }
 
     pub fn with_backend(backend: Arc<dyn HttpBackend>, token: Option<String>) -> Self {
+        Self::with_backend_and_security(backend, token, HttpSecurityOptions::default())
+    }
+
+    pub fn with_backend_and_security(
+        backend: Arc<dyn HttpBackend>,
+        token: Option<String>,
+        security: HttpSecurityOptions,
+    ) -> Self {
         let upstream = backend.event_sender();
         let (events, _) = broadcast::channel(1024);
+        let mut token_scopes = security.scoped_tokens.clone();
+        if let Some(token) = token.as_ref().filter(|token| !token.trim().is_empty()) {
+            token_scopes.insert(token.clone(), vec!["admin".into()]);
+        }
         let state = Self {
             backend,
             meta: json!({
@@ -221,6 +266,10 @@ impl HttpState {
                 EVENT_HISTORY_CAPACITY,
             ))),
             turn_states: Arc::new(StdMutex::new(HashMap::new())),
+            token_scopes: Arc::new(token_scopes),
+            security: Arc::new(security),
+            rate_windows: Arc::new(StdMutex::new(HashMap::new())),
+            audit_lock: Arc::new(StdMutex::new(())),
         };
         if let (Some(upstream), Ok(runtime)) = (upstream, tokio::runtime::Handle::try_current()) {
             let forward_state = state.clone();
@@ -332,22 +381,20 @@ pub struct AuthQuery {
 }
 
 fn check_auth(state: &HttpState, q: &AuthQuery) -> Result<(), StatusCode> {
-    match &state.token {
-        None => Ok(()),
-        Some(expected) => {
-            if q.token.as_deref() == Some(expected.as_str()) {
-                Ok(())
-            } else {
-                Err(StatusCode::UNAUTHORIZED)
-            }
-        }
+    if state.token_scopes.is_empty() {
+        return Ok(());
     }
+    q.token
+        .as_ref()
+        .filter(|token| state.token_scopes.contains_key(*token))
+        .map(|_| ())
+        .ok_or(StatusCode::UNAUTHORIZED)
 }
 
-fn authorize_request(state: &HttpState, request: &mut Request) -> Result<(), StatusCode> {
-    let Some(expected) = state.token.as_deref() else {
-        return Ok(());
-    };
+fn authorize_request(state: &HttpState, request: &mut Request) -> Result<String, StatusCode> {
+    if state.token_scopes.is_empty() {
+        return Ok("anonymous".into());
+    }
     let query_token = url::Url::parse(&format!("http://localhost{}", request.uri()))
         .ok()
         .and_then(|url| {
@@ -355,9 +402,6 @@ fn authorize_request(state: &HttpState, request: &mut Request) -> Result<(), Sta
                 .find(|(name, _)| name == "token")
                 .map(|(_, value)| value.into_owned())
         });
-    if query_token.as_deref() == Some(expected) {
-        return Ok(());
-    }
     let bearer = request
         .headers()
         .get(axum::http::header::AUTHORIZATION)
@@ -365,15 +409,39 @@ fn authorize_request(state: &HttpState, request: &mut Request) -> Result<(), Sta
         .and_then(|value| value.split_once(' '))
         .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
         .map(|(_, token)| token);
-    if bearer != Some(expected) {
-        return Err(StatusCode::UNAUTHORIZED);
+    let presented = bearer
+        .map(str::to_string)
+        .or(query_token)
+        .ok_or(StatusCode::UNAUTHORIZED)?;
+    let scopes = state
+        .token_scopes
+        .get(&presented)
+        .ok_or(StatusCode::UNAUTHORIZED)?;
+    let required_scope = required_scope(request.method().as_str(), request.uri().path());
+    if !scopes
+        .iter()
+        .any(|scope| scope == "admin" || scope == required_scope)
+    {
+        return Err(StatusCode::FORBIDDEN);
     }
 
     // Existing handlers also validate the legacy query token. Inject an encoded
     // copy after authenticating the header so both access paths share one check.
     let mut url = url::Url::parse(&format!("http://localhost{}", request.uri()))
         .map_err(|_| StatusCode::BAD_REQUEST)?;
-    url.query_pairs_mut().append_pair("token", expected);
+    let preserved = url
+        .query_pairs()
+        .filter(|(name, _)| name != "token")
+        .map(|(name, value)| (name.into_owned(), value.into_owned()))
+        .collect::<Vec<_>>();
+    url.set_query(None);
+    {
+        let mut query = url.query_pairs_mut();
+        for (name, value) in preserved {
+            query.append_pair(&name, &value);
+        }
+        query.append_pair("token", &presented);
+    }
     let path_and_query = match url.query() {
         Some(query) => format!("{}?{query}", url.path()),
         None => url.path().to_string(),
@@ -381,7 +449,7 @@ fn authorize_request(state: &HttpState, request: &mut Request) -> Result<(), Sta
     *request.uri_mut() = path_and_query
         .parse()
         .map_err(|_| StatusCode::BAD_REQUEST)?;
-    Ok(())
+    Ok(token_fingerprint(&presented))
 }
 
 async fn auth_middleware(
@@ -389,9 +457,115 @@ async fn auth_middleware(
     mut request: Request,
     next: Next,
 ) -> impl IntoResponse {
+    let path = request.uri().path().to_string();
+    let method = request.method().to_string();
+    if path.starts_with("/api/v1/terminals") && !state.security.allow_terminal_api {
+        audit_request(&state, "disabled", &method, &path, StatusCode::FORBIDDEN);
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    if path == "/api/v1/fs" && method == "POST" && !state.security.allow_fs_write_api {
+        audit_request(&state, "disabled", &method, &path, StatusCode::FORBIDDEN);
+        return StatusCode::FORBIDDEN.into_response();
+    }
     match authorize_request(&state, &mut request) {
-        Ok(()) => next.run(request).await,
-        Err(status) => status.into_response(),
+        Ok(identity) => {
+            if !consume_rate_limit(&state, &identity) {
+                audit_request(
+                    &state,
+                    &identity,
+                    &method,
+                    &path,
+                    StatusCode::TOO_MANY_REQUESTS,
+                );
+                return StatusCode::TOO_MANY_REQUESTS.into_response();
+            }
+            let response = next.run(request).await;
+            audit_request(&state, &identity, &method, &path, response.status());
+            response
+        }
+        Err(status) => {
+            audit_request(&state, "unauthorized", &method, &path, status);
+            status.into_response()
+        }
+    }
+}
+
+fn required_scope(method: &str, path: &str) -> &'static str {
+    if path.starts_with("/api/v1/terminals") {
+        "terminal"
+    } else if method == "GET" {
+        "read"
+    } else {
+        "write"
+    }
+}
+
+fn token_fingerprint(token: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(token.as_bytes());
+    format!("token:{}", hex::encode(&digest[..6]))
+}
+
+fn consume_rate_limit(state: &HttpState, identity: &str) -> bool {
+    let limit = state.security.requests_per_minute;
+    if limit == 0 {
+        return true;
+    }
+    let minute = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        / 60;
+    let Ok(mut windows) = state.rate_windows.lock() else {
+        return false;
+    };
+    let window = windows.entry(identity.to_string()).or_default();
+    if window.minute != minute {
+        window.minute = minute;
+        window.count = 0;
+    }
+    if window.count >= limit {
+        return false;
+    }
+    window.count += 1;
+    true
+}
+
+fn audit_request(state: &HttpState, identity: &str, method: &str, path: &str, status: StatusCode) {
+    tracing::info!(
+        target: "kkagent.http.audit",
+        identity,
+        method,
+        path,
+        status = status.as_u16(),
+        "http request"
+    );
+    let Some(pathname) = state.security.audit_log.as_ref() else {
+        return;
+    };
+    let Ok(_guard) = state.audit_lock.lock() else {
+        return;
+    };
+    if let Some(parent) = pathname.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let record = json!({
+        "at": chrono::Utc::now().to_rfc3339(),
+        "identity": identity,
+        "method": method,
+        "path": path,
+        "status": status.as_u16(),
+    });
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    if let Ok(mut file) = options.open(pathname) {
+        use std::io::Write;
+        let _ = writeln!(file, "{record}");
     }
 }
 
@@ -1109,8 +1283,23 @@ pub async fn serve_listener_with_backend(
     backend: Arc<dyn HttpBackend>,
     token: Option<String>,
 ) -> anyhow::Result<()> {
+    serve_listener_with_backend_and_security(
+        listener,
+        backend,
+        token,
+        HttpSecurityOptions::default(),
+    )
+    .await
+}
+
+pub async fn serve_listener_with_backend_and_security(
+    listener: tokio::net::TcpListener,
+    backend: Arc<dyn HttpBackend>,
+    token: Option<String>,
+    security: HttpSecurityOptions,
+) -> anyhow::Result<()> {
     let address = listener.local_addr()?;
-    let state = HttpState::with_backend(backend, token);
+    let state = HttpState::with_backend_and_security(backend, token, security);
     let app = router(state);
     tracing::info!("kkagent HTTP listening on http://{address}");
     axum::serve(listener, app).await?;
@@ -1172,6 +1361,63 @@ mod security_tests {
             authorize_request(&state, &mut request),
             Err(StatusCode::UNAUTHORIZED)
         );
+    }
+
+    #[test]
+    fn scoped_tokens_enforce_read_write_and_terminal_boundaries() {
+        let mut scoped_tokens = HashMap::new();
+        scoped_tokens.insert("reader".into(), vec!["read".into()]);
+        scoped_tokens.insert("writer".into(), vec!["read".into(), "write".into()]);
+        let state = HttpState::with_backend_and_security(
+            Arc::new(MemoryBackend::default()),
+            None,
+            HttpSecurityOptions {
+                scoped_tokens,
+                ..HttpSecurityOptions::default()
+            },
+        );
+        let mut read = Request::builder()
+            .uri("/api/v1/sessions")
+            .header("authorization", "Bearer reader")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert!(authorize_request(&state, &mut read).is_ok());
+        let mut write = Request::builder()
+            .method("POST")
+            .uri("/api/v1/sessions")
+            .header("authorization", "Bearer reader")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert_eq!(
+            authorize_request(&state, &mut write),
+            Err(StatusCode::FORBIDDEN)
+        );
+        let mut terminal = Request::builder()
+            .method("POST")
+            .uri("/api/v1/terminals")
+            .header("authorization", "Bearer writer")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert_eq!(
+            authorize_request(&state, &mut terminal),
+            Err(StatusCode::FORBIDDEN)
+        );
+    }
+
+    #[test]
+    fn rate_limit_is_per_identity() {
+        let state = HttpState::with_backend_and_security(
+            Arc::new(MemoryBackend::default()),
+            None,
+            HttpSecurityOptions {
+                requests_per_minute: 2,
+                ..HttpSecurityOptions::default()
+            },
+        );
+        assert!(consume_rate_limit(&state, "a"));
+        assert!(consume_rate_limit(&state, "a"));
+        assert!(!consume_rate_limit(&state, "a"));
+        assert!(consume_rate_limit(&state, "b"));
     }
 
     #[tokio::test]

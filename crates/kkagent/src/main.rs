@@ -84,6 +84,18 @@ enum Commands {
         /// Bearer/query token for HTTP API
         #[arg(long)]
         http_token: Option<String>,
+        /// Enable the authenticated arbitrary-command terminal API
+        #[arg(long)]
+        allow_terminal_api: bool,
+        /// Enable direct authenticated writes through POST /api/v1/fs
+        #[arg(long)]
+        allow_fs_write_api: bool,
+        /// Per-token HTTP request limit per minute (0 disables limiting)
+        #[arg(long, default_value_t = 600)]
+        http_rate_limit: u32,
+        /// Append structured HTTP audit records to this file
+        #[arg(long)]
+        http_audit_log: Option<PathBuf>,
     },
     /// Serve Agent Client Protocol over stdio (IDE bridge)
     Acp,
@@ -145,6 +157,10 @@ async fn main() -> Result<()> {
             listen,
             http,
             http_token,
+            allow_terminal_api,
+            allow_fs_write_api,
+            http_rate_limit,
+            http_audit_log,
         }) => {
             let mut token = http_token.or_else(|| std::env::var("KKAGENT_HTTP_TOKEN").ok());
             if http.is_some() && token.as_deref().is_none_or(str::is_empty) {
@@ -154,7 +170,32 @@ async fn main() -> Result<()> {
                 );
                 token = Some(generated);
             }
-            run_server(config, listen, http, token).await
+            let mut scoped_tokens = HashMap::new();
+            if let Ok(token) = std::env::var("KKAGENT_HTTP_READ_TOKEN") {
+                if !token.trim().is_empty() {
+                    scoped_tokens.insert(token, vec!["read".into()]);
+                }
+            }
+            if let Ok(token) = std::env::var("KKAGENT_HTTP_WRITE_TOKEN") {
+                if !token.trim().is_empty() {
+                    scoped_tokens.insert(token, vec!["read".into(), "write".into()]);
+                }
+            }
+            if let Ok(token) = std::env::var("KKAGENT_HTTP_TERMINAL_TOKEN") {
+                if !token.trim().is_empty() {
+                    scoped_tokens.insert(token, vec!["read".into(), "terminal".into()]);
+                }
+            }
+            let security = kkagent_rpc::HttpSecurityOptions {
+                scoped_tokens,
+                allow_terminal_api,
+                allow_fs_write_api,
+                requests_per_minute: http_rate_limit,
+                audit_log: Some(http_audit_log.unwrap_or_else(|| {
+                    kkagent_config::default_config_dir().join("http-audit.jsonl")
+                })),
+            };
+            run_server(config, listen, http, token, security).await
         }
         Some(Commands::Acp) => {
             let state = build_server_state(Arc::new(config)).await?;
@@ -551,6 +592,7 @@ async fn run_server(
     listen: Option<String>,
     http: Option<String>,
     http_token: Option<String>,
+    http_security: kkagent_rpc::HttpSecurityOptions,
 ) -> Result<()> {
     let socket_path = listen.unwrap_or_else(|| {
         let dir = kkagent_config::default_config_dir();
@@ -571,8 +613,13 @@ async fn run_server(
         let token = http_token;
         let http_listener = kkagent_rpc::bind_http(&addr, token.as_deref()).await?;
         Some(tokio::spawn(async move {
-            if let Err(e) =
-                kkagent_rpc::serve_http_listener_with_backend(http_listener, backend, token).await
+            if let Err(e) = kkagent_rpc::serve_http_listener_with_backend_and_security(
+                http_listener,
+                backend,
+                token,
+                http_security,
+            )
+            .await
             {
                 tracing::error!("HTTP server error: {e}");
             }
