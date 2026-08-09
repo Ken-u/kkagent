@@ -104,10 +104,13 @@ impl TranscriptDb {
     }
 
     pub fn set_title(&self, session_id: &str, title: &str) -> anyhow::Result<()> {
-        self.conn.execute(
+        let changed = self.conn.execute(
             "UPDATE sessions SET title = ?1, updated_at = ?2 WHERE session_id = ?3",
             params![title, Utc::now().to_rfc3339(), session_id],
         )?;
+        if changed == 0 {
+            anyhow::bail!("session not found: {session_id}");
+        }
         Ok(())
     }
 
@@ -264,10 +267,76 @@ impl TranscriptDb {
     }
 
     pub fn archive_session(&self, session_id: &str) -> anyhow::Result<()> {
-        self.conn.execute(
-            "UPDATE sessions SET is_archived = 1, updated_at = ?1 WHERE session_id = ?2",
-            params![Utc::now().to_rfc3339(), session_id],
+        self.set_archived(session_id, true)
+    }
+
+    pub fn set_archived(&self, session_id: &str, archived: bool) -> anyhow::Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE sessions SET is_archived = ?1, updated_at = ?2 WHERE session_id = ?3",
+            params![archived, Utc::now().to_rfc3339(), session_id],
         )?;
+        if changed == 0 {
+            anyhow::bail!("session not found: {session_id}");
+        }
+        Ok(())
+    }
+
+    /// Clone a resumable transcript. `turn_index` follows the session-store approximation
+    /// of two transcript messages per completed turn.
+    pub fn fork_session(
+        &self,
+        source_id: &str,
+        target_id: &str,
+        title: Option<&str>,
+        turn_index: Option<usize>,
+    ) -> anyhow::Result<()> {
+        let source = self
+            .get_session(source_id)?
+            .ok_or_else(|| anyhow::anyhow!("session not found: {source_id}"))?;
+        if self.get_session(target_id)?.is_some() {
+            anyhow::bail!("session already exists: {target_id}");
+        }
+        let mut messages = self.load_messages(source_id)?;
+        if let Some(turn_index) = turn_index {
+            messages.truncate(
+                messages
+                    .len()
+                    .min(turn_index.saturating_add(1).saturating_mul(2)),
+            );
+        }
+
+        let transaction = self.conn.unchecked_transaction()?;
+        let now = Utc::now().to_rfc3339();
+        transaction.execute(
+            "INSERT INTO sessions
+             (session_id, title, model, working_dir, created_at, updated_at, message_count, is_archived, summary)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, 0, ?7)",
+            params![
+                target_id,
+                title.or(source.title.as_deref()),
+                source.model,
+                source.working_dir,
+                now,
+                messages.len() as u32,
+                Option::<String>::None,
+            ],
+        )?;
+        {
+            let mut statement = transaction.prepare(
+                "INSERT INTO messages (session_id, role, content_json, token_count, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+            )?;
+            for message in &messages {
+                statement.execute(params![
+                    target_id,
+                    message.role,
+                    message.content_json,
+                    message.token_count,
+                    message.created_at,
+                ])?;
+            }
+        }
+        transaction.commit()?;
         Ok(())
     }
 
@@ -420,5 +489,38 @@ mod tests {
 
         let session = db.get_session("s1").unwrap().unwrap();
         assert_eq!(session.title.as_deref(), Some("My Session"));
+    }
+
+    #[test]
+    fn test_fork_session_is_resumable_and_independent() {
+        let db = test_db();
+        db.create_session("source", "model", "/workspace").unwrap();
+        for index in 0..6 {
+            db.append_message(
+                "source",
+                if index % 2 == 0 { "user" } else { "assistant" },
+                &format!(r#"[{{"type":"text","text":"msg{index}"}}]"#),
+                None,
+            )
+            .unwrap();
+        }
+
+        db.fork_session("source", "fork", Some("Forked"), Some(1))
+            .unwrap();
+
+        let fork = db.get_session("fork").unwrap().unwrap();
+        assert_eq!(fork.title.as_deref(), Some("Forked"));
+        assert_eq!(fork.working_dir, "/workspace");
+        assert_eq!(fork.message_count, 4);
+        assert_eq!(db.load_messages("fork").unwrap().len(), 4);
+        db.append_message("source", "user", "[]", None).unwrap();
+        assert_eq!(db.load_messages("fork").unwrap().len(), 4);
+    }
+
+    #[test]
+    fn metadata_updates_reject_missing_sessions() {
+        let db = test_db();
+        assert!(db.set_title("missing", "title").is_err());
+        assert!(db.set_archived("missing", true).is_err());
     }
 }

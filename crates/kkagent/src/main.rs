@@ -1828,12 +1828,18 @@ async fn handle_rpc_call(
     match method {
         "sessions.create" => {
             let session_id = uuid::Uuid::new_v4().to_string();
-            let workspace = params
+            let requested_workspace = params
                 .as_ref()
                 .and_then(|p| p.get("workspace"))
                 .and_then(|v| v.as_str())
                 .unwrap_or(".")
                 .to_string();
+            let workspace = std::fs::canonicalize(&requested_workspace).map_err(|error| {
+                (
+                    -32602,
+                    format!("Invalid workspace {requested_workspace}: {error}"),
+                )
+            })?;
             let perm_mode: PermissionMode = params
                 .as_ref()
                 .and_then(|p| p.get("permission_mode"))
@@ -1854,7 +1860,7 @@ async fn handle_rpc_call(
 
             let mut session = Session::new(
                 session_id.clone(),
-                PathBuf::from(&workspace),
+                workspace.clone(),
                 perm_mode,
                 model_alias.clone(),
             );
@@ -1885,9 +1891,8 @@ async fn handle_rpc_call(
 
             {
                 let db = state.transcript.lock().await;
-                if let Err(e) = db.create_session(&session_id, &model_alias, &workspace) {
-                    tracing::warn!("transcript create_session: {}", e);
-                }
+                db.create_session(&session_id, &model_alias, &workspace.to_string_lossy())
+                    .map_err(|error| (-32000, error.to_string()))?;
             }
 
             state
@@ -1923,7 +1928,7 @@ async fn handle_rpc_call(
                     kkagent_mcp::hooks::HookEvent::SessionStart,
                     &serde_json::json!({
                         "session_id": session_id,
-                        "workspace": workspace,
+                        "workspace": workspace.display().to_string(),
                     }),
                 )
                 .await;
@@ -2011,6 +2016,14 @@ async fn handle_rpc_call(
             let summary = store
                 .fork(source_id, &target_id, title, turn_index)
                 .map_err(|e| (-32000, e.to_string()))?;
+            let transcript_result = {
+                let db = state.transcript.lock().await;
+                db.fork_session(source_id, &target_id, summary.title.as_deref(), turn_index)
+            };
+            if let Err(error) = transcript_result {
+                let _ = store.delete(&target_id);
+                return Err((-32000, error.to_string()));
+            }
             Ok(serde_json::json!({
                 "session_id": summary.id,
                 "session_dir": summary.session_dir,
@@ -2032,6 +2045,13 @@ async fn handle_rpc_call(
             SessionStore::open_default()
                 .archive(session_id, archived)
                 .map_err(|e| (-32000, e.to_string()))?;
+            {
+                let db = state.transcript.lock().await;
+                if let Err(error) = db.set_archived(session_id, archived) {
+                    let _ = SessionStore::open_default().archive(session_id, !archived);
+                    return Err((-32000, error.to_string()));
+                }
+            }
             if let Some(session) = state.sessions.lock().await.get_mut(session_id) {
                 let _ = session.services.metadata.set_archived(archived);
                 if archived {
@@ -2051,9 +2071,23 @@ async fn handle_rpc_call(
                 .and_then(|p| p.get("title"))
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| (-32602, "Missing title".into()))?;
-            SessionStore::open_default()
+            let store = SessionStore::open_default();
+            let old_title = store
+                .get(session_id)
+                .map_err(|error| (-32000, error.to_string()))?
+                .title
+                .unwrap_or_else(|| session_id.to_string());
+            store
                 .rename(session_id, title)
                 .map_err(|e| (-32000, e.to_string()))?;
+            let transcript_result = {
+                let db = state.transcript.lock().await;
+                db.set_title(session_id, title)
+            };
+            if let Err(error) = transcript_result {
+                let _ = store.rename(session_id, &old_title);
+                return Err((-32000, error.to_string()));
+            }
             if let Some(session) = state.sessions.lock().await.get_mut(session_id) {
                 let _ = session.set_title_persisted(title);
             }
