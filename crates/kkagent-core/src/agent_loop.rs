@@ -258,6 +258,7 @@ Do not mention this reminder to the user.\n</system-reminder>"
         let mut thinking_text = String::new();
         let mut tool_calls: Vec<PendingToolCall> = Vec::new();
         let mut interrupted = false;
+        let mut terminal_stream_error: Option<String> = None;
 
         for attempt in 1..=max_attempts {
             assistant_text.clear();
@@ -382,15 +383,8 @@ Do not mention this reminder to the user.\n</system-reminder>"
                         }
                         StreamEvent::Error(msg) => {
                             tracing::error!("Stream error: {}", msg);
-                            last_stream_error = Some(msg.clone());
+                            last_stream_error = Some(msg);
                             stream_failed = true;
-                            let _ = self
-                                .event_tx
-                                .send(AgentEvent::Error {
-                                    session_id: session_id.clone(),
-                                    message: msg,
-                                })
-                                .await;
                         }
                     },
                     Ok(None) => break,
@@ -406,7 +400,8 @@ Do not mention this reminder to the user.\n</system-reminder>"
 
             let empty =
                 assistant_text.is_empty() && thinking_text.is_empty() && tool_calls.is_empty();
-            if (stream_failed || (empty && !got_message_end)) && attempt < max_attempts {
+            let failed = stream_failed || !got_message_end;
+            if failed && empty && attempt < max_attempts {
                 tracing::warn!(
                     "LLM step retry {}/{} ({})",
                     attempt,
@@ -415,8 +410,19 @@ Do not mention this reminder to the user.\n</system-reminder>"
                         .as_deref()
                         .unwrap_or("empty/incomplete stream")
                 );
-                tokio::time::sleep(Duration::from_millis(200 * attempt as u64)).await;
+                let exponent = attempt.saturating_sub(1).min(5);
+                let delay_ms = 200_u64.saturating_mul(1_u64 << exponent);
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                 continue;
+            }
+            if failed {
+                terminal_stream_error = Some(last_stream_error.unwrap_or_else(|| {
+                    if empty {
+                        "LLM returned an empty or incomplete stream".into()
+                    } else {
+                        "LLM stream ended before completion".into()
+                    }
+                }));
             }
             break;
         }
@@ -447,6 +453,10 @@ Do not mention this reminder to the user.\n</system-reminder>"
                 });
             }
             return self.finish_interrupted(session).await;
+        }
+
+        if let Some(error) = terminal_stream_error {
+            anyhow::bail!(error);
         }
 
         tracing::info!(
@@ -1439,5 +1449,117 @@ fn describe_tool_action(name: &str, input: &serde_json::Value) -> String {
             let short: String = pretty.chars().take(200).collect();
             format!("{}  {}", name, short)
         }
+    }
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+    use kkagent_config::{LoopControlConfig, ModelConfig, ProviderConfig};
+    use kkagent_protocol::PermissionMode;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
+
+    #[tokio::test]
+    async fn retries_transient_empty_failures_without_publishing_early_error() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            for attempt in 1..=3 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0_u8; 8192];
+                let _ = socket.read(&mut request).await.unwrap();
+                let (status, content_type, body) = if attempt < 3 {
+                    ("429 Too Many Requests", "application/json", "rate limited")
+                } else {
+                    (
+                        "200 OK",
+                        "text/event-stream",
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"recovered\"}}]}\n\
+                         data: [DONE]\n",
+                    )
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+
+        let mut config = AppConfig {
+            default_model: Some("test/model".into()),
+            loop_control: Some(LoopControlConfig {
+                max_attempts_per_step: 3,
+                reserved_context_size: 1_000,
+                max_steps_per_turn: 4,
+                auto_compact: true,
+                compact_keep_last: 4,
+                token_counting: "estimated".into(),
+            }),
+            ..AppConfig::default()
+        };
+        config.providers.insert(
+            "test".into(),
+            ProviderConfig {
+                provider_type: "openai-chat".into(),
+                api_key: Some("token".into()),
+                base_url: Some(base_url),
+                custom_headers: HashMap::new(),
+            },
+        );
+        config.models.insert(
+            "test/model".into(),
+            ModelConfig {
+                provider: "test".into(),
+                model: "test-model".into(),
+                max_context_size: Some(16_000),
+                max_output_size: Some(1_000),
+                capabilities: Vec::new(),
+                display_name: None,
+                support_efforts: Vec::new(),
+                default_effort: None,
+            },
+        );
+        let config = Arc::new(config);
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let loop_ = AgentLoop::new(
+            config,
+            Arc::new(ToolRegistry::new()),
+            Arc::new(Mutex::new(PermissionChain::new(
+                PermissionMode::Auto,
+                Vec::new(),
+            ))),
+            event_tx,
+            Arc::new(Mutex::new(HashMap::new())),
+        );
+        let workspace =
+            std::env::temp_dir().join(format!("kkagent-retry-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let mut session = Session::new(
+            "retry-test".into(),
+            workspace.clone(),
+            PermissionMode::Auto,
+            "test/model".into(),
+        );
+        session.add_user_message("hello".into());
+
+        loop_.run_turn(&mut session).await.unwrap();
+        let mut errors = Vec::new();
+        while let Ok(event) = event_rx.try_recv() {
+            if let AgentEvent::Error { message, .. } = event {
+                errors.push(message);
+            }
+        }
+        assert!(errors.is_empty());
+        assert!(session.messages.iter().any(|message| {
+            message
+                .content
+                .iter()
+                .any(|content| matches!(content, ChatContent::Text { text } if text == "recovered"))
+        }));
+        std::fs::remove_dir_all(workspace).unwrap();
     }
 }
