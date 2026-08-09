@@ -506,16 +506,18 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
     }
 
     async fn fs_read(&self, path: &str) -> Result<String, String> {
+        let path = resolve_http_fs_path(&self.state.config, path, false)?;
         tokio::fs::read_to_string(path)
             .await
             .map_err(|e| e.to_string())
     }
 
     async fn fs_write(&self, path: &str, content: &str) -> Result<(), String> {
-        if let Some(parent) = std::path::Path::new(path).parent() {
+        let path = resolve_http_fs_path(&self.state.config, path, true)?;
+        if let Some(parent) = path.parent() {
             let _ = tokio::fs::create_dir_all(parent).await;
         }
-        tokio::fs::write(path, content)
+        tokio::fs::write(&path, content)
             .await
             .map_err(|e| e.to_string())
     }
@@ -529,6 +531,121 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
             "cwd": std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_else(|_| ".".into()),
             "sessions": self.state.sessions.lock().await.len(),
         })
+    }
+}
+
+fn trusted_http_roots(config: &AppConfig) -> Result<Vec<PathBuf>, String> {
+    let configured = if config.trusted_workspaces.is_empty() {
+        vec![std::env::current_dir().map_err(|e| e.to_string())?]
+    } else {
+        config
+            .trusted_workspaces
+            .iter()
+            .map(PathBuf::from)
+            .collect()
+    };
+    configured
+        .into_iter()
+        .map(|root| {
+            std::fs::canonicalize(&root)
+                .map_err(|e| format!("invalid trusted workspace {}: {e}", root.display()))
+        })
+        .collect()
+}
+
+fn resolve_http_fs_path(config: &AppConfig, raw: &str, for_write: bool) -> Result<PathBuf, String> {
+    if raw.trim().is_empty() {
+        return Err("path must not be empty".into());
+    }
+    let roots = trusted_http_roots(config)?;
+    let candidate = {
+        let path = PathBuf::from(raw);
+        if path.is_absolute() {
+            path
+        } else {
+            std::env::current_dir()
+                .map_err(|e| e.to_string())?
+                .join(path)
+        }
+    };
+
+    let resolved = if candidate.exists() || !for_write {
+        std::fs::canonicalize(&candidate)
+            .map_err(|e| format!("cannot resolve {}: {e}", candidate.display()))?
+    } else {
+        let mut ancestor = candidate.as_path();
+        while !ancestor.exists() {
+            ancestor = ancestor
+                .parent()
+                .ok_or_else(|| format!("cannot resolve parent of {}", candidate.display()))?;
+        }
+        let canonical_ancestor = std::fs::canonicalize(ancestor)
+            .map_err(|e| format!("cannot resolve {}: {e}", ancestor.display()))?;
+        let suffix = candidate
+            .strip_prefix(ancestor)
+            .map_err(|e| e.to_string())?;
+        canonical_ancestor.join(suffix)
+    };
+
+    if roots.iter().any(|root| resolved.starts_with(root)) {
+        Ok(resolved)
+    } else {
+        Err(format!(
+            "path {} is outside trusted workspaces",
+            candidate.display()
+        ))
+    }
+}
+
+#[cfg(test)]
+mod http_path_tests {
+    use super::*;
+
+    fn config_with_root(root: &std::path::Path) -> AppConfig {
+        AppConfig {
+            trusted_workspaces: vec![root.display().to_string()],
+            ..AppConfig::default()
+        }
+    }
+
+    #[test]
+    fn rejects_paths_outside_trusted_workspace() {
+        let root = std::env::temp_dir().join(format!("kkagent-http-root-{}", uuid::Uuid::new_v4()));
+        let outside =
+            std::env::temp_dir().join(format!("kkagent-http-out-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), "secret").unwrap();
+        let err = resolve_http_fs_path(
+            &config_with_root(&root),
+            &outside.join("secret.txt").display().to_string(),
+            false,
+        )
+        .unwrap_err();
+        assert!(err.contains("outside trusted workspaces"));
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[test]
+    fn allows_new_files_below_trusted_workspace() {
+        let root = std::env::temp_dir().join(format!("kkagent-http-root-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let expected = root.join("new").join("file.txt");
+        let actual = resolve_http_fs_path(
+            &config_with_root(&root),
+            &expected.display().to_string(),
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            actual,
+            std::fs::canonicalize(&root)
+                .unwrap()
+                .join("new")
+                .join("file.txt")
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
 

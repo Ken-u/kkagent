@@ -11,7 +11,6 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{broadcast, Mutex};
-use tower_http::cors::CorsLayer;
 
 /// Pluggable backend so HTTP can bind to the live AgentLoop/ServerState.
 #[async_trait::async_trait]
@@ -615,7 +614,6 @@ pub fn router(state: HttpState) -> Router {
         )
         .route("/api/v1/connections", get(connections))
         .route("/api/v1/ws", get(ws_handler))
-        .layer(CorsLayer::permissive())
         .with_state(state)
 }
 
@@ -628,10 +626,35 @@ pub async fn serve_with_backend(
     backend: Arc<dyn HttpBackend>,
     token: Option<String>,
 ) -> anyhow::Result<()> {
+    let token = token.filter(|value| !value.trim().is_empty());
+    let resolved: Vec<std::net::SocketAddr> = tokio::net::lookup_host(addr).await?.collect();
+    if resolved.is_empty() {
+        anyhow::bail!("HTTP listen address resolved to no socket addresses: {addr}");
+    }
+    if token.is_none() && resolved.iter().any(|socket| !socket.ip().is_loopback()) {
+        anyhow::bail!(
+            "refusing to expose unauthenticated HTTP API on non-loopback address {addr}; pass --http-token or KKAGENT_HTTP_TOKEN"
+        );
+    }
     let state = HttpState::with_backend(backend, token);
     let app = router(state);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("kkagent HTTP listening on http://{addr}");
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod security_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn refuses_unauthenticated_non_loopback_listener() {
+        let result =
+            serve_with_backend("0.0.0.0:0", Arc::new(MemoryBackend::default()), None).await;
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("refusing to expose unauthenticated"));
+    }
 }
