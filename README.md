@@ -245,7 +245,12 @@ TUI 模式下日志**不会**打印到屏幕（避免破坏布局），而是追
 
 ```bash
 ./target/release/kkagent server --listen /tmp/kkagent.sock
+./target/release/kkagent server --http 127.0.0.1:8787 --http-token "$KKAGENT_HTTP_TOKEN"
 ```
+
+HTTP/WS API 始终启用认证：优先使用 `Authorization: Bearer <token>`，也兼容
+`?token=<token>`。如果未传 `--http-token` 且环境变量中没有
+`KKAGENT_HTTP_TOKEN`，服务会为本次进程生成高熵 token 并打印到 stderr。
 
 **TUI ↔ Server 配对：**
 

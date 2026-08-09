@@ -1,8 +1,9 @@
 //! REST API v1 + WebSocket (kap-server route matrix subset) with AgentLoop backend hooks.
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, Query, Request, State};
 use axum::http::StatusCode;
+use axum::middleware::{self, Next};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -220,6 +221,57 @@ fn check_auth(state: &HttpState, q: &AuthQuery) -> Result<(), StatusCode> {
                 Err(StatusCode::UNAUTHORIZED)
             }
         }
+    }
+}
+
+fn authorize_request(state: &HttpState, request: &mut Request) -> Result<(), StatusCode> {
+    let Some(expected) = state.token.as_deref() else {
+        return Ok(());
+    };
+    let query_token = url::Url::parse(&format!("http://localhost{}", request.uri()))
+        .ok()
+        .and_then(|url| {
+            url.query_pairs()
+                .find(|(name, _)| name == "token")
+                .map(|(_, value)| value.into_owned())
+        });
+    if query_token.as_deref() == Some(expected) {
+        return Ok(());
+    }
+    let bearer = request
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split_once(' '))
+        .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
+        .map(|(_, token)| token);
+    if bearer != Some(expected) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+
+    // Existing handlers also validate the legacy query token. Inject an encoded
+    // copy after authenticating the header so both access paths share one check.
+    let mut url = url::Url::parse(&format!("http://localhost{}", request.uri()))
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    url.query_pairs_mut().append_pair("token", expected);
+    let path_and_query = match url.query() {
+        Some(query) => format!("{}?{query}", url.path()),
+        None => url.path().to_string(),
+    };
+    *request.uri_mut() = path_and_query
+        .parse()
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    Ok(())
+}
+
+async fn auth_middleware(
+    State(state): State<HttpState>,
+    mut request: Request,
+    next: Next,
+) -> impl IntoResponse {
+    match authorize_request(&state, &mut request) {
+        Ok(()) => next.run(request).await,
+        Err(status) => status.into_response(),
     }
 }
 
@@ -758,6 +810,10 @@ pub fn router(state: HttpState) -> Router {
         )
         .route("/api/v1/connections", get(connections))
         .route("/api/v1/ws", get(ws_handler))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ))
         .with_state(state)
 }
 
@@ -814,6 +870,33 @@ mod security_tests {
             .unwrap_err()
             .to_string()
             .contains("refusing to expose unauthenticated"));
+    }
+
+    #[test]
+    fn accepts_bearer_auth_and_injects_legacy_query_token() {
+        let state = HttpState::new(Some("complex token".into()));
+        let mut request = Request::builder()
+            .uri("/api/v1/sessions?view=all")
+            .header("authorization", "Bearer complex token")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        authorize_request(&state, &mut request).unwrap();
+        let query = request.uri().query().unwrap();
+        assert!(query.contains("view=all"));
+        assert!(query.contains("token=complex+token"));
+    }
+
+    #[test]
+    fn rejects_missing_http_auth() {
+        let state = HttpState::new(Some("secret".into()));
+        let mut request = Request::builder()
+            .uri("/api/v1/sessions")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert_eq!(
+            authorize_request(&state, &mut request),
+            Err(StatusCode::UNAUTHORIZED)
+        );
     }
 
     #[tokio::test]

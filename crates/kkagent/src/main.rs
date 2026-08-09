@@ -146,7 +146,14 @@ async fn main() -> Result<()> {
             http,
             http_token,
         }) => {
-            let token = http_token.or_else(|| std::env::var("KKAGENT_HTTP_TOKEN").ok());
+            let mut token = http_token.or_else(|| std::env::var("KKAGENT_HTTP_TOKEN").ok());
+            if http.is_some() && token.as_deref().is_none_or(str::is_empty) {
+                let generated = format!("{}{}", uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+                tracing::warn!(
+                    "No HTTP token was supplied. Generated one for this server process: {generated}"
+                );
+                token = Some(generated);
+            }
             run_server(config, listen, http, token).await
         }
         Some(Commands::Acp) => {
