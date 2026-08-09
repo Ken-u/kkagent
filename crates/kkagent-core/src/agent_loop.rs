@@ -284,6 +284,7 @@ Do not mention this reminder to the user.\n</system-reminder>"
         let mut tool_calls: Vec<PendingToolCall> = Vec::new();
         let mut interrupted = false;
         let mut terminal_stream_error: Option<String> = None;
+        let mut rejected_tool_call_recovery: Option<ToolCallRollback> = None;
 
         for attempt in 1..=max_attempts {
             assistant_text.clear();
@@ -439,6 +440,26 @@ Do not mention this reminder to the user.\n</system-reminder>"
             let empty =
                 assistant_text.is_empty() && thinking_text.is_empty() && tool_calls.is_empty();
             let failed = stream_failed || !got_message_end;
+            if failed && empty {
+                if let Some(error) = last_stream_error
+                    .as_deref()
+                    .filter(|error| is_tool_call_arguments_object_error(error))
+                {
+                    if let Some(mut rollback) =
+                        rollback_rejected_tool_call(&mut session.messages, error)
+                    {
+                        rollback.provider_error = error.to_string();
+                        session.transcript_rewrite_required = true;
+                        tracing::warn!(
+                            tool_call_id = %rollback.tool_call_id,
+                            removed_blocks = rollback.removed_blocks,
+                            "Rolled back provider-rejected assistant tool call"
+                        );
+                        rejected_tool_call_recovery = Some(rollback);
+                        break;
+                    }
+                }
+            }
             if failed
                 && empty
                 && attempt < max_attempts
@@ -508,6 +529,15 @@ Do not mention this reminder to the user.\n</system-reminder>"
                 });
             }
             return self.finish_interrupted(session).await;
+        }
+
+        if let Some(rollback) = rejected_tool_call_recovery {
+            let message = format!(
+                "Model rejected malformed tool call `{}`; discarded that micro-step and stopped. Send `continue` to resume. ({})",
+                rollback.tool_call_id,
+                truncate_chars_for_event(&rollback.provider_error, 300)
+            );
+            return self.finish_interrupted_with_message(session, message).await;
         }
 
         if let Some(error) = terminal_stream_error {
@@ -1017,6 +1047,15 @@ Do not mention this reminder to the user.\n</system-reminder>"
     }
 
     async fn finish_interrupted(&self, session: &mut Session) -> anyhow::Result<()> {
+        self.finish_interrupted_with_message(session, "Interrupted".into())
+            .await
+    }
+
+    async fn finish_interrupted_with_message(
+        &self,
+        session: &mut Session,
+        message: String,
+    ) -> anyhow::Result<()> {
         let session_id = session.id.clone();
         tracing::info!("Turn interrupted for session {}", session_id);
         session.note_turn_cancelled();
@@ -1024,7 +1063,7 @@ Do not mention this reminder to the user.\n</system-reminder>"
             .event_tx
             .send(AgentEvent::Error {
                 session_id: session_id.clone(),
-                message: "Interrupted".into(),
+                message,
             })
             .await;
         let _ = self
@@ -1331,6 +1370,85 @@ fn is_request_too_large(error: &str) -> bool {
         || error.contains("payload too large")
         || error.contains("request too large")
         || error.contains("request_too_large")
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ToolCallRollback {
+    tool_call_id: String,
+    removed_blocks: usize,
+    provider_error: String,
+}
+
+fn is_tool_call_arguments_object_error(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    lower.contains("assistant tool call")
+        && lower.contains(".arguments must be a json object")
+        && (lower.contains("status_code=400")
+            || lower.contains("http 400")
+            || lower.contains("400 bad request"))
+}
+
+fn rejected_tool_call_id(error: &str) -> Option<String> {
+    const PREFIX: &str = "assistant tool call ";
+    const SUFFIX: &str = ".arguments must be a json object";
+    let lower = error.to_ascii_lowercase();
+    let start = lower.find(PREFIX)? + PREFIX.len();
+    let end = lower[start..].find(SUFFIX)? + start;
+    let id = error[start..end]
+        .trim()
+        .trim_matches(|ch| matches!(ch, '\'' | '"' | '`'));
+    (!id.is_empty()).then(|| id.to_string())
+}
+
+fn rollback_rejected_tool_call(
+    messages: &mut Vec<ChatMessage>,
+    error: &str,
+) -> Option<ToolCallRollback> {
+    let requested_id = rejected_tool_call_id(error);
+    let exact_exists = requested_id.as_deref().is_some_and(|id| {
+        messages.iter().any(|message| {
+            message.content.iter().any(
+                |part| matches!(part, ChatContent::ToolUse { id: candidate, .. } if candidate == id),
+            )
+        })
+    });
+    let tool_call_id = if exact_exists {
+        requested_id?
+    } else {
+        messages.iter().rev().find_map(|message| {
+            message.content.iter().rev().find_map(|part| match part {
+                ChatContent::ToolUse { id, input, .. } if !input.is_object() => Some(id.clone()),
+                _ => None,
+            })
+        })?
+    };
+
+    let rollback_index = messages.iter().rposition(|message| {
+        message
+            .content
+            .iter()
+            .any(|part| matches!(part, ChatContent::ToolUse { id, .. } if id == &tool_call_id))
+    })?;
+    let removed_blocks = messages[rollback_index..]
+        .iter()
+        .map(|message| message.content.len())
+        .sum();
+    messages.truncate(rollback_index);
+    (removed_blocks > 0).then(|| ToolCallRollback {
+        tool_call_id,
+        removed_blocks,
+        provider_error: String::new(),
+    })
+}
+
+fn truncate_chars_for_event(value: &str, max_chars: usize) -> String {
+    let mut chars = value.chars();
+    let truncated: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{truncated}…")
+    } else {
+        truncated
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1673,6 +1791,80 @@ mod retry_tests {
     }
 
     #[test]
+    fn rolls_back_to_before_the_rejected_tool_call_micro_step() {
+        let bad_id = "functions.BadTool:0";
+        let mut messages = vec![
+            ChatMessage {
+                role: "user".into(),
+                content: vec![ChatContent::Text {
+                    text: "work".into(),
+                }],
+            },
+            ChatMessage {
+                role: "assistant".into(),
+                content: vec![
+                    ChatContent::Text {
+                        text: "checking".into(),
+                    },
+                    ChatContent::ToolUse {
+                        id: "functions.GoodTool:0".into(),
+                        name: "GoodTool".into(),
+                        input: serde_json::json!({"ok": true}),
+                    },
+                    ChatContent::ToolUse {
+                        id: bad_id.into(),
+                        name: "BadTool".into(),
+                        input: serde_json::Value::Null,
+                    },
+                ],
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: vec![
+                    ChatContent::ToolResult {
+                        tool_use_id: "functions.GoodTool:0".into(),
+                        content: "ok".into(),
+                        is_error: false,
+                    },
+                    ChatContent::ToolResult {
+                        tool_use_id: bad_id.into(),
+                        content: "invalid arguments".into(),
+                        is_error: true,
+                    },
+                ],
+            },
+        ];
+        let error = format!(
+            "HTTP 400 Bad Request: status_code=400, Assistant tool call {bad_id}.arguments must be a JSON object."
+        );
+        assert!(is_tool_call_arguments_object_error(&error));
+        let rollback = rollback_rejected_tool_call(&mut messages, &error).unwrap();
+        assert_eq!(rollback.tool_call_id, bad_id);
+        assert_eq!(rollback.removed_blocks, 5);
+        assert_eq!(messages.len(), 1);
+        assert!(matches!(
+            &messages[0].content[0],
+            ChatContent::Text { text } if text == "work"
+        ));
+    }
+
+    #[test]
+    fn masked_provider_id_falls_back_to_latest_non_object_tool_call() {
+        let mut messages = vec![ChatMessage {
+            role: "assistant".into(),
+            content: vec![ChatContent::ToolUse {
+                id: "actual-call".into(),
+                name: "BadTool".into(),
+                input: serde_json::json!([1, 2]),
+            }],
+        }];
+        let error = "status_code=400, Assistant tool call ***.arguments must be a JSON object.";
+        let rollback = rollback_rejected_tool_call(&mut messages, error).unwrap();
+        assert_eq!(rollback.tool_call_id, "actual-call");
+        assert!(messages.is_empty());
+    }
+
+    #[test]
     fn persists_large_tool_results_inside_workspace() {
         let workspace =
             std::env::temp_dir().join(format!("kkagent-output-{}", uuid::Uuid::new_v4()));
@@ -1843,6 +2035,127 @@ mod retry_tests {
                 .iter()
                 .any(|content| matches!(content, ChatContent::Text { text } if text == "recovered"))
         }));
+        std::fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[tokio::test]
+    async fn provider_argument_object_error_rolls_back_and_stops_without_retry() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 8192];
+            let _ = socket.read(&mut request).await.unwrap();
+            let body = "status_code=400, Assistant tool call functions.BadTool:0.arguments must be a JSON object.";
+            let response = format!(
+                "HTTP/1.1 400 Bad Request\r\ncontent-type: text/plain\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let mut config = AppConfig {
+            default_model: Some("test/model".into()),
+            loop_control: Some(LoopControlConfig {
+                max_attempts_per_step: 3,
+                reserved_context_size: 1_000,
+                max_steps_per_turn: 4,
+                auto_compact: true,
+                compact_keep_last: 4,
+                token_counting: "estimated".into(),
+            }),
+            ..AppConfig::default()
+        };
+        config.providers.insert(
+            "test".into(),
+            ProviderConfig {
+                provider_type: "openai-chat".into(),
+                api_key: Some("token".into()),
+                base_url: Some(base_url),
+                custom_headers: HashMap::new(),
+                oauth: None,
+            },
+        );
+        config.models.insert(
+            "test/model".into(),
+            ModelConfig {
+                provider: "test".into(),
+                model: "test-model".into(),
+                max_context_size: Some(16_000),
+                max_output_size: Some(1_000),
+                capabilities: vec!["tool_use".into()],
+                display_name: None,
+                support_efforts: Vec::new(),
+                default_effort: None,
+            },
+        );
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let loop_ = AgentLoop::new(
+            Arc::new(config),
+            Arc::new(ToolRegistry::new()),
+            Arc::new(Mutex::new(PermissionChain::new(
+                PermissionMode::Auto,
+                Vec::new(),
+            ))),
+            event_tx,
+            Arc::new(Mutex::new(HashMap::new())),
+        );
+        let workspace =
+            std::env::temp_dir().join(format!("kkagent-tool-rollback-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let mut session = Session::new(
+            "tool-rollback-test".into(),
+            workspace.clone(),
+            PermissionMode::Auto,
+            "test/model".into(),
+        );
+        session.messages = vec![
+            ChatMessage {
+                role: "user".into(),
+                content: vec![ChatContent::Text {
+                    text: "do work".into(),
+                }],
+            },
+            ChatMessage {
+                role: "assistant".into(),
+                content: vec![ChatContent::ToolUse {
+                    id: "functions.BadTool:0".into(),
+                    name: "BadTool".into(),
+                    input: serde_json::Value::Null,
+                }],
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: vec![ChatContent::ToolResult {
+                    tool_use_id: "functions.BadTool:0".into(),
+                    content: "invalid arguments".into(),
+                    is_error: true,
+                }],
+            },
+        ];
+
+        loop_.run_turn(&mut session).await.unwrap();
+        server.await.unwrap();
+        assert_eq!(session.messages.len(), 1);
+        assert!(session.transcript_rewrite_required);
+        let mut recovery_errors = Vec::new();
+        let mut saw_idle = false;
+        let mut saw_turn_end = false;
+        while let Ok(event) = event_rx.try_recv() {
+            match event {
+                AgentEvent::Error { message, .. } => recovery_errors.push(message),
+                AgentEvent::StatusUpdate {
+                    status: SessionStatus::Idle,
+                    ..
+                } => saw_idle = true,
+                AgentEvent::TurnEnd { .. } => saw_turn_end = true,
+                _ => {}
+            }
+        }
+        assert_eq!(recovery_errors.len(), 1);
+        assert!(recovery_errors[0].contains("discarded that micro-step"));
+        assert!(saw_idle);
+        assert!(saw_turn_end);
         std::fs::remove_dir_all(workspace).unwrap();
     }
 }

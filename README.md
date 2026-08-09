@@ -429,6 +429,7 @@ grep -E "Tool use|Permission|Turn completed|LLM response status" /tmp/kkagent_sm
 | HTTP 卡住无响应 | 上游代理 / HTTP2 | 客户端已强制 HTTP/1.1；检查网络与代理 |
 | `400` max tokens 超限 | `max_output_size` 过大 | 设为 `16384` 或更小 |
 | 无工具调用 | 模型未开 `tool_use` / 权限卡住 | `capabilities` 加 `tool_use`；用 `-y` |
+| Tool call arguments 400 | 兼容服务拒绝了非 object 参数 | kkagent 会自动回滚该 Agent 小步骤并停止；检查提示后发送“继续” |
 | 配置未生效 | 写了 `.env` 却没传 `--config` | 拷到 `~/.kkagent/config.toml` 或显式 `--config` |
 | `Model '...' not found` | `default_model` 别名在 `[models."..."]` 里不存在 | 补上对应 `[models."别名"]`，或把 `default_model` 改成已有别名 |
 
