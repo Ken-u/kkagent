@@ -317,10 +317,8 @@ pub fn build_compaction_digest(messages: &[ChatMessage]) -> String {
 ///   synthetic tool_result (needed after compaction slices a delayed result
 ///   into the dropped prefix / retained tail).
 pub fn repair_tool_exchanges(messages: &mut Vec<ChatMessage>, synthesize_missing: bool) {
-    let use_ids: std::collections::HashSet<String> = messages
-        .iter()
-        .flat_map(tool_use_ids)
-        .collect();
+    let use_ids: std::collections::HashSet<String> =
+        messages.iter().flat_map(tool_use_ids).collect();
 
     // Drop orphan tool_result parts; drop messages left empty.
     messages.retain_mut(|msg| {
@@ -335,10 +333,8 @@ pub fn repair_tool_exchanges(messages: &mut Vec<ChatMessage>, synthesize_missing
         return;
     }
 
-    let result_ids: std::collections::HashSet<String> = messages
-        .iter()
-        .flat_map(tool_result_ids)
-        .collect();
+    let result_ids: std::collections::HashSet<String> =
+        messages.iter().flat_map(tool_result_ids).collect();
 
     let mut inserts: Vec<(usize, ChatMessage)> = Vec::new();
     for (i, msg) in messages.iter().enumerate() {
@@ -383,13 +379,12 @@ pub fn compact_messages(messages: &mut Vec<ChatMessage>, keep_last: usize, summa
     let drop_n = cut;
     let mut kept: Vec<ChatMessage> = messages.split_off(cut);
     // Final safety: drop any remaining leading orphan tool-result-only msgs.
-    while kept
-        .first()
-        .is_some_and(|m| is_tool_result_only(m) && {
+    while kept.first().is_some_and(|m| {
+        is_tool_result_only(m) && {
             let ids = tool_result_ids(m);
             !ids.iter().all(|id| slice_has_tool_use(&kept, id))
-        })
-    {
+        }
+    }) {
         kept.remove(0);
     }
     repair_tool_exchanges(&mut kept, true);
@@ -497,9 +492,7 @@ mod tests {
         let mut msgs = vec![
             ChatMessage {
                 role: "user".into(),
-                content: vec![ChatContent::Text {
-                    text: "old".into(),
-                }],
+                content: vec![ChatContent::Text { text: "old".into() }],
             },
             ChatMessage {
                 role: "assistant".into(),
@@ -527,10 +520,14 @@ mod tests {
         // Naive keep_last=2 would start on the tool_result. The cut should pull
         // the matching tool_use into the kept side so the exchange stays intact.
         let cut = compact_cut_index(&msgs, 2);
-        assert!(cut <= 1, "cut={cut} should include the tool_use with its result");
+        assert!(
+            cut <= 1,
+            "cut={cut} should include the tool_use with its result"
+        );
         let _ = compact_messages(&mut msgs, 2, "summary");
         assert!(
-            msgs.iter().any(|m| tool_use_ids(m).iter().any(|id| id == "call-1")),
+            msgs.iter()
+                .any(|m| tool_use_ids(m).iter().any(|id| id == "call-1")),
             "kept history should retain tool_use call-1"
         );
         assert!(

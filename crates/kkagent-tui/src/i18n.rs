@@ -51,7 +51,7 @@ fn format_duration_en(duration_ms: u64) -> String {
         if rem == 0 {
             format!("{mins} min")
         } else {
-            format!("{mins}.{} min", (rem * 10 / 60).max(1).min(9))
+            format!("{mins}.{} min", (rem * 10 / 60).clamp(1, 9))
         }
     } else {
         let hours = secs / 3600;

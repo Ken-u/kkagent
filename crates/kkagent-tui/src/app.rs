@@ -523,9 +523,7 @@ impl AppState {
             .turn_started_at
             .map(|t| t.elapsed().as_millis() as u64)
             .unwrap_or(0);
-        let tokens = self
-            .approx_tokens
-            .saturating_sub(self.tokens_at_turn_start);
+        let tokens = self.approx_tokens.saturating_sub(self.tokens_at_turn_start);
         self.turn_started_at = None;
 
         let start = self
@@ -882,7 +880,7 @@ impl TuiApp {
             }
 
             self.state.tick = self.state.tick.wrapping_add(1);
-            if self.state.tick % 100 == 0 {
+            if self.state.tick.is_multiple_of(100) {
                 let _ = self.refresh_workspace_sessions().await;
             }
             if matches!(
@@ -1844,9 +1842,7 @@ impl TuiApp {
     }
 
     async fn apply_permission_mode_id(&mut self, id: &str) -> anyhow::Result<()> {
-        let new_mode: PermissionMode = id
-            .parse()
-            .map_err(|e: String| anyhow::anyhow!(e))?;
+        let new_mode: PermissionMode = id.parse().map_err(|e: String| anyhow::anyhow!(e))?;
         if new_mode == self.state.permission_mode {
             self.system_message(format!("Permission mode already: {new_mode}"));
             return Ok(());
@@ -1959,10 +1955,7 @@ impl TuiApp {
                         if id.is_empty() {
                             continue;
                         }
-                        let work = s
-                            .get("working_dir")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("");
+                        let work = s.get("working_dir").and_then(|v| v.as_str()).unwrap_or("");
                         let same_workspace = if work.is_empty() {
                             false
                         } else {
@@ -1977,22 +1970,16 @@ impl TuiApp {
                         if !same_workspace {
                             continue;
                         }
-                        let empty = s
-                            .get("empty")
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or_else(|| {
-                                s.get("message_count")
-                                    .and_then(|v| v.as_u64())
-                                    .unwrap_or(0)
-                                    == 0
-                                    && s.get("last_prompt")
-                                        .and_then(|v| v.as_str())
-                                        .map(|p| {
-                                            p.trim().is_empty()
-                                                || kkagent_protocol::is_harness_only_user_text(p)
-                                        })
-                                        .unwrap_or(true)
-                            });
+                        let empty = s.get("empty").and_then(|v| v.as_bool()).unwrap_or_else(|| {
+                            s.get("message_count").and_then(|v| v.as_u64()).unwrap_or(0) == 0
+                                && s.get("last_prompt")
+                                    .and_then(|v| v.as_str())
+                                    .map(|p| {
+                                        p.trim().is_empty()
+                                            || kkagent_protocol::is_harness_only_user_text(p)
+                                    })
+                                    .unwrap_or(true)
+                        });
                         // Keep empty sessions only while they are the active page.
                         if empty && current.as_deref() != Some(id.as_str()) {
                             continue;
@@ -2142,12 +2129,7 @@ impl TuiApp {
         }
 
         // Cold resume of an unrelated session: drop ephemeral window group.
-        if !self
-            .state
-            .open_session_group
-            .iter()
-            .any(|id| id == &sid)
-        {
+        if !self.state.open_session_group.iter().any(|id| id == &sid) {
             self.state.open_session_group.clear();
         }
 
@@ -2264,9 +2246,9 @@ impl TuiApp {
         let family_ids = crate::chrome::fork_family_ids(&parent_rows, &current_id);
 
         // Ephemeral window group (`/new` siblings) — not persisted across process restarts.
-        self.state.open_session_group.retain(|id| {
-            id == &current_id || rows.iter().any(|(rid, _, _)| rid == id)
-        });
+        self.state
+            .open_session_group
+            .retain(|id| id == &current_id || rows.iter().any(|(rid, _, _)| rid == id));
         let mut ids: Vec<String> = if family_ids.is_empty() {
             Vec::new()
         } else {
@@ -2475,7 +2457,10 @@ impl TuiApp {
         let params = serde_json::json!({"session_id": deleted_id});
         match self.client.rpc_call("sessions.delete", Some(params)).await {
             Ok(_) => {
-                self.system_message(format!("Deleted session {}", &confirm.session_id[..8.min(confirm.session_id.len())]));
+                self.system_message(format!(
+                    "Deleted session {}",
+                    &confirm.session_id[..8.min(confirm.session_id.len())]
+                ));
                 let was_current = self.state.session_id.as_deref() == Some(deleted_id.as_str());
                 if was_current {
                     // Prefer another fork-family member; otherwise start fresh.
@@ -2499,7 +2484,9 @@ impl TuiApp {
                         self.state.status_bar.session_id = Some(session_id.clone());
                         self.state.tab_strip.ensure_active(&session_id, "main");
                         self.state.messages.clear();
-                        self.system_message("Current session was deleted; started a new one.".into());
+                        self.system_message(
+                            "Current session was deleted; started a new one.".into(),
+                        );
                     }
                 }
                 self.open_session_picker().await?;
@@ -3040,7 +3027,9 @@ impl TuiApp {
             "btw" => {
                 if args.is_empty() {
                     self.state.btw.open = true;
-                    self.system_message("Usage: /btw <question> — side Q&A (does not alter main chat)".into());
+                    self.system_message(
+                        "Usage: /btw <question> — side Q&A (does not alter main chat)".into(),
+                    );
                 } else if self.state.btw.streaming {
                     self.system_message(
                         "Wait for /btw to finish before sending another question.".into(),
@@ -3549,8 +3538,7 @@ impl TuiApp {
                                 }
                             }
                         }
-                        self.state.approval_pending =
-                            Some(pending_approval_from_request(&request));
+                        self.state.approval_pending = Some(pending_approval_from_request(&request));
                         self.state.status = SessionStatus::WaitingApproval;
                     }
                     AgentEvent::QuestionAsked { question, .. } => {
@@ -3749,7 +3737,15 @@ impl TuiApp {
 
 fn summarize_tool_input(input: &serde_json::Value) -> String {
     // Prefer human-readable fields; keep enough text for full-width chips.
-    for key in ["command", "path", "pattern", "query", "url", "description", "prompt"] {
+    for key in [
+        "command",
+        "path",
+        "pattern",
+        "query",
+        "url",
+        "description",
+        "prompt",
+    ] {
         if let Some(s) = input.get(key).and_then(|v| v.as_str()) {
             let t = s.trim();
             if !t.is_empty() {
@@ -3764,9 +3760,7 @@ fn summarize_tool_input(input: &serde_json::Value) -> String {
         .collect()
 }
 
-fn pending_approval_from_request(
-    request: &kkagent_protocol::ApprovalRequest,
-) -> PendingApproval {
+fn pending_approval_from_request(request: &kkagent_protocol::ApprovalRequest) -> PendingApproval {
     let display = request
         .tool_input_display
         .clone()
@@ -3855,8 +3849,7 @@ fn session_has_retained_io(messages: &[DisplayMessage]) -> bool {
     messages.iter().any(|m| match m.role {
         MessageRole::System => false,
         MessageRole::User => {
-            !m.content.trim().is_empty()
-                && !kkagent_protocol::is_harness_only_user_text(&m.content)
+            !m.content.trim().is_empty() && !kkagent_protocol::is_harness_only_user_text(&m.content)
         }
         MessageRole::Plan => !m.content.trim().is_empty(),
         MessageRole::Assistant => {
@@ -3933,11 +3926,7 @@ fn transcript_messages_to_display(msgs: &[serde_json::Value]) -> Vec<DisplayMess
                         continue;
                     }
                     let visible = kkagent_protocol::visible_user_text(&text);
-                    let content = if visible.is_empty() {
-                        text
-                    } else {
-                        visible
-                    };
+                    let content = if visible.is_empty() { text } else { visible };
                     if content.trim().is_empty() {
                         continue;
                     }
@@ -4244,7 +4233,8 @@ mod app_state_tests {
     #[test]
     fn collapse_turn_tools_into_overview() {
         let mut state = AppState::new(PermissionMode::Manual, false);
-        state.turn_started_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(90));
+        state.turn_started_at =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(90));
         state.tokens_at_turn_start = 100;
         state.approx_tokens = 2500;
         state.messages.push(DisplayMessage {
@@ -4280,7 +4270,9 @@ mod app_state_tests {
 
         state.collapse_completed_turn_tools();
         let parts = &state.messages.last().unwrap().parts;
-        assert!(matches!(parts.first(), Some(DisplayPart::ToolHistory(h)) if h.tool_count == 2 && !h.expanded));
+        assert!(
+            matches!(parts.first(), Some(DisplayPart::ToolHistory(h)) if h.tool_count == 2 && !h.expanded)
+        );
         assert!(matches!(parts.last(), Some(DisplayPart::Text(t)) if t == "done"));
         assert!(!parts.iter().any(|p| matches!(p, DisplayPart::Tool(_))));
     }

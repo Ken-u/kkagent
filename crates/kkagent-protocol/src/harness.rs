@@ -14,10 +14,7 @@ fn strip_tagged_blocks(text: &str, tag: &str) -> String {
     let open = format!("<{tag}>");
     let close = format!("</{tag}>");
     let mut out = text.to_string();
-    loop {
-        let Some(start) = out.find(&open) else {
-            break;
-        };
+    while let Some(start) = out.find(&open) {
         let Some(rel_end) = out[start..].find(&close) else {
             // Unclosed tag — drop from open to end (truncated display junk).
             out.truncate(start);

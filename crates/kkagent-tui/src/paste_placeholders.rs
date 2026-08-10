@@ -53,9 +53,7 @@ fn find_next_marker(text: &str, from: usize) -> Option<(usize, usize, u32)> {
     let mut i = from;
     while i < text.len() {
         let rest = &text[i..];
-        let Some(rel) = rest.find(MARKER_PREFIX) else {
-            return None;
-        };
+        let rel = rest.find(MARKER_PREFIX)?;
         let start = i + rel;
         let after_hash = start + MARKER_PREFIX.len();
         if after_hash >= text.len() {

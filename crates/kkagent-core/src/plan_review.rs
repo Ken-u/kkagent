@@ -74,13 +74,7 @@ impl PlanReviewDisplay {
 pub fn is_reserved_label(label: &str) -> bool {
     matches!(
         normalize_label(label).as_str(),
-        "approve"
-            | "reject"
-            | "reject and exit"
-            | "revise"
-            | "执行"
-            | "拒绝"
-            | "修改意见"
+        "approve" | "reject" | "reject and exit" | "revise" | "执行" | "拒绝" | "修改意见"
     )
 }
 

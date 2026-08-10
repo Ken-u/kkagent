@@ -1095,9 +1095,7 @@ impl kkagent_acp::AcpHost for AgentAcpHost {
                 Ok(())
             }
             "manual" | "yolo" | "auto" => {
-                let perm = mode
-                    .parse::<PermissionMode>()
-                    .map_err(|e| e.to_string())?;
+                let perm = mode.parse::<PermissionMode>().map_err(|e| e.to_string())?;
                 if let Some(arc) = self.state.permission_modes.lock().await.get(session_id) {
                     *arc.lock().unwrap_or_else(|e| e.into_inner()) = perm;
                     return Ok(());
@@ -2788,10 +2786,7 @@ async fn handle_rpc_call(
             state.approval_txs.lock().await.remove(&session_id);
             state.question_txs.lock().await.remove(&session_id);
             if let Some(session) = removed {
-                session
-                    .services
-                    .on_close(SessionCloseReason::Exit)
-                    .await;
+                session.services.on_close(SessionCloseReason::Exit).await;
             }
             drop(_turn_permit);
             state.turn_locks.remove(&session_id).await;
@@ -2854,19 +2849,13 @@ async fn handle_rpc_call(
                         .into_iter()
                         .rev()
                         .collect();
-                    (
-                        session.title.clone(),
-                        Some(session.get_model_alias()),
-                        msgs,
-                    )
+                    (session.title.clone(), Some(session.get_model_alias()), msgs)
                 } else {
                     drop(sessions);
                     let db = state.transcript.lock().await;
-                    let sid = resolve_session_id(&db, &session_id)
-                        .unwrap_or_else(|| session_id.clone());
-                    let record = db
-                        .get_session(&sid)
-                        .map_err(|e| (-32000, e.to_string()))?;
+                    let sid =
+                        resolve_session_id(&db, &session_id).unwrap_or_else(|| session_id.clone());
+                    let record = db.get_session(&sid).map_err(|e| (-32000, e.to_string()))?;
                     let records = db
                         .load_messages(&sid)
                         .map_err(|e| (-32000, e.to_string()))?;

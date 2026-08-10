@@ -12,8 +12,8 @@ use tokio::sync::{mpsc, Mutex};
 use tokio::task::AbortHandle;
 
 use crate::context_projector::{
-    compact_messages, fold_old_media, project, project_strict, ProjectOptions,
-    build_compaction_digest, compact_cut_index,
+    build_compaction_digest, compact_cut_index, compact_messages, fold_old_media, project,
+    project_strict, ProjectOptions,
 };
 use crate::model_capability::ModelCapability;
 use crate::permission::{PermissionChain, PermissionDecision};
@@ -715,9 +715,7 @@ Do not mention this reminder to the user.\n</system-reminder>"
                         if tc.name == "AskUserQuestion" {
                             Prepared::Done(self.execute_tool(session, &tc.name, &tc.input).await)
                         } else if tc.name == "ExitPlanMode" {
-                            Prepared::Done(
-                                self.auto_exit_plan_mode(session, &tc.input).await,
-                            )
+                            Prepared::Done(self.auto_exit_plan_mode(session, &tc.input).await)
                         } else {
                             if tc.name == "Write" || tc.name == "Edit" {
                                 if let Some(path_str) =
@@ -740,98 +738,100 @@ Do not mention this reminder to the user.\n</system-reminder>"
                     PermissionDecision::Ask => {
                         if tc.name == "ExitPlanMode" {
                             Prepared::Done(
-                                self.review_exit_plan_mode(session, &session_id, &tc).await?,
+                                self.review_exit_plan_mode(session, &session_id, tc).await?,
                             )
                         } else {
-                        let approval_id = uuid::Uuid::new_v4().to_string();
-                        let action = describe_tool_action(&tc.name, &tc.input);
-                        let _ = self
-                            .event_tx
-                            .send(AgentEvent::ApprovalRequested {
-                                session_id: session_id.clone(),
-                                request: kkagent_protocol::ApprovalRequest {
-                                    approval_id: approval_id.clone(),
+                            let approval_id = uuid::Uuid::new_v4().to_string();
+                            let action = describe_tool_action(&tc.name, &tc.input);
+                            let _ = self
+                                .event_tx
+                                .send(AgentEvent::ApprovalRequested {
                                     session_id: session_id.clone(),
-                                    tool_call_id: tc.id.clone(),
-                                    tool_name: tc.name.clone(),
-                                    action,
-                                    tool_input_display: Some(tc.input.clone()),
-                                    created_at: chrono::Utc::now(),
+                                    request: kkagent_protocol::ApprovalRequest {
+                                        approval_id: approval_id.clone(),
+                                        session_id: session_id.clone(),
+                                        tool_call_id: tc.id.clone(),
+                                        tool_name: tc.name.clone(),
+                                        action,
+                                        tool_input_display: Some(tc.input.clone()),
+                                        created_at: chrono::Utc::now(),
+                                    },
+                                })
+                                .await;
+
+                            let _ = self
+                                .event_tx
+                                .send(AgentEvent::StatusUpdate {
+                                    session_id: session_id.clone(),
+                                    status: SessionStatus::WaitingApproval,
+                                })
+                                .await;
+
+                            let approval_timeout = self
+                                .config
+                                .background
+                                .as_ref()
+                                .and_then(|background| background.approval_timeout_s)
+                                .unwrap_or(900)
+                                .clamp(1, 86_400);
+                            let response = match tokio::time::timeout(
+                                std::time::Duration::from_secs(approval_timeout),
+                                session.wait_approval(&approval_id),
+                            )
+                            .await
+                            {
+                                Ok(response) => response,
+                                Err(_) => kkagent_protocol::ApprovalResponse {
+                                    approval_id: approval_id.clone(),
+                                    decision: kkagent_protocol::ApprovalDecision::Rejected,
+                                    scope: None,
+                                    feedback: Some(format!(
+                                        "approval timed out after {approval_timeout} seconds"
+                                    )),
+                                    selected_label: None,
                                 },
-                            })
-                            .await;
-
-                        let _ = self
-                            .event_tx
-                            .send(AgentEvent::StatusUpdate {
-                                session_id: session_id.clone(),
-                                status: SessionStatus::WaitingApproval,
-                            })
-                            .await;
-
-                        let approval_timeout = self
-                            .config
-                            .background
-                            .as_ref()
-                            .and_then(|background| background.approval_timeout_s)
-                            .unwrap_or(900)
-                            .clamp(1, 86_400);
-                        let response = match tokio::time::timeout(
-                            std::time::Duration::from_secs(approval_timeout),
-                            session.wait_approval(&approval_id),
-                        )
-                        .await
-                        {
-                            Ok(response) => response,
-                            Err(_) => kkagent_protocol::ApprovalResponse {
-                                approval_id: approval_id.clone(),
-                                decision: kkagent_protocol::ApprovalDecision::Rejected,
-                                scope: None,
-                                feedback: Some(format!(
-                                    "approval timed out after {approval_timeout} seconds"
-                                )),
-                                selected_label: None,
-                            },
-                        };
-                        match response.decision {
-                            kkagent_protocol::ApprovalDecision::Approved => {
-                                if response.scope == Some(kkagent_protocol::ApprovalScope::Session)
-                                {
-                                    let mut perm = self.permission.lock().await;
-                                    perm.record_session_approval(&tc.name, &tc.input);
-                                }
-                                if tc.name == "AskUserQuestion" {
-                                    Prepared::Done(
-                                        self.execute_tool(session, &tc.name, &tc.input).await,
-                                    )
-                                } else {
-                                    if tc.name == "Write" || tc.name == "Edit" {
-                                        if let Some(path_str) =
-                                            tc.input.get("path").and_then(|v| v.as_str())
-                                        {
-                                            let path =
-                                                if std::path::Path::new(path_str).is_absolute() {
+                            };
+                            match response.decision {
+                                kkagent_protocol::ApprovalDecision::Approved => {
+                                    if response.scope
+                                        == Some(kkagent_protocol::ApprovalScope::Session)
+                                    {
+                                        let mut perm = self.permission.lock().await;
+                                        perm.record_session_approval(&tc.name, &tc.input);
+                                    }
+                                    if tc.name == "AskUserQuestion" {
+                                        Prepared::Done(
+                                            self.execute_tool(session, &tc.name, &tc.input).await,
+                                        )
+                                    } else {
+                                        if tc.name == "Write" || tc.name == "Edit" {
+                                            if let Some(path_str) =
+                                                tc.input.get("path").and_then(|v| v.as_str())
+                                            {
+                                                let path = if std::path::Path::new(path_str)
+                                                    .is_absolute()
+                                                {
                                                     std::path::PathBuf::from(path_str)
                                                 } else {
                                                     session.working_dir.join(path_str)
                                                 };
-                                            session.record_pre_change(path).await;
+                                                session.record_pre_change(path).await;
+                                            }
+                                        }
+                                        Prepared::Ready {
+                                            name: tc.name.clone(),
+                                            input: tc.input.clone(),
                                         }
                                     }
-                                    Prepared::Ready {
-                                        name: tc.name.clone(),
-                                        input: tc.input.clone(),
-                                    }
                                 }
+                                kkagent_protocol::ApprovalDecision::Cancelled => {
+                                    self.finish_interrupted(session).await?;
+                                    return Ok(TurnStep::Done);
+                                }
+                                _ => Prepared::Done(ToolOutput::error(
+                                    "Tool call was rejected by user",
+                                )),
                             }
-                            kkagent_protocol::ApprovalDecision::Cancelled => {
-                                self.finish_interrupted(session).await?;
-                                return Ok(TurnStep::Done);
-                            }
-                            _ => {
-                                Prepared::Done(ToolOutput::error("Tool call was rejected by user"))
-                            }
-                        }
                         } // end else non-ExitPlanMode Ask
                     }
                     PermissionDecision::Deny(reason) => {
@@ -914,8 +914,7 @@ Do not mention this reminder to the user.\n</system-reminder>"
                         };
                         match response.decision {
                             kkagent_protocol::ApprovalDecision::Approved => {
-                                if response.scope
-                                    == Some(kkagent_protocol::ApprovalScope::Session)
+                                if response.scope == Some(kkagent_protocol::ApprovalScope::Session)
                                 {
                                     let mut perm = self.permission.lock().await;
                                     perm.record_session_approval(name, input);

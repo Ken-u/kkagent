@@ -236,9 +236,7 @@ impl SessionBtwService {
         while let Some(evt) = stream_rx.recv().await {
             if cancel.load(Ordering::SeqCst) {
                 handle.abort();
-                let _ = event_tx
-                    .send(StreamEvent::Error("cancelled".into()))
-                    .await;
+                let _ = event_tx.send(StreamEvent::Error("cancelled".into())).await;
                 break;
             }
             if event_tx.send(evt).await.is_err() {

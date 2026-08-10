@@ -456,7 +456,12 @@ fn build_transcript_lines(state: &mut AppState, theme: &Theme, width: u16) -> Ve
                             }
                             DisplayPart::ToolHistory(hist) => {
                                 render_tool_history_lines(
-                                    &mut lines, hist, width, theme, state.locale, first_bullet,
+                                    &mut lines,
+                                    hist,
+                                    width,
+                                    theme,
+                                    state.locale,
+                                    first_bullet,
                                 );
                                 first_bullet = false;
                                 rendered_any = true;
@@ -619,7 +624,11 @@ fn render_tool_call_lines(
         lines.push(Line::from(vec![
             Span::styled("● ", Style::default().fg(theme.text)),
             Span::styled(
-                format!("{} {}", status_icon(tc), ToolRenderRegistry::chip_label(tc, width)),
+                format!(
+                    "{} {}",
+                    status_icon(tc),
+                    ToolRenderRegistry::chip_label(tc, width)
+                ),
                 ToolRenderRegistry::chip_style(tc, theme),
             ),
         ]));
@@ -646,12 +655,8 @@ fn render_tool_history_lines(
     locale: Locale,
     first_bullet: bool,
 ) {
-    let overview = i18n::tool_history_overview(
-        locale,
-        hist.tool_count,
-        hist.duration_ms,
-        hist.tokens,
-    );
+    let overview =
+        i18n::tool_history_overview(locale, hist.tool_count, hist.duration_ms, hist.tokens);
     let hint = if hist.expanded {
         i18n::tool_history_collapse_hint(locale)
     } else {
@@ -664,10 +669,7 @@ fn render_tool_history_lines(
             format!("… {overview}"),
             Style::default().fg(theme.text_muted),
         ),
-        Span::styled(
-            format!(" ({hint})"),
-            Style::default().fg(theme.text_dim),
-        ),
+        Span::styled(format!(" ({hint})"), Style::default().fg(theme.text_dim)),
     ]));
 
     if hist.expanded {
@@ -1023,7 +1025,10 @@ fn render_input(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
 
     // Soft-wrap each logical line; prefix only the first visual row of the buffer.
     let mut visual: Vec<Line> = Vec::new();
-    for (li, logical) in input_logical_lines(&state.input.text).into_iter().enumerate() {
+    for (li, logical) in input_logical_lines(&state.input.text)
+        .into_iter()
+        .enumerate()
+    {
         let chunks = soft_wrap_line(logical, content_width);
         for (ci, chunk) in chunks.into_iter().enumerate() {
             if li == 0 && ci == 0 {
@@ -1043,8 +1048,12 @@ fn render_input(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         visual.push(Line::from(vec![Span::styled(prefix, prefix_style)]));
     }
 
-    let (cursor_x, cursor_y) =
-        cursor_position(&state.input.text, state.input.cursor, content_width, prefix_w as u16);
+    let (cursor_x, cursor_y) = cursor_position(
+        &state.input.text,
+        state.input.cursor,
+        content_width,
+        prefix_w as u16,
+    );
     // Exact wrap boundary can place the cursor on a fresh visual row — pad so it paints.
     while (visual.len() as u16) <= cursor_y {
         visual.push(Line::from(vec![
@@ -1054,11 +1063,7 @@ fn render_input(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     }
 
     let view_h = inner.height.max(1);
-    let scroll = if cursor_y + 1 > view_h {
-        cursor_y + 1 - view_h
-    } else {
-        0
-    };
+    let scroll = (cursor_y + 1).saturating_sub(view_h);
 
     let paragraph = Paragraph::new(Text::from(visual)).scroll((scroll, 0));
     f.render_widget(paragraph, inner);
@@ -1242,9 +1247,7 @@ fn render_footer(f: &mut Frame, area: Rect, state: &AppState, config: &AppConfig
     let strip_budget = (area.width as usize)
         .saturating_sub(ctx_w)
         .saturating_sub(gap);
-    let session_spans = state
-        .workspace_sessions
-        .render_spans(strip_budget, theme);
+    let session_spans = state.workspace_sessions.render_spans(strip_budget, theme);
     let strip_text: String = session_spans.iter().map(|s| s.content.clone()).collect();
     let strip_w = UnicodeWidthStr::width(strip_text.as_str());
     let pad2 = area
@@ -1255,10 +1258,7 @@ fn render_footer(f: &mut Frame, area: Rect, state: &AppState, config: &AppConfig
     if pad2 > 0 {
         line2_spans.push(Span::raw(" ".repeat(pad2 as usize)));
     }
-    line2_spans.push(Span::styled(
-        context,
-        Style::default().fg(theme.text),
-    ));
+    line2_spans.push(Span::styled(context, Style::default().fg(theme.text)));
     let line2 = Line::from(line2_spans);
 
     f.render_widget(
@@ -1646,10 +1646,7 @@ fn render_list_picker(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme
                 } else {
                     Style::default().fg(theme.text_dim)
                 };
-                lines.push(Line::from(Span::styled(
-                    format!("{prefix}{label}"),
-                    style,
-                )));
+                lines.push(Line::from(Span::styled(format!("{prefix}{label}"), style)));
             }
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
@@ -2277,7 +2274,7 @@ mod render_smoke {
             .join("\n");
         assert!(joined.contains("step 1"));
         assert!(joined.contains("step 40"));
-        assert!(joined.contains("more lines") == false);
+        assert!(!joined.contains("more lines"));
         assert!(joined.contains("scroll = full plan only"));
         // No earlier transcript noise
         assert!(!joined.contains("kkagent"));

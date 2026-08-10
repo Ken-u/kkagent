@@ -18,10 +18,7 @@ impl ToolRenderRegistry {
             "Read" | "Write" | "Edit" => format!(
                 "{} {}",
                 tc.name,
-                fit(
-                    &tc.input_summary,
-                    budget.saturating_sub(tc.name.len() + 1)
-                )
+                fit(&tc.input_summary, budget.saturating_sub(tc.name.len() + 1))
             ),
             "Grep" => format!("grep {}", fit(&tc.input_summary, budget.saturating_sub(5))),
             "Glob" => format!("glob {}", fit(&tc.input_summary, budget.saturating_sub(5))),
@@ -31,10 +28,7 @@ impl ToolRenderRegistry {
             "WebSearch" | "FetchURL" => format!(
                 "{} {}",
                 tc.name,
-                fit(
-                    &tc.input_summary,
-                    budget.saturating_sub(tc.name.len() + 1)
-                )
+                fit(&tc.input_summary, budget.saturating_sub(tc.name.len() + 1))
             ),
             other => format!(
                 "{} {}",
@@ -93,7 +87,7 @@ fn fit(s: &str, max_cols: usize) -> String {
     for ch in s.chars() {
         let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
         if w + cw > max_cols {
-            if max_cols >= 1 && UnicodeWidthStr::width(out.as_str()) + 1 <= max_cols {
+            if max_cols >= 1 && UnicodeWidthStr::width(out.as_str()) < max_cols {
                 out.push('…');
             }
             break;
@@ -104,12 +98,7 @@ fn fit(s: &str, max_cols: usize) -> String {
     out
 }
 
-fn push_wrapped_output_line(
-    lines: &mut Vec<Line<'static>>,
-    raw: &str,
-    width: u16,
-    style: Style,
-) {
+fn push_wrapped_output_line(lines: &mut Vec<Line<'static>>, raw: &str, width: u16, style: Style) {
     let avail = (width as usize).saturating_sub(2).max(8);
     for chunk in wrap_cols(raw, avail) {
         lines.push(Line::from(Span::styled(format!("  {chunk}"), style)));

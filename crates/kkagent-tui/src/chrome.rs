@@ -588,12 +588,7 @@ mod tests {
         let rem = "<system-reminder>\nToday's date is 2026-08-10.\n</system-reminder>";
         let t = session_display_title(Some(rem), false, Some(rem), "abcdef12");
         assert_eq!(t, "abcdef12");
-        let t = session_display_title(
-            Some(rem),
-            false,
-            Some("real question"),
-            "abcdef12",
-        );
+        let t = session_display_title(Some(rem), false, Some("real question"), "abcdef12");
         assert_eq!(t, "real question");
     }
 
@@ -632,10 +627,7 @@ mod tests {
         let text: String = spans.iter().map(|s| s.content.clone()).collect();
         assert!(text.contains('8') || text.contains('['));
         assert!(
-            text.contains('‹')
-                || text.contains('›')
-                || text.contains('·')
-                || text.contains('[')
+            text.contains('‹') || text.contains('›') || text.contains('·') || text.contains('[')
         );
     }
 }

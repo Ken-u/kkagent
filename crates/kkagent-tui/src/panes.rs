@@ -191,7 +191,9 @@ pub fn render_btw(f: &mut Frame, area: Rect, pane: &BtwPane, theme: &Theme) {
         .title(title)
         .border_style(Style::default().fg(theme.border));
     f.render_widget(
-        Paragraph::new(lines).wrap(Wrap { trim: false }).block(block),
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .block(block),
         area,
     );
 }

@@ -62,21 +62,16 @@ impl SessionEventRouter {
                     self.status = SessionStatus::Idle;
                 }
             }
-            AgentEvent::Error { message, .. } => {
-                if is_current {
-                    self.last_error = Some(message.clone());
-                }
+            AgentEvent::Error { message, .. } if is_current => {
+                self.last_error = Some(message.clone());
             }
-            AgentEvent::UsageUpdate { usage, .. } => {
-                if is_current {
-                    status.tokens = status
-                        .tokens
-                        .saturating_add(usage.input_tokens.saturating_add(usage.output_tokens));
-                    if usage.cache_read_input_tokens > 0 {
-                        let total = usage.input_tokens.max(1);
-                        status.cache_hit =
-                            Some(usage.cache_read_input_tokens as f32 / total as f32);
-                    }
+            AgentEvent::UsageUpdate { usage, .. } if is_current => {
+                status.tokens = status
+                    .tokens
+                    .saturating_add(usage.input_tokens.saturating_add(usage.output_tokens));
+                if usage.cache_read_input_tokens > 0 {
+                    let total = usage.input_tokens.max(1);
+                    status.cache_hit = Some(usage.cache_read_input_tokens as f32 / total as f32);
                 }
             }
             _ => {}
