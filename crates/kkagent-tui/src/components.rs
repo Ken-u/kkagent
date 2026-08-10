@@ -1737,10 +1737,15 @@ fn render_session_delete_confirm(f: &mut Frame, area: Rect, state: &AppState, th
     };
     let inner = area.inner(Margin::new(1, 1));
     f.render_widget(Clear, area);
+    let title = if confirm.permanent {
+        " Permanently delete session "
+    } else {
+        " Close session tab "
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.warning))
-        .title(" Close session ");
+        .title(title);
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::from(Span::styled(
         format!(
@@ -1749,11 +1754,35 @@ fn render_session_delete_confirm(f: &mut Frame, area: Rect, state: &AppState, th
         ),
         Style::default().fg(theme.text),
     )));
+    if confirm.busy {
+        lines.push(Line::from(Span::styled(
+            if confirm.permanent {
+                " Busy turn will be interrupted, then history deleted."
+            } else {
+                " Busy turn keeps running in the background."
+            },
+            Style::default().fg(theme.warning),
+        )));
+    } else if confirm.permanent {
+        lines.push(Line::from(Span::styled(
+            " This permanently deletes transcript history.",
+            Style::default().fg(theme.error),
+        )));
+    } else {
+        lines.push(Line::from(Span::styled(
+            " Closes this tab only — history is kept (use /sessions Ctrl-D to delete).",
+            Style::default().fg(theme.text_dim),
+        )));
+    }
     lines.push(Line::from(""));
-    for (i, label) in ["No — keep session", "Yes — close & delete"]
-        .iter()
-        .enumerate()
-    {
+    let yes = if confirm.permanent {
+        "Yes — permanently delete"
+    } else if confirm.busy {
+        "Yes — close tab (keep running)"
+    } else {
+        "Yes — close tab"
+    };
+    for (i, label) in ["No — cancel", yes].iter().enumerate() {
         let selected = confirm.selected == i;
         let prefix = if selected { "> " } else { "  " };
         let style = if selected {

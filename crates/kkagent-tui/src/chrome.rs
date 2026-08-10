@@ -14,6 +14,20 @@ use crate::theme::Theme;
 
 const SESSION_TITLE_MAX_COLS: usize = 18;
 
+fn session_status_mark(entry: &WorkspaceSessionEntry) -> &'static str {
+    if entry.needs_attention {
+        return "!";
+    }
+    if entry.dirty {
+        return "*";
+    }
+    match entry.status {
+        SessionStatus::Thinking | SessionStatus::ToolExecuting | SessionStatus::Compacting => "…",
+        SessionStatus::WaitingApproval | SessionStatus::WaitingQuestion => "?",
+        SessionStatus::Idle => "",
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SessionTab {
     pub id: String,
@@ -121,6 +135,9 @@ impl TabStrip {
 pub struct WorkspaceSessionEntry {
     pub id: String,
     pub title: String,
+    pub status: SessionStatus,
+    pub dirty: bool,
+    pub needs_attention: bool,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -172,11 +189,12 @@ impl WorkspaceSessionStrip {
             .iter()
             .enumerate()
             .map(|(i, e)| {
+                let mark = session_status_mark(e);
                 let title = truncate_cols(&e.title, SESSION_TITLE_MAX_COLS);
                 let label = if i == self.active {
-                    format!("[{title}]")
+                    format!("[{mark}{title}]")
                 } else {
-                    title
+                    format!("{mark}{title}")
                 };
                 (i == self.active, label)
             })
@@ -623,6 +641,9 @@ mod tests {
             entries.push(WorkspaceSessionEntry {
                 id: format!("id{i}"),
                 title: format!("session-title-number-{i}"),
+                status: SessionStatus::Idle,
+                dirty: false,
+                needs_attention: false,
             });
         }
         strip.set_entries(entries, Some("id8"));

@@ -103,7 +103,7 @@
 
 ### P1：可发现性与多会话状态
 
-- [ ] 统一并修正快捷键语义：当前 `Ctrl+Tab` / `Ctrl+Shift+Tab` 只移动内部 `tab_strip` 索引却不真正 resume，应改为真实切换或移除；保留 Shift-Tab 的 plan mode 语义，并在 footer / 帮助中准确展示快捷键。
+- [x] 统一并修正快捷键语义：当前 `Ctrl+Tab` / `Ctrl+Shift+Tab` 只移动内部 `tab_strip` 索引却不真正 resume，应改为真实切换或移除；保留 Shift-Tab 的 plan mode 语义，并在 footer / 帮助中准确展示快捷键。
 - [ ] 在 footer session strip 和 `/sessions` 列表统一显示 active、未读、思考中、工具执行中、等待 approval / question、失败等状态；提供“下一个未读 / 需要处理的 session”快捷键。
 - [ ] session 列表刷新时保持稳定顺序和 active 项位置，避免周期刷新造成标签来回跳动；fork 家族使用稳定分组，并清楚标识父子关系。
 - [ ] `/sessions` 支持即时模糊搜索，可按标题、短 session id、工作目录和模型过滤；默认保留当前工作区范围并明确显示过滤范围。

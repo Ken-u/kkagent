@@ -234,6 +234,10 @@ pub struct SessionDeleteConfirm {
     pub label: String,
     /// 0 = No (default), 1 = Yes
     pub selected: usize,
+    /// true = permanently delete history; false = close TUI tab only.
+    pub permanent: bool,
+    /// Session is currently busy (running / waiting).
+    pub busy: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1800,10 +1804,28 @@ impl TuiApp {
                 {
                     if let Some(picker) = self.state.list_picker.as_ref() {
                         if let Some(item) = picker.items.get(picker.selected) {
+                            let busy = self
+                                .state
+                                .tab_strip
+                                .tabs
+                                .iter()
+                                .find(|t| t.id == item.id)
+                                .is_some_and(|t| {
+                                    matches!(
+                                        t.status,
+                                        SessionStatus::Thinking
+                                            | SessionStatus::ToolExecuting
+                                            | SessionStatus::WaitingApproval
+                                            | SessionStatus::WaitingQuestion
+                                            | SessionStatus::Compacting
+                                    ) || t.dirty
+                                });
                             self.state.session_delete_confirm = Some(SessionDeleteConfirm {
                                 session_id: item.id.clone(),
                                 label: item.label.clone(),
                                 selected: 0, // default No
+                                permanent: true,
+                                busy,
                             });
                         }
                     }
@@ -4003,15 +4025,26 @@ impl TuiApp {
         } else {
             ids.into_iter()
                 .filter_map(|id| {
+                    let tab = self.state.tab_strip.tabs.iter().find(|t| t.id == id);
+                    let status = tab.map(|t| t.status).unwrap_or(SessionStatus::Idle);
+                    let dirty = tab.map(|t| t.dirty).unwrap_or(false);
+                    let needs_attention = self.state.parked_approvals.contains_key(&id)
+                        || self.state.parked_questions.contains_key(&id);
                     if let Some((_, _, title)) = rows.iter().find(|(rid, _, _)| rid == &id) {
                         Some(crate::chrome::WorkspaceSessionEntry {
                             id,
                             title: title.clone(),
+                            status,
+                            dirty,
+                            needs_attention,
                         })
                     } else if id == current_id {
                         Some(crate::chrome::WorkspaceSessionEntry {
                             id,
                             title: "session".into(),
+                            status,
+                            dirty,
+                            needs_attention,
                         })
                     } else {
                         None
@@ -4081,11 +4114,21 @@ impl TuiApp {
                     sid.clone()
                 }
             });
+        let busy = matches!(
+            self.state.status,
+            SessionStatus::Thinking
+                | SessionStatus::ToolExecuting
+                | SessionStatus::WaitingApproval
+                | SessionStatus::WaitingQuestion
+                | SessionStatus::Compacting
+        );
         self.state.quit_confirm = false;
         self.state.session_delete_confirm = Some(SessionDeleteConfirm {
             session_id: sid,
             label,
             selected: 0,
+            permanent: false,
+            busy,
         });
     }
 
@@ -4283,7 +4326,85 @@ impl TuiApp {
             .as_ref()
             .is_some_and(|p| p.kind == ListPickerKind::Session);
 
-        // Interrupt a busy turn on the session being closed.
+        if !confirm.permanent {
+            // Close TUI tab only — keep history, optionally leave turn running.
+            self.state.open_session_group.retain(|id| id != &deleted_id);
+            self.state.tab_strip.tabs.retain(|t| t.id != deleted_id);
+            if self.state.tab_strip.active >= self.state.tab_strip.tabs.len() {
+                self.state.tab_strip.active = self.state.tab_strip.tabs.len().saturating_sub(1);
+            }
+            let was_current = self.state.session_id.as_deref() == Some(deleted_id.as_str());
+            if was_current {
+                let view = crate::session_view::SessionViewState::capture(
+                    &self.state.input,
+                    self.state.scroll_up,
+                    self.state.follow_bottom,
+                    self.state.todos_expanded,
+                    &self.state.search,
+                    self.state.highlight_message,
+                );
+                self.state.session_views.insert(deleted_id.clone(), view);
+                if let Some(approval) = self.state.approval_pending.take() {
+                    self.state
+                        .parked_approvals
+                        .insert(deleted_id.clone(), approval);
+                }
+                if let Some(question) = self.state.question_pending.take() {
+                    self.state
+                        .parked_questions
+                        .insert(deleted_id.clone(), question);
+                }
+                self.enqueue_workspace_sessions_refresh();
+                let fallback = self
+                    .state
+                    .workspace_sessions
+                    .entries
+                    .iter()
+                    .map(|e| e.id.clone())
+                    .find(|id| id != &deleted_id)
+                    .or_else(|| {
+                        self.state
+                            .open_session_group
+                            .iter()
+                            .find(|id| *id != &deleted_id)
+                            .cloned()
+                    })
+                    .or_else(|| {
+                        self.state
+                            .tab_strip
+                            .tabs
+                            .iter()
+                            .map(|t| t.id.clone())
+                            .find(|id| id != &deleted_id)
+                    });
+                if let Some(id) = fallback {
+                    self.resume_session(&id).await?;
+                } else {
+                    let cwd = std::env::current_dir()?.to_string_lossy().to_string();
+                    let session_id = self
+                        .client
+                        .create_session(Some(&cwd), Some(self.state.permission_mode))
+                        .await?;
+                    self.state.messages.clear();
+                    self.state.todos.clear();
+                    self.state.status = SessionStatus::Idle;
+                    self.state.approval_pending = None;
+                    self.state.question_pending = None;
+                    self.state.session_id = Some(session_id.clone());
+                    self.state.status_bar.session_id = Some(session_id.clone());
+                    self.state.tab_strip.ensure_active(&session_id, "main");
+                    self.bind_config_default_model();
+                }
+                self.system_message(if confirm.busy {
+                    "Tab closed — previous turn continues in the background.".into()
+                } else {
+                    "Session tab closed (history kept).".into()
+                });
+            }
+            return Ok(());
+        }
+
+        // Permanent delete — interrupt busy turns first.
         if self.state.session_id.as_deref() == Some(deleted_id.as_str())
             && !matches!(self.state.status, SessionStatus::Idle)
         {
@@ -4297,6 +4418,7 @@ impl TuiApp {
                 self.state.tab_strip.tabs.retain(|t| t.id != deleted_id);
                 self.state.parked_approvals.remove(&deleted_id);
                 self.state.parked_questions.remove(&deleted_id);
+                self.state.session_views.remove(&deleted_id);
                 let was_current = self.state.session_id.as_deref() == Some(deleted_id.as_str());
                 if was_current {
                     self.refresh_workspace_sessions().await?;
@@ -4322,22 +4444,24 @@ impl TuiApp {
                             .client
                             .create_session(Some(&cwd), Some(self.state.permission_mode))
                             .await?;
+                        self.state.messages.clear();
+                        self.state.todos.clear();
+                        self.state.status = SessionStatus::Idle;
+                        self.state.approval_pending = None;
+                        self.state.question_pending = None;
                         self.state.session_id = Some(session_id.clone());
                         self.state.status_bar.session_id = Some(session_id.clone());
                         self.state.tab_strip.ensure_active(&session_id, "main");
                         self.bind_config_default_model();
-                        self.state.messages.clear();
-                        self.state.status = SessionStatus::Idle;
-                        self.state.approval_pending = None;
-                        self.state.question_pending = None;
                     }
                 }
                 if reopen_picker {
                     self.open_session_picker().await?;
                 }
                 let _ = self.refresh_workspace_sessions().await;
+                self.system_message("Session permanently deleted.".into());
             }
-            Err(e) => self.system_message(format!("Failed to close session: {e}")),
+            Err(e) => self.system_message(format!("Failed to delete session: {e}")),
         }
         Ok(())
     }
@@ -4658,17 +4782,51 @@ impl TuiApp {
                         title
                     ));
                 } else if let Some(sid) = &self.state.session_id {
-                    let params = serde_json::json!({"session_id": sid, "title": args});
+                    let sid = sid.clone();
+                    let title = args.to_string();
+                    // Optimistic local update — roll back on RPC failure.
+                    let prev_title = self
+                        .state
+                        .workspace_sessions
+                        .entries
+                        .iter()
+                        .find(|e| e.id == sid)
+                        .map(|e| e.title.clone());
+                    if let Some(entry) = self
+                        .state
+                        .workspace_sessions
+                        .entries
+                        .iter_mut()
+                        .find(|e| e.id == sid)
+                    {
+                        entry.title = title.clone();
+                    }
+                    self.state.tab_strip.ensure_tab(&sid, title.clone());
+                    let params = serde_json::json!({"session_id": sid, "title": title});
                     match self
                         .client
                         .rpc_call("session.set_title", Some(params))
                         .await
                     {
                         Ok(_) => {
-                            self.system_message(format!("Session title set to: {}", args));
-                            let _ = self.refresh_workspace_sessions().await;
+                            self.system_message(format!("Session title set to: {}", title));
+                            self.enqueue_workspace_sessions_refresh();
                         }
-                        Err(e) => self.system_message(format!("Failed to set title: {}", e)),
+                        Err(e) => {
+                            if let Some(prev) = prev_title {
+                                if let Some(entry) = self
+                                    .state
+                                    .workspace_sessions
+                                    .entries
+                                    .iter_mut()
+                                    .find(|e| e.id == sid)
+                                {
+                                    entry.title = prev.clone();
+                                }
+                                self.state.tab_strip.ensure_tab(&sid, prev);
+                            }
+                            self.system_message(format!("Failed to set title: {}", e));
+                        }
                     }
                 }
             }
