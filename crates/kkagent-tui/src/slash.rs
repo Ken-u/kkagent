@@ -181,8 +181,8 @@ pub const BUILTIN_SLASH_COMMANDS: &[SlashCommand] = &[
     },
     SlashCommand {
         name: "skills",
-        aliases: &["skill"],
-        description: "List available skills",
+        aliases: &[],
+        description: "List available skills (activate with /skill:name)",
         priority: 50,
         argument_hint: Some("[name]"),
     },
@@ -302,6 +302,14 @@ pub struct SlashSuggestion {
 
 /// Filter + sort commands for the `/` autocomplete popup.
 pub fn filter_slash_commands(query: &str) -> Vec<SlashSuggestion> {
+    filter_slash_commands_with_extras(query, &[])
+}
+
+/// Like [`filter_slash_commands`], also matching dynamic skill slash entries.
+pub fn filter_slash_commands_with_extras(
+    query: &str,
+    extras: &[SlashSuggestion],
+) -> Vec<SlashSuggestion> {
     let q = query
         .trim_start_matches('/')
         .split_whitespace()
@@ -309,29 +317,72 @@ pub fn filter_slash_commands(query: &str) -> Vec<SlashSuggestion> {
         .unwrap_or("")
         .to_lowercase();
 
-    let mut matched: Vec<&SlashCommand> = BUILTIN_SLASH_COMMANDS
+    let mut matched: Vec<SlashSuggestion> = BUILTIN_SLASH_COMMANDS
         .iter()
         .filter(|c| c.matches(&q))
-        .collect();
-
-    matched.sort_by(|a, b| {
-        // Prefer prefix matches, then priority, then name
-        let a_prefix = a.name.starts_with(&q) as i32;
-        let b_prefix = b.name.starts_with(&q) as i32;
-        b_prefix
-            .cmp(&a_prefix)
-            .then(b.priority.cmp(&a.priority))
-            .then(a.name.cmp(b.name))
-    });
-
-    matched
-        .into_iter()
         .map(|c| SlashSuggestion {
             name: c.name.to_string(),
             description: c.description.to_string(),
             argument_hint: c.argument_hint.map(String::from),
         })
-        .collect()
+        .collect();
+
+    for extra in extras {
+        let name_l = extra.name.to_lowercase();
+        if q.is_empty()
+            || name_l.starts_with(&q)
+            || name_l.contains(&q)
+            || extra.description.to_lowercase().contains(&q)
+        {
+            matched.push(extra.clone());
+        }
+    }
+
+    matched.sort_by(|a, b| {
+        let a_prefix = a.name.to_lowercase().starts_with(&q) as i32;
+        let b_prefix = b.name.to_lowercase().starts_with(&q) as i32;
+        let a_pri = find_slash_command(&a.name)
+            .map(|c| c.priority)
+            .unwrap_or(40);
+        let b_pri = find_slash_command(&b.name)
+            .map(|c| c.priority)
+            .unwrap_or(40);
+        b_prefix
+            .cmp(&a_prefix)
+            .then(b_pri.cmp(&a_pri))
+            .then(a.name.cmp(&b.name))
+    });
+
+    matched
+}
+
+/// Build kimi-style skill slash commands (`skill:name`).
+pub fn build_skill_slash_commands(
+    skills: &[(String, String)],
+) -> (Vec<SlashSuggestion>, std::collections::HashMap<String, String>) {
+    let mut command_map = std::collections::HashMap::new();
+    let mut commands = Vec::new();
+    let mut sorted = skills.to_vec();
+    sorted.sort_by(|a, b| a.0.cmp(&b.0));
+    for (name, description) in sorted {
+        let command_name = format!("skill:{name}");
+        command_map.insert(command_name.clone(), name.clone());
+        // Also allow bare `/name` when it doesn't collide with builtins.
+        if find_slash_command(&name).is_none() {
+            command_map.insert(name.clone(), name.clone());
+            commands.push(SlashSuggestion {
+                name: name.clone(),
+                description: description.clone(),
+                argument_hint: None,
+            });
+        }
+        commands.push(SlashSuggestion {
+            name: command_name,
+            description,
+            argument_hint: None,
+        });
+    }
+    (commands, command_map)
 }
 
 pub fn find_slash_command(name: &str) -> Option<&'static SlashCommand> {

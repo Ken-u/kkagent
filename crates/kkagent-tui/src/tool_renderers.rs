@@ -22,6 +22,10 @@ impl ToolRenderRegistry {
             ),
             "Grep" => format!("grep {}", fit(&tc.input_summary, budget.saturating_sub(5))),
             "Glob" => format!("glob {}", fit(&tc.input_summary, budget.saturating_sub(5))),
+            "Skill" => format!(
+                "Skill {}",
+                fit(&tc.input_summary, budget.saturating_sub(6))
+            ),
             "CreateGoal" | "GetGoal" | "UpdateGoal" | "SetGoalBudget" => {
                 format!("goal {}", fit(&tc.input_summary, budget.saturating_sub(5)))
             }
@@ -46,6 +50,7 @@ impl ToolRenderRegistry {
                 "Bash" => Color::Yellow,
                 "Write" | "Edit" => Color::Magenta,
                 "Read" | "Grep" | "Glob" => theme.text_dim,
+                "Skill" => theme.primary,
                 "CreateGoal" | "UpdateGoal" | "SetGoalBudget" | "GetGoal" => Color::Cyan,
                 _ => theme.text_dim,
             }
@@ -68,6 +73,7 @@ impl ToolRenderRegistry {
             "Grep" => lines.extend(grep_summary(output, width, theme, max_preview)),
             "Write" | "Edit" => lines.extend(diffish_summary(output, width, theme, max_preview)),
             "ReadMediaFile" => lines.extend(media_summary(output, width, theme, max_preview)),
+            "Skill" => lines.extend(skill_summary(output, width, theme, max_preview)),
             "CreateGoal" | "GetGoal" | "UpdateGoal" | "SetGoalBudget" => {
                 lines.extend(goal_summary(output, width, theme, max_preview))
             }
@@ -214,6 +220,35 @@ fn goal_summary(output: &str, width: u16, theme: &Theme, max_preview: usize) -> 
     let mut lines = Vec::new();
     lines.extend(default_summary(output, width, theme, max_preview.min(8)));
     lines
+}
+
+/// Skill tool results are short (`loaded inline`); never dump legacy `# Skill:` bodies.
+fn skill_summary(
+    output: &str,
+    width: u16,
+    theme: &Theme,
+    _max_preview: usize,
+) -> Vec<Line<'static>> {
+    let trimmed = output.trim();
+    if trimmed.starts_with("# Skill:") || trimmed.starts_with("# Skill resource:") {
+        let lines_n = output.lines().count();
+        let name = trimmed
+            .lines()
+            .next()
+            .unwrap_or("# Skill")
+            .trim_start_matches('#')
+            .trim();
+        let mut lines = Vec::new();
+        let style = Style::default().fg(theme.text_muted);
+        push_wrapped_output_line(
+            &mut lines,
+            &format!("{name} loaded ({lines_n} lines hidden)"),
+            width,
+            style,
+        );
+        return lines;
+    }
+    default_summary(output, width, theme, 3)
 }
 
 fn truncate_hint(more: usize, theme: &Theme) -> Line<'static> {

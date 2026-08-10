@@ -126,6 +126,16 @@ pub enum AgentEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
+    /// Skill loaded via `/skill:…` or the Skill tool (kimi `skill.activated`).
+    SkillActivated {
+        session_id: String,
+        activation_id: String,
+        skill_name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        skill_args: Option<String>,
+        /// `user-slash` | `model-tool` | `nested-skill`
+        trigger: String,
+    },
 }
 
 impl AgentEvent {
@@ -154,7 +164,8 @@ impl AgentEvent {
             | Self::BtwThinkingDelta { session_id, .. }
             | Self::BtwEnd { session_id, .. }
             | Self::McpAuthRequired { session_id, .. }
-            | Self::CompactCompleted { session_id, .. } => session_id,
+            | Self::CompactCompleted { session_id, .. }
+            | Self::SkillActivated { session_id, .. } => session_id,
         }
     }
 }

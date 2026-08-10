@@ -21,8 +21,8 @@ use crate::mouse_mode::MouseMode;
 use crate::pi::{map_key, EditorAction};
 use crate::search::SearchState;
 use crate::slash::{
-    self, filter_slash_commands, find_slash_command, is_slash_name_completion, parse_slash_input,
-    SlashSuggestion,
+    self, build_skill_slash_commands, filter_slash_commands_with_extras, find_slash_command,
+    is_slash_name_completion, parse_slash_input, SlashSuggestion,
 };
 
 pub struct TuiApp {
@@ -78,6 +78,10 @@ pub struct AppState {
     pub parked_questions: std::collections::HashMap<String, PendingQuestion>,
     /// `/` command autocomplete popup
     pub slash_menu: Option<SlashMenuState>,
+    /// Dynamic skill slash entries (`skill:name` / bare name).
+    pub skill_slash_commands: Vec<SlashSuggestion>,
+    /// Maps slash command name → skill name.
+    pub skill_command_map: std::collections::HashMap<String, String>,
     /// `@` file path autocomplete popup
     pub file_menu: Option<FileMenuState>,
     /// Model / session list picker overlay
@@ -229,6 +233,11 @@ pub enum DisplayPart {
     Tool(DisplayToolCall),
     /// Collapsed tool-call history between formal assistant outputs (after turn end).
     ToolHistory(ToolHistorySummary),
+    /// kimi-style skill activation card (`▶ Activated skill: name`).
+    SkillActivation {
+        name: String,
+        args: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -277,6 +286,8 @@ pub enum MessageRole {
     System,
     /// Full plan.md contents shown after Write/Edit in plan mode.
     Plan,
+    /// Compact skill activation card (not a normal chat bubble).
+    Skill,
 }
 
 #[derive(Debug, Clone)]
@@ -437,6 +448,8 @@ impl AppState {
             question_pending: None,
             parked_questions: std::collections::HashMap::new(),
             slash_menu: None,
+            skill_slash_commands: Vec::new(),
+            skill_command_map: std::collections::HashMap::new(),
             file_menu: None,
             list_picker: None,
             tasks_panel: None,
@@ -621,7 +634,7 @@ impl AppState {
             return;
         }
         self.file_menu = None;
-        let items = filter_slash_commands(&text);
+        let items = filter_slash_commands_with_extras(&text, &self.skill_slash_commands);
         if items.is_empty() {
             self.slash_menu = Some(SlashMenuState {
                 items: Vec::new(),
@@ -714,6 +727,8 @@ impl TuiApp {
             self.state.status_bar.session_id = Some(session_id.clone());
             self.state.session_id = Some(session_id);
         }
+
+        let _ = self.refresh_skill_commands().await;
 
         // Sync CLI / config plan mode onto the server session (create starts with plan_mode=false).
         if self.state.plan_mode {
@@ -2722,6 +2737,11 @@ impl TuiApp {
             return Ok(());
         }
 
+        // Dynamic skill slash (`/skill:foo` or bare `/foo` mapped to a skill).
+        if let Some(skill_name) = self.resolve_skill_command(&command) {
+            return self.activate_skill(&skill_name, &args).await;
+        }
+
         // Resolve aliases via registry
         let resolved = find_slash_command(&command)
             .map(|c| c.name)
@@ -3086,10 +3106,48 @@ impl TuiApp {
                     "plugins: check ~/.kkagent/plugins/*/plugin.json (RPC list optional)".into(),
                 ),
             },
-            "skills" | "skill" => match self.client.rpc_call("skills.list", None).await {
-                Ok(v) => self.system_message(format!("{v}")),
-                Err(e) => self.system_message(format!("skills: {e}")),
-            },
+            "skills" => {
+                let _ = self.refresh_skill_commands().await;
+                if !args.is_empty() {
+                    let mut parts = args.splitn(2, char::is_whitespace);
+                    let name = parts.next().unwrap_or("").trim();
+                    let skill_args = parts.next().unwrap_or("").trim();
+                    if !name.is_empty() {
+                        return self.activate_skill(name, skill_args).await;
+                    }
+                }
+                match self.client.rpc_call("skills.list", None).await {
+                    Ok(data) => {
+                        let mut lines = String::from("Available skills:\n");
+                        if let Some(arr) = data.get("skills").and_then(|v| v.as_array()) {
+                            if arr.is_empty() {
+                                lines.push_str("  (none — add SKILL.md under .kkagent/skills/)\n");
+                            }
+                            for s in arr {
+                                let name = s.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+                                let desc = s
+                                    .get("description")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .trim();
+                                if desc.is_empty() {
+                                    lines.push_str(&format!("  /skill:{name}\n"));
+                                } else {
+                                    let short: String = desc.chars().take(80).collect();
+                                    lines.push_str(&format!("  /skill:{name}  — {short}\n"));
+                                }
+                            }
+                            lines.push_str(
+                                "\nActivate with /skill:<name> [args] (or bare /<name> when free).",
+                            );
+                        } else {
+                            lines.push_str(&format!("  {data}"));
+                        }
+                        self.system_message(lines);
+                    }
+                    Err(e) => self.system_message(format!("skills: {e}")),
+                }
+            }
             "swarm" => match args.as_str() {
                 "enter" | "on" => {
                     let mut params = serde_json::json!({ "trigger": "slash" });
@@ -3304,6 +3362,7 @@ impl TuiApp {
                         MessageRole::Assistant => "Assistant",
                         MessageRole::System => "System",
                         MessageRole::Plan => "Plan",
+                        MessageRole::Skill => "Skill",
                     };
                     md.push_str(&format!("## {}\n\n{}\n\n", role, msg.content));
                 }
@@ -3333,6 +3392,109 @@ impl TuiApp {
             }
         }
         Ok(())
+    }
+
+    fn resolve_skill_command(&self, command: &str) -> Option<String> {
+        if let Some(name) = self.state.skill_command_map.get(command) {
+            return Some(name.clone());
+        }
+        if let Some(rest) = command.strip_prefix("skill:") {
+            let name = rest.trim();
+            if !name.is_empty() {
+                return Some(name.to_string());
+            }
+        }
+        None
+    }
+
+    async fn refresh_skill_commands(&mut self) -> anyhow::Result<()> {
+        match self.client.rpc_call("skills.list", None).await {
+            Ok(data) => {
+                let mut pairs = Vec::new();
+                if let Some(arr) = data.get("skills").and_then(|v| v.as_array()) {
+                    for s in arr {
+                        let name = s
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        if name.is_empty() {
+                            continue;
+                        }
+                        let desc = s
+                            .get("description")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        pairs.push((name, desc));
+                    }
+                }
+                let (commands, map) = build_skill_slash_commands(&pairs);
+                self.state.skill_slash_commands = commands;
+                self.state.skill_command_map = map;
+            }
+            Err(e) => {
+                tracing::debug!("skills.list failed: {e}");
+            }
+        }
+        Ok(())
+    }
+
+    async fn activate_skill(&mut self, name: &str, args: &str) -> anyhow::Result<()> {
+        let Some(sid) = self.state.session_id.clone() else {
+            self.system_message("No active session.".into());
+            return Ok(());
+        };
+        // Optimistic card — server also emits SkillActivated (dedupe by name+pending).
+        self.push_skill_activation(name, if args.is_empty() { None } else { Some(args) });
+        self.state.status = SessionStatus::Thinking;
+        self.state.follow_bottom = true;
+        self.state.scroll_up = 0;
+
+        let params = serde_json::json!({
+            "session_id": sid,
+            "name": name,
+            "args": args,
+        });
+        match self.client.rpc_call("skills.activate", Some(params)).await {
+            Ok(_) => {
+                let _ = self.refresh_workspace_sessions().await;
+            }
+            Err(e) => {
+                self.state.status = SessionStatus::Idle;
+                // Drop optimistic card on failure.
+                if let Some(last) = self.state.messages.last() {
+                    if last.role == MessageRole::Skill {
+                        self.state.messages.pop();
+                    }
+                }
+                self.system_message(format!("Skill \"{name}\" failed: {e}"));
+            }
+        }
+        Ok(())
+    }
+
+    fn push_skill_activation(&mut self, name: &str, args: Option<&str>) {
+        // Avoid duplicate cards when both optimistic UI and SkillActivated arrive.
+        if let Some(last) = self.state.messages.last() {
+            if last.role == MessageRole::Skill {
+                if let Some(DisplayPart::SkillActivation { name: n, .. }) = last.parts.first() {
+                    if n == name {
+                        return;
+                    }
+                }
+            }
+        }
+        self.state.messages.push(DisplayMessage {
+            role: MessageRole::Skill,
+            content: format!("Activated skill: {name}"),
+            thinking: None,
+            parts: vec![DisplayPart::SkillActivation {
+                name: name.to_string(),
+                args: args.map(str::to_string).filter(|s| !s.trim().is_empty()),
+            }],
+            tool_calls: Vec::new(),
+        });
     }
 
     fn handle_search_key(&mut self, key: KeyEvent) -> anyhow::Result<()> {
@@ -3900,6 +4062,17 @@ impl TuiApp {
                             ));
                         }
                     }
+                    AgentEvent::SkillActivated {
+                        skill_name,
+                        skill_args,
+                        ..
+                    } => {
+                        self.push_skill_activation(
+                            &skill_name,
+                            skill_args.as_deref(),
+                        );
+                        self.state.follow_bottom = true;
+                    }
                 }
             }
         }
@@ -3939,6 +4112,9 @@ fn summarize_tool_input(input: &serde_json::Value) -> String {
         "url",
         "description",
         "prompt",
+        "name",
+        "skill",
+        "args",
     ] {
         if let Some(s) = input.get(key).and_then(|v| v.as_str()) {
             let t = s.trim();
@@ -4149,6 +4325,7 @@ fn collapse_all_historical_turn_tools(messages: &mut Vec<DisplayMessage>) {
 fn session_has_retained_io(messages: &[DisplayMessage]) -> bool {
     messages.iter().any(|m| match m.role {
         MessageRole::System => false,
+        MessageRole::Skill => true,
         MessageRole::User => {
             !m.content.trim().is_empty() && !kkagent_protocol::is_harness_only_user_text(&m.content)
         }

@@ -1155,6 +1155,12 @@ Do not mention this reminder to the user.\n</system-reminder>"
                     }
                 }
 
+                if !output.is_error && name == "Skill" {
+                    if let Some(evt) = skill_activated_from_output(&session_id, &output) {
+                        let _ = self.event_tx.send(evt).await;
+                    }
+                }
+
                 if !output.is_error && (name == "Write" || name == "Edit") {
                     // Reconstruct input from tool call list
                     if let Some(tc) = tool_calls.iter().find(|t| t.id == id) {
@@ -1976,6 +1982,34 @@ fn todo_items_from_output(output: &ToolOutput) -> Option<Vec<kkagent_protocol::T
     Some(items)
 }
 
+fn skill_activated_from_output(
+    session_id: &str,
+    output: &ToolOutput,
+) -> Option<AgentEvent> {
+    let data = output.data.as_ref()?;
+    if data.get("kind").and_then(|v| v.as_str()) != Some("skill_activation") {
+        return None;
+    }
+    let skill_name = data.get("skill_name")?.as_str()?.to_string();
+    let skill_args = data
+        .get("skill_args")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let trigger = data
+        .get("trigger")
+        .and_then(|v| v.as_str())
+        .unwrap_or("model-tool")
+        .to_string();
+    Some(AgentEvent::SkillActivated {
+        session_id: session_id.to_string(),
+        activation_id: uuid::Uuid::new_v4().to_string(),
+        skill_name,
+        skill_args,
+        trigger,
+    })
+}
+
 fn tool_allowed(session: &Session, name: &str) -> bool {
     if session
         .services
@@ -2202,6 +2236,20 @@ fn describe_tool_action(name: &str, input: &serde_json::Value) -> String {
         "Glob" => {
             let pat = input.get("pattern").and_then(|v| v.as_str()).unwrap_or("?");
             format!("Glob  {}", pat)
+        }
+        "Skill" => {
+            let skill = input
+                .get("name")
+                .or_else(|| input.get("skill"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            let args = input.get("args").and_then(|v| v.as_str()).unwrap_or("");
+            if args.is_empty() {
+                format!("invoke skill {skill}")
+            } else {
+                let short: String = args.chars().take(80).collect();
+                format!("invoke skill {skill} ({short})")
+            }
         }
         _ => {
             let pretty = serde_json::to_string_pretty(input).unwrap_or_default();

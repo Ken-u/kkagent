@@ -26,7 +26,10 @@ pub use media::ReadMediaFileTool;
 pub use plan::{EnterPlanModeTool, ExitPlanModeTool};
 pub use read::ReadTool;
 pub use select_tools::SelectToolsTool;
-pub use skill::{SkillCatalog, SkillTool};
+pub use skill::{
+    render_model_tool_skill_prompt, render_skill_loaded_block, render_user_slash_skill_prompt,
+    SkillCatalog, SkillTool,
+};
 pub use task::{AgentSwarmTool, AgentTool, TaskListTool, TaskOutputTool, TaskStopTool, TaskTool};
 pub use todo::TodoListTool;
 pub use web::{FetchUrlTool, WebSearchTool, WebServicesConfig};

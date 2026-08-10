@@ -10,6 +10,64 @@ const MAX_SKILL_BYTES: u64 = 256 * 1024;
 const MAX_RESOURCE_BYTES: u64 = 1024 * 1024;
 const MAX_RESOURCES: usize = 128;
 
+/// Escape attribute values for `<kimi-skill-loaded …>` (kimi-aligned).
+fn escape_xml_attr(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+/// Build the harness block that carries skill body for the model (hidden in TUI).
+pub fn render_skill_loaded_block(
+    skill_name: &str,
+    skill_args: &str,
+    skill_content: &str,
+    trigger: &str,
+    skill_dir: Option<&str>,
+) -> String {
+    let mut attrs = format!(
+        " name=\"{}\" trigger=\"{}\"",
+        escape_xml_attr(skill_name),
+        escape_xml_attr(trigger)
+    );
+    if let Some(dir) = skill_dir.filter(|d| !d.is_empty()) {
+        attrs.push_str(&format!(" dir=\"{}\"", escape_xml_attr(dir)));
+    }
+    if !skill_args.is_empty() {
+        attrs.push_str(&format!(" args=\"{}\"", escape_xml_attr(skill_args)));
+    }
+    format!("<kimi-skill-loaded{attrs}>\n{skill_content}\n</kimi-skill-loaded>")
+}
+
+/// User-slash activation prompt (model sees body; TUI shows activation card).
+pub fn render_user_slash_skill_prompt(
+    skill_name: &str,
+    skill_args: &str,
+    skill_content: &str,
+    skill_dir: Option<&str>,
+) -> String {
+    let body = format!(
+        "User activated the skill \"{skill_name}\". Follow the loaded skill instructions.\n\n{skill_content}"
+    );
+    render_skill_loaded_block(skill_name, skill_args, &body, "user-slash", skill_dir)
+}
+
+/// Model Skill-tool activation prompt delivered after the short tool result.
+pub fn render_model_tool_skill_prompt(
+    skill_name: &str,
+    skill_args: &str,
+    skill_content: &str,
+    skill_dir: Option<&str>,
+    trigger: &str,
+) -> String {
+    let body = format!(
+        "Skill tool loaded instructions for this request. Follow them.\n\n{skill_content}"
+    );
+    render_skill_loaded_block(skill_name, skill_args, &body, trigger, skill_dir)
+}
+
 #[derive(Debug, Clone)]
 pub struct SkillEntry {
     pub name: String,
@@ -388,9 +446,9 @@ impl Tool for SkillTool {
             match self.catalog.load_for(&context.working_dir, name).await {
                 Ok((entry, content)) => {
                     let args = input.get("args").and_then(Value::as_str).unwrap_or("");
-                    let mut output = format!("# Skill: {}\n\n{}", entry.name, content);
+                    let mut body = content;
                     if !entry.resources.is_empty() {
-                        output.push_str(&format!(
+                        body.push_str(&format!(
                             "\n\n## Available resources\n\n{}",
                             entry
                                 .resources
@@ -400,10 +458,27 @@ impl Tool for SkillTool {
                                 .join("\n")
                         ));
                     }
-                    if !args.is_empty() {
-                        output.push_str(&format!("\n\n## Invoked with args\n\n{args}"));
-                    }
-                    ToolOutput::success(output)
+                    let skill_dir = entry.root.to_string_lossy().to_string();
+                    let delivery = render_model_tool_skill_prompt(
+                        &entry.name,
+                        args,
+                        &body,
+                        Some(&skill_dir),
+                        "model-tool",
+                    );
+                    // UI / tool event: short chip like kimi. Full body goes via delivery.
+                    ToolOutput::success(format!(
+                        "Skill \"{}\" loaded inline. Follow its instructions.",
+                        entry.name
+                    ))
+                    .with_delivery(delivery)
+                    .with_data(json!({
+                        "kind": "skill_activation",
+                        "skill_name": entry.name,
+                        "skill_args": if args.is_empty() { Value::Null } else { json!(args) },
+                        "trigger": "model-tool",
+                        "skill_dir": skill_dir,
+                    }))
                 }
                 Err(error) => ToolOutput::error(error.to_string()),
             },
@@ -469,5 +544,22 @@ mod tests {
             .is_err());
         std::fs::remove_dir_all(workspace).unwrap();
         std::fs::remove_dir_all(extra).unwrap();
+    }
+
+    #[test]
+    fn skill_loaded_block_is_harness_hidden() {
+        let block =
+            render_skill_loaded_block("demo", "arg1", "BODY", "model-tool", Some("/tmp/demo"));
+        assert!(block.contains("<kimi-skill-loaded"));
+        assert!(block.contains("name=\"demo\""));
+        assert!(block.contains("BODY"));
+        let prompt =
+            render_model_tool_skill_prompt("demo", "arg1", "BODY", Some("/tmp/demo"), "model-tool");
+        let stripped = kkagent_protocol::strip_harness_blocks(&prompt);
+        assert!(
+            stripped.trim().is_empty(),
+            "left after strip: {stripped:?}\nprompt: {prompt:?}"
+        );
+        assert!(kkagent_protocol::is_harness_only_user_text(&prompt));
     }
 }

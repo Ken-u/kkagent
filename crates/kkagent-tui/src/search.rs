@@ -55,6 +55,7 @@ impl SearchState {
                 MessageRole::Assistant => "assistant",
                 MessageRole::System => "system",
                 MessageRole::Plan => "plan",
+                MessageRole::Skill => "skill",
             };
             self.hits.push(SearchHit {
                 message_index: i,
@@ -128,6 +129,15 @@ fn message_search_text(msg: &DisplayMessage) -> String {
                         out.push('\n');
                         out.push_str(o);
                     }
+                }
+            }
+            DisplayPart::SkillActivation { name, args } => {
+                out.push('\n');
+                out.push_str("Activated skill: ");
+                out.push_str(name);
+                if let Some(a) = args {
+                    out.push('\n');
+                    out.push_str(a);
                 }
             }
         }

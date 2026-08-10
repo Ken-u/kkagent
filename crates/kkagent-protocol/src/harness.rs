@@ -11,17 +11,29 @@ pub fn strip_harness_blocks(text: &str) -> String {
 }
 
 fn strip_tagged_blocks(text: &str, tag: &str) -> String {
-    let open = format!("<{tag}>");
+    // Match `<tag>` or `<tag attrs…>` (kimi skill blocks carry attributes).
+    let open_prefix = format!("<{tag}");
     let close = format!("</{tag}>");
     let mut out = text.to_string();
-    while let Some(start) = out.find(&open) {
+    let mut cursor = 0usize;
+    while let Some(rel) = out[cursor..].find(&open_prefix) {
+        let start = cursor + rel;
+        let after = start + open_prefix.len();
+        let boundary_ok = matches!(
+            out[after..].chars().next(),
+            Some('>') | Some(' ') | Some('\t') | Some('\n') | Some('\r')
+        );
+        if !boundary_ok {
+            cursor = after;
+            continue;
+        }
         let Some(rel_end) = out[start..].find(&close) else {
-            // Unclosed tag — drop from open to end (truncated display junk).
             out.truncate(start);
             break;
         };
         let end = start + rel_end + close.len();
         out.replace_range(start..end, "");
+        cursor = start;
     }
     out
 }
@@ -67,9 +79,16 @@ mod tests {
     }
 
     #[test]
-    fn unclosed_reminder_is_harness_only() {
-        let raw = "<system-reminder>\nToday's date";
-        assert!(is_harness_only_user_text(raw));
-        assert!(visible_user_text(raw).is_empty());
+    fn strips_skill_loaded_with_attributes() {
+        let raw = concat!(
+            "<kimi-skill-loaded name=\"demo\" trigger=\"model-tool\">\n",
+            "body here\n",
+            "</kimi-skill-loaded>\n",
+            "hello"
+        );
+        assert_eq!(visible_user_text(raw), "hello");
+        assert!(is_harness_only_user_text(
+            "<kimi-skill-loaded name=\"x\">\nonly\n</kimi-skill-loaded>"
+        ));
     }
 }

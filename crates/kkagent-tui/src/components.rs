@@ -393,6 +393,26 @@ fn build_transcript_lines(state: &mut AppState, theme: &Theme, width: u16) -> Ve
                 push_plan_box_lines(&mut lines, &path, &body, width, theme, false);
                 lines.push(Line::from(""));
             }
+            MessageRole::Skill => {
+                let (name, args) = msg
+                    .parts
+                    .iter()
+                    .find_map(|p| match p {
+                        DisplayPart::SkillActivation { name, args } => {
+                            Some((name.as_str(), args.as_deref()))
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| {
+                        let name = msg
+                            .content
+                            .strip_prefix("Activated skill: ")
+                            .unwrap_or(msg.content.as_str());
+                        (name, None)
+                    });
+                push_skill_activation_lines(&mut lines, name, args, width, theme);
+                lines.push(Line::from(""));
+            }
             MessageRole::Assistant => {
                 // Thinking block (dim), like kimi
                 if let Some(ref thinking) = msg.thinking {
@@ -466,6 +486,17 @@ fn build_transcript_lines(state: &mut AppState, theme: &Theme, width: u16) -> Ve
                                     theme,
                                     state.locale,
                                     first_bullet,
+                                );
+                                first_bullet = false;
+                                rendered_any = true;
+                            }
+                            DisplayPart::SkillActivation { name, args } => {
+                                push_skill_activation_lines(
+                                    &mut lines,
+                                    name,
+                                    args.as_deref(),
+                                    width,
+                                    theme,
                                 );
                                 first_bullet = false;
                                 rendered_any = true;
@@ -654,6 +685,76 @@ fn render_tool_call_lines(
             Style::default().fg(theme.text_muted),
         )));
     }
+}
+
+const SKILL_ARGS_PREVIEW_MAX: usize = 200;
+
+/// kimi `SkillActivationComponent`: `▶ Activated skill: name` + optional dim args.
+fn push_skill_activation_lines(
+    lines: &mut Vec<Line<'static>>,
+    name: &str,
+    args: Option<&str>,
+    width: u16,
+    theme: &Theme,
+) {
+    lines.push(Line::from(vec![
+        Span::styled(
+            "▶ Activated skill: ",
+            Style::default()
+                .fg(theme.primary)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            name.to_string(),
+            Style::default()
+                .fg(theme.role_user)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]));
+    if let Some(raw) = args {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            let preview: String = if trimmed.chars().count() > SKILL_ARGS_PREVIEW_MAX {
+                format!(
+                    "{}…",
+                    trimmed.chars().take(SKILL_ARGS_PREVIEW_MAX).collect::<String>()
+                )
+            } else {
+                trimmed.to_string()
+            };
+            let avail = (width as usize).saturating_sub(2).max(8);
+            for chunk in wrap_display_cols(&preview, avail) {
+                lines.push(Line::from(Span::styled(
+                    format!("  {chunk}"),
+                    Style::default().fg(theme.text_dim),
+                )));
+            }
+        }
+    }
+}
+
+fn wrap_display_cols(s: &str, max_width: usize) -> Vec<String> {
+    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+    if max_width == 0 {
+        return vec![s.to_string()];
+    }
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut cur_w = 0usize;
+    for ch in s.chars() {
+        let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if cur_w + w > max_width && !cur.is_empty() {
+            out.push(std::mem::take(&mut cur));
+            cur_w = 0;
+        }
+        cur.push(ch);
+        cur_w += w;
+    }
+    if !cur.is_empty() || out.is_empty() {
+        let _ = UnicodeWidthStr::width(cur.as_str());
+        out.push(cur);
+    }
+    out
 }
 
 fn render_tool_history_lines(

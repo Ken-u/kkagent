@@ -16,7 +16,9 @@ pub use shell_safety::{analyze_shell_command, ShellRisk};
 
 pub use builtin::cron::render_cron_fire_xml;
 pub use builtin::{
-    BackgroundShellManager, BashOptions, BashTool, CronManager, SkillCatalog, WebServicesConfig,
+    render_model_tool_skill_prompt, render_skill_loaded_block, render_user_slash_skill_prompt,
+    BackgroundShellManager, BashOptions, BashTool, CronManager, SkillCatalog, SkillTool,
+    WebServicesConfig,
 };
 pub use registry::*;
 
@@ -149,6 +151,11 @@ impl ToolOutput {
 
     pub fn with_note(mut self, note: impl Into<String>) -> Self {
         self.note = Some(note.into());
+        self
+    }
+
+    pub fn with_data(mut self, data: Value) -> Self {
+        self.data = Some(data);
         self
     }
 

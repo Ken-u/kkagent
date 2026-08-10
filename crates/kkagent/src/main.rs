@@ -2441,6 +2441,156 @@ fn messages_from_records(records: &[kkagent_core::transcript::MessageRecord]) ->
         .collect()
 }
 
+/// Shared turn spawn used by `session.prompt` and `skills.activate`.
+async fn spawn_session_agent_turn(
+    state: Arc<ServerState>,
+    session_id: String,
+    turn_permit: tokio::sync::OwnedSemaphorePermit,
+    rpc_event_tx: mpsc::Sender<Frame>,
+) -> Result<(), (i32, String)> {
+    let (agent_event_tx, mut agent_event_rx) = mpsc::channel::<AgentEvent>(256);
+
+    let rpc_tx = rpc_event_tx.clone();
+    let home_dir = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    let wire_dir = home_dir.join(".kkagent").join("sessions").join(&session_id);
+    let wire = kkagent_wire::WireJournal::open(&wire_dir);
+    let telemetry_fwd = state.telemetry.clone();
+    tokio::spawn(async move {
+        let _ = wire.ensure_metadata().await;
+        while let Some(evt) = agent_event_rx.recv().await {
+            let data = serde_json::to_value(&evt).unwrap_or_default();
+            let evt_type = data
+                .get("type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("agent.event")
+                .to_string();
+            let record = kkagent_wire::op_to_wire_record(
+                &evt_type,
+                data.clone(),
+                chrono::Utc::now().timestamp_millis(),
+            );
+            let _ = wire.append(&record).await;
+            match &evt {
+                AgentEvent::TurnStart { .. } => {
+                    telemetry_fwd
+                        .track_json("turn_start", serde_json::json!({}))
+                        .await;
+                }
+                AgentEvent::TurnEnd { .. } => {
+                    telemetry_fwd
+                        .track_json("turn_end", serde_json::json!({}))
+                        .await;
+                }
+                AgentEvent::SubagentSpawned { subagent_id, .. } => {
+                    telemetry_fwd
+                        .track_json(
+                            "subagent_created",
+                            serde_json::json!({"subagent_id": subagent_id}),
+                        )
+                        .await;
+                }
+                _ => {}
+            }
+            let frame = Frame::Event {
+                event: "agent".into(),
+                scope: None,
+                data,
+            };
+            if rpc_tx.send(frame).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    let model_alias = {
+        let aliases = state.model_aliases.lock().await;
+        aliases
+            .get(&session_id)
+            .map(|a| a.lock().unwrap_or_else(|e| e.into_inner()).clone())
+            .filter(|a| !a.is_empty())
+            .or_else(|| state.config.default_model_alias().map(|s| s.to_string()))
+            .ok_or_else(|| (-32000, "No default_model in config".into()))?
+    };
+    if state.config.resolve_model(&model_alias).is_none() {
+        return Err((-32000, format!("Model '{model_alias}' not found")));
+    }
+
+    let tools = build_turn_tool_registry(&state, agent_event_tx.clone()).await;
+
+    let permission_rules = state
+        .config
+        .permission
+        .as_ref()
+        .map(|p| p.rules.clone())
+        .unwrap_or_default();
+    let shared_mode = {
+        let modes = state.permission_modes.lock().await;
+        if let Some(arc) = modes.get(&session_id) {
+            arc.clone()
+        } else {
+            let sessions = state.sessions.lock().await;
+            sessions
+                .get(&session_id)
+                .map(|s| s.permission_mode.clone())
+                .ok_or_else(|| (-32602, format!("Session not found: {session_id}")))?
+        }
+    };
+    let permission = PermissionChain::with_shared_mode(shared_mode, permission_rules);
+
+    let agent_loop = Arc::new(
+        AgentLoop::new(
+            state.config.clone(),
+            Arc::new(tools),
+            Arc::new(Mutex::new(permission)),
+            agent_event_tx.clone(),
+            state.abort_registry.clone(),
+        )
+        .with_hooks(state.hooks.clone())
+        .with_goal_manager(state.goal_mgr.clone()),
+    );
+
+    let state_clone = state.clone();
+    let sid = session_id.clone();
+    tokio::spawn(async move {
+        let _turn_permit = turn_permit;
+        let mut session = {
+            let mut sessions = state_clone.sessions.lock().await;
+            match sessions.remove(&sid) {
+                Some(s) => s,
+                None => {
+                    tracing::error!("Session {} disappeared before turn", sid);
+                    return;
+                }
+            }
+        };
+
+        if let Err(e) = agent_loop.run_turn(&mut session).await {
+            tracing::error!("Agent loop error: {}", e);
+            let _ = agent_event_tx
+                .send(AgentEvent::Error {
+                    session_id: sid.clone(),
+                    message: e.to_string(),
+                })
+                .await;
+        }
+
+        {
+            let db = state_clone.transcript.lock().await;
+            if let Err(error) = persist_session_messages(&db, &mut session) {
+                tracing::error!("Failed to persist completed turn: {error}");
+                let _ = agent_event_tx.try_send(AgentEvent::Error {
+                    session_id: sid.clone(),
+                    message: format!("turn persistence failed: {error}"),
+                });
+            }
+        }
+
+        state_clone.sessions.lock().await.insert(sid, session);
+    });
+
+    Ok(())
+}
+
 fn resolve_session_id(db: &TranscriptDb, query: &str) -> Option<String> {
     if db.get_session(query).ok().flatten().is_some() {
         return Some(query.to_string());
@@ -3183,150 +3333,7 @@ async fn handle_rpc_call(
                 }
             }
 
-            // Build agent event channel that forwards to RPC transport + wire journal + telemetry
-            let (agent_event_tx, mut agent_event_rx) = mpsc::channel::<AgentEvent>(256);
-
-            let rpc_tx = rpc_event_tx.clone();
-            let home_dir = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-            let wire_dir = home_dir.join(".kkagent").join("sessions").join(&session_id);
-            let wire = kkagent_wire::WireJournal::open(&wire_dir);
-            let telemetry_fwd = state.telemetry.clone();
-            tokio::spawn(async move {
-                let _ = wire.ensure_metadata().await;
-                while let Some(evt) = agent_event_rx.recv().await {
-                    let data = serde_json::to_value(&evt).unwrap_or_default();
-                    let evt_type = data
-                        .get("type")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("agent.event")
-                        .to_string();
-                    let record = kkagent_wire::op_to_wire_record(
-                        &evt_type,
-                        data.clone(),
-                        chrono::Utc::now().timestamp_millis(),
-                    );
-                    let _ = wire.append(&record).await;
-                    match &evt {
-                        AgentEvent::TurnStart { .. } => {
-                            telemetry_fwd
-                                .track_json("turn_start", serde_json::json!({}))
-                                .await;
-                        }
-                        AgentEvent::TurnEnd { .. } => {
-                            telemetry_fwd
-                                .track_json("turn_end", serde_json::json!({}))
-                                .await;
-                        }
-                        AgentEvent::SubagentSpawned { subagent_id, .. } => {
-                            telemetry_fwd
-                                .track_json(
-                                    "subagent_created",
-                                    serde_json::json!({"subagent_id": subagent_id}),
-                                )
-                                .await;
-                        }
-                        _ => {}
-                    }
-                    let frame = Frame::Event {
-                        event: "agent".into(),
-                        scope: None,
-                        data,
-                    };
-                    if rpc_tx.send(frame).await.is_err() {
-                        break;
-                    }
-                }
-            });
-
-            // Resolve model from shared alias handle (works even mid-turn)
-            let model_alias = {
-                let aliases = state.model_aliases.lock().await;
-                aliases
-                    .get(&session_id)
-                    .map(|a| a.lock().unwrap_or_else(|e| e.into_inner()).clone())
-                    .filter(|a| !a.is_empty())
-                    .or_else(|| state.config.default_model_alias().map(|s| s.to_string()))
-                    .ok_or_else(|| (-32000, "No default_model in config".into()))?
-            };
-            if state.config.resolve_model(&model_alias).is_none() {
-                return Err((-32000, format!("Model '{}' not found", model_alias)));
-            }
-
-            let tools = build_turn_tool_registry(&state, agent_event_tx.clone()).await;
-
-            let permission_rules = state
-                .config
-                .permission
-                .as_ref()
-                .map(|p| p.rules.clone())
-                .unwrap_or_default();
-            let shared_mode = {
-                let modes = state.permission_modes.lock().await;
-                if let Some(arc) = modes.get(&session_id) {
-                    arc.clone()
-                } else {
-                    let sessions = state.sessions.lock().await;
-                    sessions
-                        .get(&session_id)
-                        .map(|s| s.permission_mode.clone())
-                        .ok_or_else(|| (-32602, format!("Session not found: {session_id}")))?
-                }
-            };
-            let permission = PermissionChain::with_shared_mode(shared_mode, permission_rules);
-
-            let agent_loop = Arc::new(
-                AgentLoop::new(
-                    state.config.clone(),
-                    Arc::new(tools),
-                    Arc::new(Mutex::new(permission)),
-                    agent_event_tx.clone(),
-                    state.abort_registry.clone(),
-                )
-                .with_hooks(state.hooks.clone())
-                .with_goal_manager(state.goal_mgr.clone()),
-            );
-
-            let state_clone = state.clone();
-            let sid = session_id.clone();
-            tokio::spawn(async move {
-                let _turn_permit = turn_permit;
-                // Take session out so we do NOT hold the sessions mutex while
-                // waiting for tool approval (would deadlock approval.respond).
-                let mut session = {
-                    let mut sessions = state_clone.sessions.lock().await;
-                    match sessions.remove(&sid) {
-                        Some(s) => s,
-                        None => {
-                            tracing::error!("Session {} disappeared before turn", sid);
-                            return;
-                        }
-                    }
-                };
-
-                if let Err(e) = agent_loop.run_turn(&mut session).await {
-                    tracing::error!("Agent loop error: {}", e);
-                    let _ = agent_event_tx
-                        .send(AgentEvent::Error {
-                            session_id: sid.clone(),
-                            message: e.to_string(),
-                        })
-                        .await;
-                }
-
-                {
-                    let db = state_clone.transcript.lock().await;
-                    if let Err(error) = persist_session_messages(&db, &mut session) {
-                        tracing::error!("Failed to persist completed turn: {error}");
-                        let _ = agent_event_tx.try_send(AgentEvent::Error {
-                            session_id: sid.clone(),
-                            message: format!("turn persistence failed: {error}"),
-                        });
-                    }
-                }
-
-                state_clone.sessions.lock().await.insert(sid, session);
-            });
-
+            spawn_session_agent_turn(state, session_id, turn_permit, rpc_event_tx).await?;
             Ok(serde_json::json!({"ok": true}))
         }
         "session.interrupt" => {
@@ -3682,10 +3689,149 @@ async fn handle_rpc_call(
             let items: Vec<serde_json::Value> = list
                 .into_iter()
                 .map(|e| {
-                    serde_json::json!({"name": e.name, "description": e.description, "path": e.path.display().to_string()})
+                    serde_json::json!({
+                        "name": e.name,
+                        "description": e.description,
+                        "path": e.path.display().to_string(),
+                        "triggers": e.triggers,
+                    })
                 })
                 .collect();
             Ok(serde_json::json!({"skills": items}))
+        }
+        "skills.activate" => {
+            let session_id = params
+                .as_ref()
+                .and_then(|p| p.get("session_id"))
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| (-32602, "Missing session_id".into()))?
+                .to_string();
+            let skill_name = params
+                .as_ref()
+                .and_then(|p| p.get("name").or_else(|| p.get("skill_name")))
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| (-32602, "Missing skill name".into()))?
+                .trim()
+                .to_string();
+            if skill_name.is_empty() {
+                return Err((-32602, "Skill name must not be empty".into()));
+            }
+            let skill_args = params
+                .as_ref()
+                .and_then(|p| p.get("args"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+
+            let turn_permit = state
+                .turn_locks
+                .try_acquire(&session_id)
+                .await
+                .map_err(|message| (-32001, message))?;
+
+            let working_dir = {
+                let sessions = state.sessions.lock().await;
+                sessions
+                    .get(&session_id)
+                    .map(|s| s.working_dir.clone())
+                    .ok_or_else(|| (-32602, format!("Session not found: {session_id}")))?
+            };
+
+            let (entry, content) = state
+                .skills
+                .load_for(&working_dir, &skill_name)
+                .await
+                .map_err(|e| (-32000, e.to_string()))?;
+            let skill_dir = entry.root.to_string_lossy().to_string();
+            let prompt = kkagent_tools::render_user_slash_skill_prompt(
+                &entry.name,
+                &skill_args,
+                &content,
+                Some(&skill_dir),
+            );
+            let resolved_name = entry.name.clone();
+
+            {
+                let mut sessions = state.sessions.lock().await;
+                let session = sessions
+                    .get_mut(&session_id)
+                    .ok_or_else(|| (-32602, format!("Session not found: {session_id}")))?;
+                session.clear_interrupt();
+                session.add_user_message(prompt);
+                session.begin_turn();
+            }
+
+            {
+                let snapshot = {
+                    let sessions = state.sessions.lock().await;
+                    sessions.get(&session_id).map(|s| {
+                        let rewrite = s.transcript_rewrite_required;
+                        let start = if rewrite {
+                            0
+                        } else {
+                            s.persisted_message_count.min(s.messages.len())
+                        };
+                        (s.messages[start..].to_vec(), start, rewrite)
+                    })
+                };
+                if let Some((pending, start, rewrite)) = snapshot {
+                    let persisted = {
+                        let db = state.transcript.lock().await;
+                        let result = if rewrite {
+                            serialize_transcript_messages(&pending).and_then(|messages| {
+                                db.replace_messages(&session_id, &messages, None)
+                            })
+                        } else {
+                            serialize_transcript_messages(&pending)
+                                .and_then(|messages| db.append_messages(&session_id, &messages))
+                        };
+                        if let Err(error) = &result {
+                            tracing::warn!("Failed to persist skill activation: {error}");
+                        }
+                        result.is_ok()
+                    };
+                    if persisted {
+                        if let Some(session) = state.sessions.lock().await.get_mut(&session_id) {
+                            session.persisted_message_count = start + pending.len();
+                            session.transcript_rewrite_required = false;
+                            if session.title.is_none() {
+                                let title: String =
+                                    format!("/{resolved_name}").chars().take(60).collect();
+                                let db = state.transcript.lock().await;
+                                if db.set_title(&session_id, &title).is_ok() {
+                                    session.title = Some(title);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            let activation_id = uuid::Uuid::new_v4().to_string();
+            let _ = rpc_event_tx
+                .send(Frame::Event {
+                    event: "agent".into(),
+                    scope: None,
+                    data: serde_json::to_value(AgentEvent::SkillActivated {
+                        session_id: session_id.clone(),
+                        activation_id,
+                        skill_name: resolved_name.clone(),
+                        skill_args: if skill_args.trim().is_empty() {
+                            None
+                        } else {
+                            Some(skill_args)
+                        },
+                        trigger: "user-slash".into(),
+                    })
+                    .unwrap_or_default(),
+                })
+                .await;
+
+            spawn_session_agent_turn(state, session_id, turn_permit, rpc_event_tx).await?;
+            Ok(serde_json::json!({
+                "activated": true,
+                "skill_name": resolved_name,
+            }))
         }
         "plugins.list" => {
             let list = state.plugins.list().await;
