@@ -113,3 +113,10 @@ kkagent-telemetry = { path = "crates/kkagent-telemetry" }
 kkagent-acp = { path = "crates/kkagent-acp" }
 kkagent-oauth = { path = "crates/kkagent-oauth" }
 kkagent-kaos = { path = "crates/kkagent-kaos" }
+
+[profile.dev]
+debug = "line-tables-only"
+incremental = true
+
+[profile.dev.package."*"]
+debug = false
