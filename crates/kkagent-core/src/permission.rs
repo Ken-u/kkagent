@@ -1,6 +1,7 @@
 use kkagent_config::PermissionRule;
 use kkagent_protocol::PermissionMode;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum PermissionDecision {
@@ -10,7 +11,8 @@ pub enum PermissionDecision {
 }
 
 pub struct PermissionChain {
-    pub mode: PermissionMode,
+    /// Live mode handle — shared with the session so `/permission` takes effect mid-turn.
+    pub mode: Arc<Mutex<PermissionMode>>,
     pub rules: Vec<PermissionRule>,
     pub session_approved: Vec<String>,
 }
@@ -47,11 +49,19 @@ const READ_ONLY_TOOLS: &[&str] = &[
 
 impl PermissionChain {
     pub fn new(mode: PermissionMode, rules: Vec<PermissionRule>) -> Self {
+        Self::with_shared_mode(Arc::new(Mutex::new(mode)), rules)
+    }
+
+    pub fn with_shared_mode(mode: Arc<Mutex<PermissionMode>>, rules: Vec<PermissionRule>) -> Self {
         Self {
             mode,
             rules,
             session_approved: Vec::new(),
         }
+    }
+
+    pub fn current_mode(&self) -> PermissionMode {
+        *self.mode.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Evaluate permission chain (kimi-code v2 order), with plan-mode guard first.
@@ -63,6 +73,8 @@ impl PermissionChain {
         plan_mode: bool,
         plan_file: Option<&Path>,
     ) -> PermissionDecision {
+        let mode = self.current_mode();
+
         // 0. plan-mode-guard-deny (must run before auto/yolo approve)
         if plan_mode {
             if let Some(deny) = plan_mode_guard(tool_name, input, working_dir, plan_file) {
@@ -71,7 +83,7 @@ impl PermissionChain {
         }
 
         // 1. auto-mode-ask-user-question-deny
-        if self.mode == PermissionMode::Auto && tool_name == "AskUserQuestion" {
+        if mode == PermissionMode::Auto && tool_name == "AskUserQuestion" {
             return PermissionDecision::Deny(
                 "AskUserQuestion is disabled in auto mode. Make a decision and continue.".into(),
             );
@@ -90,7 +102,7 @@ impl PermissionChain {
         }
 
         // 3. auto-mode-approve
-        if self.mode == PermissionMode::Auto {
+        if mode == PermissionMode::Auto {
             return PermissionDecision::Approve;
         }
 
@@ -126,7 +138,7 @@ impl PermissionChain {
         }
 
         // 8. yolo-mode-approve
-        if self.mode == PermissionMode::Yolo {
+        if mode == PermissionMode::Yolo {
             return PermissionDecision::Approve;
         }
 
@@ -149,8 +161,8 @@ impl PermissionChain {
         }
     }
 
-    pub fn set_mode(&mut self, mode: PermissionMode) {
-        self.mode = mode;
+    pub fn set_mode(&self, mode: PermissionMode) {
+        *self.mode.lock().unwrap_or_else(|e| e.into_inner()) = mode;
     }
 }
 
@@ -307,14 +319,65 @@ mod tests {
     #[test]
     fn test_auto_mode_approves_all() {
         let chain = PermissionChain::new(PermissionMode::Auto, vec![]);
-        let decision = chain.evaluate(
-            "Write",
-            &serde_json::json!({"path": "foo.rs"}),
-            Path::new("."),
-            false,
-            None,
+        assert_eq!(
+            chain.evaluate(
+                "Write",
+                &serde_json::json!({"path": "foo.rs"}),
+                Path::new("."),
+                false,
+                None,
+            ),
+            PermissionDecision::Approve
         );
-        assert_eq!(decision, PermissionDecision::Approve);
+        // Mid-turn switch to manual must take effect on the next evaluate.
+        chain.set_mode(PermissionMode::Manual);
+        assert_eq!(
+            chain.evaluate(
+                "Write",
+                &serde_json::json!({"path": "foo.rs"}),
+                Path::new("."),
+                false,
+                None,
+            ),
+            PermissionDecision::Ask
+        );
+        assert_eq!(
+            chain.evaluate(
+                "Edit",
+                &serde_json::json!({"path": "foo.rs"}),
+                Path::new("."),
+                false,
+                None,
+            ),
+            PermissionDecision::Ask
+        );
+    }
+
+    #[test]
+    fn test_shared_mode_handle_updates_live() {
+        let mode = Arc::new(Mutex::new(PermissionMode::Auto));
+        let chain = PermissionChain::with_shared_mode(mode.clone(), vec![]);
+        assert_eq!(
+            chain.evaluate(
+                "Write",
+                &serde_json::json!({"path": "a.rs"}),
+                Path::new("."),
+                false,
+                None,
+            ),
+            PermissionDecision::Approve
+        );
+        *mode.lock().unwrap() = PermissionMode::Manual;
+        assert_eq!(
+            chain.evaluate(
+                "Write",
+                &serde_json::json!({"path": "a.rs"}),
+                Path::new("."),
+                false,
+                None,
+            ),
+            PermissionDecision::Ask
+        );
     }
 
     #[test]

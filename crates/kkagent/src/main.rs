@@ -848,6 +848,11 @@ async fn ensure_http_session_loaded(
         .await
         .insert(session_id.to_string(), session.model_alias.clone());
     state
+        .permission_modes
+        .lock()
+        .await
+        .insert(session_id.to_string(), session.permission_mode.clone());
+    state
         .approval_txs
         .lock()
         .await
@@ -998,6 +1003,11 @@ impl kkagent_acp::AcpHost for AgentAcpHost {
             .await
             .insert(session_id.to_string(), session.model_alias.clone());
         self.state
+            .permission_modes
+            .lock()
+            .await
+            .insert(session_id.to_string(), session.permission_mode.clone());
+        self.state
             .approval_txs
             .lock()
             .await
@@ -1075,19 +1085,32 @@ impl kkagent_acp::AcpHost for AgentAcpHost {
     }
 
     async fn set_mode(&self, session_id: &str, mode: &str) -> Result<(), String> {
-        let mut sessions = self.state.sessions.lock().await;
-        let session = sessions
-            .get_mut(session_id)
-            .ok_or_else(|| "session not found".to_string())?;
         match mode {
-            "agent" => session.plan_mode = false,
-            "plan" => session.plan_mode = true,
-            "manual" => session.permission_mode = PermissionMode::Manual,
-            "yolo" => session.permission_mode = PermissionMode::Yolo,
-            "auto" => session.permission_mode = PermissionMode::Auto,
-            _ => return Err(format!("unsupported ACP mode: {mode}")),
+            "agent" | "plan" => {
+                let mut sessions = self.state.sessions.lock().await;
+                let session = sessions
+                    .get_mut(session_id)
+                    .ok_or_else(|| "session not found".to_string())?;
+                session.plan_mode = mode == "plan";
+                Ok(())
+            }
+            "manual" | "yolo" | "auto" => {
+                let perm = mode
+                    .parse::<PermissionMode>()
+                    .map_err(|e| e.to_string())?;
+                if let Some(arc) = self.state.permission_modes.lock().await.get(session_id) {
+                    *arc.lock().unwrap_or_else(|e| e.into_inner()) = perm;
+                    return Ok(());
+                }
+                let sessions = self.state.sessions.lock().await;
+                let session = sessions
+                    .get(session_id)
+                    .ok_or_else(|| "session not found".to_string())?;
+                session.set_permission_mode(perm);
+                Ok(())
+            }
+            _ => Err(format!("unsupported ACP mode: {mode}")),
         }
-        Ok(())
     }
 
     async fn set_model(&self, session_id: &str, model: &str) -> Result<(), String> {
@@ -1221,7 +1244,7 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
                     "title": s.title,
                     "workspace": s.working_dir.display().to_string(),
                     "messages": s.messages.len(),
-                    "permission_mode": format!("{:?}", s.permission_mode),
+                    "permission_mode": format!("{:?}", s.get_permission_mode()),
                 })
             })
             .collect();
@@ -1304,6 +1327,11 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
             .await
             .insert(id.clone(), session.model_alias.clone());
         self.state
+            .permission_modes
+            .lock()
+            .await
+            .insert(id.clone(), session.permission_mode.clone());
+        self.state
             .approval_txs
             .lock()
             .await
@@ -1360,6 +1388,7 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
         }
         self.state.interrupt_flags.lock().await.remove(id);
         self.state.model_aliases.lock().await.remove(id);
+        self.state.permission_modes.lock().await.remove(id);
         self.state.approval_txs.lock().await.remove(id);
         self.state.question_txs.lock().await.remove(id);
         self.state.turn_locks.remove(id).await;
@@ -2019,8 +2048,8 @@ async fn run_http_turn(
         .as_ref()
         .map(|p| p.rules.clone())
         .unwrap_or_default();
-    let permission = Arc::new(Mutex::new(PermissionChain::new(
-        session.permission_mode,
+    let permission = Arc::new(Mutex::new(PermissionChain::with_shared_mode(
+        session.permission_mode.clone(),
         permission_rules,
     )));
     let agent = AgentLoop::new(
@@ -2059,6 +2088,8 @@ struct ServerState {
     interrupt_flags: Mutex<HashMap<String, Arc<AtomicBool>>>,
     /// Model alias handles — reachable mid-turn when session is removed from `sessions`.
     model_aliases: Mutex<HashMap<String, Arc<std::sync::Mutex<String>>>>,
+    /// Permission mode handles — reachable mid-turn so `/permission` → manual takes effect immediately.
+    permission_modes: Mutex<HashMap<String, Arc<std::sync::Mutex<PermissionMode>>>>,
     abort_registry: Arc<Mutex<HashMap<String, AbortHandle>>>,
     transcript: Mutex<TranscriptDb>,
     durable_http: kkagent_rpc::DurableHttpStore,
@@ -2287,6 +2318,7 @@ async fn build_server_state(config: Arc<AppConfig>) -> Result<Arc<ServerState>> 
         question_txs: Mutex::new(HashMap::new()),
         interrupt_flags: Mutex::new(HashMap::new()),
         model_aliases: Mutex::new(HashMap::new()),
+        permission_modes: Mutex::new(HashMap::new()),
         abort_registry: Arc::new(Mutex::new(HashMap::new())),
         transcript: Mutex::new(transcript),
         durable_http,
@@ -2554,6 +2586,11 @@ async fn handle_rpc_call(
                 .await
                 .insert(session_id.clone(), session.model_alias.clone());
             state
+                .permission_modes
+                .lock()
+                .await
+                .insert(session_id.clone(), session.permission_mode.clone());
+            state
                 .approval_txs
                 .lock()
                 .await
@@ -2747,6 +2784,7 @@ async fn handle_rpc_call(
             let removed = state.sessions.lock().await.remove(&session_id);
             state.interrupt_flags.lock().await.remove(&session_id);
             state.model_aliases.lock().await.remove(&session_id);
+            state.permission_modes.lock().await.remove(&session_id);
             state.approval_txs.lock().await.remove(&session_id);
             state.question_txs.lock().await.remove(&session_id);
             if let Some(session) = removed {
@@ -2979,7 +3017,7 @@ async fn handle_rpc_call(
                         "session_id": session_id,
                         "messages": existing.messages,
                         "plan_mode": existing.plan_mode,
-                        "permission_mode": existing.permission_mode,
+                        "permission_mode": existing.get_permission_mode(),
                         "model": existing.get_model_alias(),
                     }));
                 }
@@ -3023,6 +3061,11 @@ async fn handle_rpc_call(
                 .lock()
                 .await
                 .insert(session_id.clone(), session.model_alias.clone());
+            state
+                .permission_modes
+                .lock()
+                .await
+                .insert(session_id.clone(), session.permission_mode.clone());
             state
                 .approval_txs
                 .lock()
@@ -3282,12 +3325,19 @@ async fn handle_rpc_call(
                 .as_ref()
                 .map(|p| p.rules.clone())
                 .unwrap_or_default();
-            let perm_mode: PermissionMode = state
-                .config
-                .effective_permission_mode()
-                .parse()
-                .unwrap_or_default();
-            let permission = PermissionChain::new(perm_mode, permission_rules);
+            let shared_mode = {
+                let modes = state.permission_modes.lock().await;
+                if let Some(arc) = modes.get(&session_id) {
+                    arc.clone()
+                } else {
+                    let sessions = state.sessions.lock().await;
+                    sessions
+                        .get(&session_id)
+                        .map(|s| s.permission_mode.clone())
+                        .ok_or_else(|| (-32602, format!("Session not found: {session_id}")))?
+                }
+            };
+            let permission = PermissionChain::with_shared_mode(shared_mode, permission_rules);
 
             let agent_loop = Arc::new(
                 AgentLoop::new(
@@ -3553,11 +3603,21 @@ async fn handle_rpc_call(
                 .and_then(|p| p.get("mode"))
                 .and_then(|v| serde_json::from_value(v.clone()).ok())
                 .unwrap_or_default();
-            let mut sessions = state.sessions.lock().await;
-            if let Some(session) = sessions.get_mut(&session_id) {
-                session.permission_mode = mode;
+            // Always update the shared Arc (works mid-turn while session is out of the map).
+            let mut updated = false;
+            if let Some(arc) = state.permission_modes.lock().await.get(&session_id) {
+                *arc.lock().unwrap_or_else(|e| e.into_inner()) = mode;
+                updated = true;
             }
-            Ok(serde_json::json!({"ok": true}))
+            if let Some(session) = state.sessions.lock().await.get(&session_id) {
+                session.set_permission_mode(mode);
+                updated = true;
+            }
+            if !updated {
+                return Err((-32602, format!("Session not found: {}", session_id)));
+            }
+            tracing::info!("Session {} permission mode set to {}", session_id, mode);
+            Ok(serde_json::json!({"ok": true, "mode": mode}))
         }
         "session.set_plan_mode" => {
             let session_id = params

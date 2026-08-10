@@ -34,7 +34,8 @@ pub struct Session {
     pub system_prompt: String,
     pub working_dir: PathBuf,
     pub image_config: kkagent_config::ImageConfig,
-    pub permission_mode: PermissionMode,
+    /// Shared Arc so `/permission` can update mid-turn while the session is out of the map.
+    pub permission_mode: Arc<std::sync::Mutex<PermissionMode>>,
     pub plan_mode: bool,
     /// Only this file may be written/edited while plan_mode is on.
     pub plan_file_path: PathBuf,
@@ -159,7 +160,7 @@ impl Session {
             system_prompt: default_system_prompt(),
             working_dir,
             image_config: kkagent_config::ImageConfig::default(),
-            permission_mode,
+            permission_mode: Arc::new(std::sync::Mutex::new(permission_mode)),
             plan_mode: false,
             plan_file_path,
             model_alias: Arc::new(std::sync::Mutex::new(model_alias)),
@@ -298,6 +299,20 @@ impl Session {
 
     pub fn set_model_alias(&self, alias: impl Into<String>) {
         *self.model_alias.lock().unwrap_or_else(|e| e.into_inner()) = alias.into();
+    }
+
+    pub fn get_permission_mode(&self) -> PermissionMode {
+        *self
+            .permission_mode
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub fn set_permission_mode(&self, mode: PermissionMode) {
+        *self
+            .permission_mode
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = mode;
     }
 
     pub fn add_user_message(&mut self, text: String) {

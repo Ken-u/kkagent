@@ -138,10 +138,10 @@ impl AgentLoop {
             })
             .await;
 
-        // Keep permission chain in sync with session mode (/yolo /auto toggles)
+        // Keep permission chain in sync with session mode (/yolo /auto /permission)
         {
-            let mut perm = self.permission.lock().await;
-            perm.set_mode(session.permission_mode);
+            let perm = self.permission.lock().await;
+            perm.set_mode(session.get_permission_mode());
         }
 
         let model_alias = {
@@ -839,6 +839,100 @@ Do not mention this reminder to the user.\n</system-reminder>"
                     }
                 };
                 prepared.push((tc.id.clone(), tc.name.clone(), prep));
+            }
+
+            // Final live re-gate: `/permission` may have switched to manual after an
+            // earlier Approve under auto/yolo (including while waiting on another Ask).
+            for prep_slot in prepared.iter_mut() {
+                let (tool_call_id, tool_name, prep) = prep_slot;
+                let Prepared::Ready { name, input } = prep else {
+                    continue;
+                };
+                let decision = {
+                    let perm = self.permission.lock().await;
+                    perm.evaluate(
+                        name,
+                        input,
+                        &session.working_dir,
+                        session.plan_mode,
+                        Some(&session.plan_file_path),
+                    )
+                };
+                match decision {
+                    PermissionDecision::Approve => {}
+                    PermissionDecision::Deny(reason) => {
+                        *prep = Prepared::Done(ToolOutput::error(format!("Denied: {reason}")));
+                    }
+                    PermissionDecision::Ask => {
+                        let approval_id = uuid::Uuid::new_v4().to_string();
+                        let action = describe_tool_action(name, input);
+                        let _ = self
+                            .event_tx
+                            .send(AgentEvent::ApprovalRequested {
+                                session_id: session_id.clone(),
+                                request: kkagent_protocol::ApprovalRequest {
+                                    approval_id: approval_id.clone(),
+                                    session_id: session_id.clone(),
+                                    tool_call_id: tool_call_id.clone(),
+                                    tool_name: tool_name.clone(),
+                                    action,
+                                    tool_input_display: Some(input.clone()),
+                                    created_at: chrono::Utc::now(),
+                                },
+                            })
+                            .await;
+                        let _ = self
+                            .event_tx
+                            .send(AgentEvent::StatusUpdate {
+                                session_id: session_id.clone(),
+                                status: SessionStatus::WaitingApproval,
+                            })
+                            .await;
+                        let approval_timeout = self
+                            .config
+                            .background
+                            .as_ref()
+                            .and_then(|background| background.approval_timeout_s)
+                            .unwrap_or(900)
+                            .clamp(1, 86_400);
+                        let response = match tokio::time::timeout(
+                            std::time::Duration::from_secs(approval_timeout),
+                            session.wait_approval(&approval_id),
+                        )
+                        .await
+                        {
+                            Ok(response) => response,
+                            Err(_) => kkagent_protocol::ApprovalResponse {
+                                approval_id: approval_id.clone(),
+                                decision: kkagent_protocol::ApprovalDecision::Rejected,
+                                scope: None,
+                                feedback: Some(format!(
+                                    "approval timed out after {approval_timeout} seconds"
+                                )),
+                                selected_label: None,
+                            },
+                        };
+                        match response.decision {
+                            kkagent_protocol::ApprovalDecision::Approved => {
+                                if response.scope
+                                    == Some(kkagent_protocol::ApprovalScope::Session)
+                                {
+                                    let mut perm = self.permission.lock().await;
+                                    perm.record_session_approval(name, input);
+                                }
+                            }
+                            kkagent_protocol::ApprovalDecision::Cancelled => {
+                                self.finish_interrupted(session).await?;
+                                return Ok(TurnStep::Done);
+                            }
+                            _ => {
+                                *prep = Prepared::Done(ToolOutput::error(
+                                    "Tool call was rejected by user",
+                                ));
+                            }
+                        }
+                    }
+                }
             }
 
             let _ = self
