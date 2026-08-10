@@ -24,7 +24,7 @@ const TIPS: &[&str] = &[
     "@ opens file picker — tab to insert a path",
     "ctrl+f searches the transcript",
     "ctrl+o expands turn tool history",
-    "ctrl+g toggles btw notes",
+    "ctrl+g toggles /btw side Q&A",
     "shift-tab toggles plan mode (scroll locks to plan)",
     "! enters shell mode",
     "/yolo auto-approves tools",
@@ -97,10 +97,13 @@ pub fn render_ui(f: &mut Frame, state: &mut AppState, config: &AppConfig) {
     render_input(f, input_area, state, &theme);
     render_footer(f, chunks[3], state, config, &theme);
 
-    if state.show_btw_pane {
-        let pane_w = (size.width / 3).clamp(28, 48);
-        let n = state.btw_notes.len().max(1) as u16;
-        let pane_h = (n + 2).clamp(4, size.height.saturating_sub(4));
+    if state.btw.open {
+        let pane_w = (size.width / 3).clamp(28, 56);
+        let pane_h = state
+            .btw
+            .line_budget()
+            .saturating_add(2)
+            .clamp(6, size.height.saturating_sub(4));
         let area = Rect {
             x: size.width.saturating_sub(pane_w + 1),
             y: tab_height.saturating_add(1),
@@ -111,11 +114,7 @@ pub fn render_ui(f: &mut Frame, state: &mut AppState, config: &AppConfig) {
             f,
             area,
             &BtwPane {
-                notes: if state.btw_notes.is_empty() {
-                    vec!["(empty — /btw <note>)".into()]
-                } else {
-                    state.btw_notes.clone()
-                },
+                state: state.btw.clone(),
             },
             &theme,
         );
@@ -1164,12 +1163,14 @@ fn render_footer(f: &mut Frame, area: Rect, state: &AppState, config: &AppConfig
         }
     }
 
-    if !state.btw_notes.is_empty() {
+    if state.btw.open || !state.btw.turns.is_empty() {
         left.push(Span::raw("  "));
-        left.push(Span::styled(
-            format!("btw:{}", state.btw_notes.len()),
-            Style::default().fg(theme.accent),
-        ));
+        let label = if state.btw.streaming {
+            "btw…".to_string()
+        } else {
+            format!("btw:{}", state.btw.turns.len())
+        };
+        left.push(Span::styled(label, Style::default().fg(theme.accent)));
     }
 
     let tip = if state.quit_confirm {

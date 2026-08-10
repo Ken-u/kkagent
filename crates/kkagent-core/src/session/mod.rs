@@ -40,7 +40,9 @@ pub use activity::{
     PendingInteraction, SessionActivityCause, SessionActivityState, SessionActivityView,
 };
 pub use agent_lifecycle::{AgentHandle, AgentLifecycleService, CreateAgentOptions, MAIN_AGENT_ID};
-pub use btw::{SessionBtwService, SIDE_QUESTION_SYSTEM_REMINDER, TOOL_CALL_DISABLED_MESSAGE};
+pub use btw::{
+    BtwTurn, SessionBtwService, SIDE_QUESTION_SYSTEM_REMINDER, TOOL_CALL_DISABLED_MESSAGE,
+};
 pub use context::SessionContext;
 pub use cron::{SessionCronJob, SessionCronService};
 pub use export::{default_export_dir_name, export_session_directory, ExportManifest, ExportResult};

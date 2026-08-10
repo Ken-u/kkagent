@@ -67,7 +67,9 @@ answer=$(kkagent -p "总结 README" 2>kkagent.err)
 - 会话：`/new`、`/clear`、`/sessions`、`/resume`、`/compact`、`/undo`、`/title`、`/status`、`/usage`。
 - 模式：`/permission`、`/yolo`、`/auto`、`/plan`、`/model`、`/effort`、`/thinking`、`/provider`。
 - 扩展：`/mcp`、`/skills`、`/plugins`、`/tasks`、`/goal`、`/swarm`、`/web`、`/prompts`。
-- 工具：`/init`、`/config`、`/auth`、`/reload`、`/add-dir`、`/btw`、`/search`、`/copy`、`/debug`。
+- 工具：`/init`、`/config`、`/auth`、`/reload`、`/add-dir`、`/btw`、`/fork`、`/search`、`/copy`、`/debug`。
+- `/btw <question>`：侧问（不写入主会话）；`Ctrl+G` 打开/关闭侧栏，流式中再按可取消。
+- `/fork [title]`：派生当前会话副本，仍停留在原会话，用 `/sessions` 切换。
 - 帮助与退出：`/help`、`/release-notes`、`/feedback`、`/info`、`/exit`、`/quit`、`/q`。
 
 部分命令仅展示状态或排队执行；输入 `/help` 可查看当前版本的参数提示。

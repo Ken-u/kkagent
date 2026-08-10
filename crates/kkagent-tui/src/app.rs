@@ -95,8 +95,8 @@ pub struct AppState {
     pub todos: Vec<TodoItem>,
     /// Expand sticky todo beyond the collapsed max rows.
     pub todos_expanded: bool,
-    /// BTW notes from `/btw`.
-    pub btw_notes: Vec<String>,
+    /// BTW side-question panel (`/btw`).
+    pub btw: crate::panes::BtwPanelState,
     /// Active model alias (best-effort).
     pub model_alias: Option<String>,
     /// Streaming cursor for live assistant deltas.
@@ -109,8 +109,6 @@ pub struct AppState {
     pub event_router: SessionEventRouter,
     /// Ctrl-F transcript search overlay.
     pub search: SearchState,
-    /// Show btw notes as a floating pane.
-    pub show_btw_pane: bool,
     /// Show activity side hints in footer when streaming.
     pub last_tool_name: Option<String>,
     /// Message index to highlight (from search).
@@ -418,7 +416,7 @@ impl AppState {
             pending_esc_ms: None,
             todos: Vec::new(),
             todos_expanded: false,
-            btw_notes: Vec::new(),
+            btw: crate::panes::BtwPanelState::default(),
             model_alias: None,
             stream_cursor: crate::streaming::StreamingCursor::default(),
             tab_strip: TabStrip::default(),
@@ -429,7 +427,6 @@ impl AppState {
             },
             event_router: SessionEventRouter::default(),
             search: SearchState::default(),
-            show_btw_pane: false,
             last_tool_name: None,
             highlight_message: None,
             plan_document: None,
@@ -1428,9 +1425,16 @@ impl TuiApp {
                 self.state.file_menu = None;
                 self.state.list_picker = None;
             }
-            // Ctrl-G: toggle btw pane
+            // Ctrl-G: toggle / cancel btw pane
             KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.state.show_btw_pane = !self.state.show_btw_pane;
+                if self.state.btw.open && self.state.btw.streaming {
+                    if let Some(sid) = self.state.session_id.clone() {
+                        let _ = self.client.cancel_btw(&sid).await;
+                    }
+                    self.state.btw.streaming = false;
+                    self.state.btw.error = Some("cancelled".into());
+                }
+                self.state.btw.open = !self.state.btw.open;
             }
             // Ctrl-O: toggle tool output folding
             KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -2365,12 +2369,8 @@ impl TuiApp {
                             .join(path)
                     };
                     if abs.is_dir() {
-                        // Persist as a soft note for this session + surface to user.
-                        self.state
-                            .btw_notes
-                            .push(format!("add-dir:{}", abs.display()));
                         self.system_message(format!(
-                            "Added directory to session notes: {}\n\
+                            "Noted extra directory: {}\n\
                              Tip: also add under [permissions].trusted_workspaces in config.toml for persistence.",
                             abs.display()
                         ));
@@ -2381,10 +2381,43 @@ impl TuiApp {
             }
             "btw" => {
                 if args.is_empty() {
-                    self.system_message("Usage: /btw <note>".into());
+                    self.state.btw.open = true;
+                    self.system_message("Usage: /btw <question> — side Q&A (does not alter main chat)".into());
+                } else if self.state.btw.streaming {
+                    self.system_message(
+                        "Wait for /btw to finish before sending another question.".into(),
+                    );
+                } else if let Some(sid) = self.state.session_id.clone() {
+                    self.state.btw.begin_question(&args);
+                    match self.client.start_btw(&sid, &args).await {
+                        Ok(_) => {}
+                        Err(e) => {
+                            self.state.btw.streaming = false;
+                            self.state.btw.error = Some(e.to_string());
+                            self.system_message(format!("Failed to start /btw: {e}"));
+                        }
+                    }
                 } else {
-                    self.state.btw_notes.push(args.to_string());
-                    self.system_message(format!("btw: {args}"));
+                    self.system_message("No active session for /btw".into());
+                }
+            }
+            "fork" => {
+                if let Some(sid) = self.state.session_id.clone() {
+                    let title = if args.is_empty() { None } else { Some(args) };
+                    match self.client.fork_session(&sid, title.as_deref()).await {
+                        Ok(data) => {
+                            let fork_id = data
+                                .get("session_id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("?");
+                            self.system_message(format!(
+                                "Session forked ({fork_id}). Still in the original session; switch to the fork via /sessions."
+                            ));
+                        }
+                        Err(e) => self.system_message(format!("Failed to fork session: {e}")),
+                    }
+                } else {
+                    self.system_message("No active session to fork".into());
                 }
             }
             "search" | "find" => {
@@ -2986,6 +3019,15 @@ impl TuiApp {
                             "MCP OAuth required for `{server_name}`.\nOpen: {authorization_url}"
                         ));
                     }
+                    AgentEvent::BtwDelta { text, .. } => {
+                        self.state.btw.open = true;
+                        self.state.btw.append_delta(&text);
+                    }
+                    AgentEvent::BtwThinkingDelta { .. } => {}
+                    AgentEvent::BtwEnd { error, .. } => {
+                        self.state.btw.finish(error);
+                        self.state.btw.open = true;
+                    }
                 }
             }
         }
@@ -3058,7 +3100,7 @@ fn slash_help_text() -> String {
   !             - Shell mode\n\
   @             - File path picker (Tab/Enter insert)\n\
   Ctrl-F / Ctrl-S - Search transcript\n\
-  Ctrl-G        - Toggle btw notes pane\n\
+  Ctrl-G        - Toggle / cancel /btw side pane\n\
   Ctrl-O        - Expand/collapse turn tool history (or tool output)\n\
   Ctrl-T        - Expand/collapse todo panel\n\
   Ctrl-P / Ctrl-N - Input history\n\

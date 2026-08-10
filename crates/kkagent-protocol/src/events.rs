@@ -97,6 +97,20 @@ pub enum AgentEvent {
         parent_tool_call_id: String,
         event: Box<AgentEvent>,
     },
+    /// `/btw` side-question streaming (does not touch the main transcript).
+    BtwDelta {
+        session_id: String,
+        text: String,
+    },
+    BtwThinkingDelta {
+        session_id: String,
+        text: String,
+    },
+    BtwEnd {
+        session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
     /// MCP OAuth authorization URL for the user to open.
     McpAuthRequired {
         session_id: String,

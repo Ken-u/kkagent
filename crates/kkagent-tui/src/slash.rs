@@ -231,9 +231,16 @@ pub const BUILTIN_SLASH_COMMANDS: &[SlashCommand] = &[
     SlashCommand {
         name: "btw",
         aliases: &[],
-        description: "Add a BTW note / reminder",
-        priority: 40,
-        argument_hint: Some("<note>"),
+        description: "Ask a side question (does not alter main chat)",
+        priority: 55,
+        argument_hint: Some("<question>"),
+    },
+    SlashCommand {
+        name: "fork",
+        aliases: &[],
+        description: "Fork current session (stay on original; switch via /sessions)",
+        priority: 55,
+        argument_hint: Some("[title]"),
     },
     SlashCommand {
         name: "search",

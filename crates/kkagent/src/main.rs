@@ -12,8 +12,8 @@ use kkagent_client::KkagentClient;
 use kkagent_config::{load_config, AppConfig};
 use kkagent_core::SubagentMirrorContext;
 use kkagent_core::{
-    AgentLoop, PermissionChain, Session, SessionCloseReason, SessionCreateSource, SessionStore,
-    TranscriptDb,
+    AgentLoop, BtwTurn, PermissionChain, Session, SessionBtwService, SessionCloseReason,
+    SessionCreateSource, SessionStore, TranscriptDb,
 };
 use kkagent_di::ServiceContainer;
 use kkagent_llm::{ChatContent, ChatMessage};
@@ -3172,6 +3172,162 @@ async fn handle_rpc_call(
             }
             // Kill any background Bash jobs owned by this session.
             state.bash_shells.cancel_session(&session_id).await;
+            Ok(serde_json::json!({"ok": true}))
+        }
+        "session.btw" => {
+            let session_id = params
+                .as_ref()
+                .and_then(|p| p.get("session_id"))
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| (-32602, "Missing session_id".into()))?
+                .to_string();
+            let question = params
+                .as_ref()
+                .and_then(|p| p.get("text").or_else(|| p.get("question")))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if question.is_empty() {
+                return Err((-32602, "BTW question must not be empty".into()));
+            }
+
+            let (history, model_alias, prior_turns, cancel, agent_id) = {
+                let sessions = state.sessions.lock().await;
+                let session = sessions
+                    .get(&session_id)
+                    .ok_or_else(|| (-32602, format!("Session not found: {session_id}")))?;
+                if !session.services.btw.try_begin() {
+                    return Err((
+                        -32001,
+                        "Wait for /btw to finish before sending another question.".into(),
+                    ));
+                }
+                let agent_id = session.services.btw.start(&session.services.agents);
+                let history = session.messages.clone();
+                let model_alias = session.get_model_alias();
+                let prior_turns = session.services.btw.turns();
+                let cancel = session.services.btw.cancel_flag();
+                cancel.store(false, std::sync::atomic::Ordering::SeqCst);
+                (history, model_alias, prior_turns, cancel, agent_id)
+            };
+
+            let rpc_tx = rpc_event_tx.clone();
+            let config = state.config.clone();
+            let state_clone = state.clone();
+            let sid = session_id.clone();
+            let q = question.clone();
+            tokio::spawn(async move {
+                let (stream_tx, mut stream_rx) =
+                    mpsc::channel::<kkagent_llm::types::StreamEvent>(256);
+                let stream_task = {
+                    let config = config.clone();
+                    let history = history;
+                    let prior = prior_turns;
+                    let question = q.clone();
+                    let cancel = cancel.clone();
+                    tokio::spawn(async move {
+                        SessionBtwService::stream_side_question(
+                            &config,
+                            &model_alias,
+                            &history,
+                            &prior,
+                            &question,
+                            stream_tx,
+                            cancel,
+                        )
+                        .await
+                    })
+                };
+
+                let mut answer = String::new();
+                let mut stream_error: Option<String> = None;
+                while let Some(evt) = stream_rx.recv().await {
+                    match evt {
+                        kkagent_llm::types::StreamEvent::TextDelta(text) => {
+                            answer.push_str(&text);
+                            let frame = Frame::Event {
+                                event: "agent".into(),
+                                scope: None,
+                                data: serde_json::to_value(AgentEvent::BtwDelta {
+                                    session_id: sid.clone(),
+                                    text,
+                                })
+                                .unwrap_or_default(),
+                            };
+                            if rpc_tx.send(frame).await.is_err() {
+                                break;
+                            }
+                        }
+                        kkagent_llm::types::StreamEvent::ThinkingDelta(text) => {
+                            let frame = Frame::Event {
+                                event: "agent".into(),
+                                scope: None,
+                                data: serde_json::to_value(AgentEvent::BtwThinkingDelta {
+                                    session_id: sid.clone(),
+                                    text,
+                                })
+                                .unwrap_or_default(),
+                            };
+                            if rpc_tx.send(frame).await.is_err() {
+                                break;
+                            }
+                        }
+                        kkagent_llm::types::StreamEvent::Error(message) => {
+                            stream_error = Some(message);
+                        }
+                        kkagent_llm::types::StreamEvent::MessageEnd { .. } => {}
+                        _ => {}
+                    }
+                }
+
+                if let Err(e) = stream_task.await.unwrap_or(Ok(())) {
+                    if stream_error.is_none() {
+                        stream_error = Some(e.to_string());
+                    }
+                }
+
+                if stream_error.is_none() && !answer.trim().is_empty() {
+                    if let Some(session) = state_clone.sessions.lock().await.get(&sid) {
+                        session.services.btw.push_turn(BtwTurn {
+                            question: q,
+                            answer,
+                        });
+                    }
+                }
+
+                if let Some(session) = state_clone.sessions.lock().await.get(&sid) {
+                    session.services.btw.end();
+                }
+
+                let frame = Frame::Event {
+                    event: "agent".into(),
+                    scope: None,
+                    data: serde_json::to_value(AgentEvent::BtwEnd {
+                        session_id: sid,
+                        error: stream_error,
+                    })
+                    .unwrap_or_default(),
+                };
+                let _ = rpc_tx.send(frame).await;
+            });
+
+            Ok(serde_json::json!({
+                "ok": true,
+                "agent_id": agent_id,
+                "question": question,
+            }))
+        }
+        "session.btw_cancel" => {
+            let session_id = params
+                .as_ref()
+                .and_then(|p| p.get("session_id"))
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| (-32602, "Missing session_id".into()))?;
+            let sessions = state.sessions.lock().await;
+            if let Some(session) = sessions.get(session_id) {
+                session.services.btw.request_cancel();
+            }
             Ok(serde_json::json!({"ok": true}))
         }
         "session.set_permission_mode" => {

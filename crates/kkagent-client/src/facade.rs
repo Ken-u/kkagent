@@ -69,6 +69,48 @@ impl KkagentClient {
         Ok(())
     }
 
+    /// Side-question (`/btw`) — streams `BtwDelta` / `BtwEnd` without touching main transcript.
+    pub async fn start_btw(&self, session_id: &str, question: &str) -> anyhow::Result<String> {
+        let params = serde_json::json!({
+            "session_id": session_id,
+            "text": question,
+        });
+        let result = self
+            .rpc
+            .call("session.btw", Some(params))
+            .await
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        Ok(result
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string())
+    }
+
+    pub async fn cancel_btw(&self, session_id: &str) -> anyhow::Result<()> {
+        let params = serde_json::json!({"session_id": session_id});
+        self.rpc
+            .call("session.btw_cancel", Some(params))
+            .await
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        Ok(())
+    }
+
+    pub async fn fork_session(
+        &self,
+        session_id: &str,
+        title: Option<&str>,
+    ) -> anyhow::Result<serde_json::Value> {
+        let mut params = serde_json::json!({"session_id": session_id});
+        if let Some(title) = title {
+            params["title"] = serde_json::json!(title);
+        }
+        self.rpc
+            .call("sessions.fork", Some(params))
+            .await
+            .map_err(|e| anyhow::anyhow!("{}", e))
+    }
+
     pub async fn set_permission_mode(
         &self,
         session_id: &str,
