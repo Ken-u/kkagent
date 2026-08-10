@@ -92,10 +92,18 @@ default_mode = "manual"
 kkagent
 ```
 
+The `kkagent` binary is also installed as a `kk` symlink in the same directory, so typing `kk` is equivalent to `kkagent`.
+
 3. Run a one-off task non-interactively:
 
 ```bash
 kkagent -y -p "Read ./Cargo.toml and count workspace members"
+```
+
+Or using the short alias:
+
+```bash
+kk -y -p "Read ./Cargo.toml and count workspace members"
 ```
 
 See [docs/cli-and-tui.md](docs/cli-and-tui.md) for more.

@@ -92,10 +92,18 @@ default_mode = "manual"
 kkagent
 ```
 
+`kkagent` 命令同时会以 `kk` 软链接的形式安装到同一目录，直接敲 `kk` 等价于 `kkagent`。
+
 3. 非交互执行单次任务：
 
 ```bash
 kkagent -y -p "Read ./Cargo.toml and count workspace members"
+```
+
+也可以简写为：
+
+```bash
+kk -y -p "Read ./Cargo.toml and count workspace members"
 ```
 
 更多用法见 [docs/cli-and-tui.md](docs/cli-and-tui.md)。
