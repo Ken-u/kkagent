@@ -1133,6 +1133,15 @@ mod tests {
     }
 
     #[test]
+    fn renders_heading() {
+        let theme = Theme::default();
+        let lines = render("# Title\n\nbody\n", 80, &theme);
+        let text = plain(&lines).join("\n");
+        assert!(text.contains("Title"));
+        assert!(!text.contains("# Title"));
+    }
+
+    #[test]
     fn code_comments_are_styled_distinctly() {
         let theme = Theme::default();
         let md = "```rust\n// note\nlet x = 1; // trail\n```\n";
