@@ -49,7 +49,8 @@ answer=$(kkagent -p "总结 README" 2>kkagent.err)
 |---|---|
 | `Enter` | 发送输入。 |
 | `Shift+Enter` / `Ctrl+J` | 插入换行。 |
-| `Esc` / `Ctrl+C` | 中断当前生成或关闭浮层。 |
+| `Esc` | 先关闭当前菜单/浮层（不影响进行中的会话）；无浮层时才中断生成。空闲下连按两次可 undo。 |
+| `Ctrl+C` | 中断当前生成；空闲且输入为空时确认退出。 |
 | 空输入时连续两次 `Ctrl+C` | 退出。 |
 | 空输入时 `Ctrl+D` | 退出。 |
 | `Shift+Tab` | 切换 Plan 模式。写入计划后滚动锁定在完整计划内；`ExitPlanMode` 后底部可选「执行 / 修改意见 / 拒绝」。 |

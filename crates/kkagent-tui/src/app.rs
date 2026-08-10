@@ -970,6 +970,41 @@ impl TuiApp {
         Ok(())
     }
 
+    /// Close the topmost transient UI (menus / pickers / search / btw / shell).
+    /// Returns true if something was dismissed. Does not touch the agent turn.
+    fn dismiss_transient_ui(&mut self) -> bool {
+        if self.state.session_delete_confirm.take().is_some() {
+            return true;
+        }
+        if self.state.list_picker.take().is_some() {
+            self.state.session_picker_preview = None;
+            return true;
+        }
+        if self.state.tasks_panel.take().is_some() {
+            return true;
+        }
+        if self.state.search.active {
+            self.state.search.close();
+            self.state.highlight_message = None;
+            return true;
+        }
+        if self.state.file_menu.take().is_some() {
+            return true;
+        }
+        if self.state.slash_menu.take().is_some() {
+            return true;
+        }
+        if self.state.btw.open {
+            self.state.btw.open = false;
+            return true;
+        }
+        if self.state.mode == AppMode::Shell {
+            self.state.mode = AppMode::Normal;
+            return true;
+        }
+        false
+    }
+
     /// Re-enable wheel capture after the user finished selecting (any key/paste).
     fn restore_mouse_capture(&mut self) {
         if !self.mouse_select_mode || self.mouse_mode != MouseMode::Capture {
@@ -998,20 +1033,20 @@ impl TuiApp {
     }
 
     async fn handle_key(&mut self, key: KeyEvent) -> anyhow::Result<()> {
-        // Busy turn: Esc / Ctrl-C always interrupt first — menus must not swallow cancel.
+        // Esc while a menu/overlay is open: only dismiss that UI — never interrupt
+        // an in-flight turn. Ctrl-C still cancels the turn below.
+        if matches!(key.code, KeyCode::Esc) && self.dismiss_transient_ui() {
+            self.state.pending_esc_ms = None;
+            self.state.quit_confirm = false;
+            return Ok(());
+        }
+
+        // Busy turn with no overlay: Esc / Ctrl-C interrupt the agent.
         if !matches!(self.state.status, SessionStatus::Idle)
             && (matches!(key.code, KeyCode::Esc)
                 || (matches!(key.code, KeyCode::Char('c'))
                     && key.modifiers.contains(KeyModifiers::CONTROL)))
         {
-            self.state.file_menu = None;
-            self.state.slash_menu = None;
-            self.state.list_picker = None;
-            self.state.tasks_panel = None;
-            if self.state.search.active {
-                self.state.search.close();
-            }
-            // Approval / question panels: cancel them via interrupt channel too.
             if let Some(sid) = self.state.session_id.clone() {
                 match self.client.interrupt(&sid).await {
                     Ok(()) => {
@@ -1441,17 +1476,9 @@ impl TuiApp {
                     self.state.quit_confirm = true;
                 }
             }
-            // Escape: interrupt / dismiss / double-Esc undo
+            // Escape: dismiss overlays already handled above; here interrupt / double-Esc undo
             KeyCode::Esc => {
-                if self.state.tasks_panel.is_some() {
-                    self.state.tasks_panel = None;
-                } else if self.state.list_picker.is_some() {
-                    self.state.list_picker = None;
-                } else if self.state.file_menu.is_some() {
-                    self.state.file_menu = None;
-                } else if self.state.slash_menu.is_some() {
-                    self.state.slash_menu = None;
-                } else if self.state.status != SessionStatus::Idle {
+                if self.state.status != SessionStatus::Idle {
                     if let Some(sid) = &self.state.session_id {
                         self.client.interrupt(sid).await?;
                         self.system_message("Interrupted.".into());
@@ -3598,7 +3625,7 @@ fn slash_help_text() -> String {
   PgUp/PgDn     - Scroll transcript\n\
   Mouse wheel   - Scroll transcript (quick flick snaps to this turn; in plan mode locks to plan)\n\
   Click + drag  - Select/copy (releases mouse; next key restores scroll)\n\
-  Esc           - Interrupt / dismiss; Esc Esc undo turn\n\
+  Esc           - Close menu/overlay only; if none, interrupt turn / Esc Esc undo\n\
   !             - Shell mode\n\
   @             - File path picker (Tab/Enter insert)\n\
   Ctrl-F / Ctrl-S - Search transcript\n\
