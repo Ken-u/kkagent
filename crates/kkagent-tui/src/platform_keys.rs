@@ -3,7 +3,8 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 /// Returns true when the key event is the platform "copy" shortcut:
-/// - macOS: ⌘Command + C (`SUPER` modifier) — not Ctrl+C
+/// - macOS: ⌘Command + C (`SUPER`) — and Ctrl + C as a fallback, because the
+///   stock Terminal.app does not forward ⌘C into the TUI.
 /// - Linux / Windows: Ctrl + C
 #[inline]
 pub fn is_copy_shortcut(key: &KeyEvent) -> bool {
@@ -15,7 +16,7 @@ pub fn is_copy_shortcut(key: &KeyEvent) -> bool {
 pub fn copy_shortcut_label() -> &'static str {
     #[cfg(target_os = "macos")]
     {
-        "⌘C"
+        "⌘C / Ctrl-C"
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -28,9 +29,12 @@ pub fn copy_shortcut_label() -> &'static str {
 pub fn is_platform_copy_modifier(modifiers: KeyModifiers) -> bool {
     #[cfg(target_os = "macos")]
     {
-        // crossterm reports Command as SUPER on macOS.
-        // Require SUPER; do not treat Ctrl+C as copy (that stays interrupt/quit).
-        modifiers.contains(KeyModifiers::SUPER) && !modifiers.contains(KeyModifiers::CONTROL)
+        // crossterm reports Command as SUPER on macOS. Terminals that forward
+        // ⌘C (iTerm2 / Kitty / WezTerm) hit the SUPER path; the stock
+        // Terminal.app swallows ⌘C, so accept Ctrl+C as well so copy keeps
+        // working there. Either modifier alone is fine — we only reject when
+        // neither is present.
+        modifiers.contains(KeyModifiers::SUPER) || modifiers.contains(KeyModifiers::CONTROL)
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -54,7 +58,7 @@ mod tests {
         #[cfg(target_os = "macos")]
         {
             assert!(is_copy_shortcut(&cmd_c));
-            assert!(!is_copy_shortcut(&ctrl_c));
+            assert!(is_copy_shortcut(&ctrl_c));
         }
         #[cfg(not(target_os = "macos"))]
         {

@@ -1083,8 +1083,10 @@ impl TuiApp {
             return Ok(());
         }
 
-        // Platform copy shortcut with a non-empty selection copies; otherwise keep
-        // interrupt / quit. macOS uses Command+C, other platforms use Ctrl+C.
+        // Platform copy shortcut with a non-empty selection copies; otherwise
+        // fall through to interrupt / quit. macOS prefers ⌘C but also accepts
+        // Ctrl+C (stock Terminal.app does not forward ⌘C); other platforms
+        // use Ctrl+C.
         if crate::platform_keys::is_copy_shortcut(&key) && self.copy_selection_or_msg() {
             self.state.quit_confirm = false;
             return Ok(());
