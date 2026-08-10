@@ -433,6 +433,113 @@ impl TranscriptDb {
 
         Ok(cutoff as u32)
     }
+
+    /// Read-only integrity scan. Corrupt message rows are reported but not deleted.
+    pub fn check_integrity(&self) -> anyhow::Result<IntegrityReport> {
+        let conn = self.lock()?;
+        let mut report = IntegrityReport::default();
+        let mut stmt = conn.prepare(
+            "SELECT session_id FROM sessions",
+        )?;
+        let sessions = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        for s in sessions {
+            match s {
+                Ok(id) => report.ok_sessions.push(id),
+                Err(e) => report.bad_sessions.push(format!("unreadable session row: {e}")),
+            }
+        }
+        let mut msg_stmt =
+            conn.prepare("SELECT id, session_id, role, content_json FROM messages")?;
+        let rows = msg_stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        for row in rows {
+            match row {
+                Ok((id, sid, role, content)) => {
+                    if role.trim().is_empty() {
+                        report.isolated_messages.push(IsolatedMessage {
+                            id,
+                            session_id: sid,
+                            reason: "empty role".into(),
+                        });
+                        continue;
+                    }
+                    if serde_json::from_str::<serde_json::Value>(&content).is_err() {
+                        report.isolated_messages.push(IsolatedMessage {
+                            id,
+                            session_id: sid,
+                            reason: "invalid content_json".into(),
+                        });
+                    } else {
+                        report.ok_messages += 1;
+                    }
+                }
+                Err(e) => report.bad_sessions.push(format!("unreadable message row: {e}")),
+            }
+        }
+        Ok(report)
+    }
+
+    /// Backup DB then move corrupt message rows into `messages_quarantine`.
+    pub fn repair_with_backup(&self, backup_path: &Path) -> anyhow::Result<IntegrityReport> {
+        {
+            let conn = self.lock()?;
+            // rusqlite Path::new for file DBs; memory DBs get a marker file.
+            if let Some(path) = conn.path() {
+                if path != "" && path != ":memory:" {
+                    let _ = std::fs::copy(path, backup_path);
+                } else {
+                    std::fs::write(backup_path, b"memory-db-no-file-backup")?;
+                }
+            } else {
+                std::fs::write(backup_path, b"memory-db-no-file-backup")?;
+            }
+        }
+        let mut report = self.check_integrity()?;
+        let conn = self.lock()?;
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS messages_quarantine (
+                id INTEGER PRIMARY KEY,
+                session_id TEXT,
+                role TEXT,
+                content_json TEXT,
+                reason TEXT,
+                quarantined_at TEXT
+            );",
+        )?;
+        let now = Utc::now().to_rfc3339();
+        for iso in &report.isolated_messages {
+            conn.execute(
+                "INSERT OR REPLACE INTO messages_quarantine (id, session_id, role, content_json, reason, quarantined_at)
+                 SELECT id, session_id, role, content_json, ?1, ?2 FROM messages WHERE id = ?3",
+                params![iso.reason, now, iso.id],
+            )?;
+            conn.execute("DELETE FROM messages WHERE id = ?1", params![iso.id])?;
+        }
+        report.repaired = report.isolated_messages.len();
+        Ok(report)
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct IntegrityReport {
+    pub ok_sessions: Vec<String>,
+    pub bad_sessions: Vec<String>,
+    pub ok_messages: u64,
+    pub isolated_messages: Vec<IsolatedMessage>,
+    pub repaired: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct IsolatedMessage {
+    pub id: i64,
+    pub session_id: String,
+    pub reason: String,
 }
 
 #[cfg(test)]

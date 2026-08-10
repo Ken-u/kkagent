@@ -1,9 +1,11 @@
 pub mod activity_view;
 pub mod agent_loop;
 pub mod blob_store;
+pub mod context_breakdown;
 pub mod context_memory;
 pub mod context_projector;
 pub mod event_bus;
+pub mod file_conflict;
 pub mod full_compaction;
 pub mod git_context;
 pub mod media_pipeline;
@@ -28,12 +30,14 @@ pub mod usage;
 pub use activity_view::{ActivityItem, ActivityView};
 pub use agent_loop::*;
 pub use blob_store::{resolve_media_refs, BlobStore};
+pub use context_breakdown::ContextBreakdown;
 pub use context_memory::{fold_loop_events, fold_vacuous, CompactionHandoff};
 pub use context_projector::{
     build_compaction_digest, compact_cut_index, compact_messages, fold_old_media, project,
     project_strict, repair_tool_exchanges, ProjectOptions,
 };
 pub use event_bus::EventBus;
+pub use file_conflict::FileConflictTracker;
 pub use full_compaction::{
     apply_compaction, compact_full, compact_full_async, is_real_user_input,
     observe_context_overflow, select_compaction_user_messages, summarize_history_with_llm,
@@ -54,6 +58,9 @@ pub use token_counting::{ContextSize, TokenCounter, TokenCountingStrategy};
 pub use tool_dedupe::{canonical_args, ToolDedupeTracker};
 pub use tool_policy::{ToolPolicyLayers, ToolPolicyService};
 pub use tool_scheduler::{ToolCallTask, ToolScheduler};
-pub use transcript::{open_shared_sqlite, open_shared_sqlite_memory, SharedSqlite, TranscriptDb};
+pub use transcript::{
+    open_shared_sqlite, open_shared_sqlite_memory, IntegrityReport, IsolatedMessage, SharedSqlite,
+    TranscriptDb,
+};
 pub use undo_service::{UndoResult, UndoService};
 pub use usage::UsageService;
