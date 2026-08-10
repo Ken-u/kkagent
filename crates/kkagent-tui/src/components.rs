@@ -13,7 +13,6 @@ use crate::app::{
     AppMode, AppState, DisplayPart, ListPickerState, MessageRole, PendingApproval, PendingQuestion,
     TodoItem, ToolHistorySummary,
 };
-use crate::chrome;
 use crate::git_badge;
 use crate::i18n::{self, Locale};
 use crate::panes::{self, BtwPane};
@@ -445,18 +444,13 @@ fn build_transcript_lines(state: &mut AppState, theme: &Theme, width: u16) -> Ve
                                 if text.is_empty() {
                                     continue;
                                 }
-                                for (i, line) in text.lines().enumerate() {
-                                    if first_bullet && i == 0 {
-                                        push_assistant_wrapped(
-                                            &mut lines, line, width, theme, true,
-                                        );
-                                        first_bullet = false;
-                                    } else {
-                                        push_assistant_wrapped(
-                                            &mut lines, line, width, theme, false,
-                                        );
-                                    }
-                                }
+                                push_assistant_markdown(
+                                    &mut lines,
+                                    text,
+                                    width,
+                                    theme,
+                                    &mut first_bullet,
+                                );
                                 rendered_any = true;
                             }
                             DisplayPart::Tool(tc) => {
@@ -486,14 +480,13 @@ fn build_transcript_lines(state: &mut AppState, theme: &Theme, width: u16) -> Ve
                         rendered_any = true;
                     }
                     if !msg.content.is_empty() {
-                        for (i, line) in msg.content.lines().enumerate() {
-                            if first_bullet && i == 0 {
-                                push_assistant_wrapped(&mut lines, line, width, theme, true);
-                                first_bullet = false;
-                            } else {
-                                push_assistant_wrapped(&mut lines, line, width, theme, false);
-                            }
-                        }
+                        push_assistant_markdown(
+                            &mut lines,
+                            &msg.content,
+                            width,
+                            theme,
+                            &mut first_bullet,
+                        );
                         rendered_any = true;
                     }
                 }
@@ -588,25 +581,31 @@ fn build_transcript_lines(state: &mut AppState, theme: &Theme, width: u16) -> Ve
     lines
 }
 
-fn assistant_first_line(line: &str, theme: &Theme) -> Line<'static> {
-    let trimmed = line.trim_start();
-    // 第一条助手行带 ●
-    if trimmed.starts_with('#') {
-        let rest = trimmed.trim_start_matches('#').trim_start();
-        return Line::from(vec![
-            Span::styled("● ", Style::default().fg(theme.text)),
-            Span::styled(
-                rest.to_string(),
-                Style::default()
-                    .fg(theme.primary)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]);
+fn push_assistant_markdown(
+    lines: &mut Vec<Line<'static>>,
+    text: &str,
+    width: u16,
+    theme: &Theme,
+    first_bullet: &mut bool,
+) {
+    let prefix_w = 2usize;
+    let avail = (width as usize).saturating_sub(prefix_w).max(8);
+    let rendered = crate::markdown::render(text, avail, theme);
+    if rendered.is_empty() {
+        return;
     }
-    Line::from(vec![
-        Span::styled("● ", Style::default().fg(theme.text)),
-        Span::styled(line.to_string(), Style::default().fg(theme.text)),
-    ])
+    for (i, content) in rendered.into_iter().enumerate() {
+        let prefix = if *first_bullet && i == 0 {
+            *first_bullet = false;
+            Span::styled("● ", Style::default().fg(theme.text))
+        } else {
+            Span::raw("  ")
+        };
+        let mut spans = Vec::with_capacity(content.spans.len() + 1);
+        spans.push(prefix);
+        spans.extend(content.spans);
+        lines.push(Line::from(spans));
+    }
 }
 
 fn status_icon(tc: &crate::app::DisplayToolCall) -> &'static str {
@@ -925,44 +924,6 @@ fn tool_continuation_line(
             Style::default().fg(color),
         ),
     ])
-}
-
-fn style_markdown_line(line: &str, theme: &Theme) -> Line<'static> {
-    let trimmed = line.trim_start();
-    let owned = line.to_string();
-
-    if trimmed.starts_with("```") {
-        return Line::from(Span::styled(
-            format!("  {}", owned),
-            Style::default().fg(theme.text_muted),
-        ));
-    }
-    if let Some(rest) = trimmed
-        .strip_prefix("### ")
-        .or_else(|| trimmed.strip_prefix("## "))
-        .or_else(|| trimmed.strip_prefix("# "))
-    {
-        return Line::from(Span::styled(
-            format!("  {}", rest),
-            Style::default()
-                .fg(theme.primary)
-                .add_modifier(Modifier::BOLD),
-        ));
-    }
-    if let Some(rest) = trimmed
-        .strip_prefix("- ")
-        .or_else(|| trimmed.strip_prefix("* "))
-    {
-        return Line::from(vec![
-            Span::raw("  "),
-            Span::styled("• ", Style::default().fg(theme.text)),
-            Span::styled(rest.to_string(), Style::default().fg(theme.text)),
-        ]);
-    }
-    Line::from(Span::styled(
-        format!("  {}", owned),
-        Style::default().fg(theme.text),
-    ))
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -1917,30 +1878,35 @@ fn push_plan_box_lines(
         Span::styled(format!("┌{title}{}┐", "─".repeat(dash_after)), border),
     ]));
 
-    // Full plan body — never truncate.
-    let body_lines: Vec<&str> = if content.is_empty() {
-        vec![""]
+    // Full plan body — never truncate. Render as markdown (display only).
+    let md_lines = if content.is_empty() {
+        vec![Line::from("")]
     } else {
-        content.lines().collect()
+        crate::markdown::render(content, content_width, theme)
     };
-    for raw in body_lines {
-        let chunks = if raw.is_empty() {
-            vec![String::new()]
-        } else {
-            wrap_str(raw, content_width)
-        };
-        for chunk in chunks {
-            let styled = plan_body_spans(&chunk, theme);
-            let chunk_w: usize = styled
+    if md_lines.is_empty() {
+        let pad = content_width;
+        lines.push(Line::from(vec![
+            Span::raw(indent.clone()),
+            Span::styled("│", border),
+            Span::raw(" "),
+            Span::raw(" ".repeat(pad)),
+            Span::raw(" "),
+            Span::styled("│", border),
+        ]));
+    } else {
+        for content_line in md_lines {
+            let chunk_w: usize = content_line
+                .spans
                 .iter()
                 .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
                 .sum();
             let pad = content_width.saturating_sub(chunk_w);
-            let mut spans = Vec::with_capacity(styled.len() + 4);
+            let mut spans = Vec::with_capacity(content_line.spans.len() + 4);
             spans.push(Span::raw(indent.clone()));
             spans.push(Span::styled("│", border));
             spans.push(Span::raw(" "));
-            spans.extend(styled);
+            spans.extend(content_line.spans);
             spans.push(Span::raw(" ".repeat(pad)));
             spans.push(Span::raw(" "));
             spans.push(Span::styled("│", border));
@@ -1952,41 +1918,6 @@ fn push_plan_box_lines(
         Span::raw(indent),
         Span::styled(format!("└{}┘", "─".repeat(horz_len)), border),
     ]));
-}
-
-fn plan_body_spans(line: &str, theme: &Theme) -> Vec<Span<'static>> {
-    let trimmed = line.trim_start();
-    if let Some(rest) = trimmed
-        .strip_prefix("### ")
-        .or_else(|| trimmed.strip_prefix("## "))
-        .or_else(|| trimmed.strip_prefix("# "))
-    {
-        return vec![Span::styled(
-            rest.to_string(),
-            Style::default()
-                .fg(theme.primary)
-                .add_modifier(Modifier::BOLD),
-        )];
-    }
-    if let Some(rest) = trimmed
-        .strip_prefix("- ")
-        .or_else(|| trimmed.strip_prefix("* "))
-    {
-        return vec![
-            Span::styled("• ", Style::default().fg(theme.text)),
-            Span::styled(rest.to_string(), Style::default().fg(theme.text)),
-        ];
-    }
-    if trimmed.starts_with("```") {
-        return vec![Span::styled(
-            line.to_string(),
-            Style::default().fg(theme.text_muted),
-        )];
-    }
-    vec![Span::styled(
-        line.to_string(),
-        Style::default().fg(theme.text),
-    )]
 }
 
 fn push_wrapped_prefixed(
@@ -2027,27 +1958,6 @@ fn push_wrapped_prefixed(
                     Span::styled(chunk, text_style),
                 ]));
             }
-        }
-    }
-}
-
-fn push_assistant_wrapped(
-    lines: &mut Vec<Line<'static>>,
-    line: &str,
-    width: u16,
-    theme: &Theme,
-    is_first: bool,
-) {
-    let prefix = if is_first { "● " } else { "  " };
-    let prefix_w = UnicodeWidthStr::width(prefix);
-    let avail = (width as usize).saturating_sub(prefix_w).max(8);
-    let mut first_chunk = true;
-    for chunk in wrap_str(line, avail) {
-        if is_first && first_chunk {
-            lines.push(assistant_first_line(&chunk, theme));
-            first_chunk = false;
-        } else {
-            lines.push(style_markdown_line(&chunk, theme));
         }
     }
 }
