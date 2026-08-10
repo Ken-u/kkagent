@@ -173,6 +173,20 @@ pub enum ListPickerKind {
     SkillManage,
     /// Toggle MCP servers on/off (Enter toggles, Esc closes).
     McpManage,
+    /// Top-level settings menu (`/config`).
+    Config,
+    /// Pick an LLM provider, then drill into its models (`/provider`).
+    Provider,
+    /// Thinking effort levels (`/effort`).
+    Effort,
+    /// Browse-only key/value rows (status / auth / flags / plugins / info).
+    Browse,
+    /// Slash command catalogue (`/help`).
+    Help,
+    /// Prompt templates (`/prompts`).
+    Prompts,
+    /// Swarm mode actions (`/swarm`).
+    Swarm,
 }
 
 #[derive(Debug, Clone)]
@@ -1864,7 +1878,33 @@ impl TuiApp {
         } else if submit_if_ready
             && matches!(
                 item.name.as_str(),
-                "model" | "sessions" | "resume" | "tasks" | "task" | "permission"
+                "model"
+                    | "sessions"
+                    | "resume"
+                    | "tasks"
+                    | "task"
+                    | "permission"
+                    | "config"
+                    | "provider"
+                    | "providers"
+                    | "effort"
+                    | "thinking"
+                    | "auth"
+                    | "help"
+                    | "h"
+                    | "?"
+                    | "info"
+                    | "status"
+                    | "usage"
+                    | "prompts"
+                    | "prompt"
+                    | "experimental-flags"
+                    | "flags"
+                    | "plugins"
+                    | "plugin"
+                    | "swarm"
+                    | "mcp"
+                    | "skills"
             )
         {
             self.state.input.clear();
@@ -1873,6 +1913,18 @@ impl TuiApp {
                 "sessions" | "resume" => self.open_session_picker().await?,
                 "tasks" | "task" => self.open_tasks_panel().await?,
                 "permission" => self.open_permission_picker(),
+                "config" => self.open_config_picker(),
+                "provider" | "providers" => self.open_provider_picker(),
+                "effort" | "thinking" => self.open_effort_picker(),
+                "auth" => self.open_auth_picker(),
+                "help" | "h" | "?" => self.open_help_picker(),
+                "info" | "status" | "usage" => self.open_status_picker(),
+                "prompts" | "prompt" => self.open_prompts_picker(),
+                "experimental-flags" | "flags" => self.open_flags_picker(),
+                "plugins" | "plugin" => self.open_plugins_picker().await?,
+                "swarm" => self.open_swarm_picker(),
+                "mcp" => self.open_mcp_manager().await?,
+                "skills" => self.open_skill_manager().await?,
                 _ => {}
             }
         } else {
@@ -1980,6 +2032,38 @@ impl TuiApp {
             ListPickerKind::Permission => {
                 self.apply_permission_mode_id(&item.id).await?;
             }
+            ListPickerKind::Config => match item.id.as_str() {
+                "model" => self.open_model_picker(),
+                "permission" => self.open_permission_picker(),
+                "effort" => self.open_effort_picker(),
+                "provider" => self.open_provider_picker(),
+                "auth" => self.open_auth_picker(),
+                "mcp" => self.open_mcp_manager().await?,
+                "skills" => self.open_skill_manager().await?,
+                "status" => self.open_status_picker(),
+                "reload" => self.reload_config_from_disk(),
+                _ => {}
+            },
+            ListPickerKind::Provider => {
+                self.open_model_picker_for_provider(&item.id);
+            }
+            ListPickerKind::Effort => {
+                self.apply_effort_level(&item.id);
+            }
+            ListPickerKind::Browse => {
+                // Browse-only: dismiss on Enter (already taken above).
+            }
+            ListPickerKind::Help => {
+                self.apply_help_command(&item.id).await?;
+            }
+            ListPickerKind::Prompts => {
+                self.apply_prompt_template(&item.id);
+            }
+            ListPickerKind::Swarm => match item.id.as_str() {
+                "enter" | "exit" => self.apply_swarm_action(&item.id).await?,
+                "tasks" => self.open_tasks_panel().await?,
+                _ => {}
+            },
             ListPickerKind::SkillManage | ListPickerKind::McpManage => {
                 // Enter is handled by toggle_manage_picker; keep picker open.
                 self.state.list_picker = Some(picker);
@@ -2249,13 +2333,23 @@ impl TuiApp {
     }
 
     fn open_model_picker(&mut self) {
+        self.open_model_picker_for_provider("");
+    }
+
+    fn open_model_picker_for_provider(&mut self, provider: &str) {
         let current = self
             .state
             .model_alias
             .clone()
             .or_else(|| self.config.default_model_alias().map(|s| s.to_string()))
             .unwrap_or_default();
-        let mut names: Vec<_> = self.config.models.keys().cloned().collect();
+        let mut names: Vec<_> = self
+            .config
+            .models
+            .iter()
+            .filter(|(_, m)| provider.is_empty() || m.provider == provider)
+            .map(|(name, _)| name.clone())
+            .collect();
         names.sort();
         let mut selected = 0;
         let items: Vec<ListPickerItem> = names
@@ -2265,24 +2359,678 @@ impl TuiApp {
                 if name == current {
                     selected = i;
                 }
-                let detail = self
+                let (detail, label) = self
                     .config
                     .resolve_model(&name)
-                    .map(|(m, _)| m.model.clone())
-                    .unwrap_or_default();
+                    .map(|(m, _)| {
+                        let detail = if provider.is_empty() {
+                            format!("{} · {}", m.provider, m.model)
+                        } else {
+                            m.model.clone()
+                        };
+                        (detail, name.clone())
+                    })
+                    .unwrap_or_else(|| (String::new(), name.clone()));
                 ListPickerItem {
-                    id: name.clone(),
-                    label: name,
+                    id: name,
+                    label,
                     detail,
                 }
             })
             .collect();
+        let title = if provider.is_empty() {
+            " Select model ".into()
+        } else {
+            format!(" Models · {provider} ")
+        };
         self.state.list_picker = Some(ListPickerState {
             kind: ListPickerKind::Model,
-            title: " Select model ".into(),
+            title,
             items,
             selected,
         });
+    }
+
+    fn open_provider_picker(&mut self) {
+        let mut names: Vec<_> = self.config.providers.keys().cloned().collect();
+        names.sort();
+        let current_provider = self
+            .state
+            .model_alias
+            .as_deref()
+            .or_else(|| self.config.default_model_alias())
+            .and_then(|a| self.config.models.get(a))
+            .map(|m| m.provider.clone());
+        let mut selected = 0;
+        let items: Vec<ListPickerItem> = names
+            .into_iter()
+            .enumerate()
+            .map(|(i, name)| {
+                if current_provider.as_deref() == Some(name.as_str()) {
+                    selected = i;
+                }
+                let p = &self.config.providers[&name];
+                let model_count = self
+                    .config
+                    .models
+                    .values()
+                    .filter(|m| m.provider == name)
+                    .count();
+                let has_key = p.api_key.as_ref().is_some_and(|k| !k.is_empty());
+                ListPickerItem {
+                    id: name.clone(),
+                    label: name,
+                    detail: format!(
+                        "{} · {} model{} · key:{}",
+                        p.provider_type,
+                        model_count,
+                        if model_count == 1 { "" } else { "s" },
+                        if has_key { "set" } else { "missing" }
+                    ),
+                }
+            })
+            .collect();
+        self.state.list_picker = Some(ListPickerState {
+            kind: ListPickerKind::Provider,
+            title: " Select provider ".into(),
+            items,
+            selected,
+        });
+    }
+
+    fn open_config_picker(&mut self) {
+        let model = self
+            .state
+            .model_alias
+            .as_deref()
+            .or_else(|| self.config.default_model_alias())
+            .unwrap_or("-");
+        let effort = self
+            .config
+            .thinking
+            .as_ref()
+            .map(|t| {
+                if t.enabled {
+                    format!("on ({})", t.effort.as_deref().unwrap_or("high"))
+                } else {
+                    "off".into()
+                }
+            })
+            .unwrap_or_else(|| "off".into());
+        let items = vec![
+            ListPickerItem {
+                id: "model".into(),
+                label: "Model".into(),
+                detail: model.to_string(),
+            },
+            ListPickerItem {
+                id: "permission".into(),
+                label: "Permission".into(),
+                detail: self.state.permission_mode.to_string(),
+            },
+            ListPickerItem {
+                id: "effort".into(),
+                label: "Thinking".into(),
+                detail: effort,
+            },
+            ListPickerItem {
+                id: "provider".into(),
+                label: "Providers".into(),
+                detail: format!("{} configured", self.config.providers.len()),
+            },
+            ListPickerItem {
+                id: "auth".into(),
+                label: "Auth".into(),
+                detail: "API key status".into(),
+            },
+            ListPickerItem {
+                id: "mcp".into(),
+                label: "MCP servers".into(),
+                detail: format!("{} configured", self.config.mcp_servers.len()),
+            },
+            ListPickerItem {
+                id: "skills".into(),
+                label: "Skills".into(),
+                detail: "enable / disable".into(),
+            },
+            ListPickerItem {
+                id: "status".into(),
+                label: "Session info".into(),
+                detail: format!(
+                    "{} msgs · ~{} tok",
+                    self.state.messages.len(),
+                    self.state.approx_tokens
+                ),
+            },
+            ListPickerItem {
+                id: "reload".into(),
+                label: "Reload config".into(),
+                detail: "from disk (in-process)".into(),
+            },
+        ];
+        self.state.list_picker = Some(ListPickerState {
+            kind: ListPickerKind::Config,
+            title: " Configuration ".into(),
+            items,
+            selected: 0,
+        });
+    }
+
+    fn open_effort_picker(&mut self) {
+        let current = self
+            .config
+            .thinking
+            .as_ref()
+            .map(|t| {
+                if !t.enabled {
+                    "off".to_string()
+                } else {
+                    t.effort
+                        .clone()
+                        .unwrap_or_else(|| "high".into())
+                        .to_lowercase()
+                }
+            })
+            .unwrap_or_else(|| "off".into());
+        let levels = ["off", "low", "medium", "high"];
+        let mut selected = 0;
+        let items: Vec<ListPickerItem> = levels
+            .iter()
+            .enumerate()
+            .map(|(i, level)| {
+                if *level == current {
+                    selected = i;
+                }
+                let detail = match *level {
+                    "off" => "disable thinking",
+                    "low" => "light reasoning",
+                    "medium" => "balanced",
+                    "high" => "deep reasoning",
+                    _ => "",
+                };
+                ListPickerItem {
+                    id: (*level).into(),
+                    label: (*level).into(),
+                    detail: detail.into(),
+                }
+            })
+            .collect();
+        self.state.list_picker = Some(ListPickerState {
+            kind: ListPickerKind::Effort,
+            title: " Thinking effort ".into(),
+            items,
+            selected,
+        });
+    }
+
+    fn apply_effort_level(&mut self, level: &str) {
+        match level {
+            "off" => {
+                if let Some(ref mut t) = self.config.thinking {
+                    t.enabled = false;
+                } else {
+                    self.config.thinking = Some(kkagent_config::ThinkingConfig {
+                        enabled: false,
+                        effort: None,
+                        keep: None,
+                    });
+                }
+                self.system_message("Thinking: off".into());
+            }
+            "low" | "medium" | "high" => {
+                self.config.thinking = Some(kkagent_config::ThinkingConfig {
+                    enabled: true,
+                    effort: Some(level.to_string()),
+                    keep: None,
+                });
+                self.system_message(format!("Thinking: on ({level})"));
+            }
+            _ => self.system_message(format!("Unknown effort level: {level}")),
+        }
+    }
+
+    fn open_auth_picker(&mut self) {
+        let mut names: Vec<_> = self.config.providers.keys().cloned().collect();
+        names.sort();
+        let items: Vec<ListPickerItem> = names
+            .into_iter()
+            .map(|name| {
+                let p = &self.config.providers[&name];
+                let has_key = p.api_key.as_ref().is_some_and(|k| !k.is_empty());
+                ListPickerItem {
+                    id: name.clone(),
+                    label: name,
+                    detail: format!(
+                        "type={} · api_key={}",
+                        p.provider_type,
+                        if has_key { "set" } else { "missing" }
+                    ),
+                }
+            })
+            .collect();
+        self.state.list_picker = Some(ListPickerState {
+            kind: ListPickerKind::Browse,
+            title: " Auth status ".into(),
+            items,
+            selected: 0,
+        });
+    }
+
+    fn open_status_picker(&mut self) {
+        let model = self
+            .state
+            .model_alias
+            .as_deref()
+            .or_else(|| self.config.default_model_alias())
+            .unwrap_or("-");
+        let sid = self.state.session_id.as_deref().unwrap_or("-");
+        let sid_short = &sid[..8.min(sid.len())];
+        let max = self
+            .state
+            .model_alias
+            .as_deref()
+            .or_else(|| self.config.default_model_alias())
+            .and_then(|a| self.config.resolve_model(a))
+            .and_then(|(m, _)| m.max_context_size)
+            .unwrap_or(256_000);
+        let used = self.state.approx_tokens;
+        let pct = used
+            .saturating_mul(100)
+            .checked_div(max)
+            .unwrap_or(0)
+            .min(100);
+        let home = dirs::home_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join(".kkagent");
+        let items = vec![
+            ListPickerItem {
+                id: "version".into(),
+                label: "Version".into(),
+                detail: format!("kkagent {}", env!("CARGO_PKG_VERSION")),
+            },
+            ListPickerItem {
+                id: "session".into(),
+                label: "Session".into(),
+                detail: sid_short.to_string(),
+            },
+            ListPickerItem {
+                id: "model".into(),
+                label: "Model".into(),
+                detail: model.to_string(),
+            },
+            ListPickerItem {
+                id: "permission".into(),
+                label: "Permission".into(),
+                detail: self.state.permission_mode.to_string(),
+            },
+            ListPickerItem {
+                id: "plan".into(),
+                label: "Plan mode".into(),
+                detail: if self.state.plan_mode { "on" } else { "off" }.into(),
+            },
+            ListPickerItem {
+                id: "status".into(),
+                label: "Status".into(),
+                detail: format!("{:?}", self.state.status),
+            },
+            ListPickerItem {
+                id: "messages".into(),
+                label: "Messages".into(),
+                detail: self.state.messages.len().to_string(),
+            },
+            ListPickerItem {
+                id: "usage".into(),
+                label: "Context".into(),
+                detail: format!("{pct}% ({used}/{max})"),
+            },
+            ListPickerItem {
+                id: "config_dir".into(),
+                label: "Config dir".into(),
+                detail: home.display().to_string(),
+            },
+        ];
+        self.state.list_picker = Some(ListPickerState {
+            kind: ListPickerKind::Browse,
+            title: " Session / system ".into(),
+            items,
+            selected: 0,
+        });
+    }
+
+    fn open_help_picker(&mut self) {
+        let mut items = vec![ListPickerItem {
+            id: "__shortcuts__".into(),
+            label: "Keyboard shortcuts".into(),
+            detail: "Enter · Esc · Tab · Ctrl-F · …".into(),
+        }];
+        let mut cmds: Vec<_> = crate::slash::BUILTIN_SLASH_COMMANDS.iter().collect();
+        cmds.sort_by(|a, b| b.priority.cmp(&a.priority).then(a.name.cmp(b.name)));
+        items.extend(cmds.into_iter().map(|c| ListPickerItem {
+            id: c.name.to_string(),
+            label: format!("/{}", c.name),
+            detail: c.description.to_string(),
+        }));
+        self.state.list_picker = Some(ListPickerState {
+            kind: ListPickerKind::Help,
+            title: " Commands ".into(),
+            items,
+            selected: 0,
+        });
+    }
+
+    fn open_shortcuts_picker(&mut self) {
+        let copy = crate::platform_keys::copy_shortcut_label();
+        let items = vec![
+            ListPickerItem {
+                id: "enter".into(),
+                label: "Enter".into(),
+                detail: "Submit / confirm slash".into(),
+            },
+            ListPickerItem {
+                id: "tab".into(),
+                label: "Tab / ← →".into(),
+                detail: "Empty input: cycle related sessions".into(),
+            },
+            ListPickerItem {
+                id: "ctrl_d".into(),
+                label: "Ctrl-D".into(),
+                detail: "Close session tab / quit if empty".into(),
+            },
+            ListPickerItem {
+                id: "shift_tab".into(),
+                label: "Shift-Tab".into(),
+                detail: "Toggle plan mode".into(),
+            },
+            ListPickerItem {
+                id: "arrows".into(),
+                label: "↑ ↓".into(),
+                detail: "Input history / menus".into(),
+            },
+            ListPickerItem {
+                id: "scroll".into(),
+                label: "PgUp / PgDn / wheel".into(),
+                detail: "Scroll transcript".into(),
+            },
+            ListPickerItem {
+                id: "select".into(),
+                label: "Drag select".into(),
+                detail: format!("Select text; {copy} copies"),
+            },
+            ListPickerItem {
+                id: "esc".into(),
+                label: "Esc".into(),
+                detail: "Close overlay / interrupt / Esc Esc undo".into(),
+            },
+            ListPickerItem {
+                id: "shell".into(),
+                label: "!".into(),
+                detail: "Shell mode".into(),
+            },
+            ListPickerItem {
+                id: "at".into(),
+                label: "@".into(),
+                detail: "File path picker".into(),
+            },
+            ListPickerItem {
+                id: "search".into(),
+                label: "Ctrl-F / Ctrl-S".into(),
+                detail: "Search transcript".into(),
+            },
+            ListPickerItem {
+                id: "btw".into(),
+                label: "Ctrl-G".into(),
+                detail: "Toggle /btw side pane".into(),
+            },
+            ListPickerItem {
+                id: "history".into(),
+                label: "Ctrl-O / Ctrl-T / Ctrl-P/N".into(),
+                detail: "Tool history · todos · input history".into(),
+            },
+        ];
+        self.state.list_picker = Some(ListPickerState {
+            kind: ListPickerKind::Browse,
+            title: " Keyboard shortcuts ".into(),
+            items,
+            selected: 0,
+        });
+    }
+
+    async fn apply_help_command(&mut self, name: &str) -> anyhow::Result<()> {
+        // Prefer opening the real UI for picker-backed commands.
+        match name {
+            "__shortcuts__" => self.open_shortcuts_picker(),
+            "model" => self.open_model_picker(),
+            "permission" => self.open_permission_picker(),
+            "config" => self.open_config_picker(),
+            "provider" | "providers" => self.open_provider_picker(),
+            "effort" | "thinking" => self.open_effort_picker(),
+            "auth" => self.open_auth_picker(),
+            "info" | "status" | "usage" | "version" => self.open_status_picker(),
+            "prompts" | "prompt" => self.open_prompts_picker(),
+            "experimental-flags" | "flags" => self.open_flags_picker(),
+            "sessions" | "resume" => self.open_session_picker().await?,
+            "tasks" | "task" => self.open_tasks_panel().await?,
+            "mcp" => self.open_mcp_manager().await?,
+            "skills" => self.open_skill_manager().await?,
+            "swarm" => self.open_swarm_picker(),
+            "plugins" | "plugin" => self.open_plugins_picker().await?,
+            "reload" => self.reload_config_from_disk(),
+            other => {
+                let hint = find_slash_command(other)
+                    .and_then(|c| c.argument_hint)
+                    .unwrap_or("");
+                if hint.is_empty() {
+                    self.state.input.set_text(format!("/{other}"));
+                } else {
+                    self.state.input.set_text(format!("/{other} "));
+                }
+                self.state.refresh_slash_menu();
+            }
+        }
+        Ok(())
+    }
+
+    fn open_prompts_picker(&mut self) {
+        let items = vec![
+            ListPickerItem {
+                id: "init".into(),
+                label: "/init".into(),
+                detail: "Generate / update AGENTS.md".into(),
+            },
+            ListPickerItem {
+                id: "compact".into(),
+                label: "/compact".into(),
+                detail: "Compress conversation context".into(),
+            },
+            ListPickerItem {
+                id: "goal".into(),
+                label: "/goal".into(),
+                detail: "Start an autonomous goal".into(),
+            },
+            ListPickerItem {
+                id: "web".into(),
+                label: "/web".into(),
+                detail: "Queue a web search prompt".into(),
+            },
+        ];
+        self.state.list_picker = Some(ListPickerState {
+            kind: ListPickerKind::Prompts,
+            title: " Prompt templates ".into(),
+            items,
+            selected: 0,
+        });
+    }
+
+    fn apply_prompt_template(&mut self, id: &str) {
+        match id {
+            "init" => {
+                self.state.pending_prompt = Some(
+                    "Analyze this codebase and create or update AGENTS.md with project conventions, build/test commands, and important paths.".into(),
+                );
+            }
+            "compact" => {
+                self.state.input.set_text("/compact ".into());
+            }
+            "goal" => {
+                self.state.input.set_text("/goal ".into());
+            }
+            "web" => {
+                self.state.input.set_text("/web ".into());
+            }
+            _ => {}
+        }
+    }
+
+    fn open_flags_picker(&mut self) {
+        let auto_compact = self
+            .config
+            .loop_control
+            .as_ref()
+            .map(|l| format!("{:?}", l.auto_compact))
+            .unwrap_or_else(|| "-".into());
+        let items = vec![
+            ListPickerItem {
+                id: "git_worktree".into(),
+                label: "KKAGENT_GIT_WORKTREE".into(),
+                detail: std::env::var("KKAGENT_GIT_WORKTREE").unwrap_or_else(|_| "0".into()),
+            },
+            ListPickerItem {
+                id: "telemetry_cloud".into(),
+                label: "KKAGENT_TELEMETRY_CLOUD".into(),
+                detail: std::env::var("KKAGENT_TELEMETRY_CLOUD").unwrap_or_else(|_| "0".into()),
+            },
+            ListPickerItem {
+                id: "auto_compact".into(),
+                label: "auto_compact".into(),
+                detail: auto_compact,
+            },
+        ];
+        self.state.list_picker = Some(ListPickerState {
+            kind: ListPickerKind::Browse,
+            title: " Experimental flags ".into(),
+            items,
+            selected: 0,
+        });
+    }
+
+    async fn open_plugins_picker(&mut self) -> anyhow::Result<()> {
+        let mut items = Vec::new();
+        match self.client.rpc_call("plugins.list", None).await {
+            Ok(v) => {
+                if let Some(arr) = v.get("plugins").and_then(|p| p.as_array()) {
+                    for p in arr {
+                        let name = p
+                            .get("name")
+                            .or_else(|| p.get("id"))
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("plugin")
+                            .to_string();
+                        let detail = p
+                            .get("path")
+                            .or_else(|| p.get("version"))
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        items.push(ListPickerItem {
+                            id: name.clone(),
+                            label: name,
+                            detail,
+                        });
+                    }
+                } else if let Some(obj) = v.as_object() {
+                    for (k, val) in obj {
+                        items.push(ListPickerItem {
+                            id: k.clone(),
+                            label: k.clone(),
+                            detail: val.to_string(),
+                        });
+                    }
+                }
+            }
+            Err(_) => {}
+        }
+        if items.is_empty() {
+            let dir = kkagent_config::default_config_dir().join("plugins");
+            items.push(ListPickerItem {
+                id: "hint".into(),
+                label: "(none loaded)".into(),
+                detail: format!("drop plugin.json under {}", dir.display()),
+            });
+        }
+        self.state.list_picker = Some(ListPickerState {
+            kind: ListPickerKind::Browse,
+            title: " Plugins ".into(),
+            items,
+            selected: 0,
+        });
+        Ok(())
+    }
+
+    fn open_swarm_picker(&mut self) {
+        let items = vec![
+            ListPickerItem {
+                id: "enter".into(),
+                label: "Enter swarm".into(),
+                detail: "enable multi-agent mode".into(),
+            },
+            ListPickerItem {
+                id: "exit".into(),
+                label: "Exit swarm".into(),
+                detail: "return to single-agent".into(),
+            },
+            ListPickerItem {
+                id: "tasks".into(),
+                label: "Background tasks".into(),
+                detail: "view subagents / tasks".into(),
+            },
+        ];
+        self.state.list_picker = Some(ListPickerState {
+            kind: ListPickerKind::Swarm,
+            title: " Swarm ".into(),
+            items,
+            selected: 0,
+        });
+    }
+
+    async fn apply_swarm_action(&mut self, action: &str) -> anyhow::Result<()> {
+        match action {
+            "enter" => {
+                let mut params = serde_json::json!({ "trigger": "slash" });
+                if let Some(sid) = &self.state.session_id {
+                    params["session_id"] = serde_json::json!(sid);
+                }
+                match self.client.rpc_call("swarm.enter", Some(params)).await {
+                    Ok(_) => self.system_message("Swarm mode ON".into()),
+                    Err(e) => self.system_message(format!("swarm enter failed: {e}")),
+                }
+            }
+            "exit" => {
+                let params = self
+                    .state
+                    .session_id
+                    .as_ref()
+                    .map(|sid| serde_json::json!({ "session_id": sid }));
+                match self.client.rpc_call("swarm.exit", params).await {
+                    Ok(_) => self.system_message("Swarm mode OFF".into()),
+                    Err(e) => self.system_message(format!("swarm exit failed: {e}")),
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn reload_config_from_disk(&mut self) {
+        match kkagent_config::load_config(None) {
+            Ok(config) => {
+                self.config = config;
+                self.system_message(
+                    "Config reloaded from disk. Server-side MCP/hooks may need a restart."
+                        .into(),
+                );
+            }
+            Err(e) => self.system_message(format!("Reload failed: {e}")),
+        }
     }
 
     async fn open_session_picker(&mut self) -> anyhow::Result<()> {
@@ -3163,50 +3911,12 @@ impl TuiApp {
             }
             "effort" | "thinking" => {
                 if args.is_empty() {
-                    let label = self
-                        .config
-                        .thinking
-                        .as_ref()
-                        .map(|t| {
-                            if t.enabled {
-                                format!("on ({})", t.effort.as_deref().unwrap_or("high"))
-                            } else {
-                                "off".into()
-                            }
-                        })
-                        .unwrap_or_else(|| "off".into());
-                    self.system_message(format!(
-                        "Thinking: {}\nUsage: /effort [off|low|medium|high]",
-                        label
-                    ));
+                    self.open_effort_picker();
                 } else {
                     let effort = args.to_lowercase();
                     match effort.as_str() {
-                        "off" => {
-                            if let Some(ref mut t) = self.config.thinking {
-                                t.enabled = false;
-                            } else {
-                                self.config.thinking = Some(kkagent_config::ThinkingConfig {
-                                    enabled: false,
-                                    effort: None,
-                                    keep: None,
-                                });
-                            }
-                            self.system_message("Thinking: off".into());
-                        }
-                        "low" | "medium" | "high" | "on" => {
-                            let e = if effort == "on" {
-                                "high".to_string()
-                            } else {
-                                effort
-                            };
-                            self.config.thinking = Some(kkagent_config::ThinkingConfig {
-                                enabled: true,
-                                effort: Some(e.clone()),
-                                keep: None,
-                            });
-                            self.system_message(format!("Thinking: on ({})", e));
-                        }
+                        "off" | "low" | "medium" | "high" => self.apply_effort_level(&effort),
+                        "on" => self.apply_effort_level("high"),
                         _ => self.system_message("Usage: /effort [off|low|medium|high]".into()),
                     }
                 }
@@ -3235,44 +3945,8 @@ impl TuiApp {
                     }
                 }
             }
-            "status" => {
-                let model = self
-                    .state
-                    .model_alias
-                    .as_deref()
-                    .or_else(|| self.config.default_model_alias())
-                    .unwrap_or("?");
-                let sid = self.state.session_id.as_deref().unwrap_or("-");
-                self.system_message(format!(
-                    "session: {}\nmodel: {}\npermission: {}\nplan: {}\nstatus: {:?}\nmessages: {}\ntokens≈ {}",
-                    &sid[..8.min(sid.len())],
-                    model,
-                    self.state.permission_mode,
-                    if self.state.plan_mode { "on" } else { "off" },
-                    self.state.status,
-                    self.state.messages.len(),
-                    self.state.approx_tokens,
-                ));
-            }
-            "usage" => {
-                let max = self
-                    .state
-                    .model_alias
-                    .as_deref()
-                    .or_else(|| self.config.default_model_alias())
-                    .and_then(|a| self.config.resolve_model(a))
-                    .and_then(|(m, _)| m.max_context_size)
-                    .unwrap_or(256_000);
-                let used = self.state.approx_tokens;
-                let pct = used
-                    .saturating_mul(100)
-                    .checked_div(max)
-                    .unwrap_or(0)
-                    .min(100);
-                self.system_message(format!(
-                    "context: {}% ({}/{})\napprox tokens used: {}",
-                    pct, used, max, used
-                ));
+            "status" | "usage" | "info" => {
+                self.open_status_picker();
             }
             "mcp" => {
                 self.open_mcp_manager().await?;
@@ -3314,37 +3988,14 @@ impl TuiApp {
                 }
             }
             "config" => {
-                let models = self.config.models.len();
-                let providers = self.config.providers.len();
-                let mcp = self.config.mcp_servers.len();
-                self.system_message(format!(
-                    "config: providers={} models={} mcp={} default_model={} secondary={:?} trusted={}",
-                    providers,
-                    models,
-                    mcp,
-                    self.config.default_model.as_deref().unwrap_or("-"),
-                    self.config.secondary_model,
-                    self.config.trusted_workspaces.len()
-                ));
+                self.open_config_picker();
             }
             "auth" => {
-                let mut lines = String::from("Auth status (secrets redacted):\n");
-                for (name, p) in &self.config.providers {
-                    let has_key = p.api_key.as_ref().map(|k| !k.is_empty()).unwrap_or(false);
-                    lines.push_str(&format!(
-                        "  {name}: type={} api_key={}\n",
-                        p.provider_type,
-                        if has_key { "set" } else { "missing" }
-                    ));
-                }
-                self.system_message(lines);
+                self.open_auth_picker();
             }
-            "plugins" | "plugin" => match self.client.rpc_call("plugins.list", None).await {
-                Ok(v) => self.system_message(format!("plugins: {}", v)),
-                Err(_) => self.system_message(
-                    "plugins: check ~/.kkagent/plugins/*/plugin.json (RPC list optional)".into(),
-                ),
-            },
+            "plugins" | "plugin" => {
+                self.open_plugins_picker().await?;
+            }
             "skills" => {
                 let _ = self.refresh_skill_commands().await;
                 if !args.is_empty() {
@@ -3358,49 +4009,15 @@ impl TuiApp {
                 self.open_skill_manager().await?;
             }
             "swarm" => match args.as_str() {
-                "enter" | "on" => {
-                    let mut params = serde_json::json!({ "trigger": "slash" });
-                    if let Some(sid) = &self.state.session_id {
-                        params["session_id"] = serde_json::json!(sid);
-                    }
-                    match self.client.rpc_call("swarm.enter", Some(params)).await {
-                        Ok(v) => self.system_message(format!("swarm enter: {v}")),
-                        Err(e) => self.system_message(format!("swarm enter failed: {e}")),
-                    }
-                }
-                "exit" | "off" => {
-                    let params = self
-                        .state
-                        .session_id
-                        .as_ref()
-                        .map(|sid| serde_json::json!({ "session_id": sid }));
-                    match self.client.rpc_call("swarm.exit", params).await {
-                        Ok(v) => self.system_message(format!("swarm exit: {v}")),
-                        Err(e) => self.system_message(format!("swarm exit failed: {e}")),
-                    }
-                }
-                _ => {
-                    self.open_tasks_panel().await?;
-                    self.system_message(
-                        "swarm: panel open. Use /swarm enter|exit to toggle mode.".into(),
-                    );
-                }
+                "enter" | "on" => self.apply_swarm_action("enter").await?,
+                "exit" | "off" => self.apply_swarm_action("exit").await?,
+                _ => self.open_swarm_picker(),
             },
             "provider" | "providers" => {
-                let mut lines = String::from("Providers / models:\n");
-                for (alias, m) in &self.config.models {
-                    lines.push_str(&format!(
-                        "  {alias} → {} ({}) ctx={:?}\n",
-                        m.model, m.provider, m.max_context_size
-                    ));
-                }
-                self.system_message(lines);
+                self.open_provider_picker();
             }
             "reload" => {
-                self.system_message(
-                    "reload: restart kkagent to pick up config.toml changes (hot-reload next)."
-                        .into(),
-                );
+                self.reload_config_from_disk();
             }
             "web" => {
                 if args.is_empty() {
@@ -3411,20 +4028,6 @@ impl TuiApp {
                     ));
                     self.system_message("Queued web search prompt in input — press Enter.".into());
                 }
-            }
-            "info" => {
-                let home = dirs::home_dir()
-                    .unwrap_or_else(|| std::path::PathBuf::from("."))
-                    .join(".kkagent");
-                self.system_message(format!(
-                    "kkagent {}\nconfig_dir: {}\nsession: {}\nmessages: {}\napprox_tokens: {}\nmodel: {}",
-                    env!("CARGO_PKG_VERSION"),
-                    home.display(),
-                    self.state.session_id.as_deref().unwrap_or("-"),
-                    self.state.messages.len(),
-                    self.state.approx_tokens,
-                    self.state.model_alias.as_deref().unwrap_or("-"),
-                ));
             }
             "add-dir" | "add_dir" => {
                 if args.is_empty() {
@@ -3509,21 +4112,10 @@ impl TuiApp {
                 self.state.list_picker = None;
             }
             "prompts" | "prompt" => {
-                self.system_message(
-                    "prompts:\n  /init — generate AGENTS.md\n  /compact — compress context\n  /goal — autonomous goal\n  /web — web search"
-                        .into(),
-                );
+                self.open_prompts_picker();
             }
             "experimental-flags" | "flags" => {
-                self.system_message(format!(
-                    "flags:\n  KKAGENT_GIT_WORKTREE={}\n  KKAGENT_TELEMETRY_CLOUD={}\n  auto_compact={:?}",
-                    std::env::var("KKAGENT_GIT_WORKTREE").unwrap_or_else(|_| "0".into()),
-                    std::env::var("KKAGENT_TELEMETRY_CLOUD").unwrap_or_else(|_| "0".into()),
-                    self.config
-                        .loop_control
-                        .as_ref()
-                        .map(|l| l.auto_compact)
-                ));
+                self.open_flags_picker();
             }
             "copy" => {
                 let text = self
@@ -3581,10 +4173,10 @@ impl TuiApp {
                 }
             }
             "version" => {
-                self.system_message(format!("kkagent {}", env!("CARGO_PKG_VERSION")));
+                self.open_status_picker();
             }
             "help" | "h" | "?" => {
-                self.system_message(slash_help_text());
+                self.open_help_picker();
             }
             _ => {
                 if find_slash_command(&command).is_some() {
@@ -4392,39 +4984,6 @@ fn split_plan_message_content(content: &str) -> (String, String) {
         }
     }
     (path, body.to_string())
-}
-
-fn slash_help_text() -> String {
-    let copy = crate::platform_keys::copy_shortcut_label();
-    let mut s = format!(
-        "Keyboard shortcuts:\n\
-  Enter         - Submit / confirm slash\n\
-  Tab / ← →    - Empty input: cycle related sessions (/new or /fork)\n\
-  Ctrl-D        - Multi-session: close current (confirm); else quit if empty\n\
-  Shift-Tab     - Toggle plan mode (scroll locks to full plan until exit)\n\
-  ↑↓            - Input history / slash menu\n\
-  PgUp/PgDn     - Scroll transcript\n\
-  Mouse wheel   - Scroll transcript (stays in-app)\n\
-  Drag select   - Select transcript text; {copy} copies (OSC 52 / local)\n\
-  Esc           - Clear selection / close menu/overlay; if none, interrupt / Esc Esc undo\n\
-  !             - Shell mode\n\
-  @             - File path picker (Tab/Enter insert)\n\
-  Ctrl-F / Ctrl-S - Search transcript\n\
-  Ctrl-G        - Toggle / cancel /btw side pane\n\
-  Ctrl-O        - Expand/collapse turn tool history (or tool output)\n\
-  Ctrl-T        - Expand/collapse todo panel\n\
-  Ctrl-P / Ctrl-N - Input history\n\
-  Large paste   - Collapses to [Pasted text #n] overview\n\n\
-Slash commands:\n"
-    );
-    for cmd in slash::BUILTIN_SLASH_COMMANDS {
-        let hint = cmd
-            .argument_hint
-            .map(|h| format!(" {}", h))
-            .unwrap_or_default();
-        s.push_str(&format!("  /{}{}  — {}\n", cmd.name, hint, cmd.description));
-    }
-    s
 }
 
 /// Fold tool calls in `[start, end)` into one `ToolHistory` overview.
