@@ -277,6 +277,8 @@ fn render_messages(f: &mut Frame, area: Rect, state: &mut AppState, theme: &Them
 fn build_transcript_lines(state: &mut AppState, theme: &Theme, width: u16) -> Vec<Line<'static>> {
     let mut lines: Vec<Line> = Vec::new();
     state.message_line_starts.clear();
+    state.render_cache.clear_if_width_changed(width);
+    let mut render_cache = std::mem::take(&mut state.render_cache);
 
     let browsing_sessions = state
         .list_picker
@@ -289,6 +291,7 @@ fn build_transcript_lines(state: &mut AppState, theme: &Theme, width: u16) -> Ve
             // Single synthetic index so scroll helpers stay consistent.
             state.message_line_starts.push(0);
             push_plan_focus_lines(&mut lines, &doc.path, &doc.content, width, theme);
+            state.render_cache = render_cache;
             return lines;
         }
     }
@@ -313,6 +316,7 @@ fn build_transcript_lines(state: &mut AppState, theme: &Theme, width: u16) -> Ve
                 Style::default().fg(theme.text_muted),
             )));
             lines.push(Line::from(""));
+            state.render_cache = render_cache;
             return lines;
         }
         lines.push(Line::from(""));
@@ -349,7 +353,16 @@ fn build_transcript_lines(state: &mut AppState, theme: &Theme, width: u16) -> Ve
             Span::styled(tip.to_string(), Style::default().fg(theme.text_dim)),
         ]));
         lines.push(Line::from(""));
+        state.render_cache = render_cache;
         return lines;
+    }
+
+    if state.history_loading {
+        lines.push(Line::from(Span::styled(
+            "  Loading earlier messages…",
+            Style::default().fg(theme.text_muted),
+        )));
+        lines.push(Line::from(""));
     }
 
     for (msg_idx, msg) in messages.iter().enumerate() {
@@ -470,6 +483,7 @@ fn build_transcript_lines(state: &mut AppState, theme: &Theme, width: u16) -> Ve
                                     width,
                                     theme,
                                     &mut first_bullet,
+                                    &mut render_cache,
                                 );
                                 rendered_any = true;
                             }
@@ -517,6 +531,7 @@ fn build_transcript_lines(state: &mut AppState, theme: &Theme, width: u16) -> Ve
                             width,
                             theme,
                             &mut first_bullet,
+                            &mut render_cache,
                         );
                         rendered_any = true;
                     }
@@ -609,6 +624,7 @@ fn build_transcript_lines(state: &mut AppState, theme: &Theme, width: u16) -> Ve
         _ => {}
     }
 
+    state.render_cache = render_cache;
     lines
 }
 
@@ -618,10 +634,9 @@ fn push_assistant_markdown(
     width: u16,
     theme: &Theme,
     first_bullet: &mut bool,
+    cache: &mut crate::render_cache::RenderCache,
 ) {
-    let prefix_w = 2usize;
-    let avail = (width as usize).saturating_sub(prefix_w).max(8);
-    let rendered = crate::markdown::render(text, avail, theme);
+    let rendered = cache.get_or_insert_markdown(text, width, theme);
     if rendered.is_empty() {
         return;
     }

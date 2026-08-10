@@ -2776,6 +2776,22 @@ fn mcp_status_json(snap: &kkagent_mcp::McpStatusSnapshot) -> serde_json::Value {
     })
 }
 
+/// Returns (display_slice, oldest_index, older_available).
+fn slice_recent_messages<T: Clone>(
+    messages: &[T],
+    display_limit: Option<usize>,
+) -> (Vec<T>, usize, bool) {
+    let total = messages.len();
+    let Some(limit) = display_limit else {
+        return (messages.to_vec(), 0, false);
+    };
+    if total <= limit {
+        return (messages.to_vec(), 0, false);
+    }
+    let start = total - limit;
+    (messages[start..].to_vec(), start, true)
+}
+
 fn resolve_session_id(db: &TranscriptDb, query: &str) -> Option<String> {
     if db.get_session(query).ok().flatten().is_some() {
         return Some(query.to_string());
@@ -3263,6 +3279,13 @@ async fn handle_rpc_call(
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| (-32602, "Missing session_id".into()))?
                 .to_string();
+            // When set, only the most recent N messages are returned for the TUI
+            // display; the full transcript remains loaded server-side for the agent.
+            let display_limit = params
+                .as_ref()
+                .and_then(|p| p.get("display_limit").or_else(|| p.get("tail")))
+                .and_then(|v| v.as_u64())
+                .map(|n| n as usize);
 
             let (record, messages) = {
                 let db = state.transcript.lock().await;
@@ -3284,12 +3307,20 @@ async fn handle_rpc_call(
             {
                 let sessions = state.sessions.lock().await;
                 if let Some(existing) = sessions.get(&session_id) {
+                    let total = existing.messages.len();
+                    let (display, oldest_index, older_available) =
+                        slice_recent_messages(&existing.messages, display_limit);
                     return Ok(serde_json::json!({
                         "session_id": session_id,
-                        "messages": existing.messages,
+                        "messages": display,
                         "plan_mode": existing.plan_mode,
                         "permission_mode": existing.get_permission_mode(),
                         "model": existing.get_model_alias(),
+                        "history": {
+                            "total": total,
+                            "oldest_index": oldest_index,
+                            "older_available": older_available,
+                        },
                     }));
                 }
             }
@@ -3354,12 +3385,58 @@ async fn handle_rpc_call(
                 .await
                 .insert(session_id.clone(), session);
 
+            let total = messages.len();
+            let (display, oldest_index, older_available) =
+                slice_recent_messages(&messages, display_limit);
             Ok(serde_json::json!({
                 "session_id": session_id,
-                "messages": messages,
+                "messages": display,
                 "plan_mode": false,
                 "permission_mode": perm_mode,
                 "model": resumed_model,
+                "history": {
+                    "total": total,
+                    "oldest_index": oldest_index,
+                    "older_available": older_available,
+                },
+            }))
+        }
+        "session.history" => {
+            let session_id = params
+                .as_ref()
+                .and_then(|p| p.get("session_id"))
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| (-32602, "Missing session_id".into()))?
+                .to_string();
+            let before = params
+                .as_ref()
+                .and_then(|p| p.get("before"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as usize;
+            let limit = params
+                .as_ref()
+                .and_then(|p| p.get("limit"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(40) as usize;
+            let limit = limit.clamp(1, 200);
+
+            let sessions = state.sessions.lock().await;
+            let session = sessions
+                .get(&session_id)
+                .ok_or_else(|| (-32602, format!("Session not found: {session_id}")))?;
+            let total = session.messages.len();
+            let end = before.min(total);
+            let start = end.saturating_sub(limit);
+            let page = session.messages[start..end].to_vec();
+            Ok(serde_json::json!({
+                "session_id": session_id,
+                "messages": page,
+                "history": {
+                    "total": total,
+                    "oldest_index": start,
+                    "older_available": start > 0,
+                    "before": before,
+                },
             }))
         }
         "session.prompt" => {

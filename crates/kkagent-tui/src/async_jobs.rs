@@ -20,6 +20,7 @@ pub enum JobChannel {
     SessionsList,
     SessionPreview,
     SessionResume,
+    SessionHistory,
     SkillsList,
     McpStatus,
     McpList,
@@ -36,6 +37,7 @@ impl JobChannel {
             Self::SessionsList => "Loading sessions",
             Self::SessionPreview => "Loading preview",
             Self::SessionResume => "Switching session",
+            Self::SessionHistory => "Loading earlier messages",
             Self::SkillsList => "Loading skills",
             Self::McpStatus => "Connecting MCP",
             Self::McpList => "Loading MCP",
@@ -60,6 +62,11 @@ pub enum JobPayload {
     },
     SessionResume {
         query: String,
+        result: Result<Value, String>,
+    },
+    SessionHistory {
+        session_id: String,
+        before: usize,
         result: Result<Value, String>,
     },
     Prompt {
@@ -301,13 +308,19 @@ impl AsyncJobHub {
                 started,
                 retryable: true,
                 retry_method: Some("session.resume".into()),
-                retry_params: Some(serde_json::json!({"session_id": query})),
+                retry_params: Some(serde_json::json!({
+                    "session_id": query,
+                    "display_limit": 60,
+                })),
             },
         );
         let tx = self.tx.clone();
         let q = query.clone();
         tokio::spawn(async move {
-            let params = serde_json::json!({"session_id": q});
+            let params = serde_json::json!({
+                "session_id": q,
+                "display_limit": 60,
+            });
             let result = requester
                 .rpc_call("session.resume", Some(params))
                 .await
@@ -317,6 +330,57 @@ impl AsyncJobHub {
                 generation,
                 started,
                 payload: JobPayload::SessionResume { query: q, result },
+            });
+        });
+        generation
+    }
+
+    pub fn spawn_session_history(
+        &mut self,
+        requester: KkagentRequester,
+        session_id: String,
+        before: usize,
+        limit: usize,
+    ) -> u64 {
+        let generation = self.next_generation(JobChannel::SessionHistory);
+        let started = Instant::now();
+        self.pending.insert(
+            JobChannel::SessionHistory,
+            PendingJob {
+                channel: JobChannel::SessionHistory,
+                generation,
+                label: "Loading earlier messages".into(),
+                started,
+                retryable: true,
+                retry_method: Some("session.history".into()),
+                retry_params: Some(serde_json::json!({
+                    "session_id": session_id,
+                    "before": before,
+                    "limit": limit,
+                })),
+            },
+        );
+        let tx = self.tx.clone();
+        let sid = session_id.clone();
+        tokio::spawn(async move {
+            let params = serde_json::json!({
+                "session_id": sid,
+                "before": before,
+                "limit": limit,
+            });
+            let result = requester
+                .rpc_call("session.history", Some(params))
+                .await
+                .map_err(|e| e.to_string());
+            let _ = tx.send(JobOutcome {
+                channel: JobChannel::SessionHistory,
+                generation,
+                started,
+                payload: JobPayload::SessionHistory {
+                    session_id: sid,
+                    before,
+                    result,
+                },
             });
         });
         generation

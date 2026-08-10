@@ -145,6 +145,14 @@ pub struct AppState {
     pub tokens_at_turn_start: u64,
     /// UI locale for overview strings (English today).
     pub locale: crate::i18n::Locale,
+    /// Cached markdown/layout lines for completed transcript messages.
+    pub render_cache: crate::render_cache::RenderCache,
+    /// Older transcript pages still loading after a lazy resume.
+    pub history_loading: bool,
+    /// Absolute index of the oldest message currently shown (for prepend pages).
+    pub history_oldest_index: Option<usize>,
+    /// Total message count known from the last resume/history response.
+    pub history_total: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -515,6 +523,10 @@ impl AppState {
             turn_started_at: None,
             tokens_at_turn_start: 0,
             locale: crate::i18n::Locale::En,
+            render_cache: crate::render_cache::RenderCache::new(),
+            history_loading: false,
+            history_oldest_index: None,
+            history_total: None,
         }
     }
 
@@ -1057,6 +1069,26 @@ impl TuiApp {
                                 Some(channel),
                                 Some(generation),
                                 format!("Resume failed: {err}"),
+                                true,
+                                0,
+                            );
+                        }
+                    }
+                }
+                crate::async_jobs::JobPayload::SessionHistory {
+                    session_id,
+                    before,
+                    result,
+                } => {
+                    self.jobs.mark_done(channel, generation);
+                    match result {
+                        Ok(data) => self.apply_session_history_page(&session_id, before, data),
+                        Err(err) => {
+                            self.state.history_loading = false;
+                            self.jobs.push_error(
+                                Some(channel),
+                                Some(generation),
+                                format!("History load failed: {err}"),
                                 true,
                                 0,
                             );
@@ -3630,6 +3662,10 @@ impl TuiApp {
         self.state.thinking_text.clear();
         self.state.scroll_up = 0;
         self.state.follow_bottom = true;
+        self.state.render_cache.invalidate_all();
+        self.state.history_loading = false;
+        self.state.history_oldest_index = None;
+        self.state.history_total = None;
         self.state.status = SessionStatus::Idle;
         self.state.approval_pending = self.state.parked_approvals.remove(&sid);
         self.state.question_pending = self.state.parked_questions.remove(&sid);
@@ -3695,7 +3731,100 @@ impl TuiApp {
         self.state.list_picker = None;
         self.state.session_picker_preview = None;
         self.enqueue_workspace_sessions_refresh();
+
+        // Lazy history: show recent messages first, then backfill older pages
+        // without forcing the viewport to the bottom.
+        if let Some(hist) = data.get("history") {
+            let total = hist.get("total").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            let oldest = hist
+                .get("oldest_index")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as usize;
+            let older = hist
+                .get("older_available")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            self.state.history_total = Some(total);
+            self.state.history_oldest_index = Some(oldest);
+            if older && oldest > 0 {
+                self.state.history_loading = true;
+                self.jobs
+                    .spawn_session_history(self.client.requester(), sid.clone(), oldest, 40);
+            }
+        }
         Ok(())
+    }
+
+    fn apply_session_history_page(
+        &mut self,
+        session_id: &str,
+        before: usize,
+        data: serde_json::Value,
+    ) {
+        if self.state.session_id.as_deref() != Some(session_id) {
+            return;
+        }
+        // Ignore stale pages if a newer history request superseded them.
+        if self
+            .state
+            .history_oldest_index
+            .is_some_and(|idx| idx != before)
+        {
+            return;
+        }
+
+        let Some(msgs) = data.get("messages").and_then(|v| v.as_array()) else {
+            self.state.history_loading = false;
+            return;
+        };
+        let older = transcript_messages_to_display(msgs);
+        let added = older.len();
+        if added == 0 {
+            self.state.history_loading = false;
+            return;
+        }
+
+        // Preserve the user's reading position: when prepending, keep the same
+        // visual offset from the bottom by increasing scroll_up by the new
+        // content's approximate line count once the next frame measures it.
+        // For now bump scroll_up by a conservative estimate (2 lines/msg) so we
+        // do not snap to the bottom; follow_bottom stays false if the user was
+        // reading history.
+        let was_following = self.state.follow_bottom;
+        if !was_following || self.state.scroll_up > 0 {
+            self.state.follow_bottom = false;
+            self.state.scroll_up = self
+                .state
+                .scroll_up
+                .saturating_add((added as u16).saturating_mul(3));
+        }
+
+        let mut merged = older;
+        merged.append(&mut self.state.messages);
+        self.state.messages = merged;
+
+        let new_oldest = data
+            .get("history")
+            .and_then(|h| h.get("oldest_index"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize;
+        let older_available = data
+            .get("history")
+            .and_then(|h| h.get("older_available"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        self.state.history_oldest_index = Some(new_oldest);
+        if older_available && new_oldest > 0 {
+            self.state.history_loading = true;
+            self.jobs.spawn_session_history(
+                self.client.requester(),
+                session_id.to_string(),
+                new_oldest,
+                40,
+            );
+        } else {
+            self.state.history_loading = false;
+        }
     }
 
     /// True when the transcript has user/assistant/plan content worth keeping.
