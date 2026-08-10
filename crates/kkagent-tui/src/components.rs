@@ -174,16 +174,9 @@ fn picker_height(picker: &ListPickerState, state: &AppState) -> u16 {
         (picker.items.len() as u16).min(max_visible)
     };
     let mut h = rows + 2;
-    if picker.kind == crate::app::ListPickerKind::Session {
-        let preview_lines = state
-            .session_picker_preview
-            .as_ref()
-            .map(|p| p.lines.len().min(8) as u16 + 2) // title + lines
-            .unwrap_or(3);
-        h = h.saturating_add(preview_lines);
-        if state.session_delete_confirm.is_some() {
-            h = h.saturating_add(1);
-        }
+    if picker.kind == crate::app::ListPickerKind::Session && state.session_delete_confirm.is_some()
+    {
+        h = h.saturating_add(1);
     }
     h.min(28)
 }
@@ -275,7 +268,13 @@ fn build_transcript_lines(state: &mut AppState, theme: &Theme, width: u16) -> Ve
     let mut lines: Vec<Line> = Vec::new();
     state.message_line_starts.clear();
 
-    if state.plan_focus_active() {
+    let browsing_sessions = state
+        .list_picker
+        .as_ref()
+        .map(|p| p.kind == crate::app::ListPickerKind::Session)
+        .unwrap_or(false);
+
+    if !browsing_sessions && state.plan_focus_active() {
         if let Some(doc) = state.plan_document.clone() {
             // Single synthetic index so scroll helpers stay consistent.
             state.message_line_starts.push(0);
@@ -284,7 +283,28 @@ fn build_transcript_lines(state: &mut AppState, theme: &Theme, width: u16) -> Ve
         }
     }
 
-    if state.messages.is_empty() {
+    // While /sessions is open, the main pane shows the highlighted session's
+    // normal transcript (not a separate preview widget).
+    let browse_msgs = if browsing_sessions {
+        state
+            .session_picker_preview
+            .as_ref()
+            .map(|p| p.messages.as_slice())
+    } else {
+        None
+    };
+    let messages: &[crate::app::DisplayMessage] = browse_msgs.unwrap_or(&state.messages);
+
+    if messages.is_empty() {
+        if browsing_sessions {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "  (empty session)",
+                Style::default().fg(theme.text_muted),
+            )));
+            lines.push(Line::from(""));
+            return lines;
+        }
         lines.push(Line::from(""));
         lines.push(Line::from(vec![
             Span::styled("● ", Style::default().fg(theme.primary)),
@@ -322,7 +342,7 @@ fn build_transcript_lines(state: &mut AppState, theme: &Theme, width: u16) -> Ve
         return lines;
     }
 
-    for (msg_idx, msg) in state.messages.iter().enumerate() {
+    for (msg_idx, msg) in messages.iter().enumerate() {
         state
             .message_line_starts
             .push(lines.len().min(u16::MAX as usize) as u16);
@@ -1604,33 +1624,6 @@ fn render_list_picker(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme
     let mut lines: Vec<Line> = Vec::new();
 
     if picker.kind == crate::app::ListPickerKind::Session {
-        if let Some(preview) = state.session_picker_preview.as_ref() {
-            lines.push(Line::from(Span::styled(
-                format!(" preview · {} ", preview.title),
-                Style::default()
-                    .fg(theme.accent)
-                    .add_modifier(Modifier::BOLD),
-            )));
-            for line in preview.lines.iter().take(8) {
-                lines.push(Line::from(Span::styled(
-                    format!("  {}", truncate(line, inner.width.saturating_sub(2) as usize)),
-                    Style::default().fg(theme.text_dim),
-                )));
-            }
-            lines.push(Line::from(Span::styled(
-                "─".repeat(inner.width as usize),
-                Style::default().fg(theme.border),
-            )));
-        } else {
-            lines.push(Line::from(Span::styled(
-                " preview · loading…",
-                Style::default().fg(theme.text_muted),
-            )));
-            lines.push(Line::from(Span::styled(
-                "─".repeat(inner.width as usize),
-                Style::default().fg(theme.border),
-            )));
-        }
         if let Some(confirm) = state.session_delete_confirm.as_ref() {
             lines.push(Line::from(Span::styled(
                 format!(

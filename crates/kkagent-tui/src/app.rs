@@ -169,8 +169,8 @@ pub struct ListPickerItem {
 #[derive(Debug, Clone)]
 pub struct SessionPickerPreview {
     pub session_id: String,
-    pub title: String,
-    pub lines: Vec<String>,
+    /// Normal transcript bubbles shown in the main message area while browsing.
+    pub messages: Vec<DisplayMessage>,
 }
 
 #[derive(Debug, Clone)]
@@ -1946,7 +1946,7 @@ impl TuiApp {
                         .unwrap_or(0);
                     self.state.list_picker = Some(ListPickerState {
                         kind: ListPickerKind::Session,
-                        title: " Sessions  ↑↓ preview  Enter open  Ctrl-D delete ".into(),
+                        title: " Sessions  ↑↓  Enter open  Ctrl-D delete ".into(),
                         items,
                         selected,
                     });
@@ -2176,49 +2176,61 @@ impl TuiApp {
             return Ok(());
         };
         let sid = item.id.clone();
-        let label = item.label.clone();
-        let params = serde_json::json!({"session_id": sid, "limit": 10});
+
+        // Current session: reuse live transcript (same look as normal chat).
+        if self.state.session_id.as_deref() == Some(sid.as_str()) {
+            self.state.session_picker_preview = Some(SessionPickerPreview {
+                session_id: sid,
+                messages: self.state.messages.clone(),
+            });
+            self.state.follow_bottom = true;
+            self.state.scroll_up = 0;
+            return Ok(());
+        }
+
+        let params = serde_json::json!({"session_id": sid, "limit": 80});
         match self.client.rpc_call("session.preview", Some(params)).await {
             Ok(data) => {
-                let title = data
-                    .get("title")
-                    .and_then(|v| v.as_str())
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or(label.as_str())
-                    .to_string();
-                let mut lines = Vec::new();
+                let mut messages = Vec::new();
                 if let Some(msgs) = data.get("messages").and_then(|v| v.as_array()) {
                     for m in msgs {
-                        let role = m.get("role").and_then(|v| v.as_str()).unwrap_or("?");
+                        let role = m.get("role").and_then(|v| v.as_str()).unwrap_or("");
                         let text = m.get("text").and_then(|v| v.as_str()).unwrap_or("");
-                        let one = text
-                            .chars()
-                            .map(|c| if c.is_whitespace() { ' ' } else { c })
-                            .collect::<String>()
-                            .split_whitespace()
-                            .collect::<Vec<_>>()
-                            .join(" ");
-                        if one.is_empty() {
+                        if text.trim().is_empty() {
                             continue;
                         }
-                        let mark = if role == "user" { "you" } else { "ai" };
-                        lines.push(format!("{mark}: {one}"));
+                        let role = match role {
+                            "user" => MessageRole::User,
+                            "assistant" => MessageRole::Assistant,
+                            "system" => MessageRole::System,
+                            _ => continue,
+                        };
+                        messages.push(DisplayMessage {
+                            role,
+                            content: text.to_string(),
+                            thinking: None,
+                            parts: Vec::new(),
+                            tool_calls: Vec::new(),
+                        });
                     }
-                }
-                if lines.is_empty() {
-                    lines.push("(empty session)".into());
                 }
                 self.state.session_picker_preview = Some(SessionPickerPreview {
                     session_id: sid,
-                    title,
-                    lines,
+                    messages,
                 });
+                self.state.follow_bottom = true;
+                self.state.scroll_up = 0;
             }
             Err(e) => {
                 self.state.session_picker_preview = Some(SessionPickerPreview {
                     session_id: sid,
-                    title: label,
-                    lines: vec![format!("preview unavailable: {e}")],
+                    messages: vec![DisplayMessage {
+                        role: MessageRole::System,
+                        content: format!("Failed to load session history: {e}"),
+                        thinking: None,
+                        parts: Vec::new(),
+                        tool_calls: Vec::new(),
+                    }],
                 });
             }
         }
