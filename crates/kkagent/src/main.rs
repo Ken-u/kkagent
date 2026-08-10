@@ -528,6 +528,7 @@ async fn provision_managed_kimi_config(
                     .and_then(|value| value.get("default_effort"))
                     .and_then(|value| value.as_str())
                     .map(str::to_string),
+                            pricing: None,
             },
         );
     }

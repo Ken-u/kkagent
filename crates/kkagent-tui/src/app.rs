@@ -175,6 +175,28 @@ pub struct AppState {
     pub queue_when_busy: bool,
     /// Last session-switch latency samples (ms) for regression awareness.
     pub last_switch_metrics: Option<SessionSwitchMetrics>,
+    /// Cumulative token usage for the active session (server-authoritative).
+    pub usage_session: SessionUsageTotals,
+    /// Recent per-turn usage samples for `/usage`.
+    pub usage_turns: Vec<TurnUsageSample>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SessionUsageTotals {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_creation_tokens: u64,
+    pub cache_read_tokens: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct TurnUsageSample {
+    pub model: Option<String>,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_creation_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub duration_ms: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -588,6 +610,8 @@ pub struct PendingQuestion {
     pub text: String,
     pub options: Vec<(String, String)>, // id, label
     pub allow_free_text: bool,
+    pub allow_multiple: bool,
+    pub background: bool,
     pub selected: usize,
     pub toggled: Vec<bool>,
     pub free_text: String,
@@ -678,6 +702,8 @@ impl AppState {
             prompt_queue: crate::prompt_queue::PromptQueue::default(),
             queue_when_busy: true,
             last_switch_metrics: None,
+            usage_session: SessionUsageTotals::default(),
+            usage_turns: Vec::new(),
         }
     }
 
@@ -2599,7 +2625,9 @@ impl TuiApp {
                 "effort" | "thinking" => self.open_effort_picker(),
                 "auth" => self.open_auth_picker(),
                 "help" | "h" | "?" => self.open_help_picker(),
-                "info" | "status" | "usage" => self.open_status_picker(),
+                "info" | "status" => self.open_status_picker(),
+                "usage" => self.open_usage_picker(),
+                "doctor" => self.open_doctor_picker().await?,
                 "prompts" | "prompt" => self.open_prompts_picker(),
                 "experimental-flags" | "flags" => self.open_flags_picker(),
                 "plugins" | "plugin" => self.open_plugins_picker().await?,
@@ -3029,9 +3057,14 @@ impl TuiApp {
             self.system_message(format!("Permission mode already: {new_mode}"));
             return Ok(());
         }
+        let previous = self.state.permission_mode;
         self.state.permission_mode = new_mode;
         if let Some(sid) = &self.state.session_id {
-            self.client.set_permission_mode(sid, new_mode).await?;
+            if let Err(e) = self.client.set_permission_mode(sid, new_mode).await {
+                self.state.permission_mode = previous;
+                self.system_message(format!("Permission update failed, rolled back: {e}"));
+                return Ok(());
+            }
         }
         self.system_message(format!("Permission mode: {new_mode}"));
         Ok(())
@@ -3386,6 +3419,123 @@ impl TuiApp {
         });
     }
 
+    fn open_usage_picker(&mut self) {
+        let u = &self.state.usage_session;
+        let model = self
+            .state
+            .model_alias
+            .clone()
+            .or_else(|| self.config.default_model_alias().map(|s| s.to_string()))
+            .unwrap_or_else(|| "-".into());
+        let (in_price, out_price, cache_c, cache_r, generic) =
+            model_pricing(&self.config, model.as_str());
+        let cost = estimate_usd(u, in_price, out_price, cache_c, cache_r);
+        let mut items = vec![
+            ListPickerItem {
+                id: "model".into(),
+                label: "Model".into(),
+                detail: model,
+            },
+            ListPickerItem {
+                id: "input".into(),
+                label: "Input tokens".into(),
+                detail: u.input_tokens.to_string(),
+            },
+            ListPickerItem {
+                id: "output".into(),
+                label: "Output tokens".into(),
+                detail: u.output_tokens.to_string(),
+            },
+            ListPickerItem {
+                id: "cache_c".into(),
+                label: "Cache creation".into(),
+                detail: u.cache_creation_tokens.to_string(),
+            },
+            ListPickerItem {
+                id: "cache_r".into(),
+                label: "Cache read".into(),
+                detail: u.cache_read_tokens.to_string(),
+            },
+            ListPickerItem {
+                id: "cost".into(),
+                label: if generic {
+                    "Est. cost (generic)".into()
+                } else {
+                    "Est. cost".into()
+                },
+                detail: format!("${cost:.4}"),
+            },
+        ];
+        for (i, turn) in self.state.usage_turns.iter().rev().take(8).enumerate() {
+            items.push(ListPickerItem {
+                id: format!("turn{i}"),
+                label: format!(
+                    "Turn −{}",
+                    i + 1
+                ),
+                detail: format!(
+                    "in={} out={} · {}ms",
+                    turn.input_tokens, turn.output_tokens, turn.duration_ms
+                ),
+            });
+        }
+        self.replace_list_picker(ListPickerState {
+            kind: ListPickerKind::Browse,
+            title: " /usage ".into(),
+            items,
+            selected: 0,
+            filter: String::new(),
+            all_items: Vec::new(),
+        });
+    }
+
+    async fn open_doctor_picker(&mut self) -> anyhow::Result<()> {
+        let path = kkagent_config::default_config_path();
+        let mut items = vec![ListPickerItem {
+            id: "config".into(),
+            label: "Config".into(),
+            detail: path.display().to_string(),
+        }];
+        let web_configured = self
+            .config
+            .services
+            .as_ref()
+            .map(|s| s.web_search.is_some() || s.moonshot_search.is_some())
+            .unwrap_or(false);
+        items.push(ListPickerItem {
+            id: "web".into(),
+            label: "WebSearch".into(),
+            detail: if web_configured {
+                "ok — configured".into()
+            } else {
+                "warning — [services.web_search] missing".into()
+            },
+        });
+        items.push(ListPickerItem {
+            id: "model".into(),
+            label: "Default model".into(),
+            detail: self
+                .config
+                .default_model_alias()
+                .unwrap_or("-")
+                .to_string(),
+        });
+        items.push(ListPickerItem {
+            id: "hint".into(),
+            label: "CLI".into(),
+            detail: "kkagent doctor — full checks".into(),
+        });
+        self.replace_list_picker(ListPickerState {
+            kind: ListPickerKind::Browse,
+            title: " /doctor ".into(),
+            items,
+            selected: 0,
+            filter: String::new(),
+            all_items: Vec::new(),
+        });
+        Ok(())
+    }
+
     fn open_status_picker(&mut self) {
         let model = self
             .state
@@ -3584,7 +3734,11 @@ impl TuiApp {
             "provider" | "providers" => self.open_provider_picker(),
             "effort" | "thinking" => self.open_effort_picker(),
             "auth" => self.open_auth_picker(),
-            "info" | "status" | "usage" | "version" => self.open_status_picker(),
+            "info" | "status" | "version" => self.open_status_picker(),
+            "usage" => self.open_usage_picker(),
+            "doctor" => {
+                self.open_doctor_picker().await?;
+            }
             "prompts" | "prompt" => self.open_prompts_picker(),
             "experimental-flags" | "flags" => self.open_flags_picker(),
             "sessions" | "resume" => self.open_session_picker().await?,
@@ -4094,6 +4248,37 @@ impl TuiApp {
             if !model.is_empty() {
                 self.state.model_alias = Some(model.to_string());
             }
+        }
+        if let Some(perm) = data
+            .get("permission_mode")
+            .and_then(|v| v.as_str())
+            .and_then(parse_permission_mode_str)
+        {
+            self.state.permission_mode = perm;
+            self.state.status_bar.permission = perm;
+        }
+        if let Some(usage) = data.get("usage") {
+            let input = usage
+                .get("input_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let output = usage
+                .get("output_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            self.state.approx_tokens = input.saturating_add(output);
+            self.state.usage_session = SessionUsageTotals {
+                input_tokens: input,
+                output_tokens: output,
+                cache_creation_tokens: usage
+                    .get("cache_creation_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0),
+                cache_read_tokens: usage
+                    .get("cache_read_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0),
+            };
         }
         if let Some(plan) = data.get("plan_mode").and_then(|v| v.as_bool()) {
             self.state.on_plan_mode_changed(plan);
@@ -5249,9 +5434,17 @@ impl TuiApp {
                     }
                 }
             }
-            "status" | "usage" | "info" => {
+            "status" | "info" => {
                 self.begin_root_picker();
                 self.open_status_picker();
+            }
+            "usage" => {
+                self.begin_root_picker();
+                self.open_usage_picker();
+            }
+            "doctor" => {
+                self.begin_root_picker();
+                self.open_doctor_picker().await?;
             }
             "mcp" => {
                 self.begin_root_picker();
@@ -5779,16 +5972,24 @@ impl TuiApp {
             KeyCode::Down if q.selected < max_row => {
                 q.selected += 1;
             }
-            KeyCode::Char(' ') if q.selected < n => {
+            KeyCode::Char(' ') if q.selected < n && q.allow_multiple => {
                 if let Some(t) = q.toggled.get_mut(q.selected) {
                     *t = !*t;
                 }
             }
             KeyCode::Enter => {
-                if q.selected < n && !q.toggled.iter().any(|t| *t) {
+                if !q.allow_multiple && q.selected < n && !q.toggled.iter().any(|t| *t) {
                     if let Some(t) = q.toggled.get_mut(q.selected) {
                         *t = true;
                     }
+                }
+                if q.allow_multiple
+                    && q.selected < n
+                    && !q.toggled.iter().any(|t| *t)
+                    && q.free_text.trim().is_empty()
+                {
+                    // Require at least one selection or free text for multi.
+                    return Ok(());
                 }
                 self.respond_question(false).await?;
             }
@@ -5801,12 +6002,19 @@ impl TuiApp {
             KeyCode::Char(c) if c.is_ascii_digit() && n > 0 => {
                 let idx = (c as u8 - b'1') as usize;
                 if idx < n {
-                    q.selected = idx;
-                    q.toggled.iter_mut().for_each(|t| *t = false);
-                    if let Some(t) = q.toggled.get_mut(idx) {
-                        *t = true;
+                    if q.allow_multiple {
+                        q.selected = idx;
+                        if let Some(t) = q.toggled.get_mut(idx) {
+                            *t = !*t;
+                        }
+                    } else {
+                        q.selected = idx;
+                        q.toggled.iter_mut().for_each(|t| *t = false);
+                        if let Some(t) = q.toggled.get_mut(idx) {
+                            *t = true;
+                        }
+                        self.respond_question(false).await?;
                     }
-                    self.respond_question(false).await?;
                 }
             }
             _ => {}
@@ -5829,6 +6037,20 @@ impl TuiApp {
             .zip(q.toggled.iter())
             .filter_map(|((id, _), on)| if *on { Some(id.clone()) } else { None })
             .collect();
+        let answer_preview = {
+            let labels: Vec<&str> = q
+                .options
+                .iter()
+                .zip(q.toggled.iter())
+                .filter_map(|((_, label), on)| if *on { Some(label.as_str()) } else { None })
+                .collect();
+            let mut parts = labels;
+            let free = q.free_text.trim();
+            if !free.is_empty() {
+                parts.push(free);
+            }
+            parts.join(", ")
+        };
         let free_text = {
             let t = q.free_text.trim();
             if t.is_empty() {
@@ -5853,6 +6075,9 @@ impl TuiApp {
         {
             self.state.question_pending = Some(q);
             self.system_message(format!("Question reply failed: {}", e));
+        } else if !cancelled {
+            let preview: String = answer_preview.chars().take(80).collect();
+            self.system_message(format!("Answered: {preview}"));
         }
         Ok(())
     }
@@ -5904,6 +6129,8 @@ impl TuiApp {
                                     text: question.text,
                                     options,
                                     allow_free_text: question.allow_free_text,
+                                    allow_multiple: question.allow_multiple,
+                                    background: question.background,
                                     selected: 0,
                                     toggled,
                                     free_text: String::new(),
@@ -6074,20 +6301,70 @@ impl TuiApp {
                             .map(|o| (o.id, o.label))
                             .collect();
                         let toggled = vec![false; options.len()];
-                        self.state.question_pending = Some(PendingQuestion {
+                        let pending = PendingQuestion {
                             question_id: question.question_id,
                             text: question.text,
                             options,
                             allow_free_text: question.allow_free_text,
+                            allow_multiple: question.allow_multiple,
+                            background: question.background,
                             selected: 0,
                             toggled,
                             free_text: String::new(),
-                        });
-                        self.state.status = SessionStatus::WaitingQuestion;
+                        };
+                        if question.background {
+                            if let Some(sid) = self.state.session_id.clone() {
+                                self.state.parked_questions.insert(sid.clone(), pending);
+                                self.state.tab_strip.mark_dirty(&sid, true);
+                            }
+                            self.system_message(
+                                "Background question waiting — open via session attention (Ctrl-N)."
+                                    .into(),
+                            );
+                        } else {
+                            self.state.question_pending = Some(pending);
+                            self.state.status = SessionStatus::WaitingQuestion;
+                        }
                     }
                     AgentEvent::UsageUpdate { usage, .. } => {
                         self.state.approx_tokens =
                             usage.input_tokens.saturating_add(usage.output_tokens);
+                        self.state.usage_session.input_tokens = self
+                            .state
+                            .usage_session
+                            .input_tokens
+                            .max(usage.input_tokens);
+                        self.state.usage_session.output_tokens = self
+                            .state
+                            .usage_session
+                            .output_tokens
+                            .max(usage.output_tokens);
+                        self.state.usage_session.cache_creation_tokens = self
+                            .state
+                            .usage_session
+                            .cache_creation_tokens
+                            .max(usage.cache_creation_input_tokens);
+                        self.state.usage_session.cache_read_tokens = self
+                            .state
+                            .usage_session
+                            .cache_read_tokens
+                            .max(usage.cache_read_input_tokens);
+                        self.state.usage_turns.push(TurnUsageSample {
+                            model: self.state.model_alias.clone(),
+                            input_tokens: usage.input_tokens,
+                            output_tokens: usage.output_tokens,
+                            cache_creation_tokens: usage.cache_creation_input_tokens,
+                            cache_read_tokens: usage.cache_read_input_tokens,
+                            duration_ms: self
+                                .state
+                                .turn_started_at
+                                .map(|t| t.elapsed().as_millis() as u64)
+                                .unwrap_or(0),
+                        });
+                        if self.state.usage_turns.len() > 32 {
+                            let drain = self.state.usage_turns.len() - 32;
+                            self.state.usage_turns.drain(0..drain);
+                        }
                     }
                     AgentEvent::Error { message, .. } => {
                         self.state.status = SessionStatus::Idle;
@@ -6291,6 +6568,45 @@ impl TuiApp {
             }
         }
     }
+}
+
+fn parse_permission_mode_str(raw: &str) -> Option<PermissionMode> {
+    let s = raw.trim().trim_matches('"');
+    s.parse().ok().or_else(|| match s.to_ascii_lowercase().as_str() {
+        "manual" => Some(PermissionMode::Manual),
+        "yolo" => Some(PermissionMode::Yolo),
+        "auto" => Some(PermissionMode::Auto),
+        _ => None,
+    })
+}
+
+/// Returns (input, output, cache_creation, cache_read) USD per 1M tokens, and whether fallback.
+fn model_pricing(config: &kkagent_config::AppConfig, alias: &str) -> (f64, f64, f64, f64, bool) {
+    if let Some((model, _)) = config.resolve_model(alias) {
+        if let Some(p) = model.pricing.as_ref() {
+            return (
+                p.input_per_mtok.unwrap_or(0.50),
+                p.output_per_mtok.unwrap_or(2.00),
+                p.cache_creation_per_mtok.unwrap_or(0.50),
+                p.cache_read_per_mtok.unwrap_or(0.05),
+                p.input_per_mtok.is_none() && p.output_per_mtok.is_none(),
+            );
+        }
+    }
+    (0.50, 2.00, 0.50, 0.05, true)
+}
+
+fn estimate_usd(
+    u: &SessionUsageTotals,
+    in_price: f64,
+    out_price: f64,
+    cache_c: f64,
+    cache_r: f64,
+) -> f64 {
+    (u.input_tokens as f64) * in_price / 1_000_000.0
+        + (u.output_tokens as f64) * out_price / 1_000_000.0
+        + (u.cache_creation_tokens as f64) * cache_c / 1_000_000.0
+        + (u.cache_read_tokens as f64) * cache_r / 1_000_000.0
 }
 
 fn summarize_tool_input(input: &serde_json::Value) -> String {

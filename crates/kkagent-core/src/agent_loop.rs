@@ -1741,6 +1741,8 @@ Do not mention this reminder to the user.\n</system-reminder>"
                     text: question_text.to_string(),
                     options: options.clone(),
                     allow_free_text,
+                    allow_multiple,
+                    background,
                 },
             })
             .await;
@@ -2536,6 +2538,7 @@ mod retry_tests {
                 display_name: None,
                 support_efforts: Vec::new(),
                 default_effort: None,
+                            pricing: None,
             },
         );
         let config = Arc::new(config);
@@ -2640,6 +2643,7 @@ mod retry_tests {
                 display_name: None,
                 support_efforts: Vec::new(),
                 default_effort: None,
+                            pricing: None,
             },
         );
         let (event_tx, _) = mpsc::channel(512);
@@ -2725,6 +2729,7 @@ mod retry_tests {
                 display_name: None,
                 support_efforts: Vec::new(),
                 default_effort: None,
+                            pricing: None,
             },
         );
         let (event_tx, mut event_rx) = mpsc::channel(64);

@@ -1607,13 +1607,16 @@ fn format_context(state: &AppState, config: &AppConfig) -> String {
         .and_then(|a| config.resolve_model(a))
         .and_then(|(m, _)| m.max_context_size)
         .unwrap_or(256_000);
-    // 粗略估计：尚未接真实 usage 时用消息长度估算
-    let used = state
-        .messages
-        .iter()
-        .map(|m| m.content.len() as u64 / 4)
-        .sum::<u64>()
-        .saturating_add(state.approx_tokens);
+    // Prefer server-authoritative usage; fall back to char estimate only when empty.
+    let used = if state.approx_tokens > 0 {
+        state.approx_tokens
+    } else {
+        state
+            .messages
+            .iter()
+            .map(|m| m.content.len() as u64 / 4)
+            .sum::<u64>()
+    };
     let pct = used
         .saturating_mul(100)
         .checked_div(max)
@@ -2350,7 +2353,13 @@ fn render_question_panel(f: &mut Frame, area: Rect, question: &mut PendingQuesti
             Style::default().fg(theme.text_dim)
         };
         let marker = if selected { "> " } else { "  " };
-        let boxc = if checked { "[x]" } else { "[ ]" };
+        let boxc = if question.allow_multiple {
+            if checked { "[x]" } else { "[ ]" }
+        } else if checked || selected {
+            "(•)"
+        } else {
+            "( )"
+        };
         lines.push(Line::from(vec![
             Span::styled(marker, style),
             Span::styled(
@@ -2381,8 +2390,13 @@ fn render_question_panel(f: &mut Frame, area: Rect, question: &mut PendingQuesti
     }
 
     lines.push(Line::from(""));
+    let hint = if question.allow_multiple {
+        "  1-9 / space toggle · enter confirm · esc cancel"
+    } else {
+        "  1-9 submit · ↑↓ move · enter confirm · esc cancel"
+    };
     lines.push(Line::from(Span::styled(
-        "  1-9 / space toggle / enter confirm / esc cancel",
+        hint,
         Style::default().fg(theme.text_muted),
     )));
 

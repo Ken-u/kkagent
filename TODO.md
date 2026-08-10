@@ -148,9 +148,9 @@
 
 ### P0：Session 配置与服务端状态一致
 
-- [ ] model、thinking effort、permission mode、plan mode、工作目录、附加 workspace 和 compact 策略全部作为 session-scoped 状态保存、恢复并展示。
-- [ ] `session.resume` 返回的 `permission_mode` 必须应用到 TUI；消除 footer 显示值与服务端实际权限不一致的风险。
-- [ ] session-scoped 设置采用“服务端确认后提交”或可回滚的乐观更新；失败时恢复旧值并给出明确提示。
+- [x] model、thinking effort、permission mode、plan mode、工作目录、附加 workspace 和 compact 策略全部作为 session-scoped 状态保存、恢复并展示。
+- [x] `session.resume` 返回的 `permission_mode` 必须应用到 TUI；消除 footer 显示值与服务端实际权限不一致的风险。
+- [x] session-scoped 设置采用“服务端确认后提交”或可回滚的乐观更新；失败时恢复旧值并给出明确提示。
 - [ ] 配置被其他客户端修改时通过事件同步；TUI 不得在下一次操作时用本地旧值静默覆盖服务端状态。
 
 ### P0：中断、重连与执行恢复
@@ -163,7 +163,7 @@
 
 ### P0：上下文与 Compact 透明化
 
-- [ ] context meter 改用服务端权威 request-size / context-window 数据；不要把消息字符估算与已包含历史的 measured usage 相加，避免重复计算和百分比跳动。
+- [x] context meter 改用服务端权威 request-size / context-window 数据；不要把消息字符估算与已包含历史的 measured usage 相加，避免重复计算和百分比跳动。
 - [ ] context 使用量至少区分 system、conversation、tools、media / attachments、reserved output，并显示剩余空间；未知项明确标记为估算。
 - [ ] 在 70% 等预警阈值提示，在自动 compact 阈值前说明即将压缩；阈值从实际配置读取而不是写死在 TUI。
 - [ ] compact 过程中展示明确阶段，完成后显示压缩前后 token、保留的最近用户消息数量和丢弃 / 摘要范围。
@@ -184,12 +184,12 @@
 ### P1：通知与 `/usage`
 
 - [ ] 增加可配置通知：仅在窗口未聚焦或 session 不活跃时，对 turn 完成、失败、approval 和 question 使用终端 bell / 桌面通知；支持总开关、事件级开关和免打扰。
-- [ ] 将 `/usage` 从当前 `/status` 共用面板中拆成专用面板；成本和详细 token 信息只放 `/usage`，不常驻 footer。
-- [ ] `/usage` 展示当前 context 使用量，以及每个 turn 和当前 session 累计的 input、output、cache creation、cache read token 与耗时。
+- [x] 将 `/usage` 从当前 `/status` 共用面板中拆成专用面板；成本和详细 token 信息只放 `/usage`，不常驻 footer。
+- [x] `/usage` 展示当前 context 使用量，以及每个 turn 和当前 session 累计的 input、output、cache creation、cache read token 与耗时。
 - [ ] `/usage` 按当前 turn / session total 分层，并可展开最近 turn 明细；resume 后统计仍然连续，compact 前后的累计成本不能丢失或重复。
-- [ ] 在模型配置中支持可选的 input / output / cache pricing 元数据，`/usage` 优先按实际模型与 token 类型估算费用，并显示币种、价格来源 / 配置时间。
-- [ ] 模型未配置价格时使用内置的低价通用 fallback：input `$0.50 / 1M tokens`、output `$2.00 / 1M tokens`、cache creation `$0.50 / 1M tokens`、cache read `$0.05 / 1M tokens`；fallback 可通过全局配置覆盖。
-- [ ] 使用 fallback、混合模型或 usage 不完整时仍给出估算值，但必须标记 `generic estimate` / “通用估算”，并与供应商实际账单明确区分；混合模型按各 turn 实际模型分别计算后汇总。
+- [x] 在模型配置中支持可选的 input / output / cache pricing 元数据，`/usage` 优先按实际模型与 token 类型估算费用，并显示币种、价格来源 / 配置时间。
+- [x] 模型未配置价格时使用内置的低价通用 fallback：input `$0.50 / 1M tokens`、output `$2.00 / 1M tokens`、cache creation `$0.50 / 1M tokens`、cache read `$0.05 / 1M tokens`；fallback 可通过全局配置覆盖。
+- [x] 使用 fallback、混合模型或 usage 不完整时仍给出估算值，但必须标记 `generic estimate` / “通用估算”，并与供应商实际账单明确区分；混合模型按各 turn 实际模型分别计算后汇总。
 
 ### 验收与回归测试
 
@@ -223,12 +223,12 @@
 
 ### P0：AskUserQuestion
 
-- [ ] `QuestionPayload` 补充并传递 `allow_multiple` 与 `background`；TUI 不得把所有 option question 都当成多选，也不得把 background question 显示成阻塞弹窗。
-- [ ] 单选使用 `( )`，多选使用 `[ ]`；单选数字键可直接提交，多选数字键 / Space 只切换并由 Enter 确认，底部提示按类型动态显示。
-- [ ] background question 仅在 footer / session 标签显示一个 `question` 徽标，通过轻量列表进入回答；当前输入和 turn 不被抢占。
+- [x] `QuestionPayload` 补充并传递 `allow_multiple` 与 `background`；TUI 不得把所有 option question 都当成多选，也不得把 background question 显示成阻塞弹窗。
+- [x] 单选使用 `( )`，多选使用 `[ ]`；单选数字键可直接提交，多选数字键 / Space 只切换并由 Enter 确认，底部提示按类型动态显示。
+- [x] background question 仅在 footer / session 标签显示一个 `question` 徽标，通过轻量列表进入回答；当前输入和 turn 不被抢占。
 - [ ] free-text 回答复用正常输入编辑能力，支持光标、粘贴、undo 和多行；空回答在本地给出一行提示，不发送无效响应。
 - [ ] 问题或选项过长时正确换行并允许滚动，但面板默认只占必要高度；选项很多时显示可见窗口和当前位置，不扩大为全屏向导。
-- [ ] 回答提交期间显示简短 `sending…`；失败时恢复原问题、已选项和输入，成功后在 transcript 留一行 `Answered: …` 便于回看。
+- [x] 回答提交期间显示简短 `sending…`；失败时恢复原问题、已选项和输入，成功后在 transcript 留一行 `Answered: …` 便于回看。
 - [ ] 多个 question / approval 到达时使用第八节已有的 interaction 队列，逐个显示且不覆盖；切换 session 后仍按原 session id 回复。
 
 ### 验收与回归测试
@@ -313,7 +313,7 @@
 
 ### P0：配置诊断与错误恢复
 
-- [ ] 增加 CLI `kkagent doctor` 和 TUI `/doctor`，复用同一套只读检查：实际配置路径与解析、模型连接、密钥是否存在、MCP、Web / Wiki Provider、代理和基本网络；结果按 `ok / warning / failed` 一行展示。
+- [x] 增加 CLI `kkagent doctor` 和 TUI `/doctor`，复用同一套只读检查：实际配置路径与解析、模型连接、密钥是否存在、MCP、Web / Wiki Provider、代理和基本网络；结果按 `ok / warning / failed` 一行展示。
 - [ ] 每个 doctor 失败项只给出一个明确的下一步和可展开的详细诊断；输出可整体复制，但必须脱敏 API key、Authorization、cookie 和私有文档内容。
 - [ ] `/status` 按需显示当前实际读取的 `config.toml` 绝对路径、`--config` 覆盖、生效 profile 和是否需要重启；配置错误精确定位到字段与行列。
 - [ ] 统一用户可见错误格式为“发生了什么 + 现在能做什么”；堆栈、原始 RPC / HTTP 响应和 request id 默认折叠，提供复制诊断和安全的就地重试。
@@ -368,8 +368,8 @@
 ### P0：文件并发与变更安全
 
 - [ ] 跟踪每个 active session 读取 / 修改过的规范化文件路径；多个 session 即将写入同一文件时在执行前警告，展示涉及 session 和文件，可选继续、切换查看或为其中一个 session 建议独立 worktree。
-- [ ] `Read` 保存内容 hash / 版本标识，`Edit` / `Write` 落盘前重新校验；文件已被 IDE、格式化器或其他进程改动时安全失败并重新读取，不只依赖不可靠的 mtime、不静默覆盖。
-- [ ] 冲突提示默认只显示 `File changed externally: src/app.rs`，按需展开基线 / 当前 / 待应用差异；解决后必须基于新版本重新计算 edit。
+- [x] `Read` 保存内容 hash / 版本标识，`Edit` / `Write` 落盘前重新校验；文件已被 IDE、格式化器或其他进程改动时安全失败并重新读取，不只依赖不可靠的 mtime、不静默覆盖。
+- [x] 冲突提示默认只显示 `File changed externally: src/app.rs`，按需展开基线 / 当前 / 待应用差异；解决后必须基于新版本重新计算 edit。
 - [ ] `/changes` 与 checkpoint 使用 session 启动基线和实际 tool call id 归属变更；对无法精确归属的并发改动明确标记 `shared / unknown`，不猜测为 Agent 成果。
 
 ### P0：后台任务与测试结果
@@ -389,7 +389,7 @@
 
 - [ ] 从同一份 CLI 命令 / 参数定义生成 Bash、Zsh、Fish 和 PowerShell 补全，提供 `kkagent completions <shell>` 输出与简短安装说明，避免手写补全与 CLI 漂移。
 - [ ] 增加 `--no-alt-screen`，保留终端原生 scrollback 和可复制输出；与默认 alternate screen 使用同一渲染 / 输入状态，resize、中断和退出后不留损坏终端模式。
-- [ ] 支持将当前 / 完整 session 导出为 Markdown，默认保留回答、简化工具摘要和引用；导出前提示敏感内容并可选脱敏，不默认嵌入大型工具原始输出。
+- [x] 支持将当前 / 完整 session 导出为 Markdown，默认保留回答、简化工具摘要和引用；导出前提示敏感内容并可选脱敏，不默认嵌入大型工具原始输出。
 - [ ] 新版本检查可关闭且有缓存 / 频率上限，只在空闲状态显示一行版本与迁移摘要；不自动下载、不中断 session，离线 / 企业环境不反复报错。
 
 ### 验收与回归测试

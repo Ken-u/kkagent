@@ -94,7 +94,8 @@ pub fn run_init(
             display_name: None,
             support_efforts: Vec::new(),
             default_effort: None,
-        },
+                        pricing: None,
+            },
     );
     apply_preset(&mut config, preset)?;
     config.validate()?;

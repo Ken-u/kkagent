@@ -159,6 +159,11 @@ More lines remain — call Read again with offset={}.",
             );
         }
 
+        let content_hash = {
+            use sha2::{Digest, Sha256};
+            let digest = Sha256::digest(&bytes);
+            digest.iter().map(|b| format!("{b:02x}")).collect::<String>()
+        };
         let mut out = ToolOutput::success_with_data(
             result,
             json!({
@@ -166,6 +171,7 @@ More lines remain — call Read again with offset={}.",
                 "bytes": bytes.len(),
                 "startLine": if end > start { start + 1 } else { start },
                 "endLine": end,
+                "content_hash": content_hash,
             }),
         );
         if !note_parts.is_empty() {

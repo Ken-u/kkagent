@@ -22,7 +22,11 @@ Preserves original CRLF/LF line endings."
                 "path": {"type": "string", "description": "File path to edit"},
                 "old_string": {"type": "string", "description": "Exact text to replace"},
                 "new_string": {"type": "string", "description": "Replacement text"},
-                "replace_all": {"type": "boolean", "description": "Replace all occurrences (default: false)"}
+                "replace_all": {"type": "boolean", "description": "Replace all occurrences (default: false)"},
+                "expected_content_hash": {
+                    "type": "string",
+                    "description": "Optional SHA-256 hex of current file contents from a prior Read; fails safely if the file changed externally"
+                }
             },
             "required": ["path", "old_string", "new_string"]
         })
@@ -45,6 +49,11 @@ Preserves original CRLF/LF line endings."
             .get("replace_all")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        let expected_hash = input
+            .get("expected_content_hash")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
 
         if old_string == new_string {
             return Ok(ToolOutput::error("old_string and new_string are identical"));
@@ -66,6 +75,14 @@ Preserves original CRLF/LF line endings."
         let raw = tokio::fs::read(&path)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to read: {}", e))?;
+        if let Some(expected) = expected_hash {
+            let actual = content_sha256_hex(&raw);
+            if !actual.eq_ignore_ascii_case(expected) {
+                return Ok(ToolOutput::error(format!(
+                    "File changed externally: {path_str} (hash mismatch — re-read before editing)"
+                )));
+            }
+        }
         let content = String::from_utf8_lossy(&raw).into_owned();
         let crlf = detect_crlf(&content);
 
@@ -122,6 +139,12 @@ fn fuzzy_hint(haystack: &str, needle: &str) -> String {
         }
     }
     String::new()
+}
+
+fn content_sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(bytes);
+    digest.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 #[cfg(test)]

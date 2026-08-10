@@ -126,6 +126,21 @@ pub struct ModelConfig {
     pub support_efforts: Vec<String>,
     #[serde(default)]
     pub default_effort: Option<String>,
+    /// Optional USD pricing per 1M tokens for `/usage` estimates.
+    #[serde(default)]
+    pub pricing: Option<ModelPricing>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ModelPricing {
+    #[serde(default)]
+    pub input_per_mtok: Option<f64>,
+    #[serde(default)]
+    pub output_per_mtok: Option<f64>,
+    #[serde(default)]
+    pub cache_creation_per_mtok: Option<f64>,
+    #[serde(default)]
+    pub cache_read_per_mtok: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -572,6 +587,7 @@ mod tests {
                 display_name: None,
                 support_efforts: Vec::new(),
                 default_effort: None,
+                            pricing: None,
             },
         );
         config

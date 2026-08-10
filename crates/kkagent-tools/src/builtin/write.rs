@@ -20,7 +20,11 @@ impl Tool for WriteTool {
             "properties": {
                 "path": {"type": "string", "description": "File path to write"},
                 "content": {"type": "string", "description": "Content to write"},
-                "mode": {"type": "string", "enum": ["overwrite", "append"], "description": "Write mode (default: overwrite)"}
+                "mode": {"type": "string", "enum": ["overwrite", "append"], "description": "Write mode (default: overwrite)"},
+                "expected_content_hash": {
+                    "type": "string",
+                    "description": "Optional SHA-256 of existing file contents; fails if the file changed externally before overwrite"
+                }
             },
             "required": ["path", "content"]
         })
@@ -55,6 +59,27 @@ impl Tool for WriteTool {
 
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await?;
+        }
+
+        let expected_hash = input
+            .get("expected_content_hash")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        if let Some(expected) = expected_hash {
+            if path.exists() {
+                let existing = tokio::fs::read(&path).await?;
+                use sha2::{Digest, Sha256};
+                let actual: String = Sha256::digest(&existing)
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect();
+                if !actual.eq_ignore_ascii_case(expected) {
+                    return Ok(ToolOutput::error(format!(
+                        "File changed externally: {path_str} (hash mismatch — re-read before writing)"
+                    )));
+                }
+            }
         }
 
         let bytes = content.as_bytes();
