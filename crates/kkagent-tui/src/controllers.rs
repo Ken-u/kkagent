@@ -48,6 +48,7 @@ impl SessionEventRouter {
             }
             AgentEvent::TurnStart { session_id } => {
                 tabs.mark_dirty(session_id, true);
+                tabs.set_status(session_id, SessionStatus::Thinking);
                 if is_current {
                     self.turn_active = true;
                     status.status = SessionStatus::Thinking;
@@ -55,9 +56,9 @@ impl SessionEventRouter {
             }
             AgentEvent::TurnEnd { session_id, .. } => {
                 tabs.mark_dirty(session_id, false);
+                tabs.set_status(session_id, SessionStatus::Idle);
                 if is_current {
                     self.turn_active = false;
-                    tabs.mark_dirty(session_id, false);
                     status.status = SessionStatus::Idle;
                     self.status = SessionStatus::Idle;
                 }

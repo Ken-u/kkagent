@@ -50,23 +50,23 @@ pub fn render_ui(f: &mut Frame, state: &mut AppState, config: &AppConfig) {
     // Sticky todo sits above the input (highest visual priority).
     let todo_height = todo_panel_height(state);
 
-    // kimi 布局：tabs(可选) | 消息区 | todo(可选) | 带边框输入框 | footer 两行
-    let tab_height = if state.tab_strip.tabs.len() > 1 { 1 } else { 0 };
+    // kimi 布局：消息区 | todo(可选) | 带边框输入框 | footer 两行
+    // Top TabStrip removed — session switching lives in the footer strip.
     let input_inner = input_inner_height(state, size.width);
     let input_box = input_inner + 2; // borders
     let bottom_stack = todo_height + input_box + slash_height;
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(tab_height),
             Constraint::Min(1),
             Constraint::Length(bottom_stack),
             Constraint::Length(2),
         ])
         .split(size);
 
-    let msg_area = chunks[1];
-    let bottom = chunks[2];
+    let msg_area = chunks[0];
+    let bottom = chunks[1];
+    let footer_area = chunks[2];
     let bottom_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -80,9 +80,6 @@ pub fn render_ui(f: &mut Frame, state: &mut AppState, config: &AppConfig) {
     let slash_area = bottom_chunks[1];
     let input_area = bottom_chunks[2];
 
-    if tab_height > 0 {
-        chrome::draw_tab_strip(f, chunks[0], &state.tab_strip, &theme);
-    }
     // Keep status_bar in sync for chrome consumers / future status line.
     state.status_bar.permission = state.permission_mode;
     state.status_bar.plan_mode = state.plan_mode;
@@ -97,7 +94,7 @@ pub fn render_ui(f: &mut Frame, state: &mut AppState, config: &AppConfig) {
         render_todo_panel(f, todo_area, state, &theme);
     }
     render_input(f, input_area, state, &theme);
-    render_footer(f, chunks[3], state, config, &theme);
+    render_footer(f, footer_area, state, config, &theme);
 
     if state.btw.open {
         let pane_w = (size.width / 3).clamp(28, 56);
@@ -108,7 +105,7 @@ pub fn render_ui(f: &mut Frame, state: &mut AppState, config: &AppConfig) {
             .clamp(6, size.height.saturating_sub(4));
         let area = Rect {
             x: size.width.saturating_sub(pane_w + 1),
-            y: tab_height.saturating_add(1),
+            y: 1,
             width: pane_w,
             height: pane_h,
         };
@@ -1169,19 +1166,6 @@ fn render_footer(f: &mut Frame, area: Rect, state: &AppState, config: &AppConfig
         left.push(Span::raw("  "));
     }
 
-    // Live spinner when agent is busy
-    if matches!(
-        state.status,
-        SessionStatus::Thinking | SessionStatus::ToolExecuting | SessionStatus::WaitingApproval
-    ) {
-        let frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-        let ch = frames[(state.tick / 2) % frames.len()];
-        left.push(Span::styled(
-            format!("{ch} "),
-            Style::default().fg(theme.primary),
-        ));
-    }
-
     left.push(Span::styled(
         model_label(config),
         Style::default().fg(theme.text),
@@ -1253,21 +1237,34 @@ fn render_footer(f: &mut Frame, area: Rect, state: &AppState, config: &AppConfig
         ));
     }
 
-    // Line 2: workspace session strip (left) + context meter (right)
+    // Line 2: [spinner] workspace session strip (left) + context meter (right)
     let context = format_context(state, config);
     let ctx_w = UnicodeWidthStr::width(context.as_str());
     let gap = 2usize;
     let strip_budget = (area.width as usize)
         .saturating_sub(ctx_w)
         .saturating_sub(gap);
-    let session_spans = state.workspace_sessions.render_spans(strip_budget, theme);
-    let strip_text: String = session_spans.iter().map(|s| s.content.clone()).collect();
+    let session_busy = session_strip_has_busy(state);
+    let spinner_cols = if session_busy { 2 } else { 0 }; // "⠋ "
+    let session_spans = state
+        .workspace_sessions
+        .render_spans(strip_budget.saturating_sub(spinner_cols), theme);
+    let mut line2_spans: Vec<Span> = Vec::new();
+    if session_busy {
+        let frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+        let ch = frames[(state.tick / 2) % frames.len()];
+        line2_spans.push(Span::styled(
+            format!("{ch} "),
+            Style::default().fg(theme.primary),
+        ));
+    }
+    line2_spans.extend(session_spans);
+    let strip_text: String = line2_spans.iter().map(|s| s.content.clone()).collect();
     let strip_w = UnicodeWidthStr::width(strip_text.as_str());
     let pad2 = area
         .width
         .saturating_sub(strip_w as u16)
         .saturating_sub(ctx_w as u16);
-    let mut line2_spans = session_spans;
     if pad2 > 0 {
         line2_spans.push(Span::raw(" ".repeat(pad2 as usize)));
     }
@@ -1278,6 +1275,35 @@ fn render_footer(f: &mut Frame, area: Rect, state: &AppState, config: &AppConfig
         Paragraph::new(Text::from(vec![Line::from(line1_spans), line2])),
         area,
     );
+}
+
+fn session_status_is_busy(status: SessionStatus) -> bool {
+    matches!(
+        status,
+        SessionStatus::Thinking
+            | SessionStatus::ToolExecuting
+            | SessionStatus::WaitingApproval
+            | SessionStatus::WaitingQuestion
+            | SessionStatus::Compacting
+    )
+}
+
+/// True when the current session or any session in the footer strip is running.
+fn session_strip_has_busy(state: &AppState) -> bool {
+    if session_status_is_busy(state.status) {
+        return true;
+    }
+    for entry in &state.workspace_sessions.entries {
+        if state.session_id.as_deref() == Some(entry.id.as_str()) {
+            continue;
+        }
+        if let Some(tab) = state.tab_strip.tabs.iter().find(|t| t.id == entry.id) {
+            if session_status_is_busy(tab.status) || tab.dirty {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn render_scroll_hint(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {

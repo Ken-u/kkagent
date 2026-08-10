@@ -1083,16 +1083,15 @@ impl TuiApp {
             return Ok(());
         }
 
-        // Ctrl+C with a non-empty selection copies; otherwise keep interrupt / quit.
-        if matches!(key.code, KeyCode::Char('c'))
-            && key.modifiers.contains(KeyModifiers::CONTROL)
-            && self.copy_selection_or_msg()
-        {
+        // Platform copy shortcut with a non-empty selection copies; otherwise keep
+        // interrupt / quit. macOS uses Command+C, other platforms use Ctrl+C.
+        if crate::platform_keys::is_copy_shortcut(&key) && self.copy_selection_or_msg() {
             self.state.quit_confirm = false;
             return Ok(());
         }
 
-        // Busy turn with no overlay: Esc / Ctrl-C interrupt the agent.
+        // Busy turn with no overlay: Esc / Ctrl-C interrupt the agent (always Ctrl-C
+        // even on macOS so the key to stop a running turn is consistent).
         if !matches!(self.state.status, SessionStatus::Idle)
             && (matches!(key.code, KeyCode::Esc)
                 || (matches!(key.code, KeyCode::Char('c'))

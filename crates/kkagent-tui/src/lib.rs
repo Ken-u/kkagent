@@ -9,6 +9,7 @@ pub mod mouse_mode;
 pub mod panes;
 pub mod paste_placeholders;
 pub mod pi;
+pub mod platform_keys;
 pub mod reverse_rpc;
 pub mod search;
 pub mod selection;
