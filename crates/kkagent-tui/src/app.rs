@@ -4142,6 +4142,7 @@ end try"#;
     }
     #[cfg(target_os = "linux")]
     {
+        let _ = path;
         for (command, args) in [
             ("wl-paste", vec!["--no-newline", "--type", "image/png"]),
             (
