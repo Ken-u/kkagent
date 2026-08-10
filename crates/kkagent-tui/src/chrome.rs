@@ -48,6 +48,23 @@ impl TabStrip {
         self.active = self.tabs.len() - 1;
     }
 
+    /// Ensure a tab exists without changing the active selection.
+    pub fn ensure_tab(&mut self, id: &str, title: impl Into<String>) {
+        if let Some(t) = self.tabs.iter_mut().find(|t| t.id == id) {
+            let title = title.into();
+            if !title.is_empty() && title != "main" {
+                t.title = title;
+            }
+            return;
+        }
+        self.tabs.push(SessionTab {
+            id: id.to_string(),
+            title: title.into(),
+            dirty: false,
+            status: SessionStatus::Idle,
+        });
+    }
+
     pub fn set_status(&mut self, id: &str, status: SessionStatus) {
         if let Some(t) = self.tabs.iter_mut().find(|t| t.id == id) {
             t.status = status;

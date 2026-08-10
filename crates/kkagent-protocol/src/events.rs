@@ -119,6 +119,36 @@ pub enum AgentEvent {
     },
 }
 
+impl AgentEvent {
+    pub fn session_id(&self) -> &str {
+        match self {
+            Self::MessageDelta { session_id, .. }
+            | Self::ThinkingDelta { session_id, .. }
+            | Self::ToolCall { session_id, .. }
+            | Self::ToolResult { session_id, .. }
+            | Self::TurnStart { session_id, .. }
+            | Self::TurnEnd { session_id, .. }
+            | Self::StatusUpdate { session_id, .. }
+            | Self::UsageUpdate { session_id, .. }
+            | Self::ApprovalRequested { session_id, .. }
+            | Self::QuestionAsked { session_id, .. }
+            | Self::Error { session_id, .. }
+            | Self::PlanModeChanged { session_id, .. }
+            | Self::PlanFileUpdated { session_id, .. }
+            | Self::TodoUpdated { session_id, .. }
+            | Self::SubagentSpawned { session_id, .. }
+            | Self::SubagentStarted { session_id, .. }
+            | Self::SubagentCompleted { session_id, .. }
+            | Self::SubagentFailed { session_id, .. }
+            | Self::SubagentChildEvent { session_id, .. }
+            | Self::BtwDelta { session_id, .. }
+            | Self::BtwThinkingDelta { session_id, .. }
+            | Self::BtwEnd { session_id, .. }
+            | Self::McpAuthRequired { session_id, .. } => session_id,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TodoItemEvent {
     pub id: String,

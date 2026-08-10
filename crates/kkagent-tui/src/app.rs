@@ -62,8 +62,12 @@ pub struct AppState {
     pub message_line_starts: Vec<u16>,
     pub approx_tokens: u64,
     pub approval_pending: Option<PendingApproval>,
+    /// Approvals for sessions that are open in this window but not currently focused.
+    pub parked_approvals: std::collections::HashMap<String, PendingApproval>,
     /// AskUserQuestion panel
     pub question_pending: Option<PendingQuestion>,
+    /// Questions for background sessions in this window.
+    pub parked_questions: std::collections::HashMap<String, PendingQuestion>,
     /// `/` command autocomplete popup
     pub slash_menu: Option<SlashMenuState>,
     /// `@` file path autocomplete popup
@@ -100,6 +104,8 @@ pub struct AppState {
     pub status_bar: StatusBarModel,
     /// Workspace sessions for footer strip + empty-input Tab cycling.
     pub workspace_sessions: crate::chrome::WorkspaceSessionStrip,
+    /// Ephemeral Tab group for this TUI window (`/new` siblings). Not persisted.
+    pub open_session_group: Vec<String>,
     /// Preview pane while `/sessions` list is open.
     pub session_picker_preview: Option<SessionPickerPreview>,
     /// Pending delete confirmation inside `/sessions` (default = No).
@@ -414,7 +420,9 @@ impl AppState {
             message_line_starts: Vec::new(),
             approx_tokens: 0,
             approval_pending: None,
+            parked_approvals: std::collections::HashMap::new(),
             question_pending: None,
+            parked_questions: std::collections::HashMap::new(),
             slash_menu: None,
             file_menu: None,
             list_picker: None,
@@ -437,6 +445,7 @@ impl AppState {
                 ..Default::default()
             },
             workspace_sessions: crate::chrome::WorkspaceSessionStrip::default(),
+            open_session_group: Vec::new(),
             session_picker_preview: None,
             session_delete_confirm: None,
             event_router: SessionEventRouter::default(),
@@ -1458,7 +1467,7 @@ impl TuiApp {
             KeyCode::Enter if !key.modifiers.contains(KeyModifiers::SHIFT) => {
                 self.submit_input().await?;
             }
-            // Empty input Tab / ← →: cycle fork-family sessions (only when a family exists)
+            // Empty input Tab / ← →: cycle related sessions (/new or /fork group)
             KeyCode::Tab
                 if !key.modifiers.contains(KeyModifiers::CONTROL)
                     && !key.modifiers.contains(KeyModifiers::SHIFT)
@@ -2045,6 +2054,22 @@ impl TuiApp {
             .map(|id| id != query && !session_has_retained_io(&self.state.messages))
             .unwrap_or(false);
 
+        // Park interactive prompts for the session we leave so background turns can resume them.
+        if let Some(ref leaving) = leaving_id {
+            if leaving != query {
+                if let Some(approval) = self.state.approval_pending.take() {
+                    self.state
+                        .parked_approvals
+                        .insert(leaving.clone(), approval);
+                }
+                if let Some(question) = self.state.question_pending.take() {
+                    self.state
+                        .parked_questions
+                        .insert(leaving.clone(), question);
+                }
+            }
+        }
+
         let params = serde_json::json!({"session_id": query});
         let data = self
             .client
@@ -2064,6 +2089,14 @@ impl TuiApp {
         self.state.thinking_text.clear();
         self.state.scroll_up = 0;
         self.state.follow_bottom = true;
+        self.state.status = SessionStatus::Idle;
+        self.state.approval_pending = self.state.parked_approvals.remove(&sid);
+        self.state.question_pending = self.state.parked_questions.remove(&sid);
+        if self.state.approval_pending.is_some() {
+            self.state.status = SessionStatus::WaitingApproval;
+        } else if self.state.question_pending.is_some() {
+            self.state.status = SessionStatus::WaitingQuestion;
+        }
 
         if let Some(msgs) = data.get("messages").and_then(|v| v.as_array()) {
             self.state.messages = transcript_messages_to_display(msgs);
@@ -2103,8 +2136,19 @@ impl TuiApp {
             if let Some(prev) = leaving_id {
                 if prev != sid {
                     let _ = self.discard_session_record(&prev).await;
+                    self.state.open_session_group.retain(|id| id != &prev);
                 }
             }
+        }
+
+        // Cold resume of an unrelated session: drop ephemeral window group.
+        if !self
+            .state
+            .open_session_group
+            .iter()
+            .any(|id| id == &sid)
+        {
+            self.state.open_session_group.clear();
         }
 
         self.system_message(format!(
@@ -2157,7 +2201,8 @@ impl TuiApp {
                     continue;
                 }
                 let empty = s.get("empty").and_then(|v| v.as_bool()).unwrap_or(false);
-                if empty && id != current_id {
+                let in_group = self.state.open_session_group.iter().any(|g| g == &id);
+                if empty && id != current_id && !in_group {
                     continue;
                 }
                 let forked_from = s
@@ -2217,18 +2262,48 @@ impl TuiApp {
             .map(|(id, parent, _)| (id.clone(), parent.clone()))
             .collect();
         let family_ids = crate::chrome::fork_family_ids(&parent_rows, &current_id);
-        let entries: Vec<crate::chrome::WorkspaceSessionEntry> = if family_ids.is_empty() {
+
+        // Ephemeral window group (`/new` siblings) — not persisted across process restarts.
+        self.state.open_session_group.retain(|id| {
+            id == &current_id || rows.iter().any(|(rid, _, _)| rid == id)
+        });
+        let mut ids: Vec<String> = if family_ids.is_empty() {
             Vec::new()
         } else {
             family_ids
-                .into_iter()
+        };
+        if self
+            .state
+            .open_session_group
+            .iter()
+            .any(|id| id == &current_id)
+            && self.state.open_session_group.len() >= 2
+        {
+            for id in &self.state.open_session_group {
+                if !ids.contains(id) {
+                    ids.push(id.clone());
+                }
+            }
+        }
+
+        let entries: Vec<crate::chrome::WorkspaceSessionEntry> = if ids.len() < 2 {
+            Vec::new()
+        } else {
+            ids.into_iter()
                 .filter_map(|id| {
-                    rows.iter()
-                        .find(|(rid, _, _)| rid == &id)
-                        .map(|(_, _, title)| crate::chrome::WorkspaceSessionEntry {
+                    if let Some((_, _, title)) = rows.iter().find(|(rid, _, _)| rid == &id) {
+                        Some(crate::chrome::WorkspaceSessionEntry {
                             id,
                             title: title.clone(),
                         })
+                    } else if id == current_id {
+                        Some(crate::chrome::WorkspaceSessionEntry {
+                            id,
+                            title: "session".into(),
+                        })
+                    } else {
+                        None
+                    }
                 })
                 .collect()
         };
@@ -2238,9 +2313,7 @@ impl TuiApp {
             .set_entries(entries, Some(current_id.as_str()));
 
         for e in &self.state.workspace_sessions.entries {
-            if self.state.tab_strip.tabs.iter().any(|t| t.id == e.id) {
-                self.state.tab_strip.ensure_active(&e.id, e.title.clone());
-            }
+            self.state.tab_strip.ensure_tab(&e.id, e.title.clone());
         }
         let title = self
             .state
@@ -2257,6 +2330,14 @@ impl TuiApp {
             .unwrap_or_else(|| "main".into());
         self.state.tab_strip.ensure_active(&current_id, title);
         Ok(())
+    }
+
+    fn link_open_sessions(&mut self, a: &str, b: &str) {
+        for id in [a, b] {
+            if !self.state.open_session_group.iter().any(|x| x == id) {
+                self.state.open_session_group.push(id.to_string());
+            }
+        }
     }
 
     fn can_cycle_fork_sessions(&self) -> bool {
@@ -2559,32 +2640,69 @@ impl TuiApp {
             }
             "new" | "clear" => {
                 let prev = self.state.session_id.clone();
+                let prev_busy = matches!(
+                    self.state.status,
+                    SessionStatus::Thinking
+                        | SessionStatus::ToolExecuting
+                        | SessionStatus::WaitingApproval
+                        | SessionStatus::WaitingQuestion
+                );
                 let prev_empty = !self.current_session_has_io();
+                // Keep the previous turn running in the background — do not interrupt.
+                if let Some(ref leaving) = prev {
+                    if let Some(approval) = self.state.approval_pending.take() {
+                        self.state
+                            .parked_approvals
+                            .insert(leaving.clone(), approval);
+                    }
+                    if let Some(question) = self.state.question_pending.take() {
+                        self.state
+                            .parked_questions
+                            .insert(leaving.clone(), question);
+                    }
+                }
                 self.state.messages.clear();
                 self.state.todos.clear();
                 self.state.todos_expanded = false;
                 self.state.thinking_text.clear();
                 self.state.plan_document = None;
                 self.state.plan_scroll_to_top = false;
+                self.state.status = SessionStatus::Idle;
+                self.state.turn_started_at = None;
                 let cwd = std::env::current_dir()?.to_string_lossy().to_string();
                 let session_id = self
                     .client
                     .create_session(Some(&cwd), Some(self.state.permission_mode))
                     .await?;
-                self.state.tab_strip.ensure_active(&session_id, "main");
-                self.state.status_bar.session_id = Some(session_id.clone());
-                self.state.session_id = Some(session_id.clone());
                 if self.state.plan_mode {
                     let _ = self.client.set_plan_mode(&session_id, true).await;
                 }
-                if prev_empty {
-                    if let Some(prev) = prev {
-                        if prev != session_id {
-                            let _ = self.discard_session_record(&prev).await;
+                let keep_prev = prev
+                    .as_ref()
+                    .is_some_and(|p| p != &session_id && (prev_busy || !prev_empty));
+                if keep_prev {
+                    if let Some(ref p) = prev {
+                        self.link_open_sessions(p, &session_id);
+                        self.state.tab_strip.ensure_tab(p, "background");
+                    }
+                    self.state.tab_strip.ensure_active(&session_id, "new");
+                    self.system_message(
+                        "New session started. Previous session keeps running — Tab / ←→ to switch."
+                            .into(),
+                    );
+                } else {
+                    if prev_empty {
+                        if let Some(prev) = prev {
+                            if prev != session_id {
+                                let _ = self.discard_session_record(&prev).await;
+                            }
                         }
                     }
+                    self.state.tab_strip.ensure_active(&session_id, "main");
+                    self.system_message("New session started.".into());
                 }
-                self.system_message("New session started.".into());
+                self.state.status_bar.session_id = Some(session_id.clone());
+                self.state.session_id = Some(session_id);
                 let _ = self.refresh_workspace_sessions().await;
             }
             "sessions" | "resume" => {
@@ -2949,7 +3067,12 @@ impl TuiApp {
                             let fork_id = data
                                 .get("session_id")
                                 .and_then(|v| v.as_str())
-                                .unwrap_or("?");
+                                .unwrap_or("?")
+                                .to_string();
+                            if fork_id != "?" {
+                                self.link_open_sessions(&sid, &fork_id);
+                                self.state.tab_strip.ensure_tab(&fork_id, "fork");
+                            }
                             self.system_message(format!(
                                 "Session forked ({fork_id}). Still in the original session; switch to the fork via Tab or /sessions."
                             ));
@@ -3265,11 +3388,63 @@ impl TuiApp {
     fn handle_server_event(&mut self, frame: Frame) {
         if let Frame::Event { event: _, data, .. } = frame {
             if let Ok(evt) = serde_json::from_value::<AgentEvent>(data) {
+                let evt_sid = evt.session_id().to_string();
+                let is_current = self.state.session_id.as_deref() == Some(evt_sid.as_str());
                 self.state.event_router.on_event(
                     &evt,
                     &mut self.state.tab_strip,
                     &mut self.state.status_bar,
+                    self.state.session_id.as_deref(),
                 );
+
+                if !is_current {
+                    match evt {
+                        AgentEvent::ApprovalRequested { request, .. } => {
+                            let pending = pending_approval_from_request(&request);
+                            self.state.parked_approvals.insert(evt_sid.clone(), pending);
+                            self.state.tab_strip.mark_dirty(&evt_sid, true);
+                            self.state.tab_strip.ensure_tab(&evt_sid, "needs approval");
+                            self.system_message(format!(
+                                "Background session {} needs approval — Tab / ←→ to switch.",
+                                &evt_sid[..8.min(evt_sid.len())]
+                            ));
+                        }
+                        AgentEvent::QuestionAsked { question, .. } => {
+                            let options: Vec<(String, String)> = question
+                                .options
+                                .into_iter()
+                                .map(|o| (o.id, o.label))
+                                .collect();
+                            let toggled = vec![false; options.len()];
+                            self.state.parked_questions.insert(
+                                evt_sid.clone(),
+                                PendingQuestion {
+                                    question_id: question.question_id,
+                                    text: question.text,
+                                    options,
+                                    allow_free_text: question.allow_free_text,
+                                    selected: 0,
+                                    toggled,
+                                    free_text: String::new(),
+                                },
+                            );
+                            self.state.tab_strip.mark_dirty(&evt_sid, true);
+                            self.system_message(format!(
+                                "Background session {} asked a question — Tab / ←→ to switch.",
+                                &evt_sid[..8.min(evt_sid.len())]
+                            ));
+                        }
+                        AgentEvent::Error { message, .. } if message != "Interrupted" => {
+                            self.system_message(format!(
+                                "Background session {}: {message}",
+                                &evt_sid[..8.min(evt_sid.len())]
+                            ));
+                        }
+                        _ => {}
+                    }
+                    return;
+                }
+
                 match evt {
                     AgentEvent::MessageDelta { text, .. } => {
                         let pending_thinking = if !self.state.thinking_text.is_empty() {
@@ -3353,55 +3528,29 @@ impl TuiApp {
                         self.state.status = status;
                     }
                     AgentEvent::ApprovalRequested { request, .. } => {
-                        let display = request.tool_input_display.clone().unwrap_or(serde_json::Value::Null);
                         let is_plan_review = request.tool_name == "ExitPlanMode"
-                            || display
-                                .get("kind")
-                                .and_then(|v| v.as_str())
-                                == Some("plan_review");
-                        let choices = if is_plan_review {
-                            // Ensure the full plan is focused while reviewing.
-                            if let Some(plan) = display.get("plan").and_then(|v| v.as_str()) {
-                                let path = display
-                                    .get("path")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("")
-                                    .to_string();
-                                if !plan.trim().is_empty() {
-                                    self.state.apply_plan_document(path, plan.to_string());
-                                }
-                            }
-                            PendingApproval::plan_review_choices(&display)
-                        } else {
-                            PendingApproval::default_tool_choices()
-                        };
-                        let detail = if is_plan_review {
-                            String::new()
-                        } else {
-                            request
+                            || request
                                 .tool_input_display
                                 .as_ref()
-                                .map(|v| {
-                                    serde_json::to_string_pretty(v)
-                                        .unwrap_or_else(|_| v.to_string())
-                                })
-                                .unwrap_or_default()
-                        };
-                        self.state.approval_pending = Some(PendingApproval {
-                            approval_id: request.approval_id,
-                            tool_name: request.tool_name.clone(),
-                            action: if is_plan_review {
-                                "按此计划开始执行？".into()
-                            } else {
-                                request.action
-                            },
-                            detail,
-                            selected: 0,
-                            choices,
-                            is_plan_review,
-                            feedback_mode: false,
-                            feedback: String::new(),
-                        });
+                                .and_then(|d| d.get("kind"))
+                                .and_then(|v| v.as_str())
+                                == Some("plan_review");
+                        if is_plan_review {
+                            if let Some(display) = request.tool_input_display.as_ref() {
+                                if let Some(plan) = display.get("plan").and_then(|v| v.as_str()) {
+                                    let path = display
+                                        .get("path")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("")
+                                        .to_string();
+                                    if !plan.trim().is_empty() {
+                                        self.state.apply_plan_document(path, plan.to_string());
+                                    }
+                                }
+                            }
+                        }
+                        self.state.approval_pending =
+                            Some(pending_approval_from_request(&request));
                         self.state.status = SessionStatus::WaitingApproval;
                     }
                     AgentEvent::QuestionAsked { question, .. } => {
@@ -3615,6 +3764,46 @@ fn summarize_tool_input(input: &serde_json::Value) -> String {
         .collect()
 }
 
+fn pending_approval_from_request(
+    request: &kkagent_protocol::ApprovalRequest,
+) -> PendingApproval {
+    let display = request
+        .tool_input_display
+        .clone()
+        .unwrap_or(serde_json::Value::Null);
+    let is_plan_review = request.tool_name == "ExitPlanMode"
+        || display.get("kind").and_then(|v| v.as_str()) == Some("plan_review");
+    let choices = if is_plan_review {
+        PendingApproval::plan_review_choices(&display)
+    } else {
+        PendingApproval::default_tool_choices()
+    };
+    let detail = if is_plan_review {
+        String::new()
+    } else {
+        request
+            .tool_input_display
+            .as_ref()
+            .map(|v| serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string()))
+            .unwrap_or_default()
+    };
+    PendingApproval {
+        approval_id: request.approval_id.clone(),
+        tool_name: request.tool_name.clone(),
+        action: if is_plan_review {
+            "按此计划开始执行？".into()
+        } else {
+            request.action.clone()
+        },
+        detail,
+        selected: 0,
+        choices,
+        is_plan_review,
+        feedback_mode: false,
+        feedback: String::new(),
+    }
+}
+
 fn split_plan_message_content(content: &str) -> (String, String) {
     let mut body = content;
     let mut path = String::new();
@@ -3631,11 +3820,11 @@ fn slash_help_text() -> String {
     let mut s = String::from(
         "Keyboard shortcuts:\n\
   Enter         - Submit / confirm slash\n\
-  Tab / ← →    - Empty input: cycle fork-family sessions\n\
+  Tab / ← →    - Empty input: cycle related sessions (/new or /fork)\n\
   Shift-Tab     - Toggle plan mode (scroll locks to full plan until exit)\n\
   ↑↓            - Input history / slash menu\n\
   PgUp/PgDn     - Scroll transcript\n\
-  Mouse wheel   - Scroll transcript (quick flick snaps to this turn; in plan mode locks to plan)\n\
+  Mouse wheel   - Scroll transcript\n\
   Click + drag  - Select/copy (releases mouse; next key restores scroll)\n\
   Esc           - Close menu/overlay only; if none, interrupt turn / Esc Esc undo\n\
   !             - Shell mode\n\

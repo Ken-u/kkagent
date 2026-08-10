@@ -23,40 +23,60 @@ impl Default for SessionEventRouter {
 }
 
 impl SessionEventRouter {
-    pub fn on_event(&mut self, ev: &AgentEvent, tabs: &mut TabStrip, status: &mut StatusBarModel) {
+    pub fn on_event(
+        &mut self,
+        ev: &AgentEvent,
+        tabs: &mut TabStrip,
+        status: &mut StatusBarModel,
+        current_session_id: Option<&str>,
+    ) {
+        let sid = ev.session_id();
+        let is_current = current_session_id == Some(sid);
         match ev {
             AgentEvent::StatusUpdate {
                 session_id,
                 status: s,
             } => {
-                self.status = *s;
-                status.status = *s;
                 tabs.set_status(session_id, *s);
-                if matches!(s, SessionStatus::Idle | SessionStatus::Compacting) {
-                    self.turn_active = false;
+                if is_current {
+                    self.status = *s;
+                    status.status = *s;
+                    if matches!(s, SessionStatus::Idle | SessionStatus::Compacting) {
+                        self.turn_active = false;
+                    }
                 }
             }
             AgentEvent::TurnStart { session_id } => {
-                self.turn_active = true;
                 tabs.mark_dirty(session_id, true);
-                status.status = SessionStatus::Thinking;
+                if is_current {
+                    self.turn_active = true;
+                    status.status = SessionStatus::Thinking;
+                }
             }
             AgentEvent::TurnEnd { session_id, .. } => {
-                self.turn_active = false;
                 tabs.mark_dirty(session_id, false);
-                status.status = SessionStatus::Idle;
-                self.status = SessionStatus::Idle;
+                if is_current {
+                    self.turn_active = false;
+                    tabs.mark_dirty(session_id, false);
+                    status.status = SessionStatus::Idle;
+                    self.status = SessionStatus::Idle;
+                }
             }
             AgentEvent::Error { message, .. } => {
-                self.last_error = Some(message.clone());
+                if is_current {
+                    self.last_error = Some(message.clone());
+                }
             }
             AgentEvent::UsageUpdate { usage, .. } => {
-                status.tokens = status
-                    .tokens
-                    .saturating_add(usage.input_tokens.saturating_add(usage.output_tokens));
-                if usage.cache_read_input_tokens > 0 {
-                    let total = usage.input_tokens.max(1);
-                    status.cache_hit = Some(usage.cache_read_input_tokens as f32 / total as f32);
+                if is_current {
+                    status.tokens = status
+                        .tokens
+                        .saturating_add(usage.input_tokens.saturating_add(usage.output_tokens));
+                    if usage.cache_read_input_tokens > 0 {
+                        let total = usage.input_tokens.max(1);
+                        status.cache_hit =
+                            Some(usage.cache_read_input_tokens as f32 / total as f32);
+                    }
                 }
             }
             _ => {}

@@ -84,7 +84,7 @@ pub const BUILTIN_SLASH_COMMANDS: &[SlashCommand] = &[
     SlashCommand {
         name: "new",
         aliases: &["clear"],
-        description: "Start a fresh session in the current workspace",
+        description: "Start a fresh session (keeps previous running; Tab to switch)",
         priority: 80,
         argument_hint: None,
     },

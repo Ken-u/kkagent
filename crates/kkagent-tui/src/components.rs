@@ -24,7 +24,7 @@ const TIPS: &[&str] = &[
     "@ opens file picker — tab to insert a path",
     "ctrl+f searches the transcript",
     "ctrl+o expands turn tool history",
-    "tab / ←→ cycle fork sessions when input is empty",
+    "tab / ←→ cycle related sessions when input is empty",
     "ctrl+g toggles /btw side Q&A",
     "shift-tab toggles plan mode (scroll locks to plan)",
     "! enters shell mode",
