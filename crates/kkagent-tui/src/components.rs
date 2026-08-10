@@ -173,7 +173,7 @@ fn picker_height(picker: &ListPickerState, state: &AppState) -> u16 {
     } else {
         (picker.items.len() as u16).min(max_visible)
     };
-    let mut h = rows + 2;
+    let h = rows + 2;
     // Delete confirm replaces the list with a small choice panel.
     if picker.kind == crate::app::ListPickerKind::Session && state.session_delete_confirm.is_some()
     {
