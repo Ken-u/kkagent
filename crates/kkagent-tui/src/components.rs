@@ -1274,7 +1274,9 @@ fn render_footer(f: &mut Frame, area: Rect, state: &AppState, config: &AppConfig
         left.push(Span::styled(label, Style::default().fg(theme.accent)));
     }
 
-    let tip = if state.quit_confirm {
+    let tip = if let Some(ref activity) = state.status_bar.activity {
+        activity.clone()
+    } else if state.quit_confirm {
         "press ctrl-c again to quit".to_string()
     } else if state.search.active {
         "↑↓ navigate · enter jump · esc close".to_string()
@@ -1296,6 +1298,8 @@ fn render_footer(f: &mut Frame, area: Rect, state: &AppState, config: &AppConfig
             tip,
             Style::default().fg(if state.quit_confirm {
                 theme.warning
+            } else if state.status_bar.activity.is_some() {
+                theme.primary
             } else {
                 theme.text_muted
             }),

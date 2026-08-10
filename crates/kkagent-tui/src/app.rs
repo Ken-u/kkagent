@@ -30,12 +30,8 @@ pub struct TuiApp {
     client: KkagentClient,
     state: AppState,
     mouse_mode: MouseMode,
+    jobs: crate::async_jobs::AsyncJobHub,
 }
-
-type StartupMetadata = (
-    anyhow::Result<serde_json::Value>,
-    anyhow::Result<serde_json::Value>,
-);
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum AppMode {
@@ -129,6 +125,8 @@ pub struct AppState {
     pub session_picker_preview: Option<SessionPickerPreview>,
     /// Pending delete confirmation inside `/sessions` (default = No).
     pub session_delete_confirm: Option<SessionDeleteConfirm>,
+    /// In-flight non-blocking session switch context (last selection wins).
+    pub resume_switch: Option<ResumeSwitchCtx>,
     /// Session event router (controllers).
     pub event_router: SessionEventRouter,
     /// Ctrl-F transcript search overlay.
@@ -216,6 +214,13 @@ pub struct SessionDeleteConfirm {
     pub label: String,
     /// 0 = No (default), 1 = Yes
     pub selected: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResumeSwitchCtx {
+    pub target: String,
+    pub leaving_id: Option<String>,
+    pub leaving_empty: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -500,6 +505,7 @@ impl AppState {
             open_session_group: Vec::new(),
             session_picker_preview: None,
             session_delete_confirm: None,
+            resume_switch: None,
             event_router: SessionEventRouter::default(),
             search: SearchState::default(),
             last_tool_name: None,
@@ -726,6 +732,7 @@ impl TuiApp {
             client,
             state: AppState::new(permission_mode, plan_mode),
             mouse_mode: MouseMode::from_env(),
+            jobs: crate::async_jobs::AsyncJobHub::new(),
         }
     }
 
@@ -775,18 +782,38 @@ impl TuiApp {
             }
         }
 
-        // Skills and session history are useful, but neither is required for the
-        // first interactive frame. Fetch both on a request-only client so slow
-        // disks or large catalogs never hold the alternate screen hostage.
+        // Skills / sessions / MCP status are useful, but none are required for the
+        // first interactive frame. Fetch on a request-only client so slow disks
+        // or MCP handshakes never hold the alternate screen hostage.
         let requester = self.client.requester();
-        let startup_metadata = tokio::spawn(async move {
-            let skills_fut = requester.rpc_call("skills.list", None);
-            let sessions_fut = requester.rpc_call(
-                "sessions.list",
-                Some(serde_json::json!({"limit": 80, "include_archived": false})),
+        self.jobs.spawn_rpc(
+            requester.clone(),
+            crate::async_jobs::JobChannel::SkillsList,
+            "skills.list",
+            None,
+            Some("Loading skills".into()),
+            true,
+        );
+        self.jobs.spawn_rpc(
+            requester.clone(),
+            crate::async_jobs::JobChannel::SessionsList,
+            "sessions.list",
+            Some(serde_json::json!({"limit": 80, "include_archived": false})),
+            Some("Loading sessions".into()),
+            true,
+        );
+        if !self.config.mcp_servers.is_empty() {
+            self.jobs.mcp.configured = true;
+            self.jobs.mcp.total = self.config.mcp_servers.len();
+            self.jobs.spawn_rpc(
+                requester,
+                crate::async_jobs::JobChannel::McpStatus,
+                "mcp.status",
+                None,
+                Some("Connecting MCP".into()),
+                true,
             );
-            tokio::join!(skills_fut, sessions_fut)
-        });
+        }
 
         enable_raw_mode().map_err(|e| {
             anyhow::anyhow!(
@@ -821,7 +848,7 @@ impl TuiApp {
             }
         };
 
-        let result = self.main_loop(&mut terminal, Some(startup_metadata)).await;
+        let result = self.main_loop(&mut terminal).await;
         let sid = self.state.session_id.clone();
         let empty = !session_has_retained_io(&self.state.messages);
 
@@ -858,24 +885,17 @@ impl TuiApp {
     async fn main_loop(
         &mut self,
         terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-        mut startup_metadata: Option<tokio::task::JoinHandle<StartupMetadata>>,
     ) -> anyhow::Result<()> {
         loop {
+            self.jobs.refresh_busy_notices();
+            // Expose async notice / MCP status to the renderer via status_bar activity.
+            self.state.status_bar.activity = self.jobs.active_notice_text();
+
             terminal.draw(|f| {
                 components::render_ui(f, &mut self.state, &self.config);
             })?;
 
-            if startup_metadata
-                .as_ref()
-                .is_some_and(tokio::task::JoinHandle::is_finished)
-            {
-                if let Some(task) = startup_metadata.take() {
-                    if let Ok((skills_res, sessions_res)) = task.await {
-                        self.apply_skills_list(skills_res.ok());
-                        self.apply_workspace_sessions_list(sessions_res.ok());
-                    }
-                }
-            }
+            self.drain_job_results();
 
             // Drain the full event queue each frame so trackpad bursts stay in-app
             // (one-event-per-poll left a backlog that felt like lag / terminal scroll).
@@ -928,8 +948,15 @@ impl TuiApp {
             }
 
             self.state.tick = self.state.tick.wrapping_add(1);
+            // Periodic background refresh — never await on the UI loop.
             if self.state.tick.is_multiple_of(100) {
-                let _ = self.refresh_workspace_sessions().await;
+                self.enqueue_workspace_sessions_refresh();
+            }
+            if self.state.tick.is_multiple_of(20)
+                && self.jobs.mcp.configured
+                && !self.jobs.mcp.initialized
+            {
+                self.enqueue_mcp_status_poll();
             }
             if matches!(
                 self.state.status,
@@ -942,10 +969,236 @@ impl TuiApp {
                 break;
             }
         }
-        if let Some(task) = startup_metadata {
-            task.abort();
-        }
         Ok(())
+    }
+
+    fn enqueue_workspace_sessions_refresh(&mut self) {
+        if self
+            .jobs
+            .pending
+            .contains_key(&crate::async_jobs::JobChannel::SessionsList)
+        {
+            return;
+        }
+        self.jobs.spawn_rpc(
+            self.client.requester(),
+            crate::async_jobs::JobChannel::SessionsList,
+            "sessions.list",
+            Some(serde_json::json!({"limit": 80, "include_archived": false})),
+            Some("Refreshing sessions".into()),
+            true,
+        );
+    }
+
+    fn enqueue_mcp_status_poll(&mut self) {
+        if self
+            .jobs
+            .pending
+            .contains_key(&crate::async_jobs::JobChannel::McpStatus)
+        {
+            return;
+        }
+        self.jobs.spawn_rpc(
+            self.client.requester(),
+            crate::async_jobs::JobChannel::McpStatus,
+            "mcp.status",
+            None,
+            Some("Connecting MCP".into()),
+            true,
+        );
+    }
+
+    fn drain_job_results(&mut self) {
+        while let Some(outcome) = self.jobs.try_recv() {
+            if !self.jobs.is_current(outcome.channel, outcome.generation) {
+                continue;
+            }
+            let channel = outcome.channel;
+            let generation = outcome.generation;
+            match outcome.payload {
+                crate::async_jobs::JobPayload::Rpc { method, result } => {
+                    self.jobs.mark_done(channel, generation);
+                    match result {
+                        Ok(data) => self.apply_rpc_job_ok(channel, &method, data),
+                        Err(err) => self.apply_rpc_job_err(channel, generation, &method, err),
+                    }
+                }
+                crate::async_jobs::JobPayload::SessionPreview { session_id, result } => {
+                    self.jobs.mark_done(channel, generation);
+                    match result {
+                        Ok(data) => self.apply_session_preview_data(&session_id, data),
+                        Err(err) => {
+                            self.jobs.push_error(
+                                Some(channel),
+                                Some(generation),
+                                format!("Preview failed: {err}"),
+                                true,
+                                0,
+                            );
+                        }
+                    }
+                }
+                crate::async_jobs::JobPayload::SessionResume { query, result } => {
+                    self.jobs.mark_done(channel, generation);
+                    match result {
+                        Ok(data) => {
+                            if let Err(e) = self.apply_session_resume_data(&query, data) {
+                                self.jobs.push_error(
+                                    Some(channel),
+                                    Some(generation),
+                                    format!("Resume failed: {e}"),
+                                    true,
+                                    0,
+                                );
+                            }
+                        }
+                        Err(err) => {
+                            self.jobs.push_error(
+                                Some(channel),
+                                Some(generation),
+                                format!("Resume failed: {err}"),
+                                true,
+                                0,
+                            );
+                        }
+                    }
+                }
+                crate::async_jobs::JobPayload::Prompt { session_id, result } => {
+                    self.jobs.mark_done(channel, generation);
+                    match result {
+                        Ok(()) => {
+                            self.jobs.mcp.waiting_for_prompt =
+                                self.jobs.mcp.configured && !self.jobs.mcp.initialized;
+                            // Refresh strip titles without blocking.
+                            self.enqueue_workspace_sessions_refresh();
+                            let _ = session_id;
+                        }
+                        Err(err) => {
+                            self.state.status = SessionStatus::Idle;
+                            self.jobs.mcp.waiting_for_prompt = false;
+                            self.jobs.push_error(
+                                Some(channel),
+                                Some(generation),
+                                format!("Send failed: {err}"),
+                                true,
+                                0,
+                            );
+                            self.system_message(format!("Error: {err}"));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn apply_rpc_job_ok(
+        &mut self,
+        channel: crate::async_jobs::JobChannel,
+        method: &str,
+        data: serde_json::Value,
+    ) {
+        match channel {
+            crate::async_jobs::JobChannel::SessionsList => {
+                if method == "sessions.list"
+                    && self
+                        .state
+                        .list_picker
+                        .as_ref()
+                        .is_some_and(|p| p.kind == ListPickerKind::Session)
+                {
+                    self.apply_session_picker_list(data);
+                } else {
+                    self.apply_workspace_sessions_list(Some(data));
+                }
+            }
+            crate::async_jobs::JobChannel::SkillsList => {
+                self.apply_skills_list(Some(data));
+            }
+            crate::async_jobs::JobChannel::McpStatus | crate::async_jobs::JobChannel::McpList => {
+                self.jobs.apply_mcp_status(&data);
+                if channel == crate::async_jobs::JobChannel::McpList {
+                    // Manager open path may still want the picker rebuilt — handled by callers.
+                }
+            }
+            crate::async_jobs::JobChannel::TasksList => {
+                self.apply_tasks_list_data(data);
+            }
+            _ => {}
+        }
+    }
+
+    fn apply_rpc_job_err(
+        &mut self,
+        channel: crate::async_jobs::JobChannel,
+        generation: u64,
+        method: &str,
+        err: String,
+    ) {
+        // Background session refresh failures are soft — show retryable notice.
+        let retryable = matches!(
+            channel,
+            crate::async_jobs::JobChannel::SessionsList
+                | crate::async_jobs::JobChannel::McpStatus
+                | crate::async_jobs::JobChannel::SkillsList
+                | crate::async_jobs::JobChannel::TasksList
+                | crate::async_jobs::JobChannel::SessionPreview
+                | crate::async_jobs::JobChannel::SessionResume
+                | crate::async_jobs::JobChannel::Prompt
+        );
+        self.jobs.push_error(
+            Some(channel),
+            Some(generation),
+            format!("{method} failed: {err}"),
+            retryable,
+            0,
+        );
+        // Auto-backoff retry for list/status polls only.
+        if matches!(
+            channel,
+            crate::async_jobs::JobChannel::SessionsList
+                | crate::async_jobs::JobChannel::McpStatus
+                | crate::async_jobs::JobChannel::SkillsList
+        ) && self.jobs.can_auto_retry(0)
+        {
+            // Leave the error visible; user can press `r`, and the next periodic
+            // poll will also retry after the pending slot clears.
+        }
+    }
+
+    fn apply_tasks_list_data(&mut self, data: serde_json::Value) {
+        let mut tasks = Vec::new();
+        if let Some(arr) = data.get("tasks").and_then(|v| v.as_array()) {
+            for t in arr {
+                tasks.push(TaskInfo {
+                    task_id: t
+                        .get("task_id")
+                        .or_else(|| t.get("id"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    description: t
+                        .get("description")
+                        .or_else(|| t.get("command"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    status: t
+                        .get("status")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown")
+                        .to_string(),
+                    result: t
+                        .get("result")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string()),
+                    error: t
+                        .get("error")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string()),
+                });
+            }
+        }
+        self.state.tasks_panel = Some(TasksPanelState { tasks, selected: 0 });
     }
 
     /// Close the topmost transient UI (menus / pickers / search / btw / shell).
@@ -1231,7 +1484,43 @@ impl TuiApp {
             }
             self.state.pending_esc_ms = None;
             self.state.quit_confirm = false;
+            self.jobs.mcp.waiting_for_prompt = false;
             return Ok(());
+        }
+
+        // Retry the latest failed background RPC when the composer is empty.
+        if matches!(key.code, KeyCode::Char('r') | KeyCode::Char('R'))
+            && self.state.input.is_empty()
+            && self.state.list_picker.is_none()
+            && self.state.tasks_panel.is_none()
+            && self.state.slash_menu.is_none()
+            && self.state.file_menu.is_none()
+            && self.state.approval_pending.is_none()
+            && self.state.question_pending.is_none()
+        {
+            if let Some((channel, _gen, method, params, retry_count)) =
+                self.jobs.take_retryable_error()
+            {
+                if self.jobs.can_auto_retry(retry_count) {
+                    self.jobs.spawn_rpc(
+                        self.client.requester(),
+                        channel,
+                        method,
+                        params,
+                        Some(format!("Retrying {}", channel.label())),
+                        true,
+                    );
+                } else {
+                    self.jobs.push_error(
+                        Some(channel),
+                        None,
+                        format!("{}: retry limit reached", channel.label()),
+                        false,
+                        retry_count,
+                    );
+                }
+                return Ok(());
+            }
         }
 
         // Transcript search overlay (Ctrl-F)
@@ -1414,7 +1703,7 @@ impl TuiApp {
                         .map(|p| p.kind == ListPickerKind::Session)
                         .unwrap_or(false)
                     {
-                        self.refresh_session_picker_preview().await?;
+                        self.refresh_session_picker_preview();
                     }
                     return Ok(());
                 }
@@ -1431,7 +1720,7 @@ impl TuiApp {
                         .map(|p| p.kind == ListPickerKind::Session)
                         .unwrap_or(false)
                     {
-                        self.refresh_session_picker_preview().await?;
+                        self.refresh_session_picker_preview();
                     }
                     return Ok(());
                 }
@@ -3167,103 +3456,120 @@ impl TuiApp {
     }
 
     async fn open_session_picker(&mut self) -> anyhow::Result<()> {
+        // Open a placeholder immediately; list fills when the background job returns.
+        if !self
+            .state
+            .list_picker
+            .as_ref()
+            .is_some_and(|p| p.kind == ListPickerKind::Session)
+        {
+            self.replace_list_picker(ListPickerState {
+                kind: ListPickerKind::Session,
+                title: " Sessions (this workspace)  ↑↓  Enter open  Ctrl-D delete ".into(),
+                items: Vec::new(),
+                selected: 0,
+            });
+        }
+        self.state.session_delete_confirm = None;
+        self.jobs.spawn_rpc(
+            self.client.requester(),
+            crate::async_jobs::JobChannel::SessionsList,
+            "sessions.list",
+            Some(serde_json::json!({"limit": 80})),
+            Some("Loading sessions".into()),
+            true,
+        );
+        Ok(())
+    }
+
+    fn apply_session_picker_list(&mut self, data: serde_json::Value) {
         let cwd = std::env::current_dir()
             .ok()
             .and_then(|p| std::fs::canonicalize(&p).ok())
             .unwrap_or_else(|| std::path::PathBuf::from("."));
         let cwd_key = cwd.to_string_lossy().to_string();
-        let params = serde_json::json!({"limit": 80});
-        match self.client.rpc_call("sessions.list", Some(params)).await {
-            Ok(data) => {
-                let mut items = Vec::new();
-                let current = self.state.session_id.clone();
-                if let Some(sessions) = data.get("sessions").and_then(|v| v.as_array()) {
-                    for s in sessions {
-                        let id = s
-                            .get("session_id")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        if id.is_empty() {
-                            continue;
-                        }
-                        let work = s.get("working_dir").and_then(|v| v.as_str()).unwrap_or("");
-                        let same_workspace = if work.is_empty() {
-                            false
-                        } else {
-                            std::fs::canonicalize(work)
-                                .map(|p| p.to_string_lossy() == cwd_key)
-                                .unwrap_or_else(|_| {
-                                    std::path::Path::new(work) == cwd
-                                        || work == cwd_key
-                                        || work == "."
-                                })
-                        };
-                        if !same_workspace {
-                            continue;
-                        }
-                        let empty = s.get("empty").and_then(|v| v.as_bool()).unwrap_or_else(|| {
-                            s.get("message_count").and_then(|v| v.as_u64()).unwrap_or(0) == 0
-                                && s.get("last_prompt")
-                                    .and_then(|v| v.as_str())
-                                    .map(|p| {
-                                        p.trim().is_empty()
-                                            || kkagent_protocol::is_harness_only_user_text(p)
-                                    })
-                                    .unwrap_or(true)
-                        });
-                        // Keep empty sessions only while they are the active page.
-                        if empty && current.as_deref() != Some(id.as_str()) {
-                            continue;
-                        }
-                        let title = crate::chrome::session_display_title(
-                            s.get("title").and_then(|v| v.as_str()),
-                            s.get("is_custom_title")
-                                .and_then(|v| v.as_bool())
-                                .unwrap_or(false),
-                            s.get("last_prompt").and_then(|v| v.as_str()),
-                            &id,
-                        );
-                        let short = &id[..8.min(id.len())];
-                        let fork = s
-                            .get("forked_from")
-                            .and_then(|v| v.as_str())
-                            .map(|p| format!("fork←{}", &p[..8.min(p.len())]))
-                            .unwrap_or_else(|| "session".into());
-                        let mark = if current.as_deref() == Some(id.as_str()) {
-                            "·current"
-                        } else {
-                            ""
-                        };
-                        items.push(ListPickerItem {
-                            id: id.clone(),
-                            label: format!("{short} — {title}"),
-                            detail: format!("{fork}{mark}"),
-                        });
-                    }
+        let mut items = Vec::new();
+        let current = self.state.session_id.clone();
+        if let Some(sessions) = data.get("sessions").and_then(|v| v.as_array()) {
+            for s in sessions {
+                let id = s
+                    .get("session_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if id.is_empty() {
+                    continue;
                 }
-                if items.is_empty() {
-                    self.state.list_picker = None;
-                    self.state.session_picker_preview = None;
-                    self.system_message("No sessions in this workspace.".into());
+                let work = s.get("working_dir").and_then(|v| v.as_str()).unwrap_or("");
+                let same_workspace = if work.is_empty() {
+                    false
                 } else {
-                    let selected = current
-                        .as_ref()
-                        .and_then(|c| items.iter().position(|i| &i.id == c))
-                        .unwrap_or(0);
-                    self.replace_list_picker(ListPickerState {
-                        kind: ListPickerKind::Session,
-                        title: " Sessions (this workspace)  ↑↓  Enter open  Ctrl-D delete ".into(),
-                        items,
-                        selected,
-                    });
-                    self.state.session_delete_confirm = None;
-                    self.refresh_session_picker_preview().await?;
+                    std::fs::canonicalize(work)
+                        .map(|p| p.to_string_lossy() == cwd_key)
+                        .unwrap_or_else(|_| {
+                            std::path::Path::new(work) == cwd || work == cwd_key || work == "."
+                        })
+                };
+                if !same_workspace {
+                    continue;
                 }
+                let empty = s.get("empty").and_then(|v| v.as_bool()).unwrap_or_else(|| {
+                    s.get("message_count").and_then(|v| v.as_u64()).unwrap_or(0) == 0
+                        && s.get("last_prompt")
+                            .and_then(|v| v.as_str())
+                            .map(|p| {
+                                p.trim().is_empty()
+                                    || kkagent_protocol::is_harness_only_user_text(p)
+                            })
+                            .unwrap_or(true)
+                });
+                if empty && current.as_deref() != Some(id.as_str()) {
+                    continue;
+                }
+                let title = crate::chrome::session_display_title(
+                    s.get("title").and_then(|v| v.as_str()),
+                    s.get("is_custom_title")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false),
+                    s.get("last_prompt").and_then(|v| v.as_str()),
+                    &id,
+                );
+                let short = &id[..8.min(id.len())];
+                let fork = s
+                    .get("forked_from")
+                    .and_then(|v| v.as_str())
+                    .map(|p| format!("fork←{}", &p[..8.min(p.len())]))
+                    .unwrap_or_else(|| "session".into());
+                let mark = if current.as_deref() == Some(id.as_str()) {
+                    "·current"
+                } else {
+                    ""
+                };
+                items.push(ListPickerItem {
+                    id: id.clone(),
+                    label: format!("{short} — {title}"),
+                    detail: format!("{fork}{mark}"),
+                });
             }
-            Err(e) => self.system_message(format!("Failed to list sessions: {}", e)),
         }
-        Ok(())
+        if items.is_empty() {
+            self.state.list_picker = None;
+            self.state.session_picker_preview = None;
+            self.system_message("No sessions in this workspace.".into());
+            return;
+        }
+        let selected = current
+            .as_ref()
+            .and_then(|c| items.iter().position(|i| &i.id == c))
+            .unwrap_or(0);
+        self.replace_list_picker(ListPickerState {
+            kind: ListPickerKind::Session,
+            title: " Sessions (this workspace)  ↑↓  Enter open  Ctrl-D delete ".into(),
+            items,
+            selected,
+        });
+        self.state.session_delete_confirm = None;
+        self.refresh_session_picker_preview();
     }
 
     async fn resume_session(&mut self, query: &str) -> anyhow::Result<()> {
@@ -3289,12 +3595,28 @@ impl TuiApp {
             }
         }
 
-        let params = serde_json::json!({"session_id": query});
-        let data = self
-            .client
-            .rpc_call("session.resume", Some(params))
-            .await
-            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        self.state.resume_switch = Some(ResumeSwitchCtx {
+            target: query.to_string(),
+            leaving_id,
+            leaving_empty,
+        });
+        // Keep showing the current transcript until the target loads.
+        self.jobs
+            .spawn_session_resume(self.client.requester(), query.to_string());
+        Ok(())
+    }
+
+    fn apply_session_resume_data(
+        &mut self,
+        query: &str,
+        data: serde_json::Value,
+    ) -> anyhow::Result<()> {
+        let ctx = match self.state.resume_switch.as_ref() {
+            Some(c) if c.target == query => self.state.resume_switch.take(),
+            _ => None,
+        };
+        let leaving_id = ctx.as_ref().and_then(|c| c.leaving_id.clone());
+        let leaving_empty = ctx.as_ref().map(|c| c.leaving_empty).unwrap_or(false);
 
         let sid = data
             .get("session_id")
@@ -3323,14 +3645,12 @@ impl TuiApp {
 
         if let Some(model) = data.get("model").and_then(|v| v.as_str()) {
             if !model.is_empty() {
-                // Session-scoped: do not rewrite global config.default_model.
                 self.state.model_alias = Some(model.to_string());
             }
         }
         if let Some(plan) = data.get("plan_mode").and_then(|v| v.as_bool()) {
             self.state.on_plan_mode_changed(plan);
         }
-        // Restore plan document from transcript so plan-focus scroll works after resume.
         if let Some(plan_msg) = self
             .state
             .messages
@@ -3351,24 +3671,30 @@ impl TuiApp {
             }
         }
 
-        // Drop the session we left if it never had any real I/O.
         if leaving_empty {
             if let Some(prev) = leaving_id {
                 if prev != sid {
-                    let _ = self.discard_session_record(&prev).await;
+                    let requester = self.client.requester();
+                    let prev_id = prev.clone();
+                    tokio::spawn(async move {
+                        let params = serde_json::json!({"session_id": prev_id});
+                        let _ = requester.rpc_call("sessions.delete", Some(params)).await;
+                    });
+                    self.state.tab_strip.tabs.retain(|t| t.id != prev);
                     self.state.open_session_group.retain(|id| id != &prev);
                 }
             }
         }
 
-        // Cold resume of an unrelated session: drop ephemeral window group.
         if !self.state.open_session_group.iter().any(|id| id == &sid) {
             self.state.open_session_group.clear();
         }
 
-        // Show the transcript as a normal chat view — no "Resumed session…" banner.
         self.state.status_bar.session_id = Some(sid.clone());
-        let _ = self.refresh_workspace_sessions().await;
+        self.state.tab_strip.ensure_active(&sid, "session");
+        self.state.list_picker = None;
+        self.state.session_picker_preview = None;
+        self.enqueue_workspace_sessions_refresh();
         Ok(())
     }
 
@@ -3388,17 +3714,7 @@ impl TuiApp {
     }
 
     async fn refresh_workspace_sessions(&mut self) -> anyhow::Result<()> {
-        let Some(_current_id) = self.state.session_id.clone() else {
-            self.state.workspace_sessions.set_entries(Vec::new(), None);
-            return Ok(());
-        };
-        let params = serde_json::json!({"limit": 80, "include_archived": false});
-        let data = self
-            .client
-            .rpc_call("sessions.list", Some(params))
-            .await
-            .ok();
-        self.apply_workspace_sessions_list(data);
+        self.enqueue_workspace_sessions_refresh();
         Ok(())
     }
 
@@ -3633,18 +3949,18 @@ impl TuiApp {
         self.resume_session(&next_id).await
     }
 
-    async fn refresh_session_picker_preview(&mut self) -> anyhow::Result<()> {
+    fn refresh_session_picker_preview(&mut self) {
         let Some(picker) = self.state.list_picker.as_ref() else {
             self.state.session_picker_preview = None;
-            return Ok(());
+            return;
         };
         if picker.kind != ListPickerKind::Session {
             self.state.session_picker_preview = None;
-            return Ok(());
+            return;
         }
         let Some(item) = picker.items.get(picker.selected) else {
             self.state.session_picker_preview = None;
-            return Ok(());
+            return;
         };
         let sid = item.id.clone();
 
@@ -3656,72 +3972,79 @@ impl TuiApp {
             });
             self.state.follow_bottom = true;
             self.state.scroll_up = 0;
-            return Ok(());
+            return;
         }
 
-        let params = serde_json::json!({"session_id": sid, "limit": 80});
-        match self.client.rpc_call("session.preview", Some(params)).await {
-            Ok(data) => {
-                let mut messages = Vec::new();
-                if let Some(msgs) = data.get("messages").and_then(|v| v.as_array()) {
-                    for m in msgs {
-                        let role = m.get("role").and_then(|v| v.as_str()).unwrap_or("");
-                        let text = m.get("text").and_then(|v| v.as_str()).unwrap_or("");
-                        if text.trim().is_empty() {
-                            continue;
-                        }
-                        let role = match role {
-                            "user" => MessageRole::User,
-                            "assistant" => MessageRole::Assistant,
-                            "system" => MessageRole::System,
-                            _ => continue,
-                        };
-                        let content = if role == MessageRole::User {
-                            if kkagent_protocol::is_harness_only_user_text(text) {
-                                continue;
-                            }
-                            let visible = kkagent_protocol::visible_user_text(text);
-                            if visible.is_empty() {
-                                text.to_string()
-                            } else {
-                                visible
-                            }
-                        } else {
-                            text.to_string()
-                        };
-                        if content.trim().is_empty() {
-                            continue;
-                        }
-                        messages.push(DisplayMessage {
-                            role,
-                            content,
-                            thinking: None,
-                            parts: Vec::new(),
-                            tool_calls: Vec::new(),
-                        });
-                    }
+        // Clear stale preview immediately so the previous session's content
+        // never flashes under a newly highlighted row.
+        self.state.session_picker_preview = Some(SessionPickerPreview {
+            session_id: sid.clone(),
+            messages: vec![DisplayMessage {
+                role: MessageRole::System,
+                content: "Loading preview…".into(),
+                thinking: None,
+                parts: Vec::new(),
+                tool_calls: Vec::new(),
+            }],
+        });
+        self.jobs
+            .spawn_session_preview(self.client.requester(), sid);
+    }
+
+    fn apply_session_preview_data(&mut self, session_id: &str, data: serde_json::Value) {
+        // Ignore if the user has already moved the highlight.
+        let still_selected = self.state.list_picker.as_ref().is_some_and(|p| {
+            p.kind == ListPickerKind::Session
+                && p.items.get(p.selected).is_some_and(|i| i.id == session_id)
+        });
+        if !still_selected {
+            return;
+        }
+        let mut messages = Vec::new();
+        if let Some(msgs) = data.get("messages").and_then(|v| v.as_array()) {
+            for m in msgs {
+                let role = m.get("role").and_then(|v| v.as_str()).unwrap_or("");
+                let text = m.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                if text.trim().is_empty() {
+                    continue;
                 }
-                self.state.session_picker_preview = Some(SessionPickerPreview {
-                    session_id: sid,
-                    messages,
-                });
-                self.state.follow_bottom = true;
-                self.state.scroll_up = 0;
-            }
-            Err(e) => {
-                self.state.session_picker_preview = Some(SessionPickerPreview {
-                    session_id: sid,
-                    messages: vec![DisplayMessage {
-                        role: MessageRole::System,
-                        content: format!("Failed to load session history: {e}"),
-                        thinking: None,
-                        parts: Vec::new(),
-                        tool_calls: Vec::new(),
-                    }],
+                let role = match role {
+                    "user" => MessageRole::User,
+                    "assistant" => MessageRole::Assistant,
+                    "system" => MessageRole::System,
+                    _ => continue,
+                };
+                let content = if role == MessageRole::User {
+                    if kkagent_protocol::is_harness_only_user_text(text) {
+                        continue;
+                    }
+                    let visible = kkagent_protocol::visible_user_text(text);
+                    if visible.is_empty() {
+                        text.to_string()
+                    } else {
+                        visible
+                    }
+                } else {
+                    text.to_string()
+                };
+                if content.trim().is_empty() {
+                    continue;
+                }
+                messages.push(DisplayMessage {
+                    role,
+                    content,
+                    thinking: None,
+                    parts: Vec::new(),
+                    tool_calls: Vec::new(),
                 });
             }
         }
-        Ok(())
+        self.state.session_picker_preview = Some(SessionPickerPreview {
+            session_id: session_id.to_string(),
+            messages,
+        });
+        self.state.follow_bottom = true;
+        self.state.scroll_up = 0;
     }
 
     async fn confirm_delete_session(&mut self, yes: bool) -> anyhow::Result<()> {
@@ -3836,15 +4159,14 @@ impl TuiApp {
         self.state.scroll_up = 0;
         self.state.follow_bottom = true;
 
-        // Send to server — show errors in UI instead of crashing the TUI
-        if let Some(sid) = &self.state.session_id {
-            if let Err(e) = self.client.send_prompt(sid, &prompt_text).await {
-                self.state.status = SessionStatus::Idle;
-                self.system_message(format!("Error: {}", e));
-            } else {
-                // Update footer title from first/latest prompt.
-                let _ = self.refresh_workspace_sessions().await;
+        // Send to server — never block the UI loop on the prompt RPC.
+        if let Some(sid) = self.state.session_id.clone() {
+            if self.jobs.mcp.configured && !self.jobs.mcp.initialized {
+                self.jobs.mcp.waiting_for_prompt = true;
+                self.enqueue_mcp_status_poll();
             }
+            self.jobs
+                .spawn_prompt(self.client.requester(), sid, prompt_text, Vec::new());
         } else {
             self.state.status = SessionStatus::Idle;
             self.system_message("No active session.".into());
@@ -4654,7 +4976,16 @@ impl TuiApp {
     }
 
     fn handle_server_event(&mut self, frame: Frame) {
-        if let Frame::Event { event: _, data, .. } = frame {
+        if let Frame::Event {
+            event: event_name,
+            data,
+            ..
+        } = frame
+        {
+            if event_name == "mcp.status" {
+                self.jobs.apply_mcp_status(&data);
+                return;
+            }
             if let Ok(evt) = serde_json::from_value::<AgentEvent>(data) {
                 let evt_sid = evt.session_id().to_string();
                 let is_current = self.state.session_id.as_deref() == Some(evt_sid.as_str());
@@ -4917,6 +5248,7 @@ impl TuiApp {
                         self.state.thinking_text.clear();
                         self.state.turn_started_at = Some(std::time::Instant::now());
                         self.state.tokens_at_turn_start = self.state.approx_tokens;
+                        self.jobs.mcp.waiting_for_prompt = false;
                     }
                     AgentEvent::SubagentSpawned {
                         subagent_id,

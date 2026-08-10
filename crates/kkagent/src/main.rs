@@ -2257,6 +2257,7 @@ async fn build_server_state(config: Arc<AppConfig>) -> Result<Arc<ServerState>> 
     // MCP startup can involve subprocess launches, remote handshakes, or OAuth.
     // Begin it immediately, but do not keep the TUI's first frame waiting for it.
     // Agent turns synchronize on McpManager::wait_until_initialized below.
+    // TUI discovers readiness via `mcp.status` polling / turn-time mcp.status events.
     if mcp_servers_configured {
         let task = tokio::spawn(async move {
             match mcp_connect.connect_all().await {
@@ -2521,6 +2522,9 @@ async fn persist_disabled_extensions(state: &ServerState) -> Result<(), String> 
 }
 
 /// Shared turn spawn used by `session.prompt` and `skills.activate`.
+///
+/// Returns immediately after scheduling the turn. MCP discovery (which can take
+/// seconds) runs inside the turn task so the RPC / TUI main loop stay responsive.
 async fn spawn_session_agent_turn(
     state: Arc<ServerState>,
     session_id: String,
@@ -2594,8 +2598,6 @@ async fn spawn_session_agent_turn(
         return Err((-32000, format!("Model '{model_alias}' not found")));
     }
 
-    let tools = build_turn_tool_registry(&state, agent_event_tx.clone()).await;
-
     let permission_rules = state
         .config
         .permission
@@ -2614,24 +2616,89 @@ async fn spawn_session_agent_turn(
                 .ok_or_else(|| (-32602, format!("Session not found: {session_id}")))?
         }
     };
-    let permission = PermissionChain::with_shared_mode(shared_mode, permission_rules);
-
-    let agent_loop = Arc::new(
-        AgentLoop::new(
-            state.config.clone(),
-            Arc::new(tools),
-            Arc::new(Mutex::new(permission)),
-            agent_event_tx.clone(),
-            state.abort_registry.clone(),
-        )
-        .with_hooks(state.hooks.clone())
-        .with_goal_manager(state.goal_mgr.clone()),
-    );
 
     let state_clone = state.clone();
     let sid = session_id.clone();
+    let rpc_progress = rpc_event_tx.clone();
     tokio::spawn(async move {
         let _turn_permit = turn_permit;
+
+        // Surface MCP wait to the TUI without blocking the prompt RPC.
+        if !state_clone.mcp.is_initialized() && state_clone.mcp.configured_count() > 0 {
+            let _ = agent_event_tx
+                .send(AgentEvent::StatusUpdate {
+                    session_id: sid.clone(),
+                    status: SessionStatus::Thinking,
+                })
+                .await;
+            let snap = state_clone.mcp.status_snapshot().await;
+            let _ = rpc_progress
+                .send(Frame::Event {
+                    event: "mcp.status".into(),
+                    scope: None,
+                    data: mcp_status_json(&snap),
+                })
+                .await;
+
+            let cancel = {
+                let flags = state_clone.interrupt_flags.lock().await;
+                flags.get(&sid).cloned()
+            };
+            let ready = if let Some(flag) = cancel {
+                state_clone
+                    .mcp
+                    .wait_until_initialized_or_cancel(flag.as_ref())
+                    .await
+            } else {
+                state_clone.mcp.wait_until_initialized().await;
+                true
+            };
+
+            if !ready {
+                let _ = agent_event_tx
+                    .send(AgentEvent::Error {
+                        session_id: sid.clone(),
+                        message: "Interrupted while waiting for MCP".into(),
+                    })
+                    .await;
+                let _ = agent_event_tx
+                    .send(AgentEvent::StatusUpdate {
+                        session_id: sid.clone(),
+                        status: SessionStatus::Idle,
+                    })
+                    .await;
+                let _ = agent_event_tx
+                    .send(AgentEvent::TurnEnd {
+                        session_id: sid.clone(),
+                    })
+                    .await;
+                return;
+            }
+
+            let snap = state_clone.mcp.status_snapshot().await;
+            let _ = rpc_progress
+                .send(Frame::Event {
+                    event: "mcp.status".into(),
+                    scope: None,
+                    data: mcp_status_json(&snap),
+                })
+                .await;
+        }
+
+        let tools = build_turn_tool_registry(&state_clone, agent_event_tx.clone()).await;
+        let permission = PermissionChain::with_shared_mode(shared_mode, permission_rules);
+        let agent_loop = Arc::new(
+            AgentLoop::new(
+                state_clone.config.clone(),
+                Arc::new(tools),
+                Arc::new(Mutex::new(permission)),
+                agent_event_tx.clone(),
+                state_clone.abort_registry.clone(),
+            )
+            .with_hooks(state_clone.hooks.clone())
+            .with_goal_manager(state_clone.goal_mgr.clone()),
+        );
+
         let mut session = {
             let mut sessions = state_clone.sessions.lock().await;
             match sessions.remove(&sid) {
@@ -2642,6 +2709,28 @@ async fn spawn_session_agent_turn(
                 }
             }
         };
+
+        if session.is_interrupted() {
+            let _ = agent_event_tx
+                .send(AgentEvent::Error {
+                    session_id: sid.clone(),
+                    message: "Interrupted".into(),
+                })
+                .await;
+            let _ = agent_event_tx
+                .send(AgentEvent::StatusUpdate {
+                    session_id: sid.clone(),
+                    status: SessionStatus::Idle,
+                })
+                .await;
+            let _ = agent_event_tx
+                .send(AgentEvent::TurnEnd {
+                    session_id: sid.clone(),
+                })
+                .await;
+            state_clone.sessions.lock().await.insert(sid, session);
+            return;
+        }
 
         if let Err(e) = agent_loop.run_turn(&mut session).await {
             tracing::error!("Agent loop error: {}", e);
@@ -2668,6 +2757,23 @@ async fn spawn_session_agent_turn(
     });
 
     Ok(())
+}
+
+fn mcp_status_json(snap: &kkagent_mcp::McpStatusSnapshot) -> serde_json::Value {
+    serde_json::json!({
+        "configured": snap.configured,
+        "initialized": snap.initialized,
+        "connected": snap.connected,
+        "enabled": snap.enabled,
+        "total": snap.total,
+        "tool_count": snap.tool_count,
+        "servers": snap.servers.iter().map(|s| serde_json::json!({
+            "name": s.name,
+            "enabled": s.enabled,
+            "connected": s.connected,
+            "transport": s.transport,
+        })).collect::<Vec<_>>(),
+    })
 }
 
 fn resolve_session_id(db: &TranscriptDb, query: &str) -> Option<String> {
@@ -3822,17 +3928,12 @@ async fn handle_rpc_call(
             }))
         }
         "mcp.list" => {
-            let servers = state.mcp.list_server_status().await;
-            let tool_count = state.mcp.list_tools().await.len();
-            Ok(serde_json::json!({
-                "servers": servers.iter().map(|s| serde_json::json!({
-                    "name": s.name,
-                    "enabled": s.enabled,
-                    "connected": s.connected,
-                    "transport": s.transport,
-                })).collect::<Vec<_>>(),
-                "tool_count": tool_count,
-            }))
+            let snap = state.mcp.status_snapshot().await;
+            Ok(mcp_status_json(&snap))
+        }
+        "mcp.status" => {
+            let snap = state.mcp.status_snapshot().await;
+            Ok(mcp_status_json(&snap))
         }
         "mcp.set_enabled" => {
             let name = params

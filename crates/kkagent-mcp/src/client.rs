@@ -75,6 +75,17 @@ pub struct McpServerStatus {
     pub transport: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct McpStatusSnapshot {
+    pub configured: bool,
+    pub initialized: bool,
+    pub connected: usize,
+    pub enabled: usize,
+    pub total: usize,
+    pub tool_count: usize,
+    pub servers: Vec<McpServerStatus>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct McpCallOutput {
     pub text: String,
@@ -115,6 +126,14 @@ impl McpManager {
         }
     }
 
+    pub fn is_initialized(&self) -> bool {
+        *self.initialized.borrow()
+    }
+
+    pub fn configured_count(&self) -> usize {
+        self.configs.len()
+    }
+
     pub async fn wait_until_initialized(&self) {
         let mut initialized = self.initialized.subscribe();
         while !*initialized.borrow_and_update() {
@@ -124,8 +143,52 @@ impl McpManager {
         }
     }
 
+    /// Wait for MCP discovery, returning early when `cancel` becomes true.
+    /// Returns `Ok(true)` when ready, `Ok(false)` when cancelled.
+    pub async fn wait_until_initialized_or_cancel(
+        &self,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> bool {
+        if self.is_initialized() {
+            return true;
+        }
+        let mut initialized = self.initialized.subscribe();
+        loop {
+            if cancel.load(std::sync::atomic::Ordering::SeqCst) {
+                return false;
+            }
+            if *initialized.borrow_and_update() {
+                return true;
+            }
+            tokio::select! {
+                changed = initialized.changed() => {
+                    if changed.is_err() {
+                        return self.is_initialized();
+                    }
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
+            }
+        }
+    }
+
     fn mark_initialized(&self) {
         self.initialized.send_replace(true);
+    }
+
+    pub async fn status_snapshot(&self) -> McpStatusSnapshot {
+        let servers = self.list_server_status().await;
+        let connected = servers.iter().filter(|s| s.enabled && s.connected).count();
+        let enabled = servers.iter().filter(|s| s.enabled).count();
+        let tool_count = self.list_tools().await.len();
+        McpStatusSnapshot {
+            configured: !self.configs.is_empty(),
+            initialized: self.is_initialized(),
+            connected,
+            enabled,
+            total: self.configs.len(),
+            tool_count,
+            servers,
+        }
     }
 
     pub async fn set_disabled_names(&self, names: impl IntoIterator<Item = String>) {

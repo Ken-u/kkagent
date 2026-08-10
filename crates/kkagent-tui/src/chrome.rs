@@ -453,6 +453,8 @@ pub struct StatusBarModel {
     pub tokens: u64,
     pub cache_hit: Option<f32>,
     pub cwd: Option<String>,
+    /// Non-blocking busy / error / MCP notice for the footer tip slot.
+    pub activity: Option<String>,
 }
 
 impl Default for StatusBarModel {
@@ -466,6 +468,7 @@ impl Default for StatusBarModel {
             tokens: 0,
             cache_hit: None,
             cwd: None,
+            activity: None,
         }
     }
 }

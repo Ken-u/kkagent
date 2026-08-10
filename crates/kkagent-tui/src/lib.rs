@@ -1,4 +1,5 @@
 pub mod app;
+pub mod async_jobs;
 pub mod chrome;
 pub mod components;
 pub mod controllers;
