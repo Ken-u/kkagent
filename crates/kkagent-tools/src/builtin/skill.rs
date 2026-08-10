@@ -344,7 +344,12 @@ impl Tool for SkillTool {
     }
 
     fn read_only(&self) -> bool {
-        true
+        // Skill can inject arbitrary instructions / resources — ask like kimi.
+        false
+    }
+
+    fn default_approve(&self) -> bool {
+        false
     }
 
     async fn execute(&self, input: Value, context: &ToolContext) -> anyhow::Result<ToolOutput> {

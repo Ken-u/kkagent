@@ -1136,6 +1136,7 @@ Do not mention this reminder to the user.\n</system-reminder>"
                         session_id: session_id.clone(),
                         tool_call_id: id.clone(),
                         tool_name: name.clone(),
+                        // UI sees content only — note stays model-side.
                         output: output.content.clone(),
                         is_error: output.is_error,
                     })
@@ -1181,22 +1182,31 @@ Do not mention this reminder to the user.\n</system-reminder>"
             }
 
             let mut result_content = Vec::new();
+            let mut deliveries = Vec::new();
             for (id, output) in &tool_results {
                 result_content.push(ChatContent::ToolResult {
                     tool_use_id: id.clone(),
-                    content: output.content.clone(),
+                    content: output.model_content(),
                     is_error: output.is_error,
                 });
                 result_content.extend(output.images.iter().map(|image| ChatContent::Image {
                     media_type: image.media_type.clone(),
                     data: image.data.clone(),
                 }));
+                if let Some(delivery) = &output.delivery {
+                    deliveries.push(delivery.message.clone());
+                }
             }
 
             session.messages.push(ChatMessage {
                 role: "user".into(),
                 content: result_content,
             });
+
+            // Steer / delivery messages land after tool results (next model turn).
+            for msg in deliveries {
+                session.add_user_message(msg);
+            }
 
             if session.is_interrupted() {
                 self.finish_interrupted(session).await?;
@@ -1707,6 +1717,10 @@ Do not mention this reminder to the user.\n</system-reminder>"
             .get("allow_free_text")
             .and_then(|v| v.as_bool())
             .unwrap_or(options.is_empty());
+        let background = input
+            .get("background")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
         let question_id = uuid::Uuid::new_v4().to_string();
         let session_id = session.id.clone();
@@ -1730,6 +1744,16 @@ Do not mention this reminder to the user.\n</system-reminder>"
                 status: SessionStatus::WaitingQuestion,
             })
             .await;
+
+        if background {
+            // Park without blocking the agent turn — deliver a steer when answered elsewhere.
+            return ToolOutput::success(format!(
+                "Background question parked (id={question_id}). Continue other work; the answer will arrive as a follow-up delivery."
+            ))
+            .with_delivery(format!(
+                "<system>Background AskUserQuestion {question_id} is waiting for the user. Do not block on it.</system>"
+            ));
+        }
 
         let response = session.wait_question(&question_id).await;
         if response.cancelled || session.is_interrupted() {
@@ -2055,6 +2079,13 @@ async fn execute_tool_parallel(request: ParallelToolRequest) -> ToolOutput {
         Some(t) => t,
         None => return ToolOutput::error(format!("Unknown tool: {}", name)),
     };
+
+    if let Err(e) = kkagent_tools::args_validator::validate_against_schema(
+        &tool.parameters_schema(),
+        &input,
+    ) {
+        return ToolOutput::error(e.message);
+    }
 
     let ctx = ToolContext {
         working_dir,

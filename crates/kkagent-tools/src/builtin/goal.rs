@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use kkagent_protocol::goal::{GoalBudget, GoalManager};
+use kkagent_protocol::goal::{GoalBudget, GoalManager, GoalStatus};
 use serde_json::Value;
 use std::sync::Arc;
 
@@ -21,49 +21,80 @@ impl Tool for CreateGoalTool {
         "CreateGoal"
     }
     fn description(&self) -> &str {
-        "Create a new multi-turn goal that will drive autonomous execution across many turns."
+        "Create a new multi-turn goal that will drive autonomous execution across many turns. \
+Use SetGoalBudget afterwards to attach hard limits."
     }
     fn parameters_schema(&self) -> Value {
         serde_json::json!({
             "type": "object",
             "properties": {
+                "objective": {
+                    "type": "string",
+                    "description": "The objective to pursue. Must have a verifiable end state."
+                },
                 "description": {
                     "type": "string",
-                    "description": "A clear description of the goal to accomplish"
+                    "description": "Deprecated alias for objective"
                 },
-                "turn_budget": {
-                    "type": "integer",
-                    "description": "Max turns allowed (default: unlimited)"
+                "completionCriterion": {
+                    "type": "string",
+                    "description": "How to verify the goal is complete"
                 },
-                "token_budget": {
-                    "type": "integer",
-                    "description": "Max tokens allowed (default: unlimited)"
+                "completion_criterion": {
+                    "type": "string",
+                    "description": "Alias for completionCriterion"
                 },
-                "wall_clock_budget_ms": {
-                    "type": "integer",
-                    "description": "Max wall-clock milliseconds (default: unlimited)"
+                "replace": {
+                    "type": "boolean",
+                    "description": "Replace an existing active/paused/blocked goal instead of failing"
                 }
             },
-            "required": ["description"]
+            "required": []
         })
     }
 
     async fn execute(&self, input: Value, _ctx: &ToolContext) -> anyhow::Result<ToolOutput> {
-        let desc = input
-            .get("description")
+        let objective = input
+            .get("objective")
+            .or_else(|| input.get("description"))
             .and_then(|v| v.as_str())
-            .unwrap_or("Unnamed goal");
+            .unwrap_or("")
+            .trim();
+        if objective.is_empty() {
+            return Ok(ToolOutput::error("objective (or description) is required"));
+        }
+        let criterion = input
+            .get("completionCriterion")
+            .or_else(|| input.get("completion_criterion"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        let replace = input
+            .get("replace")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
-        let budget = GoalBudget {
-            turn_budget: input
-                .get("turn_budget")
-                .and_then(|v| v.as_u64())
-                .map(|v| v as u32),
-            token_budget: input.get("token_budget").and_then(|v| v.as_u64()),
-            wall_clock_budget_ms: input.get("wall_clock_budget_ms").and_then(|v| v.as_u64()),
-        };
+        if let Some(existing) = self.goal_mgr.get_goal().await {
+            if !existing.is_terminal() && !replace {
+                return Ok(ToolOutput::error(format!(
+                    "A goal is already active ({}). Pass replace=true to replace it.",
+                    existing.description
+                )));
+            }
+        }
 
-        let goal = self.goal_mgr.create_goal(desc, budget).await;
+        // Budgets are set via SetGoalBudget (kimi-aligned).
+        let mut goal = self
+            .goal_mgr
+            .create_goal(objective, GoalBudget::default())
+            .await;
+        if let Some(c) = criterion {
+            self.goal_mgr.set_completion_criterion(&c).await;
+            if let Some(g) = self.goal_mgr.get_goal().await {
+                goal = g;
+            } else {
+                let _ = c;
+            }
+        }
         Ok(ToolOutput::success(
             serde_json::to_string_pretty(&goal).unwrap_or_default(),
         ))
@@ -124,7 +155,7 @@ impl Tool for UpdateGoalTool {
         "UpdateGoal"
     }
     fn description(&self) -> &str {
-        "Update the goal status: complete, fail, pause, or resume."
+        "Update the goal status: active, complete, or blocked (kimi-aligned)."
     }
     fn parameters_schema(&self) -> Value {
         serde_json::json!({
@@ -132,12 +163,8 @@ impl Tool for UpdateGoalTool {
             "properties": {
                 "status": {
                     "type": "string",
-                    "enum": ["complete", "failed", "paused", "active"],
-                    "description": "New goal status"
-                },
-                "reason": {
-                    "type": "string",
-                    "description": "Reason for the status change"
+                    "enum": ["active", "complete", "blocked", "paused"],
+                    "description": "Lifecycle status. Prefer active/complete/blocked."
                 }
             },
             "required": ["status"]
@@ -146,19 +173,19 @@ impl Tool for UpdateGoalTool {
 
     async fn execute(&self, input: Value, _ctx: &ToolContext) -> anyhow::Result<ToolOutput> {
         let status = input.get("status").and_then(|v| v.as_str()).unwrap_or("");
-        let reason = input
-            .get("reason")
-            .and_then(|v| v.as_str())
-            .unwrap_or("No reason given");
 
         match status {
             "complete" => {
-                self.goal_mgr.complete_goal(reason).await;
-                Ok(ToolOutput::success("Goal completed."))
+                self.goal_mgr.complete_goal("completed").await;
+                Ok(ToolOutput::success("Goal completed.").with_delivery(
+                    "Goal marked complete. Summarize outcomes for the user and stop autonomous goal work.",
+                ))
             }
-            "failed" => {
-                self.goal_mgr.fail_goal(reason).await;
-                Ok(ToolOutput::success("Goal failed."))
+            "blocked" => {
+                self.goal_mgr.block_goal("blocked").await;
+                Ok(ToolOutput::success("Goal blocked.").with_delivery(
+                    "Goal marked blocked. Explain the blocker and wait for user direction.",
+                ))
             }
             "paused" => {
                 self.goal_mgr.pause_goal().await;
@@ -168,7 +195,16 @@ impl Tool for UpdateGoalTool {
                 self.goal_mgr.resume_goal().await;
                 Ok(ToolOutput::success("Goal resumed."))
             }
-            _ => Ok(ToolOutput::error(format!("Unknown status: {}", status))),
+            // Legacy alias kept for old transcripts.
+            "failed" => {
+                self.goal_mgr.block_goal("failed").await;
+                Ok(ToolOutput::success(
+                    "Goal blocked (legacy status `failed` mapped to blocked).",
+                ))
+            }
+            _ => Ok(ToolOutput::error(format!(
+                "Unknown status: {status}. Use active, complete, or blocked."
+            ))),
         }
     }
 }
@@ -189,24 +225,29 @@ impl Tool for SetGoalBudgetTool {
         "SetGoalBudget"
     }
     fn description(&self) -> &str {
-        "Update the active goal's turn/token/wall-clock budget without changing its status."
+        "Set one hard budget limit for the active goal (unit + value). \
+Legacy multi-field token_budget/turn_budget/wall_clock_budget_ms still accepted."
     }
     fn parameters_schema(&self) -> Value {
         serde_json::json!({
             "type": "object",
             "properties": {
-                "turn_budget": {
-                    "type": "integer",
-                    "description": "Max turns (omit to leave unchanged; null to clear)"
+                "unit": {
+                    "type": "string",
+                    "enum": ["turns", "tokens", "milliseconds", "seconds", "minutes", "hours", "turn", "token", "wall_clock"],
+                    "description": "Budget unit (kimi-aligned)"
                 },
-                "token_budget": {
-                    "type": "integer",
-                    "description": "Max tokens (omit to leave unchanged; null to clear)"
+                "budget_unit": {
+                    "type": "string",
+                    "description": "Alias for unit"
                 },
-                "wall_clock_budget_ms": {
-                    "type": "integer",
-                    "description": "Max wall-clock ms (omit to leave unchanged; null to clear)"
-                }
+                "value": {
+                    "type": "number",
+                    "description": "Positive numeric budget value"
+                },
+                "turn_budget": {"type": "integer"},
+                "token_budget": {"type": "integer"},
+                "wall_clock_budget_ms": {"type": "integer"}
             }
         })
     }
@@ -217,34 +258,63 @@ impl Tool for SetGoalBudgetTool {
         };
 
         let mut budget = goal.budget.clone();
-        if input
-            .as_object()
-            .map(|o| o.contains_key("turn_budget"))
-            .unwrap_or(false)
-        {
-            budget.turn_budget = input
-                .get("turn_budget")
-                .and_then(|v| v.as_u64())
-                .map(|v| v as u32);
-        }
-        if input
-            .as_object()
-            .map(|o| o.contains_key("token_budget"))
-            .unwrap_or(false)
-        {
-            budget.token_budget = input.get("token_budget").and_then(|v| v.as_u64());
-        }
-        if input
-            .as_object()
-            .map(|o| o.contains_key("wall_clock_budget_ms"))
-            .unwrap_or(false)
-        {
-            budget.wall_clock_budget_ms =
-                input.get("wall_clock_budget_ms").and_then(|v| v.as_u64());
+        let unit = input
+            .get("unit")
+            .or_else(|| input.get("budget_unit"))
+            .and_then(|v| v.as_str());
+        if let (Some(unit), Some(value)) = (unit, input.get("value").and_then(|v| v.as_f64())) {
+            if value <= 0.0 {
+                return Ok(ToolOutput::error("value must be positive"));
+            }
+            match unit {
+                "turns" | "turn" => budget.turn_budget = Some(value.round() as u32),
+                "tokens" | "token" => budget.token_budget = Some(value.round() as u64),
+                "milliseconds" | "wall_clock" => {
+                    budget.wall_clock_budget_ms = Some(value.round() as u64)
+                }
+                "seconds" => budget.wall_clock_budget_ms = Some((value * 1000.0).round() as u64),
+                "minutes" => {
+                    budget.wall_clock_budget_ms = Some((value * 60_000.0).round() as u64)
+                }
+                "hours" => {
+                    budget.wall_clock_budget_ms = Some((value * 3_600_000.0).round() as u64)
+                }
+                other => {
+                    return Ok(ToolOutput::error(format!("Unknown budget unit: {other}")));
+                }
+            }
+        } else {
+            // Legacy multi-field form
+            if input
+                .as_object()
+                .map(|o| o.contains_key("turn_budget"))
+                .unwrap_or(false)
+            {
+                budget.turn_budget = input
+                    .get("turn_budget")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as u32);
+            }
+            if input
+                .as_object()
+                .map(|o| o.contains_key("token_budget"))
+                .unwrap_or(false)
+            {
+                budget.token_budget = input.get("token_budget").and_then(|v| v.as_u64());
+            }
+            if input
+                .as_object()
+                .map(|o| o.contains_key("wall_clock_budget_ms"))
+                .unwrap_or(false)
+            {
+                budget.wall_clock_budget_ms =
+                    input.get("wall_clock_budget_ms").and_then(|v| v.as_u64());
+            }
         }
 
         self.goal_mgr.update_budget(budget).await;
         goal = self.goal_mgr.get_goal().await.unwrap_or(goal);
+        let _ = GoalStatus::Active;
         Ok(ToolOutput::success(
             serde_json::to_string_pretty(&goal).unwrap_or_default(),
         ))

@@ -83,38 +83,55 @@ pub fn restore_line_endings(content: &str, crlf: bool) -> String {
     content.replace("\r\n", "\n").replace('\n', "\r\n")
 }
 
-/// Decode text bytes: UTF-8, UTF-16 LE/BE BOM, or lossy UTF-8.
+/// Decode text bytes: UTF-8, UTF-16 LE/BE BOM, UTF-16 without BOM (NUL parity), or lossy UTF-8.
 pub fn decode_text(bytes: &[u8]) -> Result<String, String> {
     if bytes.starts_with(&[0xFF, 0xFE]) {
-        let u16s: Vec<u16> = bytes[2..]
-            .chunks(2)
-            .filter_map(|c| {
-                if c.len() == 2 {
-                    Some(u16::from_le_bytes([c[0], c[1]]))
-                } else {
-                    None
-                }
-            })
-            .collect();
-        return String::from_utf16(&u16s).map_err(|_| "Invalid UTF-16 LE".into());
+        return decode_utf16(&bytes[2..], true);
     }
     if bytes.starts_with(&[0xFE, 0xFF]) {
-        let u16s: Vec<u16> = bytes[2..]
-            .chunks(2)
-            .filter_map(|c| {
-                if c.len() == 2 {
-                    Some(u16::from_be_bytes([c[0], c[1]]))
-                } else {
-                    None
-                }
-            })
-            .collect();
-        return String::from_utf16(&u16s).map_err(|_| "Invalid UTF-16 BE".into());
+        return decode_utf16(&bytes[2..], false);
+    }
+    // Heuristic: even length + many NULs in odd/even positions → UTF-16 without BOM.
+    if bytes.len() >= 4 && bytes.len().is_multiple_of(2) {
+        let sample = &bytes[..bytes.len().min(512)];
+        let even_nul = sample.iter().step_by(2).filter(|&&b| b == 0).count();
+        let odd_nul = sample.iter().skip(1).step_by(2).filter(|&&b| b == 0).count();
+        let pairs = sample.len() / 2;
+        if pairs > 0 && even_nul * 2 > pairs {
+            return decode_utf16(bytes, true); // LE: ASCII as XX 00
+        }
+        if pairs > 0 && odd_nul * 2 > pairs {
+            return decode_utf16(bytes, false); // BE: ASCII as 00 XX
+        }
     }
     if sniff_binary(bytes) {
         return Err("File appears to be binary".into());
     }
     Ok(String::from_utf8_lossy(bytes).into_owned())
+}
+
+fn decode_utf16(bytes: &[u8], little_endian: bool) -> Result<String, String> {
+    let u16s: Vec<u16> = bytes
+        .chunks(2)
+        .filter_map(|c| {
+            if c.len() == 2 {
+                Some(if little_endian {
+                    u16::from_le_bytes([c[0], c[1]])
+                } else {
+                    u16::from_be_bytes([c[0], c[1]])
+                })
+            } else {
+                None
+            }
+        })
+        .collect();
+    String::from_utf16(&u16s).map_err(|_| {
+        if little_endian {
+            "Invalid UTF-16 LE".into()
+        } else {
+            "Invalid UTF-16 BE".into()
+        }
+    })
 }
 
 pub const MAX_LINE_LENGTH: usize = 2000;

@@ -1952,14 +1952,17 @@ async fn build_turn_tool_registry(
         state.subagents.clone(),
         launch,
     )));
-    tools.register(Arc::new(kkagent_tools::builtin::TaskOutputTool::new(
+    tools.register(Arc::new(kkagent_tools::builtin::TaskOutputTool::with_bash_shells(
         state.subagents.clone(),
+        state.bash_shells.clone(),
     )));
-    tools.register(Arc::new(kkagent_tools::builtin::TaskListTool::new(
+    tools.register(Arc::new(kkagent_tools::builtin::TaskListTool::with_bash_shells(
         state.subagents.clone(),
+        state.bash_shells.clone(),
     )));
-    tools.register(Arc::new(kkagent_tools::builtin::TaskStopTool::new(
+    tools.register(Arc::new(kkagent_tools::builtin::TaskStopTool::with_bash_shells(
         state.subagents.clone(),
+        state.bash_shells.clone(),
     )));
     tools.register(Arc::new(kkagent_tools::builtin::CreateGoalTool::new(
         state.goal_mgr.clone(),
@@ -2244,12 +2247,12 @@ async fn build_server_state(config: Arc<AppConfig>) -> Result<Arc<ServerState>> 
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(15)).await;
                 let due = cron_bg.take_due().await;
-                for (id, prompt) in due {
+                for (id, prompt, recurring) in due {
                     let xml = kkagent_tools::render_cron_fire_xml(
                         &id,
                         "scheduled",
                         &prompt,
-                        false,
+                        recurring,
                         1,
                         false,
                     );

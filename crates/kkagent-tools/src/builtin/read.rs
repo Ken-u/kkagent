@@ -26,8 +26,16 @@ Rejects binary/image files — use ReadMediaFile for media."
             "type": "object",
             "properties": {
                 "path": {"type": "string", "description": "File path to read"},
-                "line_offset": {"type": "integer", "description": "Starting line (1-indexed, negative counts from end)"},
-                "n_lines": {"type": "integer", "description": "Number of lines to read"}
+                "offset": {
+                    "type": "integer",
+                    "description": "Starting line (1-indexed; negative counts from end). Alias: line_offset."
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Number of lines to read. Alias: n_lines."
+                },
+                "line_offset": {"type": "integer", "description": "Deprecated alias for offset"},
+                "n_lines": {"type": "integer", "description": "Deprecated alias for limit"}
             },
             "required": ["path"]
         })
@@ -79,11 +87,13 @@ Rejects binary/image files — use ReadMediaFile for media."
         let total_lines = lines.len();
 
         let offset = input
-            .get("line_offset")
+            .get("offset")
+            .or_else(|| input.get("line_offset"))
             .and_then(|v| v.as_i64())
             .unwrap_or(1);
         let n_lines = input
-            .get("n_lines")
+            .get("limit")
+            .or_else(|| input.get("n_lines"))
             .and_then(|v| v.as_u64())
             .unwrap_or(MAX_READ_LINES as u64) as usize;
         let n_lines = n_lines.min(MAX_READ_LINES);
@@ -100,9 +110,11 @@ Rejects binary/image files — use ReadMediaFile for media."
         let mut selected = Vec::new();
         let mut output_bytes = 0usize;
         let mut end = start;
+        let mut line_truncated = false;
         for (i, line) in lines[start..requested_end].iter().enumerate() {
             let truncated: String = line.chars().take(MAX_LINE_LENGTH).collect();
             let suffix = if line.chars().count() > MAX_LINE_LENGTH {
+                line_truncated = true;
                 "…"
             } else {
                 ""
@@ -117,38 +129,50 @@ Rejects binary/image files — use ReadMediaFile for media."
             end = start + i + 1;
         }
 
-        let mut result = selected.join("\n");
+        let result = selected.join("\n");
+        let mut note_parts = Vec::new();
         if end < total_lines {
-            let notice = format!("... {} more lines not shown ...", total_lines - end);
-            if !result.is_empty() {
-                result.push('\n');
-            }
-            // Keep the documented 100 KiB hard ceiling even with the notice.
-            let available = MAX_READ_BYTES.saturating_sub(result.len());
-            result.push_str(truncate_utf8_bytes(&notice, available));
+            note_parts.push(format!(
+                "{} lines read from file starting from line {}. Total lines in file: {}. \
+More lines remain — call Read again with offset={}.",
+                end.saturating_sub(start),
+                start + 1,
+                total_lines,
+                end + 1
+            ));
+        } else if start > 0 || end < total_lines || n_lines < total_lines {
+            note_parts.push(format!(
+                "{} lines read from file starting from line {}. Total lines in file: {}.",
+                end.saturating_sub(start),
+                start + 1,
+                total_lines
+            ));
+        }
+        if line_truncated {
+            note_parts.push(format!(
+                "Some lines exceeded {MAX_LINE_LENGTH} characters and were truncated for display."
+            ));
+        }
+        if content.contains('\r') && !content.contains("\r\n") {
+            note_parts.push(
+                "File contains bare CR line endings; displayed with LF normalization.".into(),
+            );
         }
 
-        Ok(ToolOutput::success_with_data(
+        let mut out = ToolOutput::success_with_data(
             result,
             json!({
                 "lineCount": total_lines,
                 "bytes": bytes.len(),
-                "startLine": start + 1,
+                "startLine": if end > start { start + 1 } else { start },
                 "endLine": end,
             }),
-        ))
+        );
+        if !note_parts.is_empty() {
+            out = out.with_note(note_parts.join(" "));
+        }
+        Ok(out)
     }
-}
-
-fn truncate_utf8_bytes(value: &str, max_bytes: usize) -> &str {
-    if value.len() <= max_bytes {
-        return value;
-    }
-    let mut end = max_bytes;
-    while end > 0 && !value.is_char_boundary(end) {
-        end -= 1;
-    }
-    &value[..end]
 }
 
 #[cfg(test)]
@@ -171,14 +195,29 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("short.txt"), "one\ntwo\n").unwrap();
         let output = ReadTool
+            .execute(json!({"path": "short.txt", "offset": 99}), &context(&dir))
+            .await
+            .unwrap();
+        assert!(!output.is_error);
+        assert!(output.content.is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn accepts_legacy_line_offset_alias() {
+        let dir = std::env::temp_dir().join(format!("kkagent-read-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("short.txt"), "one\ntwo\nthree\n").unwrap();
+        let output = ReadTool
             .execute(
-                json!({"path": "short.txt", "line_offset": 99}),
+                json!({"path": "short.txt", "line_offset": 2, "n_lines": 1}),
                 &context(&dir),
             )
             .await
             .unwrap();
         assert!(!output.is_error);
-        assert!(output.content.is_empty());
+        assert!(output.content.contains("two"));
+        assert!(!output.content.contains("one"));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -199,16 +238,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refuses_sensitive_files() {
+    async fn truncation_uses_note_side_channel() {
         let dir = std::env::temp_dir().join(format!("kkagent-read-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join(".env"), "API_KEY=secret\n").unwrap();
+        let body = (1..=50)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(dir.join("many.txt"), body).unwrap();
         let output = ReadTool
-            .execute(json!({"path": ".env"}), &context(&dir))
+            .execute(
+                json!({"path": "many.txt", "offset": 1, "limit": 10}),
+                &context(&dir),
+            )
             .await
             .unwrap();
-        assert!(output.is_error);
-        assert!(!output.content.contains("API_KEY"));
+        assert!(!output.is_error);
+        assert!(!output.content.contains("more lines"));
+        assert!(output.note.as_deref().unwrap_or("").contains("Total lines"));
+        let model = output.model_content();
+        assert!(model.contains("<system>"));
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

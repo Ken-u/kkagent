@@ -23,6 +23,8 @@ chrono = { workspace = true }
 dirs = { workspace = true }
 base64 = { workspace = true }
 image = { workspace = true }
+jsonschema = "0.28"
+cron = "0.15"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

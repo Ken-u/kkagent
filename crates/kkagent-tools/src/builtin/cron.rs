@@ -18,6 +18,12 @@ pub struct CronJob {
     pub created_at: DateTime<Utc>,
     pub next_run: DateTime<Utc>,
     pub enabled: bool,
+    #[serde(default = "default_recurring")]
+    pub recurring: bool,
+}
+
+fn default_recurring() -> bool {
+    true
 }
 
 pub struct CronManager {
@@ -82,9 +88,11 @@ impl CronManager {
         self.jobs.lock().await.values().cloned().collect()
     }
 
-    pub async fn create(&self, expr: String, prompt: String) -> CronJob {
+    pub async fn create(&self, expr: String, prompt: String, recurring: bool) -> anyhow::Result<CronJob> {
         let id = Uuid::new_v4().to_string();
-        let next = parse_next_run(&expr);
+        let next = parse_next_run(&expr)?;
+        let is_delay = looks_like_delay(&expr);
+        let recurring = if is_delay { false } else { recurring };
         let job = CronJob {
             id: id.clone(),
             expression_or_delay: expr,
@@ -92,12 +100,19 @@ impl CronManager {
             created_at: Utc::now(),
             next_run: next,
             enabled: true,
+            recurring,
         };
-        self.jobs.lock().await.insert(id, job.clone());
+        {
+            let mut jobs = self.jobs.lock().await;
+            if jobs.len() >= 50 {
+                anyhow::bail!("session cron job limit reached (50)");
+            }
+            jobs.insert(id, job.clone());
+        }
         if let Err(e) = self.save_to_disk().await {
             tracing::warn!("Cron persist failed: {}", e);
         }
-        job
+        Ok(job)
     }
 
     pub async fn delete(&self, id: &str) -> bool {
@@ -111,24 +126,22 @@ impl CronManager {
     }
 
     /// Return due job prompts and advance/disable them.
-    pub async fn take_due(&self) -> Vec<(String, String)> {
+    pub async fn take_due(&self) -> Vec<(String, String, bool)> {
         let now = Utc::now();
         let mut jobs = self.jobs.lock().await;
         let mut due = Vec::new();
         let mut remove = Vec::new();
         for (id, job) in jobs.iter_mut() {
             if job.enabled && job.next_run <= now {
-                due.push((id.clone(), job.prompt.clone()));
-                // One-shot delays are disabled after fire; cron-like keep hourly for simplicity.
-                if job.expression_or_delay.starts_with("in ")
-                    || job.expression_or_delay.ends_with('s')
-                    || job.expression_or_delay.ends_with('m')
-                    || job.expression_or_delay.ends_with('h')
-                {
+                due.push((id.clone(), job.prompt.clone(), job.recurring));
+                if !job.recurring || looks_like_delay(&job.expression_or_delay) {
                     job.enabled = false;
                     remove.push(id.clone());
-                } else {
+                } else if let Ok(next) = parse_next_run_after(&job.expression_or_delay, now) {
                     // Light jitter (±3 minutes) to avoid thundering herd.
+                    let jitter = (id.as_bytes().iter().map(|b| *b as i64).sum::<i64>() % 7) - 3;
+                    job.next_run = next + Duration::minutes(jitter);
+                } else {
                     let jitter = (id.as_bytes().iter().map(|b| *b as i64).sum::<i64>() % 7) - 3;
                     job.next_run = now + Duration::hours(1) + Duration::minutes(jitter);
                 }
@@ -179,17 +192,37 @@ fn attr(value: &str) -> String {
     value.replace('&', "&amp;").replace('"', "&quot;")
 }
 
-fn parse_next_run(expr: &str) -> DateTime<Utc> {
+fn looks_like_delay(expr: &str) -> bool {
     let e = expr.trim().to_lowercase();
-    let now = Utc::now();
-    if let Some(rest) = e.strip_prefix("in ") {
-        return now + parse_duration_token(rest.trim());
+    e.starts_with("in ")
+        || ((e.ends_with('s') || e.ends_with('m') || e.ends_with('h') || e.ends_with('d'))
+            && !e.contains('*')
+            && e.split_whitespace().count() == 1)
+}
+
+fn parse_next_run(expr: &str) -> anyhow::Result<DateTime<Utc>> {
+    parse_next_run_after(expr, Utc::now())
+}
+
+fn parse_next_run_after(expr: &str, after: DateTime<Utc>) -> anyhow::Result<DateTime<Utc>> {
+    let e = expr.trim().to_lowercase();
+    if looks_like_delay(&e) {
+        let token = e.strip_prefix("in ").unwrap_or(&e);
+        return Ok(after + parse_duration_token(token.trim()));
     }
-    if e.ends_with('s') || e.ends_with('m') || e.ends_with('h') || e.ends_with('d') {
-        return now + parse_duration_token(&e);
-    }
-    // Fallback: 1 hour
-    now + Duration::hours(1)
+    // 5-field cron → prepend seconds for `cron` crate
+    let schedule_src = if e.split_whitespace().count() == 5 {
+        format!("0 {e}")
+    } else {
+        e.clone()
+    };
+    let schedule: cron::Schedule = schedule_src
+        .parse()
+        .map_err(|err| anyhow::anyhow!("invalid cron expression `{expr}`: {err}"))?;
+    schedule
+        .after(&after)
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("cron expression `{expr}` has no future fire time"))
 }
 
 fn parse_duration_token(s: &str) -> Duration {
@@ -241,21 +274,29 @@ impl Tool for CronCreateTool {
         "CronCreate"
     }
     fn description(&self) -> &str {
-        "Schedule a prompt to run later. Use delay like `in 5m`, `30s`, `2h`, or a cron-ish token."
+        "Schedule a prompt to run later. Use delay like `in 5m` / `30s`, or a 5-field cron \
+expression with recurring=true (default) / false for one-shot."
     }
     fn parameters_schema(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "delay": {"type": "string", "description": "When to run, e.g. 'in 5m' or '1h'"},
-                "prompt": {"type": "string", "description": "Prompt to inject when due"}
+                "delay": {"type": "string", "description": "When to run, e.g. 'in 5m', '1h', or cron '*/5 * * * *'"},
+                "cron": {"type": "string", "description": "Alias for delay when using a 5-field cron expression"},
+                "expression": {"type": "string", "description": "Alias for delay"},
+                "prompt": {"type": "string", "description": "Prompt to inject when due"},
+                "recurring": {
+                    "type": "boolean",
+                    "description": "true (default for cron) = fire on every match; false = one-shot. Delays are always one-shot."
+                }
             },
-            "required": ["delay", "prompt"]
+            "required": ["prompt"]
         })
     }
     async fn execute(&self, input: Value, _ctx: &ToolContext) -> anyhow::Result<ToolOutput> {
         let delay = input
             .get("delay")
+            .or_else(|| input.get("cron"))
             .or_else(|| input.get("expression"))
             .and_then(|v| v.as_str())
             .unwrap_or("")
@@ -266,14 +307,21 @@ impl Tool for CronCreateTool {
             .unwrap_or("")
             .to_string();
         if delay.is_empty() || prompt.is_empty() {
-            return Ok(ToolOutput::error("delay and prompt are required"));
+            return Ok(ToolOutput::error("delay/cron and prompt are required"));
         }
-        let job = self.mgr.create(delay, prompt).await;
-        Ok(ToolOutput::success(format!(
-            "Cron job created id={} next_run={}",
-            job.id,
-            job.next_run.to_rfc3339()
-        )))
+        let recurring = input
+            .get("recurring")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        match self.mgr.create(delay, prompt, recurring).await {
+            Ok(job) => Ok(ToolOutput::success(format!(
+                "Cron job created id={} recurring={} next_run={}",
+                job.id,
+                job.recurring,
+                job.next_run.to_rfc3339()
+            ))),
+            Err(e) => Ok(ToolOutput::error(e.to_string())),
+        }
     }
 }
 
@@ -351,7 +399,10 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("kkagent-cron-{}", Uuid::new_v4()));
         let path = dir.join("cron.json");
         let mgr = CronManager::with_persist(path.clone()).await;
-        let job = mgr.create("in 5m".into(), "hello".into()).await;
+        let job = mgr
+            .create("in 5m".into(), "hello".into(), false)
+            .await
+            .unwrap();
         drop(mgr);
         let mgr2 = CronManager::with_persist(path).await;
         let list = mgr2.list().await;

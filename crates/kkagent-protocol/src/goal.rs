@@ -24,6 +24,8 @@ pub struct GoalBudget {
 pub struct Goal {
     pub goal_id: String,
     pub description: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_criterion: Option<String>,
     pub status: GoalStatus,
     pub budget: GoalBudget,
     pub turns_used: u32,
@@ -55,7 +57,10 @@ impl Goal {
     }
 
     pub fn is_terminal(&self) -> bool {
-        matches!(self.status, GoalStatus::Complete | GoalStatus::Failed)
+        matches!(
+            self.status,
+            GoalStatus::Complete | GoalStatus::Failed | GoalStatus::Blocked
+        )
     }
 }
 
@@ -77,6 +82,7 @@ impl GoalManager {
         let goal = Goal {
             goal_id: uuid::Uuid::new_v4().to_string(),
             description: description.to_string(),
+            completion_criterion: None,
             status: GoalStatus::Active,
             budget,
             turns_used: 0,
@@ -143,6 +149,23 @@ impl GoalManager {
         }
     }
 
+    pub async fn block_goal(&self, reason: &str) {
+        let mut guard = self.current_goal.lock().await;
+        if let Some(ref mut goal) = *guard {
+            goal.status = GoalStatus::Blocked;
+            goal.terminal_reason = Some(reason.to_string());
+            goal.updated_at = Utc::now().to_rfc3339();
+        }
+    }
+
+    pub async fn set_completion_criterion(&self, criterion: &str) {
+        let mut guard = self.current_goal.lock().await;
+        if let Some(ref mut goal) = *guard {
+            goal.completion_criterion = Some(criterion.to_string());
+            goal.updated_at = Utc::now().to_rfc3339();
+        }
+    }
+
     pub async fn pause_goal(&self) {
         let mut guard = self.current_goal.lock().await;
         if let Some(ref mut goal) = *guard {
@@ -154,7 +177,10 @@ impl GoalManager {
     pub async fn resume_goal(&self) {
         let mut guard = self.current_goal.lock().await;
         if let Some(ref mut goal) = *guard {
-            if goal.status == GoalStatus::Paused {
+            if matches!(
+                goal.status,
+                GoalStatus::Paused | GoalStatus::Blocked
+            ) {
                 goal.status = GoalStatus::Active;
                 goal.updated_at = Utc::now().to_rfc3339();
                 *self.start_time.lock().await = Some(std::time::Instant::now());

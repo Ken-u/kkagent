@@ -2,11 +2,16 @@ use async_trait::async_trait;
 use kkagent_protocol::subagent::{SubagentConfig, SubagentManager, SubagentStatus};
 use serde_json::Value;
 use std::sync::Arc;
+use std::time::Duration;
 
+use crate::builtin::bash::BackgroundShellManager;
 use crate::{Tool, ToolContext, ToolOutput};
 
 /// Fire-and-forget launcher: schedules the subagent and returns immediately.
 pub type SubagentLaunchFn = Arc<dyn Fn(SubagentConfig) + Send + Sync>;
+
+const MAX_AGENT_SWARM_SUBAGENTS: usize = 128;
+const PROMPT_TEMPLATE_PLACEHOLDER: &str = "{{item}}";
 
 pub struct TaskTool {
     subagent_mgr: Arc<SubagentManager>,
@@ -59,68 +64,122 @@ After launching, continue other work and collect results with TaskOutput / TaskL
     }
 
     async fn execute(&self, input: Value, ctx: &ToolContext) -> anyhow::Result<ToolOutput> {
-        let desc = input
-            .get("description")
-            .and_then(|v| v.as_str())
-            .unwrap_or("Unnamed task");
-        let prompt = input.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
-        let model = input
-            .get("model")
-            .and_then(|v| v.as_str())
-            .map(String::from);
-        let profile = input
-            .get("profile")
-            .and_then(|v| v.as_str())
-            .map(String::from);
+        spawn_subagent(&self.subagent_mgr, &self.launch, input, ctx, None).await
+    }
+}
 
-        if prompt.trim().is_empty() {
-            return Ok(ToolOutput::error("Task prompt must not be empty"));
-        }
+async fn spawn_subagent(
+    subagent_mgr: &SubagentManager,
+    launch: &SubagentLaunchFn,
+    input: Value,
+    ctx: &ToolContext,
+    resume_id: Option<String>,
+) -> anyhow::Result<ToolOutput> {
+    let desc = input
+        .get("description")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Unnamed task");
+    let prompt = input.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
+    let model = input
+        .get("model")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let profile = input
+        .get("profile")
+        .or_else(|| input.get("subagent_type"))
+        .and_then(|v| v.as_str())
+        .map(String::from);
 
-        let agent_id = uuid::Uuid::new_v4().to_string();
-        let mut working_dir = ctx.working_dir.to_string_lossy().to_string();
-        if crate::git_worktree::worktree_enabled() {
-            if let Ok(wt) =
-                crate::git_worktree::create_worktree(&ctx.working_dir, &agent_id, None).await
-            {
-                working_dir = wt.path.display().to_string();
+    if prompt.trim().is_empty() {
+        return Ok(ToolOutput::error("Task prompt must not be empty"));
+    }
+
+    if let Some(resume) = resume_id {
+        match subagent_mgr.resume(&resume).await {
+            Ok(_) => {
+                let mut cfg = SubagentConfig {
+                    agent_id: resume.clone(),
+                    description: desc.to_string(),
+                    prompt: prompt.to_string(),
+                    model,
+                    working_dir: ctx.working_dir.to_string_lossy().to_string(),
+                    profile,
+                    parent_session_id: Some(ctx.session_id.clone()),
+                    parent_tool_call_id: ctx.tool_call_id.clone(),
+                };
+                if let Some(state) = subagent_mgr.get_state(&resume).await {
+                    cfg.description = if desc == "Unnamed task" {
+                        state.description
+                    } else {
+                        desc.to_string()
+                    };
+                }
+                (launch)(cfg);
+                return Ok(ToolOutput::success(format!(
+                    "Resumed subagent id={resume}. Use TaskOutput to fetch results."
+                )));
             }
+            Err(e) => return Ok(ToolOutput::error(format!("Failed to resume: {e}"))),
         }
+    }
 
-        let config = SubagentConfig {
-            agent_id,
-            description: desc.to_string(),
-            prompt: prompt.to_string(),
-            model,
-            working_dir,
-            profile,
-            parent_session_id: Some(ctx.session_id.clone()),
-            parent_tool_call_id: ctx.tool_call_id.clone(),
-        };
+    let agent_id = uuid::Uuid::new_v4().to_string();
+    let mut working_dir = ctx.working_dir.to_string_lossy().to_string();
+    if crate::git_worktree::worktree_enabled() {
+        if let Ok(wt) =
+            crate::git_worktree::create_worktree(&ctx.working_dir, &agent_id, None).await
+        {
+            working_dir = wt.path.display().to_string();
+        }
+    }
 
-        match self.subagent_mgr.spawn(config.clone()).await {
-            Ok(agent_id) => {
-                (self.launch)(config);
-                Ok(ToolOutput::success(format!(
-                    "Subagent launched: {desc} (id={agent_id}). \
+    let config = SubagentConfig {
+        agent_id,
+        description: desc.to_string(),
+        prompt: prompt.to_string(),
+        model,
+        working_dir,
+        profile,
+        parent_session_id: Some(ctx.session_id.clone()),
+        parent_tool_call_id: ctx.tool_call_id.clone(),
+    };
+
+    match subagent_mgr.spawn(config.clone()).await {
+        Ok(agent_id) => {
+            (launch)(config);
+            Ok(ToolOutput::success(format!(
+                "Subagent launched: {desc} (id={agent_id}). \
 Use TaskOutput with this id to fetch results when ready; use TaskList to see status."
-                )))
-            }
-            Err(e) => Ok(ToolOutput::error(format!(
-                "Failed to launch subagent: {}",
-                e
-            ))),
+            )))
         }
+        Err(e) => Ok(ToolOutput::error(format!(
+            "Failed to launch subagent: {}",
+            e
+        ))),
     }
 }
 
 pub struct TaskOutputTool {
     subagent_mgr: Arc<SubagentManager>,
+    bash_shells: Option<Arc<BackgroundShellManager>>,
 }
 
 impl TaskOutputTool {
     pub fn new(subagent_mgr: Arc<SubagentManager>) -> Self {
-        Self { subagent_mgr }
+        Self {
+            subagent_mgr,
+            bash_shells: None,
+        }
+    }
+
+    pub fn with_bash_shells(
+        subagent_mgr: Arc<SubagentManager>,
+        bash_shells: Arc<BackgroundShellManager>,
+    ) -> Self {
+        Self {
+            subagent_mgr,
+            bash_shells: Some(bash_shells),
+        }
     }
 }
 
@@ -130,7 +189,7 @@ impl Tool for TaskOutputTool {
         "TaskOutput"
     }
     fn description(&self) -> &str {
-        "Get the status and result of a previously launched Task subagent by id."
+        "Get the status and result of a previously launched Task/Agent subagent or background Bash job by id."
     }
     fn parameters_schema(&self) -> Value {
         serde_json::json!({
@@ -138,7 +197,7 @@ impl Tool for TaskOutputTool {
             "properties": {
                 "task_id": {
                     "type": "string",
-                    "description": "Subagent / task id returned by the Task tool"
+                    "description": "Subagent / task / shell id"
                 },
                 "agent_id": {
                     "type": "string",
@@ -160,37 +219,69 @@ impl Tool for TaskOutputTool {
         if id.is_empty() {
             return Ok(ToolOutput::error("Missing task_id"));
         }
-        match self.subagent_mgr.get_state(id).await {
-            Some(state) => {
+        if let Some(state) = self.subagent_mgr.get_state(id).await {
+            let mut out = format!(
+                "task_id: {}\ndescription: {}\nstatus: {:?}\nturns_used: {}",
+                state.agent_id, state.description, state.status, state.turns_used
+            );
+            if let Some(ref r) = state.result {
+                out.push_str("\n\nresult:\n");
+                out.push_str(r);
+            }
+            if let Some(ref e) = state.error {
+                out.push_str("\n\nerror:\n");
+                out.push_str(e);
+            }
+            if state.status == SubagentStatus::Running {
+                out.push_str("\n\n(still running — call TaskOutput again later)");
+            }
+            return Ok(ToolOutput::success(out));
+        }
+        if let Some(bash) = &self.bash_shells {
+            if let Some((description, _command, status, output, exit_code, running)) =
+                bash.snapshot(id).await
+            {
                 let mut out = format!(
-                    "task_id: {}\ndescription: {}\nstatus: {:?}\nturns_used: {}",
-                    state.agent_id, state.description, state.status, state.turns_used
+                    "task_id: {id}\nkind: bash\ndescription: {description}\nstatus: {status}"
                 );
-                if let Some(ref r) = state.result {
-                    out.push_str("\n\nresult:\n");
-                    out.push_str(r);
+                if let Some(code) = exit_code {
+                    out.push_str(&format!("\nexit_code: {code}"));
                 }
-                if let Some(ref e) = state.error {
-                    out.push_str("\n\nerror:\n");
-                    out.push_str(e);
+                if !output.is_empty() {
+                    out.push_str("\n\n");
+                    out.push_str(&output);
                 }
-                if state.status == SubagentStatus::Running {
+                if running {
                     out.push_str("\n\n(still running — call TaskOutput again later)");
                 }
-                Ok(ToolOutput::success(out))
+                return Ok(ToolOutput::success(out));
             }
-            None => Ok(ToolOutput::error(format!("Unknown task_id: {}", id))),
         }
+        Ok(ToolOutput::error(format!("Unknown task_id: {}", id)))
     }
 }
 
 pub struct TaskListTool {
     subagent_mgr: Arc<SubagentManager>,
+    bash_shells: Option<Arc<BackgroundShellManager>>,
 }
 
 impl TaskListTool {
     pub fn new(subagent_mgr: Arc<SubagentManager>) -> Self {
-        Self { subagent_mgr }
+        Self {
+            subagent_mgr,
+            bash_shells: None,
+        }
+    }
+
+    pub fn with_bash_shells(
+        subagent_mgr: Arc<SubagentManager>,
+        bash_shells: Arc<BackgroundShellManager>,
+    ) -> Self {
+        Self {
+            subagent_mgr,
+            bash_shells: Some(bash_shells),
+        }
     }
 }
 
@@ -200,7 +291,7 @@ impl Tool for TaskListTool {
         "TaskList"
     }
     fn description(&self) -> &str {
-        "List all Task subagents and their statuses."
+        "List all Task/Agent subagents and background Bash jobs with their statuses."
     }
     fn parameters_schema(&self) -> Value {
         serde_json::json!({
@@ -213,17 +304,16 @@ impl Tool for TaskListTool {
     }
 
     async fn execute(&self, _input: Value, _ctx: &ToolContext) -> anyhow::Result<ToolOutput> {
-        let all = self.subagent_mgr.list_all().await;
-        if all.is_empty() {
-            return Ok(ToolOutput::success("No tasks."));
-        }
-        let lines: Vec<String> = all
+        let mut lines: Vec<String> = self
+            .subagent_mgr
+            .list_all()
+            .await
             .into_iter()
             .map(|t| {
                 format!(
-                    "- {} [{}] {}{}",
+                    "- {} [agent/{:?}] {}{}",
                     t.agent_id,
-                    format!("{:?}", t.status).to_lowercase(),
+                    t.status,
                     t.description,
                     if t.result.is_some() {
                         " (has result)"
@@ -233,19 +323,29 @@ impl Tool for TaskListTool {
                 )
             })
             .collect();
+        if let Some(bash) = &self.bash_shells {
+            for (id, desc, status, _running) in bash.list_jobs().await {
+                lines.push(format!("- {id} [bash/{status}] {desc}"));
+            }
+        }
+        if lines.is_empty() {
+            return Ok(ToolOutput::success("No tasks."));
+        }
         Ok(ToolOutput::success(lines.join("\n")))
     }
 }
 
-/// Agent tool — Task with explicit profile (explore/coder/general).
+/// Agent tool — synchronous by default (kimi SubagentTool); optional background.
 pub struct AgentTool {
-    inner: TaskTool,
+    subagent_mgr: Arc<SubagentManager>,
+    launch: SubagentLaunchFn,
 }
 
 impl AgentTool {
     pub fn new(subagent_mgr: Arc<SubagentManager>, launch: SubagentLaunchFn) -> Self {
         Self {
-            inner: TaskTool::new(subagent_mgr, launch),
+            subagent_mgr,
+            launch,
         }
     }
 }
@@ -256,8 +356,9 @@ impl Tool for AgentTool {
         "Agent"
     }
     fn description(&self) -> &str {
-        "Launch a profiled subagent (explore/coder/general). Prefer explore for codebase mapping, \
-coder for implementation. Collect results with TaskOutput."
+        "Run a profiled subagent (explore/coder/general). By default waits for completion and \
+returns the result. Set run_in_background=true to detach and collect later via TaskOutput. \
+Pass resume to continue an existing agent id."
     }
     fn parameters_schema(&self) -> Value {
         serde_json::json!({
@@ -268,20 +369,102 @@ coder for implementation. Collect results with TaskOutput."
                 "profile": {
                     "type": "string",
                     "enum": ["general", "explore", "coder"],
-                    "description": "Agent profile (default explore)"
+                    "description": "Agent profile (default coder)"
                 },
-                "model": {"type": "string"}
+                "subagent_type": {
+                    "type": "string",
+                    "description": "Alias for profile"
+                },
+                "model": {"type": "string"},
+                "resume": {
+                    "type": "string",
+                    "description": "Optional agent id to resume instead of spawning a new one"
+                },
+                "run_in_background": {
+                    "type": "boolean",
+                    "description": "If true, return immediately (default false — wait for completion)"
+                }
             },
             "required": ["description", "prompt"]
         })
     }
+    fn default_approve(&self) -> bool {
+        true
+    }
     async fn execute(&self, mut input: Value, ctx: &ToolContext) -> anyhow::Result<ToolOutput> {
-        if input.get("profile").is_none() {
+        if input.get("profile").is_none() && input.get("subagent_type").is_none() {
             if let Some(obj) = input.as_object_mut() {
-                obj.insert("profile".into(), Value::String("explore".into()));
+                obj.insert("profile".into(), Value::String("coder".into()));
             }
         }
-        self.inner.execute(input, ctx).await
+        let resume = input
+            .get("resume")
+            .or_else(|| input.get("resume_id"))
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let background = input
+            .get("run_in_background")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        let launched =
+            spawn_subagent(&self.subagent_mgr, &self.launch, input, ctx, resume).await?;
+        if launched.is_error || background {
+            return Ok(launched);
+        }
+
+        let id = launched
+            .content
+            .split("id=")
+            .nth(1)
+            .and_then(|s| {
+                s.split(|c: char| c == ')' || c == '.' || c.is_whitespace())
+                    .next()
+            })
+            .unwrap_or("")
+            .to_string();
+        if id.is_empty() {
+            return Ok(launched);
+        }
+
+        loop {
+            if ctx
+                .interrupted
+                .as_ref()
+                .is_some_and(|f| f.load(std::sync::atomic::Ordering::SeqCst))
+            {
+                let _ = self.subagent_mgr.stop(&id).await;
+                return Ok(ToolOutput::error("Agent interrupted"));
+            }
+            match self.subagent_mgr.get_state(&id).await {
+                Some(state)
+                    if matches!(
+                        state.status,
+                        SubagentStatus::Complete
+                            | SubagentStatus::Failed
+                            | SubagentStatus::Cancelled
+                    ) =>
+                {
+                    let mut out = format!(
+                        "Agent {} finished ({:?})\ndescription: {}\n",
+                        id, state.status, state.description
+                    );
+                    if let Some(r) = state.result {
+                        out.push('\n');
+                        out.push_str(&r);
+                    }
+                    if let Some(e) = state.error {
+                        out.push_str("\nerror: ");
+                        out.push_str(&e);
+                    }
+                    return Ok(ToolOutput::success(out));
+                }
+                None => return Ok(ToolOutput::error(format!("Agent {id} disappeared"))),
+                _ => {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+            }
+        }
     }
 }
 
@@ -306,12 +489,31 @@ impl Tool for AgentSwarmTool {
         "AgentSwarm"
     }
     fn description(&self) -> &str {
-        "Launch multiple subagents in parallel. Pass `agents` array of {description, prompt, profile?}."
+        "Launch multiple subagents in parallel. Pass `agents` array, or `prompt_template` + `items` \
+(`{{item}}` placeholder). Optional `resume_agent_ids` map resumes existing agents first."
     }
     fn parameters_schema(&self) -> Value {
         serde_json::json!({
             "type": "object",
             "properties": {
+                "description": {"type": "string", "description": "Short description for the whole swarm"},
+                "subagent_type": {"type": "string", "description": "Default profile for item-based spawns"},
+                "profile": {"type": "string"},
+                "model": {"type": "string"},
+                "prompt_template": {
+                    "type": "string",
+                    "description": "Prompt template; {{item}} is replaced per items entry"
+                },
+                "items": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "maxItems": 128
+                },
+                "resume_agent_ids": {
+                    "type": "object",
+                    "additionalProperties": {"type": "string"},
+                    "description": "Map of agent_id → prompt used to resume that agent"
+                },
                 "agents": {
                     "type": "array",
                     "items": {
@@ -325,20 +527,102 @@ impl Tool for AgentSwarmTool {
                         "required": ["description", "prompt"]
                     }
                 }
-            },
-            "required": ["agents"]
+            }
         })
     }
+    fn default_approve(&self) -> bool {
+        true
+    }
     async fn execute(&self, input: Value, ctx: &ToolContext) -> anyhow::Result<ToolOutput> {
+        let mut launched = Vec::new();
+        let swarm_desc = input
+            .get("description")
+            .and_then(|v| v.as_str())
+            .unwrap_or("swarm");
+        let default_profile = input
+            .get("subagent_type")
+            .or_else(|| input.get("profile"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("coder");
+        let default_model = input
+            .get("model")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+
+        if let Some(map) = input.get("resume_agent_ids").and_then(|v| v.as_object()) {
+            for (agent_id, prompt_v) in map {
+                let prompt = prompt_v.as_str().unwrap_or("");
+                if prompt.is_empty() {
+                    continue;
+                }
+                let resume_input = serde_json::json!({
+                    "description": format!("{swarm_desc}:{agent_id}"),
+                    "prompt": prompt,
+                    "profile": default_profile,
+                });
+                match spawn_subagent(
+                    &self.subagent_mgr,
+                    &self.launch,
+                    resume_input,
+                    ctx,
+                    Some(agent_id.clone()),
+                )
+                .await?
+                {
+                    out if out.is_error => return Ok(out),
+                    _ => launched.push(agent_id.clone()),
+                }
+            }
+        }
+
+        if let (Some(template), Some(items)) = (
+            input.get("prompt_template").and_then(|v| v.as_str()),
+            input.get("items").and_then(|v| v.as_array()),
+        ) {
+            if items.len() > MAX_AGENT_SWARM_SUBAGENTS {
+                return Ok(ToolOutput::error(format!(
+                    "items exceeds max {MAX_AGENT_SWARM_SUBAGENTS}"
+                )));
+            }
+            for (i, item) in items.iter().enumerate() {
+                let item_s = item.as_str().unwrap_or("").trim();
+                if item_s.is_empty() {
+                    continue;
+                }
+                let prompt = template.replace(PROMPT_TEMPLATE_PLACEHOLDER, item_s);
+                let agent_input = serde_json::json!({
+                    "description": format!("{swarm_desc}[{i}]"),
+                    "prompt": prompt,
+                    "profile": default_profile,
+                    "model": default_model,
+                });
+                match spawn_subagent(&self.subagent_mgr, &self.launch, agent_input, ctx, None)
+                    .await?
+                {
+                    out if out.is_error => {
+                        return Ok(ToolOutput::error(format!(
+                            "Failed after launching {}: {}",
+                            launched.join(", "),
+                            out.content
+                        )));
+                    }
+                    out => {
+                        if let Some(id) = out.content.split("id=").nth(1).and_then(|s| {
+                            s.split(|c: char| c == ')' || c == '.' || c.is_whitespace())
+                                .next()
+                        }) {
+                            launched.push(id.to_string());
+                        }
+                    }
+                }
+            }
+        }
+
         let agents = input
             .get("agents")
             .and_then(|v| v.as_array())
             .cloned()
             .unwrap_or_default();
-        if agents.is_empty() {
-            return Ok(ToolOutput::error("agents array is empty"));
-        }
-        let mut launched = Vec::new();
         for a in agents {
             let desc = a
                 .get("description")
@@ -348,33 +632,35 @@ impl Tool for AgentSwarmTool {
             if prompt.is_empty() {
                 continue;
             }
-            let config = SubagentConfig {
-                agent_id: uuid::Uuid::new_v4().to_string(),
-                description: desc.to_string(),
-                prompt: prompt.to_string(),
-                model: a.get("model").and_then(|v| v.as_str()).map(String::from),
-                working_dir: ctx.working_dir.to_string_lossy().to_string(),
-                profile: a
-                    .get("profile")
-                    .and_then(|v| v.as_str())
-                    .map(String::from)
-                    .or_else(|| Some("explore".into())),
-                parent_session_id: Some(ctx.session_id.clone()),
-                parent_tool_call_id: ctx.tool_call_id.clone(),
-            };
-            match self.subagent_mgr.spawn(config.clone()).await {
-                Ok(id) => {
-                    (self.launch)(config);
-                    launched.push(id);
-                }
-                Err(e) => {
+            let agent_input = serde_json::json!({
+                "description": desc,
+                "prompt": prompt,
+                "profile": a.get("profile").cloned().unwrap_or(Value::String(default_profile.into())),
+                "model": a.get("model").cloned().unwrap_or(Value::Null),
+            });
+            match spawn_subagent(&self.subagent_mgr, &self.launch, agent_input, ctx, None).await? {
+                out if out.is_error => {
                     return Ok(ToolOutput::error(format!(
                         "Failed after launching {}: {}",
                         launched.join(", "),
-                        e
+                        out.content
                     )));
                 }
+                out => {
+                    if let Some(id) = out.content.split("id=").nth(1).and_then(|s| {
+                        s.split(|c: char| c == ')' || c == '.' || c.is_whitespace())
+                            .next()
+                    }) {
+                        launched.push(id.to_string());
+                    }
+                }
             }
+        }
+
+        if launched.is_empty() {
+            return Ok(ToolOutput::error(
+                "No agents launched. Provide agents[], or prompt_template+items, and/or resume_agent_ids.",
+            ));
         }
         Ok(ToolOutput::success(format!(
             "Launched {} agents: {}\nUse TaskOutput / TaskList to collect results.",
@@ -386,11 +672,25 @@ impl Tool for AgentSwarmTool {
 
 pub struct TaskStopTool {
     subagent_mgr: Arc<SubagentManager>,
+    bash_shells: Option<Arc<BackgroundShellManager>>,
 }
 
 impl TaskStopTool {
     pub fn new(subagent_mgr: Arc<SubagentManager>) -> Self {
-        Self { subagent_mgr }
+        Self {
+            subagent_mgr,
+            bash_shells: None,
+        }
+    }
+
+    pub fn with_bash_shells(
+        subagent_mgr: Arc<SubagentManager>,
+        bash_shells: Arc<BackgroundShellManager>,
+    ) -> Self {
+        Self {
+            subagent_mgr,
+            bash_shells: Some(bash_shells),
+        }
     }
 }
 
@@ -400,7 +700,7 @@ impl Tool for TaskStopTool {
         "TaskStop"
     }
     fn description(&self) -> &str {
-        "Stop a running Task subagent by id. Use TaskList to find running tasks."
+        "Stop a running Task/Agent subagent or background Bash job by id."
     }
     fn parameters_schema(&self) -> Value {
         serde_json::json!({
@@ -408,7 +708,7 @@ impl Tool for TaskStopTool {
             "properties": {
                 "task_id": {
                     "type": "string",
-                    "description": "Subagent / task id returned by the Task tool"
+                    "description": "Subagent / task / shell id"
                 },
                 "agent_id": {
                     "type": "string",
@@ -427,12 +727,17 @@ impl Tool for TaskStopTool {
         if id.is_empty() {
             return Ok(ToolOutput::error("Missing task_id"));
         }
-        match self.subagent_mgr.stop(id).await {
-            Ok(state) => Ok(ToolOutput::success(format!(
+        if let Ok(state) = self.subagent_mgr.stop(id).await {
+            return Ok(ToolOutput::success(format!(
                 "Stopped task {} ({})",
                 state.agent_id, state.description
-            ))),
-            Err(e) => Ok(ToolOutput::error(e.to_string())),
+            )));
         }
+        if let Some(bash) = &self.bash_shells {
+            if bash.stop(id).await {
+                return Ok(ToolOutput::success(format!("Stopped bash task {id}")));
+            }
+        }
+        Ok(ToolOutput::error(format!("Unknown task_id: {id}")))
     }
 }

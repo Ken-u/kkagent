@@ -113,12 +113,7 @@ impl Tool for EnterPlanModeTool {
     fn parameters_schema(&self) -> Value {
         json!({
             "type": "object",
-            "properties": {
-                "reason": {
-                    "type": "string",
-                    "description": "Why plan mode is needed"
-                }
-            }
+            "properties": {}
         })
     }
 
@@ -126,14 +121,9 @@ impl Tool for EnterPlanModeTool {
         true
     }
 
-    async fn execute(&self, input: Value, _ctx: &ToolContext) -> anyhow::Result<ToolOutput> {
-        let reason = input
-            .get("reason")
-            .and_then(|v| v.as_str())
-            .unwrap_or("Planning before implementation");
-        Ok(ToolOutput::success(format!(
-            "Entered plan mode. Reason: {}. Explore, write the plan file, then call ExitPlanMode when ready for user approval (执行 / 修改意见 / 拒绝).",
-            reason
-        )))
+    async fn execute(&self, _input: Value, _ctx: &ToolContext) -> anyhow::Result<ToolOutput> {
+        Ok(ToolOutput::success(
+            "Entered plan mode. Explore with read-only tools, write the plan file, then call ExitPlanMode when ready for user approval (执行 / 修改意见 / 拒绝).",
+        ))
     }
 }

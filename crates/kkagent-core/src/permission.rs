@@ -29,6 +29,8 @@ const SENSITIVE_PATTERNS: &[&str] = &[
     "token",
 ];
 
+/// Default-approve set aligned with kimi `default-tool-approve`
+/// (Agent/AgentSwarm included; Skill is write-ish and requires ask).
 const READ_ONLY_TOOLS: &[&str] = &[
     "Read",
     "Grep",
@@ -44,7 +46,8 @@ const READ_ONLY_TOOLS: &[&str] = &[
     "TaskOutput",
     "CronList",
     "SelectTools",
-    "Skill",
+    "Agent",
+    "AgentSwarm",
 ];
 
 impl PermissionChain {
@@ -299,8 +302,27 @@ fn has_sensitive_file_access(tool_name: &str, input: &serde_json::Value) -> bool
         .and_then(|v| v.as_str())
         .unwrap_or("");
 
+    // Prefer path_policy for file tools (handles .env.example exemption).
+    if let Some(path) = input.get("path").and_then(|v| v.as_str()) {
+        if !kkagent_tools::path_policy::is_sensitive_path(std::path::Path::new(path)) {
+            // Still scan bash commands for credential tokens below when tool is Bash.
+            if tool_name != "Bash" {
+                return false;
+            }
+        } else {
+            return true;
+        }
+    }
+
     for pattern in SENSITIVE_PATTERNS {
         if path_str.contains(pattern) {
+            // Allow common non-secret templates in command strings too.
+            if path_str.contains(".env.example")
+                || path_str.contains(".env.sample")
+                || path_str.contains(".env.template")
+            {
+                continue;
+            }
             return true;
         }
     }

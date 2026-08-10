@@ -22,6 +22,7 @@ pub use registry::*;
 
 use async_trait::async_trait;
 use serde_json::Value;
+use std::path::Path;
 
 #[async_trait]
 pub trait Tool: Send + Sync {
@@ -30,6 +31,22 @@ pub trait Tool: Send + Sync {
     fn parameters_schema(&self) -> Value;
     fn read_only(&self) -> bool {
         false
+    }
+    /// Per-call resource accesses (defaults to static inference).
+    fn accesses(&self, input: &Value, working_dir: &Path) -> ToolAccesses {
+        infer_accesses(self.name(), input, working_dir)
+    }
+    /// Approval rule subject (defaults to tool name).
+    fn approval_rule(&self) -> &str {
+        self.name()
+    }
+    /// Whether this tool is in the default-approve set (manual mode).
+    fn default_approve(&self) -> bool {
+        self.read_only()
+    }
+    /// Optional chip/summary schema override (falls back to global table).
+    fn display_schema(&self) -> Option<ToolDisplaySchema> {
+        None
     }
     async fn execute(&self, input: Value, ctx: &ToolContext) -> anyhow::Result<ToolOutput>;
 }
@@ -51,6 +68,12 @@ pub struct MediaOutput {
     pub data: String,
 }
 
+/// Steer / delivery payload injected into the next model turn (not shown as tool UI body).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolDelivery {
+    pub message: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct ToolOutput {
     pub content: String,
@@ -61,6 +84,10 @@ pub struct ToolOutput {
     pub images: Vec<MediaOutput>,
     /// When true, the agent loop should end the turn after applying this result.
     pub stop_turn: bool,
+    /// Side channel for the model only (`<system>` block). Not sent to the TUI event.
+    pub note: Option<String>,
+    /// Optional steer message delivered after this tool result into the next turn.
+    pub delivery: Option<ToolDelivery>,
 }
 
 impl ToolOutput {
@@ -71,6 +98,8 @@ impl ToolOutput {
             data: None,
             images: Vec::new(),
             stop_turn: false,
+            note: None,
+            delivery: None,
         }
     }
 
@@ -81,6 +110,8 @@ impl ToolOutput {
             data: Some(data),
             images: Vec::new(),
             stop_turn: false,
+            note: None,
+            delivery: None,
         }
     }
 
@@ -91,6 +122,8 @@ impl ToolOutput {
             data: None,
             images: Vec::new(),
             stop_turn: false,
+            note: None,
+            delivery: None,
         }
     }
 
@@ -101,6 +134,8 @@ impl ToolOutput {
             data: None,
             images: Vec::new(),
             stop_turn: true,
+            note: None,
+            delivery: None,
         }
     }
 
@@ -110,6 +145,35 @@ impl ToolOutput {
             data: data.into(),
         });
         self
+    }
+
+    pub fn with_note(mut self, note: impl Into<String>) -> Self {
+        self.note = Some(note.into());
+        self
+    }
+
+    pub fn with_delivery(mut self, message: impl Into<String>) -> Self {
+        self.delivery = Some(ToolDelivery {
+            message: message.into(),
+        });
+        self
+    }
+
+    /// Content projected to the model (content + optional `<system>` note).
+    pub fn model_content(&self) -> String {
+        match &self.note {
+            Some(note) if !note.trim().is_empty() => {
+                let note = note.trim();
+                if self.content.is_empty() {
+                    format!("<system>\n{note}\n</system>")
+                } else if self.content.ends_with('\n') {
+                    format!("{}<system>\n{note}\n</system>", self.content)
+                } else {
+                    format!("{}\n<system>\n{note}\n</system>", self.content)
+                }
+            }
+            _ => self.content.clone(),
+        }
     }
 }
 

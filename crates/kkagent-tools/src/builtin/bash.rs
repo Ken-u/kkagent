@@ -11,9 +11,10 @@ use uuid::Uuid;
 use crate::{Tool, ToolContext, ToolOutput};
 
 const MAX_OUTPUT: usize = 50_000;
-const DEFAULT_TIMEOUT_MS: u64 = 120_000;
-const MAX_TIMEOUT_MS: u64 = 600_000;
-const MAX_BG_TIMEOUT_MS: u64 = 3_600_000;
+const DEFAULT_TIMEOUT_S: u64 = 60;
+const MAX_TIMEOUT_S: u64 = 300; // 5 minutes foreground
+const DEFAULT_BG_TIMEOUT_S: u64 = 600;
+const MAX_BG_TIMEOUT_S: u64 = 86_400; // 24h
 const MAX_BACKGROUND_JOBS: usize = 256;
 const MAX_RUNNING_JOBS: usize = 16;
 
@@ -136,11 +137,39 @@ impl BackgroundShellManager {
         }
     }
 
-    async fn snapshot(&self, id: &str) -> Option<ShellJob> {
-        self.jobs.lock().await.get(id).cloned()
+    pub async fn snapshot(
+        &self,
+        id: &str,
+    ) -> Option<(String, String, String, String, Option<i32>, bool)> {
+        let job = self.jobs.lock().await.get(id)?.clone();
+        Some((
+            job.description,
+            job.command,
+            format!("{:?}", job.status).to_lowercase(),
+            job.output,
+            job.exit_code,
+            job.status == ShellStatus::Running,
+        ))
     }
 
-    async fn stop(&self, id: &str) -> bool {
+    /// List all known background shell jobs (for TaskList unification).
+    pub async fn list_jobs(&self) -> Vec<(String, String, String, bool)> {
+        self.jobs
+            .lock()
+            .await
+            .iter()
+            .map(|(id, job)| {
+                (
+                    id.clone(),
+                    job.description.clone(),
+                    format!("{:?}", job.status).to_lowercase(),
+                    job.status == ShellStatus::Running,
+                )
+            })
+            .collect()
+    }
+
+    pub async fn stop(&self, id: &str) -> bool {
         let jobs = self.jobs.lock().await;
         let Some(job) = jobs.get(id) else {
             return false;
@@ -188,9 +217,9 @@ impl Tool for BashTool {
         "Bash"
     }
     fn description(&self) -> &str {
-        "Execute a shell command. Supports cwd, description, timeout_ms, and \
-run_in_background. Foreground timeouts detach to background when configured \
-(poll with shell_id). Pass shell_id alone to fetch status/output."
+        "Execute a shell command. Supports cwd, description, timeout (seconds), \
+run_in_background, and disable_timeout (background only). Prefer TaskOutput/TaskStop \
+for background jobs (shell_id/stop remain as aliases)."
     }
     fn parameters_schema(&self) -> Value {
         json!({
@@ -199,10 +228,18 @@ run_in_background. Foreground timeouts detach to background when configured \
                 "command": {"type": "string", "description": "Shell command to execute"},
                 "cwd": {"type": "string", "description": "Working directory (absolute or relative to session cwd)"},
                 "description": {"type": "string", "description": "Short description of what this command does"},
-                "timeout_ms": {"type": "integer", "description": "Timeout in milliseconds (default: 120000)"},
-                "run_in_background": {"type": "boolean", "description": "Start in background and return a shell_id immediately"},
-                "shell_id": {"type": "string", "description": "Poll a previously started background shell"},
-                "stop": {"type": "boolean", "description": "With shell_id, stop the background process tree"}
+                "timeout": {
+                    "type": "integer",
+                    "description": format!(
+                        "Timeout in seconds. Foreground default {DEFAULT_TIMEOUT_S}s (max {MAX_TIMEOUT_S}s); \
+background default {DEFAULT_BG_TIMEOUT_S}s (max {MAX_BG_TIMEOUT_S}s). Ignored when disable_timeout=true on background."
+                    )
+                },
+                "timeout_ms": {"type": "integer", "description": "Deprecated alias for timeout (milliseconds)"},
+                "run_in_background": {"type": "boolean", "description": "Start in background and return a shell_id / task id immediately"},
+                "disable_timeout": {"type": "boolean", "description": "If true, do not apply a timeout. Only applies when run_in_background is true."},
+                "shell_id": {"type": "string", "description": "Poll a previously started background shell (prefer TaskOutput)"},
+                "stop": {"type": "boolean", "description": "With shell_id, stop the background process tree (prefer TaskStop)"}
             }
         })
     }
@@ -256,14 +293,15 @@ run_in_background. Foreground timeouts detach to background when configured \
             .get("run_in_background")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        let timeout_ms = input
-            .get("timeout_ms")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(DEFAULT_TIMEOUT_MS);
-        let timeout_ms = if run_in_background {
-            timeout_ms.min(MAX_BG_TIMEOUT_MS)
+        let disable_timeout = input
+            .get("disable_timeout")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+            && run_in_background;
+        let timeout_ms = if disable_timeout {
+            None
         } else {
-            timeout_ms.min(MAX_TIMEOUT_MS)
+            Some(resolve_timeout_ms(&input, run_in_background))
         };
 
         if run_in_background {
@@ -284,6 +322,10 @@ run_in_background. Foreground timeouts detach to background when configured \
             if !safety_note.is_empty() {
                 out.content = format!("{safety_note}{}", out.content);
             }
+            // Also emit a delivery hint so the model can collect via Task*.
+            out = out.with_delivery(
+                "<system>Background bash started. Use TaskOutput/TaskStop with the shell_id when ready.</system>",
+            );
             return Ok(out);
         }
 
@@ -293,7 +335,7 @@ run_in_background. Foreground timeouts detach to background when configured \
                 command,
                 description,
                 cwd,
-                timeout_ms,
+                timeout_ms.unwrap_or(DEFAULT_TIMEOUT_S * 1000),
                 ctx.interrupted.clone(),
             )
             .await?;
@@ -304,30 +346,50 @@ run_in_background. Foreground timeouts detach to background when configured \
     }
 }
 
+fn resolve_timeout_ms(input: &Value, run_in_background: bool) -> u64 {
+    if let Some(ms) = input.get("timeout_ms").and_then(|v| v.as_u64()) {
+        let cap = if run_in_background {
+            MAX_BG_TIMEOUT_S * 1000
+        } else {
+            MAX_TIMEOUT_S * 1000
+        };
+        return ms.min(cap);
+    }
+    let default_s = if run_in_background {
+        DEFAULT_BG_TIMEOUT_S
+    } else {
+        DEFAULT_TIMEOUT_S
+    };
+    let cap_s = if run_in_background {
+        MAX_BG_TIMEOUT_S
+    } else {
+        MAX_TIMEOUT_S
+    };
+    let secs = input
+        .get("timeout")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(default_s)
+        .min(cap_s);
+    secs.saturating_mul(1000)
+}
+
 impl BashTool {
     async fn poll_shell(&self, shell_id: &str) -> ToolOutput {
         match self.backgrounds.snapshot(shell_id).await {
             None => ToolOutput::error(format!("Unknown shell_id: {}", shell_id)),
-            Some(job) => {
-                let status = match job.status {
-                    ShellStatus::Running => "running",
-                    ShellStatus::Complete => "complete",
-                    ShellStatus::Failed => "failed",
-                    ShellStatus::TimedOut => "timed_out",
-                    ShellStatus::Cancelled => "cancelled",
-                };
+            Some((description, _command, status, output, exit_code, running)) => {
                 let mut out = format!(
-                    "shell_id: {}\nstatus: {}\ndescription: {}\ncommand: {}",
-                    shell_id, status, job.description, job.command
+                    "shell_id: {}\nstatus: {}\ndescription: {}",
+                    shell_id, status, description
                 );
-                if let Some(code) = job.exit_code {
+                if let Some(code) = exit_code {
                     out.push_str(&format!("\nexit_code: {}", code));
                 }
-                if !job.output.is_empty() {
+                if !output.is_empty() {
                     out.push_str("\n\n");
-                    out.push_str(&truncate_chars(&job.output, MAX_OUTPUT));
-                } else if job.status == ShellStatus::Running {
-                    out.push_str("\n\n(still running — call Bash again with this shell_id)");
+                    out.push_str(&truncate_chars(&output, MAX_OUTPUT));
+                } else if running {
+                    out.push_str("\n\n(still running — call TaskOutput/Bash again with this id)");
                 }
                 ToolOutput::success(out)
             }
@@ -340,7 +402,7 @@ impl BashTool {
         command: String,
         description: String,
         cwd: PathBuf,
-        timeout_ms: u64,
+        timeout_ms: Option<u64>,
     ) -> anyhow::Result<ToolOutput> {
         let id = Uuid::new_v4().to_string();
         let cancel = match self
@@ -356,21 +418,12 @@ impl BashTool {
         let id_clone = id.clone();
         let sandbox = self.options.sandbox.clone();
         tokio::spawn(async move {
-            run_shell_job(
-                mgr,
-                id_clone,
-                command,
-                cwd,
-                Some(timeout_ms),
-                cancel,
-                sandbox,
-            )
-            .await;
+            run_shell_job(mgr, id_clone, command, cwd, timeout_ms, cancel, sandbox).await;
         });
 
         Ok(ToolOutput::success(format!(
             "Background shell started: {description} (shell_id={id}). \
-Poll with Bash({{\"shell_id\":\"{id}\"}})."
+Also available as task_id={id} via TaskOutput/TaskStop."
         )))
     }
 
@@ -499,7 +552,7 @@ Poll with Bash({{\"shell_id\":\"{id}\"}})."
                         let _sandbox_guard = sandbox_guard;
                         let waited = tokio::select! {
                             result = tokio::time::timeout(
-                                tokio::time::Duration::from_millis(MAX_BG_TIMEOUT_MS),
+                                tokio::time::Duration::from_millis(MAX_BG_TIMEOUT_S * 1000),
                                 child.wait(),
                             ) => Some(result),
                             _ = wait_for_interrupt(Some(cancel)) => None,
@@ -974,8 +1027,13 @@ mod tests {
             .content
             .split("shell_id=")
             .nth(1)
-            .and_then(|tail| tail.split(')').next())
+            .and_then(|tail| tail.split([')', ' ', '/', '.']).next())
             .expect("shell id in start response");
+        assert!(
+            !id.contains("task_id"),
+            "parsed shell id should be bare uuid, got {id:?} from {}",
+            started.content
+        );
 
         let stopped = tool
             .execute(json!({"shell_id": id, "stop": true}), &context(None))

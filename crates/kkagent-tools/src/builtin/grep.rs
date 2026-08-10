@@ -21,8 +21,8 @@ impl Tool for GrepTool {
     }
     fn description(&self) -> &str {
         "Search for a regex pattern across files. Supports output_mode \
-(content/files_with_matches/count), context lines (-A/-B/-C), head_limit/offset, \
-glob/type filters, and case_insensitive."
+(content/files_with_matches/count_matches), context (-A/-B/-C), -i/-n, \
+multiline, head_limit/offset, and glob/type filters."
     }
     fn read_only(&self) -> bool {
         true
@@ -35,19 +35,25 @@ glob/type filters, and case_insensitive."
                 "path": {"type": "string", "description": "Directory or file to search in (defaults to cwd)"},
                 "glob": {"type": "string", "description": "File glob pattern filter (e.g. '*.rs')"},
                 "type": {"type": "string", "description": "ripgrep file type filter (e.g. 'rust', 'py')"},
-                "case_insensitive": {"type": "boolean", "description": "Case-insensitive search"},
+                "-i": {"type": "boolean", "description": "Case-insensitive search (alias: case_insensitive)"},
+                "case_insensitive": {"type": "boolean", "description": "Deprecated alias for -i"},
                 "output_mode": {
                     "type": "string",
-                    "enum": ["content", "files_with_matches", "count"],
-                    "description": "Output mode (default: content)"
+                    "enum": ["content", "files_with_matches", "count_matches", "count"],
+                    "description": "Output mode (default: files_with_matches). `count` is an alias for count_matches."
                 },
-                "context": {"type": "integer", "description": "Lines of context around each match (-C)"},
-                "context_before": {"type": "integer", "description": "Lines before each match (-B)"},
-                "context_after": {"type": "integer", "description": "Lines after each match (-A)"},
+                "-n": {"type": "boolean", "description": "Show line numbers in content mode (default true)"},
+                "-C": {"type": "integer", "description": "Lines of context around each match"},
+                "-B": {"type": "integer", "description": "Lines before each match"},
+                "-A": {"type": "integer", "description": "Lines after each match"},
+                "context": {"type": "integer", "description": "Deprecated alias for -C"},
+                "context_before": {"type": "integer", "description": "Deprecated alias for -B"},
+                "context_after": {"type": "integer", "description": "Deprecated alias for -A"},
                 "head_limit": {"type": "integer", "description": "Max results to return (default 200)"},
                 "offset": {"type": "integer", "description": "Skip first N results"},
-                "include_ignored": {"type": "boolean", "description": "Search ignored files (default false)"},
-                "timeout_ms": {"type": "integer", "description": "Timeout in milliseconds (default 60000, max 120000)"}
+                "multiline": {"type": "boolean", "description": "Enable multiline matching (. matches newlines)"},
+                "include_ignored": {"type": "boolean", "description": "Extension: search ignored files (default false)"},
+                "timeout_ms": {"type": "integer", "description": "Extension: timeout in milliseconds (default 60000, max 120000)"}
             },
             "required": ["pattern"]
         })
@@ -62,13 +68,24 @@ glob/type filters, and case_insensitive."
         let glob_pattern = input.get("glob").and_then(|v| v.as_str());
         let file_type = input.get("type").and_then(|v| v.as_str());
         let case_insensitive = input
-            .get("case_insensitive")
+            .get("-i")
+            .or_else(|| input.get("case_insensitive"))
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        let output_mode = input
+        let output_mode_raw = input
             .get("output_mode")
             .and_then(|v| v.as_str())
-            .unwrap_or("content");
+            .unwrap_or("files_with_matches");
+        let output_mode = match output_mode_raw {
+            "count" | "count_matches" => "count_matches",
+            "content" => "content",
+            _ => "files_with_matches",
+        };
+        let show_line_numbers = input.get("-n").and_then(|v| v.as_bool()).unwrap_or(true);
+        let multiline = input
+            .get("multiline")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         let head_limit = input
             .get("head_limit")
             .and_then(|v| v.as_u64())
@@ -78,9 +95,18 @@ glob/type filters, and case_insensitive."
             .get("include_ignored")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        let context = input.get("context").and_then(|v| v.as_u64());
-        let context_before = input.get("context_before").and_then(|v| v.as_u64());
-        let context_after = input.get("context_after").and_then(|v| v.as_u64());
+        let context = input
+            .get("-C")
+            .or_else(|| input.get("context"))
+            .and_then(|v| v.as_u64());
+        let context_before = input
+            .get("-B")
+            .or_else(|| input.get("context_before"))
+            .and_then(|v| v.as_u64());
+        let context_after = input
+            .get("-A")
+            .or_else(|| input.get("context_after"))
+            .and_then(|v| v.as_u64());
         let timeout_ms = input
             .get("timeout_ms")
             .and_then(Value::as_u64)
@@ -103,16 +129,24 @@ glob/type filters, and case_insensitive."
             "files_with_matches" => {
                 cmd.arg("--files-with-matches");
             }
-            "count" => {
+            "count_matches" => {
                 cmd.arg("--count");
             }
             _ => {
-                cmd.arg("--line-number").arg("--no-heading");
+                if show_line_numbers {
+                    cmd.arg("--line-number");
+                } else {
+                    cmd.arg("--no-line-number");
+                }
+                cmd.arg("--no-heading");
             }
         }
 
         if case_insensitive {
             cmd.arg("--ignore-case");
+        }
+        if multiline {
+            cmd.arg("--multiline").arg("--multiline-dotall");
         }
         if include_ignored {
             cmd.arg("--no-ignore");
@@ -186,7 +220,8 @@ glob/type filters, and case_insensitive."
                 _ = tokio::time::sleep_until(deadline) => {
                     terminate_process_tree(&mut child).await;
                     let _ = stderr_task.await;
-                    return Ok(ToolOutput::error(format!("Search timed out after {timeout_ms}ms")));
+                    return Ok(ToolOutput::error(format!("Search timed out after {timeout_ms}ms"))
+                        .with_note("Ripgrep aborted due to timeout. Narrow the path/glob or raise timeout_ms."));
                 }
                 _ = wait_for_interrupt(ctx.interrupted.clone()) => {
                     terminate_process_tree(&mut child).await;
@@ -203,7 +238,7 @@ glob/type filters, and case_insensitive."
                 break;
             }
             lines.push(line);
-            if output_mode != "count" && lines.len() >= fetch {
+            if lines.len() >= fetch {
                 output_truncated = true;
                 break;
             }
@@ -234,7 +269,7 @@ glob/type filters, and case_insensitive."
             }));
         }
 
-        if output_mode == "count" {
+        if output_mode == "count_matches" {
             // Aggregate: path:count → total / per-file
             let mut by_file: HashMap<String, u64> = HashMap::new();
             let mut total = 0u64;
@@ -266,7 +301,9 @@ glob/type filters, and case_insensitive."
                 ));
             }
             if output_truncated {
-                result.push_str("\n... count output truncated at 10 MiB safety limit ...");
+                return Ok(ToolOutput::success(result).with_note(
+                    "Count output truncated at safety limit; refine path/glob or raise head_limit.",
+                ));
             }
             return Ok(ToolOutput::success(result));
         }
@@ -284,21 +321,25 @@ glob/type filters, and case_insensitive."
             .take(take)
             .collect();
         let mut result = sliced.join("\n");
+        if result.is_empty() {
+            result = "No matches found.".into();
+        }
+        let mut note = None;
         if offset + sliced.len() < total {
-            result.push_str(&format!(
-                "\n... {} more results (offset={}, head_limit={}) ...",
+            note = Some(format!(
+                "{} more results not shown (offset={}, head_limit={}).",
                 total.saturating_sub(offset + sliced.len()),
                 offset,
                 head_limit
             ));
+        } else if output_truncated && head_limit == 0 {
+            note = Some("Output truncated at 10 MiB safety limit.".into());
         }
-        if result.is_empty() {
-            result = "No matches found.".into();
+        let mut out = ToolOutput::success(result);
+        if let Some(n) = note {
+            out = out.with_note(n);
         }
-        if output_truncated && head_limit == 0 {
-            result.push_str("\n... output truncated at 10 MiB safety limit ...");
-        }
-        Ok(ToolOutput::success(result))
+        Ok(out)
     }
 }
 

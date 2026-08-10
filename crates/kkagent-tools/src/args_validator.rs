@@ -1,4 +1,4 @@
-//! Lightweight JSON-schema-ish argument validation for tools.
+//! JSON Schema argument validation (draft-07 / 2019-09 / 2020-12 via jsonschema).
 
 use serde_json::Value;
 
@@ -43,6 +43,47 @@ pub fn validate_required_keys(input: &Value, keys: &[&str]) -> Result<(), Valida
     Ok(())
 }
 
+/// Validate `input` against a JSON Schema (tool `parameters_schema`).
+/// Returns Ok when schema is empty/invalid (tools keep failing at execute), or when input passes.
+pub fn validate_against_schema(schema: &Value, input: &Value) -> Result<(), ValidationError> {
+    if !schema.is_object() {
+        return Ok(());
+    }
+    let validator = match jsonschema::validator_for(schema) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::debug!("tool schema compile skipped: {e}");
+            return Ok(());
+        }
+    };
+    let errors: Vec<String> = validator
+        .iter_errors(input)
+        .take(8)
+        .map(|e| {
+            let path = e.instance_path.to_string();
+            if path.is_empty() {
+                e.to_string()
+            } else {
+                format!("{path}: {e}")
+            }
+        })
+        .collect();
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(ValidationError {
+            message: format!(
+                "Invalid tool arguments:\n{}",
+                errors
+                    .into_iter()
+                    .map(|e| format!("- {e}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -52,5 +93,26 @@ mod tests {
     fn require_string_ok() {
         let v = json!({"path": "a.rs"});
         assert_eq!(require_string(&v, "path").unwrap(), "a.rs");
+    }
+
+    #[test]
+    fn schema_rejects_missing_required() {
+        let schema = json!({
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"]
+        });
+        let err = validate_against_schema(&schema, &json!({})).unwrap_err();
+        assert!(err.message.contains("path") || err.message.contains("required"));
+    }
+
+    #[test]
+    fn schema_accepts_valid() {
+        let schema = json!({
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"]
+        });
+        assert!(validate_against_schema(&schema, &json!({"path": "a.rs"})).is_ok());
     }
 }
