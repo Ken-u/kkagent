@@ -359,7 +359,10 @@ pub fn filter_slash_commands_with_extras(
 /// Build kimi-style skill slash commands (`skill:name`).
 pub fn build_skill_slash_commands(
     skills: &[(String, String)],
-) -> (Vec<SlashSuggestion>, std::collections::HashMap<String, String>) {
+) -> (
+    Vec<SlashSuggestion>,
+    std::collections::HashMap<String, String>,
+) {
     let mut command_map = std::collections::HashMap::new();
     let mut commands = Vec::new();
     let mut sorted = skills.to_vec();

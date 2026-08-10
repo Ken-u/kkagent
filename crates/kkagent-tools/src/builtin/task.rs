@@ -407,8 +407,7 @@ Pass resume to continue an existing agent id."
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
-        let launched =
-            spawn_subagent(&self.subagent_mgr, &self.launch, input, ctx, resume).await?;
+        let launched = spawn_subagent(&self.subagent_mgr, &self.launch, input, ctx, resume).await?;
         if launched.is_error || background {
             return Ok(launched);
         }

@@ -717,7 +717,10 @@ fn push_skill_activation_lines(
             let preview: String = if trimmed.chars().count() > SKILL_ARGS_PREVIEW_MAX {
                 format!(
                     "{}…",
-                    trimmed.chars().take(SKILL_ARGS_PREVIEW_MAX).collect::<String>()
+                    trimmed
+                        .chars()
+                        .take(SKILL_ARGS_PREVIEW_MAX)
+                        .collect::<String>()
                 )
             } else {
                 trimmed.to_string()

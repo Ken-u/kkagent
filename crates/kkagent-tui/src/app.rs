@@ -726,10 +726,7 @@ impl TuiApp {
 
     /// New sessions inherit the global config default until `/model` overrides them.
     fn bind_config_default_model(&mut self) {
-        self.state.model_alias = self
-            .config
-            .default_model_alias()
-            .map(|s| s.to_string());
+        self.state.model_alias = self.config.default_model_alias().map(|s| s.to_string());
     }
 
     pub async fn run(mut self, resume: Option<String>) -> anyhow::Result<()> {
@@ -2208,7 +2205,11 @@ impl TuiApp {
                         self.system_message(format!(
                             "Skill {} {}",
                             item.id,
-                            if enable { "enabled" } else { "disabled (saved)" }
+                            if enable {
+                                "enabled"
+                            } else {
+                                "disabled (saved)"
+                            }
                         ));
                     }
                     Err(e) => self.system_message(format!("Failed to update skill: {e}")),
@@ -2223,7 +2224,11 @@ impl TuiApp {
                         self.system_message(format!(
                             "MCP {} {}",
                             item.id,
-                            if enable { "enabled" } else { "disabled (saved)" }
+                            if enable {
+                                "enabled"
+                            } else {
+                                "disabled (saved)"
+                            }
                         ));
                     }
                     Err(e) => self.system_message(format!("Failed to update MCP: {e}")),
@@ -2248,10 +2253,7 @@ impl TuiApp {
                         if name.is_empty() {
                             continue;
                         }
-                        let enabled = s
-                            .get("enabled")
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(true);
+                        let enabled = s.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
                         let desc = s
                             .get("description")
                             .and_then(|v| v.as_str())
@@ -2312,18 +2314,12 @@ impl TuiApp {
                         if name.is_empty() {
                             continue;
                         }
-                        let enabled = s
-                            .get("enabled")
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(true);
+                        let enabled = s.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
                         let connected = s
                             .get("connected")
                             .and_then(|v| v.as_bool())
                             .unwrap_or(false);
-                        let transport = s
-                            .get("transport")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("?");
+                        let transport = s.get("transport").and_then(|v| v.as_str()).unwrap_or("?");
                         let mark = if enabled { "●" } else { "○" };
                         let state = if enabled { "on" } else { "off" };
                         let link = if connected { "connected" } else { "idle" };
@@ -3023,39 +3019,36 @@ impl TuiApp {
 
     async fn open_plugins_picker(&mut self) -> anyhow::Result<()> {
         let mut items = Vec::new();
-        match self.client.rpc_call("plugins.list", None).await {
-            Ok(v) => {
-                if let Some(arr) = v.get("plugins").and_then(|p| p.as_array()) {
-                    for p in arr {
-                        let name = p
-                            .get("name")
-                            .or_else(|| p.get("id"))
-                            .and_then(|x| x.as_str())
-                            .unwrap_or("plugin")
-                            .to_string();
-                        let detail = p
-                            .get("path")
-                            .or_else(|| p.get("version"))
-                            .and_then(|x| x.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        items.push(ListPickerItem {
-                            id: name.clone(),
-                            label: name,
-                            detail,
-                        });
-                    }
-                } else if let Some(obj) = v.as_object() {
-                    for (k, val) in obj {
-                        items.push(ListPickerItem {
-                            id: k.clone(),
-                            label: k.clone(),
-                            detail: val.to_string(),
-                        });
-                    }
+        if let Ok(v) = self.client.rpc_call("plugins.list", None).await {
+            if let Some(arr) = v.get("plugins").and_then(|p| p.as_array()) {
+                for p in arr {
+                    let name = p
+                        .get("name")
+                        .or_else(|| p.get("id"))
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("plugin")
+                        .to_string();
+                    let detail = p
+                        .get("path")
+                        .or_else(|| p.get("version"))
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    items.push(ListPickerItem {
+                        id: name.clone(),
+                        label: name,
+                        detail,
+                    });
+                }
+            } else if let Some(obj) = v.as_object() {
+                for (k, val) in obj {
+                    items.push(ListPickerItem {
+                        id: k.clone(),
+                        label: k.clone(),
+                        detail: val.to_string(),
+                    });
                 }
             }
-            Err(_) => {}
         }
         if items.is_empty() {
             let dir = kkagent_config::default_config_dir().join("plugins");
@@ -3133,8 +3126,7 @@ impl TuiApp {
             Ok(config) => {
                 self.config = config;
                 self.system_message(
-                    "Config reloaded from disk. Server-side MCP/hooks may need a restart."
-                        .into(),
+                    "Config reloaded from disk. Server-side MCP/hooks may need a restart.".into(),
                 );
             }
             Err(e) => self.system_message(format!("Reload failed: {e}")),
@@ -3368,10 +3360,11 @@ impl TuiApp {
             return Ok(());
         };
         let params = serde_json::json!({"limit": 80, "include_archived": false});
-        let data = match self.client.rpc_call("sessions.list", Some(params)).await {
-            Ok(v) => Some(v),
-            Err(_) => None,
-        };
+        let data = self
+            .client
+            .rpc_call("sessions.list", Some(params))
+            .await
+            .ok();
         self.apply_workspace_sessions_list(data);
         Ok(())
     }
@@ -4682,11 +4675,7 @@ impl TuiApp {
                                 &evt_sid[..8.min(evt_sid.len())]
                             ));
                         }
-                        AgentEvent::CompactCompleted {
-                            deleted,
-                            error,
-                            ..
-                        } => {
+                        AgentEvent::CompactCompleted { deleted, error, .. } => {
                             self.state.tab_strip.mark_dirty(&evt_sid, true);
                             if let Some(err) = error {
                                 self.system_message(format!(
@@ -5000,10 +4989,7 @@ impl TuiApp {
                         skill_args,
                         ..
                     } => {
-                        self.push_skill_activation(
-                            &skill_name,
-                            skill_args.as_deref(),
-                        );
+                        self.push_skill_activation(&skill_name, skill_args.as_deref());
                         self.state.follow_bottom = true;
                     }
                 }

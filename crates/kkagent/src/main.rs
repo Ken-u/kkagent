@@ -1968,18 +1968,24 @@ async fn build_turn_tool_registry(
         state.subagents.clone(),
         launch,
     )));
-    tools.register(Arc::new(kkagent_tools::builtin::TaskOutputTool::with_bash_shells(
-        state.subagents.clone(),
-        state.bash_shells.clone(),
-    )));
-    tools.register(Arc::new(kkagent_tools::builtin::TaskListTool::with_bash_shells(
-        state.subagents.clone(),
-        state.bash_shells.clone(),
-    )));
-    tools.register(Arc::new(kkagent_tools::builtin::TaskStopTool::with_bash_shells(
-        state.subagents.clone(),
-        state.bash_shells.clone(),
-    )));
+    tools.register(Arc::new(
+        kkagent_tools::builtin::TaskOutputTool::with_bash_shells(
+            state.subagents.clone(),
+            state.bash_shells.clone(),
+        ),
+    ));
+    tools.register(Arc::new(
+        kkagent_tools::builtin::TaskListTool::with_bash_shells(
+            state.subagents.clone(),
+            state.bash_shells.clone(),
+        ),
+    ));
+    tools.register(Arc::new(
+        kkagent_tools::builtin::TaskStopTool::with_bash_shells(
+            state.subagents.clone(),
+            state.bash_shells.clone(),
+        ),
+    ));
     tools.register(Arc::new(kkagent_tools::builtin::CreateGoalTool::new(
         state.goal_mgr.clone(),
     )));

@@ -63,9 +63,8 @@ pub fn render_model_tool_skill_prompt(
     skill_dir: Option<&str>,
     trigger: &str,
 ) -> String {
-    let body = format!(
-        "Skill tool loaded instructions for this request. Follow them.\n\n{skill_content}"
-    );
+    let body =
+        format!("Skill tool loaded instructions for this request. Follow them.\n\n{skill_content}");
     render_skill_loaded_block(skill_name, skill_args, &body, trigger, skill_dir)
 }
 

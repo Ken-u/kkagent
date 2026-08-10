@@ -95,7 +95,12 @@ pub fn decode_text(bytes: &[u8]) -> Result<String, String> {
     if bytes.len() >= 4 && bytes.len().is_multiple_of(2) {
         let sample = &bytes[..bytes.len().min(512)];
         let even_nul = sample.iter().step_by(2).filter(|&&b| b == 0).count();
-        let odd_nul = sample.iter().skip(1).step_by(2).filter(|&&b| b == 0).count();
+        let odd_nul = sample
+            .iter()
+            .skip(1)
+            .step_by(2)
+            .filter(|&&b| b == 0)
+            .count();
         let pairs = sample.len() / 2;
         if pairs > 0 && even_nul * 2 > pairs {
             return decode_utf16(bytes, true); // LE: ASCII as XX 00

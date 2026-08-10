@@ -331,18 +331,13 @@ impl MdWriter {
             Event::Rule => {
                 self.flush_line();
                 let n = self.content_width().min(80);
-                self.out.push(Line::from(Span::styled(
-                    "─".repeat(n),
-                    self.styles.hr,
-                )));
+                self.out
+                    .push(Line::from(Span::styled("─".repeat(n), self.styles.hr)));
                 self.push_blank();
             }
             Event::Html(html) | Event::InlineHtml(html) => self.push_html(&html),
             Event::FootnoteReference(name) => {
-                self.push_span(Span::styled(
-                    format!("[{name}]"),
-                    self.styles.link_url,
-                ));
+                self.push_span(Span::styled(format!("[{name}]"), self.styles.link_url));
             }
             Event::TaskListMarker(checked) => {
                 let mark = if checked { "[x] " } else { "[ ] " };
@@ -479,10 +474,7 @@ impl MdWriter {
                     let label = std::mem::take(&mut self.link_text);
                     let href_cmp = href.strip_prefix("mailto:").unwrap_or(&href);
                     if !label.is_empty() && label != href && label != href_cmp {
-                        self.push_span(Span::styled(
-                            format!(" ({href})"),
-                            self.styles.link_url,
-                        ));
+                        self.push_span(Span::styled(format!(" ({href})"), self.styles.link_url));
                     }
                 }
                 self.inline_stack.pop();
@@ -655,8 +647,10 @@ impl MdWriter {
         // Trim trailing newline that pulldown includes.
         let body = self.code_buf.trim_end_matches('\n');
         if body.is_empty() {
-            self.out
-                .push(Line::from(Span::styled("  ".to_string(), self.styles.code_block)));
+            self.out.push(Line::from(Span::styled(
+                "  ".to_string(),
+                self.styles.code_block,
+            )));
         } else {
             for raw in body.lines() {
                 let styled = style_code_line(raw, lang, &self.styles);
@@ -677,20 +671,18 @@ impl MdWriter {
                 }
             }
         }
-        self.out
-            .push(Line::from(Span::styled("```".to_string(), self.styles.code_fence)));
+        self.out.push(Line::from(Span::styled(
+            "```".to_string(),
+            self.styles.code_fence,
+        )));
         self.push_blank();
     }
 
     fn emit_table(&mut self, table: TableState) {
-        let num_cols = table.header.len().max(
-            table
-                .rows
-                .iter()
-                .map(|r| r.len())
-                .max()
-                .unwrap_or(0),
-        );
+        let num_cols = table
+            .header
+            .len()
+            .max(table.rows.iter().map(|r| r.len()).max().unwrap_or(0));
         if num_cols == 0 {
             return;
         }
@@ -777,14 +769,18 @@ impl MdWriter {
                 .collect::<Vec<_>>()
                 .join("─┼─")
         );
-        self.out
-            .push(Line::from(Span::styled(sep.clone(), self.styles.table_border)));
+        self.out.push(Line::from(Span::styled(
+            sep.clone(),
+            self.styles.table_border,
+        )));
 
         for (ri, row) in rows.iter().enumerate() {
             self.emit_table_row(row, &col_widths, false);
             if ri + 1 < rows.len() {
-                self.out
-                    .push(Line::from(Span::styled(sep.clone(), self.styles.table_border)));
+                self.out.push(Line::from(Span::styled(
+                    sep.clone(),
+                    self.styles.table_border,
+                )));
             }
         }
 
@@ -851,10 +847,8 @@ impl MdWriter {
         };
         let header_line = fmt(header);
         for chunk in wrap_str(&header_line, self.width) {
-            self.out.push(Line::from(Span::styled(
-                chunk,
-                self.styles.table_header,
-            )));
+            self.out
+                .push(Line::from(Span::styled(chunk, self.styles.table_header)));
         }
         let sep = format!(
             "|{}|",
@@ -948,7 +942,10 @@ fn style_code_line(line: &str, lang: &str, styles: &Styles) -> Vec<Span<'static>
     let indent = line[..indent_len].to_string();
 
     let is_full_comment = (hash_comment && trimmed.starts_with('#'))
-        || (c_comment && (trimmed.starts_with("//") || trimmed.starts_with("/*") || trimmed.starts_with('*')))
+        || (c_comment
+            && (trimmed.starts_with("//")
+                || trimmed.starts_with("/*")
+                || trimmed.starts_with('*')))
         || (lang == "html" || lang == "xml" || lang == "svg") && trimmed.starts_with("<!--");
 
     if is_full_comment {

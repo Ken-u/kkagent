@@ -1510,9 +1510,10 @@ Do not mention this reminder to the user.\n</system-reminder>"
             );
             session.transcript_rewrite_required = true;
             session.undo_stack.clear();
-            let after = session
-                .token_counter
-                .request_size(system, tools, &session.build_messages());
+            let after =
+                session
+                    .token_counter
+                    .request_size(system, tools, &session.build_messages());
             session.last_compacted_tokens = Some(after);
             tracing::info!(
                 "Auto-compacted session {} (local digest): kept_users={} est_tokens={}->{}",
@@ -1982,10 +1983,7 @@ fn todo_items_from_output(output: &ToolOutput) -> Option<Vec<kkagent_protocol::T
     Some(items)
 }
 
-fn skill_activated_from_output(
-    session_id: &str,
-    output: &ToolOutput,
-) -> Option<AgentEvent> {
+fn skill_activated_from_output(session_id: &str, output: &ToolOutput) -> Option<AgentEvent> {
     let data = output.data.as_ref()?;
     if data.get("kind").and_then(|v| v.as_str()) != Some("skill_activation") {
         return None;
@@ -2114,10 +2112,9 @@ async fn execute_tool_parallel(request: ParallelToolRequest) -> ToolOutput {
         None => return ToolOutput::error(format!("Unknown tool: {}", name)),
     };
 
-    if let Err(e) = kkagent_tools::args_validator::validate_against_schema(
-        &tool.parameters_schema(),
-        &input,
-    ) {
+    if let Err(e) =
+        kkagent_tools::args_validator::validate_against_schema(&tool.parameters_schema(), &input)
+    {
         return ToolOutput::error(e.message);
     }
 
@@ -2467,8 +2464,10 @@ mod retry_tests {
         assert!(session.messages.len() >= 2);
         assert!(session.messages.iter().any(|m| {
             m.content.iter().any(|c| match c {
-                ChatContent::Text { text } => text.contains("compacted to free up context")
-                    || text.contains("Earlier conversation digest"),
+                ChatContent::Text { text } => {
+                    text.contains("compacted to free up context")
+                        || text.contains("Earlier conversation digest")
+                }
                 _ => false,
             })
         }));

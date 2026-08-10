@@ -177,10 +177,7 @@ impl GoalManager {
     pub async fn resume_goal(&self) {
         let mut guard = self.current_goal.lock().await;
         if let Some(ref mut goal) = *guard {
-            if matches!(
-                goal.status,
-                GoalStatus::Paused | GoalStatus::Blocked
-            ) {
+            if matches!(goal.status, GoalStatus::Paused | GoalStatus::Blocked) {
                 goal.status = GoalStatus::Active;
                 goal.updated_at = Utc::now().to_rfc3339();
                 *self.start_time.lock().await = Some(std::time::Instant::now());

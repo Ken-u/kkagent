@@ -273,12 +273,8 @@ Legacy multi-field token_budget/turn_budget/wall_clock_budget_ms still accepted.
                     budget.wall_clock_budget_ms = Some(value.round() as u64)
                 }
                 "seconds" => budget.wall_clock_budget_ms = Some((value * 1000.0).round() as u64),
-                "minutes" => {
-                    budget.wall_clock_budget_ms = Some((value * 60_000.0).round() as u64)
-                }
-                "hours" => {
-                    budget.wall_clock_budget_ms = Some((value * 3_600_000.0).round() as u64)
-                }
+                "minutes" => budget.wall_clock_budget_ms = Some((value * 60_000.0).round() as u64),
+                "hours" => budget.wall_clock_budget_ms = Some((value * 3_600_000.0).round() as u64),
                 other => {
                     return Ok(ToolOutput::error(format!("Unknown budget unit: {other}")));
                 }

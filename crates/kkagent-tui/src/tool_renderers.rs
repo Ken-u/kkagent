@@ -22,10 +22,7 @@ impl ToolRenderRegistry {
             ),
             "Grep" => format!("grep {}", fit(&tc.input_summary, budget.saturating_sub(5))),
             "Glob" => format!("glob {}", fit(&tc.input_summary, budget.saturating_sub(5))),
-            "Skill" => format!(
-                "Skill {}",
-                fit(&tc.input_summary, budget.saturating_sub(6))
-            ),
+            "Skill" => format!("Skill {}", fit(&tc.input_summary, budget.saturating_sub(6))),
             "CreateGoal" | "GetGoal" | "UpdateGoal" | "SetGoalBudget" => {
                 format!("goal {}", fit(&tc.input_summary, budget.saturating_sub(5)))
             }

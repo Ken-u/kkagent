@@ -197,11 +197,7 @@ impl McpManager {
                         );
                     }
                     Err(e) => {
-                        tracing::warn!(
-                            "Failed to connect to MCP server {}: {}",
-                            config.name,
-                            e
-                        );
+                        tracing::warn!("Failed to connect to MCP server {}: {}", config.name, e);
                     }
                 }
             }

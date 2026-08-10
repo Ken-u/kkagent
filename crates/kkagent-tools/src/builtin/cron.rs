@@ -88,7 +88,12 @@ impl CronManager {
         self.jobs.lock().await.values().cloned().collect()
     }
 
-    pub async fn create(&self, expr: String, prompt: String, recurring: bool) -> anyhow::Result<CronJob> {
+    pub async fn create(
+        &self,
+        expr: String,
+        prompt: String,
+        recurring: bool,
+    ) -> anyhow::Result<CronJob> {
         let id = Uuid::new_v4().to_string();
         let next = parse_next_run(&expr)?;
         let is_delay = looks_like_delay(&expr);
