@@ -29,6 +29,9 @@ try {
     New-Item -ItemType Directory -Force $InstallDir | Out-Null
     Copy-Item (Join-Path $packageDir "kkagent.exe") (Join-Path $InstallDir "kkagent.exe.new") -Force
     Move-Item (Join-Path $InstallDir "kkagent.exe.new") (Join-Path $InstallDir "kkagent.exe") -Force
+    $kkPath = Join-Path $InstallDir "kk.exe"
+    if (Test-Path $kkPath) { Remove-Item -Force $kkPath }
+    New-Item -ItemType SymbolicLink -Path $kkPath -Target (Join-Path $InstallDir "kkagent.exe") | Out-Null
 
     $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
     $parts = @($userPath -split ";" | Where-Object { $_ })
@@ -36,7 +39,7 @@ try {
         [Environment]::SetEnvironmentVariable("Path", (($parts + $InstallDir) -join ";"), "User")
         Write-Host "Added $InstallDir to the user PATH; open a new terminal to use it."
     }
-    Write-Host "Installed kkagent to $(Join-Path $InstallDir 'kkagent.exe')"
+    Write-Host "Installed kkagent to $(Join-Path $InstallDir 'kkagent.exe') and linked kk.exe -> kkagent.exe"
     & (Join-Path $InstallDir "kkagent.exe") --version
 }
 finally {

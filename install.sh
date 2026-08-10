@@ -48,5 +48,6 @@ mkdir -p "$temp_dir/package" "$install_dir"
 tar -C "$temp_dir/package" -xzf "$temp_dir/$archive"
 install -m 0755 "$temp_dir/package/kkagent" "$install_dir/kkagent.new"
 mv "$install_dir/kkagent.new" "$install_dir/kkagent"
-echo "Installed kkagent to $install_dir/kkagent"
+ln -sf "kkagent" "$install_dir/kk"
+echo "Installed kkagent to $install_dir/kkagent and linked kk -> kkagent"
 "$install_dir/kkagent" --version
