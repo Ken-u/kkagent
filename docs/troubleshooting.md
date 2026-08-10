@@ -34,7 +34,7 @@ TUI 问题同时查看 `~/.kkagent/kkagent.log`。分享日志前删除 token、
 | Bash 被硬阻断 | 命令被判为破坏性；改成可恢复的明确操作，不能靠 `auto` 绕过。 |
 | Bash 超时但还在跑 | 可能已转后台；查看 `/tasks` 并按 ID stop。 |
 | Grep 没有结果 | 检查 pattern、glob、工作目录和敏感/忽略路径。 |
-| WebSearch 不可用 | 配置 `[services.moonshot_search]`。 |
+| WebSearch 不可用 | 配置 `[services.web_search]`（provider / base_url / api_key_env）。 |
 | FetchURL 拒绝地址 | 地址命中 SSRF/私网保护；改用允许的公开端点。 |
 
 ## Server 与 SDK

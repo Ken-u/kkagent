@@ -8,6 +8,7 @@ pub mod path_policy;
 pub mod registry;
 pub mod sandbox;
 pub mod shell_safety;
+pub mod web_providers;
 
 pub use accesses::{infer_accesses, tool_accesses, ToolAccesses, ToolResourceAccess};
 pub use bash_ast::{collect_commands, parse as parse_bash, pipes_into_shell};
@@ -18,8 +19,8 @@ pub use builtin::cron::render_cron_fire_xml;
 pub use builtin::{
     render_model_tool_skill_prompt, render_skill_loaded_block, render_user_slash_skill_prompt,
     BackgroundShellManager, BashOptions, BashTool, CronManager, SkillCatalog, SkillTool,
-    WebServicesConfig,
 };
+pub use web_providers::WebServicesConfig;
 pub use registry::*;
 
 use async_trait::async_trait;

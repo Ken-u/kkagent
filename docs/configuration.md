@@ -164,16 +164,21 @@ timeout = 5
 ## 服务
 
 ```toml
-[services.moonshot_search]
-base_url = "https://example.invalid/search"
-api_key = "..."
+[services.web_search]
+provider = "searxng" # searxng | brave | custom
+base_url = "http://127.0.0.1:8080/search" # 完整搜索 endpoint，不会自动再拼 /v1/search
+api_key_env = "BRAVE_API_KEY" # 优先于 inline api_key
+timeout_ms = 15000
+default_limit = 5
 
-[services.moonshot_fetch]
-base_url = "https://example.invalid/fetch"
-api_key = "..."
+# 可选：FetchURL 外部代理；未配置时走直接 HTTP GET + SSRF 校验
+# [services.web_fetch]
+# base_url = "https://example.invalid/fetch"
+# api_key_env = "WEB_FETCH_API_KEY"
+# timeout_ms = 30000
 ```
 
-`moonshot_search` 为内置 `WebSearch` 提供后端。`FetchURL` 也有受 SSRF 防护约束的直接抓取路径。
+`web_search` 为内置 `WebSearch` 提供后端；未配置时不注册该工具。`FetchURL` 在未配置 `web_fetch` 时仍可直接抓取公网页面。旧的 `[services.moonshot_search]` / `[services.moonshot_fetch]` 仍可读一次并给出迁移提示。
 
 ## MCP Server
 

@@ -2004,9 +2004,11 @@ async fn build_turn_tool_registry(
     tools.register(Arc::new(kkagent_tools::builtin::SkillTool::new(
         state.skills.clone(),
     )));
-    tools.register(Arc::new(kkagent_tools::builtin::WebSearchTool::new(
-        state.web.clone(),
-    )));
+    if let Some(search) = kkagent_tools::builtin::WebSearchTool::try_new(state.web.clone()) {
+        tools.register(Arc::new(search));
+    } else {
+        tracing::debug!("WebSearch not registered: [services.web_search] not configured");
+    }
     tools.register(Arc::new(kkagent_tools::builtin::FetchUrlTool::new(
         state.web.clone(),
     )));

@@ -212,7 +212,23 @@ fn apply_env_overrides(config: &mut AppConfig) {
             }
         }
     }
-    if let Ok(url) = std::env::var("KKAGENT_MOONSHOT_SEARCH_URL") {
+    if let Ok(url) = std::env::var("KKAGENT_WEB_SEARCH_URL") {
+        let key = std::env::var("KKAGENT_WEB_SEARCH_KEY")
+            .ok()
+            .or_else(|| std::env::var("KKAGENT_MOONSHOT_SEARCH_KEY").ok())
+            .or_else(|| std::env::var("MOONSHOT_API_KEY").ok());
+        let provider = std::env::var("KKAGENT_WEB_SEARCH_PROVIDER").ok();
+        let services = config.services.get_or_insert_with(Default::default);
+        services.web_search = Some(crate::WebSearchConfig {
+            provider,
+            base_url: url,
+            api_key: key,
+            api_key_env: None,
+            timeout_ms: None,
+            default_limit: None,
+        });
+    } else if let Ok(url) = std::env::var("KKAGENT_MOONSHOT_SEARCH_URL") {
+        // Legacy env — still maps to deprecated moonshot_search for one-time compat.
         let key = std::env::var("KKAGENT_MOONSHOT_SEARCH_KEY")
             .ok()
             .or_else(|| std::env::var("MOONSHOT_API_KEY").ok());

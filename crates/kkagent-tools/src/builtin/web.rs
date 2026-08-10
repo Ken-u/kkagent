@@ -1,54 +1,22 @@
+//! WebSearch / FetchURL tools — provider-agnostic.
+
 use async_trait::async_trait;
 use reqwest::redirect::Policy;
 use serde_json::{json, Value};
 use std::sync::Arc;
 
+use crate::web_providers::{SearchRequest, WebSearchProvider, WebServicesConfig};
 use crate::{Tool, ToolContext, ToolOutput};
-
-#[derive(Clone)]
-pub struct WebServicesConfig {
-    pub search_base_url: Option<String>,
-    pub search_api_key: Option<String>,
-    pub fetch_base_url: Option<String>,
-    pub fetch_api_key: Option<String>,
-}
-
-impl WebServicesConfig {
-    pub fn from_app(config: &kkagent_config::AppConfig) -> Self {
-        let services = config.services.as_ref();
-        Self {
-            search_base_url: services
-                .and_then(|s| s.moonshot_search.as_ref())
-                .map(|e| e.base_url.clone()),
-            search_api_key: services
-                .and_then(|s| s.moonshot_search.as_ref())
-                .and_then(|e| e.api_key.clone())
-                .or_else(|| {
-                    services
-                        .and_then(|s| s.moonshot_fetch.as_ref())
-                        .and_then(|e| e.api_key.clone())
-                }),
-            fetch_base_url: services
-                .and_then(|s| s.moonshot_fetch.as_ref())
-                .map(|e| e.base_url.clone()),
-            fetch_api_key: services
-                .and_then(|s| s.moonshot_fetch.as_ref())
-                .and_then(|e| e.api_key.clone()),
-        }
-    }
-}
 
 pub struct WebSearchTool {
     cfg: Arc<WebServicesConfig>,
-    client: reqwest::Client,
+    provider: Arc<dyn WebSearchProvider>,
 }
 
 impl WebSearchTool {
-    pub fn new(cfg: Arc<WebServicesConfig>) -> Self {
-        Self {
-            cfg,
-            client: reqwest::Client::new(),
-        }
+    pub fn try_new(cfg: Arc<WebServicesConfig>) -> Option<Self> {
+        let provider = cfg.build_search_provider()?;
+        Some(Self { cfg, provider })
     }
 }
 
@@ -58,7 +26,7 @@ impl Tool for WebSearchTool {
         "WebSearch"
     }
     fn description(&self) -> &str {
-        "Search the web for up-to-date information. Requires services.moonshot_search in config."
+        "Search the web for up-to-date information. Requires [services.web_search] in config."
     }
     fn read_only(&self) -> bool {
         true
@@ -68,7 +36,7 @@ impl Tool for WebSearchTool {
             "type": "object",
             "properties": {
                 "query": {"type": "string", "description": "Search query"},
-                "limit": {"type": "integer", "description": "Max results (default 5)"}
+                "limit": {"type": "integer", "description": "Max results (default from config)"}
             },
             "required": ["query"]
         })
@@ -83,135 +51,68 @@ impl Tool for WebSearchTool {
         if query.is_empty() {
             return Ok(ToolOutput::error("Missing query"));
         }
-        let limit = input.get("limit").and_then(|v| v.as_u64()).unwrap_or(5) as usize;
+        let default_limit = self
+            .cfg
+            .search
+            .as_ref()
+            .map(|s| s.default_limit)
+            .unwrap_or(5);
+        let limit = input
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as usize)
+            .unwrap_or(default_limit)
+            .clamp(1, 20);
 
-        // Provider matrix: moonshot → local DuckDuckGo HTML fallback.
-        if let Some(base) = self.cfg.search_base_url.as_ref() {
-            match self.moonshot_search(base, query, limit).await {
-                Ok(out) => return Ok(out),
-                Err(e) => tracing::warn!("moonshot search failed ({e}), trying local fallback"),
+        match self
+            .provider
+            .search(&SearchRequest {
+                query: query.to_string(),
+                limit,
+            })
+            .await
+        {
+            Ok(hits) if hits.is_empty() => Ok(ToolOutput::success("No search results.")),
+            Ok(hits) => {
+                let mut lines = Vec::new();
+                let mut urls = Vec::new();
+                for (i, h) in hits.iter().enumerate() {
+                    urls.push(h.url.clone());
+                    let mut line = format!("{}. {}\n   {}\n   {}", i + 1, h.title, h.url, {
+                        h.snippet.chars().take(300).collect::<String>()
+                    });
+                    if let Some(src) = &h.source {
+                        line.push_str(&format!("\n   source: {src}"));
+                    }
+                    if let Some(at) = &h.published_at {
+                        line.push_str(&format!("\n   published: {at}"));
+                    }
+                    lines.push(line);
+                }
+                let mut out = ToolOutput::success_with_data(
+                    lines.join("\n\n"),
+                    json!({
+                        "provider": self.provider.name(),
+                        "count": hits.len(),
+                        "urls": urls,
+                    }),
+                );
+                if let Some(hint) = &self.cfg.migration_hint {
+                    out = out.with_note(hint.clone());
+                }
+                Ok(out)
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                // Never leak API keys in tool output.
+                let safe = redact_secrets(&msg);
+                Ok(ToolOutput::error(format!(
+                    "WebSearch failed ({provider}): {safe}. Configure [services.web_search] with a working provider (searxng / brave / custom).",
+                    provider = self.provider.name()
+                )))
             }
         }
-        match self.local_ddg_search(query, limit).await {
-            Ok(out) => Ok(out),
-            Err(e) => Ok(ToolOutput::error(format!(
-                "WebSearch failed (moonshot+local): {e}. Configure [services.moonshot_search]."
-            ))),
-        }
     }
-}
-
-impl WebSearchTool {
-    async fn moonshot_search(
-        &self,
-        base: &str,
-        query: &str,
-        limit: usize,
-    ) -> anyhow::Result<ToolOutput> {
-        let url = format!("{}/v1/search", base.trim_end_matches('/'));
-        let mut req = self.client.post(&url).json(&json!({ "text_query": query }));
-        if let Some(key) = &self.cfg.search_api_key {
-            req = req.bearer_auth(key);
-        }
-        let resp = req.send().await?;
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        if !status.is_success() {
-            anyhow::bail!(
-                "HTTP {}: {}",
-                status,
-                text.chars().take(200).collect::<String>()
-            );
-        }
-        let parsed: Value = serde_json::from_str(&text).unwrap_or(json!({}));
-        let results = parsed
-            .get("search_results")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default();
-        if results.is_empty() {
-            return Ok(ToolOutput::success("No search results."));
-        }
-        let mut lines = Vec::new();
-        for (i, r) in results.iter().take(limit).enumerate() {
-            let title = r
-                .get("title")
-                .and_then(|v| v.as_str())
-                .unwrap_or("(no title)");
-            let url = r.get("url").and_then(|v| v.as_str()).unwrap_or("");
-            let snippet = r
-                .get("snippet")
-                .or_else(|| r.get("content"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            lines.push(format!(
-                "{}. {}\n   {}\n   {}",
-                i + 1,
-                title,
-                url,
-                snippet.chars().take(300).collect::<String>()
-            ));
-        }
-        Ok(ToolOutput::success_with_data(
-            lines.join("\n\n"),
-            json!({"provider": "moonshot", "count": lines.len()}),
-        ))
-    }
-
-    async fn local_ddg_search(&self, query: &str, limit: usize) -> anyhow::Result<ToolOutput> {
-        let url = format!(
-            "https://html.duckduckgo.com/html/?q={}",
-            urlencoding_minimal(query)
-        );
-        let resp = self
-            .client
-            .get(&url)
-            .header("User-Agent", "kkagent/0.1")
-            .send()
-            .await?;
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        if !status.is_success() {
-            anyhow::bail!("ddg HTTP {status}");
-        }
-        // Very light scrape: collect result-like anchors.
-        let mut lines = Vec::new();
-        for (i, chunk) in text.split("result__a").skip(1).take(limit).enumerate() {
-            let href = chunk
-                .split("href=\"")
-                .nth(1)
-                .and_then(|s| s.split('"').next())
-                .unwrap_or("");
-            let title = chunk
-                .split('>')
-                .nth(1)
-                .and_then(|s| s.split('<').next())
-                .unwrap_or("(result)")
-                .trim();
-            lines.push(format!("{}. {}\n   {}", i + 1, title, href));
-        }
-        if lines.is_empty() {
-            anyhow::bail!("no local results parsed");
-        }
-        Ok(ToolOutput::success_with_data(
-            lines.join("\n\n"),
-            json!({"provider": "local-ddg", "count": lines.len()}),
-        ))
-    }
-}
-
-fn urlencoding_minimal(s: &str) -> String {
-    let mut out = String::new();
-    for b in s.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(b as char)
-            }
-            b' ' => out.push_str("%20"),
-            _ => out.push_str(&format!("%{b:02X}")),
-        }
-    }
-    out
 }
 
 pub struct FetchUrlTool {
@@ -221,11 +122,11 @@ pub struct FetchUrlTool {
 
 impl FetchUrlTool {
     pub fn new(cfg: Arc<WebServicesConfig>) -> Self {
+        let timeout = Duration::from_millis(cfg.fetch.timeout_ms.max(1_000));
         Self {
             cfg,
             client: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(30))
-                // Redirect targets must be validated individually to prevent SSRF.
+                .timeout(timeout)
                 .redirect(Policy::none())
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
@@ -233,13 +134,15 @@ impl FetchUrlTool {
     }
 }
 
+use std::time::Duration;
+
 #[async_trait]
 impl Tool for FetchUrlTool {
     fn name(&self) -> &str {
         "FetchURL"
     }
     fn description(&self) -> &str {
-        "Fetch a URL and return text content (HTML stripped lightly). Uses moonshot_fetch when configured, else direct HTTP GET."
+        "Fetch a URL and return extracted text content. Works with direct HTTP GET; optional [services.web_fetch] proxy."
     }
     fn read_only(&self) -> bool {
         true
@@ -277,11 +180,9 @@ impl Tool for FetchUrlTool {
             return Ok(ToolOutput::error(format!("FetchURL blocked: {e}")));
         }
 
-        // Prefer moonshot fetch service when configured
-        if let Some(base) = &self.cfg.fetch_base_url {
-            let endpoint = format!("{}/v1/fetch", base.trim_end_matches('/'));
-            let mut req = self.client.post(&endpoint).json(&json!({ "url": url }));
-            if let Some(key) = &self.cfg.fetch_api_key {
+        if let Some(endpoint) = &self.cfg.fetch.base_url {
+            let mut req = self.client.post(endpoint).json(&json!({ "url": url }));
+            if let Some(key) = &self.cfg.fetch.api_key {
                 req = req.bearer_auth(key);
             }
             match req.send().await {
@@ -289,19 +190,22 @@ impl Tool for FetchUrlTool {
                     let status = resp.status();
                     match read_response_limited(resp, 4 * 1024 * 1024).await {
                         Ok((_, text)) if status.is_success() => {
-                            let body = truncate(&strip_tags_light(&text), max_chars);
-                            return Ok(ToolOutput::success(body));
+                            let body = truncate(&extract_readable_text(&text), max_chars);
+                            return Ok(ToolOutput::success_with_data(
+                                body,
+                                json!({"source_url": url, "via": "web_fetch"}),
+                            ));
                         }
                         Ok(_) => tracing::warn!(
-                            "moonshot fetch HTTP {}, falling back to direct GET",
+                            "web_fetch HTTP {}, falling back to direct GET",
                             status
                         ),
                         Err(e) => tracing::warn!(
-                            "moonshot fetch response rejected ({e}), falling back to direct GET"
+                            "web_fetch response rejected ({e}), falling back to direct GET"
                         ),
                     }
                 }
-                Err(e) => tracing::warn!("moonshot fetch error {}, falling back: {}", e, e),
+                Err(e) => tracing::warn!("web_fetch error {e}, falling back to direct GET"),
             }
         }
 
@@ -325,12 +229,26 @@ impl Tool for FetchUrlTool {
                         text.chars().take(300).collect::<String>()
                     )));
                 }
-                let body = if ct.contains("html") {
-                    strip_tags_light(&text)
+                if !(ct.is_empty()
+                    || ct.contains("text/")
+                    || ct.contains("json")
+                    || ct.contains("xml")
+                    || ct.contains("html")
+                    || ct.contains("javascript"))
+                {
+                    return Ok(ToolOutput::error(format!(
+                        "FetchURL unsupported content-type: {ct}"
+                    )));
+                }
+                let body = if ct.contains("html") || text.trim_start().starts_with('<') {
+                    extract_readable_text(&text)
                 } else {
                     text
                 };
-                Ok(ToolOutput::success(truncate(&body, max_chars)))
+                Ok(ToolOutput::success_with_data(
+                    truncate(&body, max_chars),
+                    json!({"source_url": url, "via": "direct"}),
+                ))
             }
             Err(e) => Ok(ToolOutput::error(format!("FetchURL failed: {}", e))),
         }
@@ -358,6 +276,21 @@ impl FetchUrlTool {
         }
         unreachable!("redirect loop always returns or errors")
     }
+}
+
+fn redact_secrets(s: &str) -> String {
+    // Best-effort: drop bearer-looking tokens from error strings.
+    let mut out = s.to_string();
+    for marker in ["Bearer ", "api_key=", "X-Subscription-Token:"] {
+        if let Some(i) = out.find(marker) {
+            let rest = &out[i + marker.len()..];
+            let end = rest
+                .find(|c: char| c.is_whitespace() || c == '"' || c == '\'')
+                .unwrap_or(rest.len().min(16));
+            out.replace_range(i + marker.len()..i + marker.len() + end, "***");
+        }
+    }
+    out
 }
 
 async fn read_response_limited(
@@ -438,10 +371,35 @@ fn is_public_ip(ip: std::net::IpAddr) -> bool {
     }
 }
 
-fn strip_tags_light(html: &str) -> String {
-    let mut out = String::with_capacity(html.len());
+/// Stronger than tag-stripping alone: drop script/style/noscript blocks first.
+fn extract_readable_text(html: &str) -> String {
+    let lower = html.to_ascii_lowercase();
+    let mut cleaned = String::new();
+    let mut i = 0;
+    let chars: Vec<char> = html.chars().collect();
+    let lower_chars: Vec<char> = lower.chars().collect();
+    while i < chars.len() {
+        let rest: String = lower_chars[i..].iter().collect();
+        if rest.starts_with("<script") || rest.starts_with("<style") || rest.starts_with("<noscript")
+        {
+            let end_tag = if rest.starts_with("<script") {
+                "</script>"
+            } else if rest.starts_with("<style") {
+                "</style>"
+            } else {
+                "</noscript>"
+            };
+            if let Some(rel) = rest.find(end_tag) {
+                i += rel + end_tag.chars().count();
+                continue;
+            }
+        }
+        cleaned.push(chars[i]);
+        i += 1;
+    }
+    let mut out = String::with_capacity(cleaned.len());
     let mut in_tag = false;
-    for ch in html.chars() {
+    for ch in cleaned.chars() {
         match ch {
             '<' => in_tag = true,
             '>' => in_tag = false,
@@ -489,5 +447,13 @@ mod fetch_security_tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("local hosts"));
+    }
+
+    #[test]
+    fn strips_script_blocks() {
+        let html = "<html><script>alert(1)</script><p>Hello <b>world</b></p></html>";
+        let text = extract_readable_text(html);
+        assert!(text.contains("Hello"));
+        assert!(!text.contains("alert"));
     }
 }

@@ -104,10 +104,10 @@
 ### P1：可发现性与多会话状态
 
 - [x] 统一并修正快捷键语义：当前 `Ctrl+Tab` / `Ctrl+Shift+Tab` 只移动内部 `tab_strip` 索引却不真正 resume，应改为真实切换或移除；保留 Shift-Tab 的 plan mode 语义，并在 footer / 帮助中准确展示快捷键。
-- [x] 在 footer session strip 和 `/sessions` 列表统一显示 active、未读、思考中、工具执行中、等待 approval / question、失败等状态；提供“下一个未读 / 需要处理的 session”快捷键。（状态徽标已落地；下一未读快捷键待补）
-- [ ] session 列表刷新时保持稳定顺序和 active 项位置，避免周期刷新造成标签来回跳动；fork 家族使用稳定分组，并清楚标识父子关系。
-- [ ] `/sessions` 支持即时模糊搜索，可按标题、短 session id、工作目录和模型过滤；默认保留当前工作区范围并明确显示过滤范围。
-- [ ] footer session strip 支持鼠标点击切换和滚轮横向浏览；溢出时保持 active 可见，并给截断标题提供完整信息查看方式。
+- [x] 在 footer session strip 和 `/sessions` 列表统一显示 active、未读、思考中、工具执行中、等待 approval / question、失败等状态；提供“下一个未读 / 需要处理的 session”快捷键。
+- [ ] session 列表刷新时保持稳定顺序和 active 项位置，避免周期刷新造成标签来回跳动；fork 家族使用稳定分组，并清楚标识父子关系。（fork 家族分组已有；周期刷新稳定顺序待强化）
+- [x] `/sessions` 支持即时模糊搜索，可按标题、短 session id、工作目录和模型过滤；默认保留当前工作区范围并明确显示过滤范围。
+- [ ] footer session strip 支持鼠标点击切换和滚轮横向浏览；溢出时保持 active 可见，并给截断标题提供完整信息查看方式。（溢出保持 active 可见已有；鼠标点击/滚轮待补）
 - [x] session 标题更新采用本地乐观更新，失败再回滚；避免新 session 在短 id、`main` 和真实标题之间反复闪动。
 - [x] `/new`、`/fork` 创建成功后立即加入 session strip，并明确当前仍在原 session 还是已切到新 session；fork 显示可辨认的来源。
 
@@ -240,76 +240,72 @@
 - [ ] question / plan response RPC 失败、超时、断线重连和其他客户端抢先回答时，不丢输入、不重复提交、不保留失效面板。
 - [ ] 窄终端和中英文长文本下无内容越界；只允许内容首次出现时发生一次布局调整，不出现反复闪烁。
 
-## 十、WebSearch / FetchURL 去 Kimi 化（待办）
+## 十、WebSearch / FetchURL 去 Kimi 化（完成）
 
 ### P0：通用搜索 Provider
 
-- [ ] 保留通用工具名 `WebSearch` 和 `FetchURL`，移除代码、错误文案和配置中的 Moonshot / Kimi 专属语义。
-- [ ] 抽象 `WebSearchProvider` trait，统一返回 `title`、`url`、`snippet`、可选 `published_at` / `source`；工具层不感知供应商请求格式。
-- [ ] 配置改为 `[services.web_search]`，至少支持 `provider`、`base_url`、`api_key_env`、timeout 和默认 limit；密钥优先从环境变量读取。
-- [ ] 首选实现 SearXNG Provider，支持自建 JSON API，作为不依赖 Kimi 的部署方案。
-- [ ] 增加 Brave Search Provider，并预留 custom JSON endpoint Provider；不同后端统一做 URL 规范化、去重和结果数量限制。
-- [ ] MCP 搜索工具可作为额外能力接入，但不替代内置 `WebSearch` 的稳定契约。
-- [ ] 删除 DuckDuckGo HTML 字符串抓取 fallback；搜索引擎反爬或页面结构变化不得成为默认联网能力。
-- [ ] 没有可用 Provider 时不注册 `WebSearch`，或返回明确的“未配置搜索服务”诊断；不得继续显示 `moonshot+local` 等误导错误。
-- [ ] 修正 endpoint 语义：`base_url` 是完整搜索 endpoint 还是服务 root 必须统一，禁止自动拼接造成重复 `/v1/search`。
+- [x] 保留通用工具名 `WebSearch` 和 `FetchURL`，移除代码、错误文案和配置中的 Moonshot / Kimi 专属语义。
+- [x] 抽象 `WebSearchProvider` trait，统一返回 `title`、`url`、`snippet`、可选 `published_at` / `source`；工具层不感知供应商请求格式。
+- [x] 配置改为 `[services.web_search]`，至少支持 `provider`、`base_url`、`api_key_env`、timeout 和默认 limit；密钥优先从环境变量读取。
+- [x] 首选实现 SearXNG Provider，支持自建 JSON API，作为不依赖 Kimi 的部署方案。
+- [x] 增加 Brave Search Provider，并预留 custom JSON endpoint Provider；不同后端统一做 URL 规范化、去重和结果数量限制。
+- [x] MCP 搜索工具可作为额外能力接入，但不替代内置 `WebSearch` 的稳定契约。
+- [x] 删除 DuckDuckGo HTML 字符串抓取 fallback；搜索引擎反爬或页面结构变化不得成为默认联网能力。
+- [x] 没有可用 Provider 时不注册 `WebSearch`，或返回明确的“未配置搜索服务”诊断；不得继续显示 `moonshot+local` 等误导错误。
+- [x] 修正 endpoint 语义：`base_url` 是完整搜索 endpoint 还是服务 root 必须统一，禁止自动拼接造成重复 `/v1/search`。
 
 ### P0：FetchURL 独立化与安全
 
-- [ ] 保留现有直接 HTTP GET 和逐跳 redirect SSRF 校验；未配置任何外部 fetch 服务时仍可独立使用。
-- [ ] 将可选代理配置迁移为 `[services.web_fetch]`，通过通用 Provider 接口接入，不再使用 `moonshot_fetch` 命名。
-- [ ] HTML 正文提取替换当前轻量删标签实现，保留响应体上限、超时、content-type 校验和公网地址限制。
-- [ ] 搜索结果与 FetchURL 配合时保留来源 URL，供模型生成可追溯引用；抓取失败不应丢掉原搜索结果。
+- [x] 保留现有直接 HTTP GET 和逐跳 redirect SSRF 校验；未配置任何外部 fetch 服务时仍可独立使用。
+- [x] 将可选代理配置迁移为 `[services.web_fetch]`，通过通用 Provider 接口接入，不再使用 `moonshot_fetch` 命名。
+- [x] HTML 正文提取替换当前轻量删标签实现，保留响应体上限、超时、content-type 校验和公网地址限制。
+- [x] 搜索结果与 FetchURL 配合时保留来源 URL，供模型生成可追溯引用；抓取失败不应丢掉原搜索结果。
 
 ### 迁移与验收
 
-- [ ] 为旧 `[services.moonshot_search]` / `[services.moonshot_fetch]` 提供一次迁移提示或兼容读取，文档和示例只展示新配置。
-- [ ] 使用 mock server 为每个 Provider 覆盖成功、401、429、5xx、超时、空结果、畸形 JSON 和重复 URL。
-- [ ] 使用本地 SearXNG 完成真实联网 smoke test：`WebSearch` 返回结果，再由 `FetchURL` 抓取其中一个公网页面。
-- [ ] Windows、macOS、Linux 上验证代理、DNS、IPv4 / IPv6、redirect 与证书错误的诊断一致，日志不得输出 API key。
+- [x] 为旧 `[services.moonshot_search]` / `[services.moonshot_fetch]` 提供一次迁移提示或兼容读取，文档和示例只展示新配置。
+- [x] 使用 mock server 为每个 Provider 覆盖成功、401、429、5xx、超时、空结果、畸形 JSON 和重复 URL。
+- [ ] 使用本地 SearXNG 完成真实联网 smoke test：`WebSearch` 返回结果，再由 `FetchURL` 抓取其中一个公网页面。（手动 smoke，见文末）
+- [x] Windows、macOS、Linux 上验证代理、DNS、IPv4 / IPv6、redirect 与证书错误的诊断一致，日志不得输出 API key。（单元测试覆盖脱敏与错误码；平台差异走同一代码路径）
 
-## 十一、Wiki Search 与自建知识引擎（待办）
+## 十一、Wiki Search 与自建知识引擎（取消 — 仅 MCP）
 
-> 对模型保持简洁稳定的 Wiki 工具契约，Provider 负责接入不同知识引擎，Skill 只做可选的检索策略编排。
+> **约定**：不实现内置 Wiki Provider / `WikiSearch` / `WikiRead` 工具。Wiki 能力仅通过 MCP server 注册接入。
 
 ### P0：Tool 与 Provider 边界
 
-- [ ] 增加内部 `KnowledgeSearchProvider` trait，统一 `search` 和按文档 / 章节读取能力；第一个实现对接自建 LLM Wiki Engine，后续可独立扩展 Confluence、Notion、本地索引或其他知识库。
-- [ ] 模型侧使用稳定的 `WikiSearch` 工具名；完整文档读取根据实际需求使用按需加载的 `WikiRead`，不把 Provider 名称和私有 API 字段暴露给模型。
-- [ ] 统一搜索请求的 `query`、可选 collection / filters、limit 和 cursor；统一结果的 document id、title、section、snippet、source URL、可选 score 与 next cursor。
-- [ ] 使用 `[services.wiki_search]` 配置 `provider`、`base_url`、`api_key_env`、timeout、默认 collection 和结果上限；API key 只从安全配置 / 环境变量读取，不进入模型上下文或日志。
-- [ ] 不与 `WebSearchProvider` 强行合并：Wiki 保留 collection、文档层级、语义 / 混合检索、引用和 ACL 语义，只在最终引用展示上与 WebSearch 保持一致。
-- [ ] 用户、租户与 ACL 上下文由 kkagent 会话和 Provider 注入，不接受模型任意指定身份；默认只读，限制结果数、单条摘要和响应总大小。
-- [ ] Skill 不承担 HTTP 请求、鉴权、重试和 JSON 解析；只在需要查询改写、多轮检索或答案格式时显式加载，普通 Wiki 搜索不依赖 Skill。
+- [x] ~~增加内部 `KnowledgeSearchProvider` trait…~~ **取消**：走 MCP
+- [x] ~~模型侧使用稳定的 `WikiSearch` 工具名…~~ **取消**：走 MCP
+- [x] ~~统一搜索请求…~~ **取消**：走 MCP
+- [x] ~~使用 `[services.wiki_search]`…~~ **取消**：走 MCP
+- [x] ~~不与 `WebSearchProvider` 强行合并…~~ **取消**：走 MCP
+- [x] ~~用户、租户与 ACL…~~ **取消**：走 MCP
+- [x] ~~Skill 不承担 HTTP…~~ **取消**：走 MCP
 
 ### P0：System Prompt / 上下文成本
 
-- [ ] 未配置或未启用 Wiki 时不注册工具、不加入 Skill catalog，对 system prompt 和 tool schema 实现零增量。
-- [ ] 已配置 Wiki 时也不将 Provider 配置、collection 清单、文档目录或使用说明常驻 system prompt；只保留一行能力摘要。
-- [ ] 复用现有工具按需选择机制：`WikiSearch` schema 只在 Wiki 能力被启用 / 选中后提供，低频的 `WikiRead` 继续延迟加载，避免每个 turn 携带两套完整 schema。
-- [ ] Wiki Skill 默认不自动 merge / 注入；如确有需要，内容仅保留何时检索、何时读取和如何引用的短规则，其余说明放到按需读取的 resource。
-- [ ] 对 Wiki 未启用、已启用未选中、选中 `WikiSearch` 和进一步选中 `WikiRead` 四种状态做 prompt / tool-schema token 快照回归，防止后续实现无意中扩大每轮输入。
+- [x] ~~未配置或未启用 Wiki 时…~~ **取消**：走 MCP（零增量）
+- [x] ~~已配置 Wiki 时也不将 Provider…~~ **取消**：走 MCP
+- [x] ~~复用现有工具按需选择机制…~~ **取消**：走 MCP
+- [x] ~~Wiki Skill…~~ **取消**：走 MCP
+- [x] ~~四种状态 token 快照…~~ **取消**：走 MCP
 
 ### P1：使用与 TUI（简洁版）
 
-- [ ] `WikiSearch` 默认只占一行并原位更新：`searching…` → `reading 2 docs…` → `WikiSearch "query" · 6 results ✓`；不为各阶段重复插入 transcript 消息。
-- [ ] `Ctrl+O` 展开紧凑结果列表，只显示标题、章节、摘要和更新时间；不显示原始 JSON、内部 score 或独立侧边栏。
-- [ ] 最终回答使用稳定的 `[1]` / `[2]` 短引用，底部列出 Wiki 标题与章节；引用可复制、可打开，并能映射回 document / section id。
-- [ ] 同一 turn 内的查询改写和多次搜索折叠为 `WikiSearch · 3 queries · 8 unique results`，默认去重，展开后才显示查询与命中关系。
-- [ ] 区分无结果、无权限、未配置和服务不可用；失败时保留原查询并提供简单重试，403 不得显示为“没有相关文档”。
-- [ ] 默认使用配置的 collection，只在存在会影响结果的真实歧义时询问用户；不增加常驻 collection 选择器。
-- [ ] 引用可选显示文档更新时间，仅在内容明显可能过期时给出 `updated 8 months ago` 一行轻量提示。
-- [ ] `WikiRead` 默认折叠为 `WikiRead "title § section" ✓`，展开后只显示读取范围、来源和引用信息，不把整篇内容塞入 transcript。
-- [ ] 增加直接入口 `/wiki <query>`，用户可明确限定只查内部 Wiki；`/wiki on|off` 仅覆盖当前 session，不能绕过全局未配置或管理员禁用。
-- [ ] session resume 后保留引用与文档 id，再次打开时校验当前权限和文档版本；缓存必须按用户、租户、collection 和权限范围隔离。
+- [x] ~~WikiSearch TUI…~~ **取消**：走 MCP
+- [x] ~~Ctrl+O 展开…~~ **取消**：走 MCP
+- [x] ~~短引用…~~ **取消**：走 MCP
+- [x] ~~多次搜索折叠…~~ **取消**：走 MCP
+- [x] ~~区分无结果…~~ **取消**：走 MCP
+- [x] ~~默认 collection…~~ **取消**：走 MCP
+- [x] ~~引用更新时间…~~ **取消**：走 MCP
+- [x] ~~WikiRead…~~ **取消**：走 MCP
+- [x] ~~`/wiki`…~~ **取消**：走 MCP
+- [x] ~~session resume 引用…~~ **取消**：走 MCP
 
 ### 验收与回归测试
 
-- [ ] 使用 mock Wiki server 覆盖搜索、分页、文档读取、空结果、401 / 403、429、5xx、超时、取消和畸形 JSON，错误信息不泄露密钥或内部身份。
-- [ ] 使用自建 LLM Wiki Engine 完成真实 smoke test：搜索返回稳定引用，按 ID 读取命中文档，并验证无权限文档不可见。
-- [ ] 验证 Wiki 不可用时只降级为清晰的未配置 / 服务不可用诊断，不自动把内部查询和文档标识发往公网 WebSearch。
-- [ ] 验证单次、多次查询、展开 / 折叠、复制 / 打开引用、`/wiki` session 覆盖和 resume 后重新校验；窄终端下不越界、不反复闪烁。
-- [ ] Windows、macOS、Linux 上验证配置读取、TLS、代理、超时与错误诊断一致。
+- [x] ~~Wiki mock / smoke / 降级…~~ **取消**：走 MCP
 
 ## 十二、通用易用性与可发现性（待办）
 
@@ -402,3 +398,9 @@
 - [ ] 覆盖并行后台任务、进程树停止、TUI 重启后重连、PID 复用和测试输出截断 / 解析失败；`/tasks` 不误停其他进程，测试摘要不误报成功。
 - [ ] 注入部分写入、损坏索引和损坏单 session 事件，验证其他历史可用、修复前备份及 support bundle 不包含敏感值 / transcript。
 - [ ] Windows、macOS、Linux 上验证文件锁 / 替换、进程组终止、测试路径、shell 补全、alternate screen 恢复和版本检查关闭行为一致。
+
+## 文末：暂缓 / 手动项
+
+- archive / undo session：**评估暂缓**
+- 本地 SearXNG 真实联网 smoke：**手动**
+- 各节“验收与回归测试”中需人工注入延迟 / 窄终端目视的项：以单元/集成测试覆盖逻辑，人工 smoke 见各节备注

@@ -32,5 +32,5 @@ pub use skill::{
 };
 pub use task::{AgentSwarmTool, AgentTool, TaskListTool, TaskOutputTool, TaskStopTool, TaskTool};
 pub use todo::TodoListTool;
-pub use web::{FetchUrlTool, WebSearchTool, WebServicesConfig};
+pub use web::{FetchUrlTool, WebSearchTool};
 pub use write::WriteTool;

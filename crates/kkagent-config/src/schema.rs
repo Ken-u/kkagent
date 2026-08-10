@@ -302,9 +302,45 @@ fn default_hook_timeout() -> u64 {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ServicesConfig {
     #[serde(default)]
+    pub web_search: Option<WebSearchConfig>,
+    #[serde(default)]
+    pub web_fetch: Option<WebFetchConfig>,
+    /// Deprecated — prefer `web_search`. Still read for one-time migration compat.
+    #[serde(default)]
     pub moonshot_search: Option<ServiceEndpoint>,
+    /// Deprecated — prefer `web_fetch`.
     #[serde(default)]
     pub moonshot_fetch: Option<ServiceEndpoint>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebSearchConfig {
+    /// `searxng` | `brave` | `custom`
+    #[serde(default)]
+    pub provider: Option<String>,
+    /// Full search endpoint URL (not auto-suffixed with `/v1/search`).
+    pub base_url: String,
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// Prefer reading the key from this environment variable.
+    #[serde(default)]
+    pub api_key_env: Option<String>,
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub default_limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebFetchConfig {
+    /// Optional full proxy fetch endpoint. When omitted, FetchURL uses direct GET.
+    pub base_url: String,
+    #[serde(default)]
+    pub api_key: Option<String>,
+    #[serde(default)]
+    pub api_key_env: Option<String>,
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
