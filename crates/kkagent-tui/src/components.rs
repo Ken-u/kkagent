@@ -174,9 +174,10 @@ fn picker_height(picker: &ListPickerState, state: &AppState) -> u16 {
         (picker.items.len() as u16).min(max_visible)
     };
     let mut h = rows + 2;
+    // Delete confirm replaces the list with a small choice panel.
     if picker.kind == crate::app::ListPickerKind::Session && state.session_delete_confirm.is_some()
     {
-        h = h.saturating_add(1);
+        return 7;
     }
     h.min(28)
 }
@@ -1616,26 +1617,56 @@ fn render_list_picker(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme
     let inner = area.inner(Margin::new(1, 1));
     f.render_widget(Clear, area);
 
+    // Delete confirm: ↑↓ between No / Yes, Enter to confirm (default No).
+    if picker.kind == crate::app::ListPickerKind::Session {
+        if let Some(confirm) = state.session_delete_confirm.as_ref() {
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(theme.warning))
+                .title(" Delete session ");
+            let mut lines: Vec<Line> = Vec::new();
+            lines.push(Line::from(Span::styled(
+                format!(
+                    " {}",
+                    truncate(&confirm.label, inner.width.saturating_sub(2) as usize)
+                ),
+                Style::default().fg(theme.text),
+            )));
+            lines.push(Line::from(""));
+            for (i, label) in ["No — keep session", "Yes — delete permanently"]
+                .iter()
+                .enumerate()
+            {
+                let selected = confirm.selected == i;
+                let prefix = if selected { "> " } else { "  " };
+                let style = if selected {
+                    Style::default()
+                        .fg(if i == 1 { theme.error } else { theme.primary })
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(theme.text_dim)
+                };
+                lines.push(Line::from(Span::styled(
+                    format!("{prefix}{label}"),
+                    style,
+                )));
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                " ↑↓ select · Enter confirm · Esc cancel ",
+                Style::default().fg(theme.text_muted),
+            )));
+            f.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
+            return;
+        }
+    }
+
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.border))
         .title(picker.title.as_str());
 
     let mut lines: Vec<Line> = Vec::new();
-
-    if picker.kind == crate::app::ListPickerKind::Session {
-        if let Some(confirm) = state.session_delete_confirm.as_ref() {
-            lines.push(Line::from(Span::styled(
-                format!(
-                    " Delete {}?  y = yes · Enter/N = no ",
-                    truncate(&confirm.label, inner.width.saturating_sub(28) as usize)
-                ),
-                Style::default()
-                    .fg(theme.warning)
-                    .add_modifier(Modifier::BOLD),
-            )));
-        }
-    }
 
     if picker.items.is_empty() {
         lines.push(Line::from(Span::styled(

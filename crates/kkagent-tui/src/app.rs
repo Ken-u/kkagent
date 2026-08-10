@@ -177,6 +177,8 @@ pub struct SessionPickerPreview {
 pub struct SessionDeleteConfirm {
     pub session_id: String,
     pub label: String,
+    /// 0 = No (default), 1 = Yes
+    pub selected: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -1183,17 +1185,30 @@ impl TuiApp {
 
         // List picker (model / sessions)
         if self.state.list_picker.is_some() {
-            // Delete confirmation takes priority while open.
-            if self.state.session_delete_confirm.is_some() {
+            // Delete confirmation: ↑↓ choose · Enter confirm (default No)
+            if let Some(ref mut confirm) = self.state.session_delete_confirm {
                 match key.code {
+                    KeyCode::Up | KeyCode::BackTab => {
+                        confirm.selected = 0;
+                    }
+                    KeyCode::Down | KeyCode::Tab => {
+                        confirm.selected = 1;
+                    }
+                    KeyCode::Left => {
+                        confirm.selected = 0;
+                    }
+                    KeyCode::Right => {
+                        confirm.selected = 1;
+                    }
+                    KeyCode::Enter => {
+                        let yes = confirm.selected == 1;
+                        self.confirm_delete_session(yes).await?;
+                    }
+                    KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                        self.confirm_delete_session(false).await?;
+                    }
                     KeyCode::Char('y') | KeyCode::Char('Y') => {
                         self.confirm_delete_session(true).await?;
-                    }
-                    KeyCode::Char('n')
-                    | KeyCode::Char('N')
-                    | KeyCode::Esc
-                    | KeyCode::Enter => {
-                        self.confirm_delete_session(false).await?;
                     }
                     _ => {}
                 }
@@ -1260,6 +1275,7 @@ impl TuiApp {
                             self.state.session_delete_confirm = Some(SessionDeleteConfirm {
                                 session_id: item.id.clone(),
                                 label: item.label.clone(),
+                                selected: 0, // default No
                             });
                         }
                     }
@@ -1894,7 +1910,12 @@ impl TuiApp {
     }
 
     async fn open_session_picker(&mut self) -> anyhow::Result<()> {
-        let params = serde_json::json!({"limit": 40});
+        let cwd = std::env::current_dir()
+            .ok()
+            .and_then(|p| std::fs::canonicalize(&p).ok())
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let cwd_key = cwd.to_string_lossy().to_string();
+        let params = serde_json::json!({"limit": 80});
         match self.client.rpc_call("sessions.list", Some(params)).await {
             Ok(data) => {
                 let mut items = Vec::new();
@@ -1907,6 +1928,24 @@ impl TuiApp {
                             .unwrap_or("")
                             .to_string();
                         if id.is_empty() {
+                            continue;
+                        }
+                        let work = s
+                            .get("working_dir")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        let same_workspace = if work.is_empty() {
+                            false
+                        } else {
+                            std::fs::canonicalize(work)
+                                .map(|p| p.to_string_lossy() == cwd_key)
+                                .unwrap_or_else(|_| {
+                                    std::path::Path::new(work) == cwd
+                                        || work == cwd_key
+                                        || work == "."
+                                })
+                        };
+                        if !same_workspace {
                             continue;
                         }
                         let title = crate::chrome::session_display_title(
@@ -1938,7 +1977,7 @@ impl TuiApp {
                 if items.is_empty() {
                     self.state.list_picker = None;
                     self.state.session_picker_preview = None;
-                    self.system_message("No saved sessions.".into());
+                    self.system_message("No sessions in this workspace.".into());
                 } else {
                     let selected = current
                         .as_ref()
@@ -1946,7 +1985,7 @@ impl TuiApp {
                         .unwrap_or(0);
                     self.state.list_picker = Some(ListPickerState {
                         kind: ListPickerKind::Session,
-                        title: " Sessions  ↑↓  Enter open  Ctrl-D delete ".into(),
+                        title: " Sessions (this workspace)  ↑↓  Enter open  Ctrl-D delete ".into(),
                         items,
                         selected,
                     });
