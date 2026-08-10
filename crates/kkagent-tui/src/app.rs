@@ -105,6 +105,8 @@ pub struct AppState {
     pub tab_strip: TabStrip,
     /// Compact status model for chrome / footer sync.
     pub status_bar: StatusBarModel,
+    /// Workspace sessions for footer strip + empty-input Tab cycling.
+    pub workspace_sessions: crate::chrome::WorkspaceSessionStrip,
     /// Session event router (controllers).
     pub event_router: SessionEventRouter,
     /// Ctrl-F transcript search overlay.
@@ -425,6 +427,7 @@ impl AppState {
                 plan_mode,
                 ..Default::default()
             },
+            workspace_sessions: crate::chrome::WorkspaceSessionStrip::default(),
             event_router: SessionEventRouter::default(),
             search: SearchState::default(),
             last_tool_name: None,
@@ -816,6 +819,8 @@ impl TuiApp {
             }
         }
 
+        let _ = self.refresh_workspace_sessions().await;
+
         enable_raw_mode().map_err(|e| {
             anyhow::anyhow!(
                 "Failed to enter raw mode (is stdin a TTY?): {}. \
@@ -921,6 +926,9 @@ impl TuiApp {
             }
 
             self.state.tick = self.state.tick.wrapping_add(1);
+            if self.state.tick % 100 == 0 {
+                let _ = self.refresh_workspace_sessions().await;
+            }
             if matches!(
                 self.state.status,
                 SessionStatus::Thinking | SessionStatus::ToolExecuting
@@ -1407,6 +1415,18 @@ impl TuiApp {
             KeyCode::Enter if !key.modifiers.contains(KeyModifiers::SHIFT) => {
                 self.submit_input().await?;
             }
+            // Empty input Tab: cycle workspace sessions (same cwd / forks)
+            KeyCode::Tab
+                if !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::SHIFT)
+                    && !key.modifiers.contains(KeyModifiers::ALT)
+                    && self.state.input.is_empty()
+                    && self.state.slash_menu.is_none()
+                    && self.state.file_menu.is_none()
+                    && self.state.list_picker.is_none() =>
+            {
+                self.cycle_workspace_session().await?;
+            }
             // Shift-Enter or Ctrl-J: newline
             KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
                 self.state.input.insert_char('\n');
@@ -1889,7 +1909,123 @@ impl TuiApp {
             &sid[..8.min(sid.len())],
             self.state.messages.len()
         ));
+        let _ = self.refresh_workspace_sessions().await;
         Ok(())
+    }
+
+    async fn refresh_workspace_sessions(&mut self) -> anyhow::Result<()> {
+        let cwd = std::env::current_dir()
+            .ok()
+            .and_then(|p| std::fs::canonicalize(&p).ok())
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let cwd_key = cwd.to_string_lossy().to_string();
+        let params = serde_json::json!({"limit": 40, "include_archived": false});
+        let data = match self.client.rpc_call("sessions.list", Some(params)).await {
+            Ok(v) => v,
+            Err(_) => return Ok(()),
+        };
+        let mut entries = Vec::new();
+        if let Some(sessions) = data.get("sessions").and_then(|v| v.as_array()) {
+            for s in sessions {
+                let id = s
+                    .get("session_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if id.is_empty() {
+                    continue;
+                }
+                let work = s
+                    .get("working_dir")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let same_dir = if work.is_empty() {
+                    true
+                } else {
+                    std::fs::canonicalize(work)
+                        .map(|p| p.to_string_lossy() == cwd_key)
+                        .unwrap_or_else(|_| work == cwd_key || work == ".")
+                };
+                if !same_dir {
+                    continue;
+                }
+                let title = crate::chrome::session_display_title(
+                    s.get("title").and_then(|v| v.as_str()),
+                    s.get("is_custom_title")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false),
+                    s.get("last_prompt").and_then(|v| v.as_str()),
+                    &id,
+                );
+                entries.push(crate::chrome::WorkspaceSessionEntry { id, title });
+            }
+        }
+        // Ensure the live session is present even before the first prompt lands on disk.
+        if let Some(sid) = self.state.session_id.clone() {
+            if !entries.iter().any(|e| e.id == sid) {
+                let title = self
+                    .state
+                    .messages
+                    .iter()
+                    .find(|m| m.role == MessageRole::User)
+                    .map(|m| m.content.chars().take(40).collect::<String>())
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or_else(|| {
+                        if sid.len() > 8 {
+                            sid[..8].to_string()
+                        } else {
+                            sid.clone()
+                        }
+                    });
+                entries.insert(
+                    0,
+                    crate::chrome::WorkspaceSessionEntry { id: sid, title },
+                );
+            }
+        }
+        let active = self.state.session_id.clone();
+        self.state
+            .workspace_sessions
+            .set_entries(entries, active.as_deref());
+        // Keep top tab strip titles in sync for visited sessions.
+        for e in &self.state.workspace_sessions.entries {
+            if self
+                .state
+                .tab_strip
+                .tabs
+                .iter()
+                .any(|t| t.id == e.id)
+            {
+                self.state.tab_strip.ensure_active(&e.id, e.title.clone());
+            }
+        }
+        if let Some(sid) = active {
+            let title = self
+                .state
+                .workspace_sessions
+                .entries
+                .iter()
+                .find(|e| e.id == sid)
+                .map(|e| e.title.clone())
+                .unwrap_or_else(|| "main".into());
+            self.state.tab_strip.ensure_active(&sid, title);
+        }
+        Ok(())
+    }
+
+    async fn cycle_workspace_session(&mut self) -> anyhow::Result<()> {
+        self.refresh_workspace_sessions().await?;
+        let Some(next_id) = self.state.workspace_sessions.next_id() else {
+            self.system_message(
+                "No other sessions in this workspace — /fork to create one, then Tab to cycle."
+                    .into(),
+            );
+            return Ok(());
+        };
+        if self.state.session_id.as_deref() == Some(next_id.as_str()) {
+            return Ok(());
+        }
+        self.resume_session(&next_id).await
     }
 
     async fn submit_input(&mut self) -> anyhow::Result<()> {
@@ -1938,6 +2074,9 @@ impl TuiApp {
             if let Err(e) = self.client.send_prompt(sid, &prompt_text).await {
                 self.state.status = SessionStatus::Idle;
                 self.system_message(format!("Error: {}", e));
+            } else {
+                // Update footer title from first/latest prompt.
+                let _ = self.refresh_workspace_sessions().await;
             }
         } else {
             self.state.status = SessionStatus::Idle;
@@ -2049,6 +2188,7 @@ impl TuiApp {
                     }
                 }
                 self.system_message("New session started.".into());
+                let _ = self.refresh_workspace_sessions().await;
             }
             "sessions" | "resume" => {
                 if args.is_empty() {
@@ -2246,7 +2386,10 @@ impl TuiApp {
                         .rpc_call("session.set_title", Some(params))
                         .await
                     {
-                        Ok(_) => self.system_message(format!("Session title set to: {}", args)),
+                        Ok(_) => {
+                            self.system_message(format!("Session title set to: {}", args));
+                            let _ = self.refresh_workspace_sessions().await;
+                        }
                         Err(e) => self.system_message(format!("Failed to set title: {}", e)),
                     }
                 }
@@ -2411,8 +2554,9 @@ impl TuiApp {
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("?");
                             self.system_message(format!(
-                                "Session forked ({fork_id}). Still in the original session; switch to the fork via /sessions."
+                                "Session forked ({fork_id}). Still in the original session; switch to the fork via Tab or /sessions."
                             ));
+                            let _ = self.refresh_workspace_sessions().await;
                         }
                         Err(e) => self.system_message(format!("Failed to fork session: {e}")),
                     }
@@ -3090,13 +3234,13 @@ fn slash_help_text() -> String {
     let mut s = String::from(
         "Keyboard shortcuts:\n\
   Enter         - Submit / confirm slash\n\
-  Tab           - Complete slash command\n\
+  Tab           - Complete slash/@ · empty input cycles workspace sessions\n\
+  Shift-Tab     - Toggle plan mode (scroll locks to full plan until exit)\n\
   ↑↓            - Input history / slash menu\n\
   PgUp/PgDn     - Scroll transcript\n\
   Mouse wheel   - Scroll transcript (quick flick snaps to this turn; in plan mode locks to plan)\n\
   Click + drag  - Select/copy (releases mouse; next key restores scroll)\n\
   Esc           - Interrupt / dismiss; Esc Esc undo turn\n\
-  Shift-Tab     - Toggle plan mode (scroll locks to full plan until exit)\n\
   !             - Shell mode\n\
   @             - File path picker (Tab/Enter insert)\n\
   Ctrl-F / Ctrl-S - Search transcript\n\

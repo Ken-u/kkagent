@@ -69,7 +69,7 @@ answer=$(kkagent -p "总结 README" 2>kkagent.err)
 - 扩展：`/mcp`、`/skills`、`/plugins`、`/tasks`、`/goal`、`/swarm`、`/web`、`/prompts`。
 - 工具：`/init`、`/config`、`/auth`、`/reload`、`/add-dir`、`/btw`、`/fork`、`/search`、`/copy`、`/debug`。
 - `/btw <question>`：侧问（不写入主会话）；`Ctrl+G` 打开/关闭侧栏，流式中再按可取消。
-- `/fork [title]`：派生当前会话副本，仍停留在原会话，用 `/sessions` 切换。
+- `/fork [title]`：派生当前会话副本，仍停留在原会话；footer context 栏显示同目录会话，输入框为空时按 `Tab` 循环切换。
 - 帮助与退出：`/help`、`/release-notes`、`/feedback`、`/info`、`/exit`、`/quit`、`/q`。
 
 部分命令仅展示状态或排队执行；输入 `/help` 可查看当前版本的参数提示。

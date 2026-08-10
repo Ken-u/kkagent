@@ -1,4 +1,4 @@
-//! Chrome: tab strip, status bar — aligned with kimi-code tui/chrome.
+//! Chrome: tab strip, status bar, workspace session strip — aligned with kimi-code tui/chrome.
 
 use kkagent_protocol::{PermissionMode, SessionStatus};
 use ratatui::{
@@ -8,8 +8,11 @@ use ratatui::{
     widgets::Paragraph,
     Frame,
 };
+use unicode_width::UnicodeWidthStr;
 
 use crate::theme::Theme;
+
+const SESSION_TITLE_MAX_COLS: usize = 18;
 
 #[derive(Debug, Clone)]
 pub struct SessionTab {
@@ -29,6 +32,11 @@ impl TabStrip {
     pub fn ensure_active(&mut self, id: &str, title: impl Into<String>) {
         if let Some(i) = self.tabs.iter().position(|t| t.id == id) {
             self.active = i;
+            // Refresh title when we know a better one.
+            let title = title.into();
+            if !title.is_empty() && title != "main" {
+                self.tabs[i].title = title;
+            }
             return;
         }
         self.tabs.push(SessionTab {
@@ -84,54 +92,252 @@ impl TabStrip {
             .map(|(i, t)| {
                 let mark = if t.dirty { "*" } else { "" };
                 let active = if i == self.active { ">" } else { " " };
-                format!("{active}{mark}{}", truncate(&t.title, 16))
+                format!("{active}{mark}{}", truncate_cols(&t.title, 16))
             })
             .collect();
-        let joined = labels.join(" │ ");
-        if joined.chars().count() <= width.saturating_sub(2) {
-            return format!(" {joined}");
+        scroll_join_labels(&labels, self.active, width)
+    }
+}
+
+/// One workspace session shown in the footer context strip.
+#[derive(Debug, Clone)]
+pub struct WorkspaceSessionEntry {
+    pub id: String,
+    pub title: String,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct WorkspaceSessionStrip {
+    pub entries: Vec<WorkspaceSessionEntry>,
+    pub active: usize,
+}
+
+impl WorkspaceSessionStrip {
+    pub fn set_entries(&mut self, entries: Vec<WorkspaceSessionEntry>, active_id: Option<&str>) {
+        self.entries = entries;
+        self.active = active_id
+            .and_then(|id| self.entries.iter().position(|e| e.id == id))
+            .unwrap_or(0);
+    }
+
+    pub fn active_id(&self) -> Option<&str> {
+        self.entries.get(self.active).map(|e| e.id.as_str())
+    }
+
+    pub fn next_id(&mut self) -> Option<String> {
+        if self.entries.len() < 2 {
+            return None;
         }
-        let mut start = self.active;
-        let mut end = (self.active + 1).min(labels.len());
-        let mut guard = 0;
-        while guard < 32 {
-            guard += 1;
-            let slice = labels[start..end].join(" │ ");
-            let framed = format!("< {slice} >");
-            if framed.chars().count() <= width {
-                // try expand
-                let mut expanded = false;
-                if start > 0 {
-                    let left = labels[start - 1..end].join(" │ ");
-                    if format!("< {left} >").chars().count() <= width {
-                        start -= 1;
-                        expanded = true;
-                    }
-                }
-                if end < labels.len() {
-                    let right = labels[start..end + 1].join(" │ ");
-                    if format!("< {right} >").chars().count() <= width {
-                        end += 1;
-                        expanded = true;
-                    }
-                }
-                if !expanded {
-                    return framed;
-                }
-            } else if end - start > 1 {
-                if start < self.active {
-                    start += 1;
-                } else if end > self.active + 1 {
-                    end -= 1;
+        self.active = (self.active + 1) % self.entries.len();
+        self.active_id().map(|s| s.to_string())
+    }
+
+    /// Render a scrolling strip that always keeps the active entry visible.
+    /// Caller passes remaining width after reserving the context meter.
+    pub fn render_spans(&self, max_cols: usize, theme: &Theme) -> Vec<Span<'static>> {
+        if self.entries.is_empty() || max_cols < 4 {
+            return Vec::new();
+        }
+        let labels: Vec<(bool, String)> = self
+            .entries
+            .iter()
+            .enumerate()
+            .map(|(i, e)| {
+                let title = truncate_cols(&e.title, SESSION_TITLE_MAX_COLS);
+                let label = if i == self.active {
+                    format!("[{title}]")
                 } else {
-                    break;
-                }
+                    title
+                };
+                (i == self.active, label)
+            })
+            .collect();
+
+        let (start, end, left_overflow, right_overflow) =
+            visible_window(&labels, self.active, max_cols);
+
+        let mut spans = Vec::new();
+        if left_overflow {
+            spans.push(Span::styled(
+                "‹ ".to_string(),
+                Style::default().fg(theme.text_muted),
+            ));
+        }
+        for (i, (is_active, label)) in labels[start..end].iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::styled(
+                    " · ".to_string(),
+                    Style::default().fg(theme.text_muted),
+                ));
+            }
+            if *is_active {
+                spans.push(Span::styled(
+                    label.clone(),
+                    Style::default()
+                        .fg(theme.accent)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            } else {
+                spans.push(Span::styled(
+                    label.clone(),
+                    Style::default().fg(theme.text_dim),
+                ));
+            }
+        }
+        if right_overflow {
+            spans.push(Span::styled(
+                " ›".to_string(),
+                Style::default().fg(theme.text_muted),
+            ));
+        }
+        spans
+    }
+}
+
+/// Prefer custom `/title`, else first/last prompt snippet, else short id.
+pub fn session_display_title(
+    title: Option<&str>,
+    is_custom_title: bool,
+    last_prompt: Option<&str>,
+    session_id: &str,
+) -> String {
+    let clean = |s: &str| {
+        s.chars()
+            .map(|c| if c.is_whitespace() { ' ' } else { c })
+            .collect::<String>()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    if is_custom_title {
+        if let Some(t) = title.map(str::trim).filter(|s| !s.is_empty()) {
+            return clean(t);
+        }
+    }
+    if let Some(p) = last_prompt.map(str::trim).filter(|s| !s.is_empty()) {
+        return clean(p);
+    }
+    if let Some(t) = title.map(str::trim).filter(|s| !s.is_empty()) {
+        return clean(t);
+    }
+    let short = if session_id.len() > 8 {
+        &session_id[..8]
+    } else {
+        session_id
+    };
+    short.to_string()
+}
+
+fn visible_window(
+    labels: &[(bool, String)],
+    active: usize,
+    max_cols: usize,
+) -> (usize, usize, bool, bool) {
+    if labels.is_empty() {
+        return (0, 0, false, false);
+    }
+    let sep_w = UnicodeWidthStr::width(" · ");
+
+    let width_of = |start: usize, end: usize, left: bool, right: bool| -> usize {
+        let mut w = 0usize;
+        for (i, (_, label)) in labels[start..end].iter().enumerate() {
+            if i > 0 {
+                w = w.saturating_add(sep_w);
+            }
+            w = w.saturating_add(UnicodeWidthStr::width(label.as_str()));
+        }
+        if left {
+            w = w.saturating_add(UnicodeWidthStr::width("‹ "));
+        }
+        if right {
+            w = w.saturating_add(UnicodeWidthStr::width(" ›"));
+        }
+        w
+    };
+
+    let active = active.min(labels.len() - 1);
+    let mut start = active;
+    let mut end = active + 1;
+    loop {
+        let left = start > 0;
+        let right = end < labels.len();
+        let cur = width_of(start, end, left, right);
+        if cur > max_cols && end - start > 1 {
+            if start < active {
+                start += 1;
+            } else if end > active + 1 {
+                end -= 1;
             } else {
                 break;
             }
+            continue;
         }
-        format!("< {} >", labels[start..end].join(" │ "))
+        let mut expanded = false;
+        if start > 0 {
+            let trial = width_of(start - 1, end, start > 1, end < labels.len());
+            if trial <= max_cols {
+                start -= 1;
+                expanded = true;
+            }
+        }
+        if end < labels.len() {
+            let trial = width_of(start, end + 1, start > 0, end + 1 < labels.len());
+            if trial <= max_cols {
+                end += 1;
+                expanded = true;
+            }
+        }
+        if !expanded {
+            break;
+        }
     }
+    (start, end, start > 0, end < labels.len())
+}
+
+fn scroll_join_labels(labels: &[String], active: usize, width: usize) -> String {
+    let joined = labels.join(" │ ");
+    if UnicodeWidthStr::width(joined.as_str()) <= width.saturating_sub(2) {
+        return format!(" {joined}");
+    }
+    let mut start = active.min(labels.len().saturating_sub(1));
+    let mut end = (start + 1).min(labels.len());
+    let mut guard = 0;
+    while guard < 32 {
+        guard += 1;
+        let slice = labels[start..end].join(" │ ");
+        let framed = format!("< {slice} >");
+        if UnicodeWidthStr::width(framed.as_str()) <= width {
+            let mut expanded = false;
+            if start > 0 {
+                let left = labels[start - 1..end].join(" │ ");
+                if UnicodeWidthStr::width(format!("< {left} >").as_str()) <= width {
+                    start -= 1;
+                    expanded = true;
+                }
+            }
+            if end < labels.len() {
+                let right = labels[start..end + 1].join(" │ ");
+                if UnicodeWidthStr::width(format!("< {right} >").as_str()) <= width {
+                    end += 1;
+                    expanded = true;
+                }
+            }
+            if !expanded {
+                return framed;
+            }
+        } else if end - start > 1 {
+            if start < active {
+                start += 1;
+            } else if end > active + 1 {
+                end -= 1;
+            } else {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+    format!("< {} >", labels[start..end].join(" │ "))
 }
 
 #[derive(Debug, Clone)]
@@ -204,7 +410,7 @@ impl StatusBarModel {
         }
         if let Some(ref cwd) = self.cwd {
             spans.push(Span::styled(
-                format!("│ {} ", truncate(cwd, 28)),
+                format!("│ {} ", truncate_cols(cwd, 28)),
                 Style::default().fg(theme.text_muted),
             ));
         }
@@ -218,15 +424,28 @@ pub fn draw_tab_strip(f: &mut Frame, area: Rect, strip: &TabStrip, theme: &Theme
     f.render_widget(p, area);
 }
 
-fn truncate(s: &str, max: usize) -> String {
-    let chars: Vec<char> = s.chars().collect();
-    if chars.len() <= max {
-        s.to_string()
-    } else if max <= 1 {
-        "…".into()
-    } else {
-        format!("{}…", chars[..max - 1].iter().collect::<String>())
+fn truncate_cols(s: &str, max: usize) -> String {
+    if max == 0 {
+        return String::new();
     }
+    if UnicodeWidthStr::width(s) <= max {
+        return s.to_string();
+    }
+    if max == 1 {
+        return "…".into();
+    }
+    let mut out = String::new();
+    let mut w = 0usize;
+    for ch in s.chars() {
+        let cw = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if w + cw > max - 1 {
+            break;
+        }
+        out.push(ch);
+        w += cw;
+    }
+    out.push('…');
+    out
 }
 
 fn format_tokens(n: u64) -> String {
@@ -251,5 +470,36 @@ mod tests {
         }
         let line = s.render_labels(40);
         assert!(line.contains('<') || line.contains("session"));
+    }
+
+    #[test]
+    fn display_title_prefers_custom() {
+        let t = session_display_title(Some("My Name"), true, Some("first prompt here"), "abcdef12");
+        assert_eq!(t, "My Name");
+        let t = session_display_title(Some("auto"), false, Some("first prompt here"), "abcdef12");
+        assert_eq!(t, "first prompt here");
+    }
+
+    #[test]
+    fn workspace_strip_keeps_active_visible() {
+        let theme = Theme::default();
+        let mut strip = WorkspaceSessionStrip::default();
+        let mut entries = Vec::new();
+        for i in 0..12 {
+            entries.push(WorkspaceSessionEntry {
+                id: format!("id{i}"),
+                title: format!("session-title-number-{i}"),
+            });
+        }
+        strip.set_entries(entries, Some("id8"));
+        let spans = strip.render_spans(40, &theme);
+        let text: String = spans.iter().map(|s| s.content.clone()).collect();
+        assert!(text.contains('8') || text.contains('['));
+        assert!(
+            text.contains('‹')
+                || text.contains('›')
+                || text.contains('·')
+                || text.contains('[')
+        );
     }
 }

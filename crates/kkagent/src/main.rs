@@ -2588,6 +2588,7 @@ async fn handle_rpc_call(
                             serde_json::json!({
                                 "session_id": s.id,
                                 "title": s.title,
+                                "is_custom_title": s.is_custom_title,
                                 "working_dir": s.work_dir,
                                 "session_dir": s.session_dir,
                                 "archived": s.archived,
@@ -3419,9 +3420,12 @@ async fn handle_rpc_call(
             {
                 let mut sessions = state.sessions.lock().await;
                 if let Some(session) = sessions.get_mut(&session_id) {
-                    session.title = Some(title.clone());
+                    session
+                        .set_title_persisted(title.clone())
+                        .map_err(|e| (-32000, e.to_string()))?;
                 }
             }
+            let _ = SessionStore::open_default().rename(&session_id, &title);
             let db = state.transcript.lock().await;
             let _ = db.set_title(&session_id, &title);
             Ok(serde_json::json!({"ok": true, "title": title}))

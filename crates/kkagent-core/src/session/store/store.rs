@@ -17,6 +17,9 @@ pub struct SessionSummary {
     pub work_dir: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// True when the user set a title via `/title` (or equivalent).
+    #[serde(default)]
+    pub is_custom_title: bool,
     #[serde(default)]
     pub archived: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -249,6 +252,7 @@ fn summary_from_meta(id: &str, dir: &Path, work: &Path, meta: &SessionMeta) -> S
         session_dir: dir.to_string_lossy().into(),
         work_dir: work.to_string_lossy().into(),
         title: meta.title.clone(),
+        is_custom_title: meta.is_custom_title,
         archived: meta.archived,
         last_prompt: meta.last_prompt.clone(),
         created_at: meta.created_at,
@@ -329,6 +333,7 @@ mod tests {
         let listed = store.list(false, 10).unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].title.as_deref(), Some("My Session"));
+        assert!(listed[0].is_custom_title);
         let forked = store.fork("s1", "s2", Some("fork"), None).unwrap();
         assert_eq!(forked.forked_from.as_deref(), Some("s1"));
         store.archive("s1", true).unwrap();

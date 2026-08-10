@@ -24,6 +24,7 @@ const TIPS: &[&str] = &[
     "@ opens file picker — tab to insert a path",
     "ctrl+f searches the transcript",
     "ctrl+o expands turn tool history",
+    "tab cycles workspace sessions when the input is empty",
     "ctrl+g toggles /btw side Q&A",
     "shift-tab toggles plan mode (scroll locks to plan)",
     "! enters shell mode",
@@ -1201,23 +1202,31 @@ fn render_footer(f: &mut Frame, area: Rect, state: &AppState, config: &AppConfig
         ));
     }
 
-    // Line 2: context on the right (+ session id snip)
+    // Line 2: workspace session strip (left) + context meter (right)
     let context = format_context(state, config);
-    let mut right = context;
-    if let Some(ref sid) = state.session_id {
-        let short = if sid.len() > 8 {
-            &sid[..8]
-        } else {
-            sid.as_str()
-        };
-        right = format!("{right}  ·  {short}");
+    let ctx_w = UnicodeWidthStr::width(context.as_str());
+    let gap = 2usize;
+    let strip_budget = (area.width as usize)
+        .saturating_sub(ctx_w)
+        .saturating_sub(gap);
+    let session_spans = state
+        .workspace_sessions
+        .render_spans(strip_budget, theme);
+    let strip_text: String = session_spans.iter().map(|s| s.content.clone()).collect();
+    let strip_w = UnicodeWidthStr::width(strip_text.as_str());
+    let pad2 = area
+        .width
+        .saturating_sub(strip_w as u16)
+        .saturating_sub(ctx_w as u16);
+    let mut line2_spans = session_spans;
+    if pad2 > 0 {
+        line2_spans.push(Span::raw(" ".repeat(pad2 as usize)));
     }
-    let ctx_w = UnicodeWidthStr::width(right.as_str()) as u16;
-    let pad2 = area.width.saturating_sub(ctx_w);
-    let line2 = Line::from(vec![
-        Span::raw(" ".repeat(pad2 as usize)),
-        Span::styled(right, Style::default().fg(theme.text)),
-    ]);
+    line2_spans.push(Span::styled(
+        context,
+        Style::default().fg(theme.text),
+    ));
+    let line2 = Line::from(line2_spans);
 
     f.render_widget(
         Paragraph::new(Text::from(vec![Line::from(line1_spans), line2])),
