@@ -980,7 +980,7 @@ impl TuiApp {
             }
             Err(e) => {
                 self.system_message(format!("Copy failed: {e}"));
-                true // still consume Ctrl+C — selection was intentional
+                true // still consume the copy shortcut — selection was intentional
             }
         }
     }
@@ -3964,7 +3964,8 @@ fn split_plan_message_content(content: &str) -> (String, String) {
 }
 
 fn slash_help_text() -> String {
-    let mut s = String::from(
+    let copy = crate::platform_keys::copy_shortcut_label();
+    let mut s = format!(
         "Keyboard shortcuts:\n\
   Enter         - Submit / confirm slash\n\
   Tab / ← →    - Empty input: cycle related sessions (/new or /fork)\n\
@@ -3973,7 +3974,7 @@ fn slash_help_text() -> String {
   ↑↓            - Input history / slash menu\n\
   PgUp/PgDn     - Scroll transcript\n\
   Mouse wheel   - Scroll transcript (stays in-app)\n\
-  Drag select   - Select transcript text; Ctrl-C copies (OSC 52 / local)\n\
+  Drag select   - Select transcript text; {copy} copies (OSC 52 / local)\n\
   Esc           - Clear selection / close menu/overlay; if none, interrupt / Esc Esc undo\n\
   !             - Shell mode\n\
   @             - File path picker (Tab/Enter insert)\n\
@@ -3983,7 +3984,7 @@ fn slash_help_text() -> String {
   Ctrl-T        - Expand/collapse todo panel\n\
   Ctrl-P / Ctrl-N - Input history\n\
   Large paste   - Collapses to [Pasted text #n] overview\n\n\
-Slash commands:\n",
+Slash commands:\n"
     );
     for cmd in slash::BUILTIN_SLASH_COMMANDS {
         let hint = cmd
