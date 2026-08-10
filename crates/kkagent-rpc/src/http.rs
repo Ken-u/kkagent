@@ -83,17 +83,25 @@ impl DurableHttpStore {
         {
             std::fs::create_dir_all(parent)?;
         }
-        Self::from_connection(Connection::open(path)?)
+        let connection = Connection::open(path)?;
+        connection.busy_timeout(std::time::Duration::from_secs(5))?;
+        Self::from_shared(Arc::new(StdMutex::new(connection)))
     }
 
     pub fn open_in_memory() -> anyhow::Result<Self> {
-        Self::from_connection(Connection::open_in_memory()?)
+        let connection = Connection::open_in_memory()?;
+        connection.busy_timeout(std::time::Duration::from_secs(5))?;
+        Self::from_shared(Arc::new(StdMutex::new(connection)))
     }
 
-    fn from_connection(connection: Connection) -> anyhow::Result<Self> {
-        connection.busy_timeout(std::time::Duration::from_secs(5))?;
-        connection.execute_batch(
-            "PRAGMA journal_mode = WAL;
+    /// Share an already-opened SQLite connection (e.g. with TranscriptDb / SubagentManager).
+    pub fn from_shared(connection: Arc<StdMutex<Connection>>) -> anyhow::Result<Self> {
+        {
+            let conn = connection
+                .lock()
+                .map_err(|_| anyhow::anyhow!("durable HTTP store lock poisoned"))?;
+            conn.execute_batch(
+                "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = FULL;
              CREATE TABLE IF NOT EXISTS http_events (
                 event_seq INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -122,10 +130,9 @@ impl DurableHttpStore {
                 WHERE idempotency_key IS NOT NULL;
              CREATE INDEX IF NOT EXISTS idx_durable_turns_recovery
                 ON durable_turns(state, lease_expires_at, created_at);",
-        )?;
-        Ok(Self {
-            connection: Arc::new(StdMutex::new(connection)),
-        })
+            )?;
+        }
+        Ok(Self { connection })
     }
 
     fn append_event(&self, event: Value) -> anyhow::Result<Value> {

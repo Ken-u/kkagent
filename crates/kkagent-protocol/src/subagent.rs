@@ -62,8 +62,20 @@ impl SubagentManager {
     pub fn new_persistent(max_concurrent: usize, path: &std::path::Path) -> anyhow::Result<Self> {
         let connection = Connection::open(path)?;
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
-        connection.execute_batch(
-            "PRAGMA journal_mode = WAL;
+        Self::from_shared(max_concurrent, Arc::new(std::sync::Mutex::new(connection)))
+    }
+
+    /// Share an already-opened SQLite connection (e.g. with TranscriptDb / DurableHttpStore).
+    pub fn from_shared(
+        max_concurrent: usize,
+        connection: Arc<std::sync::Mutex<Connection>>,
+    ) -> anyhow::Result<Self> {
+        {
+            let connection = connection
+                .lock()
+                .map_err(|_| anyhow::anyhow!("subagent store lock poisoned"))?;
+            connection.execute_batch(
+                "PRAGMA journal_mode = WAL;
              CREATE TABLE IF NOT EXISTS durable_subagents (
                 agent_id TEXT PRIMARY KEY,
                 config_json TEXT NOT NULL,
@@ -82,9 +94,13 @@ impl SubagentManager {
              UPDATE durable_subagents SET status = 'failed',
                 error = 'retry limit exhausted after unclean shutdown', updated_at = datetime('now')
                 WHERE status = 'running' AND attempts >= max_attempts;",
-        )?;
+            )?;
+        }
         let mut agents = HashMap::new();
         {
+            let connection = connection
+                .lock()
+                .map_err(|_| anyhow::anyhow!("subagent store lock poisoned"))?;
             let mut statement = connection.prepare(
                 "SELECT agent_id, description, status, result, error, turns_used FROM durable_subagents",
             )?;
@@ -108,7 +124,7 @@ impl SubagentManager {
             agents: Arc::new(Mutex::new(agents)),
             aborts: Arc::new(Mutex::new(HashMap::new())),
             max_concurrent,
-            persistence: Some(Arc::new(std::sync::Mutex::new(connection))),
+            persistence: Some(connection),
         })
     }
 

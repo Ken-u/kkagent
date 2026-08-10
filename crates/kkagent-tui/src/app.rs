@@ -742,8 +742,6 @@ impl TuiApp {
             self.bind_config_default_model();
         }
 
-        let _ = self.refresh_skill_commands().await;
-
         // Sync CLI / config plan mode onto the server session (create starts with plan_mode=false).
         if self.state.plan_mode {
             if let Some(ref sid) = self.state.session_id.clone() {
@@ -753,7 +751,15 @@ impl TuiApp {
             }
         }
 
-        let _ = self.refresh_workspace_sessions().await;
+        // Independent RPCs — one RTT instead of two sequential round-trips.
+        let skills_fut = self.client.rpc_call("skills.list", None);
+        let sessions_fut = self.client.rpc_call(
+            "sessions.list",
+            Some(serde_json::json!({"limit": 80, "include_archived": false})),
+        );
+        let (skills_res, sessions_res) = tokio::join!(skills_fut, sessions_fut);
+        self.apply_skills_list(skills_res.ok());
+        self.apply_workspace_sessions_list(sessions_res.ok());
 
         enable_raw_mode().map_err(|e| {
             anyhow::anyhow!(
@@ -2501,17 +2507,27 @@ impl TuiApp {
     }
 
     async fn refresh_workspace_sessions(&mut self) -> anyhow::Result<()> {
-        let Some(current_id) = self.state.session_id.clone() else {
+        let Some(_current_id) = self.state.session_id.clone() else {
             self.state.workspace_sessions.set_entries(Vec::new(), None);
             return Ok(());
         };
         let params = serde_json::json!({"limit": 80, "include_archived": false});
         let data = match self.client.rpc_call("sessions.list", Some(params)).await {
-            Ok(v) => v,
-            Err(_) => {
-                self.state.workspace_sessions.set_entries(Vec::new(), None);
-                return Ok(());
-            }
+            Ok(v) => Some(v),
+            Err(_) => None,
+        };
+        self.apply_workspace_sessions_list(data);
+        Ok(())
+    }
+
+    fn apply_workspace_sessions_list(&mut self, data: Option<serde_json::Value>) {
+        let Some(current_id) = self.state.session_id.clone() else {
+            self.state.workspace_sessions.set_entries(Vec::new(), None);
+            return;
+        };
+        let Some(data) = data else {
+            self.state.workspace_sessions.set_entries(Vec::new(), None);
+            return;
         };
 
         let mut rows: Vec<(String, Option<String>, String)> = Vec::new();
@@ -2654,7 +2670,6 @@ impl TuiApp {
             })
             .unwrap_or_else(|| "main".into());
         self.state.tab_strip.ensure_active(&current_id, title);
-        Ok(())
     }
 
     fn link_open_sessions(&mut self, a: &str, b: &str) {
@@ -3602,43 +3617,41 @@ impl TuiApp {
     }
 
     async fn refresh_skill_commands(&mut self) -> anyhow::Result<()> {
-        match self.client.rpc_call("skills.list", None).await {
-            Ok(data) => {
-                let mut pairs = Vec::new();
-                if let Some(arr) = data.get("skills").and_then(|v| v.as_array()) {
-                    for s in arr {
-                        let name = s
-                            .get("name")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        if name.is_empty() {
-                            continue;
-                        }
-                        let enabled = s
-                            .get("enabled")
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(true);
-                        if !enabled {
-                            continue;
-                        }
-                        let desc = s
-                            .get("description")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        pairs.push((name, desc));
-                    }
+        let data = self.client.rpc_call("skills.list", None).await.ok();
+        self.apply_skills_list(data);
+        Ok(())
+    }
+
+    fn apply_skills_list(&mut self, data: Option<serde_json::Value>) {
+        let Some(data) = data else {
+            return;
+        };
+        let mut pairs = Vec::new();
+        if let Some(arr) = data.get("skills").and_then(|v| v.as_array()) {
+            for s in arr {
+                let name = s
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if name.is_empty() {
+                    continue;
                 }
-                let (commands, map) = build_skill_slash_commands(&pairs);
-                self.state.skill_slash_commands = commands;
-                self.state.skill_command_map = map;
-            }
-            Err(e) => {
-                tracing::debug!("skills.list failed: {e}");
+                let enabled = s.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
+                if !enabled {
+                    continue;
+                }
+                let desc = s
+                    .get("description")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                pairs.push((name, desc));
             }
         }
-        Ok(())
+        let (commands, map) = build_skill_slash_commands(&pairs);
+        self.state.skill_slash_commands = commands;
+        self.state.skill_command_map = map;
     }
 
     async fn activate_skill(&mut self, name: &str, args: &str) -> anyhow::Result<()> {

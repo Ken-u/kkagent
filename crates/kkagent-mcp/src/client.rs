@@ -170,20 +170,43 @@ impl McpManager {
 
     pub async fn connect_all(&self) -> Result<()> {
         let disabled = self.disabled.lock().await.clone();
-        for config in &self.configs {
-            if disabled.contains(&config.name) {
-                tracing::info!("Skipping disabled MCP server {}", config.name);
-                continue;
+        let to_connect: Vec<McpServerConfig> = self
+            .configs
+            .iter()
+            .filter(|config| {
+                if disabled.contains(&config.name) {
+                    tracing::info!("Skipping disabled MCP server {}", config.name);
+                    false
+                } else {
+                    true
+                }
+            })
+            .cloned()
+            .collect();
+
+        // Concurrent connects — each server is independent until refresh_tools.
+        let futures = to_connect.iter().map(|config| {
+            let config = config.clone();
+            async move {
+                match self.connect_server(&config).await {
+                    Ok(()) => {
+                        tracing::info!(
+                            "Connected to MCP server {} ({:?})",
+                            config.name,
+                            config.transport
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to connect to MCP server {}: {}",
+                            config.name,
+                            e
+                        );
+                    }
+                }
             }
-            match self.connect_server(config).await {
-                Ok(_) => tracing::info!(
-                    "Connected to MCP server {} ({:?})",
-                    config.name,
-                    config.transport
-                ),
-                Err(e) => tracing::warn!("Failed to connect to MCP server {}: {}", config.name, e),
-            }
-        }
+        });
+        futures::future::join_all(futures).await;
         self.refresh_tools().await?;
         Ok(())
     }

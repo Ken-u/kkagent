@@ -2184,15 +2184,15 @@ fn mcp_manager_from_config(config: &AppConfig) -> McpManager {
 fn open_transcript_with_policy(
     path: &Path,
     allow_in_memory: bool,
-) -> Result<(TranscriptDb, bool, Option<String>)> {
-    match TranscriptDb::open(path) {
+) -> Result<(kkagent_core::SharedSqlite, bool, Option<String>)> {
+    match kkagent_core::open_shared_sqlite(path) {
         Ok(database) => Ok((database, true, None)),
         Err(error) if allow_in_memory => {
             tracing::error!(
                 "Failed to open transcript DB: {error}; explicitly entering in-memory degraded mode"
             );
             Ok((
-                TranscriptDb::open_in_memory().map_err(|memory_error| {
+                kkagent_core::open_shared_sqlite_memory().map_err(|memory_error| {
                     anyhow::anyhow!(
                         "cannot open transcript DB (durable={error}, memory={memory_error})"
                     )
@@ -2213,13 +2213,12 @@ async fn build_server_state(config: Arc<AppConfig>) -> Result<Arc<ServerState>> 
         .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
     let transcript_path = kkagent_config::default_config_dir().join("transcripts.db");
-    let (transcript, persistence_durable, persistence_error) =
+    let (shared_sqlite, persistence_durable, persistence_error) =
         open_transcript_with_policy(&transcript_path, allow_in_memory)?;
-    let durable_http = if persistence_durable {
-        kkagent_rpc::DurableHttpStore::open(&transcript_path)?
-    } else {
-        kkagent_rpc::DurableHttpStore::open_in_memory()?
-    };
+    // One Connection for transcript + durable HTTP + subagents (avoid triple open/busy_timeout).
+    let transcript = TranscriptDb::from_shared(shared_sqlite.clone())?;
+    let durable_http = kkagent_rpc::DurableHttpStore::from_shared(shared_sqlite.clone())?;
+    let subagents = Arc::new(SubagentManager::from_shared(4, shared_sqlite)?);
     let sandbox_policy = kkagent_tools::sandbox::SandboxPolicy::from_config(&config.sandbox)?;
 
     let mcp = Arc::new(mcp_manager_from_config(&config));
@@ -2232,35 +2231,55 @@ async fn build_server_state(config: Arc<AppConfig>) -> Result<Arc<ServerState>> 
             .collect();
         mcp.set_disabled_names(disabled).await;
     }
-    if !config.mcp_servers.is_empty() {
-        if let Err(e) = mcp.connect_all().await {
-            tracing::warn!("MCP connect_all error: {}", e);
-        } else {
-            let n = mcp.list_tools().await.len();
-            tracing::info!(
-                "MCP ready: {} server(s), {} tool(s)",
-                config.mcp_servers.len(),
-                n
-            );
-        }
-    }
 
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let mut hooks_mgr = kkagent_mcp::HookManager::new(&cwd);
     hooks_mgr.load_from_app_config(&config.hooks).await;
-    let _ = hooks_mgr.discover().await;
-    let hooks = Arc::new(hooks_mgr);
-    let skills = Arc::new(
+    let cron_path = kkagent_config::default_config_dir().join("cron.json");
+    let mcp_connect = mcp.clone();
+    let mcp_servers_configured = !config.mcp_servers.is_empty();
+    let extra_skill_dirs = config.extra_skill_dirs.clone();
+    let merge_all_available_skills = config.merge_all_available_skills;
+
+    // Independent startup work: MCP connects, skill catalog, hooks discover, cron load.
+    let (mcp_result, skills, hooks_discover, cron) = tokio::join!(
+        async {
+            if mcp_servers_configured {
+                mcp_connect.connect_all().await
+            } else {
+                Ok(())
+            }
+        },
         kkagent_tools::SkillCatalog::configured(
             &cwd,
-            &config.extra_skill_dirs,
-            config.merge_all_available_skills,
-        )
-        .await,
+            &extra_skill_dirs,
+            merge_all_available_skills,
+        ),
+        hooks_mgr.discover(),
+        kkagent_tools::CronManager::with_persist(cron_path),
     );
+
+    if mcp_servers_configured {
+        match mcp_result {
+            Ok(()) => {
+                let n = mcp.list_tools().await.len();
+                tracing::info!(
+                    "MCP ready: {} server(s), {} tool(s)",
+                    config.mcp_servers.len(),
+                    n
+                );
+            }
+            Err(e) => tracing::warn!("MCP connect_all error: {}", e),
+        }
+    }
+    if let Err(e) = hooks_discover {
+        tracing::warn!("hooks discover error: {e}");
+    }
+
+    let hooks = Arc::new(hooks_mgr);
+    let skills = Arc::new(skills);
     skills.set_disabled(config.disabled_skills.clone()).await;
-    let cron_path = kkagent_config::default_config_dir().join("cron.json");
-    let cron = Arc::new(kkagent_tools::CronManager::with_persist(cron_path).await);
+    let cron = Arc::new(cron);
     let goal_mgr = Arc::new(kkagent_protocol::goal::GoalManager::new());
     let web = Arc::new(kkagent_tools::WebServicesConfig::from_app(&config));
 
@@ -2333,11 +2352,6 @@ async fn build_server_state(config: Arc<AppConfig>) -> Result<Arc<ServerState>> 
         )
         .await;
 
-    let subagents = if persistence_durable {
-        Arc::new(SubagentManager::new_persistent(4, &transcript_path)?)
-    } else {
-        Arc::new(SubagentManager::new(4))
-    };
     let state = Arc::new(ServerState {
         config: config.clone(),
         sandbox_policy,

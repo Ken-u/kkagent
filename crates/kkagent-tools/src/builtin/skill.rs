@@ -263,10 +263,18 @@ async fn ensure_builtin_skills() -> anyhow::Result<()> {
     for (name, body) in builtins {
         let directory = root.join(name);
         let file = directory.join("SKILL.md");
-        if !file.exists() {
-            tokio::fs::create_dir_all(&directory).await?;
-            tokio::fs::write(&file, body).await?;
+        // Fast path: skip rewrite when on-disk content already matches.
+        if let Ok(meta) = tokio::fs::metadata(&file).await {
+            if meta.is_file() && meta.len() == body.len() as u64 {
+                if let Ok(existing) = tokio::fs::read_to_string(&file).await {
+                    if existing == body {
+                        continue;
+                    }
+                }
+            }
         }
+        tokio::fs::create_dir_all(&directory).await?;
+        tokio::fs::write(&file, body).await?;
     }
     Ok(())
 }

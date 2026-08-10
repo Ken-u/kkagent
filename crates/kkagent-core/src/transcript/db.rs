@@ -1,9 +1,13 @@
 use chrono::Utc;
 use rusqlite::{params, Connection};
 use std::path::Path;
+use std::sync::{Arc, Mutex, MutexGuard};
+
+/// Shared SQLite handle used by transcript / durable HTTP / subagent stores.
+pub type SharedSqlite = Arc<Mutex<Connection>>;
 
 pub struct TranscriptDb {
-    conn: Connection,
+    conn: SharedSqlite,
 }
 
 #[derive(Debug, Clone)]
@@ -28,26 +32,48 @@ pub struct MessageRecord {
     pub created_at: String,
 }
 
-impl TranscriptDb {
-    pub fn open(db_path: &Path) -> anyhow::Result<Self> {
-        // Skip for in-memory / empty parents (Path(":memory:").parent() == Some(""))
-        if let Some(parent) = db_path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)?;
-            }
+/// Open `transcripts.db` once; callers can share the Arc across stores.
+pub fn open_shared_sqlite(db_path: &Path) -> anyhow::Result<SharedSqlite> {
+    // Skip for in-memory / empty parents (Path(":memory:").parent() == Some(""))
+    if let Some(parent) = db_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
         }
-        let conn = Connection::open(db_path)?;
-        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    }
+    let conn = Connection::open(db_path)?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    Ok(Arc::new(Mutex::new(conn)))
+}
+
+pub fn open_shared_sqlite_memory() -> anyhow::Result<SharedSqlite> {
+    let conn = Connection::open_in_memory()?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    Ok(Arc::new(Mutex::new(conn)))
+}
+
+impl TranscriptDb {
+    fn lock(&self) -> anyhow::Result<MutexGuard<'_, Connection>> {
+        self.conn
+            .lock()
+            .map_err(|_| anyhow::anyhow!("transcript db lock poisoned"))
+    }
+
+    pub fn shared(&self) -> SharedSqlite {
+        Arc::clone(&self.conn)
+    }
+
+    pub fn from_shared(conn: SharedSqlite) -> anyhow::Result<Self> {
         let db = Self { conn };
         db.migrate()?;
         Ok(db)
     }
 
+    pub fn open(db_path: &Path) -> anyhow::Result<Self> {
+        Self::from_shared(open_shared_sqlite(db_path)?)
+    }
+
     pub fn open_in_memory() -> anyhow::Result<Self> {
-        let conn = Connection::open_in_memory()?;
-        let db = Self { conn };
-        db.migrate()?;
-        Ok(db)
+        Self::from_shared(open_shared_sqlite_memory()?)
     }
 
     pub fn open_default() -> anyhow::Result<Self> {
@@ -57,7 +83,8 @@ impl TranscriptDb {
     }
 
     fn migrate(&self) -> anyhow::Result<()> {
-        self.conn.execute_batch(
+        let conn = self.lock()?;
+        conn.execute_batch(
             "PRAGMA journal_mode = WAL;
             PRAGMA synchronous = FULL;
             CREATE TABLE IF NOT EXISTS sessions (
@@ -98,7 +125,7 @@ impl TranscriptDb {
         working_dir: &str,
     ) -> anyhow::Result<()> {
         let now = Utc::now().to_rfc3339();
-        self.conn.execute(
+        self.lock()?.execute(
             "INSERT INTO sessions (session_id, model, working_dir, created_at, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5)",
             params![session_id, model, working_dir, now, now],
@@ -107,7 +134,7 @@ impl TranscriptDb {
     }
 
     pub fn set_title(&self, session_id: &str, title: &str) -> anyhow::Result<()> {
-        let changed = self.conn.execute(
+        let changed = self.lock()?.execute(
             "UPDATE sessions SET title = ?1, updated_at = ?2 WHERE session_id = ?3",
             params![title, Utc::now().to_rfc3339(), session_id],
         )?;
@@ -118,7 +145,7 @@ impl TranscriptDb {
     }
 
     pub fn set_model(&self, session_id: &str, model: &str) -> anyhow::Result<()> {
-        let changed = self.conn.execute(
+        let changed = self.lock()?.execute(
             "UPDATE sessions SET model = ?1, updated_at = ?2 WHERE session_id = ?3",
             params![model, Utc::now().to_rfc3339(), session_id],
         )?;
@@ -136,14 +163,15 @@ impl TranscriptDb {
         token_count: Option<u32>,
     ) -> anyhow::Result<i64> {
         let now = Utc::now().to_rfc3339();
-        self.conn.execute(
+        let conn = self.lock()?;
+        conn.execute(
             "INSERT INTO messages (session_id, role, content_json, token_count, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5)",
             params![session_id, role, content_json, token_count, now],
         )?;
-        let id = self.conn.last_insert_rowid();
+        let id = conn.last_insert_rowid();
 
-        self.conn.execute(
+        conn.execute(
             "UPDATE sessions SET message_count = message_count + 1, updated_at = ?1
              WHERE session_id = ?2",
             params![now, session_id],
@@ -160,7 +188,8 @@ impl TranscriptDb {
         if messages.is_empty() {
             return Ok(());
         }
-        let transaction = self.conn.unchecked_transaction()?;
+        let conn = self.lock()?;
+        let transaction = conn.unchecked_transaction()?;
         let now = Utc::now().to_rfc3339();
         {
             let mut statement = transaction.prepare(
@@ -187,7 +216,8 @@ impl TranscriptDb {
         messages: &[(String, String)],
         summary: Option<&str>,
     ) -> anyhow::Result<()> {
-        let transaction = self.conn.unchecked_transaction()?;
+        let conn = self.lock()?;
+        let transaction = conn.unchecked_transaction()?;
         transaction.execute(
             "DELETE FROM messages WHERE session_id = ?1",
             params![session_id],
@@ -212,7 +242,8 @@ impl TranscriptDb {
     }
 
     pub fn load_messages(&self, session_id: &str) -> anyhow::Result<Vec<MessageRecord>> {
-        let mut stmt = self.conn.prepare(
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
             "SELECT id, session_id, role, content_json, token_count, created_at
              FROM messages WHERE session_id = ?1 ORDER BY id",
         )?;
@@ -234,7 +265,8 @@ impl TranscriptDb {
     }
 
     pub fn list_sessions(&self, limit: usize) -> anyhow::Result<Vec<SessionRecord>> {
-        let mut stmt = self.conn.prepare(
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
             "SELECT session_id, title, model, working_dir, created_at, updated_at,
                     message_count, is_archived
              FROM sessions WHERE is_archived = 0
@@ -260,7 +292,8 @@ impl TranscriptDb {
     }
 
     pub fn get_session(&self, session_id: &str) -> anyhow::Result<Option<SessionRecord>> {
-        let mut stmt = self.conn.prepare(
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
             "SELECT session_id, title, model, working_dir, created_at, updated_at,
                     message_count, is_archived
              FROM sessions WHERE session_id = ?1",
@@ -285,7 +318,7 @@ impl TranscriptDb {
     }
 
     pub fn set_archived(&self, session_id: &str, archived: bool) -> anyhow::Result<()> {
-        let changed = self.conn.execute(
+        let changed = self.lock()?.execute(
             "UPDATE sessions SET is_archived = ?1, updated_at = ?2 WHERE session_id = ?3",
             params![archived, Utc::now().to_rfc3339(), session_id],
         )?;
@@ -319,7 +352,8 @@ impl TranscriptDb {
             );
         }
 
-        let transaction = self.conn.unchecked_transaction()?;
+        let conn = self.lock()?;
+        let transaction = conn.unchecked_transaction()?;
         let now = Utc::now().to_rfc3339();
         transaction.execute(
             "INSERT INTO sessions
@@ -361,12 +395,13 @@ impl TranscriptDb {
             return Ok(());
         }
         let cutoff_id = messages[keep_count].id;
-        self.conn.execute(
+        let conn = self.lock()?;
+        conn.execute(
             "DELETE FROM messages WHERE session_id = ?1 AND id >= ?2",
             params![session_id, cutoff_id],
         )?;
         let now = Utc::now().to_rfc3339();
-        self.conn.execute(
+        conn.execute(
             "UPDATE sessions SET message_count = ?1, updated_at = ?2 WHERE session_id = ?3",
             params![keep_count as u32, now, session_id],
         )?;
@@ -546,5 +581,17 @@ mod tests {
         let db = test_db();
         assert!(db.set_title("missing", "title").is_err());
         assert!(db.set_archived("missing", true).is_err());
+    }
+
+    #[test]
+    fn shared_connection_sees_same_tables() {
+        let shared = open_shared_sqlite_memory().unwrap();
+        let db = TranscriptDb::from_shared(Arc::clone(&shared)).unwrap();
+        db.create_session("s1", "m", ".").unwrap();
+        let conn = shared.lock().unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
     }
 }

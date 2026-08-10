@@ -54,6 +54,8 @@ pub use token_counting::{ContextSize, TokenCounter, TokenCountingStrategy};
 pub use tool_dedupe::{canonical_args, ToolDedupeTracker};
 pub use tool_policy::{ToolPolicyLayers, ToolPolicyService};
 pub use tool_scheduler::{ToolCallTask, ToolScheduler};
-pub use transcript::TranscriptDb;
+pub use transcript::{
+    open_shared_sqlite, open_shared_sqlite_memory, SharedSqlite, TranscriptDb,
+};
 pub use undo_service::{UndoResult, UndoService};
 pub use usage::UsageService;
