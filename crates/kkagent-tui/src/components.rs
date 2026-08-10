@@ -24,7 +24,7 @@ const TIPS: &[&str] = &[
     "@ opens file picker — tab to insert a path",
     "ctrl+f searches the transcript",
     "ctrl+o expands turn tool history",
-    "tab / ←→ cycle related sessions when input is empty",
+    "tab / ←→ cycle related sessions · ctrl+d close session",
     "ctrl+g toggles /btw side Q&A",
     "shift-tab toggles plan mode (scroll locks to plan)",
     "! enters shell mode",
@@ -44,6 +44,7 @@ pub fn render_ui(f: &mut Frame, state: &mut AppState, config: &AppConfig) {
         .map(menu_height)
         .or_else(|| state.file_menu.as_ref().map(file_menu_height))
         .or_else(|| state.list_picker.as_ref().map(|p| picker_height(p, state)))
+        .or_else(|| state.session_delete_confirm.as_ref().map(|_| 7u16))
         .unwrap_or(0);
 
     // Sticky todo sits above the input (highest visual priority).
@@ -135,6 +136,8 @@ pub fn render_ui(f: &mut Frame, state: &mut AppState, config: &AppConfig) {
         render_file_menu(f, slash_area, state, &theme);
     } else if state.list_picker.is_some() {
         render_list_picker(f, slash_area, state, &theme);
+    } else if state.session_delete_confirm.is_some() {
+        render_session_delete_confirm(f, slash_area, state, &theme);
     }
 
     if state.tasks_panel.is_some() {
@@ -1612,6 +1615,48 @@ fn render_file_menu(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) 
     f.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
 }
 
+fn render_session_delete_confirm(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    let Some(confirm) = state.session_delete_confirm.as_ref() else {
+        return;
+    };
+    let inner = area.inner(Margin::new(1, 1));
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.warning))
+        .title(" Close session ");
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(Span::styled(
+        format!(
+            " {}",
+            truncate(&confirm.label, inner.width.saturating_sub(2) as usize)
+        ),
+        Style::default().fg(theme.text),
+    )));
+    lines.push(Line::from(""));
+    for (i, label) in ["No — keep session", "Yes — close & delete"]
+        .iter()
+        .enumerate()
+    {
+        let selected = confirm.selected == i;
+        let prefix = if selected { "> " } else { "  " };
+        let style = if selected {
+            Style::default()
+                .fg(if i == 1 { theme.error } else { theme.primary })
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.text_dim)
+        };
+        lines.push(Line::from(Span::styled(format!("{prefix}{label}"), style)));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        " ↑↓ select · Enter confirm · Esc cancel ",
+        Style::default().fg(theme.text_muted),
+    )));
+    f.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
+}
+
 fn render_list_picker(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let Some(picker) = state.list_picker.as_ref() else {
         return;
@@ -1624,49 +1669,15 @@ fn render_list_picker(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme
         (picker.items.len() as u16).min(max_visible)
     };
 
+    // Delete confirm: ↑↓ between No / Yes, Enter to confirm (default No).
+    if picker.kind == crate::app::ListPickerKind::Session && state.session_delete_confirm.is_some()
+    {
+        render_session_delete_confirm(f, area, state, theme);
+        return;
+    }
+
     let inner = area.inner(Margin::new(1, 1));
     f.render_widget(Clear, area);
-
-    // Delete confirm: ↑↓ between No / Yes, Enter to confirm (default No).
-    if picker.kind == crate::app::ListPickerKind::Session {
-        if let Some(confirm) = state.session_delete_confirm.as_ref() {
-            let block = Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(theme.warning))
-                .title(" Delete session ");
-            let mut lines: Vec<Line> = Vec::new();
-            lines.push(Line::from(Span::styled(
-                format!(
-                    " {}",
-                    truncate(&confirm.label, inner.width.saturating_sub(2) as usize)
-                ),
-                Style::default().fg(theme.text),
-            )));
-            lines.push(Line::from(""));
-            for (i, label) in ["No — keep session", "Yes — delete permanently"]
-                .iter()
-                .enumerate()
-            {
-                let selected = confirm.selected == i;
-                let prefix = if selected { "> " } else { "  " };
-                let style = if selected {
-                    Style::default()
-                        .fg(if i == 1 { theme.error } else { theme.primary })
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(theme.text_dim)
-                };
-                lines.push(Line::from(Span::styled(format!("{prefix}{label}"), style)));
-            }
-            lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled(
-                " ↑↓ select · Enter confirm · Esc cancel ",
-                Style::default().fg(theme.text_muted),
-            )));
-            f.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
-            return;
-        }
-    }
 
     let block = Block::default()
         .borders(Borders::ALL)

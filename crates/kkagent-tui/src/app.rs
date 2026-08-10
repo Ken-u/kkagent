@@ -1043,6 +1043,38 @@ impl TuiApp {
             return Ok(());
         }
 
+        // Close/delete session confirm (Tab strip Ctrl-D or /sessions Ctrl-D).
+        if self.state.session_delete_confirm.is_some() {
+            match key.code {
+                KeyCode::Up | KeyCode::BackTab | KeyCode::Left => {
+                    if let Some(ref mut confirm) = self.state.session_delete_confirm {
+                        confirm.selected = 0;
+                    }
+                }
+                KeyCode::Down | KeyCode::Tab | KeyCode::Right => {
+                    if let Some(ref mut confirm) = self.state.session_delete_confirm {
+                        confirm.selected = 1;
+                    }
+                }
+                KeyCode::Enter => {
+                    let yes = self
+                        .state
+                        .session_delete_confirm
+                        .as_ref()
+                        .is_some_and(|c| c.selected == 1);
+                    self.confirm_delete_session(yes).await?;
+                }
+                KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                    self.confirm_delete_session(false).await?;
+                }
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    self.confirm_delete_session(true).await?;
+                }
+                _ => {}
+            }
+            return Ok(());
+        }
+
         // Esc clears in-app selection before interrupt / other Esc handling.
         if matches!(key.code, KeyCode::Esc) && self.state.selection.is_some() {
             self.clear_selection();
@@ -1245,35 +1277,6 @@ impl TuiApp {
 
         // List picker (model / sessions)
         if self.state.list_picker.is_some() {
-            // Delete confirmation: ↑↓ choose · Enter confirm (default No)
-            if let Some(ref mut confirm) = self.state.session_delete_confirm {
-                match key.code {
-                    KeyCode::Up | KeyCode::BackTab => {
-                        confirm.selected = 0;
-                    }
-                    KeyCode::Down | KeyCode::Tab => {
-                        confirm.selected = 1;
-                    }
-                    KeyCode::Left => {
-                        confirm.selected = 0;
-                    }
-                    KeyCode::Right => {
-                        confirm.selected = 1;
-                    }
-                    KeyCode::Enter => {
-                        let yes = confirm.selected == 1;
-                        self.confirm_delete_session(yes).await?;
-                    }
-                    KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
-                        self.confirm_delete_session(false).await?;
-                    }
-                    KeyCode::Char('y') | KeyCode::Char('Y') => {
-                        self.confirm_delete_session(true).await?;
-                    }
-                    _ => {}
-                }
-                return Ok(());
-            }
             match key.code {
                 KeyCode::Up => {
                     if let Some(ref mut p) = self.state.list_picker {
@@ -1485,11 +1488,13 @@ impl TuiApp {
                     self.state.list_picker = None;
                 }
             }
-            // Ctrl-D: quit if empty
+            // Ctrl-D: close current multi-session tab (with confirm), else quit if empty
             KeyCode::Char('d')
                 if key.modifiers.contains(KeyModifiers::CONTROL) && self.state.input.is_empty() =>
             {
-                if self.state.quit_confirm {
+                if self.can_close_current_session_tab() {
+                    self.begin_close_current_session_confirm();
+                } else if self.state.quit_confirm {
                     self.state.should_quit = true;
                 } else {
                     self.state.quit_confirm = true;
@@ -2184,6 +2189,7 @@ impl TuiApp {
         if let Some(model) = data.get("model").and_then(|v| v.as_str()) {
             if !model.is_empty() {
                 self.config.default_model = Some(model.to_string());
+                self.state.model_alias = Some(model.to_string());
             }
         }
         if let Some(plan) = data.get("plan_mode").and_then(|v| v.as_bool()) {
@@ -2225,11 +2231,8 @@ impl TuiApp {
             self.state.open_session_group.clear();
         }
 
-        self.system_message(format!(
-            "Resumed session {} ({} bubbles).",
-            &sid[..8.min(sid.len())],
-            self.state.messages.len()
-        ));
+        // Show the transcript as a normal chat view — no "Resumed session…" banner.
+        self.state.status_bar.session_id = Some(sid.clone());
         let _ = self.refresh_workspace_sessions().await;
         Ok(())
     }
@@ -2414,6 +2417,44 @@ impl TuiApp {
         }
     }
 
+    fn can_close_current_session_tab(&self) -> bool {
+        self.state.input.is_empty()
+            && self.state.session_id.is_some()
+            && self.state.workspace_sessions.entries.len() >= 2
+            && self.state.list_picker.is_none()
+            && self.state.tasks_panel.is_none()
+            && self.state.slash_menu.is_none()
+            && self.state.file_menu.is_none()
+            && !self.state.search.active
+            && self.state.session_delete_confirm.is_none()
+    }
+
+    fn begin_close_current_session_confirm(&mut self) {
+        let Some(sid) = self.state.session_id.clone() else {
+            return;
+        };
+        let label = self
+            .state
+            .workspace_sessions
+            .entries
+            .iter()
+            .find(|e| e.id == sid)
+            .map(|e| e.title.clone())
+            .unwrap_or_else(|| {
+                if sid.len() > 8 {
+                    sid[..8].to_string()
+                } else {
+                    sid.clone()
+                }
+            });
+        self.state.quit_confirm = false;
+        self.state.session_delete_confirm = Some(SessionDeleteConfirm {
+            session_id: sid,
+            label,
+            selected: 0,
+        });
+    }
+
     fn can_cycle_fork_sessions(&self) -> bool {
         self.state.input.is_empty()
             && self.state.mode == AppMode::Normal
@@ -2546,16 +2587,28 @@ impl TuiApp {
             return Ok(());
         }
         let deleted_id = confirm.session_id.clone();
+        let reopen_picker = self
+            .state
+            .list_picker
+            .as_ref()
+            .is_some_and(|p| p.kind == ListPickerKind::Session);
+
+        // Interrupt a busy turn on the session being closed.
+        if self.state.session_id.as_deref() == Some(deleted_id.as_str())
+            && !matches!(self.state.status, SessionStatus::Idle)
+        {
+            let _ = self.client.interrupt(&deleted_id).await;
+        }
+
         let params = serde_json::json!({"session_id": deleted_id});
         match self.client.rpc_call("sessions.delete", Some(params)).await {
             Ok(_) => {
-                self.system_message(format!(
-                    "Deleted session {}",
-                    &confirm.session_id[..8.min(confirm.session_id.len())]
-                ));
+                self.state.open_session_group.retain(|id| id != &deleted_id);
+                self.state.tab_strip.tabs.retain(|t| t.id != deleted_id);
+                self.state.parked_approvals.remove(&deleted_id);
+                self.state.parked_questions.remove(&deleted_id);
                 let was_current = self.state.session_id.as_deref() == Some(deleted_id.as_str());
                 if was_current {
-                    // Prefer another fork-family member; otherwise start fresh.
                     self.refresh_workspace_sessions().await?;
                     let fallback = self
                         .state
@@ -2563,7 +2616,14 @@ impl TuiApp {
                         .entries
                         .iter()
                         .map(|e| e.id.clone())
-                        .find(|id| id != &deleted_id);
+                        .find(|id| id != &deleted_id)
+                        .or_else(|| {
+                            self.state
+                                .open_session_group
+                                .iter()
+                                .find(|id| *id != &deleted_id)
+                                .cloned()
+                        });
                     if let Some(id) = fallback {
                         self.resume_session(&id).await?;
                     } else {
@@ -2576,15 +2636,17 @@ impl TuiApp {
                         self.state.status_bar.session_id = Some(session_id.clone());
                         self.state.tab_strip.ensure_active(&session_id, "main");
                         self.state.messages.clear();
-                        self.system_message(
-                            "Current session was deleted; started a new one.".into(),
-                        );
+                        self.state.status = SessionStatus::Idle;
+                        self.state.approval_pending = None;
+                        self.state.question_pending = None;
                     }
                 }
-                self.open_session_picker().await?;
+                if reopen_picker {
+                    self.open_session_picker().await?;
+                }
                 let _ = self.refresh_workspace_sessions().await;
             }
-            Err(e) => self.system_message(format!("Failed to delete session: {e}")),
+            Err(e) => self.system_message(format!("Failed to close session: {e}")),
         }
         Ok(())
     }
@@ -3907,6 +3969,7 @@ fn slash_help_text() -> String {
         "Keyboard shortcuts:\n\
   Enter         - Submit / confirm slash\n\
   Tab / ← →    - Empty input: cycle related sessions (/new or /fork)\n\
+  Ctrl-D        - Multi-session: close current (confirm); else quit if empty\n\
   Shift-Tab     - Toggle plan mode (scroll locks to full plan until exit)\n\
   ↑↓            - Input history / slash menu\n\
   PgUp/PgDn     - Scroll transcript\n\
