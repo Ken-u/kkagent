@@ -1,7 +1,7 @@
 //! Side panes: activity / btw / queue.
 
 use ratatui::layout::Rect;
-use ratatui::style::Style;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
@@ -81,6 +81,24 @@ pub struct BtwPane {
 #[derive(Debug, Clone, Default)]
 pub struct QueuePane {
     pub items: Vec<String>,
+    pub selected: usize,
+}
+
+impl QueuePane {
+    pub fn from_prompt_queue(q: &crate::prompt_queue::PromptQueue) -> Self {
+        Self {
+            items: q
+                .items
+                .iter()
+                .map(|i| {
+                    let kind = if i.as_steer { "steer" } else { "next" };
+                    let preview: String = i.text.chars().take(48).collect();
+                    format!("[{kind}] {preview}")
+                })
+                .collect(),
+            selected: q.selected,
+        }
+    }
 }
 
 pub fn render_activity(f: &mut Frame, area: Rect, pane: &ActivityPane, theme: &Theme) {
@@ -208,17 +226,25 @@ pub fn render_queue(f: &mut Frame, area: Rect, pane: &QueuePane, theme: &Theme) 
     } else {
         pane.items
             .iter()
-            .map(|n| {
+            .enumerate()
+            .map(|(i, n)| {
+                let selected = i == pane.selected;
                 Line::from(Span::styled(
-                    format!(" ▸ {n}"),
-                    Style::default().fg(theme.text_dim),
+                    format!("{} {n}", if selected { "▸" } else { " " }),
+                    if selected {
+                        Style::default()
+                            .fg(theme.accent)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(theme.text_dim)
+                    },
                 ))
             })
             .collect()
     };
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(" queue ")
+        .title(format!(" queue · {} ", pane.items.len()))
         .border_style(Style::default().fg(theme.border));
     f.render_widget(Paragraph::new(lines).block(block), area);
 }

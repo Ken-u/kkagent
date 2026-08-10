@@ -2139,6 +2139,8 @@ struct ServerState {
     pending_questions: Mutex<HashMap<String, serde_json::Value>>,
     background_tasks: Mutex<Vec<AbortHandle>>,
     turn_locks: SessionTurnLocks,
+    /// Recent session.prompt idempotency keys → first-seen time.
+    prompt_idempotency: Mutex<HashMap<String, std::time::Instant>>,
     persistence_durable: bool,
     persistence_error: Option<String>,
     started_at: std::time::Instant,
@@ -2390,6 +2392,7 @@ async fn build_server_state(config: Arc<AppConfig>) -> Result<Arc<ServerState>> 
         pending_questions: Mutex::new(HashMap::new()),
         background_tasks: Mutex::new(background_tasks),
         turn_locks: SessionTurnLocks::default(),
+        prompt_idempotency: Mutex::new(HashMap::new()),
         persistence_durable,
         persistence_error,
         started_at: std::time::Instant::now(),
@@ -3454,6 +3457,26 @@ async fn handle_rpc_call(
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| (-32602, "Missing text".into()))?
                 .to_string();
+            let idempotency_key = params
+                .as_ref()
+                .and_then(|p| p.get("idempotency_key"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            if let Some(ref key) = idempotency_key {
+                let mut seen = state.prompt_idempotency.lock().await;
+                // Drop entries older than 10 minutes.
+                let cutoff = std::time::Instant::now() - std::time::Duration::from_secs(600);
+                seen.retain(|_, at| *at > cutoff);
+                let stamp = format!("{session_id}:{key}");
+                if seen.contains_key(&stamp) {
+                    return Ok(serde_json::json!({
+                        "session_id": session_id,
+                        "deduped": true,
+                    }));
+                }
+                seen.insert(stamp, std::time::Instant::now());
+            }
             let images = params
                 .as_ref()
                 .and_then(|p| p.get("images"))

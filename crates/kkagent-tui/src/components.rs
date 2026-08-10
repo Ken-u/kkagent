@@ -48,12 +48,19 @@ pub fn render_ui(f: &mut Frame, state: &mut AppState, config: &AppConfig) {
 
     // Sticky todo sits above the input (highest visual priority).
     let todo_height = todo_panel_height(state);
+    let queue_height = if state.prompt_queue.is_empty() {
+        0u16
+    } else {
+        (state.prompt_queue.items.len() as u16)
+            .saturating_add(2)
+            .min(6)
+    };
 
-    // kimi 布局：消息区 | todo(可选) | 带边框输入框 | footer 两行
+    // kimi 布局：消息区 | todo(可选) | queue(可选) | 带边框输入框 | footer 两行
     // Top TabStrip removed — session switching lives in the footer strip.
     let input_inner = input_inner_height(state, size.width);
     let input_box = input_inner + 2; // borders
-    let bottom_stack = todo_height + input_box + slash_height;
+    let bottom_stack = todo_height + queue_height + input_box + slash_height;
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -70,14 +77,16 @@ pub fn render_ui(f: &mut Frame, state: &mut AppState, config: &AppConfig) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(todo_height),
+            Constraint::Length(queue_height),
             Constraint::Length(slash_height),
             Constraint::Length(input_box),
         ])
         .split(bottom);
 
     let todo_area = bottom_chunks[0];
-    let slash_area = bottom_chunks[1];
-    let input_area = bottom_chunks[2];
+    let queue_area = bottom_chunks[1];
+    let slash_area = bottom_chunks[2];
+    let input_area = bottom_chunks[3];
 
     // Keep status_bar in sync for chrome consumers / future status line.
     state.status_bar.permission = state.permission_mode;
@@ -91,6 +100,14 @@ pub fn render_ui(f: &mut Frame, state: &mut AppState, config: &AppConfig) {
     render_scroll_hint(f, msg_area, state, &theme);
     if todo_height > 0 {
         render_todo_panel(f, todo_area, state, &theme);
+    }
+    if queue_height > 0 {
+        panes::render_queue(
+            f,
+            queue_area,
+            &panes::QueuePane::from_prompt_queue(&state.prompt_queue),
+            &theme,
+        );
     }
     render_input(f, input_area, state, &theme);
     render_footer(f, footer_area, state, config, &theme);
@@ -389,6 +406,18 @@ fn build_transcript_lines(state: &mut AppState, theme: &Theme, width: u16) -> Ve
                         .add_modifier(Modifier::BOLD),
                     Style::default().fg(theme.role_user),
                 );
+                let delivery_label = msg.delivery.label();
+                if !delivery_label.is_empty() {
+                    lines.push(Line::from(Span::styled(
+                        format!("  ({delivery_label})"),
+                        Style::default().fg(match msg.delivery {
+                            crate::prompt_queue::DeliveryState::Failed => theme.error,
+                            crate::prompt_queue::DeliveryState::Queued
+                            | crate::prompt_queue::DeliveryState::Sending => theme.warning,
+                            _ => theme.text_muted,
+                        }),
+                    )));
+                }
                 lines.push(Line::from(""));
             }
             MessageRole::Plan => {
@@ -655,6 +684,9 @@ fn push_assistant_markdown(
 }
 
 fn status_icon(tc: &crate::app::DisplayToolCall) -> &'static str {
+    if tc.stopping {
+        return "…";
+    }
     if tc.output.is_some() {
         if tc.is_error {
             "✗"
@@ -676,16 +708,25 @@ fn render_tool_call_lines(
     use crate::tool_renderers::ToolRenderRegistry;
 
     if first_bullet {
+        let mut label = format!(
+            "{} {}",
+            status_icon(tc),
+            ToolRenderRegistry::chip_label(tc, width)
+        );
+        if tc.output.is_none() {
+            if let Some(started) = tc.started_at {
+                let secs = started.elapsed().as_secs();
+                if secs >= 2 {
+                    label.push_str(&format!(" {secs}s"));
+                }
+            }
+            if tc.stopping {
+                label.push_str(" stopping…");
+            }
+        }
         lines.push(Line::from(vec![
             Span::styled("● ", Style::default().fg(theme.text)),
-            Span::styled(
-                format!(
-                    "{} {}",
-                    status_icon(tc),
-                    ToolRenderRegistry::chip_label(tc, width)
-                ),
-                ToolRenderRegistry::chip_style(tc, theme),
-            ),
+            Span::styled(label, ToolRenderRegistry::chip_style(tc, theme)),
         ]));
     } else {
         lines.push(tool_continuation_line(tc, width, theme));

@@ -71,6 +71,7 @@ pub enum JobPayload {
     },
     Prompt {
         session_id: String,
+        idempotency_key: String,
         result: Result<(), String>,
     },
 }
@@ -392,6 +393,7 @@ impl AsyncJobHub {
         session_id: String,
         text: String,
         images: Vec<(String, String)>,
+        idempotency_key: String,
     ) -> u64 {
         let generation = self.next_generation(JobChannel::Prompt);
         let started = Instant::now();
@@ -409,10 +411,12 @@ impl AsyncJobHub {
         );
         let tx = self.tx.clone();
         let sid = session_id.clone();
+        let key = idempotency_key.clone();
         tokio::spawn(async move {
             let params = serde_json::json!({
                 "session_id": sid,
                 "text": text,
+                "idempotency_key": key,
                 "images": images.iter().map(|(media_type, data)| serde_json::json!({
                     "media_type": media_type,
                     "data": data,
@@ -429,6 +433,7 @@ impl AsyncJobHub {
                 started,
                 payload: JobPayload::Prompt {
                     session_id: sid,
+                    idempotency_key: key,
                     result,
                 },
             });

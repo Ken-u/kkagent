@@ -175,6 +175,8 @@ mod tests {
             thinking: None,
             parts: vec![],
             tool_calls: vec![],
+                    delivery: crate::prompt_queue::DeliveryState::Sent,
+            idempotency_key: None,
         }];
         let mut s = SearchState {
             query: "login".into(),

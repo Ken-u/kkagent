@@ -169,6 +169,10 @@ pub struct AppState {
     pub preview_debounce: Option<PreviewDebounce>,
     /// LRU cache of session.preview JSON payloads.
     pub preview_cache: crate::session_view::PreviewLru,
+    /// Queued prompts waiting for the current turn to finish.
+    pub prompt_queue: crate::prompt_queue::PromptQueue,
+    /// When session is busy, Enter queues by default (Shift-Enter steers if supported).
+    pub queue_when_busy: bool,
     /// Last session-switch latency samples (ms) for regression awareness.
     pub last_switch_metrics: Option<SessionSwitchMetrics>,
 }
@@ -311,6 +315,10 @@ pub struct DisplayMessage {
     pub parts: Vec<DisplayPart>,
     /// Legacy parallel list — kept empty for new assistant bubbles; resume may fill both.
     pub tool_calls: Vec<DisplayToolCall>,
+    /// Delivery lifecycle for user prompts (ignored for other roles).
+    pub delivery: crate::prompt_queue::DeliveryState,
+    /// Client idempotency key used when sending this user prompt.
+    pub idempotency_key: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -350,6 +358,87 @@ impl DisplayMessage {
         self.parts.push(DisplayPart::Tool(tc));
     }
 
+    pub fn find_tool_by_id_mut(&mut self, tool_call_id: &str) -> Option<&mut DisplayToolCall> {
+        for part in self.parts.iter_mut().rev() {
+            match part {
+                DisplayPart::Tool(tc) if tc.id == tool_call_id => return Some(tc),
+                DisplayPart::ToolHistory(hist) => {
+                    if let Some(tc) = hist.tools.iter_mut().find(|t| t.id == tool_call_id) {
+                        return Some(tc);
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.tool_calls.iter_mut().find(|t| t.id == tool_call_id)
+    }
+
+    pub fn find_tool_for_result_mut(
+        &mut self,
+        tool_call_id: &str,
+        tool_name: &str,
+    ) -> Option<&mut DisplayToolCall> {
+        #[derive(Clone, Copy)]
+        enum Loc {
+            Part(usize),
+            Hist { part: usize, tool: usize },
+            Legacy(usize),
+        }
+        let mut loc: Option<Loc> = None;
+        if !tool_call_id.is_empty() {
+            for (i, part) in self.parts.iter().enumerate().rev() {
+                match part {
+                    DisplayPart::Tool(tc) if tc.id == tool_call_id => {
+                        loc = Some(Loc::Part(i));
+                        break;
+                    }
+                    DisplayPart::ToolHistory(hist) => {
+                        if let Some(j) = hist.tools.iter().position(|t| t.id == tool_call_id) {
+                            loc = Some(Loc::Hist { part: i, tool: j });
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if loc.is_none() {
+                if let Some(i) = self.tool_calls.iter().position(|t| t.id == tool_call_id) {
+                    loc = Some(Loc::Legacy(i));
+                }
+            }
+        }
+        if loc.is_none() {
+            for (i, part) in self.parts.iter().enumerate().rev() {
+                if let DisplayPart::Tool(tc) = part {
+                    if tc.name == tool_name && tc.output.is_none() {
+                        loc = Some(Loc::Part(i));
+                        break;
+                    }
+                }
+            }
+        }
+        if loc.is_none() {
+            if let Some(i) = self
+                .tool_calls
+                .iter()
+                .rposition(|t| t.name == tool_name && t.output.is_none())
+            {
+                loc = Some(Loc::Legacy(i));
+            }
+        }
+        match loc? {
+            Loc::Part(i) => match self.parts.get_mut(i)? {
+                DisplayPart::Tool(tc) => Some(tc),
+                _ => None,
+            },
+            Loc::Hist { part, tool } => match self.parts.get_mut(part)? {
+                DisplayPart::ToolHistory(hist) => hist.tools.get_mut(tool),
+                _ => None,
+            },
+            Loc::Legacy(i) => self.tool_calls.get_mut(i),
+        }
+    }
+
     pub fn find_pending_tool_mut(&mut self, name: &str) -> Option<&mut DisplayToolCall> {
         for part in self.parts.iter_mut().rev() {
             if let DisplayPart::Tool(tc) = part {
@@ -378,11 +467,14 @@ pub enum MessageRole {
 
 #[derive(Debug, Clone)]
 pub struct DisplayToolCall {
+    pub id: String,
     pub name: String,
     pub input_summary: String,
     pub output: Option<String>,
     pub is_error: bool,
     pub collapsed: bool,
+    pub started_at: Option<std::time::Instant>,
+    pub stopping: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -583,6 +675,8 @@ impl AppState {
             session_views: std::collections::HashMap::new(),
             preview_debounce: None,
             preview_cache: crate::session_view::PreviewLru::new(12),
+            prompt_queue: crate::prompt_queue::PromptQueue::default(),
+            queue_when_busy: true,
             last_switch_metrics: None,
         }
     }
@@ -610,6 +704,8 @@ impl AppState {
             thinking: None,
             parts: Vec::new(),
             tool_calls: Vec::new(),
+                    delivery: crate::prompt_queue::DeliveryState::Sent,
+            idempotency_key: None,
         });
         if self.plan_mode {
             if first {
@@ -1168,19 +1264,36 @@ impl TuiApp {
                         }
                     }
                 }
-                crate::async_jobs::JobPayload::Prompt { session_id, result } => {
+                crate::async_jobs::JobPayload::Prompt {
+                    session_id,
+                    idempotency_key,
+                    result,
+                } => {
                     self.jobs.mark_done(channel, generation);
                     match result {
                         Ok(()) => {
                             self.jobs.mcp.waiting_for_prompt =
                                 self.jobs.mcp.configured && !self.jobs.mcp.initialized;
-                            // Refresh strip titles without blocking.
+                            if let Some(msg) = self.state.messages.iter_mut().rev().find(|m| {
+                                m.role == MessageRole::User
+                                    && m.idempotency_key.as_deref() == Some(idempotency_key.as_str())
+                            }) {
+                                msg.delivery = crate::prompt_queue::DeliveryState::Sent;
+                            }
                             self.enqueue_workspace_sessions_refresh();
                             let _ = session_id;
                         }
                         Err(err) => {
                             self.state.status = SessionStatus::Idle;
                             self.jobs.mcp.waiting_for_prompt = false;
+                            if let Some(msg) = self.state.messages.iter_mut().rev().find(|m| {
+                                m.role == MessageRole::User
+                                    && m.idempotency_key.as_deref() == Some(idempotency_key.as_str())
+                            }) {
+                                msg.delivery = crate::prompt_queue::DeliveryState::Failed;
+                                // Restore draft for edit/retry without losing the failed bubble.
+                                self.state.input.set_text(msg.content.clone());
+                            }
                             self.jobs.push_error(
                                 Some(channel),
                                 Some(generation),
@@ -4518,7 +4631,9 @@ impl TuiApp {
                     thinking: None,
                     parts: Vec::new(),
                     tool_calls: Vec::new(),
-                }],
+                            delivery: crate::prompt_queue::DeliveryState::Sent,
+            idempotency_key: None,
+        }],
             });
         }
 
@@ -4603,7 +4718,9 @@ impl TuiApp {
                     thinking: None,
                     parts: Vec::new(),
                     tool_calls: Vec::new(),
-                });
+                            delivery: crate::prompt_queue::DeliveryState::Sent,
+            idempotency_key: None,
+        });
             }
         }
         self.state.session_picker_preview = Some(SessionPickerPreview {
@@ -4794,13 +4911,43 @@ impl TuiApp {
 
         self.state.push_input_history(&text);
 
-        // Add user message to display
+        let busy = matches!(
+            self.state.status,
+            SessionStatus::Thinking
+                | SessionStatus::ToolExecuting
+                | SessionStatus::WaitingApproval
+                | SessionStatus::WaitingQuestion
+                | SessionStatus::Compacting
+        );
+        if busy && self.state.queue_when_busy {
+            self.state
+                .prompt_queue
+                .push(crate::prompt_queue::QueuedPrompt::next_turn(prompt_text));
+            self.state.messages.push(DisplayMessage {
+                role: MessageRole::User,
+                content: text,
+                thinking: None,
+                parts: Vec::new(),
+                tool_calls: Vec::new(),
+                delivery: crate::prompt_queue::DeliveryState::Queued,
+                idempotency_key: None,
+            });
+            self.system_message(format!(
+                "Queued ({} waiting) — will send after current turn.",
+                self.state.prompt_queue.items.len()
+            ));
+            return Ok(());
+        }
+
+        let idem = uuid::Uuid::new_v4().to_string();
         self.state.messages.push(DisplayMessage {
             role: MessageRole::User,
             content: text,
             thinking: None,
             parts: Vec::new(),
             tool_calls: Vec::new(),
+            delivery: crate::prompt_queue::DeliveryState::Sending,
+            idempotency_key: Some(idem.clone()),
         });
         self.state.status = SessionStatus::Thinking;
         self.state.thinking_text.clear();
@@ -4813,14 +4960,63 @@ impl TuiApp {
                 self.jobs.mcp.waiting_for_prompt = true;
                 self.enqueue_mcp_status_poll();
             }
-            self.jobs
-                .spawn_prompt(self.client.requester(), sid, prompt_text, Vec::new());
+            self.jobs.spawn_prompt(
+                self.client.requester(),
+                sid,
+                prompt_text,
+                Vec::new(),
+                idem,
+            );
         } else {
             self.state.status = SessionStatus::Idle;
+            if let Some(msg) = self.state.messages.last_mut() {
+                msg.delivery = crate::prompt_queue::DeliveryState::Failed;
+            }
             self.system_message("No active session.".into());
         }
 
         Ok(())
+    }
+
+    fn flush_prompt_queue_if_idle(&mut self) {
+        if !matches!(self.state.status, SessionStatus::Idle) {
+            return;
+        }
+        let Some(item) = self.state.prompt_queue.pop_front() else {
+            return;
+        };
+        let Some(sid) = self.state.session_id.clone() else {
+            return;
+        };
+        let idem = uuid::Uuid::new_v4().to_string();
+        if let Some(msg) = self
+            .state
+            .messages
+            .iter_mut()
+            .rev()
+            .find(|m| m.role == MessageRole::User && m.delivery == crate::prompt_queue::DeliveryState::Queued && m.content == item.text)
+        {
+            msg.delivery = crate::prompt_queue::DeliveryState::Sending;
+            msg.idempotency_key = Some(idem.clone());
+        } else {
+            self.state.messages.push(DisplayMessage {
+                role: MessageRole::User,
+                content: item.text.clone(),
+                thinking: None,
+                parts: Vec::new(),
+                tool_calls: Vec::new(),
+                delivery: crate::prompt_queue::DeliveryState::Sending,
+                idempotency_key: Some(idem.clone()),
+            });
+        }
+        self.state.status = SessionStatus::Thinking;
+        self.jobs.spawn_prompt(
+            self.client.requester(),
+            sid,
+            item.text,
+            item.images,
+            idem,
+        );
     }
 
     async fn handle_slash_command(&mut self, cmd: &str) -> anyhow::Result<()> {
@@ -5457,6 +5653,8 @@ impl TuiApp {
                 args: args.map(str::to_string).filter(|s| !s.trim().is_empty()),
             }],
             tool_calls: Vec::new(),
+                    delivery: crate::prompt_queue::DeliveryState::Sent,
+            idempotency_key: None,
         });
     }
 
@@ -5515,6 +5713,8 @@ impl TuiApp {
             thinking: None,
             parts: Vec::new(),
             tool_calls: Vec::new(),
+                    delivery: crate::prompt_queue::DeliveryState::Sent,
+            idempotency_key: None,
         });
     }
 
@@ -5763,7 +5963,9 @@ impl TuiApp {
                             thinking: pending_thinking,
                             parts: Vec::new(),
                             tool_calls: Vec::new(),
-                        };
+                                    delivery: crate::prompt_queue::DeliveryState::Sent,
+            idempotency_key: None,
+        };
                         msg.append_assistant_text(&text);
                         self.state.messages.push(msg);
                     }
@@ -5771,7 +5973,10 @@ impl TuiApp {
                         self.state.thinking_text.push_str(&text);
                     }
                     AgentEvent::ToolCall {
-                        tool_name, input, ..
+                        tool_call_id,
+                        tool_name,
+                        input,
+                        ..
                     } => {
                         self.state.last_tool_name = Some(tool_name.clone());
                         let summary = summarize_tool_input(&input);
@@ -5781,6 +5986,9 @@ impl TuiApp {
                             None
                         };
                         let tc = DisplayToolCall {
+                            id: tool_call_id,
+                            started_at: Some(std::time::Instant::now()),
+                            stopping: false,
                             name: tool_name,
                             input_summary: summary,
                             output: None,
@@ -5802,25 +6010,37 @@ impl TuiApp {
                             thinking: pending_thinking,
                             parts: Vec::new(),
                             tool_calls: Vec::new(),
+                            delivery: crate::prompt_queue::DeliveryState::Sent,
+                            idempotency_key: None,
                         };
                         msg.push_tool(tc);
                         self.state.messages.push(msg);
                     }
                     AgentEvent::ToolResult {
+                        tool_call_id,
                         tool_name,
                         output,
                         is_error,
                         ..
                     } => {
                         if let Some(last) = self.state.messages.last_mut() {
-                            if let Some(tc) = last.find_pending_tool_mut(&tool_name) {
+                            if let Some(tc) =
+                                last.find_tool_for_result_mut(&tool_call_id, &tool_name)
+                            {
                                 tc.output = Some(output);
                                 tc.is_error = is_error;
+                                tc.stopping = false;
+                                if is_error {
+                                    tc.collapsed = false;
+                                }
                             }
                         }
                     }
                     AgentEvent::StatusUpdate { status, .. } => {
                         self.state.status = status;
+                        if matches!(status, SessionStatus::Idle) {
+                            self.flush_prompt_queue_if_idle();
+                        }
                     }
                     AgentEvent::ApprovalRequested { request, .. } => {
                         let is_plan_review = request.tool_name == "ExitPlanMode"
@@ -5911,7 +6131,9 @@ impl TuiApp {
                                         thinking: Some(t),
                                         parts: Vec::new(),
                                         tool_calls: Vec::new(),
-                                    });
+                                                delivery: crate::prompt_queue::DeliveryState::Sent,
+            idempotency_key: None,
+        });
                                 }
                             } else {
                                 self.state.messages.push(DisplayMessage {
@@ -5920,11 +6142,14 @@ impl TuiApp {
                                     thinking: Some(t),
                                     parts: Vec::new(),
                                     tool_calls: Vec::new(),
-                                });
+                                            delivery: crate::prompt_queue::DeliveryState::Sent,
+            idempotency_key: None,
+        });
                             }
                         }
                         self.state.collapse_completed_turn_tools();
                         self.state.status = SessionStatus::Idle;
+                        self.flush_prompt_queue_if_idle();
                     }
                     AgentEvent::TurnStart { .. } => {
                         self.state.thinking_text.clear();
@@ -6217,7 +6442,9 @@ fn collapse_tools_in_turn(
                 thinking: None,
                 parts: vec![summary],
                 tool_calls: Vec::new(),
-            },
+                        delivery: crate::prompt_queue::DeliveryState::Sent,
+            idempotency_key: None,
+        },
         );
     }
 }
@@ -6350,7 +6577,9 @@ fn transcript_messages_to_display(msgs: &[serde_json::Value]) -> Vec<DisplayMess
                         thinking: None,
                         parts: Vec::new(),
                         tool_calls: Vec::new(),
-                    });
+                                delivery: crate::prompt_queue::DeliveryState::Sent,
+            idempotency_key: None,
+        });
                 }
             }
             "assistant" => {
@@ -6392,9 +6621,12 @@ fn transcript_messages_to_display(msgs: &[serde_json::Value]) -> Vec<DisplayMess
                             let summary: String = summary.chars().take(120).collect();
                             let pi = parts.len();
                             if !id.is_empty() {
-                                tool_index.insert(id, (msg_idx, pi));
+                                tool_index.insert(id.clone(), (msg_idx, pi));
                             }
                             parts.push(DisplayPart::Tool(DisplayToolCall {
+                                id,
+                                started_at: None,
+                                stopping: false,
                                 name,
                                 input_summary: summary,
                                 output: None,
@@ -6412,7 +6644,9 @@ fn transcript_messages_to_display(msgs: &[serde_json::Value]) -> Vec<DisplayMess
                         thinking,
                         parts,
                         tool_calls: Vec::new(),
-                    });
+                                delivery: crate::prompt_queue::DeliveryState::Sent,
+            idempotency_key: None,
+        });
                 }
             }
             "system" => {
@@ -6434,7 +6668,9 @@ fn transcript_messages_to_display(msgs: &[serde_json::Value]) -> Vec<DisplayMess
                         thinking: None,
                         parts: Vec::new(),
                         tool_calls: Vec::new(),
-                    });
+                                delivery: crate::prompt_queue::DeliveryState::Sent,
+            idempotency_key: None,
+        });
                 }
             }
             _ => {}
@@ -6641,6 +6877,8 @@ mod app_state_tests {
             thinking: None,
             parts: Vec::new(),
             tool_calls: Vec::new(),
+                    delivery: crate::prompt_queue::DeliveryState::Sent,
+            idempotency_key: None,
         }]));
         assert!(session_has_retained_io(&[DisplayMessage {
             role: MessageRole::User,
@@ -6648,6 +6886,8 @@ mod app_state_tests {
             thinking: None,
             parts: Vec::new(),
             tool_calls: Vec::new(),
+                    delivery: crate::prompt_queue::DeliveryState::Sent,
+            idempotency_key: None,
         }]));
         assert!(!session_has_retained_io(&[DisplayMessage {
             role: MessageRole::User,
@@ -6655,6 +6895,8 @@ mod app_state_tests {
             thinking: None,
             parts: Vec::new(),
             tool_calls: Vec::new(),
+                    delivery: crate::prompt_queue::DeliveryState::Sent,
+            idempotency_key: None,
         }]));
     }
 
@@ -6671,6 +6913,8 @@ mod app_state_tests {
             thinking: None,
             parts: Vec::new(),
             tool_calls: Vec::new(),
+                    delivery: crate::prompt_queue::DeliveryState::Sent,
+            idempotency_key: None,
         });
         let mut asst = DisplayMessage {
             role: MessageRole::Assistant,
@@ -6678,8 +6922,13 @@ mod app_state_tests {
             thinking: None,
             parts: Vec::new(),
             tool_calls: Vec::new(),
+                    delivery: crate::prompt_queue::DeliveryState::Sent,
+            idempotency_key: None,
         };
         asst.parts.push(DisplayPart::Tool(DisplayToolCall {
+                            id: String::new(),
+                            started_at: None,
+                            stopping: false,
             name: "Read".into(),
             input_summary: "a.rs".into(),
             output: Some("ok".into()),
@@ -6687,6 +6936,9 @@ mod app_state_tests {
             collapsed: true,
         }));
         asst.parts.push(DisplayPart::Tool(DisplayToolCall {
+                            id: String::new(),
+                            started_at: None,
+                            stopping: false,
             name: "Bash".into(),
             input_summary: "ls".into(),
             output: Some("x".into()),
@@ -6761,5 +7013,49 @@ mod app_state_tests {
             .iter()
             .flat_map(|m| m.parts.iter())
             .any(|p| matches!(p, DisplayPart::Tool(_))));
+    }
+
+    #[test]
+    fn tool_result_matches_by_id_not_name() {
+        let mut msg = DisplayMessage {
+            role: MessageRole::Assistant,
+            content: String::new(),
+            thinking: None,
+            parts: vec![
+                DisplayPart::Tool(DisplayToolCall {
+                    id: "a".into(),
+                    name: "Bash".into(),
+                    input_summary: "one".into(),
+                    output: None,
+                    is_error: false,
+                    collapsed: true,
+                    started_at: None,
+                    stopping: false,
+                }),
+                DisplayPart::Tool(DisplayToolCall {
+                    id: "b".into(),
+                    name: "Bash".into(),
+                    input_summary: "two".into(),
+                    output: None,
+                    is_error: false,
+                    collapsed: true,
+                    started_at: None,
+                    stopping: false,
+                }),
+            ],
+            tool_calls: Vec::new(),
+            delivery: crate::prompt_queue::DeliveryState::Sent,
+            idempotency_key: None,
+        };
+        let tc = msg.find_tool_for_result_mut("b", "Bash").unwrap();
+        tc.output = Some("second".into());
+        assert!(msg.parts.iter().any(|p| matches!(
+            p,
+            DisplayPart::Tool(t) if t.id == "b" && t.output.as_deref() == Some("second")
+        )));
+        assert!(msg.parts.iter().any(|p| matches!(
+            p,
+            DisplayPart::Tool(t) if t.id == "a" && t.output.is_none()
+        )));
     }
 }
