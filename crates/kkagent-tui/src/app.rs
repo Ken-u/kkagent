@@ -3462,4 +3462,48 @@ mod scroll_snap_tests {
         assert_eq!(state.scroll_up, 0);
         assert!(!state.scroll_snap_consumed);
     }
+
+    #[test]
+    fn collapse_turn_tools_into_overview() {
+        let mut state = AppState::new(PermissionMode::Manual, false);
+        state.turn_started_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(90));
+        state.tokens_at_turn_start = 100;
+        state.approx_tokens = 2500;
+        state.messages.push(DisplayMessage {
+            role: MessageRole::User,
+            content: "do it".into(),
+            thinking: None,
+            parts: Vec::new(),
+            tool_calls: Vec::new(),
+        });
+        let mut asst = DisplayMessage {
+            role: MessageRole::Assistant,
+            content: "done".into(),
+            thinking: None,
+            parts: Vec::new(),
+            tool_calls: Vec::new(),
+        };
+        asst.parts.push(DisplayPart::Tool(DisplayToolCall {
+            name: "Read".into(),
+            input_summary: "a.rs".into(),
+            output: Some("ok".into()),
+            is_error: false,
+            collapsed: true,
+        }));
+        asst.parts.push(DisplayPart::Tool(DisplayToolCall {
+            name: "Bash".into(),
+            input_summary: "ls".into(),
+            output: Some("x".into()),
+            is_error: false,
+            collapsed: true,
+        }));
+        asst.parts.push(DisplayPart::Text("done".into()));
+        state.messages.push(asst);
+
+        state.collapse_completed_turn_tools();
+        let parts = &state.messages.last().unwrap().parts;
+        assert!(matches!(parts.first(), Some(DisplayPart::ToolHistory(h)) if h.tool_count == 2 && !h.expanded));
+        assert!(matches!(parts.last(), Some(DisplayPart::Text(t)) if t == "done"));
+        assert!(!parts.iter().any(|p| matches!(p, DisplayPart::Tool(_))));
+    }
 }
