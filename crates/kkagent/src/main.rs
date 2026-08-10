@@ -71,6 +71,10 @@ struct Cli {
     #[arg(long)]
     connect: Option<String>,
 
+    /// Keep the terminal's primary screen (native scrollback); skip alternate screen
+    #[arg(long)]
+    no_alt_screen: bool,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -142,6 +146,14 @@ enum Commands {
         /// Also probe the configured provider endpoint
         #[arg(long)]
         live: bool,
+        /// Print a support-bundle inventory (no secrets / transcripts) and exit
+        #[arg(long)]
+        bundle: bool,
+    },
+    /// Generate shell completion scripts
+    Completions {
+        /// bash | zsh | fish | powershell
+        shell: String,
     },
 }
 
@@ -204,8 +216,18 @@ async fn main() -> Result<()> {
         Some(Commands::Config { command }) => {
             return run_config(command, cli.config.as_deref());
         }
-        Some(Commands::Doctor { json, live }) => {
+        Some(Commands::Doctor {
+            json,
+            live,
+            bundle,
+        }) => {
+            if *bundle {
+                return print_doctor_bundle(cli.config.as_deref());
+            }
             return run_doctor(cli.config.as_deref(), *json, *live).await;
+        }
+        Some(Commands::Completions { shell }) => {
+            return print_completions(shell);
         }
         _ => {}
     }
@@ -296,21 +318,116 @@ async fn main() -> Result<()> {
             server.serve_stdio().await
         }
         Some(Commands::Auth { .. }) => unreachable!("auth handled before config startup"),
-        Some(Commands::Init { .. } | Commands::Config { .. } | Commands::Doctor { .. }) => {
+        Some(Commands::Init { .. } | Commands::Config { .. } | Commands::Doctor { .. } | Commands::Completions { .. }) => {
             unreachable!("setup commands handled before runtime startup")
         }
         None => {
             if let Some(prompt) = cli.prompt {
                 run_print_mode(config, prompt, permission_mode, cli.connect).await
             } else {
-                run_tui(config, permission_mode, cli.plan, cli.resume, cli.connect).await
+                run_tui(
+                    config,
+                    permission_mode,
+                    cli.plan,
+                    cli.resume,
+                    cli.connect,
+                    cli.no_alt_screen,
+                )
+                .await
             }
         }
     }
 }
 
-/// TUI 模式下日志写到文件，避免污染 alternate screen；
-/// print / server 模式仍输出到 stderr。
+fn print_completions(shell: &str) -> Result<()> {
+    let name = "kkagent";
+    match shell.to_ascii_lowercase().as_str() {
+        "bash" => {
+            println!(
+                r#"# kkagent bash completion — add to ~/.bashrc:
+#   eval "$(kkagent completions bash)"
+_kkagent() {{
+  local cur="${{COMP_WORDS[COMP_CWORD]}}"
+  local cmds="server acp auth init config doctor completions"
+  if [[ ${{COMP_CWORD}} -eq 1 ]]; then
+    COMPREPLY=( $(compgen -W "$cmds --help --version --config --yolo --auto --plan --prompt --resume --connect --no-alt-screen" -- "$cur") )
+  fi
+}}
+complete -F _kkagent {name}
+"#
+            );
+        }
+        "zsh" => {
+            println!(
+                r#"# kkagent zsh completion — add to ~/.zshrc:
+#   eval "$(kkagent completions zsh)"
+#compdef kkagent
+_arguments \
+  '--config[Path to config]:file:_files' \
+  '--yolo[Auto-approve tools]' \
+  '--auto[Fully autonomous]' \
+  '--plan[Start in plan mode]' \
+  '--prompt[Non-interactive prompt]:text:' \
+  '--resume[Resume session]:id:' \
+  '--connect[Connect to server]:endpoint:' \
+  '--no-alt-screen[Keep primary screen]' \
+  '1:command:(server acp auth init config doctor completions)'
+"#
+            );
+        }
+        "fish" => {
+            println!(
+                r#"# kkagent fish completion — save to ~/.config/fish/completions/kkagent.fish
+complete -c kkagent -n '__fish_use_subcommand' -a 'server acp auth init config doctor completions'
+complete -c kkagent -l config -r
+complete -c kkagent -l yolo
+complete -c kkagent -l auto
+complete -c kkagent -l plan
+complete -c kkagent -l prompt -r
+complete -c kkagent -l resume -r
+complete -c kkagent -l connect -r
+complete -c kkagent -l no-alt-screen
+"#
+            );
+        }
+        "powershell" | "pwsh" => {
+            println!(
+                r#"# kkagent PowerShell completion — add to $PROFILE:
+#   kkagent completions powershell | Out-String | Invoke-Expression
+Register-ArgumentCompleter -CommandName kkagent -ScriptBlock {{
+  param($wordToComplete, $commandAst, $cursorPosition)
+  $cmds = @('server','acp','auth','init','config','doctor','completions')
+  $cmds | Where-Object {{ $_ -like "$wordToComplete*" }} | ForEach-Object {{
+    [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterValue', $_)
+  }}
+}}
+"#
+            );
+        }
+        other => anyhow::bail!("unsupported shell '{other}' (use bash|zsh|fish|powershell)"),
+    }
+    Ok(())
+}
+
+fn print_doctor_bundle(configured_path: Option<&std::path::Path>) -> Result<()> {
+    let path = configured_path
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(kkagent_config::default_config_path);
+    let dir = kkagent_config::default_config_dir();
+    println!("kkagent doctor --bundle (inventory only; nothing collected yet)");
+    println!("Would include:");
+    println!("  - version: {}", env!("CARGO_PKG_VERSION"));
+    println!("  - platform: {} {}", std::env::consts::OS, std::env::consts::ARCH);
+    println!("  - config path: {}", path.display());
+    println!("  - config dir: {}", dir.display());
+    println!("  - desensitized config summary (no api keys)");
+    println!("  - doctor health checks");
+    println!("  - truncated recent logs (if present under {})", dir.join("logs").display());
+    println!("Would NOT include: transcripts, file contents, secrets, Wiki results");
+    println!("Re-run with confirmation in a future release to write a zip; this inventory is cancel-safe.");
+    Ok(())
+}
+
 fn init_logging(tui_mode: bool) -> Result<()> {
     let filter = tracing_subscriber::EnvFilter::from_default_env()
         .add_directive("kkagent=info".parse().unwrap());
@@ -584,6 +701,7 @@ async fn run_tui(
     plan_mode: bool,
     resume: Option<String>,
     connect: Option<String>,
+    no_alt_screen: bool,
 ) -> Result<()> {
     // Default TUI: 1:1 in-process pair via memory duplex.
     // This process owns both ends — quitting the TUI aborts the paired server
@@ -609,7 +727,8 @@ async fn run_tui(
     tui_config.default_plan_mode = plan_mode;
 
     let client = KkagentClient::new(rpc_client, event_rx);
-    let app = TuiApp::new(tui_config, client);
+    let mut app = TuiApp::new(tui_config, client);
+    app.set_use_alt_screen(!no_alt_screen);
     let result = app.run(resume).await;
 
     // Drop the paired server (and any in-flight agent/LLM tasks it owns).

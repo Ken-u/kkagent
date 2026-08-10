@@ -31,6 +31,7 @@ pub struct TuiApp {
     state: AppState,
     mouse_mode: MouseMode,
     jobs: crate::async_jobs::AsyncJobHub,
+    use_alt_screen: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -81,6 +82,8 @@ pub struct AppState {
     pub last_mouse: Option<(u16, u16)>,
     pub approx_tokens: u64,
     pub approval_pending: Option<PendingApproval>,
+    /// Additional approvals waiting behind the active one (FIFO).
+    pub approval_queue: std::collections::VecDeque<PendingApproval>,
     /// Approvals for sessions that are open in this window but not currently focused.
     pub parked_approvals: std::collections::HashMap<String, PendingApproval>,
     /// AskUserQuestion panel
@@ -651,6 +654,7 @@ impl AppState {
             last_mouse: None,
             approx_tokens: 0,
             approval_pending: None,
+            approval_queue: std::collections::VecDeque::new(),
             parked_approvals: std::collections::HashMap::new(),
             question_pending: None,
             parked_questions: std::collections::HashMap::new(),
@@ -924,7 +928,12 @@ impl TuiApp {
             state: AppState::new(permission_mode, plan_mode),
             mouse_mode: MouseMode::from_env(),
             jobs: crate::async_jobs::AsyncJobHub::new(),
+            use_alt_screen: true,
         }
+    }
+
+    pub fn set_use_alt_screen(&mut self, enabled: bool) {
+        self.use_alt_screen = enabled;
     }
 
     /// New sessions inherit the global config default until `/model` overrides them.
@@ -1017,16 +1026,26 @@ impl TuiApp {
         // Capture mouse so the wheel and in-app drag-select stay inside the TUI.
         // Capture remains on for the whole session (no disable-on-click hacks).
         // `KKAGENT_MOUSE_MODE=off` disables mouse reporting.
-        if let Err(e) = execute!(stdout, EnterAlternateScreen, EnableBracketedPaste) {
+        if self.use_alt_screen {
+            if let Err(e) = execute!(stdout, EnterAlternateScreen, EnableBracketedPaste) {
+                let _ = disable_raw_mode();
+                return Err(e.into());
+            }
+        } else if let Err(e) = execute!(stdout, EnableBracketedPaste) {
             let _ = disable_raw_mode();
             return Err(e.into());
         }
         tracing::info!(
             elapsed_ms = startup_started.elapsed().as_millis() as u64,
+            alt_screen = self.use_alt_screen,
             "TUI first frame ready"
         );
         if let Err(e) = self.mouse_mode.enable(&mut stdout) {
-            let _ = execute!(stdout, DisableBracketedPaste, LeaveAlternateScreen);
+            if self.use_alt_screen {
+                let _ = execute!(stdout, DisableBracketedPaste, LeaveAlternateScreen);
+            } else {
+                let _ = execute!(stdout, DisableBracketedPaste);
+            }
             let _ = disable_raw_mode();
             return Err(e.into());
         }
@@ -1054,11 +1073,15 @@ impl TuiApp {
         // Always restore the terminal, even if the loop failed.
         let _ = disable_raw_mode();
         let _ = self.mouse_mode.disable(terminal.backend_mut());
-        let _ = execute!(
-            terminal.backend_mut(),
-            DisableBracketedPaste,
-            LeaveAlternateScreen
-        );
+        if self.use_alt_screen {
+            let _ = execute!(
+                terminal.backend_mut(),
+                DisableBracketedPaste,
+                LeaveAlternateScreen
+            );
+        } else {
+            let _ = execute!(terminal.backend_mut(), DisableBracketedPaste);
+        }
         let _ = terminal.show_cursor();
 
         if let Some(id) = sid {
@@ -5950,6 +5973,9 @@ impl TuiApp {
             // Restore panel on failure
             self.state.approval_pending = Some(approval);
             self.system_message(format!("Approval failed: {}", e));
+        } else if let Some(next) = self.state.approval_queue.pop_front() {
+            self.state.approval_pending = Some(next);
+            self.state.status = SessionStatus::WaitingApproval;
         }
         Ok(())
     }
@@ -6291,8 +6317,17 @@ impl TuiApp {
                                 }
                             }
                         }
-                        self.state.approval_pending = Some(pending_approval_from_request(&request));
-                        self.state.status = SessionStatus::WaitingApproval;
+                        let pending = pending_approval_from_request(&request);
+                        if self.state.approval_pending.is_some() {
+                            self.state.approval_queue.push_back(pending);
+                            self.system_message(format!(
+                                "Approval queued ({} waiting).",
+                                self.state.approval_queue.len()
+                            ));
+                        } else {
+                            self.state.approval_pending = Some(pending);
+                            self.state.status = SessionStatus::WaitingApproval;
+                        }
                     }
                     AgentEvent::QuestionAsked { question, .. } => {
                         let options: Vec<(String, String)> = question

@@ -173,7 +173,7 @@
 ### P1：交互、导航与回退
 
 - [ ] 增加 turn 执行时间线：显示当前 step、LLM 重试次数、当前工具、每阶段耗时和最近活动；默认简洁，需要时展开详情。
-- [ ] approval / question 使用真正的队列而非单槽状态，多个请求不得互相覆盖；显示来源工具 / agent、风险范围和等待时长。
+- [x] approval / question 使用真正的队列而非单槽状态，多个请求不得互相覆盖；显示来源工具 / agent、风险范围和等待时长。
 - [ ] approval 支持按当前调用、当前 turn、当前 session 或明确规则授权；仅对安全且作用域一致的请求提供批量处理。
 - [ ] 每个可能修改文件的 turn 建立 checkpoint，undo 前预览将恢复的消息和文件；支持 redo，并明确哪些外部副作用不可恢复。
 - [ ] 支持编辑历史 user prompt 后重新执行，并让用户选择覆盖后续历史或从该点 fork，避免隐式破坏原对话。
@@ -193,8 +193,8 @@
 
 ### 验收与回归测试
 
-- [ ] session 正忙、RPC 超时和服务端拒绝三种情况下提交 prompt，输入与附件均不丢失，重试不会重复执行。
-- [ ] 两个以上同名工具并行完成且顺序交错时，每个结果仍匹配正确的 `tool_call_id`。
+- [x] session 正忙、RPC 超时和服务端拒绝三种情况下提交 prompt，输入与附件均不丢失，重试不会重复执行。
+- [x] 两个以上同名工具并行完成且顺序交错时，每个结果仍匹配正确的 `tool_call_id`。
 - [ ] 中断、断线、重连和事件 replay 后 transcript 无重复 delta，工具 / approval 状态与服务端一致。
 - [ ] resume 不同 permission / model / plan 配置的 session 后，TUI 状态和实际执行策略完全一致。
 - [ ] 自动 compact、手动 compact、compact 失败和 overflow fallback 均有准确状态反馈，且当前 prompt、滚动位置和累计 usage 不丢失。
@@ -207,29 +207,29 @@
 
 ### P0：Plan Mode 与 Plan Review
 
-- [ ] Plan 流程只显示四个清晰阶段：Planning → Review → Executing → Done；footer 使用一个短标签，不新增独立流程页。
-- [ ] 保留“plan 文档出现后独占整个 transcript”的专注视图；Plan Mode 内只显示完整 plan，退出 Plan Mode 后再恢复正常对话流。
-- [ ] plan 专注视图只维护一份原位更新的完整文档；首次出现定位到顶部，后续文件更新保持当前阅读位置，不重复插入消息、不强制跳到底部。
-- [ ] Plan Mode 中弹出 Question 或 Review 后，关闭面板必须恢复之前的 plan 阅读位置，不能重新跳到顶部或底部。
-- [ ] ExitPlanMode review 保持简单的 `1 执行 / 2 修改意见 / 3 拒绝`；有多个 approach 时只显示短标题，当前选中项下方最多显示一行说明。
-- [ ] review 打开时仍可用 `PgUp/PgDn` 或 `Ctrl+U/Ctrl+D` 滚动完整 plan；数字键直接选择，方向键只移动操作项，快捷键提示固定显示一行。
-- [ ] “修改意见”复用正常输入编辑能力，支持光标移动、粘贴、undo 和多行；提交失败时保留原反馈内容。
-- [ ] 选择“执行”后立即关闭 review、折叠 plan、回到 transcript 底部并显示一行 `Executing plan…`；后续工具输出按正常对话流展示，不继续占用 plan focus。
-- [ ] 选择“修改意见”后关闭 review 并显示 `Revising plan…`，保持 plan mode；新版本仍更新同一张 plan 卡片，再次 Review 时保留新的内容与反馈关系。
-- [ ] 选择“拒绝”后停止当前 turn、退出 waiting 状态但保留 plan 文件；用户之后可继续修改或重新发起 Review，不清空对话。
-- [ ] 执行阶段只在 sticky todo 中显示 `当前步骤 / 总步骤` 和当前步骤标题；不把完整 plan 再复制成另一套复杂时间线。
-- [ ] 进入 / 退出 plan mode 以服务端确认为准；RPC 失败时回滚本地 mode、footer 和 plan focus，不能出现界面已退出但服务端仍禁止写入的状态。
-- [ ] plan review 超时、被其他客户端处理或 turn 被中断时，及时关闭旧确认条并显示一行结果；不得留下已经失效但仍可操作的面板。
+- [x] Plan 流程只显示四个清晰阶段：Planning → Review → Executing → Done；footer 使用一个短标签，不新增独立流程页。
+- [x] 保留“plan 文档出现后独占整个 transcript”的专注视图；Plan Mode 内只显示完整 plan，退出 Plan Mode 后再恢复正常对话流。
+- [x] plan 专注视图只维护一份原位更新的完整文档；首次出现定位到顶部，后续文件更新保持当前阅读位置，不重复插入消息、不强制跳到底部。
+- [x] Plan Mode 中弹出 Question 或 Review 后，关闭面板必须恢复之前的 plan 阅读位置，不能重新跳到顶部或底部。
+- [x] ExitPlanMode review 保持简单的 `1 执行 / 2 修改意见 / 3 拒绝`；有多个 approach 时只显示短标题，当前选中项下方最多显示一行说明。
+- [x] review 打开时仍可用 `PgUp/PgDn` 或 `Ctrl+U/Ctrl+D` 滚动完整 plan；数字键直接选择，方向键只移动操作项，快捷键提示固定显示一行。
+- [x] “修改意见”复用正常输入编辑能力，支持光标移动、粘贴、undo 和多行；提交失败时保留原反馈内容。
+- [x] 选择“执行”后立即关闭 review、折叠 plan、回到 transcript 底部并显示一行 `Executing plan…`；后续工具输出按正常对话流展示，不继续占用 plan focus。
+- [x] 选择“修改意见”后关闭 review 并显示 `Revising plan…`，保持 plan mode；新版本仍更新同一张 plan 卡片，再次 Review 时保留新的内容与反馈关系。
+- [x] 选择“拒绝”后停止当前 turn、退出 waiting 状态但保留 plan 文件；用户之后可继续修改或重新发起 Review，不清空对话。
+- [x] 执行阶段只在 sticky todo 中显示 `当前步骤 / 总步骤` 和当前步骤标题；不把完整 plan 再复制成另一套复杂时间线。
+- [x] 进入 / 退出 plan mode 以服务端确认为准；RPC 失败时回滚本地 mode、footer 和 plan focus，不能出现界面已退出但服务端仍禁止写入的状态。
+- [x] plan review 超时、被其他客户端处理或 turn 被中断时，及时关闭旧确认条并显示一行结果；不得留下已经失效但仍可操作的面板。
 
 ### P0：AskUserQuestion
 
 - [x] `QuestionPayload` 补充并传递 `allow_multiple` 与 `background`；TUI 不得把所有 option question 都当成多选，也不得把 background question 显示成阻塞弹窗。
 - [x] 单选使用 `( )`，多选使用 `[ ]`；单选数字键可直接提交，多选数字键 / Space 只切换并由 Enter 确认，底部提示按类型动态显示。
 - [x] background question 仅在 footer / session 标签显示一个 `question` 徽标，通过轻量列表进入回答；当前输入和 turn 不被抢占。
-- [ ] free-text 回答复用正常输入编辑能力，支持光标、粘贴、undo 和多行；空回答在本地给出一行提示，不发送无效响应。
-- [ ] 问题或选项过长时正确换行并允许滚动，但面板默认只占必要高度；选项很多时显示可见窗口和当前位置，不扩大为全屏向导。
+- [x] free-text 回答复用正常输入编辑能力，支持光标、粘贴、undo 和多行；空回答在本地给出一行提示，不发送无效响应。
+- [x] 问题或选项过长时正确换行并允许滚动，但面板默认只占必要高度；选项很多时显示可见窗口和当前位置，不扩大为全屏向导。
 - [x] 回答提交期间显示简短 `sending…`；失败时恢复原问题、已选项和输入，成功后在 transcript 留一行 `Answered: …` 便于回看。
-- [ ] 多个 question / approval 到达时使用第八节已有的 interaction 队列，逐个显示且不覆盖；切换 session 后仍按原 session id 回复。
+- [x] 多个 question / approval 到达时使用第八节已有的 interaction 队列，逐个显示且不覆盖；切换 session 后仍按原 session id 回复。
 
 ### 验收与回归测试
 
@@ -334,7 +334,7 @@
 ### P1：Transcript 密度与终端交互
 
 - [ ] 连续的 `Read` / `Grep` / `Glob` 等探索型调用可折叠为 `Explored 12 files ✓`，展开后保留原工具顺序、状态和摘要；失败、approval 或写操作不得被静默隐藏。
-- [ ] 用户向上滚动后暂停自动跟随，底部只显示 `↓ 24 new lines`，用户主动返回底部后再恢复；流式 Markdown 与未完成代码块避免每个 delta 全量重排。
+- [x] 用户向上滚动后暂停自动跟随，底部只显示 `↓ 24 new lines`，用户主动返回底部后再恢复；流式 Markdown 与未完成代码块避免每个 delta 全量重排。
 - [ ] 文件路径、URL 和 Wiki 引用在终端支持时使用 OSC 8 可打开链接；不支持时保留统一复制操作，不因平台差异显示死链接。
 
 ### P1：安全退出与无障碍
@@ -383,12 +383,12 @@
 
 - [ ] session 元数据、索引和事件持久化使用事务 / 原子写入；单条损坏时隔离该记录，其他 session 仍可列出、resume 和导出。
 - [ ] 增加只读检查与显式的修复 / 导出流程；修复前必须备份原数据，报告哪些记录完整、已隔离或无法恢复，不静默删除历史。
-- [ ] `kkagent doctor --bundle` 先列出将收集的文件 / 字段并允许取消；默认只包含版本、平台、脱敏配置摘要、健康检查和有上限日志，不包含 transcript、文件正文、密钥或私有 Wiki 结果。
+- [x] `kkagent doctor --bundle` 先列出将收集的文件 / 字段并允许取消；默认只包含版本、平台、脱敏配置摘要、健康检查和有上限日志，不包含 transcript、文件正文、密钥或私有 Wiki 结果。
 
 ### P1：CLI 与终端集成
 
-- [ ] 从同一份 CLI 命令 / 参数定义生成 Bash、Zsh、Fish 和 PowerShell 补全，提供 `kkagent completions <shell>` 输出与简短安装说明，避免手写补全与 CLI 漂移。
-- [ ] 增加 `--no-alt-screen`，保留终端原生 scrollback 和可复制输出；与默认 alternate screen 使用同一渲染 / 输入状态，resize、中断和退出后不留损坏终端模式。
+- [x] 从同一份 CLI 命令 / 参数定义生成 Bash、Zsh、Fish 和 PowerShell 补全，提供 `kkagent completions <shell>` 输出与简短安装说明，避免手写补全与 CLI 漂移。
+- [x] 增加 `--no-alt-screen`，保留终端原生 scrollback 和可复制输出；与默认 alternate screen 使用同一渲染 / 输入状态，resize、中断和退出后不留损坏终端模式。
 - [x] 支持将当前 / 完整 session 导出为 Markdown，默认保留回答、简化工具摘要和引用；导出前提示敏感内容并可选脱敏，不默认嵌入大型工具原始输出。
 - [ ] 新版本检查可关闭且有缓存 / 频率上限，只在空闲状态显示一行版本与迁移摘要；不自动下载、不中断 session，离线 / 企业环境不反复报错。
 

@@ -1452,7 +1452,7 @@ fn render_scroll_hint(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme
     if max == 0 {
         return;
     }
-    let label = format!(" ↑ {} / {} ", state.scroll_up, max);
+    let label = format!(" ↓ {} new lines · end to follow ", state.scroll_up);
     let w = UnicodeWidthStr::width(label.as_str()) as u16;
     if w >= area.width {
         return;
