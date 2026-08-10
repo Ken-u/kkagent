@@ -153,6 +153,18 @@ pub struct AppState {
     pub history_oldest_index: Option<usize>,
     /// Total message count known from the last resume/history response.
     pub history_total: Option<usize>,
+    /// Per-session draft / scroll / search state (survives switches).
+    pub session_views: std::collections::HashMap<String, crate::session_view::SessionViewState>,
+    /// Debounced `/sessions` preview target.
+    pub preview_debounce: Option<PreviewDebounce>,
+    /// LRU cache of session.preview JSON payloads.
+    pub preview_cache: crate::session_view::PreviewLru,
+}
+
+#[derive(Debug, Clone)]
+pub struct PreviewDebounce {
+    pub session_id: String,
+    pub due_at: std::time::Instant,
 }
 
 #[derive(Debug, Clone)]
@@ -527,6 +539,9 @@ impl AppState {
             history_loading: false,
             history_oldest_index: None,
             history_total: None,
+            session_views: std::collections::HashMap::new(),
+            preview_debounce: None,
+            preview_cache: crate::session_view::PreviewLru::new(12),
         }
     }
 
@@ -970,6 +985,7 @@ impl TuiApp {
             {
                 self.enqueue_mcp_status_poll();
             }
+            self.flush_preview_debounce();
             if matches!(
                 self.state.status,
                 SessionStatus::Thinking | SessionStatus::ToolExecuting
@@ -1984,9 +2000,9 @@ impl TuiApp {
                 }
                 self.state.quit_confirm = false;
             }
-            // Ctrl+Shift-Tab: previous session tab
+            // Ctrl+Shift-Tab: previous related session (real resume)
             KeyCode::BackTab if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.state.tab_strip.prev();
+                self.cycle_workspace_session(-1).await?;
             }
             // Shift-Tab: toggle plan mode
             KeyCode::BackTab => {
@@ -2134,7 +2150,7 @@ impl TuiApp {
                 self.state.refresh_slash_menu();
             }
             KeyCode::Tab if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.state.tab_strip.next();
+                self.cycle_workspace_session(1).await?;
             }
             // Normal character input
             KeyCode::Char(c) => {
@@ -3611,9 +3627,18 @@ impl TuiApp {
             .map(|id| id != query && !session_has_retained_io(&self.state.messages))
             .unwrap_or(false);
 
-        // Park interactive prompts for the session we leave so background turns can resume them.
+        // Persist UI context for the session we leave.
         if let Some(ref leaving) = leaving_id {
             if leaving != query {
+                let view = crate::session_view::SessionViewState::capture(
+                    &self.state.input,
+                    self.state.scroll_up,
+                    self.state.follow_bottom,
+                    self.state.todos_expanded,
+                    &self.state.search,
+                    self.state.highlight_message,
+                );
+                self.state.session_views.insert(leaving.clone(), view);
                 if let Some(approval) = self.state.approval_pending.take() {
                     self.state
                         .parked_approvals
@@ -3731,6 +3756,25 @@ impl TuiApp {
         self.state.list_picker = None;
         self.state.session_picker_preview = None;
         self.enqueue_workspace_sessions_refresh();
+
+        // Restore UI context captured when we last left this session.
+        if let Some(view) = self.state.session_views.remove(&sid) {
+            view.restore_into(
+                &mut self.state.input,
+                &mut self.state.scroll_up,
+                &mut self.state.follow_bottom,
+                &mut self.state.todos_expanded,
+                &mut self.state.search,
+                &mut self.state.highlight_message,
+            );
+        } else {
+            self.state.input.clear();
+            self.state.scroll_up = 0;
+            self.state.follow_bottom = true;
+            self.state.todos_expanded = false;
+            self.state.search = crate::search::SearchState::default();
+            self.state.highlight_message = None;
+        }
 
         // Lazy history: show recent messages first, then backfill older pages
         // without forcing the viewport to the bottom.
@@ -4081,20 +4125,24 @@ impl TuiApp {
     fn refresh_session_picker_preview(&mut self) {
         let Some(picker) = self.state.list_picker.as_ref() else {
             self.state.session_picker_preview = None;
+            self.state.preview_debounce = None;
             return;
         };
         if picker.kind != ListPickerKind::Session {
             self.state.session_picker_preview = None;
+            self.state.preview_debounce = None;
             return;
         }
         let Some(item) = picker.items.get(picker.selected) else {
             self.state.session_picker_preview = None;
+            self.state.preview_debounce = None;
             return;
         };
         let sid = item.id.clone();
 
         // Current session: reuse live transcript (same look as normal chat).
         if self.state.session_id.as_deref() == Some(sid.as_str()) {
+            self.state.preview_debounce = None;
             self.state.session_picker_preview = Some(SessionPickerPreview {
                 session_id: sid,
                 messages: self.state.messages.clone(),
@@ -4104,18 +4152,60 @@ impl TuiApp {
             return;
         }
 
-        // Clear stale preview immediately so the previous session's content
-        // never flashes under a newly highlighted row.
-        self.state.session_picker_preview = Some(SessionPickerPreview {
-            session_id: sid.clone(),
-            messages: vec![DisplayMessage {
-                role: MessageRole::System,
-                content: "Loading preview…".into(),
-                thinking: None,
-                parts: Vec::new(),
-                tool_calls: Vec::new(),
-            }],
+        // Immediate highlight movement: never show the previous session's
+        // preview under a newly selected row.
+        if self
+            .state
+            .session_picker_preview
+            .as_ref()
+            .is_none_or(|p| p.session_id != sid)
+        {
+            if let Some(cached) = self.state.preview_cache.get(&sid) {
+                self.apply_session_preview_data(&sid, cached);
+                self.state.preview_debounce = None;
+                return;
+            }
+            self.state.session_picker_preview = Some(SessionPickerPreview {
+                session_id: sid.clone(),
+                messages: vec![DisplayMessage {
+                    role: MessageRole::System,
+                    content: "Loading preview…".into(),
+                    thinking: None,
+                    parts: Vec::new(),
+                    tool_calls: Vec::new(),
+                }],
+            });
+        }
+
+        // Debounce the network fetch so rapid ↑↓ only loads the final item.
+        self.state.preview_debounce = Some(PreviewDebounce {
+            session_id: sid,
+            due_at: std::time::Instant::now() + std::time::Duration::from_millis(120),
         });
+    }
+
+    fn flush_preview_debounce(&mut self) {
+        let Some(pending) = self.state.preview_debounce.as_ref() else {
+            return;
+        };
+        if std::time::Instant::now() < pending.due_at {
+            return;
+        }
+        let sid = pending.session_id.clone();
+        self.state.preview_debounce = None;
+
+        // Selection may have moved away while we waited.
+        let still_selected = self.state.list_picker.as_ref().is_some_and(|p| {
+            p.kind == ListPickerKind::Session
+                && p.items.get(p.selected).is_some_and(|i| i.id == sid)
+        });
+        if !still_selected {
+            return;
+        }
+        if let Some(cached) = self.state.preview_cache.get(&sid) {
+            self.apply_session_preview_data(&sid, cached);
+            return;
+        }
         self.jobs
             .spawn_session_preview(self.client.requester(), sid);
     }
@@ -4129,6 +4219,9 @@ impl TuiApp {
         if !still_selected {
             return;
         }
+        self.state
+            .preview_cache
+            .put(session_id.to_string(), data.clone());
         let mut messages = Vec::new();
         if let Some(msgs) = data.get("messages").and_then(|v| v.as_array()) {
             for m in msgs {

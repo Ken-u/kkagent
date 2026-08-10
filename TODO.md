@@ -96,10 +96,10 @@
 - [x] 将 session 切换实现为非阻塞、可取消的状态机：加载目标 session 时继续显示当前 transcript，并在 footer 显示“正在切换到 …”；成功后一次性原子替换，失败则保留当前 session 和全部交互状态。（交叉：随六·P0 AsyncJobHub / SessionResume 落地）
 - [x] 连续快速切换采用“最后一次选择生效”：A → B → C 时取消或忽略 A/B 的迟到结果，只允许 C 更新界面。（交叉：generation + resume_switch）
 - [x] 去掉切换热路径中的同步 `sessions.list`：Tab / 左右键直接使用内存快照选出目标，列表刷新放到后台；`session.resume` 成功后的标题和关联 session 刷新也不得阻塞切换完成。（交叉：enqueue_workspace_sessions_refresh）
-- [ ] `/sessions` 预览增加 100–150ms debounce、旧请求取消 / generation 校验和小型 LRU 缓存；快速按上下键时立即移动高亮，只为最终停留项加载预览。（预览已非阻塞 + 占位/generation；debounce/LRU 待补）
+- [x] `/sessions` 预览增加 100–150ms debounce、旧请求取消 / generation 校验和小型 LRU 缓存；快速按上下键时立即移动高亮，只为最终停留项加载预览。
 - [x] 为预览和恢复提供稳定占位状态；旧预览不能短暂显示到新选中项上，加载失败可就地重试且不关闭选择器。
-- [ ] 每个 session 独立保存并恢复 UI 上下文：未发送草稿、输入光标、消息滚动位置、是否跟随底部、搜索条件、todo 展开状态；不能把 A 的视图状态带到 B。
-- [ ] 后台 session 的流式输出、工具执行、approval 和 question 必须继续按 session id 路由；切回时恢复正确状态，不丢事件、不串消息。
+- [x] 每个 session 独立保存并恢复 UI 上下文：未发送草稿、输入光标、消息滚动位置、是否跟随底部、搜索条件、todo 展开状态；不能把 A 的视图状态带到 B。
+- [x] 后台 session 的流式输出、工具执行、approval 和 question 必须继续按 session id 路由；切回时恢复正确状态，不丢事件、不串消息。（approval/question park；切回走 resume 拉齐服务端状态；tab dirty/status 按 id 更新）
 
 ### P1：可发现性与多会话状态
 

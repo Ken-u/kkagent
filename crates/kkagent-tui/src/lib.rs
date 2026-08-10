@@ -16,6 +16,7 @@ pub mod render_cache;
 pub mod reverse_rpc;
 pub mod search;
 pub mod selection;
+pub mod session_view;
 pub mod slash;
 pub mod streaming;
 pub mod theme;
