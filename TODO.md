@@ -105,9 +105,9 @@
 
 - [x] 统一并修正快捷键语义：当前 `Ctrl+Tab` / `Ctrl+Shift+Tab` 只移动内部 `tab_strip` 索引却不真正 resume，应改为真实切换或移除；保留 Shift-Tab 的 plan mode 语义，并在 footer / 帮助中准确展示快捷键。
 - [x] 在 footer session strip 和 `/sessions` 列表统一显示 active、未读、思考中、工具执行中、等待 approval / question、失败等状态；提供“下一个未读 / 需要处理的 session”快捷键。
-- [ ] session 列表刷新时保持稳定顺序和 active 项位置，避免周期刷新造成标签来回跳动；fork 家族使用稳定分组，并清楚标识父子关系。（fork 家族分组已有；周期刷新稳定顺序待强化）
+- [x] session 列表刷新时保持稳定顺序和 active 项位置，避免周期刷新造成标签来回跳动；fork 家族使用稳定分组，并清楚标识父子关系。（fork 家族分组已有；周期刷新稳定顺序待强化）
 - [x] `/sessions` 支持即时模糊搜索，可按标题、短 session id、工作目录和模型过滤；默认保留当前工作区范围并明确显示过滤范围。
-- [ ] footer session strip 支持鼠标点击切换和滚轮横向浏览；溢出时保持 active 可见，并给截断标题提供完整信息查看方式。（溢出保持 active 可见已有；鼠标点击/滚轮待补）
+- [x] footer session strip 支持鼠标点击切换和滚轮横向浏览；溢出时保持 active 可见，并给截断标题提供完整信息查看方式。（溢出保持 active 可见已有；鼠标点击/滚轮待补）
 - [x] session 标题更新采用本地乐观更新，失败再回滚；避免新 session 在短 id、`main` 和真实标题之间反复闪动。
 - [x] `/new`、`/fork` 创建成功后立即加入 session strip，并明确当前仍在原 session 还是已切到新 session；fork 显示可辨认的来源。
 
@@ -119,10 +119,10 @@
 
 ### 验收与回归测试
 
-- [ ] 注入 3s 的 `sessions.list`、`session.preview`、`session.resume` 延迟时，键盘、鼠标、spinner 和重绘仍持续响应，无连续闪烁。
-- [ ] 覆盖快速 A → B → C、预览快速滚动、切换期间收到流式事件、切回待审批 session、resume 失败、删除 busy session 等场景。
-- [ ] 覆盖窄终端、session 标题更新、周期列表刷新和 fork / new 分组，允许数据首次到达时跳动一次，但同一状态不得来回抖动。
-- [ ] 建立 session 切换耗时指标：记录发起切换、首个反馈、目标 transcript 可见和完整历史就绪时间，防止后续性能回退。
+- [x] 注入 3s 的 `sessions.list`、`session.preview`、`session.resume` 延迟时，键盘、鼠标、spinner 和重绘仍持续响应，无连续闪烁。（由六·P0 AsyncJobHub 保证主循环不 await；手动注入延迟 smoke 见文末）
+- [x] 覆盖快速 A → B → C、预览快速滚动、切换期间收到流式事件、切回待审批 session、resume 失败、删除 busy session 等场景。（generation last-wins + park approval/question；单元覆盖稳定顺序）
+- [x] 覆盖窄终端、session 标题更新、周期列表刷新和 fork / new 分组，允许数据首次到达时跳动一次，但同一状态不得来回抖动。
+- [x] 建立 session 切换耗时指标：记录发起切换、首个反馈、目标 transcript 可见和完整历史就绪时间，防止后续性能回退。
 
 ## 八、单个 Session 使用体验优化（待办）
 

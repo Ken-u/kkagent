@@ -1210,7 +1210,7 @@ fn cursor_position(text: &str, cursor: usize, content_width: usize, prefix_w: u1
     (prefix_w, y.saturating_sub(1))
 }
 
-fn render_footer(f: &mut Frame, area: Rect, state: &AppState, config: &AppConfig, theme: &Theme) {
+fn render_footer(f: &mut Frame, area: Rect, state: &mut AppState, config: &AppConfig, theme: &Theme) {
     // Line 1: yolo  model  thinking  cwd  git ............ tip
     let mut left: Vec<Span> = Vec::new();
 
@@ -1291,6 +1291,8 @@ fn render_footer(f: &mut Frame, area: Rect, state: &AppState, config: &AppConfig
 
     let tip = if let Some(ref activity) = state.status_bar.activity {
         activity.clone()
+    } else if let Some(ref hover) = state.strip_hover_title {
+        hover.clone()
     } else if state.quit_confirm {
         "press ctrl-c again to quit".to_string()
     } else if state.search.active {
@@ -1330,9 +1332,9 @@ fn render_footer(f: &mut Frame, area: Rect, state: &AppState, config: &AppConfig
         .saturating_sub(gap);
     let session_busy = session_strip_has_busy(state);
     let spinner_cols = if session_busy { 2 } else { 0 }; // "⠋ "
-    let session_spans = state
+    let (session_spans, relative_hits) = state
         .workspace_sessions
-        .render_spans(strip_budget.saturating_sub(spinner_cols), theme);
+        .render_spans_with_hits(strip_budget.saturating_sub(spinner_cols), theme);
     let mut line2_spans: Vec<Span> = Vec::new();
     if session_busy {
         let frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
@@ -1342,6 +1344,17 @@ fn render_footer(f: &mut Frame, area: Rect, state: &AppState, config: &AppConfig
             Style::default().fg(theme.primary),
         ));
     }
+    let strip_origin_x = area.x.saturating_add(spinner_cols as u16);
+    state.footer_area = area;
+    state.session_strip_origin_x = strip_origin_x;
+    state.session_strip_hits = relative_hits
+        .into_iter()
+        .map(|mut h| {
+            h.x0 = h.x0.saturating_add(strip_origin_x as usize);
+            h.x1 = h.x1.saturating_add(strip_origin_x as usize);
+            h
+        })
+        .collect();
     line2_spans.extend(session_spans);
     let strip_text: String = line2_spans.iter().map(|s| s.content.clone()).collect();
     let strip_w = UnicodeWidthStr::width(strip_text.as_str());

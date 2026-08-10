@@ -147,6 +147,35 @@ pub struct WorkspaceSessionStrip {
 }
 
 impl WorkspaceSessionStrip {
+    /// Merge a freshly fetched entry list into the strip while preserving the
+    /// previous relative order of still-present sessions (avoids tab jitter on
+    /// periodic refresh). New ids are appended; missing ids are dropped.
+    pub fn set_entries_stable(
+        &mut self,
+        mut incoming: Vec<WorkspaceSessionEntry>,
+        active_id: Option<&str>,
+    ) {
+        if self.entries.is_empty() {
+            self.set_entries(incoming, active_id);
+            return;
+        }
+        let mut by_id: std::collections::HashMap<String, WorkspaceSessionEntry> = incoming
+            .drain(..)
+            .map(|e| (e.id.clone(), e))
+            .collect();
+        let mut ordered = Vec::with_capacity(by_id.len());
+        for prev in &self.entries {
+            if let Some(e) = by_id.remove(&prev.id) {
+                ordered.push(e);
+            }
+        }
+        // Preserve relative order of brand-new ids as provided by the caller.
+        let mut rest: Vec<_> = by_id.into_values().collect();
+        rest.sort_by(|a, b| a.id.cmp(&b.id));
+        ordered.extend(rest);
+        self.set_entries(ordered, active_id);
+    }
+
     pub fn set_entries(&mut self, entries: Vec<WorkspaceSessionEntry>, active_id: Option<&str>) {
         self.entries = entries;
         self.active = active_id
@@ -180,11 +209,16 @@ impl WorkspaceSessionStrip {
 
     /// Render a scrolling strip that always keeps the active entry visible.
     /// Caller passes remaining width after reserving the context meter.
-    pub fn render_spans(&self, max_cols: usize, theme: &Theme) -> Vec<Span<'static>> {
+    /// Returns spans plus hit boxes relative to the strip's starting column (0-based).
+    pub fn render_spans_with_hits(
+        &self,
+        max_cols: usize,
+        theme: &Theme,
+    ) -> (Vec<Span<'static>>, Vec<SessionStripHit>) {
         if self.entries.is_empty() || max_cols < 4 {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         }
-        let labels: Vec<(bool, String)> = self
+        let labels: Vec<(bool, String, String)> = self
             .entries
             .iter()
             .enumerate()
@@ -196,27 +230,44 @@ impl WorkspaceSessionStrip {
                 } else {
                     format!("{mark}{title}")
                 };
-                (i == self.active, label)
+                (i == self.active, label, e.id.clone())
             })
             .collect();
 
+        let label_pairs: Vec<(bool, String)> = labels
+            .iter()
+            .map(|(a, l, _)| (*a, l.clone()))
+            .collect();
         let (start, end, left_overflow, right_overflow) =
-            visible_window(&labels, self.active, max_cols);
+            visible_window(&label_pairs, self.active, max_cols);
 
         let mut spans = Vec::new();
+        let mut hits = Vec::new();
+        let mut col = 0usize;
         if left_overflow {
-            spans.push(Span::styled(
-                "‹ ".to_string(),
-                Style::default().fg(theme.text_muted),
-            ));
+            let s = "‹ ".to_string();
+            col += UnicodeWidthStr::width(s.as_str());
+            spans.push(Span::styled(s, Style::default().fg(theme.text_muted)));
         }
-        for (i, (is_active, label)) in labels[start..end].iter().enumerate() {
+        for (i, (is_active, label, id)) in labels[start..end].iter().enumerate() {
             if i > 0 {
-                spans.push(Span::styled(
-                    " · ".to_string(),
-                    Style::default().fg(theme.text_muted),
-                ));
+                let sep = " · ".to_string();
+                col += UnicodeWidthStr::width(sep.as_str());
+                spans.push(Span::styled(sep, Style::default().fg(theme.text_muted)));
             }
+            let w = UnicodeWidthStr::width(label.as_str());
+            hits.push(SessionStripHit {
+                session_id: id.clone(),
+                full_title: self
+                    .entries
+                    .iter()
+                    .find(|e| e.id == *id)
+                    .map(|e| e.title.clone())
+                    .unwrap_or_else(|| id.clone()),
+                x0: col,
+                x1: col + w,
+            });
+            col += w;
             if *is_active {
                 spans.push(Span::styled(
                     label.clone(),
@@ -237,8 +288,21 @@ impl WorkspaceSessionStrip {
                 Style::default().fg(theme.text_muted),
             ));
         }
-        spans
+        (spans, hits)
     }
+
+    pub fn render_spans(&self, max_cols: usize, theme: &Theme) -> Vec<Span<'static>> {
+        self.render_spans_with_hits(max_cols, theme).0
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionStripHit {
+    pub session_id: String,
+    pub full_title: String,
+    /// Column offsets relative to the start of the session strip text.
+    pub x0: usize,
+    pub x1: usize,
 }
 
 /// Prefer custom `/title`, else first/last prompt snippet, else short id.
@@ -653,5 +717,75 @@ mod tests {
         assert!(
             text.contains('‹') || text.contains('›') || text.contains('·') || text.contains('[')
         );
+    }
+
+    #[test]
+    fn workspace_strip_stable_order_on_refresh() {
+        let mut strip = WorkspaceSessionStrip::default();
+        strip.set_entries(
+            vec![
+                WorkspaceSessionEntry {
+                    id: "a".into(),
+                    title: "A".into(),
+                    status: SessionStatus::Idle,
+                    dirty: false,
+                    needs_attention: false,
+                },
+                WorkspaceSessionEntry {
+                    id: "b".into(),
+                    title: "B".into(),
+                    status: SessionStatus::Idle,
+                    dirty: false,
+                    needs_attention: false,
+                },
+                WorkspaceSessionEntry {
+                    id: "c".into(),
+                    title: "C".into(),
+                    status: SessionStatus::Idle,
+                    dirty: false,
+                    needs_attention: false,
+                },
+            ],
+            Some("b"),
+        );
+        // Server returns shuffled order + one new id; relative order of a/b/c must hold.
+        strip.set_entries_stable(
+            vec![
+                WorkspaceSessionEntry {
+                    id: "c".into(),
+                    title: "C2".into(),
+                    status: SessionStatus::Thinking,
+                    dirty: true,
+                    needs_attention: false,
+                },
+                WorkspaceSessionEntry {
+                    id: "a".into(),
+                    title: "A2".into(),
+                    status: SessionStatus::Idle,
+                    dirty: false,
+                    needs_attention: false,
+                },
+                WorkspaceSessionEntry {
+                    id: "d".into(),
+                    title: "D".into(),
+                    status: SessionStatus::Idle,
+                    dirty: false,
+                    needs_attention: false,
+                },
+                WorkspaceSessionEntry {
+                    id: "b".into(),
+                    title: "B2".into(),
+                    status: SessionStatus::Idle,
+                    dirty: false,
+                    needs_attention: true,
+                },
+            ],
+            Some("b"),
+        );
+        let ids: Vec<_> = strip.entries.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, vec!["a", "b", "c", "d"]);
+        assert_eq!(strip.active_id(), Some("b"));
+        assert_eq!(strip.entries[1].title, "B2");
+        assert!(strip.entries[1].needs_attention);
     }
 }

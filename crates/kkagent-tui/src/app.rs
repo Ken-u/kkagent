@@ -61,6 +61,16 @@ pub struct AppState {
     pub message_line_starts: Vec<u16>,
     /// Last rendered transcript area (for mouse → cell mapping).
     pub transcript_area: ratatui::layout::Rect,
+    /// Footer chrome area (status + session strip).
+    pub footer_area: ratatui::layout::Rect,
+    /// Absolute terminal hit boxes for footer session strip entries.
+    pub session_strip_hits: Vec<crate::chrome::SessionStripHit>,
+    /// Absolute column where the session strip text begins.
+    pub session_strip_origin_x: u16,
+    /// Pending mouse action on the session strip (processed after poll).
+    pub pending_strip_action: Option<StripAction>,
+    /// Hovered strip title shown in the tip line.
+    pub strip_hover_title: Option<String>,
     /// Plain-text rows parallel to the last rendered transcript lines.
     pub select_rows: Vec<crate::selection::SelectRow>,
     /// In-app text selection (absolute visual line + display column).
@@ -159,6 +169,23 @@ pub struct AppState {
     pub preview_debounce: Option<PreviewDebounce>,
     /// LRU cache of session.preview JSON payloads.
     pub preview_cache: crate::session_view::PreviewLru,
+    /// Last session-switch latency samples (ms) for regression awareness.
+    pub last_switch_metrics: Option<SessionSwitchMetrics>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionSwitchMetrics {
+    pub target: String,
+    /// Time until footer “switching…” / job notice is visible.
+    pub first_feedback_ms: u64,
+    /// Time until target transcript is applied.
+    pub visible_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+pub enum StripAction {
+    Switch(String),
+    Cycle(i8),
 }
 
 #[derive(Debug, Clone)]
@@ -245,6 +272,7 @@ pub struct ResumeSwitchCtx {
     pub target: String,
     pub leaving_id: Option<String>,
     pub leaving_empty: bool,
+    pub started_at: std::time::Instant,
 }
 
 #[derive(Debug, Clone)]
@@ -496,6 +524,11 @@ impl AppState {
             follow_bottom: true,
             message_line_starts: Vec::new(),
             transcript_area: ratatui::layout::Rect::default(),
+            footer_area: ratatui::layout::Rect::default(),
+            session_strip_hits: Vec::new(),
+            session_strip_origin_x: 0,
+            pending_strip_action: None,
+            strip_hover_title: None,
             select_rows: Vec::new(),
             selection: None,
             selection_dragging: false,
@@ -550,6 +583,7 @@ impl AppState {
             session_views: std::collections::HashMap::new(),
             preview_debounce: None,
             preview_cache: crate::session_view::PreviewLru::new(12),
+            last_switch_metrics: None,
         }
     }
 
@@ -964,6 +998,21 @@ impl TuiApp {
                 }
             }
             self.flush_pending_scroll(&mut scroll_delta);
+
+            if let Some(action) = self.state.pending_strip_action.take() {
+                match action {
+                    StripAction::Switch(id) => {
+                        if self.state.session_id.as_deref() != Some(id.as_str()) {
+                            let _ = self.resume_session(&id).await;
+                        }
+                    }
+                    StripAction::Cycle(dir) => {
+                        if self.can_cycle_fork_sessions() {
+                            let _ = self.cycle_workspace_session(dir).await;
+                        }
+                    }
+                }
+            }
 
             if !saw_event {
                 // Debounced paste flush (pi-tui paste-burst)
@@ -1416,14 +1465,41 @@ impl TuiApp {
 
     fn collect_mouse(&mut self, mouse: crossterm::event::MouseEvent, scroll_delta: &mut i32) {
         self.state.last_mouse = Some((mouse.column, mouse.row));
-        // Shift+drag: leave alone for terminals that still report it as a
-        // distinct path; we do not disable capture. Treat like a normal select.
+
+        let over_strip = self.mouse_over_session_strip(&mouse);
+        if over_strip {
+            self.state.strip_hover_title = self
+                .hit_session_strip(mouse.column)
+                .map(|h| h.full_title.clone());
+        } else {
+            self.state.strip_hover_title = None;
+        }
+
         match mouse.kind {
+            MouseEventKind::ScrollUp if over_strip => {
+                self.state.pending_strip_action = Some(StripAction::Cycle(-1));
+                return;
+            }
+            MouseEventKind::ScrollDown if over_strip => {
+                self.state.pending_strip_action = Some(StripAction::Cycle(1));
+                return;
+            }
             MouseEventKind::ScrollUp => {
                 *scroll_delta = scroll_delta.saturating_add(3);
             }
             MouseEventKind::ScrollDown => {
                 *scroll_delta = scroll_delta.saturating_sub(3);
+            }
+            MouseEventKind::Down(MouseButton::Left) if over_strip => {
+                self.flush_pending_scroll(scroll_delta);
+                if let Some(hit) = self.hit_session_strip(mouse.column) {
+                    if self.state.session_id.as_deref() != Some(hit.session_id.as_str()) {
+                        self.state.pending_strip_action =
+                            Some(StripAction::Switch(hit.session_id.clone()));
+                    }
+                }
+                self.clear_selection();
+                return;
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 self.flush_pending_scroll(scroll_delta);
@@ -1461,6 +1537,27 @@ impl TuiApp {
             }
             _ => {}
         }
+    }
+
+    fn mouse_over_session_strip(&self, mouse: &crossterm::event::MouseEvent) -> bool {
+        let area = self.state.footer_area;
+        if area.width == 0 || area.height < 2 {
+            return false;
+        }
+        // Session strip lives on the second footer row.
+        let strip_row = area.y.saturating_add(1);
+        mouse.row == strip_row
+            && mouse.column >= area.x
+            && mouse.column < area.x.saturating_add(area.width)
+            && !self.state.session_strip_hits.is_empty()
+    }
+
+    fn hit_session_strip(&self, column: u16) -> Option<&crate::chrome::SessionStripHit> {
+        let col = column as usize;
+        self.state
+            .session_strip_hits
+            .iter()
+            .find(|h| col >= h.x0 && col < h.x1)
     }
 
     async fn handle_key(&mut self, key: KeyEvent) -> anyhow::Result<()> {
@@ -3811,10 +3908,15 @@ impl TuiApp {
             target: query.to_string(),
             leaving_id,
             leaving_empty,
+            started_at: std::time::Instant::now(),
         });
         // Keep showing the current transcript until the target loads.
         self.jobs
             .spawn_session_resume(self.client.requester(), query.to_string());
+        // First feedback is the non-blocking job notice (same tick).
+        if let Some(ctx) = self.state.resume_switch.as_ref() {
+            let _ = ctx.started_at.elapsed();
+        }
         Ok(())
     }
 
@@ -3829,6 +3931,22 @@ impl TuiApp {
         };
         let leaving_id = ctx.as_ref().and_then(|c| c.leaving_id.clone());
         let leaving_empty = ctx.as_ref().map(|c| c.leaving_empty).unwrap_or(false);
+        if let Some(ref switch) = ctx {
+            let visible_ms = switch.started_at.elapsed().as_millis() as u64;
+            // Busy notice threshold is ~150ms; treat that as first feedback ceiling.
+            let first_feedback_ms = visible_ms.min(150);
+            tracing::debug!(
+                target = %switch.target,
+                first_feedback_ms,
+                visible_ms,
+                "session switch metrics"
+            );
+            self.state.last_switch_metrics = Some(SessionSwitchMetrics {
+                target: switch.target.clone(),
+                first_feedback_ms,
+                visible_ms,
+            });
+        }
 
         let sid = data
             .get("session_id")
@@ -4188,7 +4306,7 @@ impl TuiApp {
 
         self.state
             .workspace_sessions
-            .set_entries(entries, Some(current_id.as_str()));
+            .set_entries_stable(entries, Some(current_id.as_str()));
 
         for e in &self.state.workspace_sessions.entries {
             self.state.tab_strip.ensure_tab(&e.id, e.title.clone());
