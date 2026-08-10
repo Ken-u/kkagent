@@ -67,6 +67,12 @@ pub struct Session {
     pub tool_dedupe: crate::tool_dedupe::ToolDedupeTracker,
     /// Session token counter (measured anchors + estimates).
     pub token_counter: crate::token_counting::TokenCounter,
+    /// Token count right after the last successful compaction (re-compact guard).
+    pub last_compacted_tokens: Option<u64>,
+    /// Consecutive provider-overflow compact recoveries in the current turn.
+    pub consecutive_overflow_compacts: u32,
+    /// Observed max context after a provider overflow (may be below configured).
+    pub observed_max_context: Option<u64>,
     /// Layered tool activation policy (SelectTools + workspace/session disables).
     pub tool_policy: crate::tool_policy::ToolPolicyService,
     /// Swarm mode roster / enter-exit.
@@ -181,6 +187,9 @@ impl Session {
             token_counter: crate::token_counting::TokenCounter::new(
                 crate::token_counting::TokenCountingStrategy::MeasuredPlusEstimated,
             ),
+            last_compacted_tokens: None,
+            consecutive_overflow_compacts: 0,
+            observed_max_context: None,
             tool_policy: crate::tool_policy::ToolPolicyService::new(),
             swarm: crate::swarm::SwarmService::new(),
             usage: crate::usage::UsageService::new(),

@@ -2438,63 +2438,6 @@ fn messages_from_records(records: &[kkagent_core::transcript::MessageRecord]) ->
         .collect()
 }
 
-async fn summarize_with_llm(config: Arc<AppConfig>, digest: &str) -> Option<String> {
-    use kkagent_llm::{create_provider, LlmRequest, StreamEvent};
-    let alias = config
-        .secondary_model
-        .clone()
-        .or_else(|| config.default_model_alias().map(|s| s.to_string()))?;
-    let (model_cfg, provider_cfg) = config.resolve_model(&alias)?;
-    let provider = create_provider(provider_cfg, model_cfg).ok()?;
-    let (tx, mut rx) = mpsc::channel(64);
-    let request = LlmRequest {
-        model: model_cfg.model.clone(),
-        messages: vec![ChatMessage {
-            role: "user".into(),
-            content: vec![ChatContent::Text {
-                text: digest.to_string(),
-            }],
-        }],
-        tools: Vec::new(),
-        max_tokens: 1024,
-        system: Some("You compress conversation history into a concise factual summary.".into()),
-        thinking: None,
-    };
-    let handle = tokio::spawn(async move {
-        if let Err(error) = provider.stream_chat(request, tx.clone()).await {
-            let _ = tx.send(StreamEvent::Error(error.to_string())).await;
-        }
-    });
-    let mut out = String::new();
-    let mut complete = false;
-    let collected = tokio::time::timeout(std::time::Duration::from_secs(60), async {
-        while let Some(ev) = rx.recv().await {
-            match ev {
-                StreamEvent::TextDelta(t) => out.push_str(&t),
-                StreamEvent::MessageEnd { .. } => {
-                    complete = true;
-                    break;
-                }
-                StreamEvent::Error(error) => {
-                    tracing::warn!("compaction summary stream failed: {error}");
-                    break;
-                }
-                _ => {}
-            }
-        }
-    })
-    .await;
-    if collected.is_err() {
-        tracing::warn!("compaction summary timed out");
-    }
-    handle.abort();
-    if !complete || out.trim().is_empty() {
-        None
-    } else {
-        Some(out)
-    }
-}
-
 fn resolve_session_id(db: &TranscriptDb, query: &str) -> Option<String> {
     if db.get_session(query).ok().flatten().is_some() {
         return Some(query.to_string());
@@ -3752,77 +3695,89 @@ async fn handle_rpc_call(
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| (-32602, "Missing session_id".into()))?
                 .to_string();
-            let keep_last = params
+            let instruction = params
                 .as_ref()
-                .and_then(|p| p.get("keep_last"))
-                .and_then(|v| v.as_u64())
-                .unwrap_or(6) as usize;
+                .and_then(|p| p.get("instruction"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
 
-            // Build a summary of older messages via secondary/default model when possible.
-            let summary = {
-                let sessions = state.sessions.lock().await;
-                let Some(session) = sessions.get(&session_id) else {
-                    drop(sessions);
-                    let db = state.transcript.lock().await;
-                    let deleted = db
-                        .compact_session(&session_id, keep_last, "Conversation compacted.")
-                        .map_err(|e| (-32000, e.to_string()))?;
-                    return Ok(serde_json::json!({"ok": true, "deleted": deleted}));
-                };
-                if session.messages.len() <= keep_last {
-                    return Ok(serde_json::json!({"ok": true, "deleted": 0}));
-                }
-                let cut = kkagent_core::compact_cut_index(&session.messages, keep_last);
-                let old = if cut == 0 {
-                    &session.messages[..0]
-                } else {
-                    &session.messages[..cut]
-                };
-                let mut digest = String::from(
-                    "Summarize the following conversation for future context. \
-                     Keep decisions, file paths, tool outcomes, and unfinished tasks.\n\n",
-                );
-                digest.push_str(&kkagent_core::build_compaction_digest(old));
-                digest
-            };
-
-            let summary_text = summarize_with_llm(state.config.clone(), &summary)
-                .await
-                .unwrap_or_else(|| {
-                    // No LLM available: keep the tool-aware local digest so tool
-                    // outcomes are not silently discarded (kimi-compatible).
-                    summary.chars().take(4_000).collect()
-                });
-
-            let deleted = {
-                let sessions = state.sessions.lock().await;
-                let keep = if let Some(session) = sessions.get(&session_id) {
-                    let cut = kkagent_core::compact_cut_index(&session.messages, keep_last);
-                    session.messages.len().saturating_sub(cut).max(1)
-                } else {
-                    keep_last
-                };
-                drop(sessions);
-                let db = state.transcript.lock().await;
-                db.compact_session(&session_id, keep, &summary_text)
-                    .map_err(|e| (-32000, e.to_string()))?
-            };
-
+            // Blocking protection: refuse manual compact while a turn holds the session.
             {
-                let db = state.transcript.lock().await;
-                let records = db.load_messages(&session_id).unwrap_or_default();
-                let mut msgs = messages_from_records(&records);
-                drop(db);
-                kkagent_core::repair_tool_exchanges(&mut msgs, true);
-                let mut sessions = state.sessions.lock().await;
-                if let Some(session) = sessions.get_mut(&session_id) {
-                    session.messages = msgs;
-                    session.persisted_message_count = session.messages.len();
-                    session.undo_stack.clear();
+                let sessions = state.sessions.lock().await;
+                let busy = !sessions.contains_key(&session_id)
+                    && state.interrupt_flags.lock().await.contains_key(&session_id);
+                if busy {
+                    return Err((
+                        -32000,
+                        "Cannot compact while a turn is active. Wait for it to finish, then retry."
+                            .into(),
+                    ));
                 }
             }
 
-            Ok(serde_json::json!({"ok": true, "deleted": deleted, "summary": summary_text}))
+            let mut messages = {
+                let sessions = state.sessions.lock().await;
+                if let Some(session) = sessions.get(&session_id) {
+                    session.messages.clone()
+                } else {
+                    drop(sessions);
+                    let db = state.transcript.lock().await;
+                    let records = db
+                        .load_messages(&session_id)
+                        .map_err(|e| (-32000, e.to_string()))?;
+                    messages_from_records(&records)
+                }
+            };
+
+            if messages.is_empty() {
+                return Err((-32000, "No messages to compact in current history.".into()));
+            }
+
+            let before = messages.len();
+            let result = kkagent_core::compact_full_async(
+                state.config.clone(),
+                &mut messages,
+                instruction.as_deref(),
+            )
+            .await;
+
+            // Persist rebuilt history (kept users + summary). No assistant/tool
+            // tails — avoids toolcall pairing 400s after resume.
+            {
+                let replacement: Vec<(String, String)> = messages
+                    .iter()
+                    .filter_map(|m| {
+                        let json = serde_json::to_string(&m.content).ok()?;
+                        Some((m.role.clone(), json))
+                    })
+                    .collect();
+                let db = state.transcript.lock().await;
+                db.replace_messages(&session_id, &replacement, Some(&result.summary))
+                    .map_err(|e| (-32000, e.to_string()))?;
+            }
+
+            {
+                let mut sessions = state.sessions.lock().await;
+                if let Some(session) = sessions.get_mut(&session_id) {
+                    session.messages = messages;
+                    session.persisted_message_count = session.messages.len();
+                    session.transcript_rewrite_required = false;
+                    session.undo_stack.clear();
+                    let after = kkagent_core::TokenCounter::estimate_messages(&session.messages);
+                    session.last_compacted_tokens = Some(after);
+                }
+            }
+
+            Ok(serde_json::json!({
+                "ok": true,
+                "deleted": before.saturating_sub(
+                    result.kept_user_message_count.saturating_add(1)
+                ),
+                "kept_user_message_count": result.kept_user_message_count,
+                "kept_head_user_message_count": result.kept_head_user_message_count,
+                "summarizer_dropped_count": result.summarizer_dropped_count,
+                "summary": result.summary,
+            }))
         }
         "swarm.enter" => {
             let session_id = params

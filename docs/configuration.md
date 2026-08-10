@@ -94,10 +94,14 @@ reserved_context_size = 50000
 max_steps_per_turn = 64
 auto_compact = true
 compact_keep_last = 8
+# Early trigger / block ratios (kimi defaults). Optional.
+# compact_trigger_ratio = 0.85
+# compact_block_ratio = 0.85
+# compact_max_overflow_attempts = 3
 token_counting = "measured+estimated"
 ```
 
-`token_counting` 可取 `measured+estimated`、`measured` 或 `estimated`。上下文逼近上限时，`auto_compact` 会压缩旧历史。
+`token_counting` 可取 `measured+estimated`、`measured` 或 `estimated`。上下文达到 `compact_trigger_ratio`（默认 85%）或逼近 `reserved_context_size` 预留时，`auto_compact` 会用 LLM 摘要压缩历史，并按 token 预算保留用户消息（头+尾）；assistant/tool 交换由摘要覆盖，避免 toolcall 配对 400。手动 `/compact` 在 turn 进行中会被拒绝。
 
 ## 后台任务
 

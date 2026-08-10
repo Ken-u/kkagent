@@ -11,9 +11,10 @@ use std::time::Duration;
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::AbortHandle;
 
-use crate::context_projector::{
-    build_compaction_digest, compact_cut_index, compact_messages, fold_old_media, project,
-    project_strict, ProjectOptions,
+use crate::context_projector::{fold_old_media, project, project_strict, ProjectOptions};
+use crate::full_compaction::{
+    compact_full, compact_full_async, observe_context_overflow, CompactionPolicy,
+    CompactionStrategy, MAX_OVERFLOW_COMPACTION_ATTEMPTS,
 };
 use crate::model_capability::ModelCapability;
 use crate::permission::{PermissionChain, PermissionDecision};
@@ -122,6 +123,9 @@ impl AgentLoop {
             self.finish_interrupted(session).await?;
             return Ok(TurnStep::Done);
         }
+
+        // A new step clears the overflow→compact loop guard once we get past it.
+        session.consecutive_overflow_compacts = 0;
 
         let _ = self
             .event_tx
@@ -278,6 +282,9 @@ Do not mention this reminder to the user.\n</system-reminder>"
         }
 
         let system_prompt = session.effective_system_prompt();
+        // Early-trigger / blocking auto-compact (LLM summary + user retention).
+        self.ensure_context_budget(session, &tool_defs, &system_prompt, false)
+            .await?;
         let mut messages = self.prepare_messages(session, &tool_defs, &system_prompt);
         tracing::debug!("Conversation has {} messages (projected)", messages.len());
 
@@ -425,6 +432,8 @@ Do not mention this reminder to the user.\n</system-reminder>"
                             session
                                 .token_counter
                                 .record_measured(usage.input_tokens, usage.output_tokens);
+                            // Successful generate — overflow compact loop can reset.
+                            session.consecutive_overflow_compacts = 0;
                             let tu = kkagent_protocol::TokenUsage {
                                 input_tokens: usage.input_tokens,
                                 output_tokens: usage.output_tokens,
@@ -493,6 +502,45 @@ Do not mention this reminder to the user.\n</system-reminder>"
                     messages = self.prepare_messages(session, &tool_defs, &system_prompt);
                     tracing::warn!(
                         "LLM request too large; folded {folded} older media block(s) before retry"
+                    );
+                    continue;
+                }
+                // Overflow recovery: compact (user retention) then retry.
+                session.consecutive_overflow_compacts =
+                    session.consecutive_overflow_compacts.saturating_add(1);
+                let max_overflow = self
+                    .config
+                    .loop_control
+                    .as_ref()
+                    .and_then(|l| l.compact_max_overflow_attempts)
+                    .unwrap_or(MAX_OVERFLOW_COMPACTION_ATTEMPTS);
+                if session.consecutive_overflow_compacts > max_overflow {
+                    terminal_stream_error = Some(format!(
+                        "Compaction failed to bring the context under the model window after {max_overflow} attempts."
+                    ));
+                    break;
+                }
+                let est = session
+                    .token_counter
+                    .request_size(&system_prompt, &tool_defs, &messages);
+                let configured = self
+                    .config
+                    .resolve_model(&session.get_model_alias())
+                    .and_then(|(m, _)| m.max_context_size)
+                    .unwrap_or(200_000);
+                session.observed_max_context = Some(observe_context_overflow(
+                    est,
+                    session.observed_max_context.unwrap_or(configured),
+                ));
+                if self
+                    .ensure_context_budget(session, &tool_defs, &system_prompt, true)
+                    .await
+                    .is_ok()
+                {
+                    messages = self.prepare_messages(session, &tool_defs, &system_prompt);
+                    tracing::warn!(
+                        "LLM request too large; compacted history before retry (overflow attempt {})",
+                        session.consecutive_overflow_compacts
                     );
                     continue;
                 }
@@ -1287,6 +1335,99 @@ Do not mention this reminder to the user.\n</system-reminder>"
         Ok(())
     }
 
+    /// Early-trigger / blocking compaction with LLM summary + user retention.
+    /// `force` bypasses the "nothing new since last compact" guard (overflow path).
+    async fn ensure_context_budget(
+        &self,
+        session: &mut Session,
+        tools: &[ToolDef],
+        system: &str,
+        force: bool,
+    ) -> anyhow::Result<()> {
+        let auto_compact = self
+            .config
+            .loop_control
+            .as_ref()
+            .map(|l| l.auto_compact)
+            .unwrap_or(true);
+        if !auto_compact && !force {
+            return Ok(());
+        }
+
+        let policy = self
+            .config
+            .loop_control
+            .as_ref()
+            .map(CompactionPolicy::from_loop_control)
+            .unwrap_or_default();
+
+        let configured_max = {
+            let alias = session.get_model_alias();
+            self.config
+                .resolve_model(&alias)
+                .and_then(|(m, _)| m.max_context_size)
+                .unwrap_or(200_000)
+        };
+        let max_context = session
+            .observed_max_context
+            .map(|o| o.min(configured_max))
+            .unwrap_or(configured_max);
+
+        let projected = project(&session.build_messages(), &ProjectOptions::default());
+        let used = session
+            .token_counter
+            .request_size(system, tools, &projected);
+
+        // Nothing new since last compact — avoid nesting summaries.
+        if !force {
+            if let Some(floor) = session.last_compacted_tokens {
+                if used <= floor {
+                    return Ok(());
+                }
+            }
+        }
+
+        if !force && !policy.should_compact(max_context, used) {
+            return Ok(());
+        }
+        // Blocking protection: when over block ratio we compact synchronously
+        // before the LLM step (same as kimi block-on-compact).
+        let _ = force || policy.should_block(max_context, used);
+
+        let _ = self
+            .event_tx
+            .send(AgentEvent::StatusUpdate {
+                session_id: session.id.clone(),
+                status: SessionStatus::Compacting,
+            })
+            .await;
+
+        let result = compact_full_async(self.config.clone(), &mut session.messages, None).await;
+        session.transcript_rewrite_required = true;
+        session.undo_stack.clear();
+        let after = session
+            .token_counter
+            .request_size(system, tools, &session.build_messages());
+        session.last_compacted_tokens = Some(after);
+        tracing::info!(
+            "Compacted session {}: kept_users={} summarizer_dropped={} est_tokens {}→{}",
+            session.id,
+            result.kept_user_message_count,
+            result.summarizer_dropped_count,
+            used,
+            after
+        );
+
+        let _ = self
+            .event_tx
+            .send(AgentEvent::StatusUpdate {
+                session_id: session.id.clone(),
+                status: SessionStatus::Thinking,
+            })
+            .await;
+        Ok(())
+    }
+
     /// Project / auto-compact messages to fit model context budget.
     fn prepare_messages(
         &self,
@@ -1294,12 +1435,12 @@ Do not mention this reminder to the user.\n</system-reminder>"
         tools: &[ToolDef],
         system: &str,
     ) -> Vec<ChatMessage> {
-        let reserved = self
+        let policy = self
             .config
             .loop_control
             .as_ref()
-            .map(|l| l.reserved_context_size)
-            .unwrap_or(50_000);
+            .map(CompactionPolicy::from_loop_control)
+            .unwrap_or_default();
         let auto_compact = self
             .config
             .loop_control
@@ -1314,13 +1455,17 @@ Do not mention this reminder to the user.\n</system-reminder>"
             .unwrap_or(8)
             .max(2);
 
-        let max_context = {
+        let configured_max = {
             let alias = session.get_model_alias();
             self.config
                 .resolve_model(&alias)
                 .and_then(|(m, _)| m.max_context_size)
                 .unwrap_or(200_000)
         };
+        let max_context = session
+            .observed_max_context
+            .map(|o| o.min(configured_max))
+            .unwrap_or(configured_max);
 
         let opts = ProjectOptions::default();
         // contextMemory: drop vacuous noise + loop-event markers before project.
@@ -1329,33 +1474,36 @@ Do not mention this reminder to the user.\n</system-reminder>"
         let mut messages = project(&projected, &opts);
         let mut req = session.token_counter.request_size(system, tools, &messages);
 
-        if session
-            .token_counter
-            .needs_compaction(max_context, reserved, req)
-        {
+        if policy.should_compact(max_context, req) {
             messages = project_strict(&session.build_messages(), &opts);
             req = session.token_counter.request_size(system, tools, &messages);
         }
 
+        // Sync fallback if still over budget (e.g. LLM compact unavailable).
         if auto_compact
+            && policy.should_compact(max_context, req)
             && session
-                .token_counter
-                .needs_compaction(max_context, reserved, req)
-            && session.messages.len() > keep_last
+                .last_compacted_tokens
+                .map(|floor| req > floor)
+                .unwrap_or(true)
         {
-            let cut = compact_cut_index(&session.messages, keep_last);
-            let digest = if cut == 0 {
-                String::from("No earlier turns.")
-            } else {
-                build_compaction_digest(&session.messages[..cut])
-            };
-            let dropped = compact_messages(&mut session.messages, keep_last, &digest);
+            let result = compact_full(
+                &mut session.messages,
+                keep_last,
+                CompactionStrategy::KeepUsers,
+            );
             session.transcript_rewrite_required = true;
+            session.undo_stack.clear();
+            let after = session
+                .token_counter
+                .request_size(system, tools, &session.build_messages());
+            session.last_compacted_tokens = Some(after);
             tracing::info!(
-                "Auto-compacted session {}: dropped {} messages (est_tokens={})",
+                "Auto-compacted session {} (local digest): kept_users={} est_tokens={}->{}",
                 session.id,
-                dropped,
-                req
+                result.kept_user_message_count,
+                req,
+                after
             );
             messages = project(&session.build_messages(), &opts);
         }
@@ -2205,6 +2353,7 @@ mod retry_tests {
                 auto_compact: true,
                 compact_keep_last: 2,
                 token_counting: "estimated".into(),
+                ..Default::default()
             }),
             ..AppConfig::default()
         });
@@ -2235,7 +2384,16 @@ mod retry_tests {
         let _ = loop_.prepare_messages(&mut session, &[], "system");
 
         assert!(session.transcript_rewrite_required);
-        assert_eq!(session.messages.len(), 3);
+        // KeepUsers compaction retains real user prompts + summary (no tools).
+        assert!(session.messages.len() >= 2);
+        assert!(session.messages.iter().any(|m| {
+            m.content.iter().any(|c| match c {
+                ChatContent::Text { text } => text.contains("compacted to free up context")
+                    || text.contains("Earlier conversation digest"),
+                _ => false,
+            })
+        }));
+        assert!(session.last_compacted_tokens.is_some());
         std::fs::remove_dir_all(workspace).unwrap();
     }
 
@@ -2275,6 +2433,7 @@ mod retry_tests {
                 auto_compact: true,
                 compact_keep_last: 4,
                 token_counting: "estimated".into(),
+                ..Default::default()
             }),
             ..AppConfig::default()
         };
@@ -2378,6 +2537,7 @@ mod retry_tests {
                 auto_compact: false,
                 compact_keep_last: 4,
                 token_counting: "estimated".into(),
+                ..Default::default()
             }),
             ..AppConfig::default()
         };
@@ -2462,6 +2622,7 @@ mod retry_tests {
                 auto_compact: true,
                 compact_keep_last: 4,
                 token_counting: "estimated".into(),
+                ..Default::default()
             }),
             ..AppConfig::default()
         };

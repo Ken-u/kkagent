@@ -34,7 +34,12 @@ pub use context_projector::{
     project_strict, repair_tool_exchanges, ProjectOptions,
 };
 pub use event_bus::EventBus;
-pub use full_compaction::{compact_full, CompactionStrategy};
+pub use full_compaction::{
+    apply_compaction, compact_full, compact_full_async, is_real_user_input,
+    observe_context_overflow, select_compaction_user_messages, summarize_history_with_llm,
+    CompactionPolicy, CompactionResult, CompactionStrategy, DEFAULT_BLOCK_RATIO,
+    DEFAULT_TRIGGER_RATIO, MAX_OVERFLOW_COMPACTION_ATTEMPTS,
+};
 pub use git_context::{collect_git_context, is_workspace_trusted};
 pub use media_pipeline::{extract_at_paths, resolve_media, MediaLimits, MediaRef};
 pub use model_capability::ModelCapability;

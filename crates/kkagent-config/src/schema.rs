@@ -142,12 +142,37 @@ pub struct LoopControlConfig {
     /// Auto-compact when request estimate exceeds usable context.
     #[serde(default = "default_true")]
     pub auto_compact: bool,
-    /// Messages to keep when auto-compacting.
+    /// Messages to keep when auto-compacting (legacy KeepTail strategy).
     #[serde(default = "default_compact_keep")]
     pub compact_keep_last: u32,
+    /// Fraction of max context that triggers auto-compaction (kimi default 0.85).
+    #[serde(default)]
+    pub compact_trigger_ratio: Option<f64>,
+    /// Fraction of max context that blocks the turn on compaction (kimi default 0.85).
+    #[serde(default)]
+    pub compact_block_ratio: Option<f64>,
+    /// Max overflow→compact→overflow loops per turn before failing.
+    #[serde(default)]
+    pub compact_max_overflow_attempts: Option<u32>,
     /// Token counting strategy: measured+estimated | measured | estimated
     #[serde(default = "default_token_strategy")]
     pub token_counting: String,
+}
+
+impl Default for LoopControlConfig {
+    fn default() -> Self {
+        Self {
+            max_attempts_per_step: default_max_attempts(),
+            reserved_context_size: default_reserved_context(),
+            max_steps_per_turn: default_max_steps(),
+            auto_compact: true,
+            compact_keep_last: default_compact_keep(),
+            compact_trigger_ratio: None,
+            compact_block_ratio: None,
+            compact_max_overflow_attempts: None,
+            token_counting: default_token_strategy(),
+        }
+    }
 }
 
 fn default_true() -> bool {
