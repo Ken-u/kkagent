@@ -136,6 +136,27 @@ pub enum AgentEvent {
         /// `user-slash` | `model-tool` | `nested-skill`
         trigger: String,
     },
+    /// Session-scoped settings changed by any client (model / permission / plan / cwd).
+    SessionConfigChanged {
+        session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        permission_mode: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        plan_mode: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        working_dir: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<String>,
+    },
+    /// A single long-running tool was cancelled without ending the turn.
+    ToolCancelled {
+        session_id: String,
+        tool_call_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
 }
 
 impl AgentEvent {
@@ -165,7 +186,9 @@ impl AgentEvent {
             | Self::BtwEnd { session_id, .. }
             | Self::McpAuthRequired { session_id, .. }
             | Self::CompactCompleted { session_id, .. }
-            | Self::SkillActivated { session_id, .. } => session_id,
+            | Self::SkillActivated { session_id, .. }
+            | Self::SessionConfigChanged { session_id, .. }
+            | Self::ToolCancelled { session_id, .. } => session_id,
         }
     }
 }

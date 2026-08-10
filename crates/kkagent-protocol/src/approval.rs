@@ -24,7 +24,14 @@ pub enum ApprovalDecision {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ApprovalScope {
+    /// Approve only this single tool call.
+    Once,
+    /// Approve matching calls for the remainder of the current turn.
+    Turn,
+    /// Approve matching calls for the rest of this session.
     Session,
+    /// Persist an allow rule for this tool pattern (session + future turns).
+    Always,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

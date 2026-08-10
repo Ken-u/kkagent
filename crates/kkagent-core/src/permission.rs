@@ -15,6 +15,8 @@ pub struct PermissionChain {
     pub mode: Arc<Mutex<PermissionMode>>,
     pub rules: Vec<PermissionRule>,
     pub session_approved: Vec<String>,
+    /// Approvals that expire at the end of the current turn.
+    pub turn_approved: Vec<String>,
 }
 
 const SENSITIVE_PATTERNS: &[&str] = &[
@@ -60,6 +62,7 @@ impl PermissionChain {
             mode,
             rules,
             session_approved: Vec::new(),
+            turn_approved: Vec::new(),
         }
     }
 
@@ -114,9 +117,11 @@ impl PermissionChain {
             return PermissionDecision::Ask;
         }
 
-        // 4. session-approval-history
+        // 4. session-approval-history (session + turn scoped)
         let approval_key = format!("{}:{}", tool_name, approval_pattern(tool_name, input));
-        if self.session_approved.contains(&approval_key) {
+        if self.session_approved.contains(&approval_key)
+            || self.turn_approved.contains(&approval_key)
+        {
             return PermissionDecision::Approve;
         }
 
@@ -162,6 +167,34 @@ impl PermissionChain {
         if !self.session_approved.contains(&key) {
             self.session_approved.push(key);
         }
+    }
+
+    pub fn record_turn_approval(&mut self, tool_name: &str, input: &serde_json::Value) {
+        let key = format!("{}:{}", tool_name, approval_pattern(tool_name, input));
+        if !self.turn_approved.contains(&key) {
+            self.turn_approved.push(key);
+        }
+    }
+
+    pub fn clear_turn_approvals(&mut self) {
+        self.turn_approved.clear();
+    }
+
+    /// Persist an allow rule for matching tool patterns (Always scope).
+    pub fn record_always_approval(&mut self, tool_name: &str, input: &serde_json::Value) {
+        let pattern = format!("{}:{}", tool_name, approval_pattern(tool_name, input));
+        if !self
+            .rules
+            .iter()
+            .any(|r| r.decision == "allow" && r.pattern == pattern)
+        {
+            self.rules.push(PermissionRule {
+                decision: "allow".into(),
+                pattern,
+                scope: Some("always".into()),
+            });
+        }
+        self.record_session_approval(tool_name, input);
     }
 
     pub fn set_mode(&self, mode: PermissionMode) {

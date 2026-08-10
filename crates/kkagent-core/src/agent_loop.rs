@@ -12,6 +12,7 @@ use tokio::sync::{mpsc, Mutex};
 use tokio::task::AbortHandle;
 
 use crate::context_projector::{fold_old_media, project, project_strict, ProjectOptions};
+use crate::file_conflict::FileConflictTracker;
 use crate::full_compaction::{
     compact_full, compact_full_async, observe_context_overflow, CompactionPolicy,
     CompactionStrategy, MAX_OVERFLOW_COMPACTION_ATTEMPTS,
@@ -24,6 +25,12 @@ use crate::plan_review::{
 use crate::session::Session;
 use crate::token_counting::TokenCountingStrategy;
 use crate::tool_scheduler::{box_start, ToolCallTask, ToolScheduler};
+use std::sync::OnceLock;
+
+fn global_file_tracker() -> &'static FileConflictTracker {
+    static TRACKER: OnceLock<FileConflictTracker> = OnceLock::new();
+    TRACKER.get_or_init(FileConflictTracker::new)
+}
 
 pub struct AgentLoop {
     config: Arc<AppConfig>,
@@ -841,11 +848,20 @@ Do not mention this reminder to the user.\n</system-reminder>"
                             };
                             match response.decision {
                                 kkagent_protocol::ApprovalDecision::Approved => {
-                                    if response.scope
-                                        == Some(kkagent_protocol::ApprovalScope::Session)
-                                    {
-                                        let mut perm = self.permission.lock().await;
-                                        perm.record_session_approval(&tc.name, &tc.input);
+                                    match response.scope {
+                                        Some(kkagent_protocol::ApprovalScope::Session) => {
+                                            let mut perm = self.permission.lock().await;
+                                            perm.record_session_approval(&tc.name, &tc.input);
+                                        }
+                                        Some(kkagent_protocol::ApprovalScope::Turn) => {
+                                            let mut perm = self.permission.lock().await;
+                                            perm.record_turn_approval(&tc.name, &tc.input);
+                                        }
+                                        Some(kkagent_protocol::ApprovalScope::Always) => {
+                                            let mut perm = self.permission.lock().await;
+                                            perm.record_always_approval(&tc.name, &tc.input);
+                                        }
+                                        Some(kkagent_protocol::ApprovalScope::Once) | None => {}
                                     }
                                     if tc.name == "AskUserQuestion" {
                                         Prepared::Done(
@@ -863,6 +879,29 @@ Do not mention this reminder to the user.\n</system-reminder>"
                                                 } else {
                                                     session.working_dir.join(path_str)
                                                 };
+                                                let conflicts = global_file_tracker().conflicts_for(
+                                                    &session.id,
+                                                    &path,
+                                                    &session.working_dir,
+                                                );
+                                                if !conflicts.is_empty() {
+                                                    let others = conflicts.join(", ");
+                                                    let _ = self
+                                                        .event_tx
+                                                        .send(AgentEvent::Error {
+                                                            session_id: session.id.clone(),
+                                                            message: format!(
+                                                                "File conflict warning: {} also touched by session(s) [{others}]. Continue, switch session, or use a separate worktree.",
+                                                                path.display()
+                                                            ),
+                                                        })
+                                                        .await;
+                                                }
+                                                global_file_tracker().record_write(
+                                                    &session.id,
+                                                    &path,
+                                                    &session.working_dir,
+                                                );
                                                 session.record_pre_change(path).await;
                                             }
                                         }
@@ -962,10 +1001,20 @@ Do not mention this reminder to the user.\n</system-reminder>"
                         };
                         match response.decision {
                             kkagent_protocol::ApprovalDecision::Approved => {
-                                if response.scope == Some(kkagent_protocol::ApprovalScope::Session)
-                                {
-                                    let mut perm = self.permission.lock().await;
-                                    perm.record_session_approval(name, input);
+                                match response.scope {
+                                    Some(kkagent_protocol::ApprovalScope::Session) => {
+                                        let mut perm = self.permission.lock().await;
+                                        perm.record_session_approval(name, input);
+                                    }
+                                    Some(kkagent_protocol::ApprovalScope::Turn) => {
+                                        let mut perm = self.permission.lock().await;
+                                        perm.record_turn_approval(name, input);
+                                    }
+                                    Some(kkagent_protocol::ApprovalScope::Always) => {
+                                        let mut perm = self.permission.lock().await;
+                                        perm.record_always_approval(name, input);
+                                    }
+                                    Some(kkagent_protocol::ApprovalScope::Once) | None => {}
                                 }
                             }
                             kkagent_protocol::ApprovalDecision::Cancelled => {
@@ -1281,6 +1330,10 @@ Do not mention this reminder to the user.\n</system-reminder>"
     }
 
     async fn finish_turn(&self, session: &mut Session, record_goal: bool) -> anyhow::Result<()> {
+        {
+            let mut perm = self.permission.lock().await;
+            perm.clear_turn_approvals();
+        }
         if let Some(reminder) = session.swarm.on_turn_end() {
             session.add_user_message(reminder.into());
         }
