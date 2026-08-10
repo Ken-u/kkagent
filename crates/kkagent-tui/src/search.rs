@@ -116,6 +116,20 @@ fn message_search_text(msg: &DisplayMessage) -> String {
                     out.push_str(o);
                 }
             }
+            DisplayPart::ToolHistory(hist) => {
+                out.push('\n');
+                out.push_str(&format!("{} tool calls", hist.tool_count));
+                for tc in &hist.tools {
+                    out.push('\n');
+                    out.push_str(&tc.name);
+                    out.push(' ');
+                    out.push_str(&tc.input_summary);
+                    if let Some(o) = &tc.output {
+                        out.push('\n');
+                        out.push_str(o);
+                    }
+                }
+            }
         }
     }
     out

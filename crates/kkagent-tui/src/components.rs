@@ -11,10 +11,11 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::{
     AppMode, AppState, DisplayPart, ListPickerState, MessageRole, PendingApproval, PendingQuestion,
-    TodoItem,
+    TodoItem, ToolHistorySummary,
 };
 use crate::chrome;
 use crate::git_badge;
+use crate::i18n::{self, Locale};
 use crate::panes::{self, BtwPane};
 use crate::theme::Theme;
 
@@ -22,7 +23,7 @@ const TIPS: &[&str] = &[
     "/compact compresses context when it gets long",
     "@ opens file picker — tab to insert a path",
     "ctrl+f searches the transcript",
-    "ctrl+o expands truncated tool output",
+    "ctrl+o expands turn tool history",
     "ctrl+g toggles btw notes",
     "shift-tab toggles plan mode (scroll locks to plan)",
     "! enters shell mode",
@@ -420,6 +421,13 @@ fn build_transcript_lines(state: &mut AppState, theme: &Theme, width: u16) -> Ve
                                 first_bullet = false;
                                 rendered_any = true;
                             }
+                            DisplayPart::ToolHistory(hist) => {
+                                render_tool_history_lines(
+                                    &mut lines, hist, width, theme, state.locale, first_bullet,
+                                );
+                                first_bullet = false;
+                                rendered_any = true;
+                            }
                         }
                     }
                 } else {
@@ -578,12 +586,12 @@ fn render_tool_call_lines(
         lines.push(Line::from(vec![
             Span::styled("● ", Style::default().fg(theme.text)),
             Span::styled(
-                format!("{} {}", status_icon(tc), ToolRenderRegistry::chip_label(tc)),
+                format!("{} {}", status_icon(tc), ToolRenderRegistry::chip_label(tc, width)),
                 ToolRenderRegistry::chip_style(tc, theme),
             ),
         ]));
     } else {
-        lines.push(tool_continuation_line(tc, theme));
+        lines.push(tool_continuation_line(tc, width, theme));
     }
 
     if !tc.collapsed {
@@ -594,6 +602,47 @@ fn render_tool_call_lines(
             format!("  … ({n} more lines, ctrl+o to expand)"),
             Style::default().fg(theme.text_muted),
         )));
+    }
+}
+
+fn render_tool_history_lines(
+    lines: &mut Vec<Line<'static>>,
+    hist: &ToolHistorySummary,
+    width: u16,
+    theme: &Theme,
+    locale: Locale,
+    first_bullet: bool,
+) {
+    let overview = i18n::tool_history_overview(
+        locale,
+        hist.tool_count,
+        hist.duration_ms,
+        hist.tokens,
+    );
+    let hint = if hist.expanded {
+        i18n::tool_history_collapse_hint(locale)
+    } else {
+        i18n::tool_history_expand_hint(locale)
+    };
+    let prefix = if first_bullet { "● " } else { "  " };
+    lines.push(Line::from(vec![
+        Span::styled(prefix, Style::default().fg(theme.text_dim)),
+        Span::styled(
+            format!("… {overview}"),
+            Style::default().fg(theme.text_muted),
+        ),
+        Span::styled(
+            format!(" ({hint})"),
+            Style::default().fg(theme.text_dim),
+        ),
+    ]));
+
+    if hist.expanded {
+        for tc in &hist.tools {
+            let mut shown = tc.clone();
+            shown.collapsed = false;
+            render_tool_call_lines(lines, &shown, width, theme, false);
+        }
     }
 }
 
@@ -807,7 +856,12 @@ fn select_visible_todos(todos: &[TodoItem]) -> VisibleTodos {
     }
 }
 
-fn tool_continuation_line(tc: &crate::app::DisplayToolCall, theme: &Theme) -> Line<'static> {
+fn tool_continuation_line(
+    tc: &crate::app::DisplayToolCall,
+    width: u16,
+    theme: &Theme,
+) -> Line<'static> {
+    use crate::tool_renderers::ToolRenderRegistry;
     let color = if tc.is_error {
         theme.error
     } else if tc.output.is_some() {
@@ -818,12 +872,12 @@ fn tool_continuation_line(tc: &crate::app::DisplayToolCall, theme: &Theme) -> Li
     Line::from(vec![
         Span::raw("  "),
         Span::styled(
-            format!("{} {}", status_icon(tc), tc.name),
+            format!(
+                "{} {}",
+                status_icon(tc),
+                ToolRenderRegistry::chip_label(tc, width.saturating_sub(2))
+            ),
             Style::default().fg(color),
-        ),
-        Span::styled(
-            format!("  {}", truncate(&tc.input_summary, 64)),
-            Style::default().fg(theme.text_muted),
         ),
     ])
 }

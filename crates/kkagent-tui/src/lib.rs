@@ -3,6 +3,7 @@ pub mod chrome;
 pub mod components;
 pub mod controllers;
 pub mod git_badge;
+pub mod i18n;
 pub mod input;
 pub mod mouse_mode;
 pub mod panes;

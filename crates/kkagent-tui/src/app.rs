@@ -119,6 +119,12 @@ pub struct AppState {
     pub plan_document: Option<PlanDocument>,
     /// Jump once to the top of the focused plan after it appears / is replaced.
     pub plan_scroll_to_top: bool,
+    /// Wall-clock start of the active agent turn (for tool-history duration).
+    pub turn_started_at: Option<std::time::Instant>,
+    /// `approx_tokens` snapshot at turn start (for delta in tool-history).
+    pub tokens_at_turn_start: u64,
+    /// UI locale for overview strings (English today).
+    pub locale: crate::i18n::Locale,
 }
 
 #[derive(Debug, Clone)]
@@ -194,6 +200,17 @@ pub struct DisplayMessage {
 pub enum DisplayPart {
     Text(String),
     Tool(DisplayToolCall),
+    /// Collapsed tool-call history between formal assistant outputs (after turn end).
+    ToolHistory(ToolHistorySummary),
+}
+
+#[derive(Debug, Clone)]
+pub struct ToolHistorySummary {
+    pub tool_count: u32,
+    pub duration_ms: u64,
+    pub tokens: u64,
+    pub expanded: bool,
+    pub tools: Vec<DisplayToolCall>,
 }
 
 impl DisplayMessage {
@@ -417,6 +434,9 @@ impl AppState {
             highlight_message: None,
             plan_document: None,
             plan_scroll_to_top: false,
+            turn_started_at: None,
+            tokens_at_turn_start: 0,
+            locale: crate::i18n::Locale::En,
         }
     }
 
@@ -473,6 +493,85 @@ impl AppState {
             self.plan_scroll_to_top = false;
             self.follow_bottom = true;
             self.scroll_up = 0;
+        }
+    }
+
+    /// After a completed agent loop, fold tool calls between formal assistant
+    /// outputs into a single overview line (expandable with Ctrl+O).
+    pub fn collapse_completed_turn_tools(&mut self) {
+        let duration_ms = self
+            .turn_started_at
+            .map(|t| t.elapsed().as_millis() as u64)
+            .unwrap_or(0);
+        let tokens = self
+            .approx_tokens
+            .saturating_sub(self.tokens_at_turn_start);
+        self.turn_started_at = None;
+
+        let start = self
+            .messages
+            .iter()
+            .rposition(|m| m.role == MessageRole::User)
+            .map(|i| i + 1)
+            .unwrap_or(0);
+
+        let mut collected: Vec<DisplayToolCall> = Vec::new();
+        for msg in &mut self.messages[start..] {
+            if msg.role != MessageRole::Assistant {
+                continue;
+            }
+            let mut kept = Vec::with_capacity(msg.parts.len());
+            for part in msg.parts.drain(..) {
+                match part {
+                    DisplayPart::Tool(tc) => collected.push(tc),
+                    DisplayPart::ToolHistory(mut hist) => {
+                        // Already collapsed earlier in the same turn — merge.
+                        collected.append(&mut hist.tools);
+                    }
+                    other => kept.push(other),
+                }
+            }
+            // Legacy list
+            collected.append(&mut msg.tool_calls);
+            msg.parts = kept;
+        }
+
+        if collected.is_empty() {
+            return;
+        }
+
+        let summary = DisplayPart::ToolHistory(ToolHistorySummary {
+            tool_count: collected.len() as u32,
+            duration_ms,
+            tokens,
+            expanded: false,
+            tools: collected,
+        });
+
+        // Place the overview just before the last formal text of the turn,
+        // so the final answer stays at the bottom; otherwise append.
+        if let Some(msg) = self.messages[start..]
+            .iter_mut()
+            .rev()
+            .find(|m| m.role == MessageRole::Assistant)
+        {
+            if let Some(idx) = msg
+                .parts
+                .iter()
+                .rposition(|p| matches!(p, DisplayPart::Text(t) if !t.trim().is_empty()))
+            {
+                msg.parts.insert(idx, summary);
+            } else {
+                msg.parts.push(summary);
+            }
+        } else {
+            self.messages.push(DisplayMessage {
+                role: MessageRole::Assistant,
+                content: String::new(),
+                thinking: None,
+                parts: vec![summary],
+                tool_calls: Vec::new(),
+            });
         }
     }
 
@@ -2631,11 +2730,7 @@ impl TuiApp {
                         tool_name, input, ..
                     } => {
                         self.state.last_tool_name = Some(tool_name.clone());
-                        let summary = serde_json::to_string(&input)
-                            .unwrap_or_default()
-                            .chars()
-                            .take(100)
-                            .collect();
+                        let summary = summarize_tool_input(&input);
                         let pending_thinking = if !self.state.thinking_text.is_empty() {
                             Some(std::mem::take(&mut self.state.thinking_text))
                         } else {
@@ -2811,10 +2906,13 @@ impl TuiApp {
                                 });
                             }
                         }
+                        self.state.collapse_completed_turn_tools();
                         self.state.status = SessionStatus::Idle;
                     }
                     AgentEvent::TurnStart { .. } => {
                         self.state.thinking_text.clear();
+                        self.state.turn_started_at = Some(std::time::Instant::now());
+                        self.state.tokens_at_turn_start = self.state.approx_tokens;
                     }
                     AgentEvent::SubagentSpawned {
                         subagent_id,
@@ -2894,6 +2992,16 @@ impl TuiApp {
     }
 
     fn toggle_tool_folding(&mut self) {
+        // Prefer expanding/collapsing the latest turn tool-history overview.
+        for msg in self.state.messages.iter_mut().rev() {
+            for part in msg.parts.iter_mut().rev() {
+                if let DisplayPart::ToolHistory(hist) = part {
+                    hist.expanded = !hist.expanded;
+                    return;
+                }
+            }
+        }
+        // Fallback: toggle per-tool output folding while a turn is still live.
         for msg in &mut self.state.messages {
             for part in &mut msg.parts {
                 if let DisplayPart::Tool(tc) = part {
@@ -2905,6 +3013,23 @@ impl TuiApp {
             }
         }
     }
+}
+
+fn summarize_tool_input(input: &serde_json::Value) -> String {
+    // Prefer human-readable fields; keep enough text for full-width chips.
+    for key in ["command", "path", "pattern", "query", "url", "description", "prompt"] {
+        if let Some(s) = input.get(key).and_then(|v| v.as_str()) {
+            let t = s.trim();
+            if !t.is_empty() {
+                return t.chars().take(512).collect();
+            }
+        }
+    }
+    serde_json::to_string(input)
+        .unwrap_or_default()
+        .chars()
+        .take(512)
+        .collect()
 }
 
 fn split_plan_message_content(content: &str) -> (String, String) {
@@ -2934,7 +3059,7 @@ fn slash_help_text() -> String {
   @             - File path picker (Tab/Enter insert)\n\
   Ctrl-F / Ctrl-S - Search transcript\n\
   Ctrl-G        - Toggle btw notes pane\n\
-  Ctrl-O        - Fold tool output\n\
+  Ctrl-O        - Expand/collapse turn tool history (or tool output)\n\
   Ctrl-T        - Expand/collapse todo panel\n\
   Ctrl-P / Ctrl-N - Input history\n\
   Large paste   - Collapses to [Pasted text #n] overview\n\n\

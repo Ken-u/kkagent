@@ -2,6 +2,7 @@
 
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::DisplayToolCall;
 use crate::theme::Theme;
@@ -9,17 +10,37 @@ use crate::theme::Theme;
 pub struct ToolRenderRegistry;
 
 impl ToolRenderRegistry {
-    pub fn chip_label(tc: &DisplayToolCall) -> String {
+    pub fn chip_label(tc: &DisplayToolCall, width: u16) -> String {
+        // Leave room for "● ✓ " / status prefix (~6 cols).
+        let budget = (width as usize).saturating_sub(6).max(24);
         match tc.name.as_str() {
-            "Bash" => format!("$ {}", short(&tc.input_summary, 48)),
-            "Read" | "Write" | "Edit" => format!("{} {}", tc.name, short(&tc.input_summary, 56)),
-            "Grep" => format!("grep {}", short(&tc.input_summary, 48)),
-            "Glob" => format!("glob {}", short(&tc.input_summary, 48)),
+            "Bash" => format!("$ {}", fit(&tc.input_summary, budget.saturating_sub(2))),
+            "Read" | "Write" | "Edit" => format!(
+                "{} {}",
+                tc.name,
+                fit(
+                    &tc.input_summary,
+                    budget.saturating_sub(tc.name.len() + 1)
+                )
+            ),
+            "Grep" => format!("grep {}", fit(&tc.input_summary, budget.saturating_sub(5))),
+            "Glob" => format!("glob {}", fit(&tc.input_summary, budget.saturating_sub(5))),
             "CreateGoal" | "GetGoal" | "UpdateGoal" | "SetGoalBudget" => {
-                format!("goal {}", short(&tc.input_summary, 40))
+                format!("goal {}", fit(&tc.input_summary, budget.saturating_sub(5)))
             }
-            "WebSearch" | "FetchURL" => format!("{} {}", tc.name, short(&tc.input_summary, 40)),
-            other => format!("{} {}", other, short(&tc.input_summary, 48)),
+            "WebSearch" | "FetchURL" => format!(
+                "{} {}",
+                tc.name,
+                fit(
+                    &tc.input_summary,
+                    budget.saturating_sub(tc.name.len() + 1)
+                )
+            ),
+            other => format!(
+                "{} {}",
+                other,
+                fit(&tc.input_summary, budget.saturating_sub(other.len() + 1))
+            ),
         }
     }
 
@@ -62,14 +83,59 @@ impl ToolRenderRegistry {
     }
 }
 
-fn short(s: &str, max: usize) -> String {
-    let n = s.chars().count();
-    if n <= max {
-        s.to_string()
-    } else {
-        let head: String = s.chars().take(max.saturating_sub(1)).collect();
-        format!("{head}…")
+/// Fit to display columns (not char count) so CJK / wide glyphs don't overrun.
+fn fit(s: &str, max_cols: usize) -> String {
+    if max_cols == 0 {
+        return String::new();
     }
+    let mut out = String::new();
+    let mut w = 0usize;
+    for ch in s.chars() {
+        let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if w + cw > max_cols {
+            if max_cols >= 1 && UnicodeWidthStr::width(out.as_str()) + 1 <= max_cols {
+                out.push('…');
+            }
+            break;
+        }
+        out.push(ch);
+        w += cw;
+    }
+    out
+}
+
+fn push_wrapped_output_line(
+    lines: &mut Vec<Line<'static>>,
+    raw: &str,
+    width: u16,
+    style: Style,
+) {
+    let avail = (width as usize).saturating_sub(2).max(8);
+    for chunk in wrap_cols(raw, avail) {
+        lines.push(Line::from(Span::styled(format!("  {chunk}"), style)));
+    }
+}
+
+fn wrap_cols(s: &str, max_width: usize) -> Vec<String> {
+    if max_width == 0 {
+        return vec![s.to_string()];
+    }
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut cur_w = 0usize;
+    for ch in s.chars() {
+        let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if cur_w + w > max_width && !cur.is_empty() {
+            out.push(std::mem::take(&mut cur));
+            cur_w = 0;
+        }
+        cur.push(ch);
+        cur_w += w;
+    }
+    if !cur.is_empty() || out.is_empty() {
+        out.push(cur);
+    }
+    out
 }
 
 fn default_summary(
@@ -81,12 +147,9 @@ fn default_summary(
     let all: Vec<&str> = output.lines().collect();
     let show = all.len().min(max_preview);
     let mut lines = Vec::new();
+    let style = Style::default().fg(theme.text_muted);
     for l in &all[..show] {
-        let truncated = short(l, width.saturating_sub(4) as usize);
-        lines.push(Line::from(Span::styled(
-            format!("  {truncated}"),
-            Style::default().fg(theme.text_muted),
-        )));
+        push_wrapped_output_line(&mut lines, l, width, style);
     }
     if all.len() > max_preview {
         lines.push(truncate_hint(all.len() - max_preview, theme));
@@ -98,17 +161,9 @@ fn bash_summary(output: &str, width: u16, theme: &Theme, max_preview: usize) -> 
     let all: Vec<&str> = output.lines().collect();
     let show = all.len().min(max_preview);
     let mut lines = Vec::new();
+    let style = Style::default().fg(theme.text_muted);
     for l in &all[..show] {
-        let truncated = short(l, width.saturating_sub(4) as usize);
-        let fg = if l.starts_with("error:") || l.contains("FAILED") {
-            theme.error
-        } else {
-            Color::Yellow
-        };
-        lines.push(Line::from(Span::styled(
-            format!("  {truncated}"),
-            Style::default().fg(fg),
-        )));
+        push_wrapped_output_line(&mut lines, l, width, style);
     }
     if all.len() > max_preview {
         lines.push(truncate_hint(all.len() - max_preview, theme));
@@ -120,12 +175,9 @@ fn grep_summary(output: &str, width: u16, theme: &Theme, max_preview: usize) -> 
     let all: Vec<&str> = output.lines().collect();
     let show = all.len().min(max_preview);
     let mut lines = Vec::new();
+    let style = Style::default().fg(theme.text_muted);
     for l in &all[..show] {
-        let truncated = short(l, width.saturating_sub(4) as usize);
-        lines.push(Line::from(Span::styled(
-            format!("  {truncated}"),
-            Style::default().fg(Color::Green),
-        )));
+        push_wrapped_output_line(&mut lines, l, width, style);
     }
     if all.len() > max_preview {
         lines.push(truncate_hint(all.len() - max_preview, theme));
@@ -143,18 +195,14 @@ fn diffish_summary(
     let show = all.len().min(max_preview);
     let mut lines = Vec::new();
     for l in &all[..show] {
-        let truncated = short(l, width.saturating_sub(4) as usize);
-        let fg = if l.starts_with('+') {
-            Color::Green
+        let style = if l.starts_with('+') {
+            Style::default().fg(theme.success)
         } else if l.starts_with('-') {
-            theme.error
+            Style::default().fg(theme.error)
         } else {
-            theme.text_muted
+            Style::default().fg(theme.text_muted)
         };
-        lines.push(Line::from(Span::styled(
-            format!("  {truncated}"),
-            Style::default().fg(fg),
-        )));
+        push_wrapped_output_line(&mut lines, l, width, style);
     }
     if all.len() > max_preview {
         lines.push(truncate_hint(all.len() - max_preview, theme));
@@ -169,20 +217,12 @@ fn media_summary(
     max_preview: usize,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
-    lines.push(Line::from(Span::styled(
-        "  [media]",
-        Style::default().fg(Color::Cyan),
-    )));
     lines.extend(default_summary(output, width, theme, max_preview.min(6)));
     lines
 }
 
 fn goal_summary(output: &str, width: u16, theme: &Theme, max_preview: usize) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
-    lines.push(Line::from(Span::styled(
-        "  [goal]",
-        Style::default().fg(Color::Cyan),
-    )));
     lines.extend(default_summary(output, width, theme, max_preview.min(8)));
     lines
 }
@@ -192,4 +232,23 @@ fn truncate_hint(more: usize, theme: &Theme) -> Line<'static> {
         format!("  … ({more} more lines, ctrl+o to expand)"),
         Style::default().fg(theme.text_muted),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chip_uses_available_width() {
+        let tc = DisplayToolCall {
+            name: "Bash".into(),
+            input_summary: "x".repeat(200),
+            output: None,
+            is_error: false,
+            collapsed: true,
+        };
+        let label = ToolRenderRegistry::chip_label(&tc, 80);
+        assert!(UnicodeWidthStr::width(label.as_str()) <= 80);
+        assert!(UnicodeWidthStr::width(label.as_str()) > 40);
+    }
 }
