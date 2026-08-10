@@ -70,7 +70,8 @@ answer=$(kkagent -p "总结 README" 2>kkagent.err)
 - 工具：`/init`、`/config`、`/auth`、`/reload`、`/add-dir`、`/btw`、`/fork`、`/search`、`/copy`、`/debug`。
 - `/btw <question>`：侧问（不写入主会话）；`Ctrl+G` 打开/关闭侧栏，流式中再按可取消。
 - `/fork [title]`：派生当前会话副本，仍停留在原会话；仅当存在 fork 族时，footer context 栏显示可切换会话，空输入下 `Tab` / `←` / `→` 循环切换。
-- `/sessions`：仅列出当前 workspace；↑↓ 时上方主对话区显示该会话正常历史；`Ctrl+D` 删除（↑↓ 选 No/Yes，默认 No，Enter 确认）。
+- `/sessions`：仅列出当前 workspace 中有内容的会话（正在查看的空会话仍可见）；离开空会话会自动丢弃记录。
+- `/sessions` 删除：`Ctrl+D` 后 ↑↓ 选 No/Yes（默认 No），Enter 确认。
 - 帮助与退出：`/help`、`/release-notes`、`/feedback`、`/info`、`/exit`、`/quit`、`/q`。
 
 部分命令仅展示状态或排队执行；输入 `/help` 可查看当前版本的参数提示。

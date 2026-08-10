@@ -873,10 +873,14 @@ impl TuiApp {
 
         let result = self.main_loop(&mut terminal).await;
         let sid = self.state.session_id.clone();
+        let empty = !session_has_retained_io(&self.state.messages);
 
         // Interrupt any in-flight turn before tearing down the paired server.
         if let Some(ref id) = sid {
             let _ = self.client.interrupt(id).await;
+            if empty {
+                let _ = self.discard_session_record(id).await;
+            }
         }
 
         // Always restore the terminal, even if the loop failed.
@@ -890,10 +894,12 @@ impl TuiApp {
         let _ = terminal.show_cursor();
 
         if let Some(id) = sid {
-            println!();
-            println!("Session: {}", id);
-            println!("Resume:  kkagent --resume {}", id);
-            println!();
+            if !empty {
+                println!();
+                println!("Session: {}", id);
+                println!("Resume:  kkagent --resume {}", id);
+                println!();
+            }
         }
 
         result
@@ -1948,6 +1954,23 @@ impl TuiApp {
                         if !same_workspace {
                             continue;
                         }
+                        let empty = s
+                            .get("empty")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or_else(|| {
+                                s.get("message_count")
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or(0)
+                                    == 0
+                                    && s.get("last_prompt")
+                                        .and_then(|v| v.as_str())
+                                        .map(|p| p.trim().is_empty())
+                                        .unwrap_or(true)
+                            });
+                        // Keep empty sessions only while they are the active page.
+                        if empty && current.as_deref() != Some(id.as_str()) {
+                            continue;
+                        }
                         let title = crate::chrome::session_display_title(
                             s.get("title").and_then(|v| v.as_str()),
                             s.get("is_custom_title")
@@ -1999,6 +2022,12 @@ impl TuiApp {
     }
 
     async fn resume_session(&mut self, query: &str) -> anyhow::Result<()> {
+        let leaving_id = self.state.session_id.clone();
+        let leaving_empty = leaving_id
+            .as_ref()
+            .map(|id| id != query && !session_has_retained_io(&self.state.messages))
+            .unwrap_or(false);
+
         let params = serde_json::json!({"session_id": query});
         let data = self
             .client
@@ -2052,12 +2081,36 @@ impl TuiApp {
             }
         }
 
+        // Drop the session we left if it never had any real I/O.
+        if leaving_empty {
+            if let Some(prev) = leaving_id {
+                if prev != sid {
+                    let _ = self.discard_session_record(&prev).await;
+                }
+            }
+        }
+
         self.system_message(format!(
             "Resumed session {} ({} bubbles).",
             &sid[..8.min(sid.len())],
             self.state.messages.len()
         ));
         let _ = self.refresh_workspace_sessions().await;
+        Ok(())
+    }
+
+    /// True when the transcript has user/assistant/plan content worth keeping.
+    fn current_session_has_io(&self) -> bool {
+        session_has_retained_io(&self.state.messages)
+    }
+
+    async fn discard_session_record(&mut self, session_id: &str) -> anyhow::Result<()> {
+        let params = serde_json::json!({"session_id": session_id});
+        let _ = self.client.rpc_call("sessions.delete", Some(params)).await;
+        self.state.tab_strip.tabs.retain(|t| t.id != session_id);
+        if self.state.tab_strip.active >= self.state.tab_strip.tabs.len() {
+            self.state.tab_strip.active = self.state.tab_strip.tabs.len().saturating_sub(1);
+        }
         Ok(())
     }
 
@@ -2084,6 +2137,10 @@ impl TuiApp {
                     .unwrap_or("")
                     .to_string();
                 if id.is_empty() {
+                    continue;
+                }
+                let empty = s.get("empty").and_then(|v| v.as_bool()).unwrap_or(false);
+                if empty && id != current_id {
                     continue;
                 }
                 let forked_from = s
@@ -2462,6 +2519,8 @@ impl TuiApp {
                 self.state.should_quit = true;
             }
             "new" | "clear" => {
+                let prev = self.state.session_id.clone();
+                let prev_empty = !self.current_session_has_io();
                 self.state.messages.clear();
                 self.state.todos.clear();
                 self.state.todos_expanded = false;
@@ -2475,10 +2534,15 @@ impl TuiApp {
                     .await?;
                 self.state.tab_strip.ensure_active(&session_id, "main");
                 self.state.status_bar.session_id = Some(session_id.clone());
-                self.state.session_id = Some(session_id);
+                self.state.session_id = Some(session_id.clone());
                 if self.state.plan_mode {
-                    if let Some(ref sid) = self.state.session_id.clone() {
-                        let _ = self.client.set_plan_mode(sid, true).await;
+                    let _ = self.client.set_plan_mode(&session_id, true).await;
+                }
+                if prev_empty {
+                    if let Some(prev) = prev {
+                        if prev != session_id {
+                            let _ = self.discard_session_record(&prev).await;
+                        }
                     }
                 }
                 self.system_message("New session started.".into());
@@ -3557,6 +3621,24 @@ Slash commands:\n",
 
 /// Convert a list of serialized ChatMessages into display bubbles,
 /// pairing tool_result blocks onto preceding tool_use entries.
+/// Sessions with only UI system notices (or nothing) are treated as empty and
+/// discarded when the user leaves the page.
+fn session_has_retained_io(messages: &[DisplayMessage]) -> bool {
+    messages.iter().any(|m| match m.role {
+        MessageRole::System => false,
+        MessageRole::User | MessageRole::Plan => !m.content.trim().is_empty(),
+        MessageRole::Assistant => {
+            !m.content.trim().is_empty()
+                || !m.parts.is_empty()
+                || !m.tool_calls.is_empty()
+                || m.thinking
+                    .as_ref()
+                    .map(|t| !t.trim().is_empty())
+                    .unwrap_or(false)
+        }
+    })
+}
+
 fn transcript_messages_to_display(msgs: &[serde_json::Value]) -> Vec<DisplayMessage> {
     let mut out: Vec<DisplayMessage> = Vec::new();
     // tool_use id -> (msg_idx, part_idx)
@@ -3888,6 +3970,25 @@ fn read_clipboard_text() -> anyhow::Result<String> {
 #[cfg(test)]
 mod scroll_snap_tests {
     use super::*;
+
+    #[test]
+    fn empty_session_ignores_system_notices() {
+        assert!(!session_has_retained_io(&[]));
+        assert!(!session_has_retained_io(&[DisplayMessage {
+            role: MessageRole::System,
+            content: "tip".into(),
+            thinking: None,
+            parts: Vec::new(),
+            tool_calls: Vec::new(),
+        }]));
+        assert!(session_has_retained_io(&[DisplayMessage {
+            role: MessageRole::User,
+            content: "hello".into(),
+            thinking: None,
+            parts: Vec::new(),
+            tool_calls: Vec::new(),
+        }]));
+    }
 
     fn state_with_anchor() -> AppState {
         let mut state = AppState::new(PermissionMode::Manual, false);

@@ -2582,9 +2582,21 @@ async fn handle_rpc_call(
             let store = SessionStore::open_default();
             if let Ok(summaries) = store.list(include_archived, limit) {
                 if !summaries.is_empty() {
+                    let db = state.transcript.lock().await;
                     let list: Vec<_> = summaries
                         .into_iter()
                         .map(|s| {
+                            let message_count = db
+                                .get_session(&s.id)
+                                .ok()
+                                .flatten()
+                                .map(|r| r.message_count)
+                                .unwrap_or(0);
+                            let empty = message_count == 0
+                                && s.last_prompt
+                                    .as_ref()
+                                    .map(|p| p.trim().is_empty())
+                                    .unwrap_or(true);
                             serde_json::json!({
                                 "session_id": s.id,
                                 "title": s.title,
@@ -2596,6 +2608,8 @@ async fn handle_rpc_call(
                                 "created_at": s.created_at,
                                 "updated_at": s.updated_at,
                                 "forked_from": s.forked_from,
+                                "message_count": message_count,
+                                "empty": empty,
                             })
                         })
                         .collect();
@@ -2609,6 +2623,7 @@ async fn handle_rpc_call(
             let list: Vec<_> = sessions
                 .into_iter()
                 .map(|s| {
+                    let empty = s.message_count == 0;
                     serde_json::json!({
                         "session_id": s.session_id,
                         "title": s.title,
@@ -2617,6 +2632,7 @@ async fn handle_rpc_call(
                         "created_at": s.created_at,
                         "updated_at": s.updated_at,
                         "message_count": s.message_count,
+                        "empty": empty,
                     })
                 })
                 .collect();
