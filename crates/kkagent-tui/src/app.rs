@@ -30,8 +30,10 @@ pub struct TuiApp {
     client: KkagentClient,
     state: AppState,
     mouse_mode: MouseMode,
-    /// Capture temporarily released after a click so the terminal can drag-select.
+    /// Capture temporarily released (Shift+click) so the terminal can drag-select.
     mouse_select_mode: bool,
+    /// When select mode started — used to auto-restore capture.
+    mouse_select_since: Option<std::time::Instant>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -599,12 +601,14 @@ impl AppState {
     }
 
     pub fn scroll_lines(&mut self, delta: i32) {
+        let max = self.max_scroll_up();
         if delta > 0 {
-            let max = self.max_scroll_up();
             self.scroll_up = (self.scroll_up as i32 + delta).clamp(0, max as i32) as u16;
         } else if delta < 0 {
             self.scroll_up = self.scroll_up.saturating_sub((-delta) as u16);
         }
+        // Content can shrink between frames; never leave scroll past the end.
+        self.scroll_up = self.scroll_up.min(max);
         self.follow_bottom = self.scroll_up == 0;
     }
 
@@ -730,6 +734,7 @@ impl TuiApp {
             state: AppState::new(permission_mode, plan_mode),
             mouse_mode: MouseMode::from_env(),
             mouse_select_mode: false,
+            mouse_select_since: None,
         }
     }
 
@@ -777,9 +782,9 @@ impl TuiApp {
             )
         })?;
         let mut stdout = io::stdout();
-        // Capture mouse for wheel scroll. Left-click temporarily releases capture so
-        // the terminal can drag-select; the next keypress restores capture. ↑↓ stay
-        // on input history. `KKAGENT_MOUSE_MODE=off` disables mouse reporting.
+        // Capture mouse so the wheel stays inside the TUI. Shift+click temporarily
+        // releases capture for native drag-select; any key / timeout restores it.
+        // `KKAGENT_MOUSE_MODE=off` disables mouse reporting.
         if let Err(e) = execute!(stdout, EnterAlternateScreen, EnableBracketedPaste) {
             let _ = disable_raw_mode();
             return Err(e.into());
@@ -836,24 +841,46 @@ impl TuiApp {
         &mut self,
         terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     ) -> anyhow::Result<()> {
+        const SELECT_RESTORE_MS: u128 = 3500;
         loop {
             terminal.draw(|f| {
                 components::render_ui(f, &mut self.state, &self.config);
             })?;
 
-            if event::poll(std::time::Duration::from_millis(50))? {
+            // Auto-restore mouse capture after Shift+click select window.
+            if self.mouse_select_mode {
+                let expired = self
+                    .mouse_select_since
+                    .is_some_and(|t| t.elapsed().as_millis() >= SELECT_RESTORE_MS);
+                if expired {
+                    self.restore_mouse_capture();
+                }
+            }
+
+            // Drain the full event queue each frame so trackpad bursts stay in-app
+            // (one-event-per-poll left a backlog that felt like lag / terminal scroll).
+            let mut saw_event = false;
+            let mut scroll_delta = 0i32;
+            while event::poll(if saw_event {
+                std::time::Duration::ZERO
+            } else {
+                std::time::Duration::from_millis(50)
+            })? {
+                saw_event = true;
                 match event::read()? {
                     Event::Key(key) => {
                         self.restore_mouse_capture();
+                        self.flush_pending_scroll(&mut scroll_delta);
                         self.handle_key(key).await?;
                     }
                     Event::Mouse(mouse)
                         if self.mouse_mode == MouseMode::Capture && !self.mouse_select_mode =>
                     {
-                        self.handle_mouse(mouse);
+                        self.collect_mouse(mouse, &mut scroll_delta);
                     }
                     Event::Paste(text) => {
                         self.restore_mouse_capture();
+                        self.flush_pending_scroll(&mut scroll_delta);
                         let fold = self.state.mode != AppMode::Shell;
                         self.state.input.paste_chunk(&text);
                         self.state.input.force_flush_paste(fold);
@@ -862,7 +889,10 @@ impl TuiApp {
                     Event::Resize(_, _) => {}
                     _ => {}
                 }
-            } else {
+            }
+            self.flush_pending_scroll(&mut scroll_delta);
+
+            if !saw_event {
                 // Debounced paste flush (pi-tui paste-burst)
                 let fold = self.state.mode != AppMode::Shell;
                 if self.state.input.flush_paste(fold) {
@@ -932,29 +962,54 @@ impl TuiApp {
         false
     }
 
-    /// Re-enable wheel capture after the user finished selecting (any key/paste).
+    /// Re-enable wheel capture after the user finished selecting (any key/paste/timeout).
     fn restore_mouse_capture(&mut self) {
         if !self.mouse_select_mode || self.mouse_mode != MouseMode::Capture {
             return;
         }
         let _ = self.mouse_mode.enable(&mut io::stdout());
         self.mouse_select_mode = false;
+        self.mouse_select_since = None;
     }
 
-    /// Release capture on click so the terminal owns drag-select/copy.
+    /// Release capture for native drag-select (Shift+click). Auto-restores soon after.
     fn release_mouse_for_select(&mut self) {
         if self.mouse_select_mode || self.mouse_mode != MouseMode::Capture {
             return;
         }
         let _ = self.mouse_mode.disable(&mut io::stdout());
         self.mouse_select_mode = true;
+        self.mouse_select_since = Some(std::time::Instant::now());
+        self.system_message(
+            "Select mode: drag to copy. Wheel returns in ~3s (or press any key).".into(),
+        );
     }
 
-    fn handle_mouse(&mut self, mouse: crossterm::event::MouseEvent) {
+    fn flush_pending_scroll(&mut self, scroll_delta: &mut i32) {
+        if *scroll_delta != 0 {
+            self.state.scroll_lines(*scroll_delta);
+            *scroll_delta = 0;
+        }
+    }
+
+    fn collect_mouse(&mut self, mouse: crossterm::event::MouseEvent, scroll_delta: &mut i32) {
         match mouse.kind {
-            MouseEventKind::ScrollUp => self.state.scroll_lines(3),
-            MouseEventKind::ScrollDown => self.state.scroll_lines(-3),
-            MouseEventKind::Down(MouseButton::Left) => self.release_mouse_for_select(),
+            // Always consume wheel while capture is on so the terminal cannot
+            // scroll the alternate screen ("outside" the TUI chrome).
+            MouseEventKind::ScrollUp => {
+                *scroll_delta = scroll_delta.saturating_add(3);
+            }
+            MouseEventKind::ScrollDown => {
+                *scroll_delta = scroll_delta.saturating_sub(3);
+            }
+            MouseEventKind::Down(MouseButton::Left)
+                if mouse.modifiers.contains(KeyModifiers::SHIFT) =>
+            {
+                // Plain click keeps capture (wheel stays in-app). Shift+click
+                // temporarily releases for native terminal selection.
+                self.flush_pending_scroll(scroll_delta);
+                self.release_mouse_for_select();
+            }
             _ => {}
         }
     }
@@ -3818,8 +3873,8 @@ fn slash_help_text() -> String {
   Shift-Tab     - Toggle plan mode (scroll locks to full plan until exit)\n\
   ↑↓            - Input history / slash menu\n\
   PgUp/PgDn     - Scroll transcript\n\
-  Mouse wheel   - Scroll transcript\n\
-  Click + drag  - Select/copy (releases mouse; next key restores scroll)\n\
+  Mouse wheel   - Scroll transcript (stays in-app)\n\
+  Shift+click   - Temporary native text select; key/timeout restores wheel\n\
   Esc           - Close menu/overlay only; if none, interrupt turn / Esc Esc undo\n\
   !             - Shell mode\n\
   @             - File path picker (Tab/Enter insert)\n\

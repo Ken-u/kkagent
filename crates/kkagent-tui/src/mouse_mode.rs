@@ -1,9 +1,12 @@
-//! Mouse capture for wheel scroll, with click-to-release for native selection.
+//! Mouse capture for in-app wheel scroll.
 //!
-//! Enabling SGR mouse capture lets the app handle the wheel, but blocks the
-//! terminal's drag-select. On left-click we temporarily disable capture so the
-//! same gesture (or the next drag) can select text; the next keypress restores
-//! capture. ↑↓ stay bound to input history.
+//! Full SGR mouse capture keeps the wheel inside the TUI (scrolling the
+//! transcript). Releasing capture lets the terminal scroll the alternate
+//! screen instead — that looks like the UI "jumps outside" the layout.
+//!
+//! Default: keep capture always. Hold Shift and left-click to temporarily
+//! release for native drag-select; capture auto-restores after a few seconds
+//! or on the next keypress.
 //!
 //! Set `KKAGENT_MOUSE_MODE=off` to disable mouse reporting entirely.
 
@@ -13,7 +16,7 @@ use std::io::{self, Write};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MouseMode {
-    /// Wheel scroll via `Event::Mouse`; left-click releases capture for select.
+    /// Wheel scroll via `Event::Mouse`; Shift+click releases capture for select.
     Capture,
     /// No mouse reporting (PgUp/PgDn only).
     Off,
