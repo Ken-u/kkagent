@@ -86,6 +86,8 @@ pub struct AppState {
     pub file_menu: Option<FileMenuState>,
     /// Model / session list picker overlay
     pub list_picker: Option<ListPickerState>,
+    /// Parents for nested pickers; Esc pops one level instead of closing all.
+    pub list_picker_stack: Vec<ListPickerState>,
     /// Background tasks browser overlay
     pub tasks_panel: Option<TasksPanelState>,
     /// Queued user prompt to send after a slash command (avoids async recursion)
@@ -169,9 +171,9 @@ pub enum ListPickerKind {
     Model,
     Session,
     Permission,
-    /// Toggle skills on/off (Enter toggles, Esc closes).
+    /// Toggle skills on/off (Enter toggles, Esc goes back).
     SkillManage,
-    /// Toggle MCP servers on/off (Enter toggles, Esc closes).
+    /// Toggle MCP servers on/off (Enter toggles, Esc goes back).
     McpManage,
     /// Top-level settings menu (`/config`).
     Config,
@@ -470,6 +472,7 @@ impl AppState {
             skill_command_map: std::collections::HashMap::new(),
             file_menu: None,
             list_picker: None,
+            list_picker_stack: Vec::new(),
             tasks_panel: None,
             pending_prompt: None,
             tick: 0,
@@ -921,11 +924,17 @@ impl TuiApp {
         if self.state.session_delete_confirm.take().is_some() {
             return true;
         }
-        if self.state.list_picker.take().is_some() {
-            self.state.session_picker_preview = None;
+        if self.state.list_picker.is_some() {
+            self.pop_list_picker_level();
             return true;
         }
         if self.state.tasks_panel.take().is_some() {
+            // Swarm (or similar) may have been pushed before opening the panel.
+            if self.state.list_picker.is_none() {
+                if let Some(prev) = self.state.list_picker_stack.pop() {
+                    self.state.list_picker = Some(prev);
+                }
+            }
             return true;
         }
         if self.state.search.active {
@@ -948,6 +957,38 @@ impl TuiApp {
             return true;
         }
         false
+    }
+
+    /// Esc: return to parent picker if any, otherwise close.
+    fn pop_list_picker_level(&mut self) {
+        self.state.session_picker_preview = None;
+        self.state.session_delete_confirm = None;
+        if let Some(prev) = self.state.list_picker_stack.pop() {
+            self.state.list_picker = Some(prev);
+        } else {
+            self.state.list_picker = None;
+        }
+    }
+
+    fn clear_list_pickers(&mut self) {
+        self.state.list_picker = None;
+        self.state.list_picker_stack.clear();
+        self.state.session_picker_preview = None;
+        self.state.session_delete_confirm = None;
+    }
+
+    /// Replace the active picker without touching the stack (refresh same surface).
+    fn replace_list_picker(&mut self, next: ListPickerState) {
+        self.state.session_picker_preview = None;
+        self.state.session_delete_confirm = None;
+        self.state.list_picker = Some(next);
+    }
+
+    /// Reset picker navigation before opening a slash-command root surface.
+    fn begin_root_picker(&mut self) {
+        self.state.list_picker_stack.clear();
+        self.state.session_picker_preview = None;
+        self.state.session_delete_confirm = None;
     }
 
     fn flush_pending_scroll(&mut self, scroll_delta: &mut i32) {
@@ -1378,9 +1419,7 @@ impl TuiApp {
                     return Ok(());
                 }
                 KeyCode::Esc => {
-                    self.state.list_picker = None;
-                    self.state.session_picker_preview = None;
-                    self.state.session_delete_confirm = None;
+                    self.pop_list_picker_level();
                     return Ok(());
                 }
                 KeyCode::Char('d') | KeyCode::Char('D')
@@ -1908,6 +1947,9 @@ impl TuiApp {
             )
         {
             self.state.input.clear();
+            self.state.list_picker_stack.clear();
+            self.state.session_picker_preview = None;
+            self.state.session_delete_confirm = None;
             match item.name.as_str() {
                 "model" => self.open_model_picker(),
                 "sessions" | "resume" => self.open_session_picker().await?,
@@ -2025,43 +2067,109 @@ impl TuiApp {
                     }
                 }
                 self.system_message(format!("Model set to: {}", item.id));
+                self.clear_list_pickers();
             }
             ListPickerKind::Session => {
+                self.clear_list_pickers();
                 self.resume_session(&item.id).await?;
             }
             ListPickerKind::Permission => {
                 self.apply_permission_mode_id(&item.id).await?;
+                self.clear_list_pickers();
             }
             ListPickerKind::Config => match item.id.as_str() {
-                "model" => self.open_model_picker(),
-                "permission" => self.open_permission_picker(),
-                "effort" => self.open_effort_picker(),
-                "provider" => self.open_provider_picker(),
-                "auth" => self.open_auth_picker(),
-                "mcp" => self.open_mcp_manager().await?,
-                "skills" => self.open_skill_manager().await?,
-                "status" => self.open_status_picker(),
-                "reload" => self.reload_config_from_disk(),
-                _ => {}
+                "reload" => {
+                    self.reload_config_from_disk();
+                    self.open_config_picker();
+                }
+                id => {
+                    self.state.list_picker_stack.push(picker);
+                    match id {
+                        "model" => self.open_model_picker(),
+                        "permission" => self.open_permission_picker(),
+                        "effort" => self.open_effort_picker(),
+                        "provider" => self.open_provider_picker(),
+                        "auth" => self.open_auth_picker(),
+                        "mcp" => self.open_mcp_manager().await?,
+                        "skills" => self.open_skill_manager().await?,
+                        "status" => self.open_status_picker(),
+                        _ => {
+                            if let Some(prev) = self.state.list_picker_stack.pop() {
+                                self.state.list_picker = Some(prev);
+                            }
+                        }
+                    }
+                }
             },
             ListPickerKind::Provider => {
+                self.state.list_picker_stack.push(picker);
                 self.open_model_picker_for_provider(&item.id);
             }
             ListPickerKind::Effort => {
                 self.apply_effort_level(&item.id);
+                self.clear_list_pickers();
             }
             ListPickerKind::Browse => {
-                // Browse-only: dismiss on Enter (already taken above).
+                // Enter = same as Esc: back to parent if any.
+                if let Some(prev) = self.state.list_picker_stack.pop() {
+                    self.state.list_picker = Some(prev);
+                }
             }
             ListPickerKind::Help => {
-                self.apply_help_command(&item.id).await?;
+                let nested = matches!(
+                    item.id.as_str(),
+                    "__shortcuts__"
+                        | "model"
+                        | "permission"
+                        | "config"
+                        | "provider"
+                        | "providers"
+                        | "effort"
+                        | "thinking"
+                        | "auth"
+                        | "info"
+                        | "status"
+                        | "usage"
+                        | "version"
+                        | "prompts"
+                        | "prompt"
+                        | "experimental-flags"
+                        | "flags"
+                        | "sessions"
+                        | "resume"
+                        | "tasks"
+                        | "task"
+                        | "mcp"
+                        | "skills"
+                        | "swarm"
+                        | "plugins"
+                        | "plugin"
+                );
+                if nested {
+                    self.state.list_picker_stack.push(picker);
+                    self.apply_help_command(&item.id).await?;
+                } else if item.id == "reload" {
+                    self.state.list_picker_stack.push(picker);
+                    self.reload_config_from_disk();
+                    self.pop_list_picker_level();
+                } else {
+                    self.clear_list_pickers();
+                    self.apply_help_command(&item.id).await?;
+                }
             }
             ListPickerKind::Prompts => {
                 self.apply_prompt_template(&item.id);
+                self.clear_list_pickers();
             }
             ListPickerKind::Swarm => match item.id.as_str() {
-                "enter" | "exit" => self.apply_swarm_action(&item.id).await?,
-                "tasks" => self.open_tasks_panel().await?,
+                "enter" | "exit" => {
+                    self.apply_swarm_action(&item.id).await?;
+                    self.clear_list_pickers();
+                }
+                "tasks" => {
+                    self.state.list_picker_stack.push(picker);
+                    self.open_tasks_panel().await?;
+                }
                 _ => {}
             },
             ListPickerKind::SkillManage | ListPickerKind::McpManage => {
@@ -2168,9 +2276,9 @@ impl TuiApp {
                 return Ok(());
             }
         }
-        self.state.list_picker = Some(ListPickerState {
+        self.replace_list_picker(ListPickerState {
             kind: ListPickerKind::SkillManage,
-            title: " Skills — Enter toggle · Esc close ".into(),
+            title: " Skills — Enter toggle · Esc back ".into(),
             selected: {
                 let prev = self
                     .state
@@ -2249,9 +2357,9 @@ impl TuiApp {
                 }
             }
         }
-        self.state.list_picker = Some(ListPickerState {
+        self.replace_list_picker(ListPickerState {
             kind: ListPickerKind::McpManage,
-            title: " MCP servers — Enter toggle · Esc close ".into(),
+            title: " MCP servers — Enter toggle · Esc back ".into(),
             selected: {
                 let prev = self
                     .state
@@ -2324,7 +2432,7 @@ impl TuiApp {
                 }
             })
             .collect();
-        self.state.list_picker = Some(ListPickerState {
+        self.replace_list_picker(ListPickerState {
             kind: ListPickerKind::Permission,
             title: " Select permission mode ".into(),
             items,
@@ -2383,7 +2491,7 @@ impl TuiApp {
         } else {
             format!(" Models · {provider} ")
         };
-        self.state.list_picker = Some(ListPickerState {
+        self.replace_list_picker(ListPickerState {
             kind: ListPickerKind::Model,
             title,
             items,
@@ -2430,7 +2538,7 @@ impl TuiApp {
                 }
             })
             .collect();
-        self.state.list_picker = Some(ListPickerState {
+        self.replace_list_picker(ListPickerState {
             kind: ListPickerKind::Provider,
             title: " Select provider ".into(),
             items,
@@ -2508,7 +2616,7 @@ impl TuiApp {
                 detail: "from disk (in-process)".into(),
             },
         ];
-        self.state.list_picker = Some(ListPickerState {
+        self.replace_list_picker(ListPickerState {
             kind: ListPickerKind::Config,
             title: " Configuration ".into(),
             items,
@@ -2555,7 +2663,7 @@ impl TuiApp {
                 }
             })
             .collect();
-        self.state.list_picker = Some(ListPickerState {
+        self.replace_list_picker(ListPickerState {
             kind: ListPickerKind::Effort,
             title: " Thinking effort ".into(),
             items,
@@ -2608,7 +2716,7 @@ impl TuiApp {
                 }
             })
             .collect();
-        self.state.list_picker = Some(ListPickerState {
+        self.replace_list_picker(ListPickerState {
             kind: ListPickerKind::Browse,
             title: " Auth status ".into(),
             items,
@@ -2689,7 +2797,7 @@ impl TuiApp {
                 detail: home.display().to_string(),
             },
         ];
-        self.state.list_picker = Some(ListPickerState {
+        self.replace_list_picker(ListPickerState {
             kind: ListPickerKind::Browse,
             title: " Session / system ".into(),
             items,
@@ -2710,7 +2818,7 @@ impl TuiApp {
             label: format!("/{}", c.name),
             detail: c.description.to_string(),
         }));
-        self.state.list_picker = Some(ListPickerState {
+        self.replace_list_picker(ListPickerState {
             kind: ListPickerKind::Help,
             title: " Commands ".into(),
             items,
@@ -2787,7 +2895,7 @@ impl TuiApp {
                 detail: "Tool history · todos · input history".into(),
             },
         ];
-        self.state.list_picker = Some(ListPickerState {
+        self.replace_list_picker(ListPickerState {
             kind: ListPickerKind::Browse,
             title: " Keyboard shortcuts ".into(),
             items,
@@ -2853,7 +2961,7 @@ impl TuiApp {
                 detail: "Queue a web search prompt".into(),
             },
         ];
-        self.state.list_picker = Some(ListPickerState {
+        self.replace_list_picker(ListPickerState {
             kind: ListPickerKind::Prompts,
             title: " Prompt templates ".into(),
             items,
@@ -2905,7 +3013,7 @@ impl TuiApp {
                 detail: auto_compact,
             },
         ];
-        self.state.list_picker = Some(ListPickerState {
+        self.replace_list_picker(ListPickerState {
             kind: ListPickerKind::Browse,
             title: " Experimental flags ".into(),
             items,
@@ -2957,7 +3065,7 @@ impl TuiApp {
                 detail: format!("drop plugin.json under {}", dir.display()),
             });
         }
-        self.state.list_picker = Some(ListPickerState {
+        self.replace_list_picker(ListPickerState {
             kind: ListPickerKind::Browse,
             title: " Plugins ".into(),
             items,
@@ -2984,7 +3092,7 @@ impl TuiApp {
                 detail: "view subagents / tasks".into(),
             },
         ];
-        self.state.list_picker = Some(ListPickerState {
+        self.replace_list_picker(ListPickerState {
             kind: ListPickerKind::Swarm,
             title: " Swarm ".into(),
             items,
@@ -3118,7 +3226,7 @@ impl TuiApp {
                         .as_ref()
                         .and_then(|c| items.iter().position(|i| &i.id == c))
                         .unwrap_or(0);
-                    self.state.list_picker = Some(ListPickerState {
+                    self.replace_list_picker(ListPickerState {
                         kind: ListPickerKind::Session,
                         title: " Sessions (this workspace)  ↑↓  Enter open  Ctrl-D delete ".into(),
                         items,
@@ -3769,6 +3877,7 @@ impl TuiApp {
                 self.system_message(format!("Permission mode: {}", new_mode));
             }
             "permission" => {
+                self.begin_root_picker();
                 self.open_permission_picker();
             }
             "plan" => {
@@ -3866,6 +3975,7 @@ impl TuiApp {
             }
             "sessions" | "resume" => {
                 if args.is_empty() {
+                    self.begin_root_picker();
                     self.open_session_picker().await?;
                 } else if let Err(e) = self.resume_session(&args).await {
                     self.system_message(format!("Failed to resume: {}", e));
@@ -3892,6 +4002,7 @@ impl TuiApp {
             }
             "model" => {
                 if args.is_empty() {
+                    self.begin_root_picker();
                     self.open_model_picker();
                 } else if self.config.resolve_model(&args).is_some() {
                     // Session-scoped; do not rewrite global config.default_model.
@@ -3911,6 +4022,7 @@ impl TuiApp {
             }
             "effort" | "thinking" => {
                 if args.is_empty() {
+                    self.begin_root_picker();
                     self.open_effort_picker();
                 } else {
                     let effort = args.to_lowercase();
@@ -3946,12 +4058,15 @@ impl TuiApp {
                 }
             }
             "status" | "usage" | "info" => {
+                self.begin_root_picker();
                 self.open_status_picker();
             }
             "mcp" => {
+                self.begin_root_picker();
                 self.open_mcp_manager().await?;
             }
             "tasks" | "task" => {
+                self.begin_root_picker();
                 self.open_tasks_panel().await?;
             }
             "init" => {
@@ -3988,12 +4103,15 @@ impl TuiApp {
                 }
             }
             "config" => {
+                self.begin_root_picker();
                 self.open_config_picker();
             }
             "auth" => {
+                self.begin_root_picker();
                 self.open_auth_picker();
             }
             "plugins" | "plugin" => {
+                self.begin_root_picker();
                 self.open_plugins_picker().await?;
             }
             "skills" => {
@@ -4006,14 +4124,19 @@ impl TuiApp {
                         return self.activate_skill(name, skill_args).await;
                     }
                 }
+                self.begin_root_picker();
                 self.open_skill_manager().await?;
             }
             "swarm" => match args.as_str() {
                 "enter" | "on" => self.apply_swarm_action("enter").await?,
                 "exit" | "off" => self.apply_swarm_action("exit").await?,
-                _ => self.open_swarm_picker(),
+                _ => {
+                    self.begin_root_picker();
+                    self.open_swarm_picker();
+                }
             },
             "provider" | "providers" => {
+                self.begin_root_picker();
                 self.open_provider_picker();
             }
             "reload" => {
@@ -4112,9 +4235,11 @@ impl TuiApp {
                 self.state.list_picker = None;
             }
             "prompts" | "prompt" => {
+                self.begin_root_picker();
                 self.open_prompts_picker();
             }
             "experimental-flags" | "flags" => {
+                self.begin_root_picker();
                 self.open_flags_picker();
             }
             "copy" => {
@@ -4173,9 +4298,11 @@ impl TuiApp {
                 }
             }
             "version" => {
+                self.begin_root_picker();
                 self.open_status_picker();
             }
             "help" | "h" | "?" => {
+                self.begin_root_picker();
                 self.open_help_picker();
             }
             _ => {
