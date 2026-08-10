@@ -1,6 +1,7 @@
 //! Keybinding map (emacs-like defaults, matching pi-tui).
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EditorAction {
@@ -75,5 +76,46 @@ pub fn map_key(key: KeyEvent) -> EditorAction {
             EditorAction::Insert(c)
         }
         _ => EditorAction::None,
+    }
+}
+
+/// Validate `[ui.keybindings]` overrides. Reserved chords for interrupt/submit cannot be unbound.
+pub fn validate_overrides(map: &HashMap<String, String>) -> Result<(), String> {
+    if map.is_empty() {
+        return Ok(());
+    }
+    let mut seen = HashSet::new();
+    let reserved = ["ctrl-c", "enter", "escape"];
+    for (action, chord) in map {
+        let c = chord.trim().to_lowercase();
+        if c.is_empty() {
+            return Err(format!("empty chord for action {action}"));
+        }
+        if !seen.insert(c.clone()) {
+            return Err(format!("duplicate chord {c}"));
+        }
+        if reserved.contains(&c.as_str())
+            && action != "interrupt"
+            && action != "submit"
+            && action != "escape"
+        {
+            return Err(format!(
+                "chord {c} is reserved for interrupt/submit/escape"
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_duplicate_chords() {
+        let mut m = HashMap::new();
+        m.insert("foo".into(), "ctrl-a".into());
+        m.insert("bar".into(), "ctrl-a".into());
+        assert!(validate_overrides(&m).is_err());
     }
 }

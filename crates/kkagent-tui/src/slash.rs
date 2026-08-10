@@ -117,6 +117,20 @@ pub const BUILTIN_SLASH_COMMANDS: &[SlashCommand] = &[
         argument_hint: None,
     },
     SlashCommand {
+        name: "timeline",
+        aliases: &["tl"],
+        description: "Show compact turn timeline (step / tool / retries)",
+        priority: 55,
+        argument_hint: None,
+    },
+    SlashCommand {
+        name: "edit",
+        aliases: &["rerun"],
+        description: "Load last user prompt into the composer to edit and re-run",
+        priority: 75,
+        argument_hint: Some("[fork]"),
+    },
+    SlashCommand {
         name: "init",
         aliases: &[],
         description: "Analyze the codebase and generate AGENTS.md",

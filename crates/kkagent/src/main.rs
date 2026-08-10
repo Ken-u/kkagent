@@ -158,7 +158,7 @@ enum Commands {
 }
 
 #[derive(Subcommand)]
-enum ConfigCommands {
+pub(crate) enum ConfigCommands {
     /// Print the effective config with secrets redacted
     Show,
     /// Read a dotted config key
@@ -167,6 +167,18 @@ enum ConfigCommands {
     Set { key: String, value: String },
     /// Apply safe, default, or full-auto runtime defaults
     Preset { name: String },
+    /// Preview schema migrations without writing (dry-run)
+    Migrate {
+        /// Actually write after backup (default is dry-run)
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Check / repair transcript DB integrity
+    Repair {
+        /// Quarantine corrupt rows after backup (default: check only)
+        #[arg(long)]
+        apply: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -3968,6 +3980,21 @@ async fn handle_rpc_call(
                 return Err((-32602, format!("Session not found: {}", session_id)));
             }
             tracing::info!("Session {} permission mode set to {}", session_id, mode);
+            let _ = rpc_event_tx
+                .send(Frame::Event {
+                    event: "agent".into(),
+                    scope: None,
+                    data: serde_json::to_value(AgentEvent::SessionConfigChanged {
+                        session_id: session_id.clone(),
+                        permission_mode: Some(mode.to_string()),
+                        model: None,
+                        plan_mode: None,
+                        working_dir: None,
+                        source: Some("rpc".into()),
+                    })
+                    .unwrap_or_default(),
+                })
+                .await;
             Ok(serde_json::json!({"ok": true, "mode": mode}))
         }
         "session.set_plan_mode" => {
@@ -3991,6 +4018,21 @@ async fn handle_rpc_call(
                     }
                 }
             }
+            let _ = rpc_event_tx
+                .send(Frame::Event {
+                    event: "agent".into(),
+                    scope: None,
+                    data: serde_json::to_value(AgentEvent::SessionConfigChanged {
+                        session_id: session_id.clone(),
+                        permission_mode: None,
+                        model: None,
+                        plan_mode: Some(enabled),
+                        working_dir: None,
+                        source: Some("rpc".into()),
+                    })
+                    .unwrap_or_default(),
+                })
+                .await;
             Ok(serde_json::json!({"ok": true}))
         }
         "session.set_model" => {
@@ -4030,7 +4072,63 @@ async fn handle_rpc_call(
                 .set_model(&session_id, &model)
                 .map_err(|e| (-32000, e.to_string()))?;
             tracing::info!("Session {} model set to {}", session_id, model);
+            let _ = rpc_event_tx
+                .send(Frame::Event {
+                    event: "agent".into(),
+                    scope: None,
+                    data: serde_json::to_value(AgentEvent::SessionConfigChanged {
+                        session_id: session_id.clone(),
+                        permission_mode: None,
+                        model: Some(model.clone()),
+                        plan_mode: None,
+                        working_dir: None,
+                        source: Some("rpc".into()),
+                    })
+                    .unwrap_or_default(),
+                })
+                .await;
             Ok(serde_json::json!({"ok": true, "model": model}))
+        }
+        "session.cancel_tool" => {
+            let session_id = params
+                .as_ref()
+                .and_then(|p| p.get("session_id"))
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| (-32602, "Missing session_id".into()))?
+                .to_string();
+            let tool_call_id = params
+                .as_ref()
+                .and_then(|p| p.get("tool_call_id"))
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| (-32602, "Missing tool_call_id".into()))?
+                .to_string();
+            // Best-effort: cancel matching background shell jobs for this session.
+            let stopped = state.bash_shells.stop(&tool_call_id).await;
+            if !stopped {
+                // Also try listing and stopping by description match — shell_id may differ.
+                for (id, _desc, _status, running) in state.bash_shells.list_jobs().await {
+                    if running && id.contains(&tool_call_id) {
+                        let _ = state.bash_shells.stop(&id).await;
+                    }
+                }
+            }
+            let _ = rpc_event_tx
+                .send(Frame::Event {
+                    event: "agent".into(),
+                    scope: None,
+                    data: serde_json::to_value(AgentEvent::ToolCancelled {
+                        session_id: session_id.clone(),
+                        tool_call_id: tool_call_id.clone(),
+                        reason: Some("cancelled by user".into()),
+                    })
+                    .unwrap_or_default(),
+                })
+                .await;
+            Ok(serde_json::json!({
+                "ok": true,
+                "tool_call_id": tool_call_id,
+                "stopped_shell": stopped,
+            }))
         }
         "session.set_title" => {
             let session_id = params

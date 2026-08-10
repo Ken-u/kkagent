@@ -7,6 +7,8 @@ pub mod draft_store;
 pub mod git_badge;
 pub mod i18n;
 pub mod input;
+pub mod input_history_store;
+pub mod instruction_scan;
 pub mod markdown;
 pub mod mouse_mode;
 pub mod panes;
@@ -24,5 +26,6 @@ pub mod streaming;
 pub mod test_summary;
 pub mod theme;
 pub mod tool_renderers;
+pub mod version_check;
 
 pub use app::TuiApp;

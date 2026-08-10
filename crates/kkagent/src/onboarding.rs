@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use kkagent_config::{
     load_config, load_workspace_dotenv, AppConfig, BackgroundConfig, ModelConfig, ProviderConfig,
 };
+use kkagent_core::TranscriptDb;
 use kkagent_tools::sandbox::{SandboxMode, SandboxPolicy};
 use serde_json::{json, Value as JsonValue};
 use std::collections::HashMap;
@@ -152,6 +153,65 @@ pub fn run_config(command: &ConfigCommands, configured_path: Option<&Path>) -> R
             config.validate()?;
             write_config(&path, &config)?;
             println!("Applied preset {name:?} to {}", path.display());
+        }
+        ConfigCommands::Migrate { apply } => {
+            let preview = kkagent_config::preview_migration(&path)?;
+            println!("Config: {}", preview.path.display());
+            println!("Backup would be: {}", preview.backup_path.display());
+            for change in &preview.changes {
+                println!("- {change}");
+            }
+            if *apply {
+                if !path.exists() {
+                    anyhow::bail!("nothing to migrate; run `kkagent init` first");
+                }
+                let raw = std::fs::read_to_string(&path)?;
+                // Round-trip through typed config then pretty TOML (comments may be lost —
+                // backup is required first).
+                let cfg: AppConfig = toml::from_str(&raw)?;
+                cfg.validate()?;
+                let body = toml::to_string_pretty(&cfg)?;
+                let bak = kkagent_config::atomic_write_with_backup(&path, &body)?;
+                println!("Applied migration; backup at {}", bak.display());
+            } else {
+                println!("Dry-run only. Re-run with --apply to write after backup.");
+            }
+        }
+        ConfigCommands::Repair { apply } => {
+            let db = TranscriptDb::open_default()?;
+            let report = if *apply {
+                let bak = kkagent_config::default_config_dir().join(format!(
+                    "transcripts.repair-{}.db",
+                    chrono::Utc::now().format("%Y%m%d%H%M%S")
+                ));
+                println!("Backing up then quarantining corrupt rows → {}", bak.display());
+                db.repair_with_backup(&bak)?
+            } else {
+                db.check_integrity()?
+            };
+            println!(
+                "sessions ok={} bad={}",
+                report.ok_sessions.len(),
+                report.bad_sessions.len()
+            );
+            println!(
+                "messages ok={} isolated={} repaired={}",
+                report.ok_messages,
+                report.isolated_messages.len(),
+                report.repaired
+            );
+            for bad in &report.bad_sessions {
+                println!("  session issue: {bad}");
+            }
+            for iso in report.isolated_messages.iter().take(20) {
+                println!(
+                    "  msg #{} session={} reason={}",
+                    iso.id, iso.session_id, iso.reason
+                );
+            }
+            if !*apply && !report.isolated_messages.is_empty() {
+                println!("Dry-run only. Re-run with --apply to quarantine after backup.");
+            }
         }
     }
     Ok(())

@@ -139,7 +139,7 @@
 
 - [x] TUI 中的每个工具调用保存并使用 `tool_call_id`，`ToolResult` 必须按 id 精确匹配；禁止仅按 `tool_name` 匹配，避免多个同名并行工具串结果。
 - [x] 工具卡片保持简洁，只展示 running / success / failed 三种主要状态；长时间运行时补充已运行时长，失败时自动展开错误。
-- [ ] 长时间工具支持单独取消，不必终止整个 turn；停止请求发送后使用简短的 `stopping…` 临时提示，服务端确认后回到最终三态之一。
+- [x] 长时间工具支持单独取消，不必终止整个 turn；停止请求发送后使用简短的 `stopping…` 临时提示，服务端确认后回到最终三态之一。
 - [x] Bash 默认一行摘要，按需展开最新输出；错误时提供“复制 / 重试”，不增加常驻详情面板。
 - [x] `Write` / `Edit` 等编辑工具默认显示一行摘要，例如 `Edit src/app.rs +12 -4 ✓`；`Ctrl+O` 按需展开 unified diff。
 - [x] 小 diff 展示完整内容，大 diff 只展示有限片段和剩余行数；失败自动展开相关位置，新建 / 删除 / 重命名分别使用 Create / Delete / Rename 标签。
@@ -151,20 +151,20 @@
 - [x] model、thinking effort、permission mode、plan mode、工作目录、附加 workspace 和 compact 策略全部作为 session-scoped 状态保存、恢复并展示。
 - [x] `session.resume` 返回的 `permission_mode` 必须应用到 TUI；消除 footer 显示值与服务端实际权限不一致的风险。
 - [x] session-scoped 设置采用“服务端确认后提交”或可回滚的乐观更新；失败时恢复旧值并给出明确提示。
-- [ ] 配置被其他客户端修改时通过事件同步；TUI 不得在下一次操作时用本地旧值静默覆盖服务端状态。
+- [x] 配置被其他客户端修改时通过事件同步；TUI 不得在下一次操作时用本地旧值静默覆盖服务端状态。
 
 ### P0：中断、重连与执行恢复
 
 - [x] turn 生命周期明确显示 queued → thinking → tool / approval → cancelling → cancelled / completed / failed；不能在只发出中断请求时就宣称已停止。
 - [x] `Esc` / `Ctrl-C` 保留已收到的 partial response 和已完成工具结果；中断完成后提供“继续处理”“编辑原 prompt 后重试”和“从此处 fork”。
-- [ ] RPC 断线后自动重连，并使用事件 sequence / replay 补齐缺失事件、去重已处理事件；不得重复文字 delta、工具结果或 approval。
-- [ ] 重连后从服务端 snapshot 恢复真实 turn、工具和 interaction 状态；超时进入“状态未知”而非错误地显示 Idle。
-- [ ] 长时间无事件时显示最近活动时间和“仍在运行 / 正在重连”，达到阈值后提供检查状态、重试连接和中断入口。
+- [x] RPC 断线后自动重连，并使用事件 sequence / replay 补齐缺失事件、去重已处理事件；不得重复文字 delta、工具结果或 approval。
+- [x] 重连后从服务端 snapshot 恢复真实 turn、工具和 interaction 状态；超时进入“状态未知”而非错误地显示 Idle。
+- [x] 长时间无事件时显示最近活动时间和“仍在运行 / 正在重连”，达到阈值后提供检查状态、重试连接和中断入口。
 
 ### P0：上下文与 Compact 透明化
 
 - [x] context meter 改用服务端权威 request-size / context-window 数据；不要把消息字符估算与已包含历史的 measured usage 相加，避免重复计算和百分比跳动。
-- [ ] context 使用量至少区分 system、conversation、tools、media / attachments、reserved output，并显示剩余空间；未知项明确标记为估算。
+- [x] context 使用量至少区分 system、conversation、tools、media / attachments、reserved output，并显示剩余空间；未知项明确标记为估算。
 - [x] 在 70% 等预警阈值提示，在自动 compact 阈值前说明即将压缩；阈值从实际配置读取而不是写死在 TUI。
 - [x] compact 过程中展示明确阶段，完成后显示压缩前后 token、保留的最近用户消息数量和丢弃 / 摘要范围。
 - [x] compact 会清空或影响文件 undo / checkpoint 能力时必须提前告知；可行时 compact 前自动创建可恢复 checkpoint。
@@ -172,14 +172,14 @@
 
 ### P1：交互、导航与回退
 
-- [ ] 增加 turn 执行时间线：显示当前 step、LLM 重试次数、当前工具、每阶段耗时和最近活动；默认简洁，需要时展开详情。
+- [x] 增加 turn 执行时间线：显示当前 step、LLM 重试次数、当前工具、每阶段耗时和最近活动；默认简洁，需要时展开详情。
 - [x] approval / question 使用真正的队列而非单槽状态，多个请求不得互相覆盖；显示来源工具 / agent、风险范围和等待时长。
-- [ ] approval 支持按当前调用、当前 turn、当前 session 或明确规则授权；仅对安全且作用域一致的请求提供批量处理。
-- [ ] 每个可能修改文件的 turn 建立 checkpoint，undo 前预览将恢复的消息和文件；支持 redo，并明确哪些外部副作用不可恢复。
-- [ ] 支持编辑历史 user prompt 后重新执行，并让用户选择覆盖后续历史或从该点 fork，避免隐式破坏原对话。
-- [ ] 增加按 turn 的导航：上一 / 下一用户消息、上一 / 下一工具错误、书签、复制整轮、导出选中范围；复用现有搜索而不是建立互相冲突的入口。
-- [ ] 输入历史按 session / workspace 合理隔离并持久化；恢复历史条目时同时恢复对应的折叠粘贴和附件引用。
-- [ ] sticky todo 可跳转到产生或更新该项的 turn，标识长时间未更新或已阻塞项，并在 session 完成后保留最终状态。
+- [x] approval 支持按当前调用、当前 turn、当前 session 或明确规则授权；仅对安全且作用域一致的请求提供批量处理。
+- [x] 每个可能修改文件的 turn 建立 checkpoint，undo 前预览将恢复的消息和文件；支持 redo，并明确哪些外部副作用不可恢复。
+- [x] 支持编辑历史 user prompt 后重新执行，并让用户选择覆盖后续历史或从该点 fork，避免隐式破坏原对话。
+- [x] 增加按 turn 的导航：上一 / 下一用户消息、上一 / 下一工具错误、书签、复制整轮、导出选中范围；复用现有搜索而不是建立互相冲突的入口。
+- [x] 输入历史按 session / workspace 合理隔离并持久化；恢复历史条目时同时恢复对应的折叠粘贴和附件引用。
+- [x] sticky todo 可跳转到产生或更新该项的 turn，标识长时间未更新或已阻塞项，并在 session 完成后保留最终状态。
 
 ### P1：通知与 `/usage`
 
@@ -327,29 +327,29 @@
 ### P0：上下文透明、隐私与工作区信任
 
 - [x] 增加 `/context`，默认只列出当前实际加载的 AGENTS / 项目指令来源与覆盖顺序、已激活 Skill / 工具、附件和 system / conversation / tools / media token 占用；按需展开本地内容，不发起新模型请求或反向增加 prompt。
-- [ ] 检测重复、冲突或不可读的项目指令并标出实际生效项；Skill / tool 未启用时不将其完整说明为了 `/context` 而预先注入上下文。
+- [x] 检测重复、冲突或不可读的项目指令并标出实际生效项；Skill / tool 未启用时不将其完整说明为了 `/context` 而预先注入上下文。
 - [x] 在用户输入、附件、选中文件和即将送往外部模型的工具结果中本地检测 API key、私钥、token 和 `.env` 敏感值；命中时允许“脱敏本次 / 仅本次允许 / 取消”，不修改源文件、不记录密钥。
-- [ ] 首次打开未信任工作区时，明确分别授权项目级 AGENTS / Skill、MCP 配置与可执行脚本；信任绑定规范化路径并可在配置中撤销，不因仅浏览仓库而自动执行项目内容。
+- [x] 首次打开未信任工作区时，明确分别授权项目级 AGENTS / Skill、MCP 配置与可执行脚本；信任绑定规范化路径并可在配置中撤销，不因仅浏览仓库而自动执行项目内容。
 
 ### P1：Transcript 密度与终端交互
 
 - [x] 连续的 `Read` / `Grep` / `Glob` 等探索型调用可折叠为 `Explored 12 files ✓`，展开后保留原工具顺序、状态和摘要；失败、approval 或写操作不得被静默隐藏。
 - [x] 用户向上滚动后暂停自动跟随，底部只显示 `↓ 24 new lines`，用户主动返回底部后再恢复；流式 Markdown 与未完成代码块避免每个 delta 全量重排。
-- [ ] 文件路径、URL 和 Wiki 引用在终端支持时使用 OSC 8 可打开链接；不支持时保留统一复制操作，不因平台差异显示死链接。
+- [x] 文件路径、URL 和 Wiki 引用在终端支持时使用 OSC 8 可打开链接；不支持时保留统一复制操作，不因平台差异显示死链接。
 
 ### P1：安全退出与无障碍
 
 - [x] 退出 TUI 时如存在未发送草稿、正在运行的 session、待处理 approval / question 或未保存设置，显示一行汇总并明确“后台继续 / 中断并退出 / 取消”；无待处理状态时直接退出。
-- [ ] 所有状态同时使用文字 / 符号表达，不只依赖颜色；提供高对比度与减少动画设置，并在窄终端、无真彩和 Windows Terminal 下保持关键信息可见。
+- [x] 所有状态同时使用文字 / 符号表达，不只依赖颜色；提供高对比度与减少动画设置，并在窄终端、无真彩和 Windows Terminal 下保持关键信息可见。
 
 ### P1：按需帮助、能力预检与完成态
 
 - [x] `?` 只在用户请求时打开当前页面 / mode 的可搜索快捷键帮助，不把完整按键列表常驻 footer；显示的是当前实际生效绑定。
-- [ ] 支持在 `config.toml` 中修改常用快捷键，启动 / reload 时检测重复、前缀与终端保留键冲突，错误不得导致无法退出或提交输入。
+- [x] 支持在 `config.toml` 中修改常用快捷键，启动 / reload 时检测重复、前缀与终端保留键冲突，错误不得导致无法退出或提交输入。
 - [x] 增加 `/changes`，汇总当前 session 修改文件、diff 统计、测试结果和本地 commit 状态；必须区分 session 修改和打开前已存在的用户变更。
-- [ ] 切换模型 / Provider 前本地预检图片、tool use、structured output、context window 和当前 session 需要的能力；不兼容时在执行前说明影响，不运行到一半才失败。
-- [ ] MCP、Web、Wiki 或单个 Provider 不可用时只降级对应能力，核心对话和本地工具继续工作；用一个稳定状态和可重试诊断代替每轮重复报错。
-- [ ] 配置 schema 变化时先显示迁移预览与差异，写入前创建备份并使用原子替换；支持 dry-run，不直接覆盖用户注释和未识别字段。
+- [x] 切换模型 / Provider 前本地预检图片、tool use、structured output、context window 和当前 session 需要的能力；不兼容时在执行前说明影响，不运行到一半才失败。
+- [x] MCP、Web、Wiki 或单个 Provider 不可用时只降级对应能力，核心对话和本地工具继续工作；用一个稳定状态和可重试诊断代替每轮重复报错。
+- [x] 配置 schema 变化时先显示迁移预览与差异，写入前创建备份并使用原子替换；支持 dry-run，不直接覆盖用户注释和未识别字段。
 - [x] turn 结束时可选显示一行 `3 files changed · 24 tests passed · committed ✓`，只汇总已有事实并可展开到 `/changes`；无文件 / 测试 / 提交活动时不显示空摘要。
 
 ### 验收与回归测试
@@ -367,22 +367,22 @@
 
 ### P0：文件并发与变更安全
 
-- [ ] 跟踪每个 active session 读取 / 修改过的规范化文件路径；多个 session 即将写入同一文件时在执行前警告，展示涉及 session 和文件，可选继续、切换查看或为其中一个 session 建议独立 worktree。
+- [x] 跟踪每个 active session 读取 / 修改过的规范化文件路径；多个 session 即将写入同一文件时在执行前警告，展示涉及 session 和文件，可选继续、切换查看或为其中一个 session 建议独立 worktree。
 - [x] `Read` 保存内容 hash / 版本标识，`Edit` / `Write` 落盘前重新校验；文件已被 IDE、格式化器或其他进程改动时安全失败并重新读取，不只依赖不可靠的 mtime、不静默覆盖。
 - [x] 冲突提示默认只显示 `File changed externally: src/app.rs`，按需展开基线 / 当前 / 待应用差异；解决后必须基于新版本重新计算 edit。
-- [ ] `/changes` 与 checkpoint 使用 session 启动基线和实际 tool call id 归属变更；对无法精确归属的并发改动明确标记 `shared / unknown`，不猜测为 Agent 成果。
+- [x] `/changes` 与 checkpoint 使用 session 启动基线和实际 tool call id 归属变更；对无法精确归属的并发改动明确标记 `shared / unknown`，不猜测为 Agent 成果。
 
 ### P0：后台任务与测试结果
 
 - [x] 增加 `/tasks`，对后台命令一行显示来源 session、命令摘要、运行时长和 running / exited / failed 状态；展开查看最新有上限的输出，可停止单个进程或进程组。
-- [ ] TUI 重启或 session 切换后能重新关联仍存活的后台任务；已退出进程保留简短终态，无法验证身份的 PID 不得被误停。
+- [x] TUI 重启或 session 切换后能重新关联仍存活的后台任务；已退出进程保留简短终态，无法验证身份的 PID 不得被误停。
 - [x] 对可识别的 Rust / 通用测试输出生成 `24 passed · 2 failed` 一行摘要，展开优先显示失败用例、短错误和可打开的 `file:line`；保留原始输出按需查看。
-- [ ] 支持重新执行失败测试，但必须显示实际将运行的命令并继续遵守当前 permission / approval 规则；无法可靠提取精确用例时不生成错误的快捷入口。
+- [x] 支持重新执行失败测试，但必须显示实际将运行的命令并继续遵守当前 permission / approval 规则；无法可靠提取精确用例时不生成错误的快捷入口。
 
 ### P0：Session 数据恢复与诊断包
 
-- [ ] session 元数据、索引和事件持久化使用事务 / 原子写入；单条损坏时隔离该记录，其他 session 仍可列出、resume 和导出。
-- [ ] 增加只读检查与显式的修复 / 导出流程；修复前必须备份原数据，报告哪些记录完整、已隔离或无法恢复，不静默删除历史。
+- [x] session 元数据、索引和事件持久化使用事务 / 原子写入；单条损坏时隔离该记录，其他 session 仍可列出、resume 和导出。
+- [x] 增加只读检查与显式的修复 / 导出流程；修复前必须备份原数据，报告哪些记录完整、已隔离或无法恢复，不静默删除历史。
 - [x] `kkagent doctor --bundle` 先列出将收集的文件 / 字段并允许取消；默认只包含版本、平台、脱敏配置摘要、健康检查和有上限日志，不包含 transcript、文件正文、密钥或私有 Wiki 结果。
 
 ### P1：CLI 与终端集成
@@ -390,7 +390,7 @@
 - [x] 从同一份 CLI 命令 / 参数定义生成 Bash、Zsh、Fish 和 PowerShell 补全，提供 `kkagent completions <shell>` 输出与简短安装说明，避免手写补全与 CLI 漂移。
 - [x] 增加 `--no-alt-screen`，保留终端原生 scrollback 和可复制输出；与默认 alternate screen 使用同一渲染 / 输入状态，resize、中断和退出后不留损坏终端模式。
 - [x] 支持将当前 / 完整 session 导出为 Markdown，默认保留回答、简化工具摘要和引用；导出前提示敏感内容并可选脱敏，不默认嵌入大型工具原始输出。
-- [ ] 新版本检查可关闭且有缓存 / 频率上限，只在空闲状态显示一行版本与迁移摘要；不自动下载、不中断 session，离线 / 企业环境不反复报错。
+- [x] 新版本检查可关闭且有缓存 / 频率上限，只在空闲状态显示一行版本与迁移摘要；不自动下载、不中断 session，离线 / 企业环境不反复报错。
 
 ### 验收与回归测试
 

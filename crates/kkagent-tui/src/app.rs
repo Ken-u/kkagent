@@ -108,6 +108,10 @@ pub struct AppState {
     pub pending_prompt: Option<String>,
     /// Spinner / redraw tick (increments every poll)
     pub tick: usize,
+    /// Last successful agent event time (for idle / reconnect hints).
+    pub last_event_at: Option<std::time::Instant>,
+    /// When RPC appears stalled while busy.
+    pub connection_unknown: bool,
     /// Submitted user prompts for ↑↓ recall
     pub input_history: Vec<String>,
     /// None = not browsing history; Some(i) = viewing history[i]
@@ -539,7 +543,14 @@ impl PendingApproval {
                 decision: kkagent_protocol::ApprovalDecision::Approved,
                 selected_label: "allow once".into(),
                 requires_feedback: false,
-                scope: None,
+                scope: Some(kkagent_protocol::ApprovalScope::Once),
+            },
+            ApprovalChoice {
+                label: "allow for turn".into(),
+                decision: kkagent_protocol::ApprovalDecision::Approved,
+                selected_label: "allow for turn".into(),
+                requires_feedback: false,
+                scope: Some(kkagent_protocol::ApprovalScope::Turn),
             },
             ApprovalChoice {
                 label: "allow for session".into(),
@@ -547,6 +558,13 @@ impl PendingApproval {
                 selected_label: "allow for session".into(),
                 requires_feedback: false,
                 scope: Some(kkagent_protocol::ApprovalScope::Session),
+            },
+            ApprovalChoice {
+                label: "always allow".into(),
+                decision: kkagent_protocol::ApprovalDecision::Approved,
+                selected_label: "always allow".into(),
+                requires_feedback: false,
+                scope: Some(kkagent_protocol::ApprovalScope::Always),
             },
             ApprovalChoice {
                 label: "reject".into(),
@@ -667,7 +685,12 @@ impl AppState {
             tasks_panel: None,
             pending_prompt: None,
             tick: 0,
-            input_history: Vec::new(),
+            last_event_at: None,
+            connection_unknown: false,
+            input_history: {
+                let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+                crate::input_history_store::load(&cwd)
+            },
             history_index: None,
             history_draft: String::new(),
             pending_esc_ms: None,
@@ -816,6 +839,8 @@ impl AppState {
         }
         self.history_index = None;
         self.history_draft.clear();
+        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        self.input_history = crate::input_history_store::push(&cwd, t);
     }
 
     pub fn history_prev(&mut self) {
@@ -972,6 +997,36 @@ impl TuiApp {
             elapsed_ms = startup_started.elapsed().as_millis() as u64,
             "TUI session ready"
         );
+
+        // Workspace trust gate (AGENTS / MCP / scripts) — empty trusted_workspaces = trust cwd.
+        let cwd_path = std::path::PathBuf::from(&cwd);
+        if !self.config.trusted_workspaces.is_empty() {
+            let trusted = self.config.trusted_workspaces.iter().any(|t| {
+                let p = std::path::PathBuf::from(t);
+                let p = p.canonicalize().unwrap_or(p);
+                let c = cwd_path.canonicalize().unwrap_or_else(|_| cwd_path.clone());
+                c.starts_with(&p)
+            });
+            if !trusted {
+                self.system_message(format!(
+                    "Untrusted workspace {}. Project AGENTS/Skills/MCP/scripts are gated until you add this path under trusted_workspaces (or clear the list).",
+                    cwd_path.display()
+                ));
+            }
+        }
+
+        // Validate optional keybinding overrides without locking the user out.
+        if let Err(e) = crate::pi::keybindings::validate_overrides(&self.config.ui.keybindings) {
+            self.system_message(format!(
+                "Keybinding config warning: {e} — defaults kept for interrupt/submit"
+            ));
+        }
+
+        if let Some(hint) =
+            crate::version_check::idle_hint(env!("CARGO_PKG_VERSION"), self.config.ui.check_updates)
+        {
+            self.system_message(hint);
+        }
 
         // Sync CLI / config plan mode onto the server session (create starts with plan_mode=false).
         if self.state.plan_mode {
@@ -1191,6 +1246,34 @@ impl TuiApp {
             // Periodic background refresh — never await on the UI loop.
             if self.state.tick.is_multiple_of(100) {
                 self.enqueue_workspace_sessions_refresh();
+            }
+            // Stall detection while busy: surface reconnect / interrupt affordance.
+            if self.state.tick.is_multiple_of(50) {
+                let busy = matches!(
+                    self.state.status,
+                    SessionStatus::Thinking
+                        | SessionStatus::ToolExecuting
+                        | SessionStatus::Cancelling
+                        | SessionStatus::Compacting
+                );
+                if busy {
+                    let stale = self
+                        .state
+                        .last_event_at
+                        .map(|t| t.elapsed().as_secs() >= 45)
+                        .unwrap_or(true);
+                    if stale && !self.state.connection_unknown {
+                        self.state.connection_unknown = true;
+                        let ago = self
+                            .state
+                            .last_event_at
+                            .map(|t| format!("{}s ago", t.elapsed().as_secs()))
+                            .unwrap_or_else(|| "no events yet".into());
+                        self.system_message(format!(
+                            "Still running / no events ({ago}). Esc interrupt · /status check · --connect mode may need reconnect"
+                        ));
+                    }
+                }
             }
             if self.state.tick.is_multiple_of(20)
                 && self.jobs.mcp.configured
@@ -2460,6 +2543,22 @@ impl TuiApp {
             {
                 self.state.todos_expanded = !self.state.todos_expanded;
             }
+            KeyCode::Char('t') | KeyCode::Char('T')
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && key.modifiers.contains(KeyModifiers::SHIFT) =>
+            {
+                self.navigate_turns(-1, false);
+                let stale = self
+                    .state
+                    .todos
+                    .iter()
+                    .filter(|t| t.status == "blocked" || t.status == "pending")
+                    .count();
+                self.system_message(format!(
+                    "Todo jump · {} pending/blocked kept after session turns",
+                    stale
+                ));
+            }
             // Emacs/pi-tui editor bindings (kill/yank/undo/word nav)
             KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.state.input.kill_line();
@@ -2521,6 +2620,43 @@ impl TuiApp {
                 if key.modifiers.contains(KeyModifiers::CONTROL) && self.state.input.is_empty() =>
             {
                 self.cycle_attention_session().await?;
+            }
+            // Empty-input turn navigation: [ ] user turns, { } tool errors
+            KeyCode::Char('[') if self.state.input.is_empty() && !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.navigate_turns(-1, false);
+            }
+            KeyCode::Char(']') if self.state.input.is_empty() && !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.navigate_turns(1, false);
+            }
+            KeyCode::Char('{') if self.state.input.is_empty() => {
+                self.navigate_turns(-1, true);
+            }
+            KeyCode::Char('}') if self.state.input.is_empty() => {
+                self.navigate_turns(1, true);
+            }
+            // Ctrl-X: cancel the latest running tool (stopping…) without full turn interrupt when possible
+            KeyCode::Char('x') | KeyCode::Char('X')
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && matches!(
+                        self.state.status,
+                        SessionStatus::ToolExecuting | SessionStatus::Thinking
+                    ) =>
+            {
+                if let Some(id) = self
+                    .state
+                    .messages
+                    .iter()
+                    .rev()
+                    .flat_map(|m| m.parts.iter().rev())
+                    .find_map(|p| match p {
+                        DisplayPart::Tool(tc) if tc.output.is_none() && !tc.stopping => {
+                            Some(tc.id.clone())
+                        }
+                        _ => None,
+                    })
+                {
+                    self.cancel_running_tool(&id).await?;
+                }
             }
             // Normal character input
             KeyCode::Char(c) => {
@@ -2766,6 +2902,29 @@ impl TuiApp {
             self.system_message("No active session.".into());
             return Ok(());
         };
+        // Preview: list recent Write/Edit tools that may be restored.
+        let mut preview = Vec::new();
+        for msg in self.state.messages.iter().rev() {
+            for part in &msg.parts {
+                if let DisplayPart::Tool(tc) = part {
+                    if matches!(tc.name.as_str(), "Write" | "Edit") {
+                        preview.push(format!("{} {}", tc.name, tc.input_summary));
+                        if preview.len() >= 5 {
+                            break;
+                        }
+                    }
+                }
+            }
+            if preview.len() >= 5 {
+                break;
+            }
+        }
+        if !preview.is_empty() {
+            self.system_message(format!(
+                "Undo preview (files may restore; external shell/network not undone): {}",
+                preview.join(" · ")
+            ));
+        }
         let params = serde_json::json!({"session_id": sid, "count": count});
         match self.client.rpc_call("session.undo", Some(params)).await {
             Ok(data) => {
@@ -2777,7 +2936,7 @@ impl TuiApp {
                 self.state.follow_bottom = true;
                 self.state.scroll_up = 0;
                 self.system_message(format!(
-                    "Undid {} turn(s). File changes restored where possible.",
+                    "Undid {} turn(s). File changes restored where possible (redo not available; fork to keep branch).",
                     undone
                 ));
             }
@@ -2799,6 +2958,9 @@ impl TuiApp {
         match picker.kind {
             ListPickerKind::Model => {
                 // Bind model to this session only; keep config default for /new.
+                if let Some(warn) = self.model_capability_precheck(&item.id) {
+                    self.system_message(warn);
+                }
                 self.state.model_alias = Some(item.id.clone());
                 if let Some(sid) = &self.state.session_id {
                     if let Err(e) = self.client.set_model(sid, &item.id).await {
@@ -3139,6 +3301,123 @@ impl TuiApp {
             }
         }
         self.system_message(format!("Permission mode: {new_mode}"));
+        Ok(())
+    }
+
+    /// Local precheck before switching models — surfaces missing capabilities early.
+    fn model_capability_precheck(&self, alias: &str) -> Option<String> {
+        let Some((model, _)) = self.config.resolve_model(alias) else {
+            return Some(format!("Unknown model alias: {alias}"));
+        };
+        let caps: std::collections::HashSet<String> = model
+            .capabilities
+            .iter()
+            .map(|c| c.to_lowercase())
+            .collect();
+        let has = |keys: &[&str]| keys.iter().any(|k| caps.contains(*k));
+        let vision = has(&["vision", "image", "image_in", "multimodal"]);
+        let tools = caps.is_empty()
+            || has(&["tools", "tool_use", "function_calling"])
+            || !has(&["no_tools"]);
+        let mut issues = Vec::new();
+        let has_images = self
+            .state
+            .messages
+            .iter()
+            .any(|m| m.content.contains("[image]") || m.content.contains("data:image"));
+        if has_images && !vision {
+            issues.push("session has images but model lacks vision/image_in".into());
+        }
+        if !tools {
+            issues.push("model disables tool use — agent tools may fail".into());
+        }
+        if let Some(ctx) = model.max_context_size {
+            if self.state.approx_tokens as u64 + 2048 > ctx {
+                issues.push(format!(
+                    "approx tokens {} may exceed context window {ctx}",
+                    self.state.approx_tokens
+                ));
+            }
+        }
+        if issues.is_empty() {
+            None
+        } else {
+            Some(format!("Model precheck ({alias}): {}", issues.join("; ")))
+        }
+    }
+
+    fn navigate_turns(&mut self, direction: i32, errors_only: bool) {
+        let mut indices: Vec<usize> = Vec::new();
+        for (i, msg) in self.state.messages.iter().enumerate() {
+            if errors_only {
+                let has_err = msg.parts.iter().any(|p| {
+                    matches!(p, DisplayPart::Tool(tc) if tc.is_error)
+                });
+                if has_err {
+                    indices.push(i);
+                }
+            } else if msg.role == MessageRole::User {
+                indices.push(i);
+            }
+        }
+        if indices.is_empty() {
+            self.system_message(if errors_only {
+                "No tool errors to jump to".into()
+            } else {
+                "No user turns to jump to".into()
+            });
+            return;
+        }
+        let current = self.state.highlight_message.unwrap_or(0);
+        let pos = indices
+            .iter()
+            .position(|&i| i >= current)
+            .unwrap_or(0);
+        let next = if direction >= 0 {
+            indices[(pos + 1).min(indices.len() - 1)]
+        } else if pos == 0 {
+            indices[0]
+        } else {
+            indices[pos.saturating_sub(1)]
+        };
+        self.state.highlight_message = Some(next);
+        self.state.follow_bottom = false;
+        if let Some(starts) = self.state.message_line_starts.get(next) {
+            self.state.scroll_up = self
+                .state
+                .content_lines
+                .saturating_sub(self.state.viewport_height)
+                .saturating_sub(*starts);
+        }
+    }
+
+    async fn cancel_running_tool(&mut self, tool_call_id: &str) -> anyhow::Result<()> {
+        // Mark UI stopping… immediately; server confirms via ToolCancelled / ToolResult.
+        for msg in &mut self.state.messages {
+            for part in &mut msg.parts {
+                if let DisplayPart::Tool(tc) = part {
+                    if tc.id == tool_call_id {
+                        tc.stopping = true;
+                    }
+                }
+            }
+        }
+        let Some(sid) = self.state.session_id.clone() else {
+            return Ok(());
+        };
+        let params = serde_json::json!({
+            "session_id": sid,
+            "tool_call_id": tool_call_id,
+        });
+        match self.client.rpc_call("session.cancel_tool", Some(params)).await {
+            Ok(_) => self.system_message(format!("stopping… {tool_call_id}")),
+            Err(e) => {
+                // Fallback: interrupt whole turn if per-tool cancel unsupported.
+                self.system_message(format!(
+                    "Per-tool cancel unavailable ({e}); use Esc to interrupt turn"
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -3494,26 +3773,110 @@ impl TuiApp {
     fn open_context_picker(&mut self) {
         let mut items = Vec::new();
         let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-        for name in ["AGENTS.md", "CLAUDE.md", ".kkagent/AGENTS.md"] {
-            let p = cwd.join(name);
+        for src in crate::instruction_scan::scan_project_instructions(&cwd) {
+            let status = if !src.readable {
+                "unreadable"
+            } else if src.effective {
+                "effective"
+            } else {
+                src.note.as_deref().unwrap_or("shadowed")
+            };
             items.push(ListPickerItem {
-                id: name.into(),
-                label: name.into(),
-                detail: if p.is_file() {
-                    "loaded (project)".into()
-                } else {
-                    "missing".into()
-                },
+                id: src.path.display().to_string(),
+                label: src.path.display().to_string(),
+                detail: format!("{} · {status}", src.kind),
+            });
+        }
+        if items.is_empty() {
+            items.push(ListPickerItem {
+                id: "none".into(),
+                label: "No project instruction files".into(),
+                detail: String::new(),
             });
         }
         items.push(ListPickerItem {
             id: "skills".into(),
-            label: "Skills".into(),
-            detail: format!("{} slash skills", self.state.skill_slash_commands.len()),
+            label: "Skills (enabled only)".into(),
+            detail: format!(
+                "{} slash skills · disabled not injected into /context",
+                self.state.skill_slash_commands.len()
+            ),
+        });
+        // Token breakdown (estimated from local transcript display).
+        let sys_est = 800u64; // system prompt not fully mirrored in TUI
+        let mut conv = 0u64;
+        let mut tools = 0u64;
+        let media = 0u64;
+        for msg in &self.state.messages {
+            for part in &msg.parts {
+                match part {
+                    DisplayPart::Text(t) => {
+                        conv += ((t.chars().count() as u64) + 3) / 4;
+                    }
+                    DisplayPart::Tool(tc) => {
+                        let n = tc.input_summary.len()
+                            + tc.output.as_ref().map(|s| s.len()).unwrap_or(0);
+                        tools += ((n as u64) + 3) / 4;
+                    }
+                    DisplayPart::ToolHistory(h) => {
+                        tools += 40 * h.tool_count as u64;
+                    }
+                    DisplayPart::SkillActivation { name, args } => {
+                        conv += ((name.len() + args.as_ref().map(|a| a.len()).unwrap_or(0)) as u64
+                            + 3)
+                            / 4;
+                    }
+                }
+            }
+        }
+        let reserved = self
+            .config
+            .loop_control
+            .as_ref()
+            .map(|l| l.reserved_context_size)
+            .unwrap_or(8_192);
+        let used = sys_est + conv + tools + media;
+        let max_ctx = self
+            .state
+            .model_alias
+            .as_deref()
+            .and_then(|a| self.config.models.get(a))
+            .and_then(|m| m.max_context_size)
+            .unwrap_or(200_000);
+        let remain = max_ctx as i64 - used as i64 - reserved as i64;
+        items.push(ListPickerItem {
+            id: "bd-system".into(),
+            label: "system (est.)".into(),
+            detail: format!("~{sys_est} tok"),
+        });
+        items.push(ListPickerItem {
+            id: "bd-conv".into(),
+            label: "conversation (est.)".into(),
+            detail: format!("~{conv} tok"),
+        });
+        items.push(ListPickerItem {
+            id: "bd-tools".into(),
+            label: "tools (est.)".into(),
+            detail: format!("~{tools} tok"),
+        });
+        items.push(ListPickerItem {
+            id: "bd-media".into(),
+            label: "media / attachments (est.)".into(),
+            detail: format!("~{media} tok"),
+        });
+        items.push(ListPickerItem {
+            id: "bd-reserved".into(),
+            label: "reserved output".into(),
+            detail: format!("{reserved} tok"),
+        });
+        items.push(ListPickerItem {
+            id: "bd-remain".into(),
+            label: "remaining (est.)".into(),
+            detail: format!("{remain} · window {max_ctx}"),
         });
         items.push(ListPickerItem {
             id: "tokens".into(),
-            label: "Approx tokens".into(),
+            label: "Server approx tokens".into(),
             detail: self.state.approx_tokens.to_string(),
         });
         items.push(ListPickerItem {
@@ -3537,16 +3900,20 @@ impl TuiApp {
 
     fn open_changes_picker(&mut self) {
         let mut items = Vec::new();
-        let mut write_tools = 0u32;
         for msg in &self.state.messages {
             for part in &msg.parts {
                 if let DisplayPart::Tool(tc) = part {
                     if matches!(tc.name.as_str(), "Write" | "Edit") {
-                        write_tools += 1;
+                        let path = tc.input_summary.chars().take(48).collect::<String>();
+                        let link = if path.contains('/') || path.ends_with(".rs") {
+                            crate::test_summary::osc8_link(&format!("file://{path}"), &path)
+                        } else {
+                            path.clone()
+                        };
                         items.push(ListPickerItem {
-                            id: format!("{write_tools}"),
-                            label: tc.name.clone(),
-                            detail: tc.input_summary.chars().take(48).collect(),
+                            id: tc.id.clone(),
+                            label: format!("{} · {}", tc.name, &tc.id[..8.min(tc.id.len())]),
+                            detail: format!("{link} · agent"),
                         });
                     }
                 }
@@ -3556,8 +3923,17 @@ impl TuiApp {
             items.push(ListPickerItem {
                 id: "none".into(),
                 label: "No file edits in this session".into(),
-                detail: String::new(),
+                detail: "shared / unknown external edits are not claimed".into(),
             });
+        } else {
+            items.insert(
+                0,
+                ListPickerItem {
+                    id: "note".into(),
+                    label: "Attribution".into(),
+                    detail: "listed by tool_call_id · concurrent IDE edits = shared/unknown".into(),
+                },
+            );
         }
         self.replace_list_picker(ListPickerState {
             kind: ListPickerKind::Browse,
@@ -5537,6 +5913,64 @@ impl TuiApp {
                 let count = args.trim().parse::<usize>().unwrap_or(1).max(1);
                 self.undo_turns(count).await?;
             }
+            "timeline" | "tl" => {
+                let mut lines = Vec::new();
+                let status = format!("{:?}", self.state.status);
+                lines.push(format!("status: {status}"));
+                if let Some(tool) = &self.state.last_tool_name {
+                    lines.push(format!("last tool: {tool}"));
+                }
+                let mut tool_n = 0u32;
+                let mut err_n = 0u32;
+                for msg in &self.state.messages {
+                    for part in &msg.parts {
+                        if let DisplayPart::Tool(tc) = part {
+                            tool_n += 1;
+                            if tc.is_error {
+                                err_n += 1;
+                            }
+                            if tc.output.is_none() {
+                                let secs = tc
+                                    .started_at
+                                    .map(|t| t.elapsed().as_secs())
+                                    .unwrap_or(0);
+                                lines.push(format!(
+                                    "running: {} ({secs}s){}",
+                                    tc.name,
+                                    if tc.stopping { " stopping…" } else { "" }
+                                ));
+                            }
+                        }
+                    }
+                }
+                lines.push(format!("tools seen: {tool_n} · errors: {err_n}"));
+                lines.push(format!("approx tokens: {}", self.state.approx_tokens));
+                self.system_message(lines.join(" · "));
+            }
+            "edit" | "rerun" => {
+                let fork = args.trim() == "fork";
+                let last_user = self
+                    .state
+                    .messages
+                    .iter()
+                    .rev()
+                    .find(|m| m.role == MessageRole::User)
+                    .map(|m| m.content.clone());
+                if let Some(text) = last_user {
+                    self.state.input.set_text(text);
+                    if fork {
+                        self.system_message(
+                            "Loaded last prompt — submit to continue; use /fork first to branch history".into(),
+                        );
+                    } else {
+                        self.system_message(
+                            "Loaded last prompt for edit & re-run (does not auto-truncate history; /undo then submit, or /fork)".into(),
+                        );
+                    }
+                } else {
+                    self.system_message("No prior user prompt to edit".into());
+                }
+            }
             "model" => {
                 if args.is_empty() {
                     self.begin_root_picker();
@@ -6267,6 +6701,8 @@ impl TuiApp {
             if let Ok(evt) = serde_json::from_value::<AgentEvent>(data) {
                 let evt_sid = evt.session_id().to_string();
                 let is_current = self.state.session_id.as_deref() == Some(evt_sid.as_str());
+                self.state.last_event_at = Some(std::time::Instant::now());
+                self.state.connection_unknown = false;
                 self.state.event_router.on_event(
                     &evt,
                     &mut self.state.tab_strip,
@@ -6738,6 +7174,70 @@ impl TuiApp {
                     } => {
                         self.push_skill_activation(&skill_name, skill_args.as_deref());
                         self.state.follow_bottom = true;
+                    }
+                    AgentEvent::SessionConfigChanged {
+                        permission_mode,
+                        model,
+                        plan_mode,
+                        working_dir,
+                        source,
+                        ..
+                    } => {
+                        if let Some(mode) = permission_mode
+                            .as_deref()
+                            .and_then(parse_permission_mode_str)
+                        {
+                            self.state.permission_mode = mode;
+                        }
+                        if let Some(ref m) = model {
+                            self.state.model_alias = Some(m.clone());
+                        }
+                        if let Some(enabled) = plan_mode {
+                            self.state.on_plan_mode_changed(enabled);
+                        }
+                        let src = source.unwrap_or_else(|| "other client".into());
+                        let mut bits = Vec::new();
+                        if permission_mode.is_some() {
+                            bits.push("permission");
+                        }
+                        if model.is_some() {
+                            bits.push("model");
+                        }
+                        if plan_mode.is_some() {
+                            bits.push("plan");
+                        }
+                        if working_dir.is_some() {
+                            bits.push("cwd");
+                        }
+                        if !bits.is_empty() {
+                            self.system_message(format!(
+                                "Session settings synced from {src}: {}",
+                                bits.join(", ")
+                            ));
+                        }
+                    }
+                    AgentEvent::ToolCancelled {
+                        tool_call_id,
+                        reason,
+                        ..
+                    } => {
+                        for msg in &mut self.state.messages {
+                            for part in &mut msg.parts {
+                                if let DisplayPart::Tool(tc) = part {
+                                    if tc.id == tool_call_id {
+                                        tc.stopping = false;
+                                        tc.is_error = true;
+                                        tc.output = Some(
+                                            reason
+                                                .clone()
+                                                .unwrap_or_else(|| "cancelled".into()),
+                                        );
+                                        tc.collapsed = false;
+                                    }
+                                }
+                            }
+                        }
+                        self.system_message(format!("Tool {tool_call_id} cancelled"));
                     }
                 }
             }
