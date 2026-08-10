@@ -7,9 +7,34 @@ pub struct KkagentClient {
     pub event_rx: mpsc::Receiver<Frame>,
 }
 
+/// Cloneable request-only handle for RPC work that should not block the UI loop.
+#[derive(Clone)]
+pub struct KkagentRequester {
+    rpc: RpcClient,
+}
+
+impl KkagentRequester {
+    pub async fn rpc_call(
+        &self,
+        method: &str,
+        params: Option<serde_json::Value>,
+    ) -> anyhow::Result<serde_json::Value> {
+        self.rpc
+            .call(method, params)
+            .await
+            .map_err(|e| anyhow::anyhow!("{}", e))
+    }
+}
+
 impl KkagentClient {
     pub fn new(rpc: RpcClient, event_rx: mpsc::Receiver<Frame>) -> Self {
         Self { rpc, event_rx }
+    }
+
+    pub fn requester(&self) -> KkagentRequester {
+        KkagentRequester {
+            rpc: self.rpc.clone(),
+        }
     }
 
     pub async fn create_session(

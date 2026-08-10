@@ -22,6 +22,7 @@ pub enum RpcError {
     Other(String),
 }
 
+#[derive(Clone)]
 pub struct RpcClient {
     write_tx: mpsc::Sender<Frame>,
     pending: Arc<Mutex<HashMap<String, PendingCall>>>,

@@ -1895,6 +1895,9 @@ async fn build_turn_tool_registry(
     state: &Arc<ServerState>,
     event_tx: mpsc::Sender<AgentEvent>,
 ) -> ToolRegistry {
+    // MCP discovery starts in the background so the TUI can paint immediately.
+    // Synchronize only when a turn actually needs its final tool registry.
+    state.mcp.wait_until_initialized().await;
     let mut tools = ToolRegistry::new();
     kkagent_tools::register_builtin_tools(&mut tools);
     let auto_background_on_timeout = state
@@ -2132,7 +2135,7 @@ struct ServerState {
     telemetry: kkagent_telemetry::TelemetryServiceHandle,
     events: tokio::sync::broadcast::Sender<serde_json::Value>,
     pending_questions: Mutex<HashMap<String, serde_json::Value>>,
-    background_tasks: Vec<AbortHandle>,
+    background_tasks: Mutex<Vec<AbortHandle>>,
     turn_locks: SessionTurnLocks,
     persistence_durable: bool,
     persistence_error: Option<String>,
@@ -2171,7 +2174,7 @@ impl ServerState {
         for (_, handle) in self.abort_registry.lock().await.drain() {
             handle.abort();
         }
-        for handle in &self.background_tasks {
+        for handle in self.background_tasks.lock().await.drain(..) {
             handle.abort();
         }
     }
@@ -2214,6 +2217,7 @@ fn open_transcript_with_policy(
 }
 
 async fn build_server_state(config: Arc<AppConfig>) -> Result<Arc<ServerState>> {
+    let startup_started = std::time::Instant::now();
     let (events, _) = tokio::sync::broadcast::channel(1024);
     let allow_in_memory = std::env::var("KKAGENT_ALLOW_IN_MEMORY_TRANSCRIPTS")
         .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
@@ -2244,18 +2248,30 @@ async fn build_server_state(config: Arc<AppConfig>) -> Result<Arc<ServerState>> 
     let cron_path = kkagent_config::default_config_dir().join("cron.json");
     let mcp_connect = mcp.clone();
     let mcp_servers_configured = !config.mcp_servers.is_empty();
+    let mcp_server_count = config.mcp_servers.len();
     let extra_skill_dirs = config.extra_skill_dirs.clone();
     let merge_all_available_skills = config.merge_all_available_skills;
+    let plugins_dir = kkagent_config::default_config_dir().join("plugins");
+    let mut background_tasks = Vec::new();
 
-    // Independent startup work: MCP connects, skill catalog, hooks discover, cron load.
-    let (mcp_result, skills, hooks_discover, cron) = tokio::join!(
-        async {
-            if mcp_servers_configured {
-                mcp_connect.connect_all().await
-            } else {
-                Ok(())
+    // MCP startup can involve subprocess launches, remote handshakes, or OAuth.
+    // Begin it immediately, but do not keep the TUI's first frame waiting for it.
+    // Agent turns synchronize on McpManager::wait_until_initialized below.
+    if mcp_servers_configured {
+        let task = tokio::spawn(async move {
+            match mcp_connect.connect_all().await {
+                Ok(()) => {
+                    let n = mcp_connect.list_tools().await.len();
+                    tracing::info!("MCP ready: {} server(s), {} tool(s)", mcp_server_count, n);
+                }
+                Err(e) => tracing::warn!("MCP connect_all error: {}", e),
             }
-        },
+        });
+        background_tasks.push(task.abort_handle());
+    }
+
+    // Only local state needed by session creation remains on the critical path.
+    let (skills, hooks_discover, cron, plugins) = tokio::join!(
         kkagent_tools::SkillCatalog::configured(
             &cwd,
             &extra_skill_dirs,
@@ -2263,21 +2279,9 @@ async fn build_server_state(config: Arc<AppConfig>) -> Result<Arc<ServerState>> 
         ),
         hooks_mgr.discover(),
         kkagent_tools::CronManager::with_persist(cron_path),
+        kkagent_core::PluginManager::discover(&plugins_dir),
     );
 
-    if mcp_servers_configured {
-        match mcp_result {
-            Ok(()) => {
-                let n = mcp.list_tools().await.len();
-                tracing::info!(
-                    "MCP ready: {} server(s), {} tool(s)",
-                    config.mcp_servers.len(),
-                    n
-                );
-            }
-            Err(e) => tracing::warn!("MCP connect_all error: {}", e),
-        }
-    }
     if let Err(e) = hooks_discover {
         tracing::warn!("hooks discover error: {e}");
     }
@@ -2290,7 +2294,6 @@ async fn build_server_state(config: Arc<AppConfig>) -> Result<Arc<ServerState>> 
     let web = Arc::new(kkagent_tools::WebServicesConfig::from_app(&config));
 
     let cron_fires: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-    let mut background_tasks = Vec::new();
     {
         let cron_bg = cron.clone();
         let fires = cron_fires.clone();
@@ -2321,11 +2324,6 @@ async fn build_server_state(config: Arc<AppConfig>) -> Result<Arc<ServerState>> 
         background_tasks.push(task.abort_handle());
     }
 
-    let plugins = {
-        let dir = kkagent_config::default_config_dir().join("plugins");
-        kkagent_core::PluginManager::discover(&dir).await
-    };
-
     let di_root = ServiceContainer::new("kkagent-root");
     let telemetry = TelemetryService::new();
     telemetry.add_appender(Arc::new(ConsoleAppender)).await;
@@ -2349,14 +2347,18 @@ async fn build_server_state(config: Arc<AppConfig>) -> Result<Arc<ServerState>> 
     }
     let _ = di_root.register_instance(telemetry.clone());
     let _ = di_root.register_instance(config.clone());
-    telemetry
-        .track_json(
-            "app_started",
-            serde_json::json!({
-                "mcp_servers": config.mcp_servers.len() as u64,
-            }),
-        )
-        .await;
+    let startup_telemetry = telemetry.clone();
+    let task = tokio::spawn(async move {
+        startup_telemetry
+            .track_json(
+                "app_started",
+                serde_json::json!({
+                        "mcp_servers": mcp_server_count as u64,
+                }),
+            )
+            .await;
+    });
+    background_tasks.push(task.abort_handle());
 
     let state = Arc::new(ServerState {
         config: config.clone(),
@@ -2383,13 +2385,25 @@ async fn build_server_state(config: Arc<AppConfig>) -> Result<Arc<ServerState>> 
         telemetry: telemetry.clone(),
         events,
         pending_questions: Mutex::new(HashMap::new()),
-        background_tasks,
+        background_tasks: Mutex::new(background_tasks),
         turn_locks: SessionTurnLocks::default(),
         persistence_durable,
         persistence_error,
         started_at: std::time::Instant::now(),
     });
-    recover_subagents(state.clone()).await;
+    let recovery_state = state.clone();
+    let recovery_task = tokio::spawn(async move {
+        recover_subagents(recovery_state).await;
+    });
+    state
+        .background_tasks
+        .lock()
+        .await
+        .push(recovery_task.abort_handle());
+    tracing::info!(
+        elapsed_ms = startup_started.elapsed().as_millis() as u64,
+        "Server state ready"
+    );
     Ok(state)
 }
 

@@ -32,6 +32,11 @@ pub struct TuiApp {
     mouse_mode: MouseMode,
 }
 
+type StartupMetadata = (
+    anyhow::Result<serde_json::Value>,
+    anyhow::Result<serde_json::Value>,
+);
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum AppMode {
     Normal,
@@ -730,6 +735,7 @@ impl TuiApp {
     }
 
     pub async fn run(mut self, resume: Option<String>) -> anyhow::Result<()> {
+        let startup_started = std::time::Instant::now();
         // Create / resume session BEFORE taking over the terminal, so RPC
         // failures don't leave the user's shell stuck in raw/alternate mode.
         let cwd = std::env::current_dir()?.to_string_lossy().to_string();
@@ -755,6 +761,10 @@ impl TuiApp {
             self.state.session_id = Some(session_id);
             self.bind_config_default_model();
         }
+        tracing::info!(
+            elapsed_ms = startup_started.elapsed().as_millis() as u64,
+            "TUI session ready"
+        );
 
         // Sync CLI / config plan mode onto the server session (create starts with plan_mode=false).
         if self.state.plan_mode {
@@ -765,15 +775,18 @@ impl TuiApp {
             }
         }
 
-        // Independent RPCs — one RTT instead of two sequential round-trips.
-        let skills_fut = self.client.rpc_call("skills.list", None);
-        let sessions_fut = self.client.rpc_call(
-            "sessions.list",
-            Some(serde_json::json!({"limit": 80, "include_archived": false})),
-        );
-        let (skills_res, sessions_res) = tokio::join!(skills_fut, sessions_fut);
-        self.apply_skills_list(skills_res.ok());
-        self.apply_workspace_sessions_list(sessions_res.ok());
+        // Skills and session history are useful, but neither is required for the
+        // first interactive frame. Fetch both on a request-only client so slow
+        // disks or large catalogs never hold the alternate screen hostage.
+        let requester = self.client.requester();
+        let startup_metadata = tokio::spawn(async move {
+            let skills_fut = requester.rpc_call("skills.list", None);
+            let sessions_fut = requester.rpc_call(
+                "sessions.list",
+                Some(serde_json::json!({"limit": 80, "include_archived": false})),
+            );
+            tokio::join!(skills_fut, sessions_fut)
+        });
 
         enable_raw_mode().map_err(|e| {
             anyhow::anyhow!(
@@ -790,6 +803,10 @@ impl TuiApp {
             let _ = disable_raw_mode();
             return Err(e.into());
         }
+        tracing::info!(
+            elapsed_ms = startup_started.elapsed().as_millis() as u64,
+            "TUI first frame ready"
+        );
         if let Err(e) = self.mouse_mode.enable(&mut stdout) {
             let _ = execute!(stdout, DisableBracketedPaste, LeaveAlternateScreen);
             let _ = disable_raw_mode();
@@ -804,7 +821,7 @@ impl TuiApp {
             }
         };
 
-        let result = self.main_loop(&mut terminal).await;
+        let result = self.main_loop(&mut terminal, Some(startup_metadata)).await;
         let sid = self.state.session_id.clone();
         let empty = !session_has_retained_io(&self.state.messages);
 
@@ -841,11 +858,24 @@ impl TuiApp {
     async fn main_loop(
         &mut self,
         terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+        mut startup_metadata: Option<tokio::task::JoinHandle<StartupMetadata>>,
     ) -> anyhow::Result<()> {
         loop {
             terminal.draw(|f| {
                 components::render_ui(f, &mut self.state, &self.config);
             })?;
+
+            if startup_metadata
+                .as_ref()
+                .is_some_and(tokio::task::JoinHandle::is_finished)
+            {
+                if let Some(task) = startup_metadata.take() {
+                    if let Ok((skills_res, sessions_res)) = task.await {
+                        self.apply_skills_list(skills_res.ok());
+                        self.apply_workspace_sessions_list(sessions_res.ok());
+                    }
+                }
+            }
 
             // Drain the full event queue each frame so trackpad bursts stay in-app
             // (one-event-per-poll left a backlog that felt like lag / terminal scroll).
@@ -911,6 +941,9 @@ impl TuiApp {
             if self.state.should_quit {
                 break;
             }
+        }
+        if let Some(task) = startup_metadata {
+            task.abort();
         }
         Ok(())
     }

@@ -7,7 +7,7 @@ use rmcp::transport::StreamableHttpClientTransport;
 use rmcp::{transport::TokioChildProcess, ServiceExt};
 use serde_json::Value;
 use tokio::process::Command;
-use tokio::sync::Mutex;
+use tokio::sync::{watch, Mutex};
 
 use crate::oauth::{interactive_oauth_login, McpOAuthStore, OAuthTokens};
 use crate::sse_client::SseMcpClient;
@@ -96,10 +96,14 @@ pub struct McpManager {
     auth_status: Arc<Mutex<HashMap<String, String>>>,
     /// Runtime-disabled server names (persisted via config / disabled.toml).
     disabled: Arc<Mutex<HashSet<String>>>,
+    /// Initial discovery runs off the UI startup path. Agent turns wait for it
+    /// so the first prompt still receives the complete MCP tool set.
+    initialized: watch::Sender<bool>,
 }
 
 impl McpManager {
     pub fn new(configs: Vec<McpServerConfig>) -> Self {
+        let (initialized, _) = watch::channel(configs.is_empty());
         Self {
             configs,
             connections: Arc::new(Mutex::new(HashMap::new())),
@@ -107,7 +111,21 @@ impl McpManager {
             oauth_store: Arc::new(McpOAuthStore::default_location()),
             auth_status: Arc::new(Mutex::new(HashMap::new())),
             disabled: Arc::new(Mutex::new(HashSet::new())),
+            initialized,
         }
+    }
+
+    pub async fn wait_until_initialized(&self) {
+        let mut initialized = self.initialized.subscribe();
+        while !*initialized.borrow_and_update() {
+            if initialized.changed().await.is_err() {
+                break;
+            }
+        }
+    }
+
+    fn mark_initialized(&self) {
+        self.initialized.send_replace(true);
     }
 
     pub async fn set_disabled_names(&self, names: impl IntoIterator<Item = String>) {
@@ -203,8 +221,9 @@ impl McpManager {
             }
         });
         futures::future::join_all(futures).await;
-        self.refresh_tools().await?;
-        Ok(())
+        let result = self.refresh_tools().await;
+        self.mark_initialized();
+        result
     }
 
     pub async fn reconnect(&self, server_name: &str) -> Result<()> {
@@ -512,5 +531,49 @@ fn token_expired(tokens: &OAuthTokens) -> bool {
     match tokens.expires_at {
         Some(ts) => chrono::Utc::now().timestamp() >= ts - 30,
         None => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn empty_manager_is_ready_immediately() {
+        let manager = McpManager::new(Vec::new());
+        tokio::time::timeout(Duration::from_millis(100), manager.wait_until_initialized())
+            .await
+            .expect("an empty manager should already be initialized");
+    }
+
+    #[tokio::test]
+    async fn configured_manager_becomes_ready_after_initial_discovery() {
+        let manager = McpManager::new(vec![McpServerConfig {
+            name: "disabled-test".into(),
+            transport: McpTransportKind::Stdio,
+            command: None,
+            args: Vec::new(),
+            env: HashMap::new(),
+            url: None,
+            headers: HashMap::new(),
+            oauth: None,
+            timeout_ms: None,
+        }]);
+        manager
+            .set_disabled_names(["disabled-test".to_string()])
+            .await;
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), manager.wait_until_initialized())
+                .await
+                .is_err(),
+            "configured managers should wait for initial discovery"
+        );
+
+        manager.connect_all().await.unwrap();
+        tokio::time::timeout(Duration::from_millis(100), manager.wait_until_initialized())
+            .await
+            .expect("connect_all should release readiness waiters");
     }
 }
