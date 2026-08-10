@@ -253,6 +253,10 @@ pub struct ListPickerState {
     pub title: String,
     pub items: Vec<ListPickerItem>,
     pub selected: usize,
+    /// Optional fuzzy filter (used by `/sessions`).
+    pub filter: String,
+    /// Unfiltered source items for session search.
+    pub all_items: Vec<ListPickerItem>,
 }
 
 #[derive(Debug, Clone)]
@@ -1831,6 +1835,36 @@ impl TuiApp {
                     }
                     return Ok(());
                 }
+                KeyCode::Backspace
+                    if self
+                        .state
+                        .list_picker
+                        .as_ref()
+                        .is_some_and(|p| p.kind == ListPickerKind::Session) =>
+                {
+                    if let Some(ref mut p) = self.state.list_picker {
+                        p.filter.pop();
+                    }
+                    self.apply_session_picker_filter();
+                    self.refresh_session_picker_preview();
+                    return Ok(());
+                }
+                KeyCode::Char(c)
+                    if !key.modifiers.contains(KeyModifiers::CONTROL)
+                        && !key.modifiers.contains(KeyModifiers::ALT)
+                        && self
+                            .state
+                            .list_picker
+                            .as_ref()
+                            .is_some_and(|p| p.kind == ListPickerKind::Session) =>
+                {
+                    if let Some(ref mut p) = self.state.list_picker {
+                        p.filter.push(c);
+                    }
+                    self.apply_session_picker_filter();
+                    self.refresh_session_picker_preview();
+                    return Ok(());
+                }
                 _ => {}
             }
         }
@@ -2173,6 +2207,12 @@ impl TuiApp {
             }
             KeyCode::Tab if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.cycle_workspace_session(1).await?;
+            }
+            // Ctrl+Shift+N / Ctrl+N: jump to next session needing attention
+            KeyCode::Char('n') | KeyCode::Char('N')
+                if key.modifiers.contains(KeyModifiers::CONTROL) && self.state.input.is_empty() =>
+            {
+                self.cycle_attention_session().await?;
             }
             // Normal character input
             KeyCode::Char(c) => {
@@ -2688,6 +2728,9 @@ impl TuiApp {
                 }
             },
             items,
+
+            filter: String::new(),
+            all_items: Vec::new(),
         });
         Ok(())
     }
@@ -2763,6 +2806,9 @@ impl TuiApp {
                 }
             },
             items,
+
+            filter: String::new(),
+            all_items: Vec::new(),
         });
         Ok(())
     }
@@ -2825,6 +2871,9 @@ impl TuiApp {
             title: " Select permission mode ".into(),
             items,
             selected,
+
+            filter: String::new(),
+            all_items: Vec::new(),
         });
     }
 
@@ -2884,6 +2933,9 @@ impl TuiApp {
             title,
             items,
             selected,
+
+            filter: String::new(),
+            all_items: Vec::new(),
         });
     }
 
@@ -2931,6 +2983,9 @@ impl TuiApp {
             title: " Select provider ".into(),
             items,
             selected,
+
+            filter: String::new(),
+            all_items: Vec::new(),
         });
     }
 
@@ -3009,6 +3064,9 @@ impl TuiApp {
             title: " Configuration ".into(),
             items,
             selected: 0,
+
+            filter: String::new(),
+            all_items: Vec::new(),
         });
     }
 
@@ -3056,6 +3114,9 @@ impl TuiApp {
             title: " Thinking effort ".into(),
             items,
             selected,
+
+            filter: String::new(),
+            all_items: Vec::new(),
         });
     }
 
@@ -3109,6 +3170,9 @@ impl TuiApp {
             title: " Auth status ".into(),
             items,
             selected: 0,
+
+            filter: String::new(),
+            all_items: Vec::new(),
         });
     }
 
@@ -3190,6 +3254,9 @@ impl TuiApp {
             title: " Session / system ".into(),
             items,
             selected: 0,
+
+            filter: String::new(),
+            all_items: Vec::new(),
         });
     }
 
@@ -3211,6 +3278,9 @@ impl TuiApp {
             title: " Commands ".into(),
             items,
             selected: 0,
+
+            filter: String::new(),
+            all_items: Vec::new(),
         });
     }
 
@@ -3288,6 +3358,9 @@ impl TuiApp {
             title: " Keyboard shortcuts ".into(),
             items,
             selected: 0,
+
+            filter: String::new(),
+            all_items: Vec::new(),
         });
     }
 
@@ -3354,6 +3427,9 @@ impl TuiApp {
             title: " Prompt templates ".into(),
             items,
             selected: 0,
+
+            filter: String::new(),
+            all_items: Vec::new(),
         });
     }
 
@@ -3406,6 +3482,9 @@ impl TuiApp {
             title: " Experimental flags ".into(),
             items,
             selected: 0,
+
+            filter: String::new(),
+            all_items: Vec::new(),
         });
     }
 
@@ -3455,6 +3534,9 @@ impl TuiApp {
             title: " Plugins ".into(),
             items,
             selected: 0,
+
+            filter: String::new(),
+            all_items: Vec::new(),
         });
         Ok(())
     }
@@ -3482,6 +3564,9 @@ impl TuiApp {
             title: " Swarm ".into(),
             items,
             selected: 0,
+
+            filter: String::new(),
+            all_items: Vec::new(),
         });
     }
 
@@ -3538,6 +3623,9 @@ impl TuiApp {
                 title: " Sessions (this workspace)  ↑↓  Enter open  Ctrl-D delete ".into(),
                 items: Vec::new(),
                 selected: 0,
+
+                filter: String::new(),
+                all_items: Vec::new(),
             });
         }
         self.state.session_delete_confirm = None;
@@ -3632,14 +3720,59 @@ impl TuiApp {
             .as_ref()
             .and_then(|c| items.iter().position(|i| &i.id == c))
             .unwrap_or(0);
+        let prior_filter = self
+            .state
+            .list_picker
+            .as_ref()
+            .filter(|p| p.kind == ListPickerKind::Session)
+            .map(|p| p.filter.clone())
+            .unwrap_or_default();
         self.replace_list_picker(ListPickerState {
             kind: ListPickerKind::Session,
-            title: " Sessions (this workspace)  ↑↓  Enter open  Ctrl-D delete ".into(),
-            items,
+            title: " Sessions (this workspace)  type to filter · ↑↓ Enter · Ctrl-D delete ".into(),
+            items: items.clone(),
             selected,
+            filter: prior_filter,
+            all_items: items,
         });
+        self.apply_session_picker_filter();
         self.state.session_delete_confirm = None;
         self.refresh_session_picker_preview();
+    }
+
+    fn apply_session_picker_filter(&mut self) {
+        let Some(picker) = self.state.list_picker.as_mut() else {
+            return;
+        };
+        if picker.kind != ListPickerKind::Session {
+            return;
+        }
+        let q = picker.filter.to_ascii_lowercase();
+        if q.is_empty() {
+            picker.items = picker.all_items.clone();
+            picker.title =
+                " Sessions (this workspace)  type to filter · ↑↓ Enter · Ctrl-D delete ".into();
+        } else {
+            picker.items = picker
+                .all_items
+                .iter()
+                .filter(|i| {
+                    i.label.to_ascii_lowercase().contains(&q)
+                        || i.detail.to_ascii_lowercase().contains(&q)
+                        || i.id.to_ascii_lowercase().contains(&q)
+                })
+                .cloned()
+                .collect();
+            picker.title = format!(
+                " Sessions · filter {:?} · {}/{} · workspace scope ",
+                picker.filter,
+                picker.items.len(),
+                picker.all_items.len()
+            );
+        }
+        if picker.selected >= picker.items.len() {
+            picker.selected = picker.items.len().saturating_sub(1);
+        }
     }
 
     async fn resume_session(&mut self, query: &str) -> anyhow::Result<()> {
@@ -4163,6 +4296,57 @@ impl TuiApp {
             return Ok(());
         }
         self.resume_session(&next_id).await
+    }
+
+    async fn cycle_attention_session(&mut self) -> anyhow::Result<()> {
+        self.enqueue_workspace_sessions_refresh();
+        let current = self.state.session_id.clone();
+        let target = {
+            let entries = &self.state.workspace_sessions.entries;
+            if !entries.is_empty() {
+                let start = current
+                    .as_ref()
+                    .and_then(|c| entries.iter().position(|e| &e.id == c))
+                    .unwrap_or(0);
+                (1..=entries.len()).find_map(|offset| {
+                    let idx = (start + offset) % entries.len();
+                    let e = &entries[idx];
+                    if (e.needs_attention || e.dirty) && current.as_deref() != Some(e.id.as_str())
+                    {
+                        Some(e.id.clone())
+                    } else {
+                        None
+                    }
+                })
+            } else {
+                let tabs = &self.state.tab_strip.tabs;
+                let start = current
+                    .as_ref()
+                    .and_then(|c| tabs.iter().position(|t| &t.id == c))
+                    .unwrap_or(0);
+                (1..=tabs.len()).find_map(|offset| {
+                    let idx = (start + offset) % tabs.len();
+                    let tab = &tabs[idx];
+                    let needs = tab.dirty
+                        || self.state.parked_approvals.contains_key(&tab.id)
+                        || self.state.parked_questions.contains_key(&tab.id)
+                        || matches!(
+                            tab.status,
+                            SessionStatus::WaitingApproval | SessionStatus::WaitingQuestion
+                        );
+                    if needs && current.as_deref() != Some(tab.id.as_str()) {
+                        Some(tab.id.clone())
+                    } else {
+                        None
+                    }
+                })
+            }
+        };
+        if let Some(id) = target {
+            return self.resume_session(&id).await;
+        }
+        self.system_message("No session needs attention.".into());
+        Ok(())
     }
 
     fn refresh_session_picker_preview(&mut self) {

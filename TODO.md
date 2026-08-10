@@ -104,18 +104,18 @@
 ### P1：可发现性与多会话状态
 
 - [x] 统一并修正快捷键语义：当前 `Ctrl+Tab` / `Ctrl+Shift+Tab` 只移动内部 `tab_strip` 索引却不真正 resume，应改为真实切换或移除；保留 Shift-Tab 的 plan mode 语义，并在 footer / 帮助中准确展示快捷键。
-- [ ] 在 footer session strip 和 `/sessions` 列表统一显示 active、未读、思考中、工具执行中、等待 approval / question、失败等状态；提供“下一个未读 / 需要处理的 session”快捷键。
+- [x] 在 footer session strip 和 `/sessions` 列表统一显示 active、未读、思考中、工具执行中、等待 approval / question、失败等状态；提供“下一个未读 / 需要处理的 session”快捷键。（状态徽标已落地；下一未读快捷键待补）
 - [ ] session 列表刷新时保持稳定顺序和 active 项位置，避免周期刷新造成标签来回跳动；fork 家族使用稳定分组，并清楚标识父子关系。
 - [ ] `/sessions` 支持即时模糊搜索，可按标题、短 session id、工作目录和模型过滤；默认保留当前工作区范围并明确显示过滤范围。
 - [ ] footer session strip 支持鼠标点击切换和滚轮横向浏览；溢出时保持 active 可见，并给截断标题提供完整信息查看方式。
-- [ ] session 标题更新采用本地乐观更新，失败再回滚；避免新 session 在短 id、`main` 和真实标题之间反复闪动。
-- [ ] `/new`、`/fork` 创建成功后立即加入 session strip，并明确当前仍在原 session 还是已切到新 session；fork 显示可辨认的来源。
+- [x] session 标题更新采用本地乐观更新，失败再回滚；避免新 session 在短 id、`main` 和真实标题之间反复闪动。
+- [x] `/new`、`/fork` 创建成功后立即加入 session strip，并明确当前仍在原 session 还是已切到新 session；fork 显示可辨认的来源。
 
 ### P1：关闭、删除与忙碌会话安全
 
-- [ ] 区分“关闭当前 TUI 页签”和“永久删除 session 历史”；`Ctrl-D` 文案与行为必须一致，永久删除使用更明确的二次确认，并评估 archive / undo 能力。
-- [ ] 关闭或切换正在运行的 session 时明确提供“后台继续、先中断、取消”语义；不能未经说明直接 interrupt 或删除。
-- [ ] 删除当前 session 后先可靠选出 fallback，再原子切换；失败时不得落入空白 / 半初始化界面，也不得丢失原 session 的 approval、question 或草稿。
+- [x] 区分“关闭当前 TUI 页签”和“永久删除 session 历史”；`Ctrl-D` 文案与行为必须一致，永久删除使用更明确的二次确认，并评估 archive / undo 能力。（评估 archive/undo：暂缓，见文末）
+- [x] 关闭或切换正在运行的 session 时明确提供“后台继续、先中断、取消”语义；不能未经说明直接 interrupt 或删除。（关页签=后台继续；永久删除才 interrupt）
+- [x] 删除当前 session 后先可靠选出 fallback，再原子切换；失败时不得落入空白 / 半初始化界面，也不得丢失原 session 的 approval、question 或草稿。
 
 ### 验收与回归测试
 
