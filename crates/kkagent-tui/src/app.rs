@@ -157,6 +157,7 @@ pub struct FileMenuState {
 pub enum ListPickerKind {
     Model,
     Session,
+    Permission,
 }
 
 #[derive(Debug, Clone)]
@@ -1795,7 +1796,7 @@ impl TuiApp {
         } else if submit_if_ready
             && matches!(
                 item.name.as_str(),
-                "model" | "sessions" | "resume" | "tasks" | "task"
+                "model" | "sessions" | "resume" | "tasks" | "task" | "permission"
             )
         {
             self.state.input.clear();
@@ -1803,6 +1804,7 @@ impl TuiApp {
                 "model" => self.open_model_picker(),
                 "sessions" | "resume" => self.open_session_picker().await?,
                 "tasks" | "task" => self.open_tasks_panel().await?,
+                "permission" => self.open_permission_picker(),
                 _ => {}
             }
         } else {
@@ -1906,8 +1908,74 @@ impl TuiApp {
             ListPickerKind::Session => {
                 self.resume_session(&item.id).await?;
             }
+            ListPickerKind::Permission => {
+                self.apply_permission_mode_id(&item.id).await?;
+            }
         }
         Ok(())
+    }
+
+    async fn apply_permission_mode_id(&mut self, id: &str) -> anyhow::Result<()> {
+        let new_mode: PermissionMode = id
+            .parse()
+            .map_err(|e: String| anyhow::anyhow!(e))?;
+        if new_mode == self.state.permission_mode {
+            self.system_message(format!("Permission mode already: {new_mode}"));
+            return Ok(());
+        }
+        self.state.permission_mode = new_mode;
+        if let Some(sid) = &self.state.session_id {
+            self.client.set_permission_mode(sid, new_mode).await?;
+        }
+        self.system_message(format!("Permission mode: {new_mode}"));
+        Ok(())
+    }
+
+    fn open_permission_picker(&mut self) {
+        let current = self.state.permission_mode;
+        let modes = [
+            (
+                PermissionMode::Manual,
+                "manual",
+                "Ask before tools / writes",
+            ),
+            (
+                PermissionMode::Yolo,
+                "yolo",
+                "Auto-approve tools (still careful)",
+            ),
+            (
+                PermissionMode::Auto,
+                "auto",
+                "Fully autonomous — agent decides",
+            ),
+        ];
+        let mut selected = 0;
+        let items: Vec<ListPickerItem> = modes
+            .into_iter()
+            .enumerate()
+            .map(|(i, (mode, id, detail))| {
+                if mode == current {
+                    selected = i;
+                }
+                let label = if mode == current {
+                    format!("{id}  (current)")
+                } else {
+                    id.to_string()
+                };
+                ListPickerItem {
+                    id: id.to_string(),
+                    label,
+                    detail: detail.to_string(),
+                }
+            })
+            .collect();
+        self.state.list_picker = Some(ListPickerState {
+            kind: ListPickerKind::Permission,
+            title: " Select permission mode ".into(),
+            items,
+            selected,
+        });
     }
 
     fn open_model_picker(&mut self) {
@@ -2545,16 +2613,7 @@ impl TuiApp {
                 self.system_message(format!("Permission mode: {}", new_mode));
             }
             "permission" => {
-                let new_mode = match self.state.permission_mode {
-                    PermissionMode::Manual => PermissionMode::Yolo,
-                    PermissionMode::Yolo => PermissionMode::Auto,
-                    PermissionMode::Auto => PermissionMode::Manual,
-                };
-                self.state.permission_mode = new_mode;
-                if let Some(sid) = &self.state.session_id {
-                    self.client.set_permission_mode(sid, new_mode).await?;
-                }
-                self.system_message(format!("Permission mode: {}", new_mode));
+                self.open_permission_picker();
             }
             "plan" => {
                 if args.eq_ignore_ascii_case("clear") {

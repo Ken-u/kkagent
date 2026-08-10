@@ -49,7 +49,7 @@ pub const BUILTIN_SLASH_COMMANDS: &[SlashCommand] = &[
     SlashCommand {
         name: "permission",
         aliases: &[],
-        description: "Cycle permission mode (manual → yolo → auto)",
+        description: "Choose permission mode (manual / yolo / auto)",
         priority: 100,
         argument_hint: None,
     },
