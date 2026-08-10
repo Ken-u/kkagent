@@ -51,6 +51,36 @@ pub struct AppConfig {
     pub services: Option<ServicesConfig>,
     #[serde(default)]
     pub mcp_servers: HashMap<String, McpServerConfig>,
+    /// TUI / accessibility / update preferences.
+    #[serde(default)]
+    pub ui: UiConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UiConfig {
+    /// High-contrast theme preference (text/symbols over color alone).
+    #[serde(default)]
+    pub high_contrast: bool,
+    /// Reduce spinner / animation updates.
+    #[serde(default)]
+    pub reduce_motion: bool,
+    /// Check crates.io / release notes when idle (cached).
+    #[serde(default = "default_true")]
+    pub check_updates: bool,
+    /// Optional key override map: action name → key chord (e.g. "interrupt" = "ctrl-c").
+    #[serde(default)]
+    pub keybindings: HashMap<String, String>,
+}
+
+impl Default for UiConfig {
+    fn default() -> Self {
+        Self {
+            high_contrast: false,
+            reduce_motion: false,
+            check_updates: true,
+            keybindings: HashMap::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
