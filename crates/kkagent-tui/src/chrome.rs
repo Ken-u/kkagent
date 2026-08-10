@@ -22,7 +22,7 @@ fn session_status_mark(entry: &WorkspaceSessionEntry) -> &'static str {
         return "*";
     }
     match entry.status {
-        SessionStatus::Thinking | SessionStatus::ToolExecuting | SessionStatus::Compacting => "…",
+        SessionStatus::Thinking | SessionStatus::ToolExecuting | SessionStatus::Compacting | SessionStatus::Cancelling => "…",
         SessionStatus::WaitingApproval | SessionStatus::WaitingQuestion => "?",
         SessionStatus::Idle => "",
     }
@@ -579,6 +579,7 @@ impl StatusBarModel {
             SessionStatus::WaitingApproval => "approval",
             SessionStatus::WaitingQuestion => "question",
             SessionStatus::Compacting => "compact",
+            SessionStatus::Cancelling => "cancelling",
         };
         spans.push(Span::raw(format!("│ {status} ")));
         if let Some(ref m) = self.model {

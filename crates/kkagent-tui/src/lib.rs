@@ -21,6 +21,7 @@ pub mod selection;
 pub mod session_view;
 pub mod slash;
 pub mod streaming;
+pub mod test_summary;
 pub mod theme;
 pub mod tool_renderers;
 

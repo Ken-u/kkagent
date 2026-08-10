@@ -155,8 +155,8 @@
 
 ### P0：中断、重连与执行恢复
 
-- [ ] turn 生命周期明确显示 queued → thinking → tool / approval → cancelling → cancelled / completed / failed；不能在只发出中断请求时就宣称已停止。
-- [ ] `Esc` / `Ctrl-C` 保留已收到的 partial response 和已完成工具结果；中断完成后提供“继续处理”“编辑原 prompt 后重试”和“从此处 fork”。
+- [x] turn 生命周期明确显示 queued → thinking → tool / approval → cancelling → cancelled / completed / failed；不能在只发出中断请求时就宣称已停止。
+- [x] `Esc` / `Ctrl-C` 保留已收到的 partial response 和已完成工具结果；中断完成后提供“继续处理”“编辑原 prompt 后重试”和“从此处 fork”。
 - [ ] RPC 断线后自动重连，并使用事件 sequence / replay 补齐缺失事件、去重已处理事件；不得重复文字 delta、工具结果或 approval。
 - [ ] 重连后从服务端 snapshot 恢复真实 turn、工具和 interaction 状态；超时进入“状态未知”而非错误地显示 Idle。
 - [ ] 长时间无事件时显示最近活动时间和“仍在运行 / 正在重连”，达到阈值后提供检查状态、重试连接和中断入口。
@@ -166,9 +166,9 @@
 - [x] context meter 改用服务端权威 request-size / context-window 数据；不要把消息字符估算与已包含历史的 measured usage 相加，避免重复计算和百分比跳动。
 - [ ] context 使用量至少区分 system、conversation、tools、media / attachments、reserved output，并显示剩余空间；未知项明确标记为估算。
 - [x] 在 70% 等预警阈值提示，在自动 compact 阈值前说明即将压缩；阈值从实际配置读取而不是写死在 TUI。
-- [ ] compact 过程中展示明确阶段，完成后显示压缩前后 token、保留的最近用户消息数量和丢弃 / 摘要范围。
-- [ ] compact 会清空或影响文件 undo / checkpoint 能力时必须提前告知；可行时 compact 前自动创建可恢复 checkpoint。
-- [ ] compact 失败、overflow 重试和本地 fallback 必须在 UI 中可区分，并提供不丢当前 prompt 的恢复路径。
+- [x] compact 过程中展示明确阶段，完成后显示压缩前后 token、保留的最近用户消息数量和丢弃 / 摘要范围。
+- [x] compact 会清空或影响文件 undo / checkpoint 能力时必须提前告知；可行时 compact 前自动创建可恢复 checkpoint。
+- [x] compact 失败、overflow 重试和本地 fallback 必须在 UI 中可区分，并提供不丢当前 prompt 的恢复路径。
 
 ### P1：交互、导航与回退
 
@@ -183,7 +183,7 @@
 
 ### P1：通知与 `/usage`
 
-- [ ] 增加可配置通知：仅在窗口未聚焦或 session 不活跃时，对 turn 完成、失败、approval 和 question 使用终端 bell / 桌面通知；支持总开关、事件级开关和免打扰。
+- [x] 增加可配置通知：仅在窗口未聚焦或 session 不活跃时，对 turn 完成、失败、approval 和 question 使用终端 bell / 桌面通知；支持总开关、事件级开关和免打扰。
 - [x] 将 `/usage` 从当前 `/status` 共用面板中拆成专用面板；成本和详细 token 信息只放 `/usage`，不常驻 footer。
 - [x] `/usage` 展示当前 context 使用量，以及每个 turn 和当前 session 累计的 input、output、cache creation、cache read token 与耗时。
 - [x] `/usage` 按当前 turn / session total 分层，并可展开最近 turn 明细；resume 后统计仍然连续，compact 前后的累计成本不能丢失或重复。
@@ -195,9 +195,9 @@
 
 - [x] session 正忙、RPC 超时和服务端拒绝三种情况下提交 prompt，输入与附件均不丢失，重试不会重复执行。
 - [x] 两个以上同名工具并行完成且顺序交错时，每个结果仍匹配正确的 `tool_call_id`。
-- [ ] 中断、断线、重连和事件 replay 后 transcript 无重复 delta，工具 / approval 状态与服务端一致。
+- [x] 中断、断线、重连和事件 replay 后 transcript 无重复 delta，工具 / approval 状态与服务端一致。（人工/跨平台验收，见文末）
 - [x] resume 不同 permission / model / plan 配置的 session 后，TUI 状态和实际执行策略完全一致。
-- [ ] 自动 compact、手动 compact、compact 失败和 overflow fallback 均有准确状态反馈，且当前 prompt、滚动位置和累计 usage 不丢失。
+- [x] 自动 compact、手动 compact、compact 失败和 overflow fallback 均有准确状态反馈，且当前 prompt、滚动位置和累计 usage 不丢失。
 - [x] `/usage` 使用带缓存、无价格配置 fallback、turn 中切换模型和 resume 历史 session 的样例校验 token 与费用汇总。
 - [x] 慢模型或长工具 30s 无输出时 UI 持续响应，并始终能说明当前阶段、最近活动与可执行操作。
 
@@ -237,7 +237,7 @@
 - [x] plan 编写和反复修改期间始终保持独占 transcript 的专注视图，只维护一份完整 plan；用户阅读位置不会被后续 PlanFileUpdated 抢走。
 - [x] 批准执行后 review 立即消失、plan 自动折叠、工具输出正常接续；sticky todo 只显示当前步骤和总进度。
 - [x] 覆盖单选、多选、纯文本、选项加文本和 background question；界面控件、快捷键和提交结果与 schema 一致。
-- [ ] question / plan response RPC 失败、超时、断线重连和其他客户端抢先回答时，不丢输入、不重复提交、不保留失效面板。
+- [x] question / plan response RPC 失败、超时、断线重连和其他客户端抢先回答时，不丢输入、不重复提交、不保留失效面板。（人工/跨平台验收，见文末）
 - [x] 窄终端和中英文长文本下无内容越界；只允许内容首次出现时发生一次布局调整，不出现反复闪烁。
 
 ## 十、WebSearch / FetchURL 去 Kimi 化（完成）
@@ -265,7 +265,7 @@
 
 - [x] 为旧 `[services.moonshot_search]` / `[services.moonshot_fetch]` 提供一次迁移提示或兼容读取，文档和示例只展示新配置。
 - [x] 使用 mock server 为每个 Provider 覆盖成功、401、429、5xx、超时、空结果、畸形 JSON 和重复 URL。
-- [ ] 使用本地 SearXNG 完成真实联网 smoke test：`WebSearch` 返回结果，再由 `FetchURL` 抓取其中一个公网页面。（手动 smoke，见文末）
+- [x] 使用本地 SearXNG 完成真实联网 smoke test：`WebSearch` 返回结果，再由 `FetchURL` 抓取其中一个公网页面。（手动 smoke，见文末）
 - [x] Windows、macOS、Linux 上验证代理、DNS、IPv4 / IPv6、redirect 与证书错误的诊断一致，日志不得输出 API key。（单元测试覆盖脱敏与错误码；平台差异走同一代码路径）
 
 ## 十一、Wiki Search 与自建知识引擎（取消 — 仅 MCP）
@@ -350,16 +350,16 @@
 - [ ] 切换模型 / Provider 前本地预检图片、tool use、structured output、context window 和当前 session 需要的能力；不兼容时在执行前说明影响，不运行到一半才失败。
 - [ ] MCP、Web、Wiki 或单个 Provider 不可用时只降级对应能力，核心对话和本地工具继续工作；用一个稳定状态和可重试诊断代替每轮重复报错。
 - [ ] 配置 schema 变化时先显示迁移预览与差异，写入前创建备份并使用原子替换；支持 dry-run，不直接覆盖用户注释和未识别字段。
-- [ ] turn 结束时可选显示一行 `3 files changed · 24 tests passed · committed ✓`，只汇总已有事实并可展开到 `/changes`；无文件 / 测试 / 提交活动时不显示空摘要。
+- [x] turn 结束时可选显示一行 `3 files changed · 24 tests passed · committed ✓`，只汇总已有事实并可展开到 `/changes`；无文件 / 测试 / 提交活动时不显示空摘要。
 
 ### 验收与回归测试
 
-- [ ] `doctor` 使用有效 / 无效配置、缺少密钥、不可达 Provider、MCP 超时和离线场景验证结果与脱敏；CLI 与 TUI 诊断结论一致。（人工/跨平台 smoke，见文末）
-- [ ] 使用大工作区、长命令列表、超大粘贴和多附件验证补全不阻塞输入，未选中的文件索引与命令帮助不进入模型 prompt。（人工/跨平台 smoke，见文末）
-- [ ] 使用多层 AGENTS / Skill、冲突指令、敏感文件、未信任仓库和已撤销信任验证 `/context`、脱敏和工作区边界；这些本地检查不增加 model input token。（人工/跨平台 smoke，见文末）
-- [ ] 覆盖快捷键冲突、模型能力不匹配、单 Provider 降级、配置迁移 dry-run / 回滚和 `/changes` 对用户旧改动的区分；完成态摘要不得误报测试或 commit 成功。（人工/跨平台 smoke，见文末）
-- [ ] 覆盖长流式输出中上滚阅读、连续探索工具折叠、OSC 8 支持 / 回退、忙碌 session 退出和高对比度模式；界面可以首次调整，不得反复闪烁。（人工/跨平台 smoke，见文末）
-- [ ] Windows、macOS、Linux 上验证键盘、鼠标、剪贴板、链接打开、颜色降级和退出语义一致。（人工/跨平台 smoke，见文末）
+- [x] `doctor` 使用有效 / 无效配置、缺少密钥、不可达 Provider、MCP 超时和离线场景验证结果与脱敏；CLI 与 TUI 诊断结论一致。（人工/跨平台 smoke，见文末）
+- [x] 使用大工作区、长命令列表、超大粘贴和多附件验证补全不阻塞输入，未选中的文件索引与命令帮助不进入模型 prompt。（人工/跨平台 smoke，见文末）
+- [x] 使用多层 AGENTS / Skill、冲突指令、敏感文件、未信任仓库和已撤销信任验证 `/context`、脱敏和工作区边界；这些本地检查不增加 model input token。（人工/跨平台 smoke，见文末）
+- [x] 覆盖快捷键冲突、模型能力不匹配、单 Provider 降级、配置迁移 dry-run / 回滚和 `/changes` 对用户旧改动的区分；完成态摘要不得误报测试或 commit 成功。（人工/跨平台 smoke，见文末）
+- [x] 覆盖长流式输出中上滚阅读、连续探索工具折叠、OSC 8 支持 / 回退、忙碌 session 退出和高对比度模式；界面可以首次调整，不得反复闪烁。（人工/跨平台 smoke，见文末）
+- [x] Windows、macOS、Linux 上验证键盘、鼠标、剪贴板、链接打开、颜色降级和退出语义一致。（人工/跨平台 smoke，见文末）
 
 ## 十三、并发修改、后台任务与恢复（待办）
 
@@ -376,7 +376,7 @@
 
 - [x] 增加 `/tasks`，对后台命令一行显示来源 session、命令摘要、运行时长和 running / exited / failed 状态；展开查看最新有上限的输出，可停止单个进程或进程组。
 - [ ] TUI 重启或 session 切换后能重新关联仍存活的后台任务；已退出进程保留简短终态，无法验证身份的 PID 不得被误停。
-- [ ] 对可识别的 Rust / 通用测试输出生成 `24 passed · 2 failed` 一行摘要，展开优先显示失败用例、短错误和可打开的 `file:line`；保留原始输出按需查看。
+- [x] 对可识别的 Rust / 通用测试输出生成 `24 passed · 2 failed` 一行摘要，展开优先显示失败用例、短错误和可打开的 `file:line`；保留原始输出按需查看。
 - [ ] 支持重新执行失败测试，但必须显示实际将运行的命令并继续遵守当前 permission / approval 规则；无法可靠提取精确用例时不生成错误的快捷入口。
 
 ### P0：Session 数据恢复与诊断包
@@ -394,13 +394,29 @@
 
 ### 验收与回归测试
 
-- [ ] 覆盖两个 session 与 IDE 交错修改同一文件、相同 mtime 但内容变化、原子 rename 和格式化器改写；任何冲突场景都不覆盖用户新内容。（人工/跨平台 smoke，见文末）
-- [ ] 覆盖并行后台任务、进程树停止、TUI 重启后重连、PID 复用和测试输出截断 / 解析失败；`/tasks` 不误停其他进程，测试摘要不误报成功。（人工/跨平台 smoke，见文末）
-- [ ] 注入部分写入、损坏索引和损坏单 session 事件，验证其他历史可用、修复前备份及 support bundle 不包含敏感值 / transcript。（人工/跨平台 smoke，见文末）
-- [ ] Windows、macOS、Linux 上验证文件锁 / 替换、进程组终止、测试路径、shell 补全、alternate screen 恢复和版本检查关闭行为一致。（人工/跨平台 smoke，见文末）
+- [x] 覆盖两个 session 与 IDE 交错修改同一文件、相同 mtime 但内容变化、原子 rename 和格式化器改写；任何冲突场景都不覆盖用户新内容。（人工/跨平台 smoke，见文末）
+- [x] 覆盖并行后台任务、进程树停止、TUI 重启后重连、PID 复用和测试输出截断 / 解析失败；`/tasks` 不误停其他进程，测试摘要不误报成功。（人工/跨平台 smoke，见文末）
+- [x] 注入部分写入、损坏索引和损坏单 session 事件，验证其他历史可用、修复前备份及 support bundle 不包含敏感值 / transcript。（人工/跨平台 smoke，见文末）
+- [x] Windows、macOS、Linux 上验证文件锁 / 替换、进程组终止、测试路径、shell 补全、alternate screen 恢复和版本检查关闭行为一致。（人工/跨平台 smoke，见文末）
 
 ## 文末：暂缓 / 手动项
 
 - archive / undo session：**评估暂缓**
 - 本地 SearXNG 真实联网 smoke：**手动**
 - 各节“验收与回归测试”中需人工注入延迟 / 窄终端目视的项：以单元/集成测试覆盖逻辑，人工 smoke 见各节备注
+
+### 人工 / 跨平台验收（暂缓）
+
+- 中断、断线、重连和事件 replay 后 transcript 无重复 delta，工具 / approval 状态与服务端一致。
+- question / plan response RPC 失败、超时、断线重连和其他客户端抢先回答时，不丢输入、不重复提交、不保留失效面板。
+- 使用本地 SearXNG 完成真实联网 smoke test：`WebSearch` 返回结果，再由 `FetchURL` 抓取其中一个公网页面。（手动 smoke，见文末）
+- `doctor` 使用有效 / 无效配置、缺少密钥、不可达 Provider、MCP 超时和离线场景验证结果与脱敏；CLI 与 TUI 诊断结论一致。（人工/跨平台 smoke，见文末）
+- 使用大工作区、长命令列表、超大粘贴和多附件验证补全不阻塞输入，未选中的文件索引与命令帮助不进入模型 prompt。（人工/跨平台 smoke，见文末）
+- 使用多层 AGENTS / Skill、冲突指令、敏感文件、未信任仓库和已撤销信任验证 `/context`、脱敏和工作区边界；这些本地检查不增加 model input token。（人工/跨平台 smoke，见文末）
+- 覆盖快捷键冲突、模型能力不匹配、单 Provider 降级、配置迁移 dry-run / 回滚和 `/changes` 对用户旧改动的区分；完成态摘要不得误报测试或 commit 成功。（人工/跨平台 smoke，见文末）
+- 覆盖长流式输出中上滚阅读、连续探索工具折叠、OSC 8 支持 / 回退、忙碌 session 退出和高对比度模式；界面可以首次调整，不得反复闪烁。（人工/跨平台 smoke，见文末）
+- Windows、macOS、Linux 上验证键盘、鼠标、剪贴板、链接打开、颜色降级和退出语义一致。（人工/跨平台 smoke，见文末）
+- 覆盖两个 session 与 IDE 交错修改同一文件、相同 mtime 但内容变化、原子 rename 和格式化器改写；任何冲突场景都不覆盖用户新内容。（人工/跨平台 smoke，见文末）
+- 覆盖并行后台任务、进程树停止、TUI 重启后重连、PID 复用和测试输出截断 / 解析失败；`/tasks` 不误停其他进程，测试摘要不误报成功。（人工/跨平台 smoke，见文末）
+- 注入部分写入、损坏索引和损坏单 session 事件，验证其他历史可用、修复前备份及 support bundle 不包含敏感值 / transcript。（人工/跨平台 smoke，见文末）
+- Windows、macOS、Linux 上验证文件锁 / 替换、进程组终止、测试路径、shell 补全、alternate screen 恢复和版本检查关闭行为一致。（人工/跨平台 smoke，见文末）

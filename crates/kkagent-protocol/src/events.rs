@@ -186,6 +186,8 @@ pub enum SessionStatus {
     WaitingApproval,
     WaitingQuestion,
     Compacting,
+    /// Interrupt requested; waiting for the turn to settle.
+    Cancelling,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

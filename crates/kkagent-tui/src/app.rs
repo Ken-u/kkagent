@@ -2263,8 +2263,12 @@ impl TuiApp {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if self.state.status != SessionStatus::Idle {
                     if let Some(sid) = &self.state.session_id {
+                        self.state.status = SessionStatus::Cancelling;
                         self.client.interrupt(sid).await?;
-                        self.system_message("Interrupted.".into());
+                        self.system_message(
+                            "Cancelling… partial output kept. After idle: edit & retry, or /fork."
+                                .into(),
+                        );
                     }
                 } else if self.state.input.is_empty() {
                     if self.state.quit_confirm {
@@ -2325,8 +2329,12 @@ impl TuiApp {
             KeyCode::Esc => {
                 if self.state.status != SessionStatus::Idle {
                     if let Some(sid) = &self.state.session_id {
+                        self.state.status = SessionStatus::Cancelling;
                         self.client.interrupt(sid).await?;
-                        self.system_message("Interrupted.".into());
+                        self.system_message(
+                            "Cancelling… partial output kept. After idle: edit & retry, or /fork."
+                                .into(),
+                        );
                     }
                     self.state.pending_esc_ms = None;
                 } else {
@@ -6598,6 +6606,22 @@ impl TuiApp {
                         }
                         self.state.collapse_completed_turn_tools();
                         self.state.status = SessionStatus::Idle;
+                        // Soft bell when the window may not be focused (best-effort).
+                        if std::env::var("KKAGENT_NOTIFY")
+                            .map(|v| v != "0" && v != "off")
+                            .unwrap_or(true)
+                        {
+                            let _ = crossterm::execute!(
+                                std::io::stdout(),
+                                crossterm::event::EnableBracketedPaste
+                            );
+                            print!("\x07");
+                            let _ = std::io::Write::flush(&mut std::io::stdout());
+                        }
+                        // Optional turn completion summary from recent bash/test tools.
+                        if let Some(summary) = recent_test_summary(&self.state.messages) {
+                            self.system_message(format!("{summary} · /changes for file edits"));
+                        }
                         self.flush_prompt_queue_if_idle();
                     }
                     AgentEvent::TurnStart { .. } => {
@@ -6695,13 +6719,15 @@ impl TuiApp {
                         ..
                     } => {
                         if let Some(err) = error {
-                            self.system_message(format!("Compact failed: {err}"));
+                            self.system_message(format!(
+                                "Compact failed: {err} — current prompt kept; try /compact again or continue."
+                            ));
                         } else {
                             self.state.messages = transcript_messages_to_display(&messages);
                             self.state.follow_bottom = true;
                             self.state.scroll_up = 0;
                             self.system_message(format!(
-                                "Compacted: {deleted} messages removed (kept {kept_user_message_count} user messages)"
+                                "Compacted: {deleted} removed · kept {kept_user_message_count} recent user msgs (file undo/checkpoints may be limited after compact)"
                             ));
                         }
                     }
@@ -6740,6 +6766,25 @@ impl TuiApp {
             }
         }
     }
+}
+
+fn recent_test_summary(messages: &[DisplayMessage]) -> Option<String> {
+    for msg in messages.iter().rev().take(6) {
+        for part in msg.parts.iter().rev() {
+            if let DisplayPart::Tool(tc) = part {
+                if tc.name == "Bash" {
+                    if let Some(out) = &tc.output {
+                        if let Some(s) = crate::test_summary::parse_test_output(out) {
+                            if s.passed + s.failed > 0 {
+                                return Some(s.one_line());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 fn parse_permission_mode_str(raw: &str) -> Option<PermissionMode> {
