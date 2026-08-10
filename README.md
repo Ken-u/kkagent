@@ -1,472 +1,215 @@
 # kkagent
 
+[English](README.en.md) | 简体中文
+
+[![CI](https://github.com/bianjinchen/kkagent/actions/workflows/ci.yml/badge.svg)](https://github.com/bianjinchen/kkagent/actions/workflows/ci.yml)
+[![Release](https://github.com/bianjinchen/kkagent/actions/workflows/release.yml/badge.svg)](https://github.com/bianjinchen/kkagent/actions/workflows/release.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Rust: 1.88+](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org/)
+
 用 Rust 实现、面向生产使用的终端 Coding Agent，核心交互与运行时对齐 kimi-code CLI。
-TUI 与 Agent Server 可分离，中间走 RPC（当前默认进程内 memory transport；也支持独立 `server` 模式）。
+TUI 与 Agent Server 可分离，中间走 RPC（默认进程内 memory transport；也支持独立 `server` 模式）。
 
 - 低内存、高性能
 - 支持 Win / macOS / Linux（x86_64 / arm64）
-- 权限模式：`manual` / `yolo` / `auto`
-- 内置工具：Read / Write / Edit / Grep / Glob / Bash / TodoList / Goal / Task
+- 权限模式：`manual` / `yolo` / `auto` / `plan`
+- 内置工具：Read / Write / Edit / Grep / Glob / Bash / TodoList / Goal / Task / AskUser / SelectTools / Cron / Web / Media / Skill / Plan
 - 会话、事件、turn 队列和后台 Agent 任务统一持久化到 `~/.kkagent/transcripts.db`
 - Bash 系统隔离：Linux Bubblewrap、macOS Seatbelt、Windows Job Object
 - MCP / Skills / Hooks（配置驱动）
 
-## 文档导航
+## 快速安装
 
-完整手册见 [docs/README.md](docs/README.md)：
-
-- [安装与快速开始](docs/getting-started.md)
-- [发布与安装包](docs/releases.md)
-- [完整配置参考](docs/configuration.md)
-- [CLI 与 TUI](docs/cli-and-tui.md)
-- [工具与权限](docs/tools-and-permissions.md)
-- [Agent Server API](docs/server-api.md)
-- [扩展机制](docs/extensions.md)
-- [安全与运维](docs/security.md)
-- [架构与开发](docs/architecture.md)
-- [故障排查](docs/troubleshooting.md)
-
----
-
-## 1. 怎么编译
-
-### 依赖
-
-- Rust **1.88+**（仓库通过 `rust-toolchain.toml` 固定最低工具链）
-- 系统：macOS / Linux / Windows
-
-```bash
-rustc --version
-cargo --version
-```
-
-### Debug 构建
-
-```bash
-cd /path/to/kkagent
-cargo build
-# 产物：target/debug/kkagent
-```
-
-或：
-
-```bash
-make build
-```
-
-### Release 构建（推荐日常使用）
-
-```bash
-cargo build --release
-# 产物：target/release/kkagent
-```
-
-或：
-
-```bash
-make release
-```
-
-### 从 GitHub Release 安装
-
-macOS / Linux：
+### macOS / Linux（推荐）
 
 ```bash
 curl -fsSLO https://raw.githubusercontent.com/bianjinchen/kkagent/main/install.sh
 sh install.sh
 ```
 
-Windows PowerShell：
+脚本默认安装到 `/usr/local/bin`，可通过环境变量覆盖：
+
+```bash
+KKAGENT_INSTALL_DIR=$HOME/.local/bin sh install.sh
+```
+
+### 手动下载
+
+从 [GitHub Releases](https://github.com/bianjinchen/kkagent/releases/latest) 下载对应平台的 tar.gz / zip，解压后将 `kkagent` 放到 `PATH` 中即可。
+
+当前发布矩阵：
+
+| 平台 | 架构 | 产物 |
+|---|---|---|
+| macOS | x86_64 / arm64 | `kkagent-x86_64-apple-darwin.tar.gz` / `kkagent-aarch64-apple-darwin.tar.gz` |
+| Linux (glibc) | x86_64 / arm64 | `kkagent-x86_64-unknown-linux-gnu.tar.gz` / `kkagent-aarch64-unknown-linux-gnu.tar.gz` |
+| Linux (musl) | x86_64 / arm64 | `kkagent-x86_64-unknown-linux-musl.tar.gz` / `kkagent-aarch64-unknown-linux-musl.tar.gz` |
+| Windows | x86_64 / arm64 | `kkagent-x86_64-pc-windows-msvc.zip` / `kkagent-aarch64-pc-windows-msvc.zip` |
+
+### Windows（PowerShell）
 
 ```powershell
-irm https://raw.githubusercontent.com/bianjinchen/kkagent/main/install.ps1 -OutFile install.ps1
-./install.ps1
+irm https://raw.githubusercontent.com/bianjinchen/kkagent/main/install.ps1 | iex
 ```
 
-安装器会自动选择 x86_64/arm64 产物，并在安装前校验 `SHA256SUMS`。如果仓库地址不同，通过 `KKAGENT_REPOSITORY=owner/repository` 覆盖。完整产物、签名验证和自定义安装目录见[发布与安装包](docs/releases.md)。
+或先下载再执行：
 
-### 从源码安装到 PATH（可选）
-
-```bash
-make install
-# 拷贝到 /usr/local/bin/kkagent
+```powershell
+curl -fsSLO https://raw.githubusercontent.com/bianjinchen/kkagent/main/install.ps1
+.\install.ps1
 ```
 
-### 跨平台交叉编译
+默认安装到 `%LOCALAPPDATA%\Programs\kkagent`，可通过环境变量覆盖：
 
-已装好 target 时：
-
-```bash
-# 单目标示例
-rustup target add aarch64-apple-darwin
-cargo build --release --target aarch64-apple-darwin
-
-# Release workflow 会构建以下六个目标
-# x86_64-apple-darwin / aarch64-apple-darwin
-# x86_64-unknown-linux-gnu / aarch64-unknown-linux-gnu
-# x86_64-pc-windows-msvc / aarch64-pc-windows-msvc
+```powershell
+$env:KKAGENT_INSTALL_DIR = "$env:USERPROFILE\bin"; .\install.ps1
 ```
 
-> 交叉编译可能还需要对应 linker 或 SDK；正式发布由各系统的 GitHub runner 构建，本机原生 `cargo build --release` 最稳。
+## 30 秒上手
 
----
-
-## 2. 配置怎么写
-
-### 配置路径
-
-优先级：
-
-1. 命令行 `--config /path/to/config.toml`
-2. 默认：`~/.kkagent/config.toml`
-
-首次使用直接运行向导：
+1. 初始化配置（交互式向导）：
 
 ```bash
 kkagent init
-kkagent doctor
 ```
 
-无人值守环境可以显式给出参数：
-
-```bash
-kkagent init --provider openai --model gpt-example --preset safe --non-interactive
-```
-
-也可以从模板手工创建：
-
-```bash
-mkdir -p ~/.kkagent
-cp examples/config.example.toml ~/.kkagent/config.toml
-# 再编辑 api_key / base_url / default_model
-```
-
-正式配置请放进 `~/.kkagent/config.toml`，不要把密钥提交进 git。工作区 `.env` 支持标准 `KEY=value` 密钥注入；为兼容旧开发环境，内容为 TOML 的 `.env` 仍可通过 `--config .env` 显式使用。
-
-### 最小可用配置
+或手动创建 `~/.kkagent/config.toml`：
 
 ```toml
-default_model = "local/claude-opus-4-8"
-default_permission_mode = "yolo"   # manual | yolo | auto
-default_plan_mode = false
+default_model = "kimi-k2-0711-preview"
 
-[providers.local]
-type = "anthropic"
-api_key = "sk-xxxx"
-base_url = "http://127.0.0.1:3000"   # Anthropic Messages 兼容端点
+[providers.kimi]
+api_base = "https://api.moonshot.cn/v1"
+api_key = "sk-..."
 
-[models."local/claude-opus-4-8"]
-provider = "local"
-model = "claude-opus-4-8"
-max_context_size = 262144
-max_output_size = 16384              # 建议 <= 16384，过大易被上游拒绝
-capabilities = ["tool_use", "image_in"]
-display_name = "claude-opus-4-8"
+[permissions]
+default_mode = "manual"
 ```
 
-说明：
-
-| 字段 | 含义 |
-|------|------|
-| `default_model` | 模型别名，必须对应 `models."别名"` |
-| `providers.*.type` | `anthropic`、`openai`、`openai_responses`、`kimi`、`google-genai` 使用各自的流式协议 |
-| `providers.*.base_url` | 可带或不带末尾 `/v1`，客户端会避免重复路径 |
-| `providers.*.api_key` | Anthropic 使用 `x-api-key`，OpenAI/Kimi 使用 Bearer token |
-| `models.*.model` | 发给上游的真实 model id |
-| `models.*.capabilities` | `tool_use` 启用工具；`image_in` 启用路径附件、粘贴和工具/MCP 图片输入；`thinking` 可按需开 |
-| `default_permission_mode` | `manual` 每次确认；`yolo` 自动批准常规工具；`auto` 更激进 |
-
-### MCP 服务器（可选）
-
-```toml
-[mcp_servers.filesystem]
-command = "npx"
-args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
-```
-
-### 权限规则（可选）
-
-```toml
-[[permission.rules]]
-decision = "allow"
-scope = "user"
-pattern = "Read"
-```
-
-### Skills / Hooks 目录
-
-| 路径 | 用途 |
-|------|------|
-| `~/.kkagent/skills/<name>/SKILL.md` | 全局 skill |
-| `.kkagent/skills/<name>/SKILL.md` | 项目 skill |
-| `AGENTS.md` | 项目约定（会被发现） |
-| `~/.kkagent/hooks.json` 或 `.kkagent/hooks.json` | Hook 脚本 |
-| `~/.kkagent/transcripts.db` | 会话 SQLite |
-
----
-
-## 3. 怎么用
-
-### 交互 TUI（默认）
+2. 启动 TUI：
 
 ```bash
-# 用默认配置
-./target/release/kkagent
-
-# 指定配置
-./target/release/kkagent --config ~/.kkagent/config.toml
-
-# 启动即 yolo / auto / plan
-./target/release/kkagent -y
-./target/release/kkagent --auto
-./target/release/kkagent --plan
+kkagent
 ```
 
-### 常用快捷键
-
-| 按键 | 作用 |
-|------|------|
-| Enter | 提交 |
-| Shift-Enter | 换行 |
-| Esc / Ctrl-C | 中断流式输出 |
-| Ctrl-C×2（空输入） | 退出 |
-| Ctrl-D（空输入） | 退出 |
-| Shift-Tab | 切换 Plan 模式 |
-| `!`（空输入） | Shell 模式 |
-| Ctrl-O | 折叠/展开工具输出 |
-
-### 斜杠命令
-
-| 命令 | 作用 |
-|------|------|
-| `/yolo` | 切换 YOLO |
-| `/auto` | 切换 Auto |
-| `/plan` | 切换 Plan（只读倾向） |
-| `/new` | 新会话 |
-| `/sessions` | 列出会话 |
-| `/resume <id>` | 恢复会话 |
-| `/compact` | 压缩历史 |
-| `/undo` | 撤销上一轮 |
-| `/model` | 查看/切换模型 |
-| `/help` | 帮助 |
-| `/exit` | 退出 |
-
-### 非交互打印模式（脚本 / CI / 烟雾测试）
+3. 非交互执行单次任务：
 
 ```bash
-./target/release/kkagent --config ~/.kkagent/config.toml \
-  -p "Read ./Cargo.toml and count workspace members"
+kkagent -y -p "Read ./Cargo.toml and count workspace members"
 ```
 
-输出写到 **stdout**，日志写到 **stderr**。
+更多用法见 [docs/cli-and-tui.md](docs/cli-and-tui.md)。
 
-调试日志：
+## 核心特性
+
+- **原生 Rust**：单二进制、低内存、秒级启动，跨平台原生支持。
+- **Agent 运行时**：多轮对话、工具调用循环、自动上下文压缩、token 预算与 turn 预算管理。
+- **TUI / Server 分离**：默认 TUI 与 Agent Server 在同一进程内通过 memory transport 通信；可用 `kkagent server` 启动独立后台，通过 UDS / TCP 连接。
+- **权限模型**：
+  - `manual`：每次写操作、Bash 等需要人工确认。
+  - `auto`：仅写文件与危险命令需确认，只读操作自动通过。
+  - `yolo`：完全自动通过，适合受信任的 CI / 自动化场景。
+  - `plan`：先审阅计划再执行，默认只读倾向。
+- **沙箱隔离**：Bash 默认使用系统级沙箱（Linux Bubblewrap、macOS Seatbelt、Windows Job Object），支持只读 / 限制网络等策略。
+- **持久化**：会话、事件、turn 队列和后台 Agent 任务统一写入 `~/.kkagent/transcripts.db`，支持 `--resume` 恢复。
+- **MCP 与 Skills**：通过配置接入外部 MCP Server，用 Skill 封装常用提示词和工具组合。
+- **可观测性**：结构化日志、HTTP 审计日志、telemetry 事件（可配置上报）。
+
+## 架构概览
+
+Workspace 包含 16 个 crate：
+
+| Crate | 说明 |
+|---|---|
+| `kkagent` | 主入口二进制，CLI / TUI 启动器。 |
+| `kkagent-protocol` | 跨 crate 的协议类型、消息与错误定义。 |
+| `kkagent-rpc` | RPC 传输层（memory / UDS / TCP）。 |
+| `kkagent-config` | TOML 配置加载、验证、环境变量覆盖。 |
+| `kkagent-llm` | LLM Provider 抽象、流解析、token 计数。 |
+| `kkagent-core` | Agent 主循环、上下文投影、权限链、计划审阅。 |
+| `kkagent-tools` | 内置工具实现与注册表。 |
+| `kkagent-mcp` | MCP Client / Server 支持。 |
+| `kkagent-client` | 高层客户端封装。 |
+| `kkagent-tui` | 终端交互界面。 |
+| `kkagent-di` | 依赖注入容器。 |
+| `kkagent-wire` | 序列化与消息编解码。 |
+| `kkagent-telemetry` | 遥测事件与可配置上报。 |
+| `kkagent-acp` | Agent-Client Protocol / 长连接协议实现。 |
+| `kkagent-oauth` | OAuth / 令牌管理。 |
+| `kkagent-kaos` | 混沌与压力测试辅助。 |
+
+### 内置工具清单
+
+| 类别 | 工具 | 说明 |
+|---|---|---|
+| 文件读写 | `Read` / `Write` / `Edit` / `Glob` | 读取、写入、行级编辑、批量查找。 |
+| 搜索 | `Grep` | 正则搜索，支持上下文与多文件过滤。 |
+| 执行 | `Bash` | 带沙箱与权限策略的命令执行，支持后台 shell。 |
+| 任务管理 | `TodoList` / `Goal` / `Task` | TODO 追踪、多轮目标、后台子 Agent 任务。 |
+| 交互 | `AskUserQuestion` / `SelectTools` | 用户确认、工具选择。 |
+| 上下文 | `Skill` | 加载并执行 skill 模板。 |
+| 计划 | `Plan` | 计划模式相关工具。 |
+| 定时 | `CronCreate` / `CronDelete` / `CronList` | 调度提示词到未来执行。 |
+| Web / 媒体 | `Web` / `Media` | 网页抓取、媒体文件读取。 |
+
+工具声明与权限策略由 `kkagent-tools` 统一管理，新增工具会自动进入权限评估流程。
+
+## 权限模式
+
+| 模式 | 行为 |
+|---|---|
+| `manual` | 每次写操作、Bash、危险命令都弹窗确认。 |
+| `auto` | 只读工具与低风险操作自动通过；写文件、Bash 仍需确认。 |
+| `yolo` | 全部操作自动批准，适合自动化脚本与受信环境。 |
+| `plan` | 先让 Agent 生成计划，用户审阅后再批量执行；默认只读倾向。 |
+
+启动时通过 `-y/--yolo`、`--auto`、`--plan` 切换，TUI 内可用 `/yolo`、`/auto`、`/plan` 动态切换。详见 [docs/tools-and-permissions.md](docs/tools-and-permissions.md)。
+
+## 配置参考
+
+kkagent 读取一份 TOML 配置：优先使用 `--config <path>`，否则读取 `~/.kkagent/config.toml`。常用命令：
 
 ```bash
-RUST_LOG=kkagent_core=info,kkagent_llm=debug \
-  ./target/release/kkagent --config ~/.kkagent/config.toml -p "Say hello"
+kkagent config show
+kkagent config get sandbox.mode
+kkagent config set sandbox.network false
+kkagent config preset safe
 ```
 
-### Kimi 托管账号登录
+完整配置项、Provider、Model、MCP、Hooks 说明见 [docs/configuration.md](docs/configuration.md)。
+
+## 文档索引
+
+- [安装与快速开始](docs/getting-started.md)
+- [配置参考](docs/configuration.md)
+- [CLI 与 TUI](docs/cli-and-tui.md)
+- [工具与权限](docs/tools-and-permissions.md)
+- [Agent Server API](docs/server-api.md)
+- [故障排查](docs/troubleshooting.md)
+- [发布与安装包](docs/releases.md)
+- [安全设计](docs/security.md)
+- [架构设计](docs/architecture.md)
+- [扩展机制](docs/extensions.md)
+- [运维与监控](docs/operations.md)
+- [Kimi Code 差异分析](docs/kimi-code-gap-analysis.md)
+- [开发与测试](docs/development.md)
+
+## 开发
 
 ```bash
-kkagent auth login
-kkagent auth status
-kkagent auth logout
-```
+git clone https://github.com/bianjinchen/kkagent.git
+cd kkagent
 
-登录使用 Kimi device-code OAuth。凭据以 `0600` 权限原子写入
-`~/.kkagent/credentials/kimi-code.json`，访问令牌过期前会自动刷新；登录成功后会从
-Kimi managed `/models` 拉取模型并更新 `~/.kkagent/config.toml`（使用 `--config` 时更新指定文件）。
+cargo build --release --workspace
+./target/release/kkagent --help
 
-TUI 模式下日志**不会**打印到屏幕（避免破坏布局），而是追加写入：
-
-```text
-~/.kkagent/kkagent.log
-```
-
-### 独立 Server 模式
-
-```bash
-./target/release/kkagent server --listen /tmp/kkagent.sock
-./target/release/kkagent server --http 127.0.0.1:8787 --http-token "$KKAGENT_HTTP_TOKEN"
-```
-
-直接 HTTP 文件写和 terminal API 默认关闭；只有确实需要时才增加
-`--allow-fs-write-api` / `--allow-terminal-api`。服务提供 `/api/v1/health`、
-`/api/v1/ready`、`/api/v1/metrics` 和带序号的事件回放。
-
-HTTP/WS API 始终启用认证：优先使用 `Authorization: Bearer <token>`，也兼容
-`?token=<token>`。如果未传 `--http-token` 且环境变量中没有
-`KKAGENT_HTTP_TOKEN`，服务会为本次进程生成高熵 token 并打印到 stderr。
-
-**TUI ↔ Server 配对：**
-
-| 启动方式 | 配对关系 | 退出行为 |
-|---------|---------|---------|
-| 默认 `kkagent`（无 subcommand） | 进程内 memory duplex，**1 个 TUI ↔ 1 个 server task** | Ctrl-C / `/exit` 退出 TUI 时会 `abort` 配对的 server task；不影响其他 `kkagent` 进程 |
-| `kkagent server` | 独立进程，UDS 监听；可被多个客户端连接（多 session） | 只有你停掉这个 server 进程它才退出；**不会**随某个 TUI 一起退出 |
-
-默认 TUI **不会**自动连到残留的 `server.sock`。若感觉「连上了旧对话」，多半是 `--resume` / 历史 transcript，或另开了一个仍在跑的 `kkagent server`，而不是默认 TUI 跨进程复用。
-
-需要复用显式启动的服务时，TUI 和非交互模式均可使用
-`--connect ~/.kkagent/server.sock`。Unix 使用 domain socket；Windows 的同一路径是仅指向
-loopback 随机端口的本地端点文件。默认 TUI 仍使用进程内 memory RPC。
-
-### Node.js SDK
-
-`sdk/node` 用于让 Node.js 后台、自动化脚本或编辑器扩展控制已经启动的
-`kkagent server`。它通过 HTTP 创建 Session、发送任务，并通过 WebSocket 接收 Agent
-回复与工具执行事件；它本身不在 Node.js 中运行模型或工具。
-
-```js
-import { KkagentClient } from "./sdk/node/src/index.js";
-
-const client = new KkagentClient({
-  baseUrl: "http://127.0.0.1:8787",
-  token: process.env.KKAGENT_HTTP_TOKEN,
-});
-
-const session = await client.createSession("/absolute/path/to/project", "代码检查");
-await client.postMessage(session.session_id, "运行测试并总结问题");
-client.connectEvents((event) => console.log(event));
-```
-
-完整的启动步骤、API、事件订阅、安全说明和当前能力边界见
-[Node.js SDK 文档](sdk/node/README.md)。
-
----
-
-## 4. 怎么测试
-
-### 单元 / 集成测试（不依赖外网）
-
-```bash
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --all-targets
-# 或
-make test
 ```
 
-当前主要覆盖：
+提交前请阅读 [docs/development.md](docs/development.md) 中的提交约定与跨平台构建说明。
 
-- LLM 方言与流终止校验（Anthropic/OpenAI Responses/Kimi/Google）
-- 工具安全边界、取消、进程树、输出上限与敏感文件保护
-- 权限链、并行调度、panic 隔离、自动压缩与 SQLite transcript 原子持久化
-- RPC/HTTP/WS/ACP、认证、会话并发、文件边界和本地 IPC
-- Kimi OAuth 刷新、私有凭据存储、视频上传和模型配置
+## License
 
-期望：全部 `ok`，无 FAILED。
-
-### Lint / 格式
-
-```bash
-make fmt
-make lint   # clippy -D warnings
-```
-
----
-
-## 5. 怎么验证（实网烟雾测试）
-
-前提：`config.toml` 里 `base_url` / `api_key` / `default_model` 可用。  
-### A. 纯对话
-
-```bash
-./target/release/kkagent --config ~/.kkagent/config.toml -p "Say hello in one sentence"
-```
-
-**通过标准**：stdout 有一句正常回复；进程退出码 0。
-
-### B. 读文件工具
-
-```bash
-./target/release/kkagent --config ~/.kkagent/config.toml -y \
-  -p "Read ./Cargo.toml and tell me how many workspace members there are"
-```
-
-**通过标准**：回复给出的数量与根目录 `Cargo.toml` 的 `workspace.members` 一致。
-
-### C. Shell 工具
-
-```bash
-./target/release/kkagent --config ~/.kkagent/config.toml -y \
-  -p "Run 'ls crates/' and list the crate names"
-```
-
-**通过标准**：列出 `crates/` 下各 crate 名。
-
-### D. 写文件工具
-
-```bash
-./target/release/kkagent --config ~/.kkagent/config.toml -y \
-  -p "Create /tmp/kkagent_smoke.txt with content Hello kkagent"
-
-cat /tmp/kkagent_smoke.txt
-# 期望：Hello kkagent
-```
-
-### E. 带日志确认工具链路
-
-```bash
-RUST_LOG=kkagent_core=info,kkagent_llm=debug \
-  ./target/release/kkagent --config ~/.kkagent/config.toml -y \
-  -p "Read ./Cargo.toml" 2> /tmp/kkagent_smoke.log
-
-grep -E "Tool use|Permission|Turn completed|LLM response status" /tmp/kkagent_smoke.log
-```
-
-**通过标准**日志中大致出现：
-
-1. `LLM response status: 200 OK`
-2. `Tool use collected: Read`
-3. `Permission for Read: Approve`（`-y` / yolo）
-4. `Recursing into next turn` → `Turn completed`
-
-### 常见失败
-
-| 现象 | 原因 | 处理 |
-|------|------|------|
-| HTTP 卡住无响应 | 上游代理 / HTTP2 | 客户端已强制 HTTP/1.1；检查网络与代理 |
-| `400` max tokens 超限 | `max_output_size` 过大 | 设为 `16384` 或更小 |
-| 无工具调用 | 模型未开 `tool_use` / 权限卡住 | `capabilities` 加 `tool_use`；用 `-y` |
-| Tool call arguments 400 | 兼容服务拒绝了非 object 参数 | kkagent 会自动回滚该 Agent 小步骤并停止；检查提示后发送“继续” |
-| 配置未生效 | 写了 `.env` 却没传 `--config` | 拷到 `~/.kkagent/config.toml` 或显式 `--config` |
-| `Model '...' not found` | `default_model` 别名在 `[models."..."]` 里不存在 | 补上对应 `[models."别名"]`，或把 `default_model` 改成已有别名 |
-
----
-
-## 6. 仓库结构（简表）
-
-```
-crates/
-  kkagent/           # CLI 入口
-  kkagent-protocol/  # RPC 帧、权限、Goal、Subagent
-  kkagent-rpc/       # NDJSON RPC + memory/UDS transport
-  kkagent-config/    # TOML 配置
-  kkagent-llm/       # Anthropic 兼容流式
-  kkagent-core/      # Agent loop / 权限 / session / transcript
-  kkagent-tools/     # 内置工具
-  kkagent-mcp/       # MCP / Skills / Hooks
-  kkagent-client/    # 客户端 facade
-  kkagent-tui/       # ratatui TUI
-examples/
-  config.example.toml
-```
-
----
-
-## 7. 一键自检清单
-
-```bash
-# 1) 编译
-cargo build --release
-
-# 2) 单测
-cargo test
-
-# 3) 实网（改成你的 config）
-./target/release/kkagent --config ~/.kkagent/config.toml -y \
-  -p "Read ./Cargo.toml and count workspace members"
-```
-
-三项都过，才能进入目标平台的发布候选验证；正式发布还应以 CI 的全平台矩阵通过为准。
+MIT — 详见 [LICENSE](LICENSE)。
