@@ -207,6 +207,7 @@ impl WorkspaceSessionStrip {
 }
 
 /// Prefer custom `/title`, else first/last prompt snippet, else short id.
+/// Harness-only injections (`<system-reminder>`, …) never become the label.
 pub fn session_display_title(
     title: Option<&str>,
     is_custom_title: bool,
@@ -221,16 +222,35 @@ pub fn session_display_title(
             .collect::<Vec<_>>()
             .join(" ")
     };
+    let usable = |raw: &str| -> Option<String> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        if kkagent_protocol::is_harness_only_user_text(trimmed) {
+            return None;
+        }
+        let visible = kkagent_protocol::visible_user_text(trimmed);
+        let pick = if visible.is_empty() {
+            trimmed
+        } else {
+            visible.as_str()
+        };
+        if pick.is_empty() || kkagent_protocol::is_harness_only_user_text(pick) {
+            return None;
+        }
+        Some(clean(pick))
+    };
     if is_custom_title {
-        if let Some(t) = title.map(str::trim).filter(|s| !s.is_empty()) {
-            return clean(t);
+        if let Some(t) = title.and_then(usable) {
+            return t;
         }
     }
-    if let Some(p) = last_prompt.map(str::trim).filter(|s| !s.is_empty()) {
-        return clean(p);
+    if let Some(p) = last_prompt.and_then(usable) {
+        return p;
     }
-    if let Some(t) = title.map(str::trim).filter(|s| !s.is_empty()) {
-        return clean(t);
+    if let Some(t) = title.and_then(usable) {
+        return t;
     }
     let short = if session_id.len() > 8 {
         &session_id[..8]
@@ -544,6 +564,20 @@ mod tests {
         assert_eq!(t, "My Name");
         let t = session_display_title(Some("auto"), false, Some("first prompt here"), "abcdef12");
         assert_eq!(t, "first prompt here");
+    }
+
+    #[test]
+    fn display_title_skips_system_reminder() {
+        let rem = "<system-reminder>\nToday's date is 2026-08-10.\n</system-reminder>";
+        let t = session_display_title(Some(rem), false, Some(rem), "abcdef12");
+        assert_eq!(t, "abcdef12");
+        let t = session_display_title(
+            Some(rem),
+            false,
+            Some("real question"),
+            "abcdef12",
+        );
+        assert_eq!(t, "real question");
     }
 
     #[test]

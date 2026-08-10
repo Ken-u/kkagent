@@ -360,7 +360,19 @@ impl Session {
                 }
             }
         }
-        let _ = self.services.metadata.set_last_prompt(&text);
+        let _ = {
+            if !kkagent_protocol::is_harness_only_user_text(&text) {
+                let visible = kkagent_protocol::visible_user_text(&text);
+                let for_prompt = if visible.is_empty() {
+                    text.as_str()
+                } else {
+                    visible.as_str()
+                };
+                self.services.metadata.set_last_prompt(for_prompt)
+            } else {
+                Ok(())
+            }
+        };
         let mut content = vec![ChatContent::Text { text }];
         content.extend(media_content);
         self.messages.push(ChatMessage {

@@ -1991,7 +1991,10 @@ impl TuiApp {
                                     == 0
                                     && s.get("last_prompt")
                                         .and_then(|v| v.as_str())
-                                        .map(|p| p.trim().is_empty())
+                                        .map(|p| {
+                                            p.trim().is_empty()
+                                                || kkagent_protocol::is_harness_only_user_text(p)
+                                        })
                                         .unwrap_or(true)
                             });
                         // Keep empty sessions only while they are the active page.
@@ -2192,9 +2195,26 @@ impl TuiApp {
                 .state
                 .messages
                 .iter()
-                .find(|m| m.role == MessageRole::User)
-                .map(|m| m.content.chars().take(40).collect::<String>())
-                .filter(|s| !s.trim().is_empty())
+                .find_map(|m| {
+                    if m.role != MessageRole::User {
+                        return None;
+                    }
+                    if kkagent_protocol::is_harness_only_user_text(&m.content) {
+                        return None;
+                    }
+                    let visible = kkagent_protocol::visible_user_text(&m.content);
+                    let pick = if visible.is_empty() {
+                        m.content.trim()
+                    } else {
+                        visible.as_str()
+                    };
+                    let snippet: String = pick.chars().take(40).collect();
+                    if snippet.trim().is_empty() {
+                        None
+                    } else {
+                        Some(snippet)
+                    }
+                })
                 .unwrap_or_else(|| {
                     if current_id.len() > 8 {
                         current_id[..8].to_string()
@@ -2328,9 +2348,25 @@ impl TuiApp {
                             "system" => MessageRole::System,
                             _ => continue,
                         };
+                        let content = if role == MessageRole::User {
+                            if kkagent_protocol::is_harness_only_user_text(text) {
+                                continue;
+                            }
+                            let visible = kkagent_protocol::visible_user_text(text);
+                            if visible.is_empty() {
+                                text.to_string()
+                            } else {
+                                visible
+                            }
+                        } else {
+                            text.to_string()
+                        };
+                        if content.trim().is_empty() {
+                            continue;
+                        }
                         messages.push(DisplayMessage {
                             role,
-                            content: text.to_string(),
+                            content,
                             thinking: None,
                             parts: Vec::new(),
                             tool_calls: Vec::new(),
@@ -3653,7 +3689,11 @@ Slash commands:\n",
 fn session_has_retained_io(messages: &[DisplayMessage]) -> bool {
     messages.iter().any(|m| match m.role {
         MessageRole::System => false,
-        MessageRole::User | MessageRole::Plan => !m.content.trim().is_empty(),
+        MessageRole::User => {
+            !m.content.trim().is_empty()
+                && !kkagent_protocol::is_harness_only_user_text(&m.content)
+        }
+        MessageRole::Plan => !m.content.trim().is_empty(),
         MessageRole::Assistant => {
             !m.content.trim().is_empty()
                 || !m.parts.is_empty()
@@ -3724,9 +3764,21 @@ fn transcript_messages_to_display(msgs: &[serde_json::Value]) -> Vec<DisplayMess
                     }
                 }
                 if !only_tool_results || !text.is_empty() {
+                    if kkagent_protocol::is_harness_only_user_text(&text) {
+                        continue;
+                    }
+                    let visible = kkagent_protocol::visible_user_text(&text);
+                    let content = if visible.is_empty() {
+                        text
+                    } else {
+                        visible
+                    };
+                    if content.trim().is_empty() {
+                        continue;
+                    }
                     out.push(DisplayMessage {
                         role: MessageRole::User,
-                        content: text,
+                        content,
                         thinking: None,
                         parts: Vec::new(),
                         tool_calls: Vec::new(),
@@ -4011,6 +4063,13 @@ mod scroll_snap_tests {
         assert!(session_has_retained_io(&[DisplayMessage {
             role: MessageRole::User,
             content: "hello".into(),
+            thinking: None,
+            parts: Vec::new(),
+            tool_calls: Vec::new(),
+        }]));
+        assert!(!session_has_retained_io(&[DisplayMessage {
+            role: MessageRole::User,
+            content: "<system-reminder>\nToday's date\n</system-reminder>".into(),
             thinking: None,
             parts: Vec::new(),
             tool_calls: Vec::new(),

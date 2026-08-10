@@ -2353,14 +2353,29 @@ fn persist_session_messages(db: &TranscriptDb, session: &mut Session) -> anyhow:
         session.persisted_message_count = session.messages.len();
     }
 
-    // Auto-title from first user text
+    // Auto-title from first real user text (skip harness-only injections).
     if session.title.is_none() {
-        if let Some(first_user) = session.messages.iter().find(|m| m.role == "user") {
-            if let Some(ChatContent::Text { text }) = first_user.content.first() {
-                let title: String = text.chars().take(60).collect();
-                db.set_title(&session.id, &title)?;
-                session.title = Some(title);
+        if let Some(text) = session.messages.iter().find_map(|m| {
+            if m.role != "user" {
+                return None;
             }
+            let text = m.content.iter().find_map(|c| match c {
+                ChatContent::Text { text } => Some(text.as_str()),
+                _ => None,
+            })?;
+            if kkagent_protocol::is_harness_only_user_text(text) {
+                return None;
+            }
+            let visible = kkagent_protocol::visible_user_text(text);
+            if visible.is_empty() {
+                None
+            } else {
+                Some(visible)
+            }
+        }) {
+            let title: String = text.chars().take(60).collect();
+            db.set_title(&session.id, &title)?;
+            session.title = Some(title);
         }
     }
     Ok(())
@@ -2595,7 +2610,10 @@ async fn handle_rpc_call(
                             let empty = message_count == 0
                                 && s.last_prompt
                                     .as_ref()
-                                    .map(|p| p.trim().is_empty())
+                                    .map(|p| {
+                                        p.trim().is_empty()
+                                            || kkagent_protocol::is_harness_only_user_text(p)
+                                    })
                                     .unwrap_or(true);
                             serde_json::json!({
                                 "session_id": s.id,
@@ -2762,11 +2780,7 @@ async fn handle_rpc_call(
                         .iter()
                         .rev()
                         .filter(|m| m.role == "user" || m.role == "assistant")
-                        .take(limit)
-                        .collect::<Vec<_>>()
-                        .into_iter()
-                        .rev()
-                        .map(|m| {
+                        .filter_map(|m| {
                             let text = m
                                 .content
                                 .iter()
@@ -2776,11 +2790,31 @@ async fn handle_rpc_call(
                                 })
                                 .collect::<Vec<_>>()
                                 .join("\n");
-                            serde_json::json!({
+                            let text = if m.role == "user" {
+                                if kkagent_protocol::is_harness_only_user_text(&text) {
+                                    return None;
+                                }
+                                let visible = kkagent_protocol::visible_user_text(&text);
+                                if visible.is_empty() {
+                                    text
+                                } else {
+                                    visible
+                                }
+                            } else {
+                                text
+                            };
+                            if text.trim().is_empty() {
+                                return None;
+                            }
+                            Some(serde_json::json!({
                                 "role": m.role,
                                 "text": text.chars().take(240).collect::<String>(),
-                            })
+                            }))
                         })
+                        .take(limit)
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
                         .collect();
                     (
                         session.title.clone(),
@@ -2803,11 +2837,7 @@ async fn handle_rpc_call(
                         .iter()
                         .rev()
                         .filter(|m| m.role == "user" || m.role == "assistant")
-                        .take(limit)
-                        .collect::<Vec<_>>()
-                        .into_iter()
-                        .rev()
-                        .map(|m| {
+                        .filter_map(|m| {
                             let text = m
                                 .content
                                 .iter()
@@ -2817,11 +2847,31 @@ async fn handle_rpc_call(
                                 })
                                 .collect::<Vec<_>>()
                                 .join("\n");
-                            serde_json::json!({
+                            let text = if m.role == "user" {
+                                if kkagent_protocol::is_harness_only_user_text(&text) {
+                                    return None;
+                                }
+                                let visible = kkagent_protocol::visible_user_text(&text);
+                                if visible.is_empty() {
+                                    text
+                                } else {
+                                    visible
+                                }
+                            } else {
+                                text
+                            };
+                            if text.trim().is_empty() {
+                                return None;
+                            }
+                            Some(serde_json::json!({
                                 "role": m.role,
                                 "text": text.chars().take(240).collect::<String>(),
-                            })
+                            }))
                         })
+                        .take(limit)
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
                         .collect();
                     (
                         record.as_ref().and_then(|r| r.title.clone()),
@@ -3114,11 +3164,24 @@ async fn handle_rpc_call(
                                 .and_then(|messages| db.append_messages(&session_id, &messages))
                         };
                         if result.is_ok() && new_title.is_none() {
-                            if let Some(ChatContent::Text { text }) = pending
-                                .iter()
-                                .find(|message| message.role == "user")
-                                .and_then(|message| message.content.first())
-                            {
+                            if let Some(text) = pending.iter().find_map(|message| {
+                                if message.role != "user" {
+                                    return None;
+                                }
+                                let text = message.content.iter().find_map(|c| match c {
+                                    ChatContent::Text { text } => Some(text.as_str()),
+                                    _ => None,
+                                })?;
+                                if kkagent_protocol::is_harness_only_user_text(text) {
+                                    return None;
+                                }
+                                let visible = kkagent_protocol::visible_user_text(text);
+                                if visible.is_empty() {
+                                    None
+                                } else {
+                                    Some(visible)
+                                }
+                            }) {
                                 let title: String = text.chars().take(60).collect();
                                 if db.set_title(&session_id, &title).is_ok() {
                                     new_title = Some(title);
