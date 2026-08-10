@@ -16,6 +16,13 @@ pub struct AppConfig {
     pub merge_all_available_skills: bool,
     #[serde(default)]
     pub extra_skill_dirs: Vec<String>,
+    /// Skill names permanently disabled via TUI / config (not offered to the model).
+    #[serde(default)]
+    pub disabled_skills: Vec<String>,
+    /// MCP server names permanently disabled via TUI / config.
+    /// Also honored when `[mcp_servers.X] enabled = false`.
+    #[serde(default)]
+    pub disabled_mcp_servers: Vec<String>,
     #[serde(default)]
     pub telemetry: bool,
     /// Trusted workspace roots (absolute paths). Empty = trust cwd implicitly.
@@ -331,6 +338,10 @@ pub struct McpServerConfig {
     /// Request timeout in milliseconds.
     #[serde(default)]
     pub timeout_ms: Option<u64>,
+    /// When `false`, the server is not connected and its tools are hidden.
+    /// Defaults to enabled when omitted.
+    #[serde(default)]
+    pub enabled: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -460,6 +471,39 @@ impl AppConfig {
     pub fn effective_permission_mode(&self) -> &str {
         self.default_permission_mode.as_deref().unwrap_or("manual")
     }
+
+    pub fn is_skill_disabled(&self, name: &str) -> bool {
+        self.disabled_skills.iter().any(|s| s == name)
+    }
+
+    pub fn is_mcp_disabled(&self, name: &str) -> bool {
+        self.disabled_mcp_servers.iter().any(|s| s == name)
+    }
+
+    pub fn set_skill_disabled(&mut self, name: &str, disabled: bool) {
+        if disabled {
+            if !self.disabled_skills.iter().any(|s| s == name) {
+                self.disabled_skills.push(name.to_string());
+                self.disabled_skills.sort();
+            }
+        } else {
+            self.disabled_skills.retain(|s| s != name);
+        }
+    }
+
+    pub fn set_mcp_disabled(&mut self, name: &str, disabled: bool) {
+        if disabled {
+            if !self.disabled_mcp_servers.iter().any(|s| s == name) {
+                self.disabled_mcp_servers.push(name.to_string());
+                self.disabled_mcp_servers.sort();
+            }
+        } else {
+            self.disabled_mcp_servers.retain(|s| s != name);
+        }
+        if let Some(server) = self.mcp_servers.get_mut(name) {
+            server.enabled = Some(!disabled);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -540,5 +584,36 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("read_byte_budget"));
+    }
+
+    #[test]
+    fn skill_and_mcp_disable_helpers() {
+        let mut config = valid_config();
+        config.mcp_servers.insert(
+            "demo".into(),
+            McpServerConfig {
+                transport_type: Some("stdio".into()),
+                command: Some("echo".into()),
+                args: Vec::new(),
+                env: HashMap::new(),
+                url: None,
+                headers: HashMap::new(),
+                oauth: None,
+                timeout_ms: None,
+                enabled: None,
+            },
+        );
+        assert!(!config.is_skill_disabled("x"));
+        config.set_skill_disabled("x", true);
+        assert!(config.is_skill_disabled("x"));
+        config.set_skill_disabled("x", false);
+        assert!(!config.is_skill_disabled("x"));
+
+        config.set_mcp_disabled("demo", true);
+        assert!(config.is_mcp_disabled("demo"));
+        assert_eq!(config.mcp_servers["demo"].enabled, Some(false));
+        config.set_mcp_disabled("demo", false);
+        assert!(!config.is_mcp_disabled("demo"));
+        assert_eq!(config.mcp_servers["demo"].enabled, Some(true));
     }
 }

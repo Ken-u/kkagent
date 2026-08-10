@@ -1,8 +1,9 @@
 use async_trait::async_trait;
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use tokio::sync::Mutex;
 
 use crate::{Tool, ToolContext, ToolOutput};
 
@@ -85,6 +86,8 @@ pub struct SkillCatalog {
     default_working_dir: PathBuf,
     extra_dirs: Vec<PathBuf>,
     merge_all: bool,
+    /// Names disabled via TUI / config (still listed for management UI).
+    disabled: Arc<Mutex<HashSet<String>>>,
 }
 
 impl SkillCatalog {
@@ -93,6 +96,7 @@ impl SkillCatalog {
             default_working_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             extra_dirs: Vec::new(),
             merge_all: false,
+            disabled: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -119,7 +123,32 @@ impl SkillCatalog {
             default_working_dir: working_dir.to_path_buf(),
             extra_dirs,
             merge_all,
+            disabled: Arc::new(Mutex::new(HashSet::new())),
         }
+    }
+
+    pub async fn set_disabled(&self, names: impl IntoIterator<Item = String>) {
+        let mut g = self.disabled.lock().await;
+        *g = names.into_iter().collect();
+    }
+
+    pub async fn set_skill_enabled(&self, name: &str, enabled: bool) {
+        let mut g = self.disabled.lock().await;
+        if enabled {
+            g.remove(name);
+        } else {
+            g.insert(name.to_string());
+        }
+    }
+
+    pub async fn is_enabled(&self, name: &str) -> bool {
+        !self.disabled.lock().await.contains(name)
+    }
+
+    pub async fn disabled_names(&self) -> Vec<String> {
+        let mut names: Vec<_> = self.disabled.lock().await.iter().cloned().collect();
+        names.sort();
+        names
     }
 
     pub async fn list(&self) -> Vec<SkillEntry> {
@@ -144,6 +173,9 @@ impl SkillCatalog {
         working_dir: &Path,
         name: &str,
     ) -> anyhow::Result<(SkillEntry, String)> {
+        if !self.is_enabled(name).await {
+            anyhow::bail!("Skill \"{name}\" is disabled");
+        }
         let entry = self
             .list_for(working_dir)
             .await
@@ -179,6 +211,12 @@ impl SkillCatalog {
 
     pub async fn catalog_prompt_section_for(&self, working_dir: &Path) -> String {
         let entries = self.list_for(working_dir).await;
+        let disabled = self.disabled.lock().await;
+        let entries: Vec<_> = entries
+            .into_iter()
+            .filter(|e| !disabled.contains(&e.name))
+            .collect();
+        drop(disabled);
         if entries.is_empty() {
             return String::new();
         }
@@ -418,10 +456,13 @@ impl Tool for SkillTool {
             .trim();
         if name.is_empty() {
             let list = self.catalog.list_for(&context.working_dir).await;
-            let lines = list
-                .iter()
-                .map(|entry| format!("- {}: {}", entry.name, entry.description))
-                .collect::<Vec<_>>();
+            let mut lines = Vec::new();
+            for entry in &list {
+                if !self.catalog.is_enabled(&entry.name).await {
+                    continue;
+                }
+                lines.push(format!("- {}: {}", entry.name, entry.description));
+            }
             return Ok(ToolOutput::success(if lines.is_empty() {
                 "No skills discovered.".to_string()
             } else {

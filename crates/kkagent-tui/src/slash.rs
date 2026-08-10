@@ -147,7 +147,7 @@ pub const BUILTIN_SLASH_COMMANDS: &[SlashCommand] = &[
     SlashCommand {
         name: "mcp",
         aliases: &[],
-        description: "Show MCP server status",
+        description: "Manage MCP servers (enable/disable, persisted)",
         priority: 60,
         argument_hint: None,
     },
@@ -182,7 +182,7 @@ pub const BUILTIN_SLASH_COMMANDS: &[SlashCommand] = &[
     SlashCommand {
         name: "skills",
         aliases: &[],
-        description: "List available skills (activate with /skill:name)",
+        description: "Manage skills (enable/disable) or /skills <name> to activate",
         priority: 50,
         argument_hint: Some("[name]"),
     },

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
@@ -67,6 +67,14 @@ pub struct McpToolInfo {
     pub input_schema: Value,
 }
 
+#[derive(Debug, Clone)]
+pub struct McpServerStatus {
+    pub name: String,
+    pub enabled: bool,
+    pub connected: bool,
+    pub transport: String,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct McpCallOutput {
     pub text: String,
@@ -86,6 +94,8 @@ pub struct McpManager {
     oauth_store: Arc<McpOAuthStore>,
     /// Pending auth URLs / status for UI.
     auth_status: Arc<Mutex<HashMap<String, String>>>,
+    /// Runtime-disabled server names (persisted via config / disabled.toml).
+    disabled: Arc<Mutex<HashSet<String>>>,
 }
 
 impl McpManager {
@@ -96,7 +106,62 @@ impl McpManager {
             tools_cache: Arc::new(Mutex::new(Vec::new())),
             oauth_store: Arc::new(McpOAuthStore::default_location()),
             auth_status: Arc::new(Mutex::new(HashMap::new())),
+            disabled: Arc::new(Mutex::new(HashSet::new())),
         }
+    }
+
+    pub async fn set_disabled_names(&self, names: impl IntoIterator<Item = String>) {
+        let mut g = self.disabled.lock().await;
+        *g = names.into_iter().collect();
+    }
+
+    pub async fn is_enabled(&self, name: &str) -> bool {
+        !self.disabled.lock().await.contains(name)
+    }
+
+    pub fn configured_names(&self) -> Vec<String> {
+        self.configs.iter().map(|c| c.name.clone()).collect()
+    }
+
+    pub fn server_configs(&self) -> &[McpServerConfig] {
+        &self.configs
+    }
+
+    pub async fn list_server_status(&self) -> Vec<McpServerStatus> {
+        let disabled = self.disabled.lock().await.clone();
+        let connections = self.connections.lock().await;
+        self.configs
+            .iter()
+            .map(|c| McpServerStatus {
+                name: c.name.clone(),
+                enabled: !disabled.contains(&c.name),
+                connected: connections.contains_key(&c.name),
+                transport: format!("{:?}", c.transport).to_ascii_lowercase(),
+            })
+            .collect()
+    }
+
+    pub async fn set_enabled(&self, name: &str, enabled: bool) -> Result<()> {
+        if !self.configs.iter().any(|c| c.name == name) {
+            anyhow::bail!("unknown MCP server {name}");
+        }
+        if enabled {
+            self.disabled.lock().await.remove(name);
+            if !self.connections.lock().await.contains_key(name) {
+                self.reconnect(name).await?;
+            } else {
+                self.refresh_tools().await?;
+            }
+        } else {
+            self.disabled.lock().await.insert(name.to_string());
+            self.disconnect(name).await;
+            self.refresh_tools().await?;
+        }
+        Ok(())
+    }
+
+    pub async fn disconnect(&self, name: &str) {
+        self.connections.lock().await.remove(name);
     }
 
     pub fn oauth_store(&self) -> Arc<McpOAuthStore> {
@@ -104,7 +169,12 @@ impl McpManager {
     }
 
     pub async fn connect_all(&self) -> Result<()> {
+        let disabled = self.disabled.lock().await.clone();
         for config in &self.configs {
+            if disabled.contains(&config.name) {
+                tracing::info!("Skipping disabled MCP server {}", config.name);
+                continue;
+            }
             match self.connect_server(config).await {
                 Ok(_) => tracing::info!(
                     "Connected to MCP server {} ({:?})",
@@ -119,6 +189,9 @@ impl McpManager {
     }
 
     pub async fn reconnect(&self, server_name: &str) -> Result<()> {
+        if self.disabled.lock().await.contains(server_name) {
+            anyhow::bail!("MCP server {server_name} is disabled");
+        }
         let config = self
             .configs
             .iter()

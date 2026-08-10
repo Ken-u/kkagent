@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 use crate::AppConfig;
@@ -11,6 +12,64 @@ pub fn default_config_dir() -> PathBuf {
 
 pub fn default_config_path() -> PathBuf {
     default_config_dir().join("config.toml")
+}
+
+/// Sidecar for TUI-managed enable/disable toggles (keeps main config.toml stable).
+pub fn disabled_state_path() -> PathBuf {
+    default_config_dir().join("disabled.toml")
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DisabledState {
+    #[serde(default)]
+    pub disabled_skills: Vec<String>,
+    #[serde(default)]
+    pub disabled_mcp_servers: Vec<String>,
+}
+
+impl DisabledState {
+    pub fn load() -> Result<Self> {
+        let path = disabled_state_path();
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+        let content = std::fs::read_to_string(&path)
+            .with_context(|| format!("Failed to read disabled state: {path:?}"))?;
+        toml::from_str(&content)
+            .with_context(|| format!("Failed to parse disabled state: {path:?}"))
+    }
+
+    pub fn save(&self) -> Result<()> {
+        ensure_config_dir()?;
+        let path = disabled_state_path();
+        let body = toml::to_string_pretty(self)
+            .with_context(|| format!("Failed to serialize disabled state: {path:?}"))?;
+        let header = "# Managed by kkagent /skills and /mcp TUI pickers.\n";
+        std::fs::write(&path, format!("{header}{body}"))
+            .with_context(|| format!("Failed to write disabled state: {path:?}"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        }
+        Ok(())
+    }
+
+    pub fn apply_to_config(&self, config: &mut AppConfig) {
+        for name in &self.disabled_skills {
+            config.set_skill_disabled(name, true);
+        }
+        for name in &self.disabled_mcp_servers {
+            config.set_mcp_disabled(name, true);
+        }
+    }
+
+    pub fn from_config(config: &AppConfig) -> Self {
+        Self {
+            disabled_skills: config.disabled_skills.clone(),
+            disabled_mcp_servers: config.disabled_mcp_servers.clone(),
+        }
+    }
 }
 
 pub fn load_config(path: Option<&Path>) -> Result<AppConfig> {
@@ -29,6 +88,21 @@ pub fn load_config(path: Option<&Path>) -> Result<AppConfig> {
         toml::from_str(&content)
             .with_context(|| format!("Failed to parse config: {config_path:?}"))?
     };
+
+    // Merge TUI-managed disables (sidecar wins for skill names; MCP merges).
+    if let Ok(disabled) = DisabledState::load() {
+        disabled.apply_to_config(&mut config);
+    }
+    // Seed disables from per-server `enabled = false` in config.toml.
+    let seeded: Vec<String> = config
+        .mcp_servers
+        .iter()
+        .filter(|(_, s)| s.enabled == Some(false))
+        .map(|(name, _)| name.clone())
+        .collect();
+    for name in seeded {
+        config.set_mcp_disabled(&name, true);
+    }
 
     apply_env_overrides(&mut config);
     config

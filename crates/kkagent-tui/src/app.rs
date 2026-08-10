@@ -169,6 +169,10 @@ pub enum ListPickerKind {
     Model,
     Session,
     Permission,
+    /// Toggle skills on/off (Enter toggles, Esc closes).
+    SkillManage,
+    /// Toggle MCP servers on/off (Enter toggles, Esc closes).
+    McpManage,
 }
 
 #[derive(Debug, Clone)]
@@ -1331,6 +1335,15 @@ impl TuiApp {
                     return Ok(());
                 }
                 KeyCode::Enter => {
+                    if let Some(picker) = self.state.list_picker.as_ref() {
+                        if matches!(
+                            picker.kind,
+                            ListPickerKind::SkillManage | ListPickerKind::McpManage
+                        ) {
+                            self.toggle_manage_picker().await?;
+                            return Ok(());
+                        }
+                    }
                     self.apply_list_picker().await?;
                     return Ok(());
                 }
@@ -1950,7 +1963,210 @@ impl TuiApp {
             ListPickerKind::Permission => {
                 self.apply_permission_mode_id(&item.id).await?;
             }
+            ListPickerKind::SkillManage | ListPickerKind::McpManage => {
+                // Enter is handled by toggle_manage_picker; keep picker open.
+                self.state.list_picker = Some(picker);
+            }
         }
+        Ok(())
+    }
+
+    async fn toggle_manage_picker(&mut self) -> anyhow::Result<()> {
+        let Some(picker) = self.state.list_picker.as_ref() else {
+            return Ok(());
+        };
+        if picker.items.is_empty() {
+            return Ok(());
+        }
+        let idx = picker.selected.min(picker.items.len() - 1);
+        let item = picker.items[idx].clone();
+        let kind = picker.kind.clone();
+        // detail encodes current enabled as "on" / "off" prefix.
+        let currently_on = item.detail.starts_with("on");
+        let enable = !currently_on;
+        match kind {
+            ListPickerKind::SkillManage => {
+                let params = serde_json::json!({"name": item.id, "enabled": enable});
+                match self
+                    .client
+                    .rpc_call("skills.set_enabled", Some(params))
+                    .await
+                {
+                    Ok(_) => {
+                        self.config.set_skill_disabled(&item.id, !enable);
+                        let _ = self.refresh_skill_commands().await;
+                        self.open_skill_manager().await?;
+                        self.system_message(format!(
+                            "Skill {} {}",
+                            item.id,
+                            if enable { "enabled" } else { "disabled (saved)" }
+                        ));
+                    }
+                    Err(e) => self.system_message(format!("Failed to update skill: {e}")),
+                }
+            }
+            ListPickerKind::McpManage => {
+                let params = serde_json::json!({"name": item.id, "enabled": enable});
+                match self.client.rpc_call("mcp.set_enabled", Some(params)).await {
+                    Ok(_) => {
+                        self.config.set_mcp_disabled(&item.id, !enable);
+                        self.open_mcp_manager().await?;
+                        self.system_message(format!(
+                            "MCP {} {}",
+                            item.id,
+                            if enable { "enabled" } else { "disabled (saved)" }
+                        ));
+                    }
+                    Err(e) => self.system_message(format!("Failed to update MCP: {e}")),
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    async fn open_skill_manager(&mut self) -> anyhow::Result<()> {
+        let mut items = Vec::new();
+        match self.client.rpc_call("skills.list", None).await {
+            Ok(data) => {
+                if let Some(arr) = data.get("skills").and_then(|v| v.as_array()) {
+                    for s in arr {
+                        let name = s
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        if name.is_empty() {
+                            continue;
+                        }
+                        let enabled = s
+                            .get("enabled")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(true);
+                        let desc = s
+                            .get("description")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .trim();
+                        let mark = if enabled { "●" } else { "○" };
+                        let state = if enabled { "on" } else { "off" };
+                        items.push(ListPickerItem {
+                            id: name.clone(),
+                            label: format!("{mark} {name}"),
+                            detail: if desc.is_empty() {
+                                state.to_string()
+                            } else {
+                                format!("{state}  {desc}")
+                            },
+                        });
+                    }
+                }
+            }
+            Err(e) => {
+                self.system_message(format!("skills: {e}"));
+                return Ok(());
+            }
+        }
+        self.state.list_picker = Some(ListPickerState {
+            kind: ListPickerKind::SkillManage,
+            title: " Skills — Enter toggle · Esc close ".into(),
+            selected: {
+                let prev = self
+                    .state
+                    .list_picker
+                    .as_ref()
+                    .filter(|p| p.kind == ListPickerKind::SkillManage)
+                    .map(|p| p.selected)
+                    .unwrap_or(0);
+                if items.is_empty() {
+                    0
+                } else {
+                    prev.min(items.len() - 1)
+                }
+            },
+            items,
+        });
+        Ok(())
+    }
+
+    async fn open_mcp_manager(&mut self) -> anyhow::Result<()> {
+        let mut items = Vec::new();
+        match self.client.rpc_call("mcp.list", None).await {
+            Ok(data) => {
+                if let Some(arr) = data.get("servers").and_then(|v| v.as_array()) {
+                    for s in arr {
+                        let name = s
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        if name.is_empty() {
+                            continue;
+                        }
+                        let enabled = s
+                            .get("enabled")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(true);
+                        let connected = s
+                            .get("connected")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        let transport = s
+                            .get("transport")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("?");
+                        let mark = if enabled { "●" } else { "○" };
+                        let state = if enabled { "on" } else { "off" };
+                        let link = if connected { "connected" } else { "idle" };
+                        items.push(ListPickerItem {
+                            id: name.clone(),
+                            label: format!("{mark} {name}"),
+                            detail: format!("{state}  {transport} · {link}"),
+                        });
+                    }
+                }
+            }
+            Err(e) => {
+                // Fallback: show config entries if RPC missing.
+                for (name, cfg) in &self.config.mcp_servers {
+                    let enabled = !self.config.is_mcp_disabled(name);
+                    let mark = if enabled { "●" } else { "○" };
+                    let state = if enabled { "on" } else { "off" };
+                    let kind = cfg
+                        .transport_type
+                        .as_deref()
+                        .unwrap_or(if cfg.url.is_some() { "http" } else { "stdio" });
+                    items.push(ListPickerItem {
+                        id: name.clone(),
+                        label: format!("{mark} {name}"),
+                        detail: format!("{state}  {kind} (local config; server: {e})"),
+                    });
+                }
+                if items.is_empty() {
+                    self.system_message(format!("mcp: {e}"));
+                    return Ok(());
+                }
+            }
+        }
+        self.state.list_picker = Some(ListPickerState {
+            kind: ListPickerKind::McpManage,
+            title: " MCP servers — Enter toggle · Esc close ".into(),
+            selected: {
+                let prev = self
+                    .state
+                    .list_picker
+                    .as_ref()
+                    .filter(|p| p.kind == ListPickerKind::McpManage)
+                    .map(|p| p.selected)
+                    .unwrap_or(0);
+                if items.is_empty() {
+                    0
+                } else {
+                    prev.min(items.len() - 1)
+                }
+            },
+            items,
+        });
         Ok(())
     }
 
@@ -3018,25 +3234,7 @@ impl TuiApp {
                 ));
             }
             "mcp" => {
-                let n = self.config.mcp_servers.len();
-                let mut lines = format!("MCP servers configured: {}\n", n);
-                for (name, cfg) in &self.config.mcp_servers {
-                    let kind = cfg
-                        .transport_type
-                        .as_deref()
-                        .unwrap_or(if cfg.url.is_some() { "http" } else { "stdio" });
-                    let detail = if let Some(url) = &cfg.url {
-                        url.clone()
-                    } else {
-                        format!("{} {:?}", cfg.command.as_deref().unwrap_or("?"), cfg.args)
-                    };
-                    let oauth = if cfg.oauth.is_some() { " oauth" } else { "" };
-                    lines.push_str(&format!("  {name} [{kind}{oauth}] — {detail}\n"));
-                }
-                if n == 0 {
-                    lines.push_str("  (none — add [mcp_servers.*] in config.toml)");
-                }
-                self.system_message(lines);
+                self.open_mcp_manager().await?;
             }
             "tasks" | "task" => {
                 self.open_tasks_panel().await?;
@@ -3116,37 +3314,7 @@ impl TuiApp {
                         return self.activate_skill(name, skill_args).await;
                     }
                 }
-                match self.client.rpc_call("skills.list", None).await {
-                    Ok(data) => {
-                        let mut lines = String::from("Available skills:\n");
-                        if let Some(arr) = data.get("skills").and_then(|v| v.as_array()) {
-                            if arr.is_empty() {
-                                lines.push_str("  (none — add SKILL.md under .kkagent/skills/)\n");
-                            }
-                            for s in arr {
-                                let name = s.get("name").and_then(|v| v.as_str()).unwrap_or("?");
-                                let desc = s
-                                    .get("description")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("")
-                                    .trim();
-                                if desc.is_empty() {
-                                    lines.push_str(&format!("  /skill:{name}\n"));
-                                } else {
-                                    let short: String = desc.chars().take(80).collect();
-                                    lines.push_str(&format!("  /skill:{name}  — {short}\n"));
-                                }
-                            }
-                            lines.push_str(
-                                "\nActivate with /skill:<name> [args] (or bare /<name> when free).",
-                            );
-                        } else {
-                            lines.push_str(&format!("  {data}"));
-                        }
-                        self.system_message(lines);
-                    }
-                    Err(e) => self.system_message(format!("skills: {e}")),
-                }
+                self.open_skill_manager().await?;
             }
             "swarm" => match args.as_str() {
                 "enter" | "on" => {
@@ -3419,6 +3587,13 @@ impl TuiApp {
                             .unwrap_or("")
                             .to_string();
                         if name.is_empty() {
+                            continue;
+                        }
+                        let enabled = s
+                            .get("enabled")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(true);
+                        if !enabled {
                             continue;
                         }
                         let desc = s

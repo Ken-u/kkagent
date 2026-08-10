@@ -9,7 +9,7 @@ use tokio::sync::{mpsc, Mutex};
 use tokio::task::AbortHandle;
 
 use kkagent_client::KkagentClient;
-use kkagent_config::{load_config, AppConfig};
+use kkagent_config::{load_config, AppConfig, DisabledState};
 use kkagent_core::SubagentMirrorContext;
 use kkagent_core::{
     AgentLoop, BtwTurn, PermissionChain, Session, SessionBtwService, SessionCloseReason,
@@ -1214,9 +1214,15 @@ impl kkagent_acp::AcpHost for AgentAcpHost {
     }
 
     async fn list_mcp(&self) -> serde_json::Value {
+        let servers = self.state.mcp.list_server_status().await;
         let tool_count = self.state.mcp.list_tools().await.len();
         serde_json::json!({
-            "servers": self.state.config.mcp_servers.keys().collect::<Vec<_>>(),
+            "servers": servers.iter().map(|s| serde_json::json!({
+                "name": s.name,
+                "enabled": s.enabled,
+                "connected": s.connected,
+                "transport": s.transport,
+            })).collect::<Vec<_>>(),
             "toolCount": tool_count,
         })
     }
@@ -1520,15 +1526,15 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
 
     async fn list_skills(&self) -> serde_json::Value {
         let list = self.state.skills.list().await;
-        let items: Vec<_> = list
-            .into_iter()
-            .map(|e| {
-                serde_json::json!({
-                    "name": e.name,
-                    "description": e.description,
-                })
-            })
-            .collect();
+        let mut items = Vec::new();
+        for e in list {
+            let enabled = self.state.skills.is_enabled(&e.name).await;
+            items.push(serde_json::json!({
+                "name": e.name,
+                "description": e.description,
+                "enabled": enabled,
+            }));
+        }
         serde_json::json!({"skills": items})
     }
 
@@ -2156,6 +2162,7 @@ impl ServerState {
 }
 
 fn mcp_manager_from_config(config: &AppConfig) -> McpManager {
+    // Keep every configured server so /mcp can re-enable at runtime.
     let configs: Vec<kkagent_mcp::McpServerConfig> = config
         .mcp_servers
         .iter()
@@ -2206,6 +2213,15 @@ async fn build_server_state(config: Arc<AppConfig>) -> Result<Arc<ServerState>> 
     let sandbox_policy = kkagent_tools::sandbox::SandboxPolicy::from_config(&config.sandbox)?;
 
     let mcp = Arc::new(mcp_manager_from_config(&config));
+    {
+        let disabled: Vec<String> = config
+            .mcp_servers
+            .keys()
+            .filter(|name| config.is_mcp_disabled(name))
+            .cloned()
+            .collect();
+        mcp.set_disabled_names(disabled).await;
+    }
     if !config.mcp_servers.is_empty() {
         if let Err(e) = mcp.connect_all().await {
             tracing::warn!("MCP connect_all error: {}", e);
@@ -2232,6 +2248,7 @@ async fn build_server_state(config: Arc<AppConfig>) -> Result<Arc<ServerState>> 
         )
         .await,
     );
+    skills.set_disabled(config.disabled_skills.clone()).await;
     let cron_path = kkagent_config::default_config_dir().join("cron.json");
     let cron = Arc::new(kkagent_tools::CronManager::with_persist(cron_path).await);
     let goal_mgr = Arc::new(kkagent_protocol::goal::GoalManager::new());
@@ -2439,6 +2456,24 @@ fn messages_from_records(records: &[kkagent_core::transcript::MessageRecord]) ->
             })
         })
         .collect()
+}
+
+async fn persist_disabled_extensions(state: &ServerState) -> Result<(), String> {
+    let disabled_skills = state.skills.disabled_names().await;
+    let disabled_mcp_servers: Vec<String> = state
+        .mcp
+        .list_server_status()
+        .await
+        .into_iter()
+        .filter(|s| !s.enabled)
+        .map(|s| s.name)
+        .collect();
+    DisabledState {
+        disabled_skills,
+        disabled_mcp_servers,
+    }
+    .save()
+    .map_err(|e| e.to_string())
 }
 
 /// Shared turn spawn used by `session.prompt` and `skills.activate`.
@@ -3686,18 +3721,94 @@ async fn handle_rpc_call(
         }
         "skills.list" => {
             let list = state.skills.list().await;
-            let items: Vec<serde_json::Value> = list
-                .into_iter()
-                .map(|e| {
-                    serde_json::json!({
-                        "name": e.name,
-                        "description": e.description,
-                        "path": e.path.display().to_string(),
-                        "triggers": e.triggers,
-                    })
-                })
-                .collect();
+            let mut items = Vec::new();
+            for e in list {
+                let enabled = state.skills.is_enabled(&e.name).await;
+                items.push(serde_json::json!({
+                    "name": e.name,
+                    "description": e.description,
+                    "path": e.path.display().to_string(),
+                    "triggers": e.triggers,
+                    "enabled": enabled,
+                }));
+            }
             Ok(serde_json::json!({"skills": items}))
+        }
+        "skills.set_enabled" => {
+            let name = params
+                .as_ref()
+                .and_then(|p| p.get("name"))
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| (-32602, "Missing skill name".into()))?
+                .trim()
+                .to_string();
+            if name.is_empty() {
+                return Err((-32602, "Skill name must not be empty".into()));
+            }
+            let enabled = params
+                .as_ref()
+                .and_then(|p| p.get("enabled"))
+                .and_then(|v| v.as_bool())
+                .ok_or_else(|| (-32602, "Missing enabled bool".into()))?;
+            let known = state
+                .skills
+                .list()
+                .await
+                .into_iter()
+                .any(|e| e.name == name);
+            if !known {
+                return Err((-32602, format!("Skill not found: {name}")));
+            }
+            state.skills.set_skill_enabled(&name, enabled).await;
+            persist_disabled_extensions(&state)
+                .await
+                .map_err(|e| (-32000, e))?;
+            Ok(serde_json::json!({
+                "name": name,
+                "enabled": enabled,
+            }))
+        }
+        "mcp.list" => {
+            let servers = state.mcp.list_server_status().await;
+            let tool_count = state.mcp.list_tools().await.len();
+            Ok(serde_json::json!({
+                "servers": servers.iter().map(|s| serde_json::json!({
+                    "name": s.name,
+                    "enabled": s.enabled,
+                    "connected": s.connected,
+                    "transport": s.transport,
+                })).collect::<Vec<_>>(),
+                "tool_count": tool_count,
+            }))
+        }
+        "mcp.set_enabled" => {
+            let name = params
+                .as_ref()
+                .and_then(|p| p.get("name"))
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| (-32602, "Missing MCP server name".into()))?
+                .trim()
+                .to_string();
+            if name.is_empty() {
+                return Err((-32602, "MCP server name must not be empty".into()));
+            }
+            let enabled = params
+                .as_ref()
+                .and_then(|p| p.get("enabled"))
+                .and_then(|v| v.as_bool())
+                .ok_or_else(|| (-32602, "Missing enabled bool".into()))?;
+            state
+                .mcp
+                .set_enabled(&name, enabled)
+                .await
+                .map_err(|e| (-32000, e.to_string()))?;
+            persist_disabled_extensions(&state)
+                .await
+                .map_err(|e| (-32000, e))?;
+            Ok(serde_json::json!({
+                "name": name,
+                "enabled": enabled,
+            }))
         }
         "skills.activate" => {
             let session_id = params
@@ -3715,6 +3826,12 @@ async fn handle_rpc_call(
                 .to_string();
             if skill_name.is_empty() {
                 return Err((-32602, "Skill name must not be empty".into()));
+            }
+            if !state.skills.is_enabled(&skill_name).await {
+                return Err((
+                    -32000,
+                    format!("Skill \"{skill_name}\" is disabled. Enable it in /skills."),
+                ));
             }
             let skill_args = params
                 .as_ref()
