@@ -1172,6 +1172,17 @@ impl TuiApp {
                 self.submit_input().await?;
             }
 
+            // Periodically persist the composer draft for the active session.
+            if self.state.tick % 20 == 0 {
+                if let Some(sid) = self.state.session_id.clone() {
+                    let text = self.state.input.text.clone();
+                    let cursor = self.state.input.cursor;
+                    if !text.is_empty() {
+                        let _ = crate::draft_store::save_draft(&sid, &text, cursor);
+                    }
+                }
+            }
+
             while let Ok(frame) = self.client.event_rx.try_recv() {
                 self.handle_server_event(frame);
             }
@@ -2259,7 +2270,37 @@ impl TuiApp {
                     if self.state.quit_confirm {
                         self.state.should_quit = true;
                     } else {
-                        self.state.quit_confirm = true;
+                        let mut reasons = Vec::new();
+                        if !self.state.input.is_empty() {
+                            reasons.push("draft");
+                        }
+                        if self.state.approval_pending.is_some()
+                            || !self.state.approval_queue.is_empty()
+                        {
+                            reasons.push("approval");
+                        }
+                        if self.state.question_pending.is_some() {
+                            reasons.push("question");
+                        }
+                        if matches!(
+                            self.state.status,
+                            SessionStatus::Thinking
+                                | SessionStatus::ToolExecuting
+                                | SessionStatus::WaitingApproval
+                                | SessionStatus::WaitingQuestion
+                                | SessionStatus::Compacting
+                        ) {
+                            reasons.push("running");
+                        }
+                        if reasons.is_empty() {
+                            self.state.quit_confirm = true;
+                        } else {
+                            self.state.quit_confirm = true;
+                            self.system_message(format!(
+                                "Quit? pending: {} — Ctrl-C again quits (turn continues in background if running).",
+                                reasons.join(", ")
+                            ));
+                        }
                     }
                 } else {
                     self.state.input.clear();
@@ -3442,6 +3483,84 @@ impl TuiApp {
         });
     }
 
+    fn open_context_picker(&mut self) {
+        let mut items = Vec::new();
+        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        for name in ["AGENTS.md", "CLAUDE.md", ".kkagent/AGENTS.md"] {
+            let p = cwd.join(name);
+            items.push(ListPickerItem {
+                id: name.into(),
+                label: name.into(),
+                detail: if p.is_file() {
+                    "loaded (project)".into()
+                } else {
+                    "missing".into()
+                },
+            });
+        }
+        items.push(ListPickerItem {
+            id: "skills".into(),
+            label: "Skills".into(),
+            detail: format!("{} slash skills", self.state.skill_slash_commands.len()),
+        });
+        items.push(ListPickerItem {
+            id: "tokens".into(),
+            label: "Approx tokens".into(),
+            detail: self.state.approx_tokens.to_string(),
+        });
+        items.push(ListPickerItem {
+            id: "tools".into(),
+            label: "Last tool".into(),
+            detail: self
+                .state
+                .last_tool_name
+                .clone()
+                .unwrap_or_else(|| "-".into()),
+        });
+        self.replace_list_picker(ListPickerState {
+            kind: ListPickerKind::Browse,
+            title: " /context ".into(),
+            items,
+            selected: 0,
+            filter: String::new(),
+            all_items: Vec::new(),
+        });
+    }
+
+    fn open_changes_picker(&mut self) {
+        let mut items = Vec::new();
+        let mut write_tools = 0u32;
+        for msg in &self.state.messages {
+            for part in &msg.parts {
+                if let DisplayPart::Tool(tc) = part {
+                    if matches!(tc.name.as_str(), "Write" | "Edit") {
+                        write_tools += 1;
+                        items.push(ListPickerItem {
+                            id: format!("{write_tools}"),
+                            label: tc.name.clone(),
+                            detail: tc.input_summary.chars().take(48).collect(),
+                        });
+                    }
+                }
+            }
+        }
+        if items.is_empty() {
+            items.push(ListPickerItem {
+                id: "none".into(),
+                label: "No file edits in this session".into(),
+                detail: String::new(),
+            });
+        }
+        self.replace_list_picker(ListPickerState {
+            kind: ListPickerKind::Browse,
+            title: " /changes (session tool edits) ".into(),
+            items,
+            selected: 0,
+            filter: String::new(),
+            all_items: Vec::new(),
+        });
+    }
+
     fn open_usage_picker(&mut self) {
         let u = &self.state.usage_session;
         let model = self
@@ -4244,6 +4363,12 @@ impl TuiApp {
             .unwrap_or(query)
             .to_string();
         self.state.session_id = Some(sid.clone());
+        if let Some(draft) = crate::draft_store::load_draft(&sid) {
+            if self.state.input.is_empty() && !draft.text.is_empty() {
+                self.state.input.set_text(draft.text);
+                self.state.input.cursor = draft.cursor.min(self.state.input.text.len());
+            }
+        }
         self.state.messages.clear();
         self.state.todos.clear();
         self.state.todos_expanded = false;
@@ -5148,6 +5273,9 @@ impl TuiApp {
         }
 
         let idem = uuid::Uuid::new_v4().to_string();
+        if let Some(warn) = crate::draft_store::redact_sensitive_preview(&text) {
+            self.system_message(warn);
+        }
         self.state.messages.push(DisplayMessage {
             role: MessageRole::User,
             content: text,
@@ -5170,11 +5298,12 @@ impl TuiApp {
             }
             self.jobs.spawn_prompt(
                 self.client.requester(),
-                sid,
+                sid.clone(),
                 prompt_text,
                 Vec::new(),
                 idem,
             );
+            crate::draft_store::clear_draft(&sid);
         } else {
             self.state.status = SessionStatus::Idle;
             if let Some(msg) = self.state.messages.last_mut() {
@@ -5464,6 +5593,14 @@ impl TuiApp {
             "usage" => {
                 self.begin_root_picker();
                 self.open_usage_picker();
+            }
+            "context" => {
+                self.begin_root_picker();
+                self.open_context_picker();
+            }
+            "changes" => {
+                self.begin_root_picker();
+                self.open_changes_picker();
             }
             "doctor" => {
                 self.begin_root_picker();

@@ -3,6 +3,7 @@ pub mod async_jobs;
 pub mod chrome;
 pub mod components;
 pub mod controllers;
+pub mod draft_store;
 pub mod git_badge;
 pub mod i18n;
 pub mod input;

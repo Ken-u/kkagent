@@ -824,8 +824,16 @@ fn render_tool_history_lines(
     locale: Locale,
     first_bullet: bool,
 ) {
-    let overview =
-        i18n::tool_history_overview(locale, hist.tool_count, hist.duration_ms, hist.tokens);
+    let explore_only = !hist.tools.is_empty()
+        && hist
+            .tools
+            .iter()
+            .all(|t| matches!(t.name.as_str(), "Read" | "Grep" | "Glob") && !t.is_error);
+    let overview = if explore_only {
+        format!("Explored {} files ✓", hist.tool_count)
+    } else {
+        i18n::tool_history_overview(locale, hist.tool_count, hist.duration_ms, hist.tokens)
+    };
     let hint = if hist.expanded {
         i18n::tool_history_collapse_hint(locale)
     } else {
@@ -1622,8 +1630,15 @@ fn format_context(state: &AppState, config: &AppConfig) -> String {
         .checked_div(max)
         .unwrap_or(0)
         .min(100);
+    let warn = if pct >= 90 {
+        " ! "
+    } else if pct >= 70 {
+        " ~ "
+    } else {
+        " "
+    };
     format!(
-        "context: {}% ({}/{})",
+        "context:{warn}{}% ({}/{})",
         pct,
         format_tokens(used),
         format_tokens(max)
