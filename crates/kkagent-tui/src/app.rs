@@ -545,65 +545,8 @@ impl AppState {
             .rposition(|m| m.role == MessageRole::User)
             .map(|i| i + 1)
             .unwrap_or(0);
-
-        let mut collected: Vec<DisplayToolCall> = Vec::new();
-        for msg in &mut self.messages[start..] {
-            if msg.role != MessageRole::Assistant {
-                continue;
-            }
-            let mut kept = Vec::with_capacity(msg.parts.len());
-            for part in msg.parts.drain(..) {
-                match part {
-                    DisplayPart::Tool(tc) => collected.push(tc),
-                    DisplayPart::ToolHistory(mut hist) => {
-                        // Already collapsed earlier in the same turn — merge.
-                        collected.append(&mut hist.tools);
-                    }
-                    other => kept.push(other),
-                }
-            }
-            // Legacy list
-            collected.append(&mut msg.tool_calls);
-            msg.parts = kept;
-        }
-
-        if collected.is_empty() {
-            return;
-        }
-
-        let summary = DisplayPart::ToolHistory(ToolHistorySummary {
-            tool_count: collected.len() as u32,
-            duration_ms,
-            tokens,
-            expanded: false,
-            tools: collected,
-        });
-
-        // Place the overview just before the last formal text of the turn,
-        // so the final answer stays at the bottom; otherwise append.
-        if let Some(msg) = self.messages[start..]
-            .iter_mut()
-            .rev()
-            .find(|m| m.role == MessageRole::Assistant)
-        {
-            if let Some(idx) = msg
-                .parts
-                .iter()
-                .rposition(|p| matches!(p, DisplayPart::Text(t) if !t.trim().is_empty()))
-            {
-                msg.parts.insert(idx, summary);
-            } else {
-                msg.parts.push(summary);
-            }
-        } else {
-            self.messages.push(DisplayMessage {
-                role: MessageRole::Assistant,
-                content: String::new(),
-                thinking: None,
-                parts: vec![summary],
-                tool_calls: Vec::new(),
-            });
-        }
+        let end = self.messages.len();
+        collapse_tools_in_turn(&mut self.messages, start, end, duration_ms, tokens);
     }
 
     pub fn max_scroll_up(&self) -> u16 {
@@ -3990,8 +3933,113 @@ Slash commands:\n",
     s
 }
 
-/// Convert a list of serialized ChatMessages into display bubbles,
-/// pairing tool_result blocks onto preceding tool_use entries.
+/// Fold tool calls in `[start, end)` into one `ToolHistory` overview.
+fn collapse_tools_in_turn(
+    messages: &mut Vec<DisplayMessage>,
+    start: usize,
+    end: usize,
+    duration_ms: u64,
+    tokens: u64,
+) {
+    if start >= messages.len() || start >= end {
+        return;
+    }
+    let end = end.min(messages.len());
+
+    let mut collected: Vec<DisplayToolCall> = Vec::new();
+    for msg in &mut messages[start..end] {
+        if msg.role != MessageRole::Assistant {
+            continue;
+        }
+        let mut kept = Vec::with_capacity(msg.parts.len());
+        for part in msg.parts.drain(..) {
+            match part {
+                DisplayPart::Tool(tc) => collected.push(tc),
+                DisplayPart::ToolHistory(mut hist) => {
+                    // Already collapsed earlier in the same turn — merge.
+                    collected.append(&mut hist.tools);
+                }
+                other => kept.push(other),
+            }
+        }
+        // Legacy list
+        collected.append(&mut msg.tool_calls);
+        msg.parts = kept;
+    }
+
+    if collected.is_empty() {
+        return;
+    }
+
+    let summary = DisplayPart::ToolHistory(ToolHistorySummary {
+        tool_count: collected.len() as u32,
+        duration_ms,
+        tokens,
+        expanded: false,
+        tools: collected,
+    });
+
+    // Place the overview just before the last formal text of the turn,
+    // so the final answer stays at the bottom; otherwise append.
+    if let Some(msg) = messages[start..end]
+        .iter_mut()
+        .rev()
+        .find(|m| m.role == MessageRole::Assistant)
+    {
+        if let Some(idx) = msg
+            .parts
+            .iter()
+            .rposition(|p| matches!(p, DisplayPart::Text(t) if !t.trim().is_empty()))
+        {
+            msg.parts.insert(idx, summary);
+        } else {
+            msg.parts.push(summary);
+        }
+    } else {
+        messages.insert(
+            end,
+            DisplayMessage {
+                role: MessageRole::Assistant,
+                content: String::new(),
+                thinking: None,
+                parts: vec![summary],
+                tool_calls: Vec::new(),
+            },
+        );
+    }
+}
+
+/// After resume / session preview rebuild, fold every completed turn's tools
+/// the same way live `TurnEnd` does (duration/tokens unknown → 0).
+fn collapse_all_historical_turn_tools(messages: &mut Vec<DisplayMessage>) {
+    let user_idxs: Vec<usize> = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.role == MessageRole::User)
+        .map(|(i, _)| i)
+        .collect();
+
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    match user_idxs.first() {
+        Some(&first) if first > 0 => ranges.push((0, first)),
+        None => ranges.push((0, messages.len())),
+        _ => {}
+    }
+    for (i, &user_i) in user_idxs.iter().enumerate() {
+        let start = user_i + 1;
+        let end = user_idxs.get(i + 1).copied().unwrap_or(messages.len());
+        if start < end {
+            ranges.push((start, end));
+        }
+    }
+
+    // Reverse so an insert at a later turn does not shift earlier ranges.
+    for (start, end) in ranges.into_iter().rev() {
+        collapse_tools_in_turn(messages, start, end, 0, 0);
+    }
+}
+
+/// True when the transcript has user/assistant/plan content worth keeping.
 /// Sessions with only UI system notices (or nothing) are treated as empty and
 /// discarded when the user leaves the page.
 fn session_has_retained_io(messages: &[DisplayMessage]) -> bool {
@@ -4013,6 +4061,9 @@ fn session_has_retained_io(messages: &[DisplayMessage]) -> bool {
     })
 }
 
+/// Convert a list of serialized ChatMessages into display bubbles,
+/// pairing tool_result blocks onto preceding tool_use entries.
+/// Completed turns are folded into tool-history overviews (same as live TurnEnd).
 fn transcript_messages_to_display(msgs: &[serde_json::Value]) -> Vec<DisplayMessage> {
     let mut out: Vec<DisplayMessage> = Vec::new();
     // tool_use id -> (msg_idx, part_idx)
@@ -4175,6 +4226,7 @@ fn transcript_messages_to_display(msgs: &[serde_json::Value]) -> Vec<DisplayMess
             _ => {}
         }
     }
+    collapse_all_historical_turn_tools(&mut out);
     out
 }
 
@@ -4437,5 +4489,63 @@ mod app_state_tests {
         );
         assert!(matches!(parts.last(), Some(DisplayPart::Text(t)) if t == "done"));
         assert!(!parts.iter().any(|p| matches!(p, DisplayPart::Tool(_))));
+    }
+
+    #[test]
+    fn resume_transcript_collapses_tool_history() {
+        let msgs = vec![
+            serde_json::json!({
+                "role": "user",
+                "content": [{"type": "text", "text": "read it"}]
+            }),
+            serde_json::json!({
+                "role": "assistant",
+                "content": [
+                    {"type": "tool_use", "id": "t1", "name": "Read", "input": {"path": "a.rs"}},
+                    {"type": "text", "text": "ok"}
+                ]
+            }),
+            serde_json::json!({
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "content": "fn main() {}", "is_error": false}
+                ]
+            }),
+            serde_json::json!({
+                "role": "user",
+                "content": [{"type": "text", "text": "again"}]
+            }),
+            serde_json::json!({
+                "role": "assistant",
+                "content": [
+                    {"type": "tool_use", "id": "t2", "name": "Bash", "input": {"command": "ls"}},
+                    {"type": "tool_use", "id": "t3", "name": "Read", "input": {"path": "b.rs"}},
+                    {"type": "text", "text": "done"}
+                ]
+            }),
+            serde_json::json!({
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "t2", "content": "a", "is_error": false},
+                    {"type": "tool_result", "tool_use_id": "t3", "content": "b", "is_error": false}
+                ]
+            }),
+        ];
+        let display = transcript_messages_to_display(&msgs);
+        let histories: Vec<_> = display
+            .iter()
+            .flat_map(|m| m.parts.iter())
+            .filter_map(|p| match p {
+                DisplayPart::ToolHistory(h) => Some(h),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(histories.len(), 2);
+        assert_eq!(histories[0].tool_count, 1);
+        assert_eq!(histories[1].tool_count, 2);
+        assert!(!display
+            .iter()
+            .flat_map(|m| m.parts.iter())
+            .any(|p| matches!(p, DisplayPart::Tool(_))));
     }
 }
