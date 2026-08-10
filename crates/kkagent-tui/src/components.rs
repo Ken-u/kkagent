@@ -24,7 +24,7 @@ const TIPS: &[&str] = &[
     "@ opens file picker — tab to insert a path",
     "ctrl+f searches the transcript",
     "ctrl+o expands turn tool history",
-    "tab cycles workspace sessions when the input is empty",
+    "tab / ←→ cycle fork sessions when input is empty",
     "ctrl+g toggles /btw side Q&A",
     "shift-tab toggles plan mode (scroll locks to plan)",
     "! enters shell mode",
@@ -43,7 +43,7 @@ pub fn render_ui(f: &mut Frame, state: &mut AppState, config: &AppConfig) {
         .as_ref()
         .map(menu_height)
         .or_else(|| state.file_menu.as_ref().map(file_menu_height))
-        .or_else(|| state.list_picker.as_ref().map(picker_height))
+        .or_else(|| state.list_picker.as_ref().map(|p| picker_height(p, state)))
         .unwrap_or(0);
 
     // Sticky todo sits above the input (highest visual priority).
@@ -166,14 +166,26 @@ fn file_menu_height(menu: &crate::app::FileMenuState) -> u16 {
     rows + 2
 }
 
-fn picker_height(picker: &ListPickerState) -> u16 {
+fn picker_height(picker: &ListPickerState, state: &AppState) -> u16 {
     let max_visible = 10u16;
     let rows = if picker.items.is_empty() {
         1
     } else {
         (picker.items.len() as u16).min(max_visible)
     };
-    rows + 2
+    let mut h = rows + 2;
+    if picker.kind == crate::app::ListPickerKind::Session {
+        let preview_lines = state
+            .session_picker_preview
+            .as_ref()
+            .map(|p| p.lines.len().min(8) as u16 + 2) // title + lines
+            .unwrap_or(3);
+        h = h.saturating_add(preview_lines);
+        if state.session_delete_confirm.is_some() {
+            h = h.saturating_add(1);
+        }
+    }
+    h.min(28)
 }
 
 fn input_prefix_str(state: &AppState) -> &'static str {
@@ -1590,6 +1602,48 @@ fn render_list_picker(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme
         .title(picker.title.as_str());
 
     let mut lines: Vec<Line> = Vec::new();
+
+    if picker.kind == crate::app::ListPickerKind::Session {
+        if let Some(preview) = state.session_picker_preview.as_ref() {
+            lines.push(Line::from(Span::styled(
+                format!(" preview · {} ", preview.title),
+                Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::BOLD),
+            )));
+            for line in preview.lines.iter().take(8) {
+                lines.push(Line::from(Span::styled(
+                    format!("  {}", truncate(line, inner.width.saturating_sub(2) as usize)),
+                    Style::default().fg(theme.text_dim),
+                )));
+            }
+            lines.push(Line::from(Span::styled(
+                "─".repeat(inner.width as usize),
+                Style::default().fg(theme.border),
+            )));
+        } else {
+            lines.push(Line::from(Span::styled(
+                " preview · loading…",
+                Style::default().fg(theme.text_muted),
+            )));
+            lines.push(Line::from(Span::styled(
+                "─".repeat(inner.width as usize),
+                Style::default().fg(theme.border),
+            )));
+        }
+        if let Some(confirm) = state.session_delete_confirm.as_ref() {
+            lines.push(Line::from(Span::styled(
+                format!(
+                    " Delete {}?  y = yes · Enter/N = no ",
+                    truncate(&confirm.label, inner.width.saturating_sub(28) as usize)
+                ),
+                Style::default()
+                    .fg(theme.warning)
+                    .add_modifier(Modifier::BOLD),
+            )));
+        }
+    }
+
     if picker.items.is_empty() {
         lines.push(Line::from(Span::styled(
             "No items",

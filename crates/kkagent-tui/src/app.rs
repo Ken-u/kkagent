@@ -107,6 +107,10 @@ pub struct AppState {
     pub status_bar: StatusBarModel,
     /// Workspace sessions for footer strip + empty-input Tab cycling.
     pub workspace_sessions: crate::chrome::WorkspaceSessionStrip,
+    /// Preview pane while `/sessions` list is open.
+    pub session_picker_preview: Option<SessionPickerPreview>,
+    /// Pending delete confirmation inside `/sessions` (default = No).
+    pub session_delete_confirm: Option<SessionDeleteConfirm>,
     /// Session event router (controllers).
     pub event_router: SessionEventRouter,
     /// Ctrl-F transcript search overlay.
@@ -160,6 +164,19 @@ pub struct ListPickerItem {
     pub id: String,
     pub label: String,
     pub detail: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionPickerPreview {
+    pub session_id: String,
+    pub title: String,
+    pub lines: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionDeleteConfirm {
+    pub session_id: String,
+    pub label: String,
 }
 
 #[derive(Debug, Clone)]
@@ -428,6 +445,8 @@ impl AppState {
                 ..Default::default()
             },
             workspace_sessions: crate::chrome::WorkspaceSessionStrip::default(),
+            session_picker_preview: None,
+            session_delete_confirm: None,
             event_router: SessionEventRouter::default(),
             search: SearchState::default(),
             last_tool_name: None,
@@ -1164,6 +1183,22 @@ impl TuiApp {
 
         // List picker (model / sessions)
         if self.state.list_picker.is_some() {
+            // Delete confirmation takes priority while open.
+            if self.state.session_delete_confirm.is_some() {
+                match key.code {
+                    KeyCode::Char('y') | KeyCode::Char('Y') => {
+                        self.confirm_delete_session(true).await?;
+                    }
+                    KeyCode::Char('n')
+                    | KeyCode::Char('N')
+                    | KeyCode::Esc
+                    | KeyCode::Enter => {
+                        self.confirm_delete_session(false).await?;
+                    }
+                    _ => {}
+                }
+                return Ok(());
+            }
             match key.code {
                 KeyCode::Up => {
                     if let Some(ref mut p) = self.state.list_picker {
@@ -1173,6 +1208,15 @@ impl TuiApp {
                             p.selected = p.items.len() - 1;
                         }
                     }
+                    if self
+                        .state
+                        .list_picker
+                        .as_ref()
+                        .map(|p| p.kind == ListPickerKind::Session)
+                        .unwrap_or(false)
+                    {
+                        self.refresh_session_picker_preview().await?;
+                    }
                     return Ok(());
                 }
                 KeyCode::Down => {
@@ -1180,6 +1224,15 @@ impl TuiApp {
                         if !p.items.is_empty() {
                             p.selected = (p.selected + 1) % p.items.len();
                         }
+                    }
+                    if self
+                        .state
+                        .list_picker
+                        .as_ref()
+                        .map(|p| p.kind == ListPickerKind::Session)
+                        .unwrap_or(false)
+                    {
+                        self.refresh_session_picker_preview().await?;
                     }
                     return Ok(());
                 }
@@ -1189,6 +1242,27 @@ impl TuiApp {
                 }
                 KeyCode::Esc => {
                     self.state.list_picker = None;
+                    self.state.session_picker_preview = None;
+                    self.state.session_delete_confirm = None;
+                    return Ok(());
+                }
+                KeyCode::Char('d') | KeyCode::Char('D')
+                    if key.modifiers.contains(KeyModifiers::CONTROL)
+                        && self
+                            .state
+                            .list_picker
+                            .as_ref()
+                            .map(|p| p.kind == ListPickerKind::Session)
+                            .unwrap_or(false) =>
+                {
+                    if let Some(picker) = self.state.list_picker.as_ref() {
+                        if let Some(item) = picker.items.get(picker.selected) {
+                            self.state.session_delete_confirm = Some(SessionDeleteConfirm {
+                                session_id: item.id.clone(),
+                                label: item.label.clone(),
+                            });
+                        }
+                    }
                     return Ok(());
                 }
                 _ => {}
@@ -1415,17 +1489,28 @@ impl TuiApp {
             KeyCode::Enter if !key.modifiers.contains(KeyModifiers::SHIFT) => {
                 self.submit_input().await?;
             }
-            // Empty input Tab: cycle workspace sessions (same cwd / forks)
+            // Empty input Tab / ← →: cycle fork-family sessions (only when a family exists)
             KeyCode::Tab
                 if !key.modifiers.contains(KeyModifiers::CONTROL)
                     && !key.modifiers.contains(KeyModifiers::SHIFT)
                     && !key.modifiers.contains(KeyModifiers::ALT)
-                    && self.state.input.is_empty()
-                    && self.state.slash_menu.is_none()
-                    && self.state.file_menu.is_none()
-                    && self.state.list_picker.is_none() =>
+                    && self.can_cycle_fork_sessions() =>
             {
-                self.cycle_workspace_session().await?;
+                self.cycle_workspace_session(1).await?;
+            }
+            KeyCode::Left
+                if !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT)
+                    && self.can_cycle_fork_sessions() =>
+            {
+                self.cycle_workspace_session(-1).await?;
+            }
+            KeyCode::Right
+                if !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT)
+                    && self.can_cycle_fork_sessions() =>
+            {
+                self.cycle_workspace_session(1).await?;
             }
             // Shift-Enter or Ctrl-J: newline
             KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
@@ -1753,6 +1838,8 @@ impl TuiApp {
         let Some(picker) = self.state.list_picker.take() else {
             return Ok(());
         };
+        self.state.session_picker_preview = None;
+        self.state.session_delete_confirm = None;
         if picker.items.is_empty() {
             return Ok(());
         }
@@ -1807,10 +1894,11 @@ impl TuiApp {
     }
 
     async fn open_session_picker(&mut self) -> anyhow::Result<()> {
-        let params = serde_json::json!({"limit": 20});
+        let params = serde_json::json!({"limit": 40});
         match self.client.rpc_call("sessions.list", Some(params)).await {
             Ok(data) => {
                 let mut items = Vec::new();
+                let current = self.state.session_id.clone();
                 if let Some(sessions) = data.get("sessions").and_then(|v| v.as_array()) {
                     for s in sessions {
                         let id = s
@@ -1821,28 +1909,49 @@ impl TuiApp {
                         if id.is_empty() {
                             continue;
                         }
-                        let title = s
-                            .get("title")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("(untitled)");
-                        let msgs = s.get("message_count").and_then(|v| v.as_u64()).unwrap_or(0);
+                        let title = crate::chrome::session_display_title(
+                            s.get("title").and_then(|v| v.as_str()),
+                            s.get("is_custom_title")
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false),
+                            s.get("last_prompt").and_then(|v| v.as_str()),
+                            &id,
+                        );
                         let short = &id[..8.min(id.len())];
+                        let fork = s
+                            .get("forked_from")
+                            .and_then(|v| v.as_str())
+                            .map(|p| format!("fork←{}", &p[..8.min(p.len())]))
+                            .unwrap_or_else(|| "session".into());
+                        let mark = if current.as_deref() == Some(id.as_str()) {
+                            "·current"
+                        } else {
+                            ""
+                        };
                         items.push(ListPickerItem {
                             id: id.clone(),
-                            label: format!("{} — {}", short, title),
-                            detail: format!("{} msgs", msgs),
+                            label: format!("{short} — {title}"),
+                            detail: format!("{fork}{mark}"),
                         });
                     }
                 }
                 if items.is_empty() {
+                    self.state.list_picker = None;
+                    self.state.session_picker_preview = None;
                     self.system_message("No saved sessions.".into());
                 } else {
+                    let selected = current
+                        .as_ref()
+                        .and_then(|c| items.iter().position(|i| &i.id == c))
+                        .unwrap_or(0);
                     self.state.list_picker = Some(ListPickerState {
                         kind: ListPickerKind::Session,
-                        title: " Resume session ".into(),
+                        title: " Sessions  ↑↓ preview  Enter open  Ctrl-D delete ".into(),
                         items,
-                        selected: 0,
+                        selected,
                     });
+                    self.state.session_delete_confirm = None;
+                    self.refresh_session_picker_preview().await?;
                 }
             }
             Err(e) => self.system_message(format!("Failed to list sessions: {}", e)),
@@ -1914,17 +2023,20 @@ impl TuiApp {
     }
 
     async fn refresh_workspace_sessions(&mut self) -> anyhow::Result<()> {
-        let cwd = std::env::current_dir()
-            .ok()
-            .and_then(|p| std::fs::canonicalize(&p).ok())
-            .unwrap_or_else(|| std::path::PathBuf::from("."));
-        let cwd_key = cwd.to_string_lossy().to_string();
-        let params = serde_json::json!({"limit": 40, "include_archived": false});
+        let Some(current_id) = self.state.session_id.clone() else {
+            self.state.workspace_sessions.set_entries(Vec::new(), None);
+            return Ok(());
+        };
+        let params = serde_json::json!({"limit": 80, "include_archived": false});
         let data = match self.client.rpc_call("sessions.list", Some(params)).await {
             Ok(v) => v,
-            Err(_) => return Ok(()),
+            Err(_) => {
+                self.state.workspace_sessions.set_entries(Vec::new(), None);
+                return Ok(());
+            }
         };
-        let mut entries = Vec::new();
+
+        let mut rows: Vec<(String, Option<String>, String)> = Vec::new();
         if let Some(sessions) = data.get("sessions").and_then(|v| v.as_array()) {
             for s in sessions {
                 let id = s
@@ -1935,20 +2047,10 @@ impl TuiApp {
                 if id.is_empty() {
                     continue;
                 }
-                let work = s
-                    .get("working_dir")
+                let forked_from = s
+                    .get("forked_from")
                     .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let same_dir = if work.is_empty() {
-                    true
-                } else {
-                    std::fs::canonicalize(work)
-                        .map(|p| p.to_string_lossy() == cwd_key)
-                        .unwrap_or_else(|_| work == cwd_key || work == ".")
-                };
-                if !same_dir {
-                    continue;
-                }
+                    .map(|s| s.to_string());
                 let title = crate::chrome::session_display_title(
                     s.get("title").and_then(|v| v.as_str()),
                     s.get("is_custom_title")
@@ -1957,75 +2059,216 @@ impl TuiApp {
                     s.get("last_prompt").and_then(|v| v.as_str()),
                     &id,
                 );
-                entries.push(crate::chrome::WorkspaceSessionEntry { id, title });
+                rows.push((id, forked_from, title));
             }
         }
-        // Ensure the live session is present even before the first prompt lands on disk.
-        if let Some(sid) = self.state.session_id.clone() {
-            if !entries.iter().any(|e| e.id == sid) {
-                let title = self
-                    .state
-                    .messages
-                    .iter()
-                    .find(|m| m.role == MessageRole::User)
-                    .map(|m| m.content.chars().take(40).collect::<String>())
-                    .filter(|s| !s.trim().is_empty())
-                    .unwrap_or_else(|| {
-                        if sid.len() > 8 {
-                            sid[..8].to_string()
-                        } else {
-                            sid.clone()
-                        }
-                    });
-                entries.insert(
-                    0,
-                    crate::chrome::WorkspaceSessionEntry { id: sid, title },
-                );
-            }
+
+        // Ensure current session is in the graph even if list is momentarily stale.
+        if !rows.iter().any(|(id, _, _)| id == &current_id) {
+            let title = self
+                .state
+                .messages
+                .iter()
+                .find(|m| m.role == MessageRole::User)
+                .map(|m| m.content.chars().take(40).collect::<String>())
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| {
+                    if current_id.len() > 8 {
+                        current_id[..8].to_string()
+                    } else {
+                        current_id.clone()
+                    }
+                });
+            rows.push((current_id.clone(), None, title));
         }
-        let active = self.state.session_id.clone();
+
+        let parent_rows: Vec<(String, Option<String>)> = rows
+            .iter()
+            .map(|(id, parent, _)| (id.clone(), parent.clone()))
+            .collect();
+        let family_ids = crate::chrome::fork_family_ids(&parent_rows, &current_id);
+        let entries: Vec<crate::chrome::WorkspaceSessionEntry> = if family_ids.is_empty() {
+            Vec::new()
+        } else {
+            family_ids
+                .into_iter()
+                .filter_map(|id| {
+                    rows.iter()
+                        .find(|(rid, _, _)| rid == &id)
+                        .map(|(_, _, title)| crate::chrome::WorkspaceSessionEntry {
+                            id,
+                            title: title.clone(),
+                        })
+                })
+                .collect()
+        };
+
         self.state
             .workspace_sessions
-            .set_entries(entries, active.as_deref());
-        // Keep top tab strip titles in sync for visited sessions.
+            .set_entries(entries, Some(current_id.as_str()));
+
         for e in &self.state.workspace_sessions.entries {
-            if self
-                .state
-                .tab_strip
-                .tabs
-                .iter()
-                .any(|t| t.id == e.id)
-            {
+            if self.state.tab_strip.tabs.iter().any(|t| t.id == e.id) {
                 self.state.tab_strip.ensure_active(&e.id, e.title.clone());
             }
         }
-        if let Some(sid) = active {
-            let title = self
-                .state
-                .workspace_sessions
-                .entries
-                .iter()
-                .find(|e| e.id == sid)
-                .map(|e| e.title.clone())
-                .unwrap_or_else(|| "main".into());
-            self.state.tab_strip.ensure_active(&sid, title);
-        }
+        let title = self
+            .state
+            .workspace_sessions
+            .entries
+            .iter()
+            .find(|e| e.id == current_id)
+            .map(|e| e.title.clone())
+            .or_else(|| {
+                rows.iter()
+                    .find(|(id, _, _)| id == &current_id)
+                    .map(|(_, _, t)| t.clone())
+            })
+            .unwrap_or_else(|| "main".into());
+        self.state.tab_strip.ensure_active(&current_id, title);
         Ok(())
     }
 
-    async fn cycle_workspace_session(&mut self) -> anyhow::Result<()> {
+    fn can_cycle_fork_sessions(&self) -> bool {
+        self.state.input.is_empty()
+            && self.state.mode == AppMode::Normal
+            && self.state.slash_menu.is_none()
+            && self.state.file_menu.is_none()
+            && self.state.list_picker.is_none()
+            && self.state.tasks_panel.is_none()
+            && !self.state.search.active
+            && self.state.approval_pending.is_none()
+            && self.state.question_pending.is_none()
+            && self.state.session_delete_confirm.is_none()
+            && self.state.workspace_sessions.entries.len() >= 2
+    }
+
+    async fn cycle_workspace_session(&mut self, direction: i8) -> anyhow::Result<()> {
         self.refresh_workspace_sessions().await?;
-        let Some(next_id) = self.state.workspace_sessions.next_id() else {
-            self.system_message(
-                "No other sessions in this workspace — /fork to create one, then Tab to cycle."
-                    .into(),
-            );
+        if self.state.workspace_sessions.entries.len() < 2 {
+            return Ok(());
+        }
+        let next_id = if direction < 0 {
+            self.state.workspace_sessions.prev_id()
+        } else {
+            self.state.workspace_sessions.next_id()
+        };
+        let Some(next_id) = next_id else {
             return Ok(());
         };
         if self.state.session_id.as_deref() == Some(next_id.as_str()) {
             return Ok(());
         }
         self.resume_session(&next_id).await
+    }
+
+    async fn refresh_session_picker_preview(&mut self) -> anyhow::Result<()> {
+        let Some(picker) = self.state.list_picker.as_ref() else {
+            self.state.session_picker_preview = None;
+            return Ok(());
+        };
+        if picker.kind != ListPickerKind::Session {
+            self.state.session_picker_preview = None;
+            return Ok(());
+        }
+        let Some(item) = picker.items.get(picker.selected) else {
+            self.state.session_picker_preview = None;
+            return Ok(());
+        };
+        let sid = item.id.clone();
+        let label = item.label.clone();
+        let params = serde_json::json!({"session_id": sid, "limit": 10});
+        match self.client.rpc_call("session.preview", Some(params)).await {
+            Ok(data) => {
+                let title = data
+                    .get("title")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(label.as_str())
+                    .to_string();
+                let mut lines = Vec::new();
+                if let Some(msgs) = data.get("messages").and_then(|v| v.as_array()) {
+                    for m in msgs {
+                        let role = m.get("role").and_then(|v| v.as_str()).unwrap_or("?");
+                        let text = m.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                        let one = text
+                            .chars()
+                            .map(|c| if c.is_whitespace() { ' ' } else { c })
+                            .collect::<String>()
+                            .split_whitespace()
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        if one.is_empty() {
+                            continue;
+                        }
+                        let mark = if role == "user" { "you" } else { "ai" };
+                        lines.push(format!("{mark}: {one}"));
+                    }
+                }
+                if lines.is_empty() {
+                    lines.push("(empty session)".into());
+                }
+                self.state.session_picker_preview = Some(SessionPickerPreview {
+                    session_id: sid,
+                    title,
+                    lines,
+                });
+            }
+            Err(e) => {
+                self.state.session_picker_preview = Some(SessionPickerPreview {
+                    session_id: sid,
+                    title: label,
+                    lines: vec![format!("preview unavailable: {e}")],
+                });
+            }
+        }
+        Ok(())
+    }
+
+    async fn confirm_delete_session(&mut self, yes: bool) -> anyhow::Result<()> {
+        let Some(confirm) = self.state.session_delete_confirm.take() else {
+            return Ok(());
+        };
+        if !yes {
+            return Ok(());
+        }
+        let deleted_id = confirm.session_id.clone();
+        let params = serde_json::json!({"session_id": deleted_id});
+        match self.client.rpc_call("sessions.delete", Some(params)).await {
+            Ok(_) => {
+                self.system_message(format!("Deleted session {}", &confirm.session_id[..8.min(confirm.session_id.len())]));
+                let was_current = self.state.session_id.as_deref() == Some(deleted_id.as_str());
+                if was_current {
+                    // Prefer another fork-family member; otherwise start fresh.
+                    self.refresh_workspace_sessions().await?;
+                    let fallback = self
+                        .state
+                        .workspace_sessions
+                        .entries
+                        .iter()
+                        .map(|e| e.id.clone())
+                        .find(|id| id != &deleted_id);
+                    if let Some(id) = fallback {
+                        self.resume_session(&id).await?;
+                    } else {
+                        let cwd = std::env::current_dir()?.to_string_lossy().to_string();
+                        let session_id = self
+                            .client
+                            .create_session(Some(&cwd), Some(self.state.permission_mode))
+                            .await?;
+                        self.state.session_id = Some(session_id.clone());
+                        self.state.status_bar.session_id = Some(session_id.clone());
+                        self.state.tab_strip.ensure_active(&session_id, "main");
+                        self.state.messages.clear();
+                        self.system_message("Current session was deleted; started a new one.".into());
+                    }
+                }
+                self.open_session_picker().await?;
+                let _ = self.refresh_workspace_sessions().await;
+            }
+            Err(e) => self.system_message(format!("Failed to delete session: {e}")),
+        }
+        Ok(())
     }
 
     async fn submit_input(&mut self) -> anyhow::Result<()> {
@@ -3234,7 +3477,7 @@ fn slash_help_text() -> String {
     let mut s = String::from(
         "Keyboard shortcuts:\n\
   Enter         - Submit / confirm slash\n\
-  Tab           - Complete slash/@ · empty input cycles workspace sessions\n\
+  Tab / ← →    - Empty input: cycle fork-family sessions\n\
   Shift-Tab     - Toggle plan mode (scroll locks to full plan until exit)\n\
   ↑↓            - Input history / slash menu\n\
   PgUp/PgDn     - Scroll transcript\n\

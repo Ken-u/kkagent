@@ -132,6 +132,18 @@ impl WorkspaceSessionStrip {
         self.active_id().map(|s| s.to_string())
     }
 
+    pub fn prev_id(&mut self) -> Option<String> {
+        if self.entries.len() < 2 {
+            return None;
+        }
+        self.active = if self.active == 0 {
+            self.entries.len() - 1
+        } else {
+            self.active - 1
+        };
+        self.active_id().map(|s| s.to_string())
+    }
+
     /// Render a scrolling strip that always keeps the active entry visible.
     /// Caller passes remaining width after reserving the context meter.
     pub fn render_spans(&self, max_cols: usize, theme: &Theme) -> Vec<Span<'static>> {
@@ -226,6 +238,60 @@ pub fn session_display_title(
         session_id
     };
     short.to_string()
+}
+
+/// Collect the fork family for `current_id` (root + all descendants).
+/// Returns empty when there is no fork (family size < 2).
+pub fn fork_family_ids(rows: &[(String, Option<String>)], current_id: &str) -> Vec<String> {
+    if current_id.is_empty() || rows.is_empty() {
+        return Vec::new();
+    }
+    let parent_of: std::collections::HashMap<&str, Option<&str>> = rows
+        .iter()
+        .map(|(id, parent)| (id.as_str(), parent.as_deref()))
+        .collect();
+    if !parent_of.contains_key(current_id) {
+        return Vec::new();
+    }
+
+    let root_of = |start: &str| -> String {
+        let mut cursor = start;
+        let mut guard = 0usize;
+        while let Some(Some(parent)) = parent_of.get(cursor).copied() {
+            if !parent_of.contains_key(parent) {
+                break;
+            }
+            cursor = parent;
+            guard += 1;
+            if guard > 64 {
+                break;
+            }
+        }
+        cursor.to_string()
+    };
+
+    let root = root_of(current_id);
+    let mut family: Vec<String> = rows
+        .iter()
+        .filter(|(id, _)| root_of(id) == root)
+        .map(|(id, _)| id.clone())
+        .collect();
+    family.sort();
+    family.dedup();
+    family.sort_by(|a, b| {
+        if a == &root {
+            std::cmp::Ordering::Less
+        } else if b == &root {
+            std::cmp::Ordering::Greater
+        } else {
+            a.cmp(b)
+        }
+    });
+    if family.len() < 2 {
+        Vec::new()
+    } else {
+        family
+    }
 }
 
 fn visible_window(
@@ -478,6 +544,25 @@ mod tests {
         assert_eq!(t, "My Name");
         let t = session_display_title(Some("auto"), false, Some("first prompt here"), "abcdef12");
         assert_eq!(t, "first prompt here");
+    }
+
+    #[test]
+    fn fork_family_hides_when_alone() {
+        let rows = vec![("a".into(), None), ("b".into(), None)];
+        assert!(fork_family_ids(&rows, "a").is_empty());
+    }
+
+    #[test]
+    fn fork_family_includes_root_and_forks() {
+        let rows = vec![
+            ("root".into(), None),
+            ("f1".into(), Some("root".into())),
+            ("f2".into(), Some("root".into())),
+            ("other".into(), None),
+        ];
+        let family = fork_family_ids(&rows, "f1");
+        assert_eq!(family, vec!["root".to_string(), "f1".into(), "f2".into()]);
+        assert!(fork_family_ids(&rows, "other").is_empty());
     }
 
     #[test]

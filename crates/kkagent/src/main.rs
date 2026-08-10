@@ -2691,6 +2691,137 @@ async fn handle_rpc_call(
             }
             Ok(serde_json::json!({"session_id": session_id, "archived": archived}))
         }
+        "sessions.delete" => {
+            let session_id = params
+                .as_ref()
+                .and_then(|p| p.get("session_id"))
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| (-32602, "Missing session_id".into()))?
+                .to_string();
+            let _turn_permit = state
+                .turn_locks
+                .try_acquire(&session_id)
+                .await
+                .map_err(|message| (-32001, message))?;
+            SessionStore::open_default()
+                .delete(&session_id)
+                .map_err(|e| (-32000, e.to_string()))?;
+            {
+                let db = state.transcript.lock().await;
+                let _ = db.archive_session(&session_id);
+            }
+            let removed = state.sessions.lock().await.remove(&session_id);
+            state.interrupt_flags.lock().await.remove(&session_id);
+            state.model_aliases.lock().await.remove(&session_id);
+            state.approval_txs.lock().await.remove(&session_id);
+            state.question_txs.lock().await.remove(&session_id);
+            if let Some(session) = removed {
+                session
+                    .services
+                    .on_close(SessionCloseReason::Exit)
+                    .await;
+            }
+            drop(_turn_permit);
+            state.turn_locks.remove(&session_id).await;
+            Ok(serde_json::json!({"session_id": session_id, "deleted": true}))
+        }
+        "session.preview" => {
+            let session_id = params
+                .as_ref()
+                .and_then(|p| p.get("session_id"))
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| (-32602, "Missing session_id".into()))?
+                .to_string();
+            let limit = params
+                .as_ref()
+                .and_then(|p| p.get("limit"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(12) as usize;
+
+            let (title, model, messages) = {
+                let sessions = state.sessions.lock().await;
+                if let Some(session) = sessions.get(&session_id) {
+                    let msgs: Vec<_> = session
+                        .messages
+                        .iter()
+                        .rev()
+                        .filter(|m| m.role == "user" || m.role == "assistant")
+                        .take(limit)
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                        .map(|m| {
+                            let text = m
+                                .content
+                                .iter()
+                                .filter_map(|c| match c {
+                                    ChatContent::Text { text } => Some(text.as_str()),
+                                    _ => None,
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            serde_json::json!({
+                                "role": m.role,
+                                "text": text.chars().take(240).collect::<String>(),
+                            })
+                        })
+                        .collect();
+                    (
+                        session.title.clone(),
+                        Some(session.get_model_alias()),
+                        msgs,
+                    )
+                } else {
+                    drop(sessions);
+                    let db = state.transcript.lock().await;
+                    let sid = resolve_session_id(&db, &session_id)
+                        .unwrap_or_else(|| session_id.clone());
+                    let record = db
+                        .get_session(&sid)
+                        .map_err(|e| (-32000, e.to_string()))?;
+                    let records = db
+                        .load_messages(&sid)
+                        .map_err(|e| (-32000, e.to_string()))?;
+                    let chat = messages_from_records(&records);
+                    let preview: Vec<_> = chat
+                        .iter()
+                        .rev()
+                        .filter(|m| m.role == "user" || m.role == "assistant")
+                        .take(limit)
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                        .map(|m| {
+                            let text = m
+                                .content
+                                .iter()
+                                .filter_map(|c| match c {
+                                    ChatContent::Text { text } => Some(text.as_str()),
+                                    _ => None,
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            serde_json::json!({
+                                "role": m.role,
+                                "text": text.chars().take(240).collect::<String>(),
+                            })
+                        })
+                        .collect();
+                    (
+                        record.as_ref().and_then(|r| r.title.clone()),
+                        record.as_ref().map(|r| r.model.clone()),
+                        preview,
+                    )
+                }
+            };
+
+            Ok(serde_json::json!({
+                "session_id": session_id,
+                "title": title,
+                "model": model,
+                "messages": messages,
+            }))
+        }
         "sessions.rename" => {
             let session_id = params
                 .as_ref()
