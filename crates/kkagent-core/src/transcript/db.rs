@@ -117,6 +117,17 @@ impl TranscriptDb {
         Ok(())
     }
 
+    pub fn set_model(&self, session_id: &str, model: &str) -> anyhow::Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE sessions SET model = ?1, updated_at = ?2 WHERE session_id = ?3",
+            params![model, Utc::now().to_rfc3339(), session_id],
+        )?;
+        if changed == 0 {
+            anyhow::bail!("session not found: {session_id}");
+        }
+        Ok(())
+    }
+
     pub fn append_message(
         &self,
         session_id: &str,
@@ -492,6 +503,16 @@ mod tests {
 
         let session = db.get_session("s1").unwrap().unwrap();
         assert_eq!(session.title.as_deref(), Some("My Session"));
+    }
+
+    #[test]
+    fn test_set_model_persists() {
+        let db = test_db();
+        db.create_session("s1", "claude", ".").unwrap();
+        db.set_model("s1", "kimi-code/kimi-k2.5").unwrap();
+        let session = db.get_session("s1").unwrap().unwrap();
+        assert_eq!(session.model, "kimi-code/kimi-k2.5");
+        assert!(db.set_model("missing", "x").is_err());
     }
 
     #[test]

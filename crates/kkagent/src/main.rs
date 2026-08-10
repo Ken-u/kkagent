@@ -1120,6 +1120,16 @@ impl kkagent_acp::AcpHost for AgentAcpHost {
             .get(session_id)
             .ok_or_else(|| "session not found".to_string())?;
         *alias.lock().unwrap_or_else(|e| e.into_inner()) = model.to_string();
+        drop(aliases);
+        if let Some(session) = self.state.sessions.lock().await.get(session_id) {
+            session.set_model_alias(model.to_string());
+        }
+        self.state
+            .transcript
+            .lock()
+            .await
+            .set_model(session_id, model)
+            .map_err(|e| e.to_string())?;
         Ok(())
     }
 
@@ -2746,6 +2756,7 @@ async fn handle_rpc_call(
             Ok(serde_json::json!({
                 "session_id": session_id,
                 "session_dir": session_dir,
+                "model": model_alias,
             }))
         }
         "sessions.list" => {
@@ -3162,6 +3173,7 @@ async fn handle_rpc_call(
                     record.model.clone()
                 },
             );
+            let resumed_model = session.get_model_alias();
             initialize_session_context(&state, &mut session).await;
             session.messages = messages.clone();
             session.persisted_message_count = messages.len();
@@ -3207,7 +3219,7 @@ async fn handle_rpc_call(
                 "messages": messages,
                 "plan_mode": false,
                 "permission_mode": perm_mode,
-                "model": record.model,
+                "model": resumed_model,
             }))
         }
         "session.prompt" => {
@@ -3648,6 +3660,13 @@ async fn handle_rpc_call(
             if !updated {
                 return Err((-32602, format!("Session not found: {}", session_id)));
             }
+            // Persist so resume restores this session's model (not global default).
+            state
+                .transcript
+                .lock()
+                .await
+                .set_model(&session_id, &model)
+                .map_err(|e| (-32000, e.to_string()))?;
             tracing::info!("Session {} model set to {}", session_id, model);
             Ok(serde_json::json!({"ok": true, "model": model}))
         }

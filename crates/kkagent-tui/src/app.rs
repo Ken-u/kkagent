@@ -707,6 +707,14 @@ impl TuiApp {
         }
     }
 
+    /// New sessions inherit the global config default until `/model` overrides them.
+    fn bind_config_default_model(&mut self) {
+        self.state.model_alias = self
+            .config
+            .default_model_alias()
+            .map(|s| s.to_string());
+    }
+
     pub async fn run(mut self, resume: Option<String>) -> anyhow::Result<()> {
         // Create / resume session BEFORE taking over the terminal, so RPC
         // failures don't leave the user's shell stuck in raw/alternate mode.
@@ -721,6 +729,7 @@ impl TuiApp {
                 self.state.tab_strip.ensure_active(&session_id, "main");
                 self.state.status_bar.session_id = Some(session_id.clone());
                 self.state.session_id = Some(session_id);
+                self.bind_config_default_model();
             }
         } else {
             let session_id = self
@@ -730,6 +739,7 @@ impl TuiApp {
             self.state.tab_strip.ensure_active(&session_id, "main");
             self.state.status_bar.session_id = Some(session_id.clone());
             self.state.session_id = Some(session_id);
+            self.bind_config_default_model();
         }
 
         let _ = self.refresh_skill_commands().await;
@@ -1949,7 +1959,8 @@ impl TuiApp {
         let item = picker.items[picker.selected.min(picker.items.len() - 1)].clone();
         match picker.kind {
             ListPickerKind::Model => {
-                self.config.default_model = Some(item.id.clone());
+                // Bind model to this session only; keep config default for /new.
+                self.state.model_alias = Some(item.id.clone());
                 if let Some(sid) = &self.state.session_id {
                     if let Err(e) = self.client.set_model(sid, &item.id).await {
                         self.system_message(format!("Failed to set model on server: {}", e));
@@ -2232,7 +2243,12 @@ impl TuiApp {
     }
 
     fn open_model_picker(&mut self) {
-        let current = self.config.default_model_alias().unwrap_or("").to_string();
+        let current = self
+            .state
+            .model_alias
+            .clone()
+            .or_else(|| self.config.default_model_alias().map(|s| s.to_string()))
+            .unwrap_or_default();
         let mut names: Vec<_> = self.config.models.keys().cloned().collect();
         names.sort();
         let mut selected = 0;
@@ -2420,7 +2436,7 @@ impl TuiApp {
 
         if let Some(model) = data.get("model").and_then(|v| v.as_str()) {
             if !model.is_empty() {
-                self.config.default_model = Some(model.to_string());
+                // Session-scoped: do not rewrite global config.default_model.
                 self.state.model_alias = Some(model.to_string());
             }
         }
@@ -2867,6 +2883,7 @@ impl TuiApp {
                         self.state.session_id = Some(session_id.clone());
                         self.state.status_bar.session_id = Some(session_id.clone());
                         self.state.tab_strip.ensure_active(&session_id, "main");
+                        self.bind_config_default_model();
                         self.state.messages.clear();
                         self.state.status = SessionStatus::Idle;
                         self.state.approval_pending = None;
@@ -3052,6 +3069,7 @@ impl TuiApp {
                     .client
                     .create_session(Some(&cwd), Some(self.state.permission_mode))
                     .await?;
+                self.bind_config_default_model();
                 if self.state.plan_mode {
                     let _ = self.client.set_plan_mode(&session_id, true).await;
                 }
@@ -3113,7 +3131,8 @@ impl TuiApp {
                 if args.is_empty() {
                     self.open_model_picker();
                 } else if self.config.resolve_model(&args).is_some() {
-                    self.config.default_model = Some(args.clone());
+                    // Session-scoped; do not rewrite global config.default_model.
+                    self.state.model_alias = Some(args.clone());
                     if let Some(sid) = &self.state.session_id {
                         if let Err(e) = self.client.set_model(sid, &args).await {
                             self.system_message(format!("Failed to set model on server: {}", e));
@@ -3202,7 +3221,12 @@ impl TuiApp {
                 }
             }
             "status" => {
-                let model = self.config.default_model_alias().unwrap_or("?");
+                let model = self
+                    .state
+                    .model_alias
+                    .as_deref()
+                    .or_else(|| self.config.default_model_alias())
+                    .unwrap_or("?");
                 let sid = self.state.session_id.as_deref().unwrap_or("-");
                 self.system_message(format!(
                     "session: {}\nmodel: {}\npermission: {}\nplan: {}\nstatus: {:?}\nmessages: {}\ntokens≈ {}",
@@ -3217,8 +3241,10 @@ impl TuiApp {
             }
             "usage" => {
                 let max = self
-                    .config
-                    .default_model_alias()
+                    .state
+                    .model_alias
+                    .as_deref()
+                    .or_else(|| self.config.default_model_alias())
                     .and_then(|a| self.config.resolve_model(a))
                     .and_then(|(m, _)| m.max_context_size)
                     .unwrap_or(256_000);

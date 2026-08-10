@@ -1229,7 +1229,7 @@ fn render_footer(f: &mut Frame, area: Rect, state: &AppState, config: &AppConfig
     }
 
     left.push(Span::styled(
-        model_label(config),
+        model_label(state, config),
         Style::default().fg(theme.text),
     ));
 
@@ -1499,8 +1499,12 @@ fn spans_to_string_approx(spans: &[Span]) -> String {
     spans.iter().map(|s| s.content.as_ref()).collect()
 }
 
-fn model_label(config: &AppConfig) -> String {
-    let alias = config.default_model_alias().unwrap_or("?");
+fn model_label(state: &AppState, config: &AppConfig) -> String {
+    let alias = state
+        .model_alias
+        .as_deref()
+        .or_else(|| config.default_model_alias())
+        .unwrap_or("?");
     if let Some((model, _)) = config.resolve_model(alias) {
         model
             .display_name
@@ -1520,8 +1524,10 @@ fn thinking_label(config: &AppConfig) -> Option<String> {
 }
 
 fn format_context(state: &AppState, config: &AppConfig) -> String {
-    let max = config
-        .default_model_alias()
+    let max = state
+        .model_alias
+        .as_deref()
+        .or_else(|| config.default_model_alias())
         .and_then(|a| config.resolve_model(a))
         .and_then(|(m, _)| m.max_context_size)
         .unwrap_or(256_000);
