@@ -21,7 +21,7 @@ use crate::mouse_mode::MouseMode;
 use crate::pi::{map_key, EditorAction};
 use crate::search::SearchState;
 use crate::slash::{
-    self, build_skill_slash_commands, filter_slash_commands_with_extras, find_slash_command,
+    build_skill_slash_commands, filter_slash_commands_with_extras, find_slash_command,
     is_slash_name_completion, parse_slash_input, SlashSuggestion,
 };
 
