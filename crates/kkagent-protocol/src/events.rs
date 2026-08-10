@@ -117,6 +117,15 @@ pub enum AgentEvent {
         server_name: String,
         authorization_url: String,
     },
+    /// Manual `/compact` finished (async); TUI should replace transcript display.
+    CompactCompleted {
+        session_id: String,
+        deleted: u64,
+        kept_user_message_count: u64,
+        messages: Vec<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
 }
 
 impl AgentEvent {
@@ -144,7 +153,8 @@ impl AgentEvent {
             | Self::BtwDelta { session_id, .. }
             | Self::BtwThinkingDelta { session_id, .. }
             | Self::BtwEnd { session_id, .. }
-            | Self::McpAuthRequired { session_id, .. } => session_id,
+            | Self::McpAuthRequired { session_id, .. }
+            | Self::CompactCompleted { session_id, .. } => session_id,
         }
     }
 }

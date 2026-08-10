@@ -2855,10 +2855,13 @@ impl TuiApp {
             "compact" => {
                 if let Some(sid) = &self.state.session_id {
                     let params = serde_json::json!({"session_id": sid, "instruction": args});
+                    // RPC returns immediately (`started: true`); completion arrives as
+                    // CompactCompleted so the TUI event loop stays responsive.
                     match self.client.rpc_call("session.compact", Some(params)).await {
-                        Ok(data) => {
-                            let deleted = data.get("deleted").and_then(|v| v.as_u64()).unwrap_or(0);
-                            self.system_message(format!("Compacted: {} messages removed", deleted));
+                        Ok(_) => {
+                            self.state.status = SessionStatus::Compacting;
+                            self.state.status_bar.status = SessionStatus::Compacting;
+                            self.system_message("Compacting conversation…".into());
                         }
                         Err(e) => self.system_message(format!("Failed to compact: {}", e)),
                     }
@@ -3582,6 +3585,24 @@ impl TuiApp {
                                 &evt_sid[..8.min(evt_sid.len())]
                             ));
                         }
+                        AgentEvent::CompactCompleted {
+                            deleted,
+                            error,
+                            ..
+                        } => {
+                            self.state.tab_strip.mark_dirty(&evt_sid, true);
+                            if let Some(err) = error {
+                                self.system_message(format!(
+                                    "Background session {} compact failed: {err}",
+                                    &evt_sid[..8.min(evt_sid.len())]
+                                ));
+                            } else {
+                                self.system_message(format!(
+                                    "Background session {} compacted ({deleted} removed).",
+                                    &evt_sid[..8.min(evt_sid.len())]
+                                ));
+                            }
+                        }
                         _ => {}
                     }
                     return;
@@ -3858,6 +3879,24 @@ impl TuiApp {
                     AgentEvent::BtwEnd { error, .. } => {
                         self.state.btw.finish(error);
                         self.state.btw.open = true;
+                    }
+                    AgentEvent::CompactCompleted {
+                        deleted,
+                        kept_user_message_count,
+                        messages,
+                        error,
+                        ..
+                    } => {
+                        if let Some(err) = error {
+                            self.system_message(format!("Compact failed: {err}"));
+                        } else {
+                            self.state.messages = transcript_messages_to_display(&messages);
+                            self.state.follow_bottom = true;
+                            self.state.scroll_up = 0;
+                            self.system_message(format!(
+                                "Compacted: {deleted} messages removed (kept {kept_user_message_count} user messages)"
+                            ));
+                        }
                     }
                 }
             }

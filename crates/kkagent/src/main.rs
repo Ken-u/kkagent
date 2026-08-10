@@ -19,7 +19,7 @@ use kkagent_di::ServiceContainer;
 use kkagent_llm::{ChatContent, ChatMessage};
 use kkagent_mcp::{register_mcp_tools, McpManager};
 use kkagent_protocol::subagent::SubagentManager;
-use kkagent_protocol::{AgentEvent, Frame, PermissionMode};
+use kkagent_protocol::{AgentEvent, Frame, PermissionMode, SessionStatus};
 use kkagent_rpc::{transport::memory::create_memory_pair, RpcClient, RpcServer};
 use kkagent_telemetry::{
     CloudAppender, CloudAppenderOptions, ConsoleAppender, FileAppender, TelemetryService,
@@ -3704,21 +3704,20 @@ async fn handle_rpc_call(
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
 
-            // Blocking protection: refuse manual compact while a turn holds the session.
-            {
-                let sessions = state.sessions.lock().await;
-                let busy = !sessions.contains_key(&session_id)
-                    && state.interrupt_flags.lock().await.contains_key(&session_id);
-                if busy {
-                    return Err((
+            // Same lock as turns: refuse while a turn (or another compact) is active.
+            let turn_permit = state
+                .turn_locks
+                .try_acquire(&session_id)
+                .await
+                .map_err(|_| {
+                    (
                         -32000,
                         "Cannot compact while a turn is active. Wait for it to finish, then retry."
                             .into(),
-                    ));
-                }
-            }
+                    )
+                })?;
 
-            let mut messages = {
+            let messages = {
                 let sessions = state.sessions.lock().await;
                 if let Some(session) = sessions.get(&session_id) {
                     session.messages.clone()
@@ -3733,20 +3732,40 @@ async fn handle_rpc_call(
             };
 
             if messages.is_empty() {
+                drop(turn_permit);
                 return Err((-32000, "No messages to compact in current history.".into()));
             }
 
-            let before = messages.len();
-            let result = kkagent_core::compact_full_async(
-                state.config.clone(),
-                &mut messages,
-                instruction.as_deref(),
-            )
-            .await;
+            let _ = rpc_event_tx
+                .send(Frame::Event {
+                    event: "agent".into(),
+                    scope: None,
+                    data: serde_json::to_value(AgentEvent::StatusUpdate {
+                        session_id: session_id.clone(),
+                        status: SessionStatus::Compacting,
+                    })
+                    .unwrap_or_default(),
+                })
+                .await;
 
-            // Persist rebuilt history (kept users + summary). No assistant/tool
-            // tails — avoids toolcall pairing 400s after resume.
-            {
+            let state_clone = state.clone();
+            let rpc_tx = rpc_event_tx.clone();
+            let sid = session_id.clone();
+            tokio::spawn(async move {
+                let _turn_permit = turn_permit;
+                let before = messages.len();
+                let mut messages = messages;
+
+                // LLM summary can take a while — do not hold the RPC handler.
+                let result = kkagent_core::compact_full_async(
+                    state_clone.config.clone(),
+                    &mut messages,
+                    instruction.as_deref(),
+                )
+                .await;
+
+                // Persist rebuilt history (kept users + summary). No assistant/tool
+                // tails — avoids toolcall pairing 400s after resume.
                 let replacement: Vec<(String, String)> = messages
                     .iter()
                     .filter_map(|m| {
@@ -3754,32 +3773,73 @@ async fn handle_rpc_call(
                         Some((m.role.clone(), json))
                     })
                     .collect();
-                let db = state.transcript.lock().await;
-                db.replace_messages(&session_id, &replacement, Some(&result.summary))
-                    .map_err(|e| (-32000, e.to_string()))?;
-            }
+                let persist_err = {
+                    let db = state_clone.transcript.lock().await;
+                    db.replace_messages(&sid, &replacement, Some(&result.summary))
+                        .err()
+                        .map(|e| e.to_string())
+                };
 
-            {
-                let mut sessions = state.sessions.lock().await;
-                if let Some(session) = sessions.get_mut(&session_id) {
-                    session.messages = messages;
-                    session.persisted_message_count = session.messages.len();
-                    session.transcript_rewrite_required = false;
-                    session.undo_stack.clear();
-                    let after = kkagent_core::TokenCounter::estimate_messages(&session.messages);
-                    session.last_compacted_tokens = Some(after);
-                }
-            }
+                let completed = if let Some(err) = persist_err {
+                    AgentEvent::CompactCompleted {
+                        session_id: sid.clone(),
+                        deleted: 0,
+                        kept_user_message_count: 0,
+                        messages: Vec::new(),
+                        error: Some(format!("Failed to persist compacted history: {err}")),
+                    }
+                } else {
+                    {
+                        let mut sessions = state_clone.sessions.lock().await;
+                        if let Some(session) = sessions.get_mut(&sid) {
+                            session.messages = messages.clone();
+                            session.persisted_message_count = session.messages.len();
+                            session.transcript_rewrite_required = false;
+                            session.undo_stack.clear();
+                            let after =
+                                kkagent_core::TokenCounter::estimate_messages(&session.messages);
+                            session.last_compacted_tokens = Some(after);
+                        }
+                    }
+                    let deleted =
+                        before.saturating_sub(result.kept_user_message_count.saturating_add(1));
+                    let messages_json: Vec<serde_json::Value> = messages
+                        .iter()
+                        .filter_map(|m| serde_json::to_value(m).ok())
+                        .collect();
+                    AgentEvent::CompactCompleted {
+                        session_id: sid.clone(),
+                        deleted: deleted as u64,
+                        kept_user_message_count: result.kept_user_message_count as u64,
+                        messages: messages_json,
+                        error: None,
+                    }
+                };
+
+                let _ = rpc_tx
+                    .send(Frame::Event {
+                        event: "agent".into(),
+                        scope: None,
+                        data: serde_json::to_value(&completed).unwrap_or_default(),
+                    })
+                    .await;
+                let _ = rpc_tx
+                    .send(Frame::Event {
+                        event: "agent".into(),
+                        scope: None,
+                        data: serde_json::to_value(AgentEvent::StatusUpdate {
+                            session_id: sid,
+                            status: SessionStatus::Idle,
+                        })
+                        .unwrap_or_default(),
+                    })
+                    .await;
+            });
 
             Ok(serde_json::json!({
                 "ok": true,
-                "deleted": before.saturating_sub(
-                    result.kept_user_message_count.saturating_add(1)
-                ),
-                "kept_user_message_count": result.kept_user_message_count,
-                "kept_head_user_message_count": result.kept_head_user_message_count,
-                "summarizer_dropped_count": result.summarizer_dropped_count,
-                "summary": result.summary,
+                "started": true,
+                "session_id": session_id,
             }))
         }
         "swarm.enter" => {
