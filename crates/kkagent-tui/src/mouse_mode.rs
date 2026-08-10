@@ -1,14 +1,12 @@
-//! Mouse capture for in-app wheel scroll.
+//! Mouse capture for in-app wheel scroll and text selection.
 //!
 //! Full SGR mouse capture keeps the wheel inside the TUI (scrolling the
-//! transcript). Releasing capture lets the terminal scroll the alternate
-//! screen instead — that looks like the UI "jumps outside" the layout.
+//! transcript) and lets the app own left-drag text selection. Capture stays
+//! enabled for the whole session so Mouse Up / wheel events are never lost.
 //!
-//! Default: keep capture always. Hold Shift and left-click to temporarily
-//! release for native drag-select; capture auto-restores after a few seconds
-//! or on the next keypress.
-//!
-//! Set `KKAGENT_MOUSE_MODE=off` to disable mouse reporting entirely.
+//! Set `KKAGENT_MOUSE_MODE=off` to disable mouse reporting entirely
+//! (PgUp/PgDn only). Hold Shift while dragging if your terminal still offers
+//! native selection as a fallback — kkagent does not disable that path.
 
 use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
 use crossterm::execute;
@@ -16,7 +14,7 @@ use std::io::{self, Write};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MouseMode {
-    /// Wheel scroll via `Event::Mouse`; Shift+click releases capture for select.
+    /// Wheel + in-app drag selection via `Event::Mouse`.
     Capture,
     /// No mouse reporting (PgUp/PgDn only).
     Off,

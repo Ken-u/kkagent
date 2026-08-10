@@ -11,6 +11,7 @@ pub mod paste_placeholders;
 pub mod pi;
 pub mod reverse_rpc;
 pub mod search;
+pub mod selection;
 pub mod slash;
 pub mod streaming;
 pub mod theme;

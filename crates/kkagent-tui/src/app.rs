@@ -30,10 +30,6 @@ pub struct TuiApp {
     client: KkagentClient,
     state: AppState,
     mouse_mode: MouseMode,
-    /// Capture temporarily released (Shift+click) so the terminal can drag-select.
-    mouse_select_mode: bool,
-    /// When select mode started — used to auto-restore capture.
-    mouse_select_since: Option<std::time::Instant>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -62,6 +58,16 @@ pub struct AppState {
     pub follow_bottom: bool,
     /// Line index (from top) where each `messages[i]` starts — updated each frame.
     pub message_line_starts: Vec<u16>,
+    /// Last rendered transcript area (for mouse → cell mapping).
+    pub transcript_area: ratatui::layout::Rect,
+    /// Plain-text rows parallel to the last rendered transcript lines.
+    pub select_rows: Vec<crate::selection::SelectRow>,
+    /// In-app text selection (absolute visual line + display column).
+    pub selection: Option<crate::selection::TextSelection>,
+    /// True while left button is held for drag-select.
+    pub selection_dragging: bool,
+    /// Last mouse cell (terminal column/row) for scroll-during-drag updates.
+    pub last_mouse: Option<(u16, u16)>,
     pub approx_tokens: u64,
     pub approval_pending: Option<PendingApproval>,
     /// Approvals for sessions that are open in this window but not currently focused.
@@ -420,6 +426,11 @@ impl AppState {
             viewport_height: 0,
             follow_bottom: true,
             message_line_starts: Vec::new(),
+            transcript_area: ratatui::layout::Rect::default(),
+            select_rows: Vec::new(),
+            selection: None,
+            selection_dragging: false,
+            last_mouse: None,
             approx_tokens: 0,
             approval_pending: None,
             parked_approvals: std::collections::HashMap::new(),
@@ -733,8 +744,6 @@ impl TuiApp {
             client,
             state: AppState::new(permission_mode, plan_mode),
             mouse_mode: MouseMode::from_env(),
-            mouse_select_mode: false,
-            mouse_select_since: None,
         }
     }
 
@@ -782,8 +791,8 @@ impl TuiApp {
             )
         })?;
         let mut stdout = io::stdout();
-        // Capture mouse so the wheel stays inside the TUI. Shift+click temporarily
-        // releases capture for native drag-select; any key / timeout restores it.
+        // Capture mouse so the wheel and in-app drag-select stay inside the TUI.
+        // Capture remains on for the whole session (no disable-on-click hacks).
         // `KKAGENT_MOUSE_MODE=off` disables mouse reporting.
         if let Err(e) = execute!(stdout, EnterAlternateScreen, EnableBracketedPaste) {
             let _ = disable_raw_mode();
@@ -841,21 +850,10 @@ impl TuiApp {
         &mut self,
         terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     ) -> anyhow::Result<()> {
-        const SELECT_RESTORE_MS: u128 = 3500;
         loop {
             terminal.draw(|f| {
                 components::render_ui(f, &mut self.state, &self.config);
             })?;
-
-            // Auto-restore mouse capture after Shift+click select window.
-            if self.mouse_select_mode {
-                let expired = self
-                    .mouse_select_since
-                    .is_some_and(|t| t.elapsed().as_millis() >= SELECT_RESTORE_MS);
-                if expired {
-                    self.restore_mouse_capture();
-                }
-            }
 
             // Drain the full event queue each frame so trackpad bursts stay in-app
             // (one-event-per-poll left a backlog that felt like lag / terminal scroll).
@@ -869,24 +867,22 @@ impl TuiApp {
                 saw_event = true;
                 match event::read()? {
                     Event::Key(key) => {
-                        self.restore_mouse_capture();
                         self.flush_pending_scroll(&mut scroll_delta);
                         self.handle_key(key).await?;
                     }
-                    Event::Mouse(mouse)
-                        if self.mouse_mode == MouseMode::Capture && !self.mouse_select_mode =>
-                    {
+                    Event::Mouse(mouse) if self.mouse_mode == MouseMode::Capture => {
                         self.collect_mouse(mouse, &mut scroll_delta);
                     }
                     Event::Paste(text) => {
-                        self.restore_mouse_capture();
                         self.flush_pending_scroll(&mut scroll_delta);
                         let fold = self.state.mode != AppMode::Shell;
                         self.state.input.paste_chunk(&text);
                         self.state.input.force_flush_paste(fold);
                         self.state.refresh_slash_menu();
                     }
-                    Event::Resize(_, _) => {}
+                    Event::Resize(_, _) => {
+                        // Selection is clamped on the next render against new rows.
+                    }
                     _ => {}
                 }
             }
@@ -962,53 +958,134 @@ impl TuiApp {
         false
     }
 
-    /// Re-enable wheel capture after the user finished selecting (any key/paste/timeout).
-    fn restore_mouse_capture(&mut self) {
-        if !self.mouse_select_mode || self.mouse_mode != MouseMode::Capture {
-            return;
-        }
-        let _ = self.mouse_mode.enable(&mut io::stdout());
-        self.mouse_select_mode = false;
-        self.mouse_select_since = None;
-    }
-
-    /// Release capture for native drag-select (Shift+click). Auto-restores soon after.
-    fn release_mouse_for_select(&mut self) {
-        if self.mouse_select_mode || self.mouse_mode != MouseMode::Capture {
-            return;
-        }
-        let _ = self.mouse_mode.disable(&mut io::stdout());
-        self.mouse_select_mode = true;
-        self.mouse_select_since = Some(std::time::Instant::now());
-        self.system_message(
-            "Select mode: drag to copy. Wheel returns in ~3s (or press any key).".into(),
-        );
-    }
-
     fn flush_pending_scroll(&mut self, scroll_delta: &mut i32) {
         if *scroll_delta != 0 {
             self.state.scroll_lines(*scroll_delta);
             *scroll_delta = 0;
+            // While dragging, remap focus to the same screen cell under a new scroll.
+            if self.state.selection_dragging {
+                self.update_selection_focus_from_last_mouse();
+            }
+        }
+    }
+
+    fn update_selection_focus_from_last_mouse(&mut self) {
+        let Some((column, row)) = self.state.last_mouse else {
+            return;
+        };
+        let fake = crossterm::event::MouseEvent {
+            kind: MouseEventKind::Moved,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        if let Some(pos) = self.mouse_to_cell(&fake) {
+            if let Some(sel) = self.state.selection.as_mut() {
+                sel.focus = pos;
+            }
+        }
+    }
+
+    /// Map a mouse event to an absolute transcript cell, if inside the pane.
+    fn mouse_to_cell(
+        &self,
+        mouse: &crossterm::event::MouseEvent,
+    ) -> Option<crate::selection::CellPos> {
+        let area = self.state.transcript_area;
+        if area.width == 0 || area.height == 0 {
+            return None;
+        }
+        if mouse.column < area.x
+            || mouse.row < area.y
+            || mouse.column >= area.x.saturating_add(area.width)
+            || mouse.row >= area.y.saturating_add(area.height)
+        {
+            return None;
+        }
+        let local_x = mouse.column.saturating_sub(area.x);
+        let local_y = mouse.row.saturating_sub(area.y);
+        let max_scroll = self.state.max_scroll_up();
+        let scroll_from_top = max_scroll.saturating_sub(self.state.scroll_up);
+        let line = scroll_from_top as usize + local_y as usize;
+        Some(crate::selection::CellPos { line, col: local_x })
+    }
+
+    fn clear_selection(&mut self) {
+        self.state.selection = None;
+        self.state.selection_dragging = false;
+    }
+
+    fn selection_copy_text(&self) -> Option<String> {
+        let sel = self.state.selection?;
+        let text = crate::selection::extract_text(&self.state.select_rows, sel);
+        if text.is_empty() {
+            None
+        } else {
+            Some(text)
+        }
+    }
+
+    fn copy_selection_or_msg(&mut self) -> bool {
+        let Some(text) = self.selection_copy_text() else {
+            return false;
+        };
+        match copy_to_clipboard(&text) {
+            Ok(()) => {
+                let n = text.chars().count();
+                self.system_message(format!("Copied {n} chars."));
+                true
+            }
+            Err(e) => {
+                self.system_message(format!("Copy failed: {e}"));
+                true // still consume Ctrl+C — selection was intentional
+            }
         }
     }
 
     fn collect_mouse(&mut self, mouse: crossterm::event::MouseEvent, scroll_delta: &mut i32) {
+        self.state.last_mouse = Some((mouse.column, mouse.row));
+        // Shift+drag: leave alone for terminals that still report it as a
+        // distinct path; we do not disable capture. Treat like a normal select.
         match mouse.kind {
-            // Always consume wheel while capture is on so the terminal cannot
-            // scroll the alternate screen ("outside" the TUI chrome).
             MouseEventKind::ScrollUp => {
                 *scroll_delta = scroll_delta.saturating_add(3);
             }
             MouseEventKind::ScrollDown => {
                 *scroll_delta = scroll_delta.saturating_sub(3);
             }
-            MouseEventKind::Down(MouseButton::Left)
-                if mouse.modifiers.contains(KeyModifiers::SHIFT) =>
-            {
-                // Plain click keeps capture (wheel stays in-app). Shift+click
-                // temporarily releases for native terminal selection.
+            MouseEventKind::Down(MouseButton::Left) => {
                 self.flush_pending_scroll(scroll_delta);
-                self.release_mouse_for_select();
+                if let Some(pos) = self.mouse_to_cell(&mouse) {
+                    self.state.selection = Some(crate::selection::TextSelection::new(pos));
+                    self.state.selection_dragging = true;
+                } else {
+                    // Click outside transcript clears selection.
+                    self.clear_selection();
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) if self.state.selection_dragging => {
+                if let Some(pos) = self.mouse_to_cell(&mouse) {
+                    if let Some(sel) = self.state.selection.as_mut() {
+                        sel.focus = pos;
+                    }
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) if self.state.selection_dragging => {
+                if let Some(pos) = self.mouse_to_cell(&mouse) {
+                    if let Some(sel) = self.state.selection.as_mut() {
+                        sel.focus = pos;
+                    }
+                }
+                self.state.selection_dragging = false;
+                // Plain click (no drag span) → clear; keep existing click semantics.
+                let drop = match self.state.selection {
+                    Some(s) if s.is_empty() => true,
+                    Some(_) => self.selection_copy_text().is_none(),
+                    None => true,
+                };
+                if drop {
+                    self.clear_selection();
+                }
             }
             _ => {}
         }
@@ -1019,6 +1096,23 @@ impl TuiApp {
         // an in-flight turn. Ctrl-C still cancels the turn below.
         if matches!(key.code, KeyCode::Esc) && self.dismiss_transient_ui() {
             self.state.pending_esc_ms = None;
+            self.state.quit_confirm = false;
+            return Ok(());
+        }
+
+        // Esc clears in-app selection before interrupt / other Esc handling.
+        if matches!(key.code, KeyCode::Esc) && self.state.selection.is_some() {
+            self.clear_selection();
+            self.state.pending_esc_ms = None;
+            self.state.quit_confirm = false;
+            return Ok(());
+        }
+
+        // Ctrl+C with a non-empty selection copies; otherwise keep interrupt / quit.
+        if matches!(key.code, KeyCode::Char('c'))
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && self.copy_selection_or_msg()
+        {
             self.state.quit_confirm = false;
             return Ok(());
         }
@@ -3874,8 +3968,8 @@ fn slash_help_text() -> String {
   ↑↓            - Input history / slash menu\n\
   PgUp/PgDn     - Scroll transcript\n\
   Mouse wheel   - Scroll transcript (stays in-app)\n\
-  Shift+click   - Temporary native text select; key/timeout restores wheel\n\
-  Esc           - Close menu/overlay only; if none, interrupt turn / Esc Esc undo\n\
+  Drag select   - Select transcript text; Ctrl-C copies (OSC 52 / local)\n\
+  Esc           - Clear selection / close menu/overlay; if none, interrupt / Esc Esc undo\n\
   !             - Shell mode\n\
   @             - File path picker (Tab/Enter insert)\n\
   Ctrl-F / Ctrl-S - Search transcript\n\
@@ -4085,6 +4179,18 @@ fn transcript_messages_to_display(msgs: &[serde_json::Value]) -> Vec<DisplayMess
 }
 
 fn copy_to_clipboard(text: &str) -> anyhow::Result<()> {
+    // OSC 52 reaches the client clipboard over SSH / tmux; never print the
+    // payload into the UI. Failures are ignored so a missing OSC capability
+    // does not crash the TUI — we still try the local native clipboard.
+    let osc_ok = crate::selection::write_osc52(text).is_ok();
+    let native_ok = copy_to_clipboard_native(text).is_ok();
+    if osc_ok || native_ok {
+        return Ok(());
+    }
+    anyhow::bail!("clipboard unavailable (OSC 52 and native helpers both failed)")
+}
+
+fn copy_to_clipboard_native(text: &str) -> anyhow::Result<()> {
     #[cfg(target_os = "macos")]
     {
         use std::io::Write;

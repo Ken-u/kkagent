@@ -239,7 +239,17 @@ fn input_inner_height(state: &AppState, terminal_width: u16) -> u16 {
 
 fn render_messages(f: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) {
     let width = area.width.max(1);
-    let lines = build_transcript_lines(state, theme, width);
+    let mut lines = build_transcript_lines(state, theme, width);
+    state.transcript_area = area;
+    state.select_rows = crate::selection::rows_from_lines(&lines);
+
+    if let Some(sel) = state.selection {
+        state.selection = crate::selection::clamp_selection(sel, state.select_rows.len());
+    }
+    if let Some(sel) = state.selection {
+        crate::selection::apply_highlight(&mut lines, sel, crate::selection::selection_style());
+    }
+
     let content_height = lines.len() as u16;
     let visible_height = area.height.max(1);
 
