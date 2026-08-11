@@ -26,7 +26,7 @@ kkagent config preset safe
 | `merge_all_available_skills` | bool | `false` | 把全部 Skill 正文合入初始上下文；默认只注入目录并按需加载。 |
 | `extra_skill_dirs` | string[] | `[]` | 额外 Skill 根目录；相对路径基于 Server 启动目录。 |
 | `telemetry` | bool | `false` | 是否启用云遥测发送。 |
-| `trusted_workspaces` | string[] | `[]` | HTTP 文件和终端操作允许访问的绝对工作区；为空时只信任 Server 启动目录。 |
+| `trusted_workspaces` | string[] | `[]` | 预配置的绝对工作区；TUI 也会通过首次进入信任弹窗维护配置旁的 trust sidecar。为空时，非交互 Server 仍只隐式信任启动目录。 |
 
 ## Provider
 
@@ -132,6 +132,19 @@ extra_write_paths = []
 `auto` 在 Linux/macOS 选择 `workspace`，在 Windows 选择 `process`。Linux 的工作区模式要求 PATH 中存在 `bwrap`，用 user/mount/PID 等 namespace、只读系统目录、独立 `/tmp` 和可选 network namespace 隔离命令；macOS 使用系统 Seatbelt，默认拒绝用户主目录并重新开放当前 workspace；Windows 的 `process` 模式用 Job Object 限制进程树、内存和进程数。显式选择平台不支持的 `workspace` 会拒绝执行，不会静默降级。
 
 `extra_read_paths`/`extra_write_paths` 必须已经存在。`disabled` 只建议用于受控容器内排障；HTTP terminal 是单独的显式管理接口，不继承 Bash sandbox。
+
+### 工作区与 Git 信任
+
+TUI 首次进入一个尚未记录的工作区时，会先确认工作区信任，再独立检查两类权限：
+
+- `.git`、gitfile、common-dir、objects/alternates 指向工作区之外的 Git 元数据；AOSP checkout 会按上层 `.repo` 根目录聚合为一次读写确认。
+- `~/.gitconfig`、`$XDG_CONFIG_HOME/git/config`、递归 include、AOSP `~/.repoconfig/config` 以及全局 ignore/attributes；这些路径只按只读权限开放。
+
+选择结果写入当前配置文件旁的 `<config-file>.trust.toml`。默认配置对应 `~/.kkagent/config.toml.trust.toml`，使用 `--config /path/team.toml` 时对应 `/path/team.toml.trust.toml`。sidecar 不保存 Git 配置值、token 或凭据，只保存规范化路径、授权结果和检测到的能力类别。
+
+未授权全局配置时，Bash 为 Git 注入隔离配置，跳过 global/system config 和默认的全局 ignore/attributes；仓库自身的 `.git/config`、`.gitignore` 和 `.gitattributes` 不受影响。授权后，已确认的配置按 Git 原有 system/global 层级只读加载，仓库本地配置仍保持更高优先级。`.ssh`、`.git-credentials`、`.gnupg` 和系统钥匙串不会因为这一授权自动加入文件沙箱。
+
+全局 Git 配置可以包含 `credential.helper`、shell alias、`core.hooksPath`、HTTP header 或其他 include。弹窗只显示风险类别和文件路径，不显示配置值。删除对应 trust sidecar 可重新触发完整审核。
 
 ## 权限规则
 

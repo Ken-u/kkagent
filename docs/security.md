@@ -34,6 +34,10 @@ Kimi OAuth 凭据原子写入 `~/.kkagent/credentials/kimi-code.json`，Unix 权
 
 配置中的 `custom_headers`、MCP `headers` 和 API key 都属于秘密。分享日志、配置或 bug report 前应人工脱敏。
 
+全局 Git 配置授权与 Git 凭据授权是不同边界。TUI 可以只读开放 `.gitconfig`、Git include、全局 ignore 和 attributes，但不会连带开放 `.git-credentials`、`.ssh`、`.gnupg` 或钥匙串文件。仍需注意 Git 配置本身可能含有 `http.extraHeader`、明文 credential URL、可执行 shell alias、Hooks 路径或 credential helper；信任弹窗会报告这些能力类别。Windows 当前的 Job Object 不能实施文件读取边界，因此 Windows 上该选择主要约束 Git 的配置加载行为，而不能阻止任意 Shell 命令直接读取用户文件。
+
+AOSP `repo` checkout 的项目 Git 状态可能位于工作目录之外的 `.repo/projects` 和 `.repo/project-objects`。kkagent 对规范化后的 `.repo` 根进行一次显式读写授权；不依赖 `.git` 字面路径，避免软链接、gitfile、common-dir 或 alternates 绕过/误伤。`~/.repoconfig/config` 归入只读全局配置授权，并通过 `REPO_CONFIG_DIR` 定位，不会因此开放整个 HOME 或 `.repoconfig/gnupg`。
+
 ## 网络和扩展
 
 `FetchURL` 有 SSRF 防护，仍应在网络层阻止访问云 metadata 和内网管理接口。MCP Server、Hook 和插件提示均跨越信任边界：stdio MCP 与 Hook 是本机进程，远程 MCP 能接收工具参数，Skill 和插件能影响模型行为。

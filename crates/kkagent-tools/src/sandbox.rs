@@ -38,6 +38,7 @@ pub struct SandboxPolicy {
     pub max_processes: u32,
     pub extra_read_paths: Vec<PathBuf>,
     pub extra_write_paths: Vec<PathBuf>,
+    workspace_trust: Vec<kkagent_config::WorkspaceTrust>,
 }
 
 impl Default for SandboxPolicy {
@@ -50,6 +51,7 @@ impl Default for SandboxPolicy {
             max_processes: 128,
             extra_read_paths: Vec::new(),
             extra_write_paths: Vec::new(),
+            workspace_trust: Vec::new(),
         }
     }
 }
@@ -82,7 +84,32 @@ impl SandboxPolicy {
             max_processes: config.max_processes,
             extra_read_paths: config.extra_read_paths.iter().map(PathBuf::from).collect(),
             extra_write_paths: config.extra_write_paths.iter().map(PathBuf::from).collect(),
+            workspace_trust: Vec::new(),
         })
+    }
+
+    pub fn from_app_config(config: &kkagent_config::AppConfig) -> anyhow::Result<Self> {
+        let mut policy = Self::from_config(&config.sandbox)?;
+        policy.workspace_trust = config.workspace_trust.workspaces.clone();
+        Ok(policy)
+    }
+
+    pub fn upsert_workspace_trust(
+        &mut self,
+        trust: kkagent_config::WorkspaceTrust,
+    ) -> anyhow::Result<()> {
+        trust.validate()?;
+        let workspace = canonical_or_owned(&trust.workspace_path());
+        if let Some(existing) = self
+            .workspace_trust
+            .iter_mut()
+            .find(|item| canonical_or_owned(&item.workspace_path()) == workspace)
+        {
+            *existing = trust;
+        } else {
+            self.workspace_trust.push(trust);
+        }
+        Ok(())
     }
 
     pub fn command(
@@ -94,12 +121,14 @@ impl SandboxPolicy {
     ) -> anyhow::Result<Command> {
         let cwd = std::fs::canonicalize(cwd)
             .map_err(|error| anyhow::anyhow!("cannot sandbox cwd {}: {error}", cwd.display()))?;
+        let trust = self.workspace_trust_for(&cwd);
         let mut command = match self.mode {
             SandboxMode::Disabled | SandboxMode::Process => shell_command(shell, flag, script),
-            SandboxMode::Workspace => workspace_command(self, shell, flag, script, &cwd)?,
+            SandboxMode::Workspace => workspace_command(self, trust, shell, flag, script, &cwd)?,
         };
         command.current_dir(&cwd);
         command.env("KKAGENT_SANDBOX", self.mode_name());
+        apply_git_environment(&mut command, self.mode, trust);
         apply_resource_limits(&mut command, self)?;
         Ok(command)
     }
@@ -110,6 +139,17 @@ impl SandboxPolicy {
             SandboxMode::Process => "process",
             SandboxMode::Workspace => "workspace",
         }
+    }
+
+    fn workspace_trust_for(&self, cwd: &Path) -> Option<&kkagent_config::WorkspaceTrust> {
+        self.workspace_trust
+            .iter()
+            .filter(|entry| cwd.starts_with(canonical_or_owned(&entry.workspace_path())))
+            .max_by_key(|entry| {
+                canonical_or_owned(&entry.workspace_path())
+                    .components()
+                    .count()
+            })
     }
 
     pub fn contain_child(
@@ -181,6 +221,7 @@ fn shell_command(shell: &str, flag: &str, script: &str) -> Command {
 #[cfg(target_os = "macos")]
 fn workspace_command(
     policy: &SandboxPolicy,
+    trust: Option<&kkagent_config::WorkspaceTrust>,
     shell: &str,
     flag: &str,
     script: &str,
@@ -190,7 +231,7 @@ fn workspace_command(
     if !sandbox.is_file() {
         anyhow::bail!("workspace sandbox requires /usr/bin/sandbox-exec on macOS");
     }
-    let profile = macos_profile(policy, cwd)?;
+    let profile = macos_profile(policy, trust, cwd)?;
     let mut command = Command::new(sandbox);
     command.args(["-p", &profile, shell, flag, script]);
     Ok(command)
@@ -199,6 +240,7 @@ fn workspace_command(
 #[cfg(target_os = "linux")]
 fn workspace_command(
     policy: &SandboxPolicy,
+    trust: Option<&kkagent_config::WorkspaceTrust>,
     shell: &str,
     flag: &str,
     script: &str,
@@ -224,6 +266,18 @@ fn workspace_command(
     for path in &policy.extra_write_paths {
         bind_path(&mut command, "--bind", path)?;
     }
+    if let Some(trust) = trust {
+        if trust.global_git_config_allowed == Some(true) {
+            for path in trust.global_git_read_paths().map(Path::new) {
+                bind_trusted_path(&mut command, "--ro-bind", path, cwd)?;
+            }
+        }
+        if trust.git_metadata_allowed == Some(true) {
+            for path in trust.git_metadata_paths.iter().map(Path::new) {
+                bind_trusted_path(&mut command, "--bind", path, cwd)?;
+            }
+        }
+    }
     command.args([
         "--chdir",
         path_text(cwd)?,
@@ -241,6 +295,7 @@ fn workspace_command(
 #[cfg(target_os = "windows")]
 fn workspace_command(
     _policy: &SandboxPolicy,
+    _trust: Option<&kkagent_config::WorkspaceTrust>,
     _shell: &str,
     _flag: &str,
     _script: &str,
@@ -252,6 +307,7 @@ fn workspace_command(
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 fn workspace_command(
     _policy: &SandboxPolicy,
+    _trust: Option<&kkagent_config::WorkspaceTrust>,
     _shell: &str,
     _flag: &str,
     _script: &str,
@@ -269,13 +325,36 @@ fn bind_path(command: &mut Command, operation: &str, path: &Path) -> anyhow::Res
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+fn bind_trusted_path(
+    command: &mut Command,
+    operation: &str,
+    path: &Path,
+    cwd: &Path,
+) -> anyhow::Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let path = std::fs::canonicalize(path)?;
+    if path.starts_with(cwd) {
+        return Ok(());
+    }
+    let text = path_text(&path)?;
+    command.args([operation, text, text]);
+    Ok(())
+}
+
 fn path_text(path: &Path) -> anyhow::Result<&str> {
     path.to_str()
         .ok_or_else(|| anyhow::anyhow!("sandbox path is not valid UTF-8: {}", path.display()))
 }
 
 #[cfg(target_os = "macos")]
-fn macos_profile(policy: &SandboxPolicy, cwd: &Path) -> anyhow::Result<String> {
+fn macos_profile(
+    policy: &SandboxPolicy,
+    trust: Option<&kkagent_config::WorkspaceTrust>,
+    cwd: &Path,
+) -> anyhow::Result<String> {
     fn literal(path: &Path) -> anyhow::Result<String> {
         let value = path_text(path)?;
         Ok(format!(
@@ -315,10 +394,47 @@ fn macos_profile(policy: &SandboxPolicy, cwd: &Path) -> anyhow::Result<String> {
             "(allow file-read* file-write* (subpath {path}))\n"
         ));
     }
+    if let Some(trust) = trust {
+        if trust.global_git_config_allowed == Some(true) {
+            for path in trust.global_git_read_paths().map(Path::new) {
+                if !path.exists() {
+                    continue;
+                }
+                let path = literal(&std::fs::canonicalize(path)?)?;
+                profile.push_str(&format!("(allow file-read* (literal {path}))\n"));
+            }
+        }
+        if trust.git_metadata_allowed == Some(true) {
+            for path in trust.git_metadata_paths.iter().map(Path::new) {
+                if !path.exists() {
+                    continue;
+                }
+                let path = literal(&std::fs::canonicalize(path)?)?;
+                profile.push_str(&format!(
+                    "(allow file-read* file-write* (subpath {path}))\n"
+                ));
+            }
+        }
+    }
     if policy.network {
         profile.push_str("(allow network*)\n");
     }
     Ok(profile)
+}
+
+fn apply_git_environment(
+    command: &mut Command,
+    mode: SandboxMode,
+    trust: Option<&kkagent_config::WorkspaceTrust>,
+) {
+    if mode == SandboxMode::Disabled {
+        return;
+    }
+    command.envs(kkagent_config::git_environment(trust));
+}
+
+fn canonical_or_owned(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 fn apply_resource_limits(command: &mut Command, policy: &SandboxPolicy) -> anyhow::Result<()> {
@@ -439,7 +555,7 @@ mod tests {
             network: false,
             ..Default::default()
         };
-        let profile = macos_profile(&policy, Path::new("/tmp/work")).unwrap();
+        let profile = macos_profile(&policy, None, Path::new("/tmp/work")).unwrap();
         assert!(profile.contains("/tmp/work"));
         assert!(!profile.contains("allow network"));
     }
@@ -525,6 +641,104 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         assert!(String::from_utf8_lossy(&output.stdout).contains("visible.txt"));
+        std::fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn mac_git_is_isolated_without_global_config_grant() {
+        let workspace = dirs::home_dir().unwrap().join(format!(
+            ".kkagent-sandbox-git-isolated-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let initialized = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&workspace)
+            .status()
+            .unwrap();
+        assert!(initialized.success());
+
+        let policy = SandboxPolicy {
+            mode: SandboxMode::Workspace,
+            ..Default::default()
+        };
+        let output = policy
+            .command("/bin/bash", "-c", "git status --short", &workspace)
+            .unwrap()
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stderr.is_empty());
+        std::fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn mac_git_reads_explicitly_trusted_global_config() {
+        let home = dirs::home_dir().unwrap();
+        let workspace = home.join(format!(
+            ".kkagent-sandbox-git-trusted-workspace-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let config_path = home.join(format!(
+            ".kkagent-sandbox-gitconfig-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(&config_path, "[user]\n\temail = sandbox@example.test\n").unwrap();
+
+        let mut policy = SandboxPolicy {
+            mode: SandboxMode::Workspace,
+            ..Default::default()
+        };
+        let mut trust = kkagent_config::WorkspaceTrust::new(&workspace);
+        trust.global_git_config_allowed = Some(true);
+        trust.global_git_config_roots = vec![config_path.to_string_lossy().into_owned()];
+        trust.global_git_config_paths = trust.global_git_config_roots.clone();
+        policy.upsert_workspace_trust(trust).unwrap();
+        let output = policy
+            .command("/bin/bash", "-c", "git config user.email", &workspace)
+            .unwrap()
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "sandbox@example.test"
+        );
+
+        let output = policy
+            .command(
+                "/bin/bash",
+                "-c",
+                "git init --quiet && git config --local user.email local@example.test && git config user.email",
+                &workspace,
+            )
+            .unwrap()
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "local@example.test"
+        );
+        std::fs::remove_file(config_path).unwrap();
         std::fs::remove_dir_all(workspace).unwrap();
     }
 }

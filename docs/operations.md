@@ -11,6 +11,7 @@
 | `~/.kkagent/credentials/kimi-code.json` | Kimi OAuth 凭据。 |
 | `~/.kkagent/kkagent.log` | TUI 文件日志。 |
 | `~/.kkagent/server.sock` | Unix socket，或 Windows 本地 endpoint 文件。 |
+| `~/.kkagent/config.toml.trust.toml` | TUI 管理的 workspace、外部 Git 元数据和只读全局 Git 配置授权；自定义 `--config` 使用同目录同名 sidecar。 |
 | `~/.kkagent/skills/`、`plugins/`、`hooks.json` | 用户扩展。 |
 | `~/.kkagent/telemetry/events.jsonl` | 本地遥测事件。 |
 | `~/.kkagent/http-audit.jsonl` | HTTP 请求审计日志，不记录原始 token。 |

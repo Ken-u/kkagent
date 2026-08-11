@@ -89,6 +89,8 @@ pub fn load_config(path: Option<&Path>) -> Result<AppConfig> {
             .with_context(|| format!("Failed to parse config: {config_path:?}"))?
     };
 
+    config.workspace_trust = crate::WorkspaceTrustStore::load(&config_path)?;
+
     // Merge TUI-managed disables (sidecar wins for skill names; MCP merges).
     if let Ok(disabled) = DisabledState::load() {
         disabled.apply_to_config(&mut config);

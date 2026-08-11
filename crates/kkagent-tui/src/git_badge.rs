@@ -39,8 +39,17 @@ struct Cache {
 static CACHE: Mutex<Option<Cache>> = Mutex::new(None);
 
 /// Refresh at most every 2s per cwd.
-pub fn git_badge(cwd: &Path) -> GitBadge {
-    let key = cwd.to_string_lossy().into_owned();
+pub fn git_badge(cwd: &Path, trust: Option<&kkagent_config::WorkspaceTrust>) -> GitBadge {
+    let key = format!(
+        "{}|{}|{}",
+        cwd.to_string_lossy(),
+        trust
+            .and_then(|entry| entry.global_git_config_allowed)
+            .unwrap_or(false),
+        trust
+            .map(|entry| entry.global_git_config_roots.join(";"))
+            .unwrap_or_default()
+    );
     if let Ok(guard) = CACHE.lock() {
         if let Some(c) = guard.as_ref() {
             if c.cwd == key && c.at.elapsed() < Duration::from_secs(2) {
@@ -48,7 +57,7 @@ pub fn git_badge(cwd: &Path) -> GitBadge {
             }
         }
     }
-    let badge = probe(cwd);
+    let badge = probe(cwd, trust);
     if let Ok(mut guard) = CACHE.lock() {
         *guard = Some(Cache {
             at: Instant::now(),
@@ -59,7 +68,10 @@ pub fn git_badge(cwd: &Path) -> GitBadge {
     badge
 }
 
-fn probe(cwd: &Path) -> GitBadge {
+fn probe(cwd: &Path, trust: Option<&kkagent_config::WorkspaceTrust>) -> GitBadge {
+    if !kkagent_config::git_metadata_accessible(trust) {
+        return GitBadge::default();
+    }
     let branch = Command::new("git")
         .args([
             "-C",
@@ -68,6 +80,7 @@ fn probe(cwd: &Path) -> GitBadge {
             "--abbrev-ref",
             "HEAD",
         ])
+        .envs(kkagent_config::git_environment(trust))
         .output()
         .ok()
         .filter(|o| o.status.success())
@@ -80,6 +93,7 @@ fn probe(cwd: &Path) -> GitBadge {
 
     let dirty = Command::new("git")
         .args(["-C", &cwd.to_string_lossy(), "status", "--porcelain"])
+        .envs(kkagent_config::git_environment(trust))
         .output()
         .ok()
         .map(|o| !o.stdout.is_empty())
@@ -96,6 +110,7 @@ fn probe(cwd: &Path) -> GitBadge {
             "--count",
             "@{upstream}...HEAD",
         ])
+        .envs(kkagent_config::git_environment(trust))
         .output()
     {
         if out.status.success() {

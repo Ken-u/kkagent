@@ -537,7 +537,16 @@ impl Session {
     }
 
     pub fn inject_git_context(&mut self) {
-        if let Some(ctx) = crate::git_context::collect_git_context(&self.working_dir) {
+        self.inject_git_context_with_trust(None);
+    }
+
+    pub fn inject_git_context_with_trust(
+        &mut self,
+        trust: Option<&kkagent_config::WorkspaceTrust>,
+    ) {
+        if let Some(ctx) =
+            crate::git_context::collect_git_context_with_trust(&self.working_dir, trust)
+        {
             self.system_prompt.push_str(&ctx);
         }
     }

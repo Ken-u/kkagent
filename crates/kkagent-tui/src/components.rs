@@ -1316,7 +1316,7 @@ fn render_footer(f: &mut Frame, area: Rect, state: &mut AppState, config: &AppCo
             shorten_path(&cwd.to_string_lossy()),
             Style::default().fg(theme.text_dim),
         ));
-        let git = git_badge::git_badge(cwd);
+        let git = git_badge::git_badge(cwd, config.workspace_trust.matching(cwd));
         if let Some(badge) = git.render() {
             left.push(Span::raw("  "));
             left.push(Span::styled(

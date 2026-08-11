@@ -27,6 +27,7 @@ use crate::slash::{
 
 pub struct TuiApp {
     config: AppConfig,
+    config_path: PathBuf,
     client: KkagentClient,
     state: AppState,
     mouse_mode: MouseMode,
@@ -951,6 +952,7 @@ impl TuiApp {
 
         Self {
             config,
+            config_path: kkagent_config::default_config_path(),
             client,
             state: AppState::new(permission_mode, plan_mode),
             mouse_mode: MouseMode::from_env(),
@@ -963,6 +965,10 @@ impl TuiApp {
         self.use_alt_screen = enabled;
     }
 
+    pub fn set_config_path(&mut self, path: PathBuf) {
+        self.config_path = path;
+    }
+
     /// New sessions inherit the global config default until `/model` overrides them.
     fn bind_config_default_model(&mut self) {
         self.state.model_alias = self.config.default_model_alias().map(|s| s.to_string());
@@ -970,6 +976,16 @@ impl TuiApp {
 
     pub async fn run(mut self, resume: Option<String>) -> anyhow::Result<()> {
         let startup_started = std::time::Instant::now();
+        if let Some(trust) = self
+            .config
+            .workspace_trust
+            .matching(&self.state.working_dir)
+            .cloned()
+        {
+            self.client
+                .rpc_call("workspace.trust", Some(serde_json::to_value(trust)?))
+                .await?;
+        }
         // Create / resume session BEFORE taking over the terminal, so RPC
         // failures don't leave the user's shell stuck in raw/alternate mode.
         let cwd = self.state.working_dir.to_string_lossy().into_owned();
@@ -1000,21 +1016,14 @@ impl TuiApp {
             "TUI session ready"
         );
 
-        // Workspace trust gate (AGENTS / MCP / scripts) — empty trusted_workspaces = trust cwd.
+        // Defensive consistency check: the startup review or static config must
+        // have established trust before the server creates this session.
         let cwd_path = std::path::PathBuf::from(&cwd);
-        if !self.config.trusted_workspaces.is_empty() {
-            let trusted = self.config.trusted_workspaces.iter().any(|t| {
-                let p = std::path::PathBuf::from(t);
-                let p = p.canonicalize().unwrap_or(p);
-                let c = cwd_path.canonicalize().unwrap_or_else(|_| cwd_path.clone());
-                c.starts_with(&p)
-            });
-            if !trusted {
-                self.system_message(format!(
-                    "Untrusted workspace {}. Project AGENTS/Skills/MCP/scripts are gated until you add this path under trusted_workspaces (or clear the list).",
-                    cwd_path.display()
-                ));
-            }
+        if self.config.workspace_trust.matching(&cwd_path).is_none() {
+            self.system_message(format!(
+                "Untrusted workspace {}. Restart kkagent and complete the workspace trust review.",
+                cwd_path.display()
+            ));
         }
 
         // Validate optional keybinding overrides without locking the user out.
@@ -4539,7 +4548,7 @@ impl TuiApp {
     }
 
     fn reload_config_from_disk(&mut self) {
-        match kkagent_config::load_config(None) {
+        match kkagent_config::load_config(Some(&self.config_path)) {
             Ok(config) => {
                 self.config = config;
                 self.system_message(

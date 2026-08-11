@@ -1,10 +1,10 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::collections::HashMap;
 use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock as StdRwLock};
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::AbortHandle;
 
@@ -339,6 +339,7 @@ async fn main() -> Result<()> {
             } else {
                 run_tui(
                     config,
+                    config_path,
                     permission_mode,
                     cli.plan,
                     cli.resume,
@@ -708,13 +709,19 @@ fn write_private_config(path: &std::path::Path, contents: &[u8]) -> Result<()> {
 }
 
 async fn run_tui(
-    config: AppConfig,
+    mut config: AppConfig,
+    config_path: PathBuf,
     permission_mode: PermissionMode,
     plan_mode: bool,
     resume: Option<String>,
     connect: Option<String>,
     no_alt_screen: bool,
 ) -> Result<()> {
+    let workspace = std::env::current_dir()
+        .and_then(std::fs::canonicalize)
+        .context("cannot resolve the TUI workspace")?;
+    kkagent_tui::ensure_workspace_trust(&mut config, &config_path, &workspace, !no_alt_screen)?;
+
     // Default TUI: 1:1 in-process pair via memory duplex.
     // This process owns both ends — quitting the TUI aborts the paired server
     // task so a subsequent `kkagent` never talks to a leftover in-process agent.
@@ -740,6 +747,7 @@ async fn run_tui(
 
     let client = KkagentClient::new(rpc_client, event_rx);
     let mut app = TuiApp::new(tui_config, client);
+    app.set_config_path(config_path);
     app.set_use_alt_screen(!no_alt_screen);
     let result = app.run(resume).await;
 
@@ -910,7 +918,13 @@ async fn initialize_session_context(state: &ServerState, session: &mut Session) 
     session.inject_working_directory_context();
     session.inject_date_reminder();
     session.inject_workspace_instructions().await;
-    session.inject_git_context();
+    let workspace_trust = state
+        .workspace_trust
+        .read()
+        .unwrap_or_else(|error| error.into_inner())
+        .matching(&session.working_dir)
+        .cloned();
+    session.inject_git_context_with_trust(workspace_trust.as_ref());
     let skill_section = state
         .skills
         .catalog_prompt_section_for(&session.working_dir)
@@ -1424,7 +1438,7 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
             .ok_or_else(|| "workspace is required".to_string())?;
         let cwd = std::fs::canonicalize(&requested)
             .map_err(|error| format!("invalid workspace {}: {error}", requested.display()))?;
-        if !kkagent_core::is_workspace_trusted(&self.state.config, &cwd) {
+        if !self.state.workspace_is_trusted(&cwd) {
             return Err(format!(
                 "workspace {} is outside trusted_workspaces",
                 cwd.display()
@@ -1713,7 +1727,7 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
             "default_model": self.state.config.default_model,
             "config_dir": kkagent_config::default_config_dir().display().to_string(),
             "mcp_servers": self.state.config.mcp_servers.len(),
-            "sandbox": self.state.sandbox_policy.mode_name(),
+            "sandbox": self.state.sandbox_snapshot().mode_name(),
         })
     }
 
@@ -1919,6 +1933,7 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
     async fn health(&self) -> serde_json::Value {
         let persistence_responding = self.state.transcript.lock().await.list_sessions(1).is_ok();
         let task_persistence_responding = self.state.durable_http.list_turns(1).is_ok();
+        let sandbox = self.state.sandbox_snapshot();
         serde_json::json!({
             "status": "ok",
             "uptime_seconds": self.state.started_at.elapsed().as_secs(),
@@ -1931,8 +1946,8 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
             "sessions": self.state.sessions.lock().await.len(),
             "mcp_servers": self.state.config.mcp_servers.len(),
             "sandbox": {
-                "mode": self.state.sandbox_policy.mode_name(),
-                "network": self.state.sandbox_policy.network,
+                "mode": sandbox.mode_name(),
+                "network": sandbox.network,
             },
         })
     }
@@ -2044,7 +2059,7 @@ async fn build_turn_tool_registry(
         state.bash_shells.clone(),
         kkagent_tools::builtin::BashOptions {
             auto_background_on_timeout,
-            sandbox: state.sandbox_policy.clone(),
+            sandbox: state.sandbox_snapshot(),
         },
     )));
     register_mcp_tools(&mut tools, &state.mcp).await;
@@ -2240,7 +2255,8 @@ async fn run_http_turn(
 
 struct ServerState {
     config: Arc<AppConfig>,
-    sandbox_policy: kkagent_tools::sandbox::SandboxPolicy,
+    sandbox_policy: StdRwLock<kkagent_tools::sandbox::SandboxPolicy>,
+    workspace_trust: StdRwLock<kkagent_config::WorkspaceTrustStore>,
     sessions: Mutex<HashMap<String, Session>>,
     /// Session approval senders — must not require holding `sessions` lock
     /// (agent loop may be waiting on approval while holding the session).
@@ -2278,6 +2294,103 @@ struct ServerState {
     persistence_durable: bool,
     persistence_error: Option<String>,
     started_at: std::time::Instant,
+}
+
+impl ServerState {
+    fn sandbox_snapshot(&self) -> kkagent_tools::sandbox::SandboxPolicy {
+        self.sandbox_policy
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+
+    fn workspace_is_trusted(&self, workspace: &Path) -> bool {
+        if self
+            .workspace_trust
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .matching(workspace)
+            .is_some()
+        {
+            return true;
+        }
+        kkagent_core::is_workspace_trusted(&self.config, workspace)
+    }
+
+    fn apply_workspace_trust(&self, trust: kkagent_config::WorkspaceTrust) -> anyhow::Result<()> {
+        let trust = canonicalize_workspace_trust(trust)?;
+        self.workspace_trust
+            .write()
+            .unwrap_or_else(|error| error.into_inner())
+            .upsert(trust.clone());
+        self.sandbox_policy
+            .write()
+            .unwrap_or_else(|error| error.into_inner())
+            .upsert_workspace_trust(trust)
+    }
+}
+
+fn canonicalize_workspace_trust(
+    mut trust: kkagent_config::WorkspaceTrust,
+) -> anyhow::Result<kkagent_config::WorkspaceTrust> {
+    fn canonical_existing(path: &str, kind: &str) -> anyhow::Result<String> {
+        let path = Path::new(path);
+        let canonical = std::fs::canonicalize(path)
+            .with_context(|| format!("cannot resolve trusted {kind} path {}", path.display()))?;
+        Ok(canonical.to_string_lossy().into_owned())
+    }
+
+    trust.workspace = canonical_existing(&trust.workspace, "workspace")?;
+    trust.git_metadata_paths = trust
+        .git_metadata_paths
+        .iter()
+        .map(|path| canonical_existing(path, "Git metadata"))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    trust.git_metadata_paths.sort();
+    trust.git_metadata_paths.dedup();
+    if trust.global_git_config_allowed == Some(true) {
+        trust.global_git_config_roots = trust
+            .global_git_config_roots
+            .iter()
+            .map(|path| canonical_existing(path, "global Git config root"))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        trust.repo_config_path = trust
+            .repo_config_path
+            .as_deref()
+            .map(|path| canonical_existing(path, "repo user config"))
+            .transpose()?;
+        trust.global_git_config_paths = trust
+            .global_git_config_paths
+            .iter()
+            .map(|path| canonical_existing(path, "global Git config"))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        trust.global_git_ignore_path = trust
+            .global_git_ignore_path
+            .as_deref()
+            .map(|path| canonical_existing(path, "global Git ignore"))
+            .transpose()?;
+        trust.global_git_attributes_path = trust
+            .global_git_attributes_path
+            .as_deref()
+            .map(|path| canonical_existing(path, "global Git attributes"))
+            .transpose()?;
+        for root in &trust.global_git_config_roots {
+            if !trust.global_git_config_paths.contains(root) {
+                anyhow::bail!("global Git config root is outside the approved config file set");
+            }
+        }
+        trust.global_git_config_paths.sort();
+        trust.global_git_config_paths.dedup();
+    } else {
+        trust.global_git_config_roots.clear();
+        trust.repo_config_path = None;
+        trust.global_git_config_paths.clear();
+        trust.global_git_ignore_path = None;
+        trust.global_git_attributes_path = None;
+        trust.global_git_risks.clear();
+    }
+    trust.validate()?;
+    Ok(trust)
 }
 
 #[derive(Default)]
@@ -2367,7 +2480,7 @@ async fn build_server_state(config: Arc<AppConfig>) -> Result<Arc<ServerState>> 
     let transcript = TranscriptDb::from_shared(shared_sqlite.clone())?;
     let durable_http = kkagent_rpc::DurableHttpStore::from_shared(shared_sqlite.clone())?;
     let subagents = Arc::new(SubagentManager::from_shared(4, shared_sqlite)?);
-    let sandbox_policy = kkagent_tools::sandbox::SandboxPolicy::from_config(&config.sandbox)?;
+    let sandbox_policy = kkagent_tools::sandbox::SandboxPolicy::from_app_config(&config)?;
 
     let mcp = Arc::new(mcp_manager_from_config(&config));
     {
@@ -2501,7 +2614,8 @@ async fn build_server_state(config: Arc<AppConfig>) -> Result<Arc<ServerState>> 
 
     let state = Arc::new(ServerState {
         config: config.clone(),
-        sandbox_policy,
+        sandbox_policy: StdRwLock::new(sandbox_policy),
+        workspace_trust: StdRwLock::new(config.workspace_trust.clone()),
         sessions: Mutex::new(HashMap::new()),
         approval_txs: Mutex::new(HashMap::new()),
         question_txs: Mutex::new(HashMap::new()),
@@ -2985,6 +3099,16 @@ async fn handle_rpc_call(
     rpc_event_tx: mpsc::Sender<Frame>,
 ) -> Result<serde_json::Value, (i32, String)> {
     match method {
+        "workspace.trust" => {
+            let value = params.ok_or_else(|| (-32602, "Missing workspace trust".to_string()))?;
+            let trust: kkagent_config::WorkspaceTrust = serde_json::from_value(value)
+                .map_err(|error| (-32602, format!("Invalid workspace trust: {error}")))?;
+            let workspace = trust.workspace.clone();
+            state
+                .apply_workspace_trust(trust)
+                .map_err(|error| (-32602, error.to_string()))?;
+            Ok(serde_json::json!({"ok": true, "workspace": workspace}))
+        }
         "sessions.create" => {
             let session_id = uuid::Uuid::new_v4().to_string();
             let requested_workspace = params
@@ -3024,7 +3148,7 @@ async fn handle_rpc_call(
                 perm_mode,
                 model_alias.clone(),
             );
-            if !kkagent_core::is_workspace_trusted(&state.config, &session.working_dir) {
+            if !state.workspace_is_trusted(&session.working_dir) {
                 return Err((
                     -32000,
                     format!(

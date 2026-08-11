@@ -44,7 +44,7 @@ pub use full_compaction::{
     CompactionPolicy, CompactionResult, CompactionStrategy, DEFAULT_BLOCK_RATIO,
     DEFAULT_TRIGGER_RATIO, MAX_OVERFLOW_COMPACTION_ATTEMPTS,
 };
-pub use git_context::{collect_git_context, is_workspace_trusted};
+pub use git_context::{collect_git_context, collect_git_context_with_trust, is_workspace_trusted};
 pub use media_pipeline::{extract_at_paths, resolve_media, MediaLimits, MediaRef};
 pub use model_capability::ModelCapability;
 pub use permission::*;

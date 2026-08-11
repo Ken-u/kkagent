@@ -28,6 +28,9 @@ pub struct AppConfig {
     /// Trusted workspace roots (absolute paths). Empty = trust cwd implicitly.
     #[serde(default)]
     pub trusted_workspaces: Vec<String>,
+    /// Runtime workspace grants loaded from the config-adjacent trust sidecar.
+    #[serde(skip)]
+    pub workspace_trust: crate::WorkspaceTrustStore,
     #[serde(default)]
     pub providers: HashMap<String, ProviderConfig>,
     #[serde(default)]
@@ -515,6 +518,9 @@ impl AppConfig {
             if !std::path::Path::new(root).is_absolute() {
                 anyhow::bail!("trusted workspace must be absolute: {root}");
             }
+        }
+        for entry in &self.workspace_trust.workspaces {
+            entry.validate()?;
         }
         if self.image.max_edge_px == 0 || self.image.max_edge_px > 16_384 {
             anyhow::bail!("image.max_edge_px must be between 1 and 16384");

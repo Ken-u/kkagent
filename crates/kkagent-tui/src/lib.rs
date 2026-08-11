@@ -27,5 +27,7 @@ pub mod test_summary;
 pub mod theme;
 pub mod tool_renderers;
 pub mod version_check;
+pub mod workspace_trust;
 
 pub use app::TuiApp;
+pub use workspace_trust::ensure_workspace_trust;
