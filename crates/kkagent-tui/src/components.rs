@@ -606,7 +606,7 @@ fn build_transcript_lines(state: &mut AppState, theme: &Theme, width: u16) -> Ve
                         .fg(theme.warning)
                         .add_modifier(Modifier::ITALIC),
                 )));
-            } else if !state.thinking_text.is_empty() {
+            } else {
                 lines.push(Line::from(Span::styled(
                     format!("● {} thinking", ch),
                     Style::default()
@@ -622,23 +622,6 @@ fn build_transcript_lines(state: &mut AppState, theme: &Theme, width: u16) -> Ve
                         Style::default().fg(theme.text_muted),
                     )));
                 }
-                lines.push(Line::from(Span::styled(
-                    format!("  {}", state.stream_cursor.glyph()),
-                    Style::default().fg(theme.primary),
-                )));
-            } else {
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        format!("● {} thinking ", ch),
-                        Style::default()
-                            .fg(theme.text_dim)
-                            .add_modifier(Modifier::ITALIC),
-                    ),
-                    Span::styled(
-                        state.stream_cursor.glyph().to_string(),
-                        Style::default().fg(theme.primary),
-                    ),
-                ]));
             }
         }
         SessionStatus::ToolExecuting => {
