@@ -889,6 +889,16 @@ impl AppState {
         }
     }
 
+    /// Leave plan mode enabled, but stop the previous plan from replacing the
+    /// transcript while the agent is working on revision feedback. The next
+    /// PlanFileUpdated event restores focus with the updated document.
+    pub fn dismiss_plan_focus(&mut self) {
+        self.plan_document = None;
+        self.plan_scroll_to_top = false;
+        self.follow_bottom = true;
+        self.scroll_up = 0;
+    }
+
     pub fn on_plan_mode_changed(&mut self, enabled: bool) {
         self.plan_mode = enabled;
         self.mode = if enabled {
@@ -7220,13 +7230,16 @@ impl TuiApp {
             // Restore panel on failure
             self.state.approval_pending = Some(approval);
             self.system_message(format!("Approval failed: {}", e));
-        } else if let Some(next) = self.state.approval_queue.pop_front() {
-            self.state.approval_pending = Some(next);
-            self.state.status = SessionStatus::WaitingApproval;
         } else {
-            self.state.status = SessionStatus::Thinking;
             if revising_plan {
+                self.state.dismiss_plan_focus();
                 self.jobs.push_info("修改意见已提交，正在更新计划…");
+            }
+            if let Some(next) = self.state.approval_queue.pop_front() {
+                self.state.approval_pending = Some(next);
+                self.state.status = SessionStatus::WaitingApproval;
+            } else {
+                self.state.status = SessionStatus::Thinking;
             }
         }
         Ok(())
@@ -8717,7 +8730,7 @@ mod app_state_tests {
     }
 
     #[tokio::test]
-    async fn submitted_plan_revision_returns_to_thinking_state() {
+    async fn submitted_plan_revision_dismisses_old_plan_until_update() {
         use futures::FutureExt;
         use std::sync::Arc;
 
@@ -8749,6 +8762,12 @@ mod app_state_tests {
         let mut app = TuiApp::new(AppConfig::default(), client);
         app.state.session_id = Some("session-1".into());
         app.state.status = SessionStatus::WaitingApproval;
+        app.state.on_plan_mode_changed(true);
+        app.state.apply_plan_document(
+            "/plans/old.md".into(),
+            "# Old plan\n\nPrevious content.".into(),
+        );
+        assert!(app.state.plan_focus_active());
         let (approval, choice) = pending_plan_revision();
         app.state.approval_pending = Some(approval);
 
@@ -8758,11 +8777,79 @@ mod app_state_tests {
 
         assert!(app.state.approval_pending.is_none());
         assert_eq!(app.state.status, SessionStatus::Thinking);
+        assert!(app.state.plan_mode);
+        assert!(app.state.plan_document.is_none());
+        assert!(!app.state.plan_focus_active());
+        assert!(app.state.follow_bottom);
         assert!(app
             .jobs
             .notices
             .iter()
             .any(|notice| notice.text.contains("正在更新计划")));
+
+        app.state.apply_plan_document(
+            "/plans/revised.md".into(),
+            "# Revised plan\n\nUpdated content.".into(),
+        );
+        assert!(app.state.plan_focus_active());
+        assert_eq!(
+            app.state
+                .plan_document
+                .as_ref()
+                .map(|plan| plan.path.as_str()),
+            Some("/plans/revised.md")
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_plan_revision_keeps_old_plan_and_approval_visible() {
+        use futures::FutureExt;
+        use std::sync::Arc;
+
+        let (client_transport, server_transport) =
+            kkagent_rpc::transport::memory::create_memory_pair();
+        let (event_tx, event_rx) = tokio::sync::mpsc::channel(16);
+        let rpc = kkagent_rpc::RpcClient::new(client_transport, event_tx);
+        let client = kkagent_client::KkagentClient::new(rpc, event_rx);
+        let handler: kkagent_rpc::server::RequestHandler =
+            Arc::new(|_id, method, _params, _event_tx| {
+                async move {
+                    assert_eq!(method, "approval.respond");
+                    Err((-32000, "delivery failed".into()))
+                }
+                .boxed()
+            });
+        tokio::spawn(async move {
+            kkagent_rpc::RpcServer::new(handler)
+                .serve(server_transport)
+                .await;
+        });
+        let mut app = TuiApp::new(AppConfig::default(), client);
+        app.state.session_id = Some("session-1".into());
+        app.state.status = SessionStatus::WaitingApproval;
+        app.state.on_plan_mode_changed(true);
+        app.state
+            .apply_plan_document("/plans/old.md".into(), "# Old plan".into());
+        let (approval, choice) = pending_plan_revision();
+        app.state.approval_pending = Some(approval);
+
+        app.respond_approval_choice(choice, Some("please revise".into()))
+            .await
+            .unwrap();
+
+        assert!(app.state.approval_pending.is_some());
+        assert_eq!(app.state.status, SessionStatus::WaitingApproval);
+        assert!(app.state.plan_focus_active());
+        assert_eq!(
+            app.state
+                .plan_document
+                .as_ref()
+                .map(|plan| plan.path.as_str()),
+            Some("/plans/old.md")
+        );
+        assert!(app.state.messages.iter().any(|message| {
+            message.role == MessageRole::System && message.content.contains("Approval failed")
+        }));
     }
 
     #[tokio::test]
