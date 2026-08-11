@@ -20,8 +20,8 @@ pub use builtin::{
     render_model_tool_skill_prompt, render_skill_loaded_block, render_user_slash_skill_prompt,
     BackgroundShellManager, BashOptions, BashTool, CronManager, SkillCatalog, SkillTool,
 };
-pub use web_providers::WebServicesConfig;
 pub use registry::*;
+pub use web_providers::WebServicesConfig;
 
 use async_trait::async_trait;
 use serde_json::Value;

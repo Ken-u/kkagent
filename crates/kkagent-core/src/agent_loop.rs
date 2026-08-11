@@ -879,11 +879,12 @@ Do not mention this reminder to the user.\n</system-reminder>"
                                                 } else {
                                                     session.working_dir.join(path_str)
                                                 };
-                                                let conflicts = global_file_tracker().conflicts_for(
-                                                    &session.id,
-                                                    &path,
-                                                    &session.working_dir,
-                                                );
+                                                let conflicts = global_file_tracker()
+                                                    .conflicts_for(
+                                                        &session.id,
+                                                        &path,
+                                                        &session.working_dir,
+                                                    );
                                                 if !conflicts.is_empty() {
                                                     let others = conflicts.join(", ");
                                                     let _ = self
@@ -1000,23 +1001,21 @@ Do not mention this reminder to the user.\n</system-reminder>"
                             },
                         };
                         match response.decision {
-                            kkagent_protocol::ApprovalDecision::Approved => {
-                                match response.scope {
-                                    Some(kkagent_protocol::ApprovalScope::Session) => {
-                                        let mut perm = self.permission.lock().await;
-                                        perm.record_session_approval(name, input);
-                                    }
-                                    Some(kkagent_protocol::ApprovalScope::Turn) => {
-                                        let mut perm = self.permission.lock().await;
-                                        perm.record_turn_approval(name, input);
-                                    }
-                                    Some(kkagent_protocol::ApprovalScope::Always) => {
-                                        let mut perm = self.permission.lock().await;
-                                        perm.record_always_approval(name, input);
-                                    }
-                                    Some(kkagent_protocol::ApprovalScope::Once) | None => {}
+                            kkagent_protocol::ApprovalDecision::Approved => match response.scope {
+                                Some(kkagent_protocol::ApprovalScope::Session) => {
+                                    let mut perm = self.permission.lock().await;
+                                    perm.record_session_approval(name, input);
                                 }
-                            }
+                                Some(kkagent_protocol::ApprovalScope::Turn) => {
+                                    let mut perm = self.permission.lock().await;
+                                    perm.record_turn_approval(name, input);
+                                }
+                                Some(kkagent_protocol::ApprovalScope::Always) => {
+                                    let mut perm = self.permission.lock().await;
+                                    perm.record_always_approval(name, input);
+                                }
+                                Some(kkagent_protocol::ApprovalScope::Once) | None => {}
+                            },
                             kkagent_protocol::ApprovalDecision::Cancelled => {
                                 self.finish_interrupted(session).await?;
                                 return Ok(TurnStep::Done);
@@ -2591,7 +2590,7 @@ mod retry_tests {
                 display_name: None,
                 support_efforts: Vec::new(),
                 default_effort: None,
-                            pricing: None,
+                pricing: None,
             },
         );
         let config = Arc::new(config);
@@ -2696,7 +2695,7 @@ mod retry_tests {
                 display_name: None,
                 support_efforts: Vec::new(),
                 default_effort: None,
-                            pricing: None,
+                pricing: None,
             },
         );
         let (event_tx, _) = mpsc::channel(512);
@@ -2782,7 +2781,7 @@ mod retry_tests {
                 display_name: None,
                 support_efforts: Vec::new(),
                 default_effort: None,
-                            pricing: None,
+                pricing: None,
             },
         );
         let (event_tx, mut event_rx) = mpsc::channel(64);

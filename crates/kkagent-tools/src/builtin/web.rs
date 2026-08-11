@@ -196,10 +196,9 @@ impl Tool for FetchUrlTool {
                                 json!({"source_url": url, "via": "web_fetch"}),
                             ));
                         }
-                        Ok(_) => tracing::warn!(
-                            "web_fetch HTTP {}, falling back to direct GET",
-                            status
-                        ),
+                        Ok(_) => {
+                            tracing::warn!("web_fetch HTTP {}, falling back to direct GET", status)
+                        }
                         Err(e) => tracing::warn!(
                             "web_fetch response rejected ({e}), falling back to direct GET"
                         ),
@@ -380,7 +379,9 @@ fn extract_readable_text(html: &str) -> String {
     let lower_chars: Vec<char> = lower.chars().collect();
     while i < chars.len() {
         let rest: String = lower_chars[i..].iter().collect();
-        if rest.starts_with("<script") || rest.starts_with("<style") || rest.starts_with("<noscript")
+        if rest.starts_with("<script")
+            || rest.starts_with("<style")
+            || rest.starts_with("<noscript")
         {
             let end_tag = if rest.starts_with("<script") {
                 "</script>"

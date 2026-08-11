@@ -277,7 +277,11 @@ impl WebSearchProvider for SearxngProvider {
                 .and_then(|v| v.as_str())
                 .unwrap_or("(no title)")
                 .to_string();
-            let url = r.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let url = r
+                .get("url")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             let snippet = r
                 .get("content")
                 .or_else(|| r.get("snippet"))
@@ -364,10 +368,7 @@ impl WebSearchProvider for BraveProvider {
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string(),
-                published_at: r
-                    .get("age")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string()),
+                published_at: r.get("age").and_then(|v| v.as_str()).map(|s| s.to_string()),
                 source: Some("brave".into()),
             });
         }
@@ -438,7 +439,11 @@ impl WebSearchProvider for CustomJsonProvider {
                     .and_then(|v| v.as_str())
                     .unwrap_or("(no title)")
                     .to_string(),
-                url: r.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                url: r
+                    .get("url")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
                 snippet: r
                     .get("snippet")
                     .or_else(|| r.get("content"))

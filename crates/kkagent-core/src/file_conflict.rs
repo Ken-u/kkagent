@@ -49,12 +49,7 @@ impl FileConflictTracker {
     }
 
     /// Other sessions that have already touched this path (excluding `session_id`).
-    pub fn conflicts_for(
-        &self,
-        session_id: &str,
-        path: &Path,
-        cwd: &Path,
-    ) -> Vec<String> {
+    pub fn conflicts_for(&self, session_id: &str, path: &Path, cwd: &Path) -> Vec<String> {
         let key = Self::normalize(path, cwd);
         let Ok(map) = self.inner.lock() else {
             return Vec::new();

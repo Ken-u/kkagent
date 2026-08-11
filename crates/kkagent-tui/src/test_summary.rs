@@ -39,9 +39,10 @@ pub fn parse_test_output(text: &str) -> Option<TestSummary> {
             found = true;
             for part in rest.split(';') {
                 let p = part.trim();
-                if let Some(n) = p.strip_suffix(" passed").and_then(|s| {
-                    s.split_whitespace().last().and_then(|x| x.parse().ok())
-                }) {
+                if let Some(n) = p
+                    .strip_suffix(" passed")
+                    .and_then(|s| s.split_whitespace().last().and_then(|x| x.parse().ok()))
+                {
                     summary.passed = n;
                 } else if let Some(n) = p
                     .strip_suffix(" failed")

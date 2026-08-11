@@ -777,7 +777,7 @@ impl AppState {
             thinking: None,
             parts: Vec::new(),
             tool_calls: Vec::new(),
-                    delivery: crate::prompt_queue::DeliveryState::Sent,
+            delivery: crate::prompt_queue::DeliveryState::Sent,
             idempotency_key: None,
         });
         if self.plan_mode {
@@ -1254,7 +1254,7 @@ impl TuiApp {
             }
 
             // Periodically persist the composer draft for the active session.
-            if self.state.tick % 20 == 0 {
+            if self.state.tick.is_multiple_of(20) {
                 if let Some(sid) = self.state.session_id.clone() {
                     let text = self.state.input.text.clone();
                     let cursor = self.state.input.cursor;
@@ -1452,7 +1452,8 @@ impl TuiApp {
                                 self.jobs.mcp.configured && !self.jobs.mcp.initialized;
                             if let Some(msg) = self.state.messages.iter_mut().rev().find(|m| {
                                 m.role == MessageRole::User
-                                    && m.idempotency_key.as_deref() == Some(idempotency_key.as_str())
+                                    && m.idempotency_key.as_deref()
+                                        == Some(idempotency_key.as_str())
                             }) {
                                 msg.delivery = crate::prompt_queue::DeliveryState::Sent;
                             }
@@ -1464,7 +1465,8 @@ impl TuiApp {
                             self.jobs.mcp.waiting_for_prompt = false;
                             if let Some(msg) = self.state.messages.iter_mut().rev().find(|m| {
                                 m.role == MessageRole::User
-                                    && m.idempotency_key.as_deref() == Some(idempotency_key.as_str())
+                                    && m.idempotency_key.as_deref()
+                                        == Some(idempotency_key.as_str())
                             }) {
                                 msg.delivery = crate::prompt_queue::DeliveryState::Failed;
                                 // Restore draft for edit/retry without losing the failed bubble.
@@ -1821,11 +1823,9 @@ impl TuiApp {
         match mouse.kind {
             MouseEventKind::ScrollUp if over_strip => {
                 self.state.pending_strip_action = Some(StripAction::Cycle(-1));
-                return;
             }
             MouseEventKind::ScrollDown if over_strip => {
                 self.state.pending_strip_action = Some(StripAction::Cycle(1));
-                return;
             }
             MouseEventKind::ScrollUp => {
                 *scroll_delta = scroll_delta.saturating_add(3);
@@ -1842,7 +1842,6 @@ impl TuiApp {
                     }
                 }
                 self.clear_selection();
-                return;
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 self.flush_pending_scroll(scroll_delta);
@@ -2711,10 +2710,16 @@ impl TuiApp {
                 self.cycle_attention_session().await?;
             }
             // Empty-input turn navigation: [ ] user turns, { } tool errors
-            KeyCode::Char('[') if self.state.input.is_empty() && !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char('[')
+                if self.state.input.is_empty()
+                    && !key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
                 self.navigate_turns(-1, false);
             }
-            KeyCode::Char(']') if self.state.input.is_empty() && !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char(']')
+                if self.state.input.is_empty()
+                    && !key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
                 self.navigate_turns(1, false);
             }
             KeyCode::Char('{') if self.state.input.is_empty() => {
@@ -3545,7 +3550,7 @@ impl TuiApp {
             issues.push("model disables tool use — agent tools may fail".into());
         }
         if let Some(ctx) = model.max_context_size {
-            if self.state.approx_tokens as u64 + 2048 > ctx {
+            if self.state.approx_tokens + 2048 > ctx {
                 issues.push(format!(
                     "approx tokens {} may exceed context window {ctx}",
                     self.state.approx_tokens
@@ -3563,9 +3568,10 @@ impl TuiApp {
         let mut indices: Vec<usize> = Vec::new();
         for (i, msg) in self.state.messages.iter().enumerate() {
             if errors_only {
-                let has_err = msg.parts.iter().any(|p| {
-                    matches!(p, DisplayPart::Tool(tc) if tc.is_error)
-                });
+                let has_err = msg
+                    .parts
+                    .iter()
+                    .any(|p| matches!(p, DisplayPart::Tool(tc) if tc.is_error));
                 if has_err {
                     indices.push(i);
                 }
@@ -3582,10 +3588,7 @@ impl TuiApp {
             return;
         }
         let current = self.state.highlight_message.unwrap_or(0);
-        let pos = indices
-            .iter()
-            .position(|&i| i >= current)
-            .unwrap_or(0);
+        let pos = indices.iter().position(|&i| i >= current).unwrap_or(0);
         let next = if direction >= 0 {
             indices[(pos + 1).min(indices.len() - 1)]
         } else if pos == 0 {
@@ -3622,7 +3625,11 @@ impl TuiApp {
             "session_id": sid,
             "tool_call_id": tool_call_id,
         });
-        match self.client.rpc_call("session.cancel_tool", Some(params)).await {
+        match self
+            .client
+            .rpc_call("session.cancel_tool", Some(params))
+            .await
+        {
             Ok(_) => self.system_message(format!("stopping… {tool_call_id}")),
             Err(e) => {
                 // Fallback: interrupt whole turn if per-tool cancel unsupported.
@@ -4023,20 +4030,19 @@ impl TuiApp {
             for part in &msg.parts {
                 match part {
                     DisplayPart::Text(t) => {
-                        conv += ((t.chars().count() as u64) + 3) / 4;
+                        conv += (t.chars().count() as u64).div_ceil(4);
                     }
                     DisplayPart::Tool(tc) => {
                         let n = tc.input_summary.len()
                             + tc.output.as_ref().map(|s| s.len()).unwrap_or(0);
-                        tools += ((n as u64) + 3) / 4;
+                        tools += (n as u64).div_ceil(4);
                     }
                     DisplayPart::ToolHistory(h) => {
                         tools += 40 * h.tool_count as u64;
                     }
                     DisplayPart::SkillActivation { name, args } => {
-                        conv += ((name.len() + args.as_ref().map(|a| a.len()).unwrap_or(0)) as u64
-                            + 3)
-                            / 4;
+                        conv += ((name.len() + args.as_ref().map(|a| a.len()).unwrap_or(0)) as u64)
+                            .div_ceil(4);
                     }
                 }
             }
@@ -4207,10 +4213,7 @@ impl TuiApp {
         for (i, turn) in self.state.usage_turns.iter().rev().take(8).enumerate() {
             items.push(ListPickerItem {
                 id: format!("turn{i}"),
-                label: format!(
-                    "Turn −{}",
-                    i + 1
-                ),
+                label: format!("Turn −{}", i + 1),
                 detail: format!(
                     "in={} out={} · {}ms",
                     turn.input_tokens, turn.output_tokens, turn.duration_ms
@@ -4252,11 +4255,7 @@ impl TuiApp {
         items.push(ListPickerItem {
             id: "model".into(),
             label: "Default model".into(),
-            detail: self
-                .config
-                .default_model_alias()
-                .unwrap_or("-")
-                .to_string(),
+            detail: self.config.default_model_alias().unwrap_or("-").to_string(),
         });
         items.push(ListPickerItem {
             id: "hint".into(),
@@ -4827,8 +4826,12 @@ impl TuiApp {
             .and_then(|p| p.items.get(p.selected).map(|i| i.id.clone()));
         let selected = prior_selected_id
             .as_deref()
-            .and_then(|id| items.iter().position(|i| &i.id == id))
-            .or_else(|| current.as_ref().and_then(|c| items.iter().position(|i| &i.id == c)))
+            .and_then(|id| items.iter().position(|i| i.id == *id))
+            .or_else(|| {
+                current
+                    .as_ref()
+                    .and_then(|c| items.iter().position(|i| i.id == *c))
+            })
             .unwrap_or(0);
         let prior_filter = self
             .state
@@ -4886,7 +4889,7 @@ impl TuiApp {
         // Try to keep the cursor on the same item; fall back to clamp.
         let new_selected = keep_id
             .as_deref()
-            .and_then(|id| picker.items.iter().position(|i| &i.id == id))
+            .and_then(|id| picker.items.iter().position(|i| i.id == *id))
             .unwrap_or_else(|| {
                 if picker.selected >= picker.items.len() {
                     picker.items.len().saturating_sub(1)
@@ -5542,8 +5545,7 @@ impl TuiApp {
                 (1..=entries.len()).find_map(|offset| {
                     let idx = (start + offset) % entries.len();
                     let e = &entries[idx];
-                    if (e.needs_attention || e.dirty) && current.as_deref() != Some(e.id.as_str())
-                    {
+                    if (e.needs_attention || e.dirty) && current.as_deref() != Some(e.id.as_str()) {
                         Some(e.id.clone())
                     } else {
                         None
@@ -5631,9 +5633,9 @@ impl TuiApp {
                     thinking: None,
                     parts: Vec::new(),
                     tool_calls: Vec::new(),
-                            delivery: crate::prompt_queue::DeliveryState::Sent,
-            idempotency_key: None,
-        }],
+                    delivery: crate::prompt_queue::DeliveryState::Sent,
+                    idempotency_key: None,
+                }],
             });
         }
 
@@ -5718,9 +5720,9 @@ impl TuiApp {
                     thinking: None,
                     parts: Vec::new(),
                     tool_calls: Vec::new(),
-                            delivery: crate::prompt_queue::DeliveryState::Sent,
-            idempotency_key: None,
-        });
+                    delivery: crate::prompt_queue::DeliveryState::Sent,
+                    idempotency_key: None,
+                });
             }
         }
         self.state.session_picker_preview = Some(SessionPickerPreview {
@@ -5904,11 +5906,9 @@ impl TuiApp {
         // Local shell: `!cmd` or Shell mode — never send to the agent loop.
         let shell_cmd = if self.state.mode == AppMode::Shell {
             Some(text.trim().to_string())
-        } else if let Some(rest) = text.strip_prefix('!') {
-            // Bang in normal mode: "!ls" / "! ls"
-            Some(rest.trim_start().to_string())
         } else {
-            None
+            text.strip_prefix('!')
+                .map(|rest| rest.trim_start().to_string())
         };
         if let Some(cmd) = shell_cmd {
             if cmd.is_empty() {
@@ -5971,13 +5971,8 @@ impl TuiApp {
                 self.jobs.mcp.waiting_for_prompt = true;
                 self.enqueue_mcp_status_poll();
             }
-            self.jobs.spawn_prompt(
-                self.client.requester(),
-                sid.clone(),
-                text,
-                Vec::new(),
-                idem,
-            );
+            self.jobs
+                .spawn_prompt(self.client.requester(), sid.clone(), text, Vec::new(), idem);
             crate::draft_store::clear_draft(&sid);
         } else {
             self.state.status = SessionStatus::Idle;
@@ -6022,13 +6017,11 @@ impl TuiApp {
             return;
         };
         let idem = uuid::Uuid::new_v4().to_string();
-        if let Some(msg) = self
-            .state
-            .messages
-            .iter_mut()
-            .rev()
-            .find(|m| m.role == MessageRole::User && m.delivery == crate::prompt_queue::DeliveryState::Queued && m.content == item.text)
-        {
+        if let Some(msg) = self.state.messages.iter_mut().rev().find(|m| {
+            m.role == MessageRole::User
+                && m.delivery == crate::prompt_queue::DeliveryState::Queued
+                && m.content == item.text
+        }) {
             msg.delivery = crate::prompt_queue::DeliveryState::Sending;
             msg.idempotency_key = Some(idem.clone());
         } else {
@@ -6043,13 +6036,8 @@ impl TuiApp {
             });
         }
         self.state.status = SessionStatus::Thinking;
-        self.jobs.spawn_prompt(
-            self.client.requester(),
-            sid,
-            item.text,
-            item.images,
-            idem,
-        );
+        self.jobs
+            .spawn_prompt(self.client.requester(), sid, item.text, item.images, idem);
     }
 
     async fn handle_slash_command(&mut self, cmd: &str) -> anyhow::Result<()> {
@@ -6247,10 +6235,8 @@ impl TuiApp {
                                 err_n += 1;
                             }
                             if tc.output.is_none() {
-                                let secs = tc
-                                    .started_at
-                                    .map(|t| t.elapsed().as_secs())
-                                    .unwrap_or(0);
+                                let secs =
+                                    tc.started_at.map(|t| t.elapsed().as_secs()).unwrap_or(0);
                                 lines.push(format!(
                                     "running: {} ({secs}s){}",
                                     tc.name,
@@ -6763,7 +6749,7 @@ impl TuiApp {
                 args: args.map(str::to_string).filter(|s| !s.trim().is_empty()),
             }],
             tool_calls: Vec::new(),
-                    delivery: crate::prompt_queue::DeliveryState::Sent,
+            delivery: crate::prompt_queue::DeliveryState::Sent,
             idempotency_key: None,
         });
     }
@@ -6823,7 +6809,7 @@ impl TuiApp {
             thinking: None,
             parts: Vec::new(),
             tool_calls: Vec::new(),
-                    delivery: crate::prompt_queue::DeliveryState::Sent,
+            delivery: crate::prompt_queue::DeliveryState::Sent,
             idempotency_key: None,
         });
     }
@@ -7112,9 +7098,9 @@ impl TuiApp {
                             thinking: pending_thinking,
                             parts: Vec::new(),
                             tool_calls: Vec::new(),
-                                    delivery: crate::prompt_queue::DeliveryState::Sent,
-            idempotency_key: None,
-        };
+                            delivery: crate::prompt_queue::DeliveryState::Sent,
+                            idempotency_key: None,
+                        };
                         msg.append_assistant_text(&text);
                         self.state.messages.push(msg);
                     }
@@ -7339,9 +7325,9 @@ impl TuiApp {
                                         thinking: Some(t),
                                         parts: Vec::new(),
                                         tool_calls: Vec::new(),
-                                                delivery: crate::prompt_queue::DeliveryState::Sent,
-            idempotency_key: None,
-        });
+                                        delivery: crate::prompt_queue::DeliveryState::Sent,
+                                        idempotency_key: None,
+                                    });
                                 }
                             } else {
                                 self.state.messages.push(DisplayMessage {
@@ -7350,9 +7336,9 @@ impl TuiApp {
                                     thinking: Some(t),
                                     parts: Vec::new(),
                                     tool_calls: Vec::new(),
-                                            delivery: crate::prompt_queue::DeliveryState::Sent,
-            idempotency_key: None,
-        });
+                                    delivery: crate::prompt_queue::DeliveryState::Sent,
+                                    idempotency_key: None,
+                                });
                             }
                         }
                         self.state.collapse_completed_turn_tools();
@@ -7543,9 +7529,7 @@ impl TuiApp {
                                         tc.stopping = false;
                                         tc.is_error = true;
                                         tc.output = Some(
-                                            reason
-                                                .clone()
-                                                .unwrap_or_else(|| "cancelled".into()),
+                                            reason.clone().unwrap_or_else(|| "cancelled".into()),
                                         );
                                         tc.collapsed = false;
                                     }
@@ -7604,12 +7588,14 @@ fn recent_test_summary(messages: &[DisplayMessage]) -> Option<String> {
 
 fn parse_permission_mode_str(raw: &str) -> Option<PermissionMode> {
     let s = raw.trim().trim_matches('"');
-    s.parse().ok().or_else(|| match s.to_ascii_lowercase().as_str() {
-        "manual" => Some(PermissionMode::Manual),
-        "yolo" => Some(PermissionMode::Yolo),
-        "auto" => Some(PermissionMode::Auto),
-        _ => None,
-    })
+    s.parse()
+        .ok()
+        .or_else(|| match s.to_ascii_lowercase().as_str() {
+            "manual" => Some(PermissionMode::Manual),
+            "yolo" => Some(PermissionMode::Yolo),
+            "auto" => Some(PermissionMode::Auto),
+            _ => None,
+        })
 }
 
 /// Returns (input, output, cache_creation, cache_read) USD per 1M tokens, and whether fallback.
@@ -7790,9 +7776,9 @@ fn collapse_tools_in_turn(
                 thinking: None,
                 parts: vec![summary],
                 tool_calls: Vec::new(),
-                        delivery: crate::prompt_queue::DeliveryState::Sent,
-            idempotency_key: None,
-        },
+                delivery: crate::prompt_queue::DeliveryState::Sent,
+                idempotency_key: None,
+            },
         );
     }
 }
@@ -7925,9 +7911,9 @@ fn transcript_messages_to_display(msgs: &[serde_json::Value]) -> Vec<DisplayMess
                         thinking: None,
                         parts: Vec::new(),
                         tool_calls: Vec::new(),
-                                delivery: crate::prompt_queue::DeliveryState::Sent,
-            idempotency_key: None,
-        });
+                        delivery: crate::prompt_queue::DeliveryState::Sent,
+                        idempotency_key: None,
+                    });
                 }
             }
             "assistant" => {
@@ -7992,9 +7978,9 @@ fn transcript_messages_to_display(msgs: &[serde_json::Value]) -> Vec<DisplayMess
                         thinking,
                         parts,
                         tool_calls: Vec::new(),
-                                delivery: crate::prompt_queue::DeliveryState::Sent,
-            idempotency_key: None,
-        });
+                        delivery: crate::prompt_queue::DeliveryState::Sent,
+                        idempotency_key: None,
+                    });
                 }
             }
             "system" => {
@@ -8016,9 +8002,9 @@ fn transcript_messages_to_display(msgs: &[serde_json::Value]) -> Vec<DisplayMess
                         thinking: None,
                         parts: Vec::new(),
                         tool_calls: Vec::new(),
-                                delivery: crate::prompt_queue::DeliveryState::Sent,
-            idempotency_key: None,
-        });
+                        delivery: crate::prompt_queue::DeliveryState::Sent,
+                        idempotency_key: None,
+                    });
                 }
             }
             _ => {}
@@ -8120,9 +8106,7 @@ fn paste_clipboard_into_workspace(root: &std::path::Path) -> anyhow::Result<Opti
         anyhow::anyhow!("clipboard does not contain a supported image: {error}")
     })?;
     image.save_with_format(&path, image::ImageFormat::Png)?;
-    Ok(Some(
-        path.strip_prefix(root).unwrap_or(&path).to_path_buf(),
-    ))
+    Ok(Some(path.strip_prefix(root).unwrap_or(&path).to_path_buf()))
 }
 
 fn read_clipboard_png(path: &std::path::Path) -> anyhow::Result<Option<Vec<u8>>> {
@@ -8277,7 +8261,7 @@ mod app_state_tests {
             thinking: None,
             parts: Vec::new(),
             tool_calls: Vec::new(),
-                    delivery: crate::prompt_queue::DeliveryState::Sent,
+            delivery: crate::prompt_queue::DeliveryState::Sent,
             idempotency_key: None,
         }]));
         assert!(session_has_retained_io(&[DisplayMessage {
@@ -8286,7 +8270,7 @@ mod app_state_tests {
             thinking: None,
             parts: Vec::new(),
             tool_calls: Vec::new(),
-                    delivery: crate::prompt_queue::DeliveryState::Sent,
+            delivery: crate::prompt_queue::DeliveryState::Sent,
             idempotency_key: None,
         }]));
         assert!(!session_has_retained_io(&[DisplayMessage {
@@ -8295,7 +8279,7 @@ mod app_state_tests {
             thinking: None,
             parts: Vec::new(),
             tool_calls: Vec::new(),
-                    delivery: crate::prompt_queue::DeliveryState::Sent,
+            delivery: crate::prompt_queue::DeliveryState::Sent,
             idempotency_key: None,
         }]));
     }
@@ -8313,7 +8297,7 @@ mod app_state_tests {
             thinking: None,
             parts: Vec::new(),
             tool_calls: Vec::new(),
-                    delivery: crate::prompt_queue::DeliveryState::Sent,
+            delivery: crate::prompt_queue::DeliveryState::Sent,
             idempotency_key: None,
         });
         let mut asst = DisplayMessage {
@@ -8322,13 +8306,13 @@ mod app_state_tests {
             thinking: None,
             parts: Vec::new(),
             tool_calls: Vec::new(),
-                    delivery: crate::prompt_queue::DeliveryState::Sent,
+            delivery: crate::prompt_queue::DeliveryState::Sent,
             idempotency_key: None,
         };
         asst.parts.push(DisplayPart::Tool(DisplayToolCall {
-                            id: String::new(),
-                            started_at: None,
-                            stopping: false,
+            id: String::new(),
+            started_at: None,
+            stopping: false,
             name: "Read".into(),
             input_summary: "a.rs".into(),
             output: Some("ok".into()),
@@ -8336,9 +8320,9 @@ mod app_state_tests {
             collapsed: true,
         }));
         asst.parts.push(DisplayPart::Tool(DisplayToolCall {
-                            id: String::new(),
-                            started_at: None,
-                            stopping: false,
+            id: String::new(),
+            started_at: None,
+            stopping: false,
             name: "Bash".into(),
             input_summary: "ls".into(),
             output: Some("x".into()),

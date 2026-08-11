@@ -99,9 +99,7 @@ pub fn validate_overrides(map: &HashMap<String, String>) -> Result<(), String> {
             && action != "submit"
             && action != "escape"
         {
-            return Err(format!(
-                "chord {c} is reserved for interrupt/submit/escape"
-            ));
+            return Err(format!("chord {c} is reserved for interrupt/submit/escape"));
         }
     }
     Ok(())

@@ -262,9 +262,9 @@ mod tests {
     #[test]
     fn chip_uses_available_width() {
         let tc = DisplayToolCall {
-                            id: String::new(),
-                            started_at: None,
-                            stopping: false,
+            id: String::new(),
+            started_at: None,
+            stopping: false,
             name: "Bash".into(),
             input_summary: "x".repeat(200),
             output: None,

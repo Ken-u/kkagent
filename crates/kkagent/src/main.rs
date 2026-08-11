@@ -250,11 +250,7 @@ async fn main() -> Result<()> {
         Some(Commands::Config { command }) => {
             return run_config(command, cli.config.as_deref());
         }
-        Some(Commands::Doctor {
-            json,
-            live,
-            bundle,
-        }) => {
+        Some(Commands::Doctor { json, live, bundle }) => {
             if *bundle {
                 return print_doctor_bundle(cli.config.as_deref());
             }
@@ -351,7 +347,12 @@ async fn main() -> Result<()> {
             server.serve_stdio().await
         }
         Some(Commands::Auth { .. }) => unreachable!("auth handled before config startup"),
-        Some(Commands::Init { .. } | Commands::Config { .. } | Commands::Doctor { .. } | Commands::Completions { .. }) => {
+        Some(
+            Commands::Init { .. }
+            | Commands::Config { .. }
+            | Commands::Doctor { .. }
+            | Commands::Completions { .. },
+        ) => {
             unreachable!("setup commands handled before runtime startup")
         }
         None => {
@@ -451,12 +452,19 @@ fn print_doctor_bundle(configured_path: Option<&std::path::Path>) -> Result<()> 
     println!("kkagent doctor --bundle (inventory only; nothing collected yet)");
     println!("Would include:");
     println!("  - version: {}", env!("CARGO_PKG_VERSION"));
-    println!("  - platform: {} {}", std::env::consts::OS, std::env::consts::ARCH);
+    println!(
+        "  - platform: {} {}",
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    );
     println!("  - config path: {}", path.display());
     println!("  - config dir: {}", dir.display());
     println!("  - desensitized config summary (no api keys)");
     println!("  - doctor health checks");
-    println!("  - truncated recent logs (if present under {})", dir.join("logs").display());
+    println!(
+        "  - truncated recent logs (if present under {})",
+        dir.join("logs").display()
+    );
     println!("Would NOT include: transcripts, file contents, secrets, Wiki results");
     println!("Re-run with confirmation in a future release to write a zip; this inventory is cancel-safe.");
     Ok(())
@@ -679,7 +687,7 @@ async fn provision_managed_kimi_config(
                     .and_then(|value| value.get("default_effort"))
                     .and_then(|value| value.as_str())
                     .map(str::to_string),
-                            pricing: None,
+                pricing: None,
             },
         );
     }
@@ -3360,8 +3368,7 @@ async fn handle_rpc_call(
                 .and_then(|p| p.get("message_limit"))
                 .and_then(|v| v.as_u64())
                 .map(|n| {
-                    usize::try_from(n)
-                        .map_err(|_| (-32602, "message_limit is too large".into()))
+                    usize::try_from(n).map_err(|_| (-32602, "message_limit is too large".into()))
                 })
                 .transpose()?;
             if turn_index.is_some() && message_limit.is_some() {

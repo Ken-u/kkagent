@@ -22,7 +22,10 @@ fn session_status_mark(entry: &WorkspaceSessionEntry) -> &'static str {
         return "*";
     }
     match entry.status {
-        SessionStatus::Thinking | SessionStatus::ToolExecuting | SessionStatus::Compacting | SessionStatus::Cancelling => "…",
+        SessionStatus::Thinking
+        | SessionStatus::ToolExecuting
+        | SessionStatus::Compacting
+        | SessionStatus::Cancelling => "…",
         SessionStatus::WaitingApproval | SessionStatus::WaitingQuestion => "?",
         SessionStatus::Idle => "",
     }
@@ -159,10 +162,8 @@ impl WorkspaceSessionStrip {
             self.set_entries(incoming, active_id);
             return;
         }
-        let mut by_id: std::collections::HashMap<String, WorkspaceSessionEntry> = incoming
-            .drain(..)
-            .map(|e| (e.id.clone(), e))
-            .collect();
+        let mut by_id: std::collections::HashMap<String, WorkspaceSessionEntry> =
+            incoming.drain(..).map(|e| (e.id.clone(), e)).collect();
         let mut ordered = Vec::with_capacity(by_id.len());
         for prev in &self.entries {
             if let Some(e) = by_id.remove(&prev.id) {
@@ -234,10 +235,8 @@ impl WorkspaceSessionStrip {
             })
             .collect();
 
-        let label_pairs: Vec<(bool, String)> = labels
-            .iter()
-            .map(|(a, l, _)| (*a, l.clone()))
-            .collect();
+        let label_pairs: Vec<(bool, String)> =
+            labels.iter().map(|(a, l, _)| (*a, l.clone())).collect();
         let (start, end, left_overflow, right_overflow) =
             visible_window(&label_pairs, self.active, max_cols);
 

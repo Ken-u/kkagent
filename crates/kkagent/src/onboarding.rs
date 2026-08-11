@@ -95,8 +95,8 @@ pub fn run_init(
             display_name: None,
             support_efforts: Vec::new(),
             default_effort: None,
-                        pricing: None,
-            },
+            pricing: None,
+        },
     );
     apply_preset(&mut config, preset)?;
     config.validate()?;
@@ -184,7 +184,10 @@ pub fn run_config(command: &ConfigCommands, configured_path: Option<&Path>) -> R
                     "transcripts.repair-{}.db",
                     chrono::Utc::now().format("%Y%m%d%H%M%S")
                 ));
-                println!("Backing up then quarantining corrupt rows → {}", bak.display());
+                println!(
+                    "Backing up then quarantining corrupt rows → {}",
+                    bak.display()
+                );
                 db.repair_with_backup(&bak)?
             } else {
                 db.check_integrity()?

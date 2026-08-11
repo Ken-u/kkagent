@@ -21,17 +21,11 @@ impl ContextBreakdown {
     }
 
     pub fn remaining(&self, max_context: u64) -> i64 {
-        max_context as i64
-            - self.total_used() as i64
-            - self.reserved_output as i64
+        max_context as i64 - self.total_used() as i64 - self.reserved_output as i64
     }
 
     /// Character-based estimate (~4 chars/token). Marks unknown as estimated.
-    pub fn estimate(
-        system_prompt: &str,
-        messages: &[ChatMessage],
-        reserved_output: u64,
-    ) -> Self {
+    pub fn estimate(system_prompt: &str, messages: &[ChatMessage], reserved_output: u64) -> Self {
         let mut out = Self {
             system: estimate_tokens(system_prompt),
             reserved_output,
@@ -64,7 +58,7 @@ impl ContextBreakdown {
 }
 
 fn estimate_tokens(text: &str) -> u64 {
-    ((text.chars().count() as u64) + 3) / 4
+    (text.chars().count() as u64).div_ceil(4)
 }
 
 #[cfg(test)]

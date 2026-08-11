@@ -1266,7 +1266,13 @@ fn cursor_position(text: &str, cursor: usize, content_width: usize, prefix_w: u1
     (prefix_w, y.saturating_sub(1))
 }
 
-fn render_footer(f: &mut Frame, area: Rect, state: &mut AppState, config: &AppConfig, theme: &Theme) {
+fn render_footer(
+    f: &mut Frame,
+    area: Rect,
+    state: &mut AppState,
+    config: &AppConfig,
+    theme: &Theme,
+) {
     // Line 1: yolo  model  thinking  cwd  git ............ tip
     let mut left: Vec<Span> = Vec::new();
 
@@ -2393,7 +2399,11 @@ fn render_question_panel(f: &mut Frame, area: Rect, question: &mut PendingQuesti
         };
         let marker = if selected { "> " } else { "  " };
         let boxc = if question.allow_multiple {
-            if checked { "[x]" } else { "[ ]" }
+            if checked {
+                "[x]"
+            } else {
+                "[ ]"
+            }
         } else if checked || selected {
             "(•)"
         } else {
@@ -2569,7 +2579,10 @@ mod render_smoke {
         let parts = wrap_str(s, 4);
         assert!(!parts.is_empty());
         assert_eq!(truncate_display_width(s, 5), "你好…");
-        assert_eq!(UnicodeWidthStr::width(truncate_display_width(s, 5).as_str()), 5);
+        assert_eq!(
+            UnicodeWidthStr::width(truncate_display_width(s, 5).as_str()),
+            5
+        );
     }
 
     #[test]

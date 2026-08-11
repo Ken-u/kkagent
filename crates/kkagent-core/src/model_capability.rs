@@ -65,8 +65,8 @@ mod tests {
             display_name: None,
             support_efforts: vec![],
             default_effort: None,
-                        pricing: None,
-            };
+            pricing: None,
+        };
         let c = ModelCapability::from_model(&m);
         assert!(c.vision);
         assert!(c.thinking);
@@ -85,8 +85,8 @@ mod tests {
             display_name: None,
             support_efforts: vec![],
             default_effort: None,
-                        pricing: None,
-            };
+            pricing: None,
+        };
         let c = ModelCapability::from_model(&m);
         assert!(c.vision);
         assert!(c.video);

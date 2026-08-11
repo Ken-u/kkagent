@@ -483,8 +483,9 @@ impl AsyncJobHub {
                 retry_params: None,
             },
         );
-        self.notices
-            .retain(|n| n.channel != Some(JobChannel::LocalShell) || !matches!(n.kind, NoticeKind::Error));
+        self.notices.retain(|n| {
+            n.channel != Some(JobChannel::LocalShell) || !matches!(n.kind, NoticeKind::Error)
+        });
         let tx = self.tx.clone();
         let cmd = command.clone();
         tokio::spawn(async move {

@@ -623,7 +623,7 @@ mod tests {
                 display_name: None,
                 support_efforts: Vec::new(),
                 default_effort: None,
-                            pricing: None,
+                pricing: None,
             },
         );
         config

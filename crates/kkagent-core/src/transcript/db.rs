@@ -463,14 +463,14 @@ impl TranscriptDb {
     pub fn check_integrity(&self) -> anyhow::Result<IntegrityReport> {
         let conn = self.lock()?;
         let mut report = IntegrityReport::default();
-        let mut stmt = conn.prepare(
-            "SELECT session_id FROM sessions",
-        )?;
+        let mut stmt = conn.prepare("SELECT session_id FROM sessions")?;
         let sessions = stmt.query_map([], |row| row.get::<_, String>(0))?;
         for s in sessions {
             match s {
                 Ok(id) => report.ok_sessions.push(id),
-                Err(e) => report.bad_sessions.push(format!("unreadable session row: {e}")),
+                Err(e) => report
+                    .bad_sessions
+                    .push(format!("unreadable session row: {e}")),
             }
         }
         let mut msg_stmt =
@@ -504,7 +504,9 @@ impl TranscriptDb {
                         report.ok_messages += 1;
                     }
                 }
-                Err(e) => report.bad_sessions.push(format!("unreadable message row: {e}")),
+                Err(e) => report
+                    .bad_sessions
+                    .push(format!("unreadable message row: {e}")),
             }
         }
         Ok(report)
@@ -516,7 +518,7 @@ impl TranscriptDb {
             let conn = self.lock()?;
             // rusqlite Path::new for file DBs; memory DBs get a marker file.
             if let Some(path) = conn.path() {
-                if path != "" && path != ":memory:" {
+                if !path.is_empty() && path != ":memory:" {
                     let _ = std::fs::copy(path, backup_path);
                 } else {
                     std::fs::write(backup_path, b"memory-db-no-file-backup")?;

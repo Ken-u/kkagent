@@ -25,8 +25,7 @@ pub fn preview_migration(config_path: &Path) -> Result<MigrationPreview> {
             unknown_fields_preserved: true,
         });
     }
-    let raw = std::fs::read_to_string(&path)
-        .with_context(|| format!("read {}", path.display()))?;
+    let raw = std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
     // Round-trip through typed config; unknown keys are dropped by toml+serde,
     // so we warn and prefer patch-style writes elsewhere.
     let parsed: Result<crate::AppConfig, _> = toml::from_str(&raw);
@@ -39,7 +38,9 @@ pub fn preview_migration(config_path: &Path) -> Result<MigrationPreview> {
                 );
             }
             if !raw.contains("[ui]") {
-                changes.push("optional: add [ui] for high_contrast / keybindings / check_updates".into());
+                changes.push(
+                    "optional: add [ui] for high_contrast / keybindings / check_updates".into(),
+                );
             }
             if changes.is_empty() {
                 changes.push("no schema migrations required".into());
@@ -59,8 +60,7 @@ pub fn preview_migration(config_path: &Path) -> Result<MigrationPreview> {
 pub fn atomic_write_with_backup(path: &Path, contents: &str) -> Result<PathBuf> {
     let backup = path.with_extension("toml.bak");
     if path.exists() {
-        std::fs::copy(path, &backup)
-            .with_context(|| format!("backup {}", path.display()))?;
+        std::fs::copy(path, &backup).with_context(|| format!("backup {}", path.display()))?;
     }
     let tmp = path.with_extension("toml.tmp");
     std::fs::write(&tmp, contents)?;
