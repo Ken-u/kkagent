@@ -3,6 +3,13 @@ use serde_json::{json, Value};
 
 use crate::{Tool, ToolContext, ToolOutput};
 
+pub fn entered_plan_mode_message(plan_path: &std::path::Path) -> String {
+    format!(
+        "Plan mode is now active. Your workflow:\n\nPlan file: {}\n\n1. Use read-only tools (Read, Grep, Glob) to investigate the codebase. Use Bash only when needed.\n2. Design a concrete, step-by-step plan.\n3. Write the plan to the plan file with Write or Edit. The first line MUST be `# <plan name>`; the host finalizes the filename as `YYYY-MM-DD_<plan-name>.md`.\n4. When the plan is ready, call ExitPlanMode for user approval.\n\nDo NOT edit files other than the plan file while plan mode is active.\nUse Bash only when needed; Bash follows the normal permission mode and rules.",
+        plan_path.display()
+    )
+}
+
 /// Signal that the agent should leave plan mode after writing a complete plan.
 pub struct ExitPlanModeTool;
 
@@ -70,11 +77,11 @@ impl Tool for ExitPlanModeTool {
     async fn execute(&self, input: Value, ctx: &ToolContext) -> anyhow::Result<ToolOutput> {
         // Interactive review is handled in the agent loop. This path runs for
         // auto-mode (or allow rules): exit and format the plan from disk.
-        let plan_path = ctx
-            .working_dir
-            .join(".kkagent")
-            .join("plans")
-            .join(format!("{}.md", ctx.session_id));
+        let Some(plan_path) = ctx.plan_file_path.as_ref() else {
+            return Ok(ToolOutput::error(
+                "No plan file path is available in this host. Wait for the host to provide one before calling ExitPlanMode.",
+            ));
+        };
         let plan = tokio::fs::read_to_string(&plan_path)
             .await
             .unwrap_or_default();
@@ -121,9 +128,12 @@ impl Tool for EnterPlanModeTool {
         true
     }
 
-    async fn execute(&self, _input: Value, _ctx: &ToolContext) -> anyhow::Result<ToolOutput> {
-        Ok(ToolOutput::success(
-            "Entered plan mode. Explore with read-only tools, write the plan file, then call ExitPlanMode when ready for user approval (执行 / 修改意见 / 拒绝).",
-        ))
+    async fn execute(&self, _input: Value, ctx: &ToolContext) -> anyhow::Result<ToolOutput> {
+        let Some(plan_path) = ctx.plan_file_path.as_ref() else {
+            return Ok(ToolOutput::success(
+                "Plan mode is now active. Wait for the host to provide a plan file path before calling ExitPlanMode.",
+            ));
+        };
+        Ok(ToolOutput::success(entered_plan_mode_message(plan_path)))
     }
 }

@@ -1094,6 +1094,7 @@ Do not mention this reminder to the user.\n</system-reminder>"
                     let input = input.clone();
                     let tool_call_id = tool_call_id.clone();
                     let interrupted = session.interrupted.clone();
+                    let plan_file_path = session.plan_file_path.clone();
                     let image = self.config.image.clone();
                     tasks.push(ToolCallTask {
                         accesses,
@@ -1118,6 +1119,7 @@ Do not mention this reminder to the user.\n</system-reminder>"
                                     input,
                                     tool_call_id: Some(tool_call_id),
                                     interrupted,
+                                    plan_file_path,
                                 })
                                 .await
                             }
@@ -1148,7 +1150,7 @@ Do not mention this reminder to the user.\n</system-reminder>"
             }
 
             let mut tool_results = Vec::new();
-            for (id, name, output) in resolved {
+            for (id, name, mut output) in resolved {
                 // ExitPlanMode / EnterPlanMode flip plan_mode inside their helpers /
                 // execute paths; mirror to the TUI here.
                 if name == "ExitPlanMode" {
@@ -1161,14 +1163,25 @@ Do not mention this reminder to the user.\n</system-reminder>"
                         .await;
                 }
                 if name == "EnterPlanMode" && !output.is_error {
-                    session.plan_mode = true;
-                    let _ = self
-                        .event_tx
-                        .send(AgentEvent::PlanModeChanged {
-                            session_id: session_id.clone(),
-                            enabled: true,
-                        })
-                        .await;
+                    match session.set_plan_mode_persisted(true) {
+                        Ok(()) => {
+                            output.content =
+                                kkagent_tools::builtin::plan::entered_plan_mode_message(
+                                    &session.plan_file_path,
+                                );
+                            let _ = self
+                                .event_tx
+                                .send(AgentEvent::PlanModeChanged {
+                                    session_id: session_id.clone(),
+                                    enabled: true,
+                                })
+                                .await;
+                        }
+                        Err(error) => {
+                            output =
+                                ToolOutput::error(format!("Failed to persist plan mode: {error}"));
+                        }
+                    }
                 }
                 if name == "SelectTools" && !output.is_error {
                     if let Some(data) = &output.data {
@@ -1639,6 +1652,10 @@ Do not mention this reminder to the user.\n</system-reminder>"
                 "No plan file found. Write your plan to {path} first, then call ExitPlanMode."
             ));
         }
+        if let Err(error) = session.finalize_plan_filename(&plan) {
+            return ToolOutput::error(error.to_string());
+        }
+        let path = session.plan_file_path.display().to_string();
         let _ = self
             .event_tx
             .send(AgentEvent::PlanFileUpdated {
@@ -1648,7 +1665,9 @@ Do not mention this reminder to the user.\n</system-reminder>"
             })
             .await;
         let _ = input;
-        session.plan_mode = false;
+        if let Err(error) = session.set_plan_mode_persisted(false) {
+            return ToolOutput::error(format!("Failed to persist plan mode: {error}"));
+        }
         ToolOutput::success(format_auto_approved_plan(&plan, &path))
     }
 
@@ -1672,6 +1691,10 @@ Do not mention this reminder to the user.\n</system-reminder>"
                 "No plan file found. Write your plan to {path} first, then call ExitPlanMode."
             )));
         }
+        if let Err(error) = session.finalize_plan_filename(&plan) {
+            return Ok(ToolOutput::error(error.to_string()));
+        }
+        let path = session.plan_file_path.display().to_string();
 
         let display = PlanReviewDisplay::from_tool_input(&tc.input, plan.clone(), path.clone());
         let _ = self
@@ -1731,6 +1754,13 @@ Do not mention this reminder to the user.\n</system-reminder>"
                 selected_label: Some(crate::plan_review::LABEL_REVISE.into()),
             },
         };
+        let _ = self
+            .event_tx
+            .send(AgentEvent::StatusUpdate {
+                session_id: session_id.to_string(),
+                status: SessionStatus::Thinking,
+            })
+            .await;
 
         if response.decision == kkagent_protocol::ApprovalDecision::Cancelled {
             return Ok(ToolOutput::success(
@@ -1740,7 +1770,7 @@ Do not mention this reminder to the user.\n</system-reminder>"
 
         let (output, exit) = resolve_exit_plan_approval(&response, &display);
         if exit {
-            session.plan_mode = false;
+            session.set_plan_mode_persisted(false)?;
         }
         Ok(output)
     }
@@ -1775,6 +1805,7 @@ Do not mention this reminder to the user.\n</system-reminder>"
             input: input.clone(),
             tool_call_id: None,
             interrupted: session.interrupted.clone(),
+            plan_file_path: session.plan_file_path.clone(),
         })
         .await
     }
@@ -2148,6 +2179,7 @@ struct ParallelToolRequest {
     input: serde_json::Value,
     tool_call_id: Option<String>,
     interrupted: Arc<std::sync::atomic::AtomicBool>,
+    plan_file_path: std::path::PathBuf,
 }
 
 async fn execute_tool_parallel(request: ParallelToolRequest) -> ToolOutput {
@@ -2162,6 +2194,7 @@ async fn execute_tool_parallel(request: ParallelToolRequest) -> ToolOutput {
         input,
         tool_call_id,
         interrupted,
+        plan_file_path,
     } = request;
     if !tool_allowed_set(enabled_tools.as_ref(), &name) {
         return ToolOutput::error(format!(
@@ -2215,6 +2248,7 @@ async fn execute_tool_parallel(request: ParallelToolRequest) -> ToolOutput {
     let ctx = ToolContext {
         working_dir,
         session_id,
+        plan_file_path: Some(plan_file_path),
         image,
         tool_call_id,
         interrupted: Some(interrupted),

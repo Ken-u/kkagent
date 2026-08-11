@@ -61,7 +61,10 @@ pub use metadata::{
 };
 pub use process::{ProcessHandle, ProcessStatus, SessionProcessRunner};
 pub use profile_catalog::{AgentProfileSummary, SessionAgentProfileCatalog};
-pub use runtime::{messages_for_llm, plan_mode_reminder, FileChange, Session, TurnCheckpoint};
+pub use runtime::{
+    load_persisted_plan_state, messages_for_llm, plan_mode_reminder, FileChange, Session,
+    SessionPlanState, TurnCheckpoint,
+};
 pub use seed::SessionSeed;
 pub use services::SessionServices;
 pub use session_tool_policy::{

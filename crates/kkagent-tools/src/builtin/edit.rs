@@ -163,6 +163,7 @@ mod tests {
         let context = ToolContext {
             working_dir: dir.clone(),
             session_id: "edit-test".into(),
+            plan_file_path: None,
             image: kkagent_config::ImageConfig::default(),
             tool_call_id: None,
             interrupted: None,

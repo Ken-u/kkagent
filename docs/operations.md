@@ -15,7 +15,7 @@
 | `~/.kkagent/skills/`、`plugins/`、`hooks.json` | 用户扩展。 |
 | `~/.kkagent/telemetry/events.jsonl` | 本地遥测事件。 |
 | `~/.kkagent/http-audit.jsonl` | HTTP 请求审计日志，不记录原始 token。 |
-| `<workspace>/.kkagent/plans/` | Session 计划。 |
+| `~/.kkagent/sessions/<workDirKey>/<sessionId>/agents/main/plans/` | Session 计划，文件名为 `YYYY-MM-DD_<plan-name>.md`。 |
 | `<workspace>/.kkagent/tool-results/` | 被外置保存的超大工具结果。 |
 
 ## 日志

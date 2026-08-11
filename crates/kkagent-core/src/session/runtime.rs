@@ -8,7 +8,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::session::instructions::SessionInstructionsProvider;
 use crate::session::lifecycle::SessionCreateSource;
-use crate::session::metadata::TurnReason;
+use crate::session::metadata::{SessionMeta, SessionMetaPatch, TurnReason};
 use crate::session::services::SessionServices;
 use crate::session::store::{encode_work_dir_key, SessionStore};
 
@@ -27,6 +27,17 @@ pub struct TurnCheckpoint {
     pub file_changes: Vec<FileChange>,
 }
 
+const PLAN_MODE_META_KEY: &str = "planMode";
+const PLAN_ID_META_KEY: &str = "planId";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionPlanState {
+    pub enabled: bool,
+    pub id: String,
+    pub path: PathBuf,
+    pub content: Option<String>,
+}
+
 pub struct Session {
     pub id: String,
     pub title: Option<String>,
@@ -37,6 +48,8 @@ pub struct Session {
     /// Shared Arc so `/permission` can update mid-turn while the session is out of the map.
     pub permission_mode: Arc<std::sync::Mutex<PermissionMode>>,
     pub plan_mode: bool,
+    /// Readable id used as the plan filename (`<id>.md`).
+    pub plan_id: String,
     /// Only this file may be written/edited while plan_mode is on.
     pub plan_file_path: PathBuf,
     /// Model alias from config (e.g. "local/claude-opus-4-8").
@@ -126,13 +139,8 @@ impl Session {
     ) -> Self {
         let (approval_tx, approval_rx) = mpsc::channel(16);
         let (question_tx, question_rx) = mpsc::channel(16);
-        let plan_file_path = working_dir
-            .join(".kkagent")
-            .join("plans")
-            .join(format!("{}.md", id));
-
         let (session_dir, workspace_id) = resolve_session_dir(&id, &working_dir, source);
-        let services = SessionServices::bootstrap(
+        let mut services = SessionServices::bootstrap(
             &id,
             working_dir.clone(),
             session_dir,
@@ -158,6 +166,35 @@ impl Session {
         });
 
         let title = services.metadata.read().title.clone();
+        let plan_state = plan_state_from_metadata(
+            &id,
+            &working_dir,
+            &services.context.session_dir,
+            Some(services.metadata.read()),
+            true,
+        );
+        if services
+            .metadata
+            .read()
+            .custom
+            .get(PLAN_ID_META_KEY)
+            .and_then(|value| value.as_str())
+            .and_then(valid_plan_id)
+            .is_none()
+            && (plan_state.enabled || plan_state.content.is_some())
+        {
+            let mut custom = services.metadata.read().custom.clone();
+            custom.insert(PLAN_ID_META_KEY.into(), plan_state.id.clone().into());
+            if let Err(error) = services.metadata.update(
+                SessionMetaPatch {
+                    custom: Some(custom),
+                    ..Default::default()
+                },
+                false,
+            ) {
+                tracing::warn!(%error, "failed to persist restored plan id");
+            }
+        }
 
         Self {
             id,
@@ -167,8 +204,9 @@ impl Session {
             working_dir,
             image_config: kkagent_config::ImageConfig::default(),
             permission_mode: Arc::new(std::sync::Mutex::new(permission_mode)),
-            plan_mode: false,
-            plan_file_path,
+            plan_mode: plan_state.enabled,
+            plan_id: plan_state.id,
+            plan_file_path: plan_state.path,
             model_alias: Arc::new(std::sync::Mutex::new(model_alias)),
             persisted_message_count: 0,
             transcript_rewrite_required: false,
@@ -205,6 +243,92 @@ impl Session {
         let title = title.into();
         self.title = Some(title.clone());
         self.services.metadata.set_title(title)
+    }
+
+    /// Change plan mode and persist the state before reporting it to clients.
+    pub fn set_plan_mode_persisted(&mut self, enabled: bool) -> anyhow::Result<()> {
+        if enabled && !self.plan_mode {
+            let plans_dir = self
+                .services
+                .context
+                .session_dir
+                .join("agents")
+                .join("main")
+                .join("plans");
+            self.plan_id = crate::plan_filename::generate_plan_id(&plans_dir, "plan");
+            self.plan_file_path = plans_dir.join(format!("{}.md", self.plan_id));
+        }
+        if enabled {
+            if let Some(parent) = self.plan_file_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+        let mut custom = self.services.metadata.read().custom.clone();
+        custom.insert(PLAN_MODE_META_KEY.into(), enabled.into());
+        custom.insert(PLAN_ID_META_KEY.into(), self.plan_id.clone().into());
+        self.services.metadata.update(
+            SessionMetaPatch {
+                custom: Some(custom),
+                ..Default::default()
+            },
+            true,
+        )?;
+        self.plan_mode = enabled;
+        Ok(())
+    }
+
+    /// Finalize `YYYY-MM-DD_<plan-name>.md` from the Markdown H1 written by
+    /// the agent. The plan stays in the same session-scoped plans directory.
+    pub fn finalize_plan_filename(&mut self, content: &str) -> anyhow::Result<()> {
+        let title = crate::plan_filename::markdown_plan_title(content)?;
+        let Some(plans_dir) = self.plan_file_path.parent().map(PathBuf::from) else {
+            anyhow::bail!("plan file has no parent directory");
+        };
+        let base_id = crate::plan_filename::plan_id_base(title);
+        let next_id = if crate::plan_filename::plan_id_matches_base(&self.plan_id, &base_id) {
+            self.plan_id.clone()
+        } else if plans_dir.join(format!("{base_id}.md")).exists() {
+            crate::plan_filename::generate_plan_id(&plans_dir, title)
+        } else {
+            base_id
+        };
+        if next_id == self.plan_id {
+            return Ok(());
+        }
+
+        let previous_id = self.plan_id.clone();
+        let previous_path = self.plan_file_path.clone();
+        let next_path = plans_dir.join(format!("{next_id}.md"));
+        std::fs::rename(&previous_path, &next_path)?;
+        self.plan_id = next_id;
+        self.plan_file_path = next_path.clone();
+
+        let mut custom = self.services.metadata.read().custom.clone();
+        custom.insert(PLAN_ID_META_KEY.into(), self.plan_id.clone().into());
+        if let Err(error) = self.services.metadata.update(
+            SessionMetaPatch {
+                custom: Some(custom),
+                ..Default::default()
+            },
+            true,
+        ) {
+            if let Err(rollback_error) = std::fs::rename(&next_path, &previous_path) {
+                tracing::error!(%rollback_error, "failed to roll back plan filename");
+            }
+            self.plan_id = previous_id;
+            self.plan_file_path = previous_path;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub fn plan_state(&self) -> SessionPlanState {
+        SessionPlanState {
+            enabled: self.plan_mode,
+            id: self.plan_id.clone(),
+            path: self.plan_file_path.clone(),
+            content: read_nonempty_plan(&self.plan_file_path),
+        }
     }
 
     pub fn note_turn_started(&mut self) {
@@ -574,6 +698,108 @@ For files inside this project root, prefer paths relative to the working directo
     )
 }
 
+fn valid_plan_id(value: &str) -> Option<&str> {
+    if value.is_empty()
+        || value.len() > 120
+        || !value
+            .chars()
+            .all(|ch| ch.is_alphanumeric() || matches!(ch, '-' | '_'))
+    {
+        return None;
+    }
+    Some(value)
+}
+
+fn plan_state_from_metadata(
+    session_id: &str,
+    working_dir: &std::path::Path,
+    session_dir: &std::path::Path,
+    metadata: Option<&SessionMeta>,
+    migrate_legacy: bool,
+) -> SessionPlanState {
+    let plans_dir = session_dir.join("agents").join("main").join("plans");
+    let legacy = working_dir
+        .join(".kkagent")
+        .join("plans")
+        .join(format!("{session_id}.md"));
+    let id = metadata
+        .and_then(|meta| meta.custom.get(PLAN_ID_META_KEY))
+        .and_then(|value| value.as_str())
+        .and_then(valid_plan_id)
+        .map(str::to_string)
+        .or_else(|| {
+            legacy.is_file().then(|| {
+                valid_plan_id(session_id)
+                    .unwrap_or("legacy-plan")
+                    .to_string()
+            })
+        })
+        .unwrap_or_else(|| crate::plan_filename::generate_plan_id(&plans_dir, "plan"));
+    let path = plans_dir.join(format!("{id}.md"));
+
+    if migrate_legacy && !path.exists() && legacy.is_file() {
+        let migration = path
+            .parent()
+            .map(std::fs::create_dir_all)
+            .transpose()
+            .and_then(|_| std::fs::copy(&legacy, &path).map(|_| ()));
+        match migration {
+            Ok(()) => tracing::info!(
+                from = %legacy.display(),
+                to = %path.display(),
+                "migrated legacy plan file"
+            ),
+            Err(error) => tracing::warn!(
+                from = %legacy.display(),
+                to = %path.display(),
+                %error,
+                "failed to migrate legacy plan file"
+            ),
+        }
+    }
+
+    SessionPlanState {
+        enabled: metadata
+            .and_then(|meta| meta.custom.get(PLAN_MODE_META_KEY))
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false),
+        id,
+        content: read_nonempty_plan(&path),
+        path,
+    }
+}
+
+fn read_nonempty_plan(path: &std::path::Path) -> Option<String> {
+    std::fs::read_to_string(path)
+        .ok()
+        .filter(|content| !content.trim().is_empty())
+}
+
+/// Read plan state without constructing a second live `Session`. This is used
+/// while an active session has temporarily moved into the agent loop.
+pub fn load_persisted_plan_state(
+    session_id: &str,
+    working_dir: &std::path::Path,
+) -> SessionPlanState {
+    let store = SessionStore::open_default();
+    let session_dir = store
+        .get(session_id)
+        .ok()
+        .map(|summary| PathBuf::from(summary.session_dir))
+        .or_else(|| store.session_dir_for(session_id, working_dir).ok())
+        .unwrap_or_else(|| store.sessions_dir.join(session_id));
+    let metadata = std::fs::read_to_string(session_dir.join("state.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str::<SessionMeta>(&text).ok());
+    plan_state_from_metadata(
+        session_id,
+        working_dir,
+        &session_dir,
+        metadata.as_ref(),
+        true,
+    )
+}
+
 fn resolve_session_dir(
     id: &str,
     working_dir: &std::path::Path,
@@ -678,24 +904,19 @@ Workflow:
   4. Write Plan — create/update the plan file with Write or Edit (use Write if it does not exist yet).
   5. Exit — call ExitPlanMode for user approval (user chooses 执行 / 修改意见 / 拒绝).
 
-## Plan quality
-Write a COMPLETE markdown plan in the plan file before exiting. Include:
-- Goal / problem statement
-- Chosen approach (and briefly why)
-- Concrete implementation steps (real files, functions, commands — verifiable, ordered)
-- Risks / edge cases
-- How to verify (tests / manual checks)
+## Plan file format
+The first line MUST be a level-1 Markdown title: `# <plan name>`. The host uses that title to finalize the filename as `YYYY-MM-DD_<plan-name>.md` when ExitPlanMode is called. Write the rest as structured Markdown with concrete ordered steps and validation.
 
 ## Handling multiple approaches
-Keep at most 2-3 meaningfully different approaches. If one is clearly superior, just propose that one.
-When the best approach depends on user preferences you don't have, use AskUserQuestion first.
-When you do include multiple approaches in the plan, you MUST pass them as the `options` parameter when calling ExitPlanMode so the user can select which approach to execute.
-NEVER write multiple approaches and call ExitPlanMode without `options`.
+Keep it focused: at most 2-3 meaningfully different approaches. Do NOT pad with minor variations — if one approach is clearly superior, just propose that one.
+When the best approach depends on user preferences, constraints, or context you don't have, use AskUserQuestion to clarify first. This helps you write a better, more targeted plan rather than dumping multiple options for the user to sort through.
+When you do include multiple approaches in the plan, you MUST pass them as the `options` parameter when calling ExitPlanMode, so the user can select which approach to execute at approval time.
+NEVER write multiple approaches in the plan and call ExitPlanMode without the `options` parameter — the user will only see the default approval controls with no way to choose a specific approach.
 
-AskUserQuestion is for clarifying missing requirements or preferences that affect the plan.
-Never ask about plan approval via text or AskUserQuestion — the user cannot see the plan until you call ExitPlanMode.
-Your turn must end with either AskUserQuestion (clarifications) or ExitPlanMode (approval). Do NOT end your turn any other way.
-Do NOT start implementing source changes. Do NOT edit files other than the plan file.
+AskUserQuestion is for clarifying missing requirements or user preferences that affect the plan.
+Never ask about plan approval via text or AskUserQuestion.
+Your turn must end with either AskUserQuestion (to clarify requirements or preferences) or ExitPlanMode (to request plan approval). Do NOT end your turn any other way.
+Do NOT use AskUserQuestion to ask about plan approval or reference "the plan" — the user cannot see the plan until you call ExitPlanMode.
 </system-reminder>"#,
         plan = plan_file.display()
     )
@@ -727,5 +948,68 @@ mod working_directory_tests {
         assert!(context.contains("`/workspace/project`"));
         assert!(context.contains("prefer paths relative to the working directory"));
         assert!(context.contains("git -C"));
+    }
+
+    #[test]
+    fn restores_active_plan_from_session_scoped_path() {
+        let root =
+            std::env::temp_dir().join(format!("kkagent-plan-restore-{}", uuid::Uuid::new_v4()));
+        let working_dir = root.join("work");
+        let session_dir = root.join("session");
+        let plan_id = "2026-08-11_resume_plan";
+        let plan_path = session_dir
+            .join("agents")
+            .join("main")
+            .join("plans")
+            .join(format!("{plan_id}.md"));
+        std::fs::create_dir_all(plan_path.parent().unwrap()).unwrap();
+        std::fs::write(&plan_path, "# Resume plan\n\nKeep this content.\n").unwrap();
+        let mut metadata = SessionMeta::new("session-1", &working_dir);
+        metadata
+            .custom
+            .insert(PLAN_MODE_META_KEY.into(), true.into());
+        metadata
+            .custom
+            .insert(PLAN_ID_META_KEY.into(), plan_id.into());
+
+        let restored = plan_state_from_metadata(
+            "session-1",
+            &working_dir,
+            &session_dir,
+            Some(&metadata),
+            true,
+        );
+        assert!(restored.enabled);
+        assert_eq!(restored.id, plan_id);
+        assert_eq!(restored.path, plan_path);
+        assert_eq!(
+            restored.content.as_deref(),
+            Some("# Resume plan\n\nKeep this content.\n")
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn migrates_workspace_plan_without_removing_legacy_file() {
+        let root =
+            std::env::temp_dir().join(format!("kkagent-plan-migration-{}", uuid::Uuid::new_v4()));
+        let working_dir = root.join("work");
+        let session_dir = root.join("session");
+        let legacy = working_dir
+            .join(".kkagent")
+            .join("plans")
+            .join("session-2.md");
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, "# Legacy plan\n").unwrap();
+
+        let restored =
+            plan_state_from_metadata("session-2", &working_dir, &session_dir, None, true);
+        assert_eq!(
+            restored.path,
+            session_dir.join("agents/main/plans").join("session-2.md")
+        );
+        assert_eq!(restored.content.as_deref(), Some("# Legacy plan\n"));
+        assert!(legacy.exists());
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

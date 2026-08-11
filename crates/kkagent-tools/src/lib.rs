@@ -58,6 +58,8 @@ pub trait Tool: Send + Sync {
 pub struct ToolContext {
     pub working_dir: std::path::PathBuf,
     pub session_id: String,
+    /// Current plan file when the host supports file-backed plan mode.
+    pub plan_file_path: Option<std::path::PathBuf>,
     pub image: kkagent_config::ImageConfig,
     /// Current tool_use id when available (for subagent mirroring).
     pub tool_call_id: Option<String>,

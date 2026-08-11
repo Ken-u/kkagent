@@ -48,9 +48,9 @@
 
 ## Plan 模式
 
-Plan 模式用于先分析和制定计划。此时写操作仅允许更新当前会话的计划文件 `.kkagent/plans/<session-id>.md`，对源代码的 Write/Edit 会被拒绝。退出 Plan 模式后才进入实施阶段。
+Plan 模式用于先分析和制定计划。此时写操作仅允许更新当前 session 目录内的 `agents/main/plans/<plan-id>.md`，对源代码的 Write/Edit 会被拒绝。计划 Markdown 第一行必须是一级标题 `# <plan name>`；调用 `ExitPlanMode` 时，文件会按该标题最终命名为 `YYYY-MM-DD_<plan-name>.md`，重名时自动追加 `_2`、`_3`。旧版 `<workspace>/.kkagent/plans/<session-id>.md` 会在恢复时复制迁移，原文件保留。退出 Plan 模式后才进入实施阶段。
 
-计划文件写入后，TUI 会完整展示计划全文；在 Plan 模式保持开启时，上下滚动仅限于该计划文档，直到用户退出 Plan 模式。
+计划模式、plan id 和计划正文均随 session 持久化。计划文件写入后，TUI 会完整展示计划全文；在 Plan 模式保持开启时，上下滚动仅限于该计划文档，直到用户退出 Plan 模式。退出 kkagent 后再 resume，同一份计划会从 session 目录恢复。
 
 当 agent 调用 `ExitPlanMode` 后（manual / yolo），底部会出现计划评审选项：
 - **执行** — 批准计划并退出 Plan 模式，开始实施

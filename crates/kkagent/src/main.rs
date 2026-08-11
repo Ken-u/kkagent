@@ -1288,8 +1288,9 @@ impl kkagent_acp::AcpHost for AgentAcpHost {
                 let session = sessions
                     .get_mut(session_id)
                     .ok_or_else(|| "session not found".to_string())?;
-                session.plan_mode = mode == "plan";
-                Ok(())
+                session
+                    .set_plan_mode_persisted(mode == "plan")
+                    .map_err(|error| error.to_string())
             }
             "manual" | "yolo" | "auto" => {
                 let perm = mode.parse::<PermissionMode>().map_err(|e| e.to_string())?;
@@ -3131,6 +3132,14 @@ fn slice_recent_messages(
     (messages[start..].to_vec(), start, true)
 }
 
+fn plan_state_json(plan: kkagent_core::SessionPlanState) -> serde_json::Value {
+    serde_json::json!({
+        "id": plan.id,
+        "path": plan.path,
+        "content": plan.content.unwrap_or_default(),
+    })
+}
+
 fn slice_message_page(
     messages: &[ChatMessage],
     before: usize,
@@ -3745,12 +3754,14 @@ async fn handle_rpc_call(
                 if let Some(existing) = sessions.get(&session_id) {
                     let total = existing.messages.len();
                     let usage = existing.usage.snapshot();
+                    let plan = plan_state_json(existing.plan_state());
                     let (display, oldest_index, older_available) =
                         slice_recent_messages(&existing.messages, display_limit);
                     return Ok(serde_json::json!({
                         "session_id": session_id,
                         "messages": display,
                         "plan_mode": existing.plan_mode,
+                        "plan": plan,
                         "permission_mode": existing.get_permission_mode(),
                         "model": existing.get_model_alias(),
                         "working_dir": existing.working_dir,
@@ -3802,13 +3813,16 @@ async fn handle_rpc_call(
                     })
             };
             if turn_active {
+                let plan_state =
+                    kkagent_core::load_persisted_plan_state(&session_id, &resumed_working_dir);
                 let total = messages.len();
                 let (display, oldest_index, older_available) =
                     slice_recent_messages(&messages, display_limit);
                 return Ok(serde_json::json!({
                     "session_id": session_id,
                     "messages": display,
-                    "plan_mode": false,
+                    "plan_mode": plan_state.enabled,
+                    "plan": plan_state_json(plan_state),
                     "permission_mode": perm_mode,
                     "model": resumed_model,
                     "working_dir": resumed_working_dir,
@@ -3836,6 +3850,8 @@ async fn handle_rpc_call(
             }
             session.services.create_source = SessionCreateSource::Resume;
             session.services.on_created().await;
+            let plan_mode = session.plan_mode;
+            let plan = plan_state_json(session.plan_state());
 
             state
                 .interrupt_flags
@@ -3874,7 +3890,8 @@ async fn handle_rpc_call(
             Ok(serde_json::json!({
                 "session_id": session_id,
                 "messages": display,
-                "plan_mode": false,
+                "plan_mode": plan_mode,
+                "plan": plan,
                 "permission_mode": perm_mode,
                 "model": resumed_model,
                 "working_dir": resumed_working_dir,
@@ -4396,14 +4413,12 @@ async fn handle_rpc_call(
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
             let mut sessions = state.sessions.lock().await;
-            if let Some(session) = sessions.get_mut(&session_id) {
-                session.plan_mode = enabled;
-                if enabled {
-                    if let Some(parent) = session.plan_file_path.parent() {
-                        let _ = std::fs::create_dir_all(parent);
-                    }
-                }
-            }
+            let session = sessions
+                .get_mut(&session_id)
+                .ok_or_else(|| (-32602, format!("Session not found: {session_id}")))?;
+            session
+                .set_plan_mode_persisted(enabled)
+                .map_err(|error| (-32000, error.to_string()))?;
             let _ = rpc_event_tx
                 .send(Frame::Event {
                     event: "agent".into(),
@@ -5093,16 +5108,28 @@ async fn handle_rpc_call(
 
                     let txs = state.approval_txs.lock().await;
                     if let Some(sid) = session_id {
-                        if let Some(tx) = txs.get(&sid) {
-                            let _ = tx.try_send(response);
-                            return Ok(serde_json::json!({"ok": true}));
+                        let tx = txs.get(&sid).ok_or_else(|| {
+                            (-32602, format!("No approval channel for session: {sid}"))
+                        })?;
+                        tx.try_send(response).map_err(|error| {
+                            (
+                                -32000,
+                                format!("Failed to deliver approval response: {error}"),
+                            )
+                        })?;
+                        return Ok(serde_json::json!({"ok": true}));
+                    }
+                    let mut delivered = 0usize;
+                    for tx in txs.values() {
+                        if tx.try_send(response.clone()).is_ok() {
+                            delivered += 1;
                         }
                     }
-                    // Fallback: try all
-                    for tx in txs.values() {
-                        let _ = tx.try_send(response.clone());
-                    }
-                    return Ok(serde_json::json!({"ok": true}));
+                    return if delivered > 0 {
+                        Ok(serde_json::json!({"ok": true, "delivered": delivered}))
+                    } else {
+                        Err((-32000, "No approval channel accepted the response".into()))
+                    };
                 }
             }
             Err((-32602, "Invalid approval response".into()))
@@ -5118,15 +5145,28 @@ async fn handle_rpc_call(
                         .map(String::from);
                     let txs = state.question_txs.lock().await;
                     if let Some(sid) = session_id {
-                        if let Some(tx) = txs.get(&sid) {
-                            let _ = tx.try_send(response);
-                            return Ok(serde_json::json!({"ok": true}));
+                        let tx = txs.get(&sid).ok_or_else(|| {
+                            (-32602, format!("No question channel for session: {sid}"))
+                        })?;
+                        tx.try_send(response).map_err(|error| {
+                            (
+                                -32000,
+                                format!("Failed to deliver question response: {error}"),
+                            )
+                        })?;
+                        return Ok(serde_json::json!({"ok": true}));
+                    }
+                    let mut delivered = 0usize;
+                    for tx in txs.values() {
+                        if tx.try_send(response.clone()).is_ok() {
+                            delivered += 1;
                         }
                     }
-                    for tx in txs.values() {
-                        let _ = tx.try_send(response.clone());
-                    }
-                    return Ok(serde_json::json!({"ok": true}));
+                    return if delivered > 0 {
+                        Ok(serde_json::json!({"ok": true, "delivered": delivered}))
+                    } else {
+                        Err((-32000, "No question channel accepted the response".into()))
+                    };
                 }
             }
             Err((-32602, "Invalid question response".into()))
@@ -5138,6 +5178,22 @@ async fn handle_rpc_call(
 #[cfg(test)]
 mod http_path_tests {
     use super::*;
+
+    #[test]
+    fn serializes_plan_resume_payload_with_full_content() {
+        let value = plan_state_json(kkagent_core::SessionPlanState {
+            enabled: true,
+            id: "2026-08-11_resume_plan".into(),
+            path: PathBuf::from("/sessions/s1/agents/main/plans/2026-08-11_resume_plan.md"),
+            content: Some("# Resume plan\n\nFull body.\n".into()),
+        });
+        assert_eq!(value["id"], "2026-08-11_resume_plan");
+        assert_eq!(value["content"], "# Resume plan\n\nFull body.\n");
+        assert!(value["path"]
+            .as_str()
+            .unwrap()
+            .contains("agents/main/plans"));
+    }
 
     fn text_message(role: &str, text: &str) -> ChatMessage {
         ChatMessage {

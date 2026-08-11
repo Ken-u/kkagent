@@ -935,6 +935,7 @@ mod tests {
         ToolContext {
             working_dir: std::env::current_dir().expect("current directory"),
             session_id: "bash-test".to_string(),
+            plan_file_path: None,
             image: kkagent_config::ImageConfig::default(),
             tool_call_id: None,
             interrupted,

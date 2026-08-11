@@ -470,6 +470,7 @@ mod tests {
         ToolContext {
             working_dir: dir.to_path_buf(),
             session_id: "media-test".into(),
+            plan_file_path: None,
             image: kkagent_config::ImageConfig::default(),
             tool_call_id: None,
             interrupted: None,

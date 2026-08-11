@@ -5419,7 +5419,9 @@ impl TuiApp {
         if let Some(plan) = data.get("plan_mode").and_then(|v| v.as_bool()) {
             self.state.on_plan_mode_changed(plan);
         }
-        if let Some(plan_msg) = self
+        if let Some(plan) = plan_document_from_resume(&data) {
+            self.state.apply_plan_document(plan.path, plan.content);
+        } else if let Some(plan_msg) = self
             .state
             .messages
             .iter()
@@ -7151,7 +7153,7 @@ impl TuiApp {
         choice: ApprovalChoice,
         feedback: Option<String>,
     ) -> anyhow::Result<()> {
-        let Some(approval) = self.state.approval_pending.take() else {
+        let Some(mut approval) = self.state.approval_pending.take() else {
             return Ok(());
         };
         let Some(sid) = self.state.session_id.clone() else {
@@ -7167,6 +7169,13 @@ impl TuiApp {
                 Some(t)
             }
         });
+        if choice.requires_feedback && feedback.is_none() {
+            approval.feedback_mode = true;
+            self.state.approval_pending = Some(approval);
+            self.jobs.push_info("请先输入修改意见，再按 Enter 提交");
+            return Ok(());
+        }
+        let revising_plan = approval.is_plan_review && choice.requires_feedback;
 
         if let Err(e) = self
             .client
@@ -7188,6 +7197,11 @@ impl TuiApp {
         } else if let Some(next) = self.state.approval_queue.pop_front() {
             self.state.approval_pending = Some(next);
             self.state.status = SessionStatus::WaitingApproval;
+        } else {
+            self.state.status = SessionStatus::Thinking;
+            if revising_plan {
+                self.jobs.push_info("修改意见已提交，正在更新计划…");
+            }
         }
         Ok(())
     }
@@ -8038,6 +8052,19 @@ fn split_plan_message_content(content: &str) -> (String, String) {
     (path, body.to_string())
 }
 
+fn plan_document_from_resume(data: &serde_json::Value) -> Option<PlanDocument> {
+    let plan = data.get("plan")?;
+    let path = plan.get("path")?.as_str()?.trim();
+    let content = plan.get("content")?.as_str()?;
+    if path.is_empty() || content.trim().is_empty() {
+        return None;
+    }
+    Some(PlanDocument {
+        path: path.to_string(),
+        content: content.to_string(),
+    })
+}
+
 /// Fold tool calls in `[start, end)` into one `ToolHistory` overview.
 fn collapse_tools_in_turn(
     messages: &mut Vec<DisplayMessage>,
@@ -8588,6 +8615,128 @@ mod app_state_tests {
         assert!(embedded.contains("Embedded agent"));
         assert!(!embedded.contains("--connect"));
         assert!(!embedded.contains("reconnect"));
+    }
+
+    #[test]
+    fn resume_payload_restores_full_plan_document() {
+        let data = serde_json::json!({
+            "plan_mode": true,
+            "plan": {
+                "id": "2026-08-11_resume_plan",
+                "path": "/sessions/s1/agents/main/plans/2026-08-11_resume_plan.md",
+                "content": "# Resume plan\n\n1. Keep every step.\n2. Restore after restart.\n"
+            }
+        });
+        let plan = plan_document_from_resume(&data).expect("plan should be restored");
+        assert_eq!(
+            plan.path,
+            "/sessions/s1/agents/main/plans/2026-08-11_resume_plan.md"
+        );
+        assert!(plan.content.contains("2. Restore after restart."));
+    }
+
+    #[test]
+    fn resume_payload_ignores_empty_plan_placeholder() {
+        let data = serde_json::json!({
+            "plan": {"path": "/plans/empty.md", "content": "  \n"}
+        });
+        assert!(plan_document_from_resume(&data).is_none());
+    }
+
+    fn pending_plan_revision() -> (PendingApproval, ApprovalChoice) {
+        let choice = ApprovalChoice {
+            label: "修改意见".into(),
+            decision: kkagent_protocol::ApprovalDecision::Rejected,
+            selected_label: "修改意见".into(),
+            requires_feedback: true,
+            scope: None,
+        };
+        (
+            PendingApproval {
+                approval_id: "approval-1".into(),
+                tool_name: "ExitPlanMode".into(),
+                action: "review".into(),
+                detail: String::new(),
+                selected: 0,
+                choices: vec![choice.clone()],
+                is_plan_review: true,
+                feedback_mode: true,
+                feedback: String::new(),
+            },
+            choice,
+        )
+    }
+
+    #[tokio::test]
+    async fn empty_plan_revision_feedback_keeps_editor_open() {
+        let mut app = test_tui_app();
+        app.state.session_id = Some("session-1".into());
+        let (approval, choice) = pending_plan_revision();
+        app.state.approval_pending = Some(approval);
+
+        app.respond_approval_choice(choice, Some("   ".into()))
+            .await
+            .unwrap();
+
+        assert!(app
+            .state
+            .approval_pending
+            .as_ref()
+            .is_some_and(|pending| pending.feedback_mode));
+        assert!(app
+            .jobs
+            .notices
+            .iter()
+            .any(|notice| notice.text.contains("请先输入修改意见")));
+    }
+
+    #[tokio::test]
+    async fn submitted_plan_revision_returns_to_thinking_state() {
+        use futures::FutureExt;
+        use std::sync::Arc;
+
+        let (client_transport, server_transport) =
+            kkagent_rpc::transport::memory::create_memory_pair();
+        let (event_tx, event_rx) = tokio::sync::mpsc::channel(16);
+        let rpc = kkagent_rpc::RpcClient::new(client_transport, event_tx);
+        let client = kkagent_client::KkagentClient::new(rpc, event_rx);
+        let handler: kkagent_rpc::server::RequestHandler =
+            Arc::new(|_id, method, params, _event_tx| {
+                async move {
+                    assert_eq!(method, "approval.respond");
+                    assert_eq!(
+                        params
+                            .as_ref()
+                            .and_then(|value| value.get("feedback"))
+                            .and_then(|value| value.as_str()),
+                        Some("please revise step two")
+                    );
+                    Ok(serde_json::json!({"ok": true}))
+                }
+                .boxed()
+            });
+        tokio::spawn(async move {
+            kkagent_rpc::RpcServer::new(handler)
+                .serve(server_transport)
+                .await;
+        });
+        let mut app = TuiApp::new(AppConfig::default(), client);
+        app.state.session_id = Some("session-1".into());
+        app.state.status = SessionStatus::WaitingApproval;
+        let (approval, choice) = pending_plan_revision();
+        app.state.approval_pending = Some(approval);
+
+        app.respond_approval_choice(choice, Some("please revise step two".into()))
+            .await
+            .unwrap();
+
+        assert!(app.state.approval_pending.is_none());
+        assert_eq!(app.state.status, SessionStatus::Thinking);
+        assert!(app
+            .jobs
+            .notices
+            .iter()
+            .any(|notice| notice.text.contains("正在更新计划")));
     }
 
     #[test]
