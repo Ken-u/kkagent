@@ -48,6 +48,9 @@ pub struct Session {
     /// Shared Arc so `/permission` can update mid-turn while the session is out of the map.
     pub permission_mode: Arc<std::sync::Mutex<PermissionMode>>,
     pub plan_mode: bool,
+    /// Desired plan mode remains reachable while the live Session is owned by
+    /// the agent loop and temporarily absent from the server session map.
+    pub plan_mode_requested: Arc<AtomicBool>,
     /// Readable id used as the plan filename (`<id>.md`).
     pub plan_id: String,
     /// Only this file may be written/edited while plan_mode is on.
@@ -205,6 +208,7 @@ impl Session {
             image_config: kkagent_config::ImageConfig::default(),
             permission_mode: Arc::new(std::sync::Mutex::new(permission_mode)),
             plan_mode: plan_state.enabled,
+            plan_mode_requested: Arc::new(AtomicBool::new(plan_state.enabled)),
             plan_id: plan_state.id,
             plan_file_path: plan_state.path,
             model_alias: Arc::new(std::sync::Mutex::new(model_alias)),
@@ -274,7 +278,27 @@ impl Session {
             true,
         )?;
         self.plan_mode = enabled;
+        self.plan_mode_requested.store(enabled, Ordering::SeqCst);
         Ok(())
+    }
+
+    pub fn request_plan_mode(&self, enabled: bool) {
+        self.plan_mode_requested.store(enabled, Ordering::SeqCst);
+    }
+
+    /// Apply a mode change requested while this session was owned by a running
+    /// agent loop. Returns true when the persisted mode changed.
+    pub fn sync_requested_plan_mode(&mut self) -> anyhow::Result<bool> {
+        let requested = self.plan_mode_requested.load(Ordering::SeqCst);
+        if requested == self.plan_mode {
+            return Ok(false);
+        }
+        if let Err(error) = self.set_plan_mode_persisted(requested) {
+            self.plan_mode_requested
+                .store(self.plan_mode, Ordering::SeqCst);
+            return Err(error);
+        }
+        Ok(true)
     }
 
     /// Finalize `YYYY-MM-DD_<plan-name>.md` from the Markdown H1 written by

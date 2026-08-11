@@ -146,10 +146,14 @@ impl AgentLoop {
             let mut rounds_left = self.max_rounds;
             loop {
                 match self.run_turn_step(session).await? {
-                    TurnStep::Done => return Ok(()),
+                    TurnStep::Done => {
+                        self.sync_requested_plan_mode(session).await?;
+                        return Ok(());
+                    }
                     TurnStep::Continue if rounds_left <= 1 => {
                         tracing::warn!("Agent turn limit reached for session {}", session.id);
                         self.finish_turn(session, true).await?;
+                        self.sync_requested_plan_mode(session).await?;
                         return Ok(());
                     }
                     TurnStep::Continue => {
@@ -164,6 +168,7 @@ impl AgentLoop {
     async fn run_turn_step(&self, session: &mut Session) -> anyhow::Result<TurnStep> {
         session.image_config = self.config.image.clone();
         let session_id = session.id.clone();
+        self.sync_requested_plan_mode(session).await?;
         tracing::info!("Starting turn for session {}", session_id);
 
         if session.is_interrupted() {
@@ -755,6 +760,7 @@ Do not mention this reminder to the user.\n</system-reminder>"
             let mut prepared: Vec<(String, String, Prepared)> = Vec::new();
 
             for (idx, tc) in tool_calls.iter().enumerate() {
+                self.sync_requested_plan_mode(session).await?;
                 if session.is_interrupted() {
                     self.finish_interrupted(session).await?;
                     return Ok(TurnStep::Done);
@@ -1336,6 +1342,19 @@ Do not mention this reminder to the user.\n</system-reminder>"
 
         self.finish_turn(session, true).await?;
         Ok(TurnStep::Done)
+    }
+
+    async fn sync_requested_plan_mode(&self, session: &mut Session) -> anyhow::Result<()> {
+        if session.sync_requested_plan_mode()? {
+            let _ = self
+                .event_tx
+                .send(AgentEvent::PlanModeChanged {
+                    session_id: session.id.clone(),
+                    enabled: session.plan_mode,
+                })
+                .await;
+        }
+        Ok(())
     }
 
     async fn finish_interrupted(&self, session: &mut Session) -> anyhow::Result<()> {

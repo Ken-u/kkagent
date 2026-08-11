@@ -988,10 +988,7 @@ async fn initialize_session_context(state: &ServerState, session: &mut Session) 
     }
 }
 
-async fn ensure_http_session_loaded(
-    state: &Arc<ServerState>,
-    session_id: &str,
-) -> Result<(), String> {
+async fn ensure_session_loaded(state: &Arc<ServerState>, session_id: &str) -> Result<(), String> {
     if state.sessions.lock().await.contains_key(session_id) {
         return Ok(());
     }
@@ -1049,6 +1046,11 @@ async fn ensure_http_session_loaded(
         .lock()
         .await
         .insert(session_id.to_string(), session.permission_mode.clone());
+    state
+        .plan_mode_requests
+        .lock()
+        .await
+        .insert(session_id.to_string(), session.plan_mode_requested.clone());
     state
         .approval_txs
         .lock()
@@ -1204,6 +1206,11 @@ impl kkagent_acp::AcpHost for AgentAcpHost {
             .lock()
             .await
             .insert(session_id.to_string(), session.permission_mode.clone());
+        self.state
+            .plan_mode_requests
+            .lock()
+            .await
+            .insert(session_id.to_string(), session.plan_mode_requested.clone());
         self.state
             .approval_txs
             .lock()
@@ -1545,6 +1552,11 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
             .await
             .insert(id.clone(), session.permission_mode.clone());
         self.state
+            .plan_mode_requests
+            .lock()
+            .await
+            .insert(id.clone(), session.plan_mode_requested.clone());
+        self.state
             .approval_txs
             .lock()
             .await
@@ -1602,6 +1614,7 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
         self.state.interrupt_flags.lock().await.remove(id);
         self.state.model_aliases.lock().await.remove(id);
         self.state.permission_modes.lock().await.remove(id);
+        self.state.plan_mode_requests.lock().await.remove(id);
         self.state.approval_txs.lock().await.remove(id);
         self.state.question_txs.lock().await.remove(id);
         self.state.turn_locks.remove(id).await;
@@ -1634,7 +1647,7 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
         if text.trim().is_empty() && images.is_empty() {
             return Err("message text must not be empty".into());
         }
-        ensure_http_session_loaded(&self.state, id).await?;
+        ensure_session_loaded(&self.state, id).await?;
         let turn_permit = self.state.turn_locks.try_acquire(id).await?;
         if let Some(task_id) = task_id {
             self.state
@@ -2298,11 +2311,14 @@ async fn run_http_turn(
         let db = state.transcript.lock().await;
         persist_session_messages(&db, &mut session)
     };
-    state
-        .sessions
-        .lock()
-        .await
-        .insert(session_id.to_string(), session);
+    {
+        // Keep reinsertion and the final request sync under the same lock. This
+        // closes the gap where an RPC could otherwise update the shared flag
+        // after the last sync but before the Session becomes visible again.
+        let mut sessions = state.sessions.lock().await;
+        session.sync_requested_plan_mode()?;
+        sessions.insert(session_id.to_string(), session);
+    }
     result?;
     persist_result
 }
@@ -2322,6 +2338,8 @@ struct ServerState {
     model_aliases: Mutex<HashMap<String, Arc<std::sync::Mutex<String>>>>,
     /// Permission mode handles — reachable mid-turn so `/permission` → manual takes effect immediately.
     permission_modes: Mutex<HashMap<String, Arc<std::sync::Mutex<PermissionMode>>>>,
+    /// Desired plan mode handles — reachable while the agent loop owns the Session.
+    plan_mode_requests: Mutex<HashMap<String, Arc<AtomicBool>>>,
     abort_registry: Arc<Mutex<HashMap<String, AbortHandle>>>,
     transcript: Mutex<TranscriptDb>,
     durable_http: kkagent_rpc::DurableHttpStore,
@@ -2684,6 +2702,7 @@ async fn build_server_state(config: Arc<AppConfig>) -> Result<Arc<ServerState>> 
         interrupt_flags: Mutex::new(HashMap::new()),
         model_aliases: Mutex::new(HashMap::new()),
         permission_modes: Mutex::new(HashMap::new()),
+        plan_mode_requests: Mutex::new(HashMap::new()),
         abort_registry: Arc::new(Mutex::new(HashMap::new())),
         transcript: Mutex::new(transcript),
         durable_http,
@@ -3045,7 +3064,11 @@ async fn spawn_session_agent_turn(
                     session_id: sid.clone(),
                 })
                 .await;
-            state_clone.sessions.lock().await.insert(sid, session);
+            let mut sessions = state_clone.sessions.lock().await;
+            if let Err(error) = session.sync_requested_plan_mode() {
+                tracing::error!("Failed to persist requested plan mode: {error}");
+            }
+            sessions.insert(sid, session);
             return;
         }
 
@@ -3070,7 +3093,15 @@ async fn spawn_session_agent_turn(
             }
         }
 
-        state_clone.sessions.lock().await.insert(sid, session);
+        let mut sessions = state_clone.sessions.lock().await;
+        if let Err(error) = session.sync_requested_plan_mode() {
+            tracing::error!("Failed to persist requested plan mode: {error}");
+            let _ = agent_event_tx.try_send(AgentEvent::Error {
+                session_id: sid.clone(),
+                message: format!("plan mode persistence failed: {error}"),
+            });
+        }
+        sessions.insert(sid, session);
     });
 
     Ok(())
@@ -3295,6 +3326,11 @@ async fn handle_rpc_call(
                 .await
                 .insert(session_id.clone(), session.permission_mode.clone());
             state
+                .plan_mode_requests
+                .lock()
+                .await
+                .insert(session_id.clone(), session.plan_mode_requested.clone());
+            state
                 .approval_txs
                 .lock()
                 .await
@@ -3516,6 +3552,7 @@ async fn handle_rpc_call(
             state.interrupt_flags.lock().await.remove(&session_id);
             state.model_aliases.lock().await.remove(&session_id);
             state.permission_modes.lock().await.remove(&session_id);
+            state.plan_mode_requests.lock().await.remove(&session_id);
             state.approval_txs.lock().await.remove(&session_id);
             state.question_txs.lock().await.remove(&session_id);
             if let Some(session) = removed {
@@ -3868,6 +3905,11 @@ async fn handle_rpc_call(
                 .lock()
                 .await
                 .insert(session_id.clone(), session.permission_mode.clone());
+            state
+                .plan_mode_requests
+                .lock()
+                .await
+                .insert(session_id.clone(), session.plan_mode_requested.clone());
             state
                 .approval_txs
                 .lock()
@@ -4412,13 +4454,46 @@ async fn handle_rpc_call(
                 .and_then(|p| p.get("enabled"))
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
-            let mut sessions = state.sessions.lock().await;
-            let session = sessions
-                .get_mut(&session_id)
-                .ok_or_else(|| (-32602, format!("Session not found: {session_id}")))?;
-            session
-                .set_plan_mode_persisted(enabled)
-                .map_err(|error| (-32000, error.to_string()))?;
+            if session_id.is_empty() {
+                return Err((-32602, "Missing session_id".into()));
+            }
+
+            let mut request = state
+                .plan_mode_requests
+                .lock()
+                .await
+                .get(&session_id)
+                .cloned();
+            if request.is_none() {
+                ensure_session_loaded(&state, &session_id)
+                    .await
+                    .map_err(|error| {
+                        if error == "session not found" {
+                            (-32602, format!("Session not found: {session_id}"))
+                        } else {
+                            (-32000, error)
+                        }
+                    })?;
+                request = state
+                    .plan_mode_requests
+                    .lock()
+                    .await
+                    .get(&session_id)
+                    .cloned();
+            }
+
+            let request =
+                request.ok_or_else(|| (-32602, format!("Session not found: {session_id}")))?;
+            request.store(enabled, std::sync::atomic::Ordering::SeqCst);
+
+            // If the turn has already put the Session back, persist now. If it
+            // is still running, AgentLoop (and its locked reinsertion path)
+            // consumes the shared request without rejecting the RPC.
+            if let Some(session) = state.sessions.lock().await.get_mut(&session_id) {
+                session
+                    .sync_requested_plan_mode()
+                    .map_err(|error| (-32000, error.to_string()))?;
+            }
             let _ = rpc_event_tx
                 .send(Frame::Event {
                     event: "agent".into(),

@@ -1092,6 +1092,31 @@ impl TuiApp {
         self.state.model_alias = self.config.default_model_alias().map(|s| s.to_string());
     }
 
+    /// Apply a user-triggered plan-mode change without letting a transient RPC
+    /// failure tear down the TUI or leave its local state ahead of the server.
+    async fn set_plan_mode_from_ui(&mut self, enabled: bool) -> bool {
+        if self.state.resume_switch.is_some() {
+            self.system_message(
+                "Session switch is still loading; try plan mode again when it finishes.".into(),
+            );
+            return false;
+        }
+        let Some(session_id) = self.state.session_id.clone() else {
+            self.system_message("Cannot change plan mode without an active session.".into());
+            return false;
+        };
+        match self.client.set_plan_mode(&session_id, enabled).await {
+            Ok(()) => {
+                self.state.on_plan_mode_changed(enabled);
+                true
+            }
+            Err(error) => {
+                self.system_message(format!("Plan mode change failed: {error}"));
+                false
+            }
+        }
+    }
+
     pub async fn run(mut self, resume: Option<String>) -> anyhow::Result<()> {
         let startup_started = std::time::Instant::now();
         if let Some(trust) = self
@@ -2694,20 +2719,18 @@ impl TuiApp {
             // Shift-Tab: toggle plan mode
             KeyCode::BackTab => {
                 let enabled = !self.state.plan_mode;
-                self.state.on_plan_mode_changed(enabled);
-                if let Some(sid) = &self.state.session_id {
-                    self.client.set_plan_mode(sid, enabled).await?;
-                }
-                if enabled {
-                    self.system_message(
-                        "Plan mode ON — explore & write plan only. \
-                         Source edits are denied until you ExitPlanMode. \
-                         After a plan is written, scroll stays within the plan \
-                         until you exit plan mode."
-                            .into(),
-                    );
-                } else {
-                    self.system_message("Plan mode OFF.".into());
+                if self.set_plan_mode_from_ui(enabled).await {
+                    if enabled {
+                        self.system_message(
+                            "Plan mode ON — explore & write plan only. \
+                             Source edits are denied until you ExitPlanMode. \
+                             After a plan is written, scroll stays within the plan \
+                             until you exit plan mode."
+                                .into(),
+                        );
+                    } else {
+                        self.system_message("Plan mode OFF.".into());
+                    }
                 }
             }
             // Enter: submit
@@ -6428,25 +6451,23 @@ impl TuiApp {
                 self.open_permission_picker();
             }
             "plan" => {
-                if args.eq_ignore_ascii_case("clear") {
-                    self.state.on_plan_mode_changed(false);
-                    self.state.plan_document = None;
-                    self.state.messages.retain(|m| m.role != MessageRole::Plan);
-                } else {
-                    self.state.on_plan_mode_changed(!self.state.plan_mode);
-                }
-                if let Some(sid) = &self.state.session_id {
-                    self.client.set_plan_mode(sid, self.state.plan_mode).await?;
-                }
-                if self.state.plan_mode {
-                    self.system_message(
-                        "Plan mode ON — explore & write plan only. \
-                         Source edits are denied until ExitPlanMode. \
-                         Scroll locks to the full plan after it is written."
-                            .into(),
-                    );
-                } else {
-                    self.system_message("Plan mode OFF.".into());
+                let clear = args.eq_ignore_ascii_case("clear");
+                let enabled = if clear { false } else { !self.state.plan_mode };
+                if self.set_plan_mode_from_ui(enabled).await {
+                    if clear {
+                        self.state.plan_document = None;
+                        self.state.messages.retain(|m| m.role != MessageRole::Plan);
+                    }
+                    if enabled {
+                        self.system_message(
+                            "Plan mode ON — explore & write plan only. \
+                             Source edits are denied until ExitPlanMode. \
+                             Scroll locks to the full plan after it is written."
+                                .into(),
+                        );
+                    } else {
+                        self.system_message("Plan mode OFF.".into());
+                    }
                 }
             }
             "exit" | "quit" | "q" => {
@@ -8737,6 +8758,42 @@ mod app_state_tests {
             .notices
             .iter()
             .any(|notice| notice.text.contains("正在更新计划")));
+    }
+
+    #[tokio::test]
+    async fn failed_plan_mode_rpc_keeps_tui_state_and_session_alive() {
+        use futures::FutureExt;
+        use std::sync::Arc;
+
+        let (client_transport, server_transport) =
+            kkagent_rpc::transport::memory::create_memory_pair();
+        let (event_tx, event_rx) = tokio::sync::mpsc::channel(16);
+        let rpc = kkagent_rpc::RpcClient::new(client_transport, event_tx);
+        let client = kkagent_client::KkagentClient::new(rpc, event_rx);
+        let handler: kkagent_rpc::server::RequestHandler =
+            Arc::new(|_id, method, _params, _event_tx| {
+                async move {
+                    assert_eq!(method, "session.set_plan_mode");
+                    Err((-32602, "Session not found: session-1".into()))
+                }
+                .boxed()
+            });
+        tokio::spawn(async move {
+            kkagent_rpc::RpcServer::new(handler)
+                .serve(server_transport)
+                .await;
+        });
+        let mut app = TuiApp::new(AppConfig::default(), client);
+        app.state.session_id = Some("session-1".into());
+        app.state.plan_mode = false;
+
+        assert!(!app.set_plan_mode_from_ui(true).await);
+        assert!(!app.state.plan_mode);
+        assert!(!app.state.should_quit);
+        assert!(app.state.messages.iter().any(|message| {
+            message.role == MessageRole::System
+                && message.content.contains("Plan mode change failed")
+        }));
     }
 
     #[test]
