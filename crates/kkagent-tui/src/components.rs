@@ -29,6 +29,7 @@ const TIPS: &[&str] = &[
     "! shell (local, immediate)",
     "/yolo auto-approves tools",
     "large pastes collapse to [Pasted text #n]",
+    "press Esc twice to fork from and edit an earlier prompt",
     "scroll to review earlier messages",
 ];
 
@@ -1105,6 +1106,28 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
+fn truncate_display_width(s: &str, max_width: usize) -> String {
+    if UnicodeWidthStr::width(s) <= max_width {
+        return s.to_string();
+    }
+    if max_width == 0 {
+        return String::new();
+    }
+    let content_width = max_width.saturating_sub(UnicodeWidthChar::width('…').unwrap_or(1));
+    let mut width = 0usize;
+    let mut out = String::new();
+    for ch in s.chars() {
+        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if width.saturating_add(ch_width) > content_width {
+            break;
+        }
+        out.push(ch);
+        width = width.saturating_add(ch_width);
+    }
+    out.push('…');
+    out
+}
+
 fn render_input(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let border = match state.mode {
         AppMode::Shell => theme.shell_mode,
@@ -1927,16 +1950,16 @@ fn render_list_picker(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme
             } else {
                 Style::default().fg(theme.text)
             };
-            let primary_w = 36usize;
-            let padded = if item.label.len() < primary_w {
-                format!("{:width$}", item.label, width = primary_w)
+            let primary_w = if picker.kind == crate::app::ListPickerKind::HistoryEdit {
+                (inner.width as usize).saturating_sub(4)
             } else {
-                let t: String = item
-                    .label
-                    .chars()
-                    .take(primary_w.saturating_sub(1))
-                    .collect();
-                format!("{}…", t)
+                36usize
+            };
+            let label_width = UnicodeWidthStr::width(item.label.as_str());
+            let padded = if label_width < primary_w {
+                format!("{}{}", item.label, " ".repeat(primary_w - label_width))
+            } else {
+                truncate_display_width(&item.label, primary_w)
             };
             lines.push(Line::from(vec![
                 Span::styled(prefix, name_style),
@@ -2495,6 +2518,8 @@ mod render_smoke {
         let s = "你好世界abcdef";
         let parts = wrap_str(s, 4);
         assert!(!parts.is_empty());
+        assert_eq!(truncate_display_width(s, 5), "你好…");
+        assert_eq!(UnicodeWidthStr::width(truncate_display_width(s, 5).as_str()), 5);
     }
 
     #[test]

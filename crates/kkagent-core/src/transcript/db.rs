@@ -328,14 +328,37 @@ impl TranscriptDb {
         Ok(())
     }
 
-    /// Clone a resumable transcript. `turn_index` follows the session-store approximation
-    /// of two transcript messages per completed turn.
+    /// Clone a resumable transcript. `turn_index` keeps the historical API's
+    /// approximation of two transcript messages per completed turn.
     pub fn fork_session(
         &self,
         source_id: &str,
         target_id: &str,
         title: Option<&str>,
         turn_index: Option<usize>,
+    ) -> anyhow::Result<()> {
+        let message_limit = turn_index.map(|turn| turn.saturating_add(1).saturating_mul(2));
+        self.fork_session_inner(source_id, target_id, title, message_limit, false)
+    }
+
+    /// Clone exactly the messages before a selected editable prompt.
+    pub fn fork_session_with_message_limit(
+        &self,
+        source_id: &str,
+        target_id: &str,
+        title: Option<&str>,
+        message_limit: usize,
+    ) -> anyhow::Result<()> {
+        self.fork_session_inner(source_id, target_id, title, Some(message_limit), true)
+    }
+
+    fn fork_session_inner(
+        &self,
+        source_id: &str,
+        target_id: &str,
+        title: Option<&str>,
+        message_limit: Option<usize>,
+        strict_message_limit: bool,
     ) -> anyhow::Result<()> {
         let source = self
             .get_session(source_id)?
@@ -344,12 +367,14 @@ impl TranscriptDb {
             anyhow::bail!("session already exists: {target_id}");
         }
         let mut messages = self.load_messages(source_id)?;
-        if let Some(turn_index) = turn_index {
-            messages.truncate(
-                messages
-                    .len()
-                    .min(turn_index.saturating_add(1).saturating_mul(2)),
-            );
+        if let Some(message_limit) = message_limit {
+            if strict_message_limit && message_limit > messages.len() {
+                anyhow::bail!(
+                    "message limit {message_limit} exceeds transcript length {}",
+                    messages.len()
+                );
+            }
+            messages.truncate(message_limit);
         }
 
         let conn = self.lock()?;
@@ -681,6 +706,38 @@ mod tests {
         assert_eq!(db.load_messages("fork").unwrap().len(), 4);
         db.append_message("source", "user", "[]", None).unwrap();
         assert_eq!(db.load_messages("fork").unwrap().len(), 4);
+    }
+
+    #[test]
+    fn test_fork_session_with_exact_message_limit_supports_editing_first_turn() {
+        let db = test_db();
+        db.create_session("source", "model", "/workspace").unwrap();
+        for index in 0..5 {
+            db.append_message(
+                "source",
+                if index == 0 || index == 4 {
+                    "user"
+                } else {
+                    "assistant"
+                },
+                &format!(r#"[{{"type":"text","text":"msg{index}"}}]"#),
+                None,
+            )
+            .unwrap();
+        }
+
+        db.fork_session_with_message_limit("source", "empty-fork", Some("Edit"), 0)
+            .unwrap();
+        assert!(db.load_messages("empty-fork").unwrap().is_empty());
+
+        db.fork_session_with_message_limit("source", "partial-fork", Some("Edit"), 4)
+            .unwrap();
+        let fork = db.load_messages("partial-fork").unwrap();
+        assert_eq!(fork.len(), 4);
+        assert!(fork.last().unwrap().content_json.contains("msg3"));
+        assert!(db
+            .fork_session_with_message_limit("source", "invalid-fork", None, 6)
+            .is_err());
     }
 
     #[test]

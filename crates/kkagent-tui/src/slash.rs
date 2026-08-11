@@ -112,9 +112,9 @@ pub const BUILTIN_SLASH_COMMANDS: &[SlashCommand] = &[
     SlashCommand {
         name: "undo",
         aliases: &[],
-        description: "Withdraw the last prompt from the transcript",
+        description: "Choose a prior prompt, fork before it, and edit",
         priority: 80,
-        argument_hint: None,
+        argument_hint: Some("[turn_count]"),
     },
     SlashCommand {
         name: "timeline",

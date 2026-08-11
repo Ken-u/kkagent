@@ -4,6 +4,7 @@ pub mod blob_store;
 pub mod context_breakdown;
 pub mod context_memory;
 pub mod context_projector;
+pub mod conversation_turns;
 pub mod event_bus;
 pub mod file_conflict;
 pub mod full_compaction;
@@ -36,6 +37,7 @@ pub use context_projector::{
     build_compaction_digest, compact_cut_index, compact_messages, fold_old_media, project,
     project_strict, repair_tool_exchanges, ProjectOptions,
 };
+pub use conversation_turns::{editable_turns, EditableTurn};
 pub use event_bus::EventBus;
 pub use file_conflict::FileConflictTracker;
 pub use full_compaction::{

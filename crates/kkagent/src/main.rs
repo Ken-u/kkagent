@@ -3305,13 +3305,40 @@ async fn handle_rpc_call(
                 .and_then(|p| p.get("turn_index"))
                 .and_then(|v| v.as_u64())
                 .map(|n| n as usize);
+            let message_limit = params
+                .as_ref()
+                .and_then(|p| p.get("message_limit"))
+                .and_then(|v| v.as_u64())
+                .map(|n| {
+                    usize::try_from(n)
+                        .map_err(|_| (-32602, "message_limit is too large".into()))
+                })
+                .transpose()?;
+            if turn_index.is_some() && message_limit.is_some() {
+                return Err((
+                    -32602,
+                    "turn_index and message_limit are mutually exclusive".into(),
+                ));
+            }
             let store = SessionStore::open_default();
-            let summary = store
-                .fork(source_id, &target_id, title, turn_index)
-                .map_err(|e| (-32000, e.to_string()))?;
+            let summary = match message_limit {
+                Some(limit) => store.fork_with_message_limit(source_id, &target_id, title, limit),
+                None => store.fork(source_id, &target_id, title, turn_index),
+            }
+            .map_err(|e| (-32000, e.to_string()))?;
             let transcript_result = {
                 let db = state.transcript.lock().await;
-                db.fork_session(source_id, &target_id, summary.title.as_deref(), turn_index)
+                match message_limit {
+                    Some(limit) => db.fork_session_with_message_limit(
+                        source_id,
+                        &target_id,
+                        summary.title.as_deref(),
+                        limit,
+                    ),
+                    None => {
+                        db.fork_session(source_id, &target_id, summary.title.as_deref(), turn_index)
+                    }
+                }
             };
             if let Err(error) = transcript_result {
                 let _ = store.delete(&target_id);
@@ -3743,6 +3770,31 @@ async fn handle_rpc_call(
                     "older_available": start > 0,
                     "before": before,
                 },
+            }))
+        }
+        "session.turns" => {
+            let session_id = params
+                .as_ref()
+                .and_then(|p| p.get("session_id"))
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| (-32602, "Missing session_id".into()))?;
+            let sessions = state.sessions.lock().await;
+            let session = sessions
+                .get(session_id)
+                .ok_or_else(|| (-32602, format!("Session not found: {session_id}")))?;
+            let turns = kkagent_core::editable_turns(&session.messages)
+                .into_iter()
+                .map(|turn| {
+                    serde_json::json!({
+                        "turn_index": turn.turn_index,
+                        "message_index": turn.message_index,
+                        "text": turn.text,
+                    })
+                })
+                .collect::<Vec<_>>();
+            Ok(serde_json::json!({
+                "session_id": session_id,
+                "turns": turns,
             }))
         }
         "session.prompt" => {

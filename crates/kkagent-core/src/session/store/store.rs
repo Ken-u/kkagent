@@ -184,6 +184,27 @@ impl SessionStore {
         title: Option<&str>,
         turn_index: Option<usize>,
     ) -> anyhow::Result<SessionSummary> {
+        self.fork_inner(source_id, target_id, title, turn_index, None)
+    }
+
+    pub fn fork_with_message_limit(
+        &self,
+        source_id: &str,
+        target_id: &str,
+        title: Option<&str>,
+        message_limit: usize,
+    ) -> anyhow::Result<SessionSummary> {
+        self.fork_inner(source_id, target_id, title, None, Some(message_limit))
+    }
+
+    fn fork_inner(
+        &self,
+        source_id: &str,
+        target_id: &str,
+        title: Option<&str>,
+        turn_index: Option<usize>,
+        message_limit: Option<usize>,
+    ) -> anyhow::Result<SessionSummary> {
         if !is_safe_session_id(target_id) {
             anyhow::bail!("unsafe session id: {target_id}");
         }
@@ -222,6 +243,8 @@ impl SessionStore {
 
         if let Some(idx) = turn_index {
             truncate_transcript_at_turn(&target_dir, idx)?;
+        } else if let Some(limit) = message_limit {
+            truncate_transcript_at_message_limit(&target_dir, limit)?;
         }
 
         append_session_index_entry(
@@ -244,6 +267,36 @@ impl SessionStore {
         let map = read_session_index(&self.home_dir, &self.sessions_dir)?;
         Ok(map.get(id).cloned())
     }
+}
+
+fn truncate_transcript_at_message_limit(
+    session_dir: &Path,
+    message_limit: usize,
+) -> anyhow::Result<()> {
+    let msgs = session_dir.join("messages.jsonl");
+    if msgs.is_file() {
+        let text = std::fs::read_to_string(&msgs)?;
+        let lines: Vec<&str> = text.lines().collect();
+        let keep = message_limit.min(lines.len());
+        let out = lines[..keep].join("\n");
+        std::fs::write(
+            &msgs,
+            if out.is_empty() {
+                out
+            } else {
+                format!("{out}\n")
+            },
+        )?;
+    }
+    // This journal is an event stream rather than a one-record-per-message
+    // transcript, so an exact message boundary cannot be inferred safely.
+    // A fork can rebuild it from new events; keeping future events would be
+    // misleading.
+    let journal = session_dir.join("wire").join("journal.jsonl");
+    if journal.is_file() {
+        std::fs::remove_file(journal)?;
+    }
+    Ok(())
 }
 
 fn summary_from_meta(id: &str, dir: &Path, work: &Path, meta: &SessionMeta) -> SessionSummary {
@@ -340,6 +393,48 @@ mod tests {
         assert_eq!(store.list(false, 10).unwrap().len(), 1); // only s2
         assert_eq!(store.list(true, 10).unwrap().len(), 2);
         store.delete("s2").unwrap();
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn fork_with_message_limit_truncates_sidecar_without_touching_source() {
+        let home = std::env::temp_dir().join(format!("kkagent-store-{}", uuid::Uuid::new_v4()));
+        let store = SessionStore::new(&home);
+        let work = home.join("proj");
+        std::fs::create_dir_all(&work).unwrap();
+        let source = store.create("source", &work).unwrap();
+        let source_dir = PathBuf::from(&source.session_dir);
+        std::fs::write(
+            source_dir.join("messages.jsonl"),
+            "first\nassistant/tool\nsecond\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(source_dir.join("wire")).unwrap();
+        std::fs::write(source_dir.join("wire/journal.jsonl"), "future-event\n").unwrap();
+
+        let fork = store
+            .fork_with_message_limit("source", "edit", Some("Edit turn"), 2)
+            .unwrap();
+        let fork_dir = PathBuf::from(fork.session_dir);
+        assert_eq!(
+            std::fs::read_to_string(fork_dir.join("messages.jsonl")).unwrap(),
+            "first\nassistant/tool\n"
+        );
+        assert!(!fork_dir.join("wire/journal.jsonl").exists());
+        assert_eq!(
+            std::fs::read_to_string(source_dir.join("messages.jsonl")).unwrap(),
+            "first\nassistant/tool\nsecond\n"
+        );
+        assert!(source_dir.join("wire/journal.jsonl").is_file());
+
+        let empty = store
+            .fork_with_message_limit("source", "edit-first", None, 0)
+            .unwrap();
+        assert!(
+            std::fs::read_to_string(Path::new(&empty.session_dir).join("messages.jsonl"))
+                .unwrap()
+                .is_empty()
+        );
         let _ = std::fs::remove_dir_all(&home);
     }
 }

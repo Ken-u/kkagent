@@ -117,7 +117,7 @@ WebSocket 是广播流；慢客户端会收到 `resync_required`，随后应从�
 
 ## 本地 RPC
 
-默认 TUI 使用进程内 memory transport。独立 Server 在 Unix 使用 UDS；Windows endpoint 文件指向本机 loopback 端口。内部 RPC 覆盖会话创建、恢复、prompt、中断、模式/模型切换、compact、undo、usage、skills、plugins、tasks、approval、question 和 swarm 等操作。
+默认 TUI 使用进程内 memory transport。独立 Server 在 Unix 使用 UDS；Windows endpoint 文件指向本机 loopback 端口。内部 RPC 覆盖会话创建、恢复、prompt、中断、模式/模型切换、compact、undo、历史轮次枚举与精确分叉、usage、skills、plugins、tasks、approval、question 和 swarm 等操作。
 
 这是内部版本化接口；外部 Node 集成优先使用 HTTP/WS SDK，编辑器集成优先使用 ACP。
 

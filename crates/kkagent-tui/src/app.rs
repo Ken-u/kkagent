@@ -121,8 +121,12 @@ pub struct AppState {
     pub history_index: Option<usize>,
     /// Draft saved when entering history browse
     pub history_draft: String,
-    /// First Esc timestamp for double-Esc undo (millis since epoch)
+    /// First Esc timestamp for opening history edit on double-Esc.
     pub pending_esc_ms: Option<u128>,
+    /// Full prompts backing the history-edit picker.
+    pub history_edit_turns: Vec<HistoryEditTurn>,
+    /// One-shot composer text applied after the forked session finishes loading.
+    pub pending_resume_prefill: Option<(String, String)>,
     /// Sticky todo panel (above input), latest TodoList state.
     pub todos: Vec<TodoItem>,
     /// Expand sticky todo beyond the collapsed max rows.
@@ -275,6 +279,15 @@ pub enum ListPickerKind {
     Prompts,
     /// Swarm mode actions (`/swarm`).
     Swarm,
+    /// Select an earlier user prompt, fork before it, and edit the prompt.
+    HistoryEdit,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryEditTurn {
+    pub turn_index: usize,
+    pub message_index: usize,
+    pub text: String,
 }
 
 #[derive(Debug, Clone)]
@@ -699,6 +712,8 @@ impl AppState {
             history_index: None,
             history_draft: String::new(),
             pending_esc_ms: None,
+            history_edit_turns: Vec::new(),
+            pending_resume_prefill: None,
             todos: Vec::new(),
             todos_expanded: false,
             btw: crate::panes::BtwPanelState::default(),
@@ -1383,6 +1398,7 @@ impl TuiApp {
                     match result {
                         Ok(data) => {
                             if let Err(e) = self.apply_session_resume_data(&query, data) {
+                                self.clear_failed_resume(&query);
                                 self.jobs.push_error(
                                     Some(channel),
                                     Some(generation),
@@ -1393,6 +1409,7 @@ impl TuiApp {
                             }
                         }
                         Err(err) => {
+                            self.clear_failed_resume(&query);
                             self.jobs.push_error(
                                 Some(channel),
                                 Some(generation),
@@ -1665,12 +1682,20 @@ impl TuiApp {
 
     /// Esc: return to parent picker if any, otherwise close.
     fn pop_list_picker_level(&mut self) {
+        let closing_history_edit = self
+            .state
+            .list_picker
+            .as_ref()
+            .is_some_and(|picker| picker.kind == ListPickerKind::HistoryEdit);
         self.state.session_picker_preview = None;
         self.state.session_delete_confirm = None;
         if let Some(prev) = self.state.list_picker_stack.pop() {
             self.state.list_picker = Some(prev);
         } else {
             self.state.list_picker = None;
+        }
+        if closing_history_edit {
+            self.state.history_edit_turns.clear();
         }
     }
 
@@ -1679,6 +1704,7 @@ impl TuiApp {
         self.state.list_picker_stack.clear();
         self.state.session_picker_preview = None;
         self.state.session_delete_confirm = None;
+        self.state.history_edit_turns.clear();
     }
 
     /// Replace the active picker without touching the stack (refresh same surface).
@@ -1693,6 +1719,7 @@ impl TuiApp {
         self.state.list_picker_stack.clear();
         self.state.session_picker_preview = None;
         self.state.session_delete_confirm = None;
+        self.state.history_edit_turns.clear();
     }
 
     fn flush_pending_scroll(&mut self, scroll_delta: &mut i32) {
@@ -2468,7 +2495,8 @@ impl TuiApp {
                     self.state.quit_confirm = true;
                 }
             }
-            // Escape: dismiss overlays already handled above; here interrupt / double-Esc undo
+            // Escape: dismiss overlays already handled above; here interrupt /
+            // double-Esc history edit.
             KeyCode::Esc => {
                 if self.state.status != SessionStatus::Idle {
                     if let Some(sid) = &self.state.session_id {
@@ -2481,7 +2509,9 @@ impl TuiApp {
                     }
                     self.state.pending_esc_ms = None;
                 } else {
-                    // Idle: double-Esc within 600ms → undo last turn (messages + files)
+                    // Idle: double-Esc within 600ms opens the prompt history
+                    // selector. Selecting a turn forks before it, preserving
+                    // the original session and workspace files.
                     let now = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_millis())
@@ -2489,19 +2519,18 @@ impl TuiApp {
                     if let Some(prev) = self.state.pending_esc_ms {
                         if now.saturating_sub(prev) <= 600 {
                             self.state.pending_esc_ms = None;
-                            self.undo_turns(1).await?;
+                            self.open_history_edit_picker().await?;
                         } else {
                             self.state.pending_esc_ms = Some(now);
                             self.system_message(
-                                "Press Esc again to undo the last turn (messages + file changes)."
+                                "Press Esc again to browse earlier prompts and edit from one."
                                     .into(),
                             );
                         }
                     } else {
                         self.state.pending_esc_ms = Some(now);
                         self.system_message(
-                            "Press Esc again to undo the last turn (messages + file changes)."
-                                .into(),
+                            "Press Esc again to browse earlier prompts and edit from one.".into(),
                         );
                     }
                 }
@@ -3005,6 +3034,111 @@ impl TuiApp {
         Ok(())
     }
 
+    async fn open_history_edit_picker(&mut self) -> anyhow::Result<()> {
+        if self.state.status != SessionStatus::Idle {
+            self.system_message("History editing is available after the turn becomes idle.".into());
+            return Ok(());
+        }
+        let Some(session_id) = self.state.session_id.clone() else {
+            self.system_message("No active session.".into());
+            return Ok(());
+        };
+        let data = match self
+            .client
+            .rpc_call(
+                "session.turns",
+                Some(serde_json::json!({"session_id": session_id})),
+            )
+            .await
+        {
+            Ok(data) => data,
+            Err(error) => {
+                self.system_message(format!("Failed to load conversation history: {error}"));
+                return Ok(());
+            }
+        };
+        let turns = history_edit_turns_from_json(&data);
+        if turns.is_empty() {
+            self.system_message("No prior user prompts to edit.".into());
+            return Ok(());
+        }
+        let items = turns
+            .iter()
+            .map(|turn| ListPickerItem {
+                id: turn.message_index.to_string(),
+                label: format!(
+                    "#{}  {}",
+                    turn.turn_index + 1,
+                    history_turn_summary(&turn.text, 72)
+                ),
+                detail: String::new(),
+            })
+            .collect::<Vec<_>>();
+        let selected = items.len().saturating_sub(1);
+        self.begin_root_picker();
+        self.state.history_edit_turns = turns;
+        self.replace_list_picker(ListPickerState {
+            kind: ListPickerKind::HistoryEdit,
+            title: " Edit history · ↑↓ choose prompt · Enter fork & edit · Esc cancel ".into(),
+            items: items.clone(),
+            selected,
+            filter: String::new(),
+            all_items: items,
+        });
+        Ok(())
+    }
+
+    async fn fork_and_edit_turn(&mut self, turn: HistoryEditTurn) -> anyhow::Result<()> {
+        let source_id = self
+            .state
+            .session_id
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("No active session"))?;
+        let source_title = self
+            .state
+            .workspace_sessions
+            .entries
+            .iter()
+            .find(|entry| entry.id == source_id)
+            .map(|entry| entry.title.as_str())
+            .or_else(|| {
+                self.state
+                    .tab_strip
+                    .tabs
+                    .iter()
+                    .find(|tab| tab.id == source_id)
+                    .map(|tab| tab.title.as_str())
+            })
+            .filter(|title| !title.trim().is_empty())
+            .unwrap_or("session");
+        let title = format!("Undo: {source_title}");
+        let data = self
+            .client
+            .rpc_call(
+                "sessions.fork",
+                Some(serde_json::json!({
+                    "session_id": source_id,
+                    "title": title,
+                    "message_limit": turn.message_index,
+                })),
+            )
+            .await?;
+        let target_id = data
+            .get("session_id")
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("fork response did not include a session id"))?
+            .to_string();
+
+        self.clear_list_pickers();
+        self.link_open_sessions(&source_id, &target_id);
+        self.state
+            .tab_strip
+            .ensure_tab(&target_id, format!("edit #{}", turn.turn_index + 1));
+        self.state.pending_resume_prefill = Some((target_id.clone(), turn.text));
+        self.resume_session(&target_id).await
+    }
+
     async fn apply_list_picker(&mut self) -> anyhow::Result<()> {
         let Some(picker) = self.state.list_picker.take() else {
             return Ok(());
@@ -3133,6 +3267,25 @@ impl TuiApp {
                 }
                 _ => {}
             },
+            ListPickerKind::HistoryEdit => {
+                let message_index = item.id.parse::<usize>().ok();
+                let turn = message_index.and_then(|message_index| {
+                    self.state
+                        .history_edit_turns
+                        .iter()
+                        .find(|turn| turn.message_index == message_index)
+                        .cloned()
+                });
+                let Some(turn) = turn else {
+                    self.state.list_picker = Some(picker);
+                    self.system_message("The selected history turn is no longer available.".into());
+                    return Ok(());
+                };
+                if let Err(error) = self.fork_and_edit_turn(turn).await {
+                    self.state.list_picker = Some(picker);
+                    self.system_message(format!("Failed to fork conversation history: {error}"));
+                }
+            }
             ListPickerKind::SkillManage | ListPickerKind::McpManage => {
                 // Enter is handled by toggle_manage_picker; keep picker open.
                 self.state.list_picker = Some(picker);
@@ -4270,7 +4423,7 @@ impl TuiApp {
             ListPickerItem {
                 id: "esc".into(),
                 label: "Esc".into(),
-                detail: "Close overlay / interrupt / Esc Esc undo".into(),
+                detail: "Close / interrupt / Esc Esc edit history".into(),
             },
             ListPickerItem {
                 id: "shell".into(),
@@ -4745,6 +4898,14 @@ impl TuiApp {
     }
 
     async fn resume_session(&mut self, query: &str) -> anyhow::Result<()> {
+        if self
+            .state
+            .pending_resume_prefill
+            .as_ref()
+            .is_some_and(|(target, _)| target != query)
+        {
+            self.state.pending_resume_prefill = None;
+        }
         let leaving_id = self.state.session_id.clone();
         let leaving_empty = leaving_id
             .as_ref()
@@ -4793,6 +4954,25 @@ impl TuiApp {
             let _ = ctx.started_at.elapsed();
         }
         Ok(())
+    }
+
+    fn clear_failed_resume(&mut self, query: &str) {
+        if self
+            .state
+            .resume_switch
+            .as_ref()
+            .is_some_and(|switch| switch.target == query)
+        {
+            self.state.resume_switch = None;
+        }
+        if self
+            .state
+            .pending_resume_prefill
+            .as_ref()
+            .is_some_and(|(target, _)| target == query)
+        {
+            self.state.pending_resume_prefill = None;
+        }
     }
 
     fn apply_session_resume_data(
@@ -4963,6 +5143,23 @@ impl TuiApp {
             self.state.todos_expanded = false;
             self.state.search = crate::search::SearchState::default();
             self.state.highlight_message = None;
+        }
+
+        if self
+            .state
+            .pending_resume_prefill
+            .as_ref()
+            .is_some_and(|(target, _)| target == &sid)
+        {
+            if let Some((_, text)) = self.state.pending_resume_prefill.take() {
+                self.state.input.set_text(text);
+                self.state.history_index = None;
+                self.state.history_draft.clear();
+                self.system_message(
+                    "Forked before the selected turn. Edit the restored prompt and press Enter; the original session is preserved."
+                        .into(),
+                );
+            }
         }
 
         // Lazy history: show recent messages first, then backfill older pages
@@ -6025,8 +6222,13 @@ impl TuiApp {
                 }
             }
             "undo" => {
-                let count = args.trim().parse::<usize>().unwrap_or(1).max(1);
-                self.undo_turns(count).await?;
+                if args.trim().is_empty() {
+                    self.open_history_edit_picker().await?;
+                } else if let Ok(count) = args.trim().parse::<usize>() {
+                    self.undo_turns(count.max(1)).await?;
+                } else {
+                    self.system_message("Usage: /undo [turn_count]".into());
+                }
             }
             "timeline" | "tl" => {
                 let mut lines = Vec::new();
@@ -8009,9 +8211,62 @@ fn read_clipboard_text() -> anyhow::Result<String> {
     Ok(String::from_utf8(output.stdout)?)
 }
 
+fn history_edit_turns_from_json(data: &serde_json::Value) -> Vec<HistoryEditTurn> {
+    let mut turns = data
+        .get("turns")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|value| {
+            let turn_index = usize::try_from(value.get("turn_index")?.as_u64()?).ok()?;
+            let message_index = usize::try_from(value.get("message_index")?.as_u64()?).ok()?;
+            let text = value.get("text")?.as_str()?.trim().to_string();
+            (!text.is_empty()).then_some(HistoryEditTurn {
+                turn_index,
+                message_index,
+                text,
+            })
+        })
+        .collect::<Vec<_>>();
+    turns.sort_by_key(|turn| (turn.turn_index, turn.message_index));
+    turns.dedup_by_key(|turn| turn.message_index);
+    turns
+}
+
+fn history_turn_summary(text: &str, max_chars: usize) -> String {
+    let first_line = text
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("(empty prompt)");
+    let count = first_line.chars().count();
+    if count <= max_chars {
+        first_line.to_string()
+    } else {
+        let keep = max_chars.saturating_sub(1);
+        format!("{}…", first_line.chars().take(keep).collect::<String>())
+    }
+}
+
 #[cfg(test)]
 mod app_state_tests {
     use super::*;
+
+    #[test]
+    fn parses_and_summarizes_history_edit_turns() {
+        let turns = history_edit_turns_from_json(&serde_json::json!({
+            "turns": [
+                {"turn_index": 1, "message_index": 4, "text": "second\nline"},
+                {"turn_index": 0, "message_index": 0, "text": "first"},
+                {"turn_index": 2, "message_index": 9, "text": "  "},
+            ]
+        }));
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].text, "first");
+        assert_eq!(turns[1].message_index, 4);
+        assert_eq!(history_turn_summary("second\nline", 20), "second");
+        assert_eq!(history_turn_summary("abcdef", 4), "abc…");
+    }
 
     #[test]
     fn empty_session_ignores_system_notices() {
