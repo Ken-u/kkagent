@@ -907,6 +907,7 @@ struct AgentAcpHost {
 
 async fn initialize_session_context(state: &ServerState, session: &mut Session) {
     session.image_config = state.config.image.clone();
+    session.inject_working_directory_context();
     session.inject_date_reminder();
     session.inject_workspace_instructions().await;
     session.inject_git_context();
@@ -3478,11 +3479,9 @@ async fn handle_rpc_call(
             };
 
             let session_id = record.session_id.clone();
-            let resumed_working_dir = resolve_resume_working_dir(
-                &record.working_dir,
-                requested_workspace.as_deref(),
-            )
-            .map_err(|error| (-32602, error))?;
+            let resumed_working_dir =
+                resolve_resume_working_dir(&record.working_dir, requested_workspace.as_deref())
+                    .map_err(|error| (-32602, error))?;
 
             // If already in memory, prefer in-memory messages (may be ahead of DB)
             {
@@ -4808,14 +4807,10 @@ mod http_path_tests {
 
     #[test]
     fn resume_working_dir_is_scoped_to_the_requested_workspace() {
-        let root = std::env::temp_dir().join(format!(
-            "kkagent-resume-workspace-{}",
-            uuid::Uuid::new_v4()
-        ));
-        let other = std::env::temp_dir().join(format!(
-            "kkagent-resume-workspace-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("kkagent-resume-workspace-{}", uuid::Uuid::new_v4()));
+        let other =
+            std::env::temp_dir().join(format!("kkagent-resume-workspace-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         std::fs::create_dir_all(&other).unwrap();
         let canonical_root = std::fs::canonicalize(&root).unwrap();

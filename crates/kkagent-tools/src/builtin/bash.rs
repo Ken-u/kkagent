@@ -226,7 +226,10 @@ for background jobs (shell_id/stop remain as aliases)."
             "type": "object",
             "properties": {
                 "command": {"type": "string", "description": "Shell command to execute"},
-                "cwd": {"type": "string", "description": "Working directory (absolute or relative to session cwd)"},
+                "cwd": {
+                    "type": "string",
+                    "description": "The working directory in which to run the command. When omitted, the command runs in the session's working directory."
+                },
                 "description": {"type": "string", "description": "Short description of what this command does"},
                 "timeout": {
                     "type": "integer",
@@ -293,6 +296,12 @@ for background jobs (shell_id/stop remain as aliases)."
             .get("run_in_background")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        tracing::info!(
+            session_id = %ctx.session_id,
+            cwd = %cwd.display(),
+            run_in_background,
+            "Executing Bash command"
+        );
         let disable_timeout = input
             .get("disable_timeout")
             .and_then(|v| v.as_bool())
@@ -959,6 +968,21 @@ mod tests {
         truncate_utf8_bytes_in_place(&mut value, MAX_OUTPUT * 2);
         assert!(value.len() <= MAX_OUTPUT * 2);
         assert!(std::str::from_utf8(value.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn cwd_defaults_to_the_session_and_schema_does_not_invite_absolute_paths() {
+        let root = PathBuf::from("workspace-root");
+        assert_eq!(resolve_cwd(None, &root), root.clone());
+        assert_eq!(
+            resolve_cwd(Some("crates/core"), &root),
+            root.join("crates/core")
+        );
+
+        let schema = BashTool::default().parameters_schema();
+        let description = schema["properties"]["cwd"]["description"].as_str().unwrap();
+        assert!(description.contains("session's working directory"));
+        assert!(!description.contains("absolute or relative"));
     }
 
     #[cfg(unix)]

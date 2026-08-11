@@ -25,7 +25,10 @@ Rejects binary/image files — use ReadMediaFile for media."
         json!({
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "File path to read"},
+                "path": {
+                    "type": "string",
+                    "description": "Path to a text file. Relative paths resolve against the working directory; a path outside the working directory must be absolute."
+                },
                 "offset": {
                     "type": "integer",
                     "description": "Starting line (1-indexed; negative counts from end). Alias: line_offset."

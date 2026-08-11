@@ -18,7 +18,10 @@ impl Tool for WriteTool {
         json!({
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "File path to write"},
+                "path": {
+                    "type": "string",
+                    "description": "Path to the file to write. Relative paths resolve against the working directory; a path outside the working directory must be absolute."
+                },
                 "content": {"type": "string", "description": "Content to write"},
                 "mode": {"type": "string", "enum": ["overwrite", "append"], "description": "Write mode (default: overwrite)"},
                 "expected_content_hash": {

@@ -27,7 +27,10 @@ Returns paths sorted by modification time (newest first)."
             "type": "object",
             "properties": {
                 "pattern": {"type": "string", "description": "Glob pattern (e.g. '**/*.rs')"},
-                "path": {"type": "string", "description": "Root directory to search (defaults to cwd)"},
+                "path": {
+                    "type": "string",
+                    "description": "Directory to search. Accepts an absolute path, or a path relative to the current working directory. Defaults to the current working directory."
+                },
                 "include_ignored": {"type": "boolean", "description": "Include gitignored files (default false)"},
                 "head_limit": {"type": "integer", "description": "Max matches to return (default 100)"}
             },
@@ -50,11 +53,14 @@ Returns paths sorted by modification time (newest first)."
             .and_then(|v| v.as_u64())
             .unwrap_or(DEFAULT_MAX as u64) as usize;
 
-        let root_dir = if Path::new(root).is_absolute() {
+        let requested_root = if Path::new(root).is_absolute() {
             std::path::PathBuf::from(root)
         } else {
             ctx.working_dir.join(root)
         };
+        let root_dir = std::fs::canonicalize(&requested_root).unwrap_or(requested_root);
+        let workspace_dir =
+            std::fs::canonicalize(&ctx.working_dir).unwrap_or_else(|_| ctx.working_dir.clone());
 
         let glob_pattern = if pattern.starts_with("**/") {
             pattern.to_string()
@@ -97,6 +103,11 @@ Returns paths sorted by modification time (newest first)."
             }
             let rel = entry.path().strip_prefix(&root_dir).unwrap_or(entry.path());
             if matcher.is_match(rel) {
+                let display_path = entry
+                    .path()
+                    .strip_prefix(&workspace_dir)
+                    .map(std::path::Path::to_path_buf)
+                    .unwrap_or_else(|_| entry.path().to_path_buf());
                 let mtime = entry
                     .metadata()
                     .ok()
@@ -104,9 +115,9 @@ Returns paths sorted by modification time (newest first)."
                     .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
                 total_matches += 1;
                 if head_limit == 0 {
-                    unlimited.push((rel.to_path_buf(), mtime));
+                    unlimited.push((display_path, mtime));
                 } else {
-                    newest.push(Reverse((mtime, rel.to_path_buf())));
+                    newest.push(Reverse((mtime, display_path)));
                     if newest.len() > head_limit {
                         newest.pop();
                     }
@@ -170,6 +181,32 @@ mod tests {
             .await
             .unwrap();
         assert!(output.content.lines().next().unwrap().ends_with("z-new.rs"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn nested_workspace_results_keep_the_workspace_relative_prefix() {
+        let dir = std::env::temp_dir().join(format!("kkagent-glob-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/lib.rs"), "fn main() {}\n").unwrap();
+        let output = GlobTool
+            .execute(
+                json!({"pattern": "*.rs", "path": "src"}),
+                &ToolContext {
+                    working_dir: dir.clone(),
+                    session_id: "glob-test".into(),
+                    image: kkagent_config::ImageConfig::default(),
+                    tool_call_id: None,
+                    interrupted: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            std::path::PathBuf::from(&output.content),
+            std::path::PathBuf::from("src").join("lib.rs")
+        );
+        assert!(!output.content.contains(dir.to_string_lossy().as_ref()));
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

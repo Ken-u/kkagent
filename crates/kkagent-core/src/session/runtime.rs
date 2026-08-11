@@ -520,6 +520,12 @@ impl Session {
         let _ = self.question_tx.try_send(response);
     }
 
+    /// Inject the server-authoritative workspace root using Kimi's working-directory framing.
+    pub fn inject_working_directory_context(&mut self) {
+        self.system_prompt
+            .push_str(&working_directory_context(&self.working_dir));
+    }
+
     /// Append AGENTS.md / `.kkagent/AGENTS.md` into the system prompt (kimi-style workspace instructions).
     pub async fn inject_workspace_instructions(&mut self) {
         if let Some(file) = SessionInstructionsProvider::load(&self.working_dir).await {
@@ -541,6 +547,22 @@ impl Session {
         self.system_prompt
             .push_str(&format!("\n\n# Date\n\nToday's date is {today}.\n"));
     }
+}
+
+fn working_directory_context(working_dir: &std::path::Path) -> String {
+    format!(
+        r#"
+
+# Working Environment
+
+## Working Directory
+
+The current working directory is `{working_dir}`. This should be considered as the project root if you are instructed to perform tasks on the project. Tools may require absolute paths for some parameters; if so, you must use absolute paths for those parameters.
+
+For files inside this project root, prefer paths relative to the working directory in tool parameters and shell commands. Do not repeat the project root with `cd` or `git -C` when the command can run in the session's working directory. Use an absolute path only when a tool requires it or the user explicitly authorizes access outside the working directory.
+"#,
+        working_dir = working_dir.display()
+    )
 }
 
 fn resolve_session_dir(
@@ -683,4 +705,18 @@ pub fn messages_for_llm(session: &Session) -> Vec<ChatMessage> {
         });
     }
     messages
+}
+
+#[cfg(test)]
+mod working_directory_tests {
+    use super::*;
+
+    #[test]
+    fn context_names_the_root_and_prefers_relative_paths() {
+        let root = std::path::Path::new("/workspace/project");
+        let context = working_directory_context(root);
+        assert!(context.contains("`/workspace/project`"));
+        assert!(context.contains("prefer paths relative to the working directory"));
+        assert!(context.contains("git -C"));
+    }
 }

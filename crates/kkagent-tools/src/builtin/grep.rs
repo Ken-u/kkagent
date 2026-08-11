@@ -32,7 +32,10 @@ multiline, head_limit/offset, and glob/type filters."
             "type": "object",
             "properties": {
                 "pattern": {"type": "string", "description": "Regex pattern to search for"},
-                "path": {"type": "string", "description": "Directory or file to search in (defaults to cwd)"},
+                "path": {
+                    "type": "string",
+                    "description": "File or directory to search. Accepts an absolute path, or a path relative to the current working directory. Omit to search the current working directory."
+                },
                 "glob": {"type": "string", "description": "File glob pattern filter (e.g. '*.rs')"},
                 "type": {"type": "string", "description": "ripgrep file type filter (e.g. 'rust', 'py')"},
                 "-i": {"type": "boolean", "description": "Case-insensitive search (alias: case_insensitive)"},
@@ -121,9 +124,24 @@ multiline, head_limit/offset, and glob/type filters."
         } else {
             ctx.working_dir.join(search_path)
         };
+        let workspace_dir =
+            std::fs::canonicalize(&ctx.working_dir).unwrap_or_else(|_| ctx.working_dir.clone());
+        let resolved_search_dir =
+            std::fs::canonicalize(&search_dir).unwrap_or_else(|_| search_dir.clone());
+        let search_arg = resolved_search_dir
+            .strip_prefix(&workspace_dir)
+            .map(|path| {
+                if path.as_os_str().is_empty() {
+                    std::path::PathBuf::from(".")
+                } else {
+                    path.to_path_buf()
+                }
+            })
+            .unwrap_or(resolved_search_dir);
 
         let mut cmd = Command::new("rg");
         cmd.arg("--color=never");
+        cmd.current_dir(&ctx.working_dir);
 
         match output_mode {
             "files_with_matches" => {
@@ -173,7 +191,7 @@ multiline, head_limit/offset, and glob/type filters."
             }
         }
 
-        cmd.arg(pattern).arg(&search_dir);
+        cmd.arg(pattern).arg(&search_arg);
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
         cmd.kill_on_drop(true);
@@ -433,6 +451,7 @@ mod tests {
             2
         );
         assert!(!output.content.contains("credentials"));
+        assert!(!output.content.contains(dir.to_string_lossy().as_ref()));
         std::fs::remove_dir_all(dir).unwrap();
     }
 

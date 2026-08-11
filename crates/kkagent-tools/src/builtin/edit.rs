@@ -19,7 +19,10 @@ Preserves original CRLF/LF line endings."
         json!({
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "File path to edit"},
+                "path": {
+                    "type": "string",
+                    "description": "Path to the text file to edit. Relative paths resolve against the working directory; a path outside the working directory must be absolute."
+                },
                 "old_string": {"type": "string", "description": "Exact text to replace"},
                 "new_string": {"type": "string", "description": "Replacement text"},
                 "replace_all": {"type": "boolean", "description": "Replace all occurrences (default: false)"},
