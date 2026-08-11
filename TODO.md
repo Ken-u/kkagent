@@ -399,6 +399,37 @@
 - [x] 注入部分写入、损坏索引和损坏单 session 事件，验证其他历史可用、修复前备份及 support bundle 不包含敏感值 / transcript。（人工/跨平台 smoke，见文末）
 - [x] Windows、macOS、Linux 上验证文件锁 / 替换、进程组终止、测试路径、shell 补全、alternate screen 恢复和版本检查关闭行为一致。（人工/跨平台 smoke，见文末）
 
+## 十四、通用开发工具链沙箱（待办）
+
+> 不为 Rust、Node、Python、Go、Java/Android 等生态逐个开放整个用户目录。统一把宿主运行时、Agent 依赖缓存、用户配置和凭据拆成不同权限域，并在 macOS、Linux、Windows 上保持一致语义。
+
+### P0：工具链发现与权限模型
+
+- [ ] 增加声明式 `ToolchainProfile` / provider 注册表；根据 workspace manifest、环境变量、PATH shim 和规范化后的实际可执行文件识别 Rust、Node、Python、Go、Java/Android 等运行时，不在 Bash 命令字符串上堆语言特判。
+- [ ] 每个 profile 分别声明 `runtime_read_only`、`agent_cache_read_write`、环境变量覆盖、敏感配置和禁止路径；宿主编译器、SDK、版本管理器只读，依赖缓存写入 `~/.kkagent/toolchains/<ecosystem>/<fingerprint>/` 或等价的 kkagent 专属目录。
+- [ ] 不全局替换 `HOME` 来适配工具；按生态注入 `RUSTUP_HOME` / `CARGO_HOME`、npm/pnpm/yarn cache、`PIP_CACHE_DIR` / `UV_CACHE_DIR`、`GOMODCACHE` / `GOCACHE`、`GRADLE_USER_HOME` 等专用变量。
+- [ ] 默认拒绝 Cargo credentials、`.npmrc` token、`.netrc`、pip 私有索引凭据、Maven `settings.xml`、Gradle 用户属性、SSH/GPG、Android/ADB key 和系统钥匙串；私有依赖认证必须按 registry/host 另行显式授权。
+- [ ] 全局工具链安装和升级默认禁止，包括 `rustup install/update`、全局 npm/pip 安装、SDK Manager 更新；workspace 内的 `target`、`node_modules`、`.venv` 和项目缓存继续遵守 workspace 写权限。
+
+### P0：信任交互与三端落地
+
+- [ ] 首次 workspace 信任时聚合展示检测到的开发环境、宿主只读路径、kkagent 可写缓存和始终隔离的凭据；默认选择较窄权限，工具链路径或 fingerprint 变化时重新确认。
+- [ ] macOS Seatbelt 为 runtime 添加只读规则、为 kkagent cache 添加读写规则；Linux bwrap 使用对应 ro/rw bind 并在 `HOME=/tmp` 时注入获批的工具专用 HOME；Windows 当前 Job Object 模式复用同一环境隔离策略。
+- [ ] 保留 `sandbox.extra_read_paths` / `extra_write_paths` 作为高级逃生口，但不得把开放整个用户 HOME 或语言用户目录作为正常修复建议。
+- [ ] 明确并修正 `sandbox.mode` 语义：`disabled` 若承诺完全关闭沙箱，就必须同时跳过文件/网络隔离、Git 环境改写和 OS 资源/Job Object 限制；若保留资源限制则改名或在配置、doctor 和文档中明确展示实际生效层。
+
+### P1：缓存生命周期与诊断
+
+- [ ] kkagent 工具链缓存提供容量上限、LRU 清理、按生态/运行时 fingerprint 分区和可审计清单；不能与用户正常开发缓存互相污染。
+- [ ] Bash 因工具链路径受限失败时识别 `EPERM` / `EACCES`、缺失 runtime 和只读 cache 三类原因，给出一次明确的重启授权或配置建议，不让 Agent 通过反复改 `HOME`、`RUSTUP_TOOLCHAIN` 等无效尝试碰运气。
+- [ ] `kkagent doctor` 展示当前 sandbox mode、平台实际隔离层、已授权 runtime、Agent cache、被隔离的用户配置以及缺失依赖；输出不得包含 token、配置正文或私有 registry URL 中的凭据。
+
+### 验收与回归测试
+
+- [ ] macOS/Linux 在 workspace 模式下完成 Rust、Node、Python、Go 和 Gradle 的离线缓存构建及公共依赖首次下载；不得读取各生态凭据文件，不得修改宿主工具链和用户依赖缓存。
+- [ ] Windows 验证环境隔离、缓存目录和 Job Object 行为；三端对 `auto`、`workspace`、`process`、`disabled` 的用户可见语义一致，unsupported 模式继续 fail-closed。
+- [ ] 覆盖 rustup/nvm/Volta/pyenv/mise/asdf、绝对路径 runtime、自定义 HOME、路径变化、缓存损坏、私有 registry 和工具链缺失场景；拒绝授权后核心对话和非相关工具仍可使用。
+
 ## 文末：暂缓 / 手动项
 
 - archive / undo session：**评估暂缓**
