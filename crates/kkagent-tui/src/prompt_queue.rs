@@ -28,6 +28,7 @@ impl DeliveryState {
 #[derive(Debug, Clone)]
 pub struct QueuedPrompt {
     pub id: String,
+    pub session_id: String,
     pub text: String,
     pub images: Vec<(String, String)>,
     /// When true, send as steer into the current turn instead of next-turn queue.
@@ -35,9 +36,10 @@ pub struct QueuedPrompt {
 }
 
 impl QueuedPrompt {
-    pub fn next_turn(text: impl Into<String>) -> Self {
+    pub fn next_turn(session_id: impl Into<String>, text: impl Into<String>) -> Self {
         Self {
             id: Uuid::new_v4().to_string(),
+            session_id: session_id.into(),
             text: text.into(),
             images: Vec::new(),
             as_steer: false,
@@ -108,9 +110,9 @@ mod tests {
     #[test]
     fn queue_reorder_and_pop() {
         let mut q = PromptQueue::default();
-        q.push(QueuedPrompt::next_turn("a"));
-        q.push(QueuedPrompt::next_turn("b"));
-        q.push(QueuedPrompt::next_turn("c"));
+        q.push(QueuedPrompt::next_turn("session", "a"));
+        q.push(QueuedPrompt::next_turn("session", "b"));
+        q.push(QueuedPrompt::next_turn("session", "c"));
         q.selected = 2;
         q.move_selected(-1);
         assert_eq!(q.items[1].text, "c");

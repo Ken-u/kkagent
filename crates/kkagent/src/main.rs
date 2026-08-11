@@ -2471,6 +2471,14 @@ impl SessionTurnLocks {
     async fn remove(&self, session_id: &str) {
         self.entries.lock().await.remove(session_id);
     }
+
+    async fn is_busy(&self, session_id: &str) -> bool {
+        self.entries
+            .lock()
+            .await
+            .get(session_id)
+            .is_some_and(|semaphore| semaphore.available_permits() == 0)
+    }
 }
 
 impl ServerState {
@@ -3084,11 +3092,34 @@ fn mcp_status_json(snap: &kkagent_mcp::McpStatusSnapshot) -> serde_json::Value {
     })
 }
 
-/// Returns (display_slice, oldest_index, older_available).
-fn slice_recent_messages<T: Clone>(
-    messages: &[T],
+fn is_visible_user_turn_start(message: &ChatMessage) -> bool {
+    message.role == "user"
+        && message.content.iter().any(|content| match content {
+            ChatContent::Text { text } => {
+                !kkagent_protocol::visible_user_text(text).trim().is_empty()
+            }
+            ChatContent::Image { .. } | ChatContent::Video { .. } => true,
+            _ => false,
+        })
+}
+
+fn aligned_message_page_start(messages: &[ChatMessage], desired_start: usize) -> usize {
+    let mut start = desired_start.min(messages.len());
+    while start > 0
+        && messages
+            .get(start)
+            .is_some_and(|message| !is_visible_user_turn_start(message))
+    {
+        start -= 1;
+    }
+    start
+}
+
+/// Returns a recent display slice aligned to a complete user turn.
+fn slice_recent_messages(
+    messages: &[ChatMessage],
     display_limit: Option<usize>,
-) -> (Vec<T>, usize, bool) {
+) -> (Vec<ChatMessage>, usize, bool) {
     let total = messages.len();
     let Some(limit) = display_limit else {
         return (messages.to_vec(), 0, false);
@@ -3096,8 +3127,18 @@ fn slice_recent_messages<T: Clone>(
     if total <= limit {
         return (messages.to_vec(), 0, false);
     }
-    let start = total - limit;
+    let start = aligned_message_page_start(messages, total - limit);
     (messages[start..].to_vec(), start, true)
+}
+
+fn slice_message_page(
+    messages: &[ChatMessage],
+    before: usize,
+    limit: usize,
+) -> (Vec<ChatMessage>, usize, bool) {
+    let end = before.min(messages.len());
+    let start = aligned_message_page_start(messages, end.saturating_sub(limit));
+    (messages[start..end].to_vec(), start, start > 0)
 }
 
 fn resolve_session_id(db: &TranscriptDb, query: &str) -> Option<String> {
@@ -3696,12 +3737,14 @@ async fn handle_rpc_call(
             let resumed_working_dir =
                 resolve_resume_working_dir(&record.working_dir, requested_workspace.as_deref())
                     .map_err(|error| (-32602, error))?;
+            let turn_active = state.turn_locks.is_busy(&session_id).await;
 
             // If already in memory, prefer in-memory messages (may be ahead of DB)
             {
                 let sessions = state.sessions.lock().await;
                 if let Some(existing) = sessions.get(&session_id) {
                     let total = existing.messages.len();
+                    let usage = existing.usage.snapshot();
                     let (display, oldest_index, older_available) =
                         slice_recent_messages(&existing.messages, display_limit);
                     return Ok(serde_json::json!({
@@ -3711,6 +3754,14 @@ async fn handle_rpc_call(
                         "permission_mode": existing.get_permission_mode(),
                         "model": existing.get_model_alias(),
                         "working_dir": existing.working_dir,
+                        "turn_active": turn_active,
+                        "status": if turn_active { SessionStatus::Thinking } else { SessionStatus::Idle },
+                        "usage": {
+                            "input_tokens": usage.input_tokens,
+                            "output_tokens": usage.output_tokens,
+                            "cache_creation_tokens": usage.cache_creation_input_tokens,
+                            "cache_read_tokens": usage.cache_read_input_tokens,
+                        },
                         "history": {
                             "total": total,
                             "oldest_index": oldest_index,
@@ -3720,24 +3771,61 @@ async fn handle_rpc_call(
                 }
             }
 
-            let perm_mode = state
+            let configured_perm_mode = state
                 .config
                 .effective_permission_mode()
                 .parse()
                 .unwrap_or_default();
+            let shared_permission = {
+                let modes = state.permission_modes.lock().await;
+                modes.get(&session_id).cloned()
+            };
+            let perm_mode = shared_permission
+                .map(|mode| *mode.lock().unwrap_or_else(|e| e.into_inner()))
+                .unwrap_or(configured_perm_mode);
+            let resumed_model = {
+                let aliases = state.model_aliases.lock().await;
+                aliases
+                    .get(&session_id)
+                    .map(|alias| alias.lock().unwrap_or_else(|e| e.into_inner()).clone())
+                    .filter(|alias| !alias.is_empty())
+                    .unwrap_or_else(|| {
+                        if record.model.is_empty() {
+                            state
+                                .config
+                                .default_model_alias()
+                                .unwrap_or("default")
+                                .to_string()
+                        } else {
+                            record.model.clone()
+                        }
+                    })
+            };
+            if turn_active {
+                let total = messages.len();
+                let (display, oldest_index, older_available) =
+                    slice_recent_messages(&messages, display_limit);
+                return Ok(serde_json::json!({
+                    "session_id": session_id,
+                    "messages": display,
+                    "plan_mode": false,
+                    "permission_mode": perm_mode,
+                    "model": resumed_model,
+                    "working_dir": resumed_working_dir,
+                    "turn_active": true,
+                    "status": SessionStatus::Thinking,
+                    "history": {
+                        "total": total,
+                        "oldest_index": oldest_index,
+                        "older_available": older_available,
+                    },
+                }));
+            }
             let mut session = Session::resume(
                 session_id.clone(),
                 resumed_working_dir.clone(),
                 perm_mode,
-                if record.model.is_empty() {
-                    state
-                        .config
-                        .default_model_alias()
-                        .unwrap_or("default")
-                        .to_string()
-                } else {
-                    record.model.clone()
-                },
+                resumed_model,
             );
             let resumed_model = session.get_model_alias();
             initialize_session_context(&state, &mut session).await;
@@ -3790,6 +3878,8 @@ async fn handle_rpc_call(
                 "permission_mode": perm_mode,
                 "model": resumed_model,
                 "working_dir": resumed_working_dir,
+                "turn_active": false,
+                "status": SessionStatus::Idle,
                 "history": {
                     "total": total,
                     "oldest_index": oldest_index,
@@ -3816,21 +3906,33 @@ async fn handle_rpc_call(
                 .unwrap_or(40) as usize;
             let limit = limit.clamp(1, 200);
 
-            let sessions = state.sessions.lock().await;
-            let session = sessions
-                .get(&session_id)
-                .ok_or_else(|| (-32602, format!("Session not found: {session_id}")))?;
-            let total = session.messages.len();
-            let end = before.min(total);
-            let start = end.saturating_sub(limit);
-            let page = session.messages[start..end].to_vec();
+            let in_memory = {
+                let sessions = state.sessions.lock().await;
+                sessions
+                    .get(&session_id)
+                    .map(|session| session.messages.clone())
+            };
+            let messages = if let Some(messages) = in_memory {
+                messages
+            } else {
+                let db = state.transcript.lock().await;
+                let records = db
+                    .load_messages(&session_id)
+                    .map_err(|error| (-32000, error.to_string()))?;
+                if records.is_empty() && db.get_session(&session_id).ok().flatten().is_none() {
+                    return Err((-32602, format!("Session not found: {session_id}")));
+                }
+                messages_from_records(&records)
+            };
+            let total = messages.len();
+            let (page, start, older_available) = slice_message_page(&messages, before, limit);
             Ok(serde_json::json!({
                 "session_id": session_id,
                 "messages": page,
                 "history": {
                     "total": total,
                     "oldest_index": start,
-                    "older_available": start > 0,
+                    "older_available": older_available,
                     "before": before,
                 },
             }))
@@ -5037,6 +5139,35 @@ async fn handle_rpc_call(
 mod http_path_tests {
     use super::*;
 
+    fn text_message(role: &str, text: &str) -> ChatMessage {
+        ChatMessage {
+            role: role.into(),
+            content: vec![ChatContent::Text { text: text.into() }],
+        }
+    }
+
+    fn tool_use_message(id: &str) -> ChatMessage {
+        ChatMessage {
+            role: "assistant".into(),
+            content: vec![ChatContent::ToolUse {
+                id: id.into(),
+                name: "Read".into(),
+                input: serde_json::json!({"path": "file.rs"}),
+            }],
+        }
+    }
+
+    fn tool_result_message(id: &str) -> ChatMessage {
+        ChatMessage {
+            role: "user".into(),
+            content: vec![ChatContent::ToolResult {
+                tool_use_id: id.into(),
+                content: "result".into(),
+                is_error: false,
+            }],
+        }
+    }
+
     #[test]
     fn disable_sandbox_flag_overrides_only_the_runtime_config() {
         let cli = Cli::try_parse_from(["kkagent", "--disable-sandbox"]).unwrap();
@@ -5047,6 +5178,48 @@ mod http_path_tests {
 
         assert!(cli.disable_sandbox);
         assert_eq!(config.sandbox.mode, "disabled");
+    }
+
+    #[test]
+    fn transcript_pages_keep_tool_calls_inside_complete_turns() {
+        let messages = vec![
+            text_message("user", "first"),
+            tool_use_message("tool-a"),
+            tool_result_message("tool-a"),
+            text_message("assistant", "first done"),
+            text_message("user", "second"),
+            tool_use_message("tool-b"),
+            tool_result_message("tool-b"),
+        ];
+
+        let (recent, oldest, older) = slice_recent_messages(&messages, Some(2));
+        assert_eq!(oldest, 4);
+        assert!(older);
+        assert_eq!(recent.len(), 3);
+        assert!(is_visible_user_turn_start(&recent[0]));
+        assert!(matches!(
+            recent[2].content.first(),
+            Some(ChatContent::ToolResult { tool_use_id, .. }) if tool_use_id == "tool-b"
+        ));
+
+        let (older_page, oldest, older) = slice_message_page(&messages, 4, 2);
+        assert_eq!(oldest, 0);
+        assert!(!older);
+        assert_eq!(older_page.len(), 4);
+        assert!(matches!(
+            older_page[2].content.first(),
+            Some(ChatContent::ToolResult { tool_use_id, .. }) if tool_use_id == "tool-a"
+        ));
+    }
+
+    #[tokio::test]
+    async fn session_turn_lock_reports_active_turns() {
+        let locks = SessionTurnLocks::default();
+        assert!(!locks.is_busy("session").await);
+        let permit = locks.try_acquire("session").await.unwrap();
+        assert!(locks.is_busy("session").await);
+        drop(permit);
+        assert!(!locks.is_busy("session").await);
     }
 
     #[test]

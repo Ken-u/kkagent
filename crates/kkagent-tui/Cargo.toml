@@ -23,3 +23,6 @@ ignore = { workspace = true }
 uuid = { workspace = true }
 image = { workspace = true }
 pulldown-cmark = { version = "0.13", default-features = false }
+
+[dev-dependencies]
+kkagent-rpc = { workspace = true }

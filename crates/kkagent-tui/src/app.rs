@@ -177,6 +177,11 @@ pub struct AppState {
     pub history_total: Option<usize>,
     /// Per-session draft / scroll / search state (survives switches).
     pub session_views: std::collections::HashMap<String, crate::session_view::SessionViewState>,
+    /// Full runtime state for inactive sessions opened in this TUI.
+    pub session_runtime_states: std::collections::HashMap<String, SessionRuntimeState>,
+    /// Agent events received while their session is not focused.
+    pub background_session_events:
+        std::collections::HashMap<String, std::collections::VecDeque<AgentEvent>>,
     /// Debounced `/sessions` preview target.
     pub preview_debounce: Option<PreviewDebounce>,
     /// LRU cache of session.preview JSON payloads.
@@ -209,6 +214,100 @@ pub struct TurnUsageSample {
     pub cache_creation_tokens: u64,
     pub cache_read_tokens: u64,
     pub duration_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionRuntimeState {
+    pub messages: Vec<DisplayMessage>,
+    pub status: SessionStatus,
+    pub permission_mode: PermissionMode,
+    pub plan_mode: bool,
+    pub working_dir: std::path::PathBuf,
+    pub mode: AppMode,
+    pub thinking_text: String,
+    pub approx_tokens: u64,
+    pub approval_queue: std::collections::VecDeque<PendingApproval>,
+    pub todos: Vec<TodoItem>,
+    pub btw: crate::panes::BtwPanelState,
+    pub model_alias: Option<String>,
+    pub last_tool_name: Option<String>,
+    pub plan_document: Option<PlanDocument>,
+    pub plan_scroll_to_top: bool,
+    pub turn_started_at: Option<std::time::Instant>,
+    pub tokens_at_turn_start: u64,
+    pub history_oldest_index: Option<usize>,
+    pub history_total: Option<usize>,
+    pub prompt_queue: crate::prompt_queue::PromptQueue,
+    pub usage_session: SessionUsageTotals,
+    pub usage_turns: Vec<TurnUsageSample>,
+}
+
+impl SessionRuntimeState {
+    fn capture(state: &AppState) -> Self {
+        Self {
+            messages: state.messages.clone(),
+            status: state.status,
+            permission_mode: state.permission_mode,
+            plan_mode: state.plan_mode,
+            working_dir: state.working_dir.clone(),
+            mode: state.mode.clone(),
+            thinking_text: state.thinking_text.clone(),
+            approx_tokens: state.approx_tokens,
+            approval_queue: state.approval_queue.clone(),
+            todos: state.todos.clone(),
+            btw: state.btw.clone(),
+            model_alias: state.model_alias.clone(),
+            last_tool_name: state.last_tool_name.clone(),
+            plan_document: state.plan_document.clone(),
+            plan_scroll_to_top: state.plan_scroll_to_top,
+            turn_started_at: state.turn_started_at,
+            tokens_at_turn_start: state.tokens_at_turn_start,
+            history_oldest_index: state.history_oldest_index,
+            history_total: state.history_total,
+            prompt_queue: state.prompt_queue.clone(),
+            usage_session: state.usage_session.clone(),
+            usage_turns: state.usage_turns.clone(),
+        }
+    }
+
+    fn restore(self, state: &mut AppState) {
+        state.messages = self.messages;
+        state.status = self.status;
+        state.permission_mode = self.permission_mode;
+        state.plan_mode = self.plan_mode;
+        state.working_dir = self.working_dir;
+        state.mode = self.mode;
+        state.thinking_text = self.thinking_text;
+        state.approx_tokens = self.approx_tokens;
+        state.approval_queue = self.approval_queue;
+        state.todos = self.todos;
+        state.btw = self.btw;
+        state.model_alias = self.model_alias;
+        state.last_tool_name = self.last_tool_name;
+        state.plan_document = self.plan_document;
+        state.plan_scroll_to_top = self.plan_scroll_to_top;
+        state.turn_started_at = self.turn_started_at;
+        state.tokens_at_turn_start = self.tokens_at_turn_start;
+        state.history_loading = false;
+        state.history_oldest_index = self.history_oldest_index;
+        state.history_total = self.history_total;
+        state.prompt_queue = self.prompt_queue;
+        state.usage_session = self.usage_session;
+        state.usage_turns = self.usage_turns;
+        state.stream_cursor = crate::streaming::StreamingCursor::default();
+        state.render_cache.invalidate_all();
+        state.status_bar.cache_hit = None;
+        state.event_router.status = state.status;
+        state.event_router.turn_active = matches!(
+            state.status,
+            SessionStatus::Thinking
+                | SessionStatus::ToolExecuting
+                | SessionStatus::WaitingApproval
+                | SessionStatus::WaitingQuestion
+                | SessionStatus::Compacting
+                | SessionStatus::Cancelling
+        );
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -740,6 +839,8 @@ impl AppState {
             history_oldest_index: None,
             history_total: None,
             session_views: std::collections::HashMap::new(),
+            session_runtime_states: std::collections::HashMap::new(),
+            background_session_events: std::collections::HashMap::new(),
             preview_debounce: None,
             preview_cache: crate::session_view::PreviewLru::new(12),
             prompt_queue: crate::prompt_queue::PromptQueue::default(),
@@ -1348,12 +1449,15 @@ impl TuiApp {
 
     fn drain_job_results(&mut self) {
         while let Some(outcome) = self.jobs.try_recv() {
-            let is_shell = matches!(
+            let may_finish_out_of_order = matches!(
                 outcome.payload,
                 crate::async_jobs::JobPayload::LocalShell { .. }
+                    | crate::async_jobs::JobPayload::Prompt { .. }
             );
-            // Local shells may complete out of order; never drop their results.
-            if !is_shell && !self.jobs.is_current(outcome.channel, outcome.generation) {
+            // Local shells and prompts from different sessions may complete out of order.
+            if !may_finish_out_of_order
+                && !self.jobs.is_current(outcome.channel, outcome.generation)
+            {
                 continue;
             }
             let channel = outcome.channel;
@@ -1434,31 +1538,77 @@ impl TuiApp {
                     result,
                 } => {
                     self.jobs.mark_done(channel, generation);
+                    let is_current = self.state.session_id.as_deref() == Some(&session_id);
                     match result {
                         Ok(()) => {
                             self.jobs.mcp.waiting_for_prompt =
                                 self.jobs.mcp.configured && !self.jobs.mcp.initialized;
-                            if let Some(msg) = self.state.messages.iter_mut().rev().find(|m| {
-                                m.role == MessageRole::User
-                                    && m.idempotency_key.as_deref()
-                                        == Some(idempotency_key.as_str())
-                            }) {
-                                msg.delivery = crate::prompt_queue::DeliveryState::Sent;
+                            let messages = if is_current {
+                                Some(&mut self.state.messages)
+                            } else {
+                                self.state
+                                    .session_runtime_states
+                                    .get_mut(&session_id)
+                                    .map(|runtime| &mut runtime.messages)
+                            };
+                            if let Some(messages) = messages {
+                                if let Some(msg) = messages.iter_mut().rev().find(|m| {
+                                    m.role == MessageRole::User
+                                        && m.idempotency_key.as_deref()
+                                            == Some(idempotency_key.as_str())
+                                }) {
+                                    msg.delivery = crate::prompt_queue::DeliveryState::Sent;
+                                }
                             }
                             self.enqueue_workspace_sessions_refresh();
-                            let _ = session_id;
                         }
                         Err(err) => {
-                            self.state.status = SessionStatus::Idle;
                             self.jobs.mcp.waiting_for_prompt = false;
-                            if let Some(msg) = self.state.messages.iter_mut().rev().find(|m| {
-                                m.role == MessageRole::User
-                                    && m.idempotency_key.as_deref()
-                                        == Some(idempotency_key.as_str())
-                            }) {
-                                msg.delivery = crate::prompt_queue::DeliveryState::Failed;
-                                // Restore draft for edit/retry without losing the failed bubble.
-                                self.state.input.set_text(msg.content.clone());
+                            let failed_text = if is_current {
+                                self.state.status = SessionStatus::Idle;
+                                self.state.messages.iter_mut().rev().find_map(|msg| {
+                                    if msg.role == MessageRole::User
+                                        && msg.idempotency_key.as_deref()
+                                            == Some(idempotency_key.as_str())
+                                    {
+                                        msg.delivery = crate::prompt_queue::DeliveryState::Failed;
+                                        Some(msg.content.clone())
+                                    } else {
+                                        None
+                                    }
+                                })
+                            } else {
+                                self.state
+                                    .session_runtime_states
+                                    .get_mut(&session_id)
+                                    .and_then(|runtime| {
+                                        runtime.status = SessionStatus::Idle;
+                                        runtime.messages.iter_mut().rev().find_map(|msg| {
+                                            if msg.role == MessageRole::User
+                                                && msg.idempotency_key.as_deref()
+                                                    == Some(idempotency_key.as_str())
+                                            {
+                                                msg.delivery =
+                                                    crate::prompt_queue::DeliveryState::Failed;
+                                                Some(msg.content.clone())
+                                            } else {
+                                                None
+                                            }
+                                        })
+                                    })
+                            };
+                            if let Some(text) = failed_text {
+                                if is_current {
+                                    self.state.input.set_text(text);
+                                } else {
+                                    let view = self
+                                        .state
+                                        .session_views
+                                        .entry(session_id.clone())
+                                        .or_default();
+                                    view.draft = text;
+                                    view.cursor = view.draft.len();
+                                }
                             }
                             self.jobs.push_error(
                                 Some(channel),
@@ -1467,7 +1617,21 @@ impl TuiApp {
                                 true,
                                 0,
                             );
-                            self.system_message(format!("Error: {err}"));
+                            if is_current {
+                                self.system_message(format!("Error: {err}"));
+                            } else if let Some(runtime) =
+                                self.state.session_runtime_states.get_mut(&session_id)
+                            {
+                                runtime.messages.push(DisplayMessage {
+                                    role: MessageRole::System,
+                                    content: format!("Error: {err}"),
+                                    thinking: None,
+                                    parts: Vec::new(),
+                                    tool_calls: Vec::new(),
+                                    delivery: crate::prompt_queue::DeliveryState::Sent,
+                                    idempotency_key: None,
+                                });
+                            }
                         }
                     }
                 }
@@ -4888,24 +5052,15 @@ impl TuiApp {
         picker.selected = new_selected;
     }
 
-    async fn resume_session(&mut self, query: &str) -> anyhow::Result<()> {
-        if self
-            .state
-            .pending_resume_prefill
-            .as_ref()
-            .is_some_and(|(target, _)| target != query)
-        {
-            self.state.pending_resume_prefill = None;
-        }
+    fn cache_active_session_state(&mut self, target: &str) -> (Option<String>, bool) {
         let leaving_id = self.state.session_id.clone();
         let leaving_empty = leaving_id
             .as_ref()
-            .map(|id| id != query && !session_has_retained_io(&self.state.messages))
+            .map(|id| id != target && !session_has_retained_io(&self.state.messages))
             .unwrap_or(false);
 
-        // Persist UI context for the session we leave.
         if let Some(ref leaving) = leaving_id {
-            if leaving != query {
+            if leaving != target {
                 let view = crate::session_view::SessionViewState::capture(
                     &self.state.input,
                     self.state.scroll_up,
@@ -4915,6 +5070,9 @@ impl TuiApp {
                     self.state.highlight_message,
                 );
                 self.state.session_views.insert(leaving.clone(), view);
+                self.state
+                    .session_runtime_states
+                    .insert(leaving.clone(), SessionRuntimeState::capture(&self.state));
                 if let Some(approval) = self.state.approval_pending.take() {
                     self.state
                         .parked_approvals
@@ -4927,12 +5085,156 @@ impl TuiApp {
                 }
             }
         }
+        (leaving_id, leaving_empty)
+    }
+
+    fn restore_session_view(&mut self, session_id: &str) {
+        if let Some(view) = self.state.session_views.remove(session_id) {
+            view.restore_into(
+                &mut self.state.input,
+                &mut self.state.scroll_up,
+                &mut self.state.follow_bottom,
+                &mut self.state.todos_expanded,
+                &mut self.state.search,
+                &mut self.state.highlight_message,
+            );
+        } else if let Some(draft) = crate::draft_store::load_draft(session_id) {
+            self.state.input.set_text(draft.text);
+            self.state.input.cursor = draft.cursor.min(self.state.input.text.len());
+            self.state.scroll_up = 0;
+            self.state.follow_bottom = true;
+            self.state.todos_expanded = false;
+            self.state.search = crate::search::SearchState::default();
+            self.state.highlight_message = None;
+        } else {
+            self.state.input.clear();
+            self.state.scroll_up = 0;
+            self.state.follow_bottom = true;
+            self.state.todos_expanded = false;
+            self.state.search = crate::search::SearchState::default();
+            self.state.highlight_message = None;
+        }
+    }
+
+    fn delete_empty_session_after_switch(&mut self, leaving_id: Option<String>, target: &str) {
+        let Some(prev) = leaving_id else {
+            return;
+        };
+        if prev == target {
+            return;
+        }
+        let requester = self.client.requester();
+        let prev_id = prev.clone();
+        tokio::spawn(async move {
+            let params = serde_json::json!({"session_id": prev_id});
+            let _ = requester.rpc_call("sessions.delete", Some(params)).await;
+        });
+        self.state.tab_strip.tabs.retain(|t| t.id != prev);
+        self.state.open_session_group.retain(|id| id != &prev);
+        self.state.session_views.remove(&prev);
+        self.state.session_runtime_states.remove(&prev);
+        self.state.background_session_events.remove(&prev);
+    }
+
+    fn replay_background_session_events(&mut self, session_id: &str) {
+        let Some(mut events) = self.state.background_session_events.remove(session_id) else {
+            return;
+        };
+        while let Some(event) = events.pop_front() {
+            let data = serde_json::to_value(event).unwrap_or_default();
+            self.handle_server_event(Frame::Event {
+                event: "agent".into(),
+                scope: None,
+                data,
+            });
+        }
+    }
+
+    fn sync_active_session_status(&mut self) {
+        self.state.event_router.status = self.state.status;
+        self.state.event_router.turn_active = matches!(
+            self.state.status,
+            SessionStatus::Thinking
+                | SessionStatus::ToolExecuting
+                | SessionStatus::WaitingApproval
+                | SessionStatus::WaitingQuestion
+                | SessionStatus::Compacting
+                | SessionStatus::Cancelling
+        );
+    }
+
+    fn activate_cached_session(
+        &mut self,
+        session_id: &str,
+        cached: SessionRuntimeState,
+        leaving_id: Option<String>,
+        leaving_empty: bool,
+        started_at: std::time::Instant,
+    ) {
+        use crate::async_jobs::JobChannel;
+
+        let old_generation = self.jobs.current_generation(JobChannel::SessionResume);
+        self.jobs
+            .mark_done(JobChannel::SessionResume, old_generation);
+        self.jobs.next_generation(JobChannel::SessionResume);
+        self.state.resume_switch = None;
+        self.state.session_id = Some(session_id.to_string());
+        cached.restore(&mut self.state);
+        self.state.approval_pending = self.state.parked_approvals.remove(session_id);
+        self.state.question_pending = self.state.parked_questions.remove(session_id);
+        if self.state.approval_pending.is_some() {
+            self.state.status = SessionStatus::WaitingApproval;
+        } else if self.state.question_pending.is_some() {
+            self.state.status = SessionStatus::WaitingQuestion;
+        }
+        self.state.status_bar.session_id = Some(session_id.to_string());
+        self.state.tab_strip.ensure_active(session_id, "session");
+        self.state.list_picker = None;
+        self.state.session_picker_preview = None;
+        self.restore_session_view(session_id);
+        self.replay_background_session_events(session_id);
+        self.sync_active_session_status();
+        if let Some(oldest) = self.state.history_oldest_index.filter(|oldest| *oldest > 0) {
+            self.state.history_loading = true;
+            self.jobs.spawn_session_history(
+                self.client.requester(),
+                session_id.to_string(),
+                oldest,
+                40,
+            );
+        }
+        self.state.last_switch_metrics = Some(SessionSwitchMetrics {
+            target: session_id.to_string(),
+            first_feedback_ms: 0,
+            visible_ms: started_at.elapsed().as_millis() as u64,
+        });
+        if leaving_empty {
+            self.delete_empty_session_after_switch(leaving_id, session_id);
+        }
+        self.enqueue_workspace_sessions_refresh();
+    }
+
+    async fn resume_session(&mut self, query: &str) -> anyhow::Result<()> {
+        if self
+            .state
+            .pending_resume_prefill
+            .as_ref()
+            .is_some_and(|(target, _)| target != query)
+        {
+            self.state.pending_resume_prefill = None;
+        }
+        let started_at = std::time::Instant::now();
+        let (leaving_id, leaving_empty) = self.cache_active_session_state(query);
+        if let Some(cached) = self.state.session_runtime_states.remove(query) {
+            self.activate_cached_session(query, cached, leaving_id, leaving_empty, started_at);
+            return Ok(());
+        }
 
         self.state.resume_switch = Some(ResumeSwitchCtx {
             target: query.to_string(),
             leaving_id,
             leaving_empty,
-            started_at: std::time::Instant::now(),
+            started_at,
         });
         // Keep showing the current transcript until the target loads.
         self.jobs.spawn_session_resume(
@@ -4999,28 +5301,73 @@ impl TuiApp {
             .and_then(|v| v.as_str())
             .unwrap_or(query)
             .to_string();
+        if leaving_id.as_deref() != Some(sid.as_str())
+            && self.state.session_id.as_deref() == leaving_id.as_deref()
+        {
+            if let Some(ref leaving) = leaving_id {
+                let view = crate::session_view::SessionViewState::capture(
+                    &self.state.input,
+                    self.state.scroll_up,
+                    self.state.follow_bottom,
+                    self.state.todos_expanded,
+                    &self.state.search,
+                    self.state.highlight_message,
+                );
+                self.state.session_views.insert(leaving.clone(), view);
+                self.state
+                    .session_runtime_states
+                    .insert(leaving.clone(), SessionRuntimeState::capture(&self.state));
+                if let Some(approval) = self.state.approval_pending.take() {
+                    self.state
+                        .parked_approvals
+                        .insert(leaving.clone(), approval);
+                }
+                if let Some(question) = self.state.question_pending.take() {
+                    self.state
+                        .parked_questions
+                        .insert(leaving.clone(), question);
+                }
+            }
+        }
         self.state.session_id = Some(sid.clone());
         if let Some(working_dir) = data.get("working_dir").and_then(|v| v.as_str()) {
             self.state.working_dir = std::fs::canonicalize(working_dir)
                 .unwrap_or_else(|_| std::path::PathBuf::from(working_dir));
         }
-        if let Some(draft) = crate::draft_store::load_draft(&sid) {
-            if self.state.input.is_empty() && !draft.text.is_empty() {
-                self.state.input.set_text(draft.text);
-                self.state.input.cursor = draft.cursor.min(self.state.input.text.len());
-            }
-        }
         self.state.messages.clear();
         self.state.todos.clear();
         self.state.todos_expanded = false;
         self.state.thinking_text.clear();
+        self.state.last_tool_name = None;
+        self.state.plan_document = None;
+        self.state.plan_scroll_to_top = false;
+        self.state.turn_started_at = None;
+        self.state.tokens_at_turn_start = 0;
+        self.state.approx_tokens = 0;
+        self.state.approval_queue.clear();
+        self.state.btw = crate::panes::BtwPanelState::default();
+        self.state.prompt_queue = crate::prompt_queue::PromptQueue::default();
+        self.state.usage_session = SessionUsageTotals::default();
+        self.state.usage_turns.clear();
         self.state.scroll_up = 0;
         self.state.follow_bottom = true;
         self.state.render_cache.invalidate_all();
         self.state.history_loading = false;
         self.state.history_oldest_index = None;
         self.state.history_total = None;
-        self.state.status = SessionStatus::Idle;
+        let turn_active = data
+            .get("turn_active")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        self.state.status = data
+            .get("status")
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok())
+            .unwrap_or(if turn_active {
+                SessionStatus::Thinking
+            } else {
+                SessionStatus::Idle
+            });
         self.state.approval_pending = self.state.parked_approvals.remove(&sid);
         self.state.question_pending = self.state.parked_questions.remove(&sid);
         if self.state.approval_pending.is_some() {
@@ -5093,18 +5440,7 @@ impl TuiApp {
         }
 
         if leaving_empty {
-            if let Some(prev) = leaving_id {
-                if prev != sid {
-                    let requester = self.client.requester();
-                    let prev_id = prev.clone();
-                    tokio::spawn(async move {
-                        let params = serde_json::json!({"session_id": prev_id});
-                        let _ = requester.rpc_call("sessions.delete", Some(params)).await;
-                    });
-                    self.state.tab_strip.tabs.retain(|t| t.id != prev);
-                    self.state.open_session_group.retain(|id| id != &prev);
-                }
-            }
+            self.delete_empty_session_after_switch(leaving_id, &sid);
         }
 
         if !self.state.open_session_group.iter().any(|id| id == &sid) {
@@ -5118,23 +5454,7 @@ impl TuiApp {
         self.enqueue_workspace_sessions_refresh();
 
         // Restore UI context captured when we last left this session.
-        if let Some(view) = self.state.session_views.remove(&sid) {
-            view.restore_into(
-                &mut self.state.input,
-                &mut self.state.scroll_up,
-                &mut self.state.follow_bottom,
-                &mut self.state.todos_expanded,
-                &mut self.state.search,
-                &mut self.state.highlight_message,
-            );
-        } else {
-            self.state.input.clear();
-            self.state.scroll_up = 0;
-            self.state.follow_bottom = true;
-            self.state.todos_expanded = false;
-            self.state.search = crate::search::SearchState::default();
-            self.state.highlight_message = None;
-        }
+        self.restore_session_view(&sid);
 
         if self
             .state
@@ -5173,6 +5493,12 @@ impl TuiApp {
                     .spawn_session_history(self.client.requester(), sid.clone(), oldest, 40);
             }
         }
+        if turn_active {
+            self.replay_background_session_events(&sid);
+        } else {
+            self.state.background_session_events.remove(&sid);
+        }
+        self.sync_active_session_status();
         Ok(())
     }
 
@@ -5257,6 +5583,9 @@ impl TuiApp {
         let params = serde_json::json!({"session_id": session_id});
         let _ = self.client.rpc_call("sessions.delete", Some(params)).await;
         self.state.tab_strip.tabs.retain(|t| t.id != session_id);
+        self.state.session_views.remove(session_id);
+        self.state.session_runtime_states.remove(session_id);
+        self.state.background_session_events.remove(session_id);
         if self.state.tab_strip.active >= self.state.tab_strip.tabs.len() {
             self.state.tab_strip.active = self.state.tab_strip.tabs.len().saturating_sub(1);
         }
@@ -5828,6 +6157,8 @@ impl TuiApp {
                 self.state.parked_approvals.remove(&deleted_id);
                 self.state.parked_questions.remove(&deleted_id);
                 self.state.session_views.remove(&deleted_id);
+                self.state.session_runtime_states.remove(&deleted_id);
+                self.state.background_session_events.remove(&deleted_id);
                 let was_current = self.state.session_id.as_deref() == Some(deleted_id.as_str());
                 if was_current {
                     self.refresh_workspace_sessions().await?;
@@ -5916,9 +6247,17 @@ impl TuiApp {
                 | SessionStatus::Compacting
         );
         if busy && self.state.queue_when_busy {
+            let Some(session_id) = self.state.session_id.clone() else {
+                self.state.input.set_text(text);
+                self.system_message("No active session.".into());
+                return Ok(());
+            };
             self.state
                 .prompt_queue
-                .push(crate::prompt_queue::QueuedPrompt::next_turn(text.clone()));
+                .push(crate::prompt_queue::QueuedPrompt::next_turn(
+                    session_id,
+                    text.clone(),
+                ));
             self.state.messages.push(DisplayMessage {
                 role: MessageRole::User,
                 content: text,
@@ -6002,8 +6341,13 @@ impl TuiApp {
             return;
         };
         let Some(sid) = self.state.session_id.clone() else {
+            self.state.prompt_queue.items.insert(0, item);
             return;
         };
+        if item.session_id != sid {
+            self.state.prompt_queue.items.insert(0, item);
+            return;
+        }
         let idem = uuid::Uuid::new_v4().to_string();
         if let Some(msg) = self.state.messages.iter_mut().rev().find(|m| {
             m.role == MessageRole::User
@@ -6998,29 +7342,25 @@ impl TuiApp {
                 );
 
                 if !is_current {
-                    match evt {
+                    match &evt {
                         AgentEvent::ApprovalRequested { request, .. } => {
-                            let pending = pending_approval_from_request(&request);
+                            let pending = pending_approval_from_request(request);
                             self.state.parked_approvals.insert(evt_sid.clone(), pending);
                             self.state.tab_strip.mark_dirty(&evt_sid, true);
                             self.state.tab_strip.ensure_tab(&evt_sid, "needs approval");
-                            self.system_message(format!(
-                                "Background session {} needs approval — Tab / ←→ to switch.",
-                                &evt_sid[..8.min(evt_sid.len())]
-                            ));
                         }
                         AgentEvent::QuestionAsked { question, .. } => {
                             let options: Vec<(String, String)> = question
                                 .options
-                                .into_iter()
-                                .map(|o| (o.id, o.label))
+                                .iter()
+                                .map(|o| (o.id.clone(), o.label.clone()))
                                 .collect();
                             let toggled = vec![false; options.len()];
                             self.state.parked_questions.insert(
                                 evt_sid.clone(),
                                 PendingQuestion {
-                                    question_id: question.question_id,
-                                    text: question.text,
+                                    question_id: question.question_id.clone(),
+                                    text: question.text.clone(),
                                     options,
                                     allow_free_text: question.allow_free_text,
                                     allow_multiple: question.allow_multiple,
@@ -7031,32 +7371,26 @@ impl TuiApp {
                                 },
                             );
                             self.state.tab_strip.mark_dirty(&evt_sid, true);
-                            self.system_message(format!(
-                                "Background session {} asked a question — Tab / ←→ to switch.",
-                                &evt_sid[..8.min(evt_sid.len())]
-                            ));
                         }
                         AgentEvent::Error { message, .. } if message != "Interrupted" => {
-                            self.system_message(format!(
-                                "Background session {}: {message}",
-                                &evt_sid[..8.min(evt_sid.len())]
-                            ));
-                        }
-                        AgentEvent::CompactCompleted { deleted, error, .. } => {
                             self.state.tab_strip.mark_dirty(&evt_sid, true);
-                            if let Some(err) = error {
-                                self.system_message(format!(
-                                    "Background session {} compact failed: {err}",
-                                    &evt_sid[..8.min(evt_sid.len())]
-                                ));
-                            } else {
-                                self.system_message(format!(
-                                    "Background session {} compacted ({deleted} removed).",
-                                    &evt_sid[..8.min(evt_sid.len())]
-                                ));
-                            }
+                        }
+                        AgentEvent::CompactCompleted { .. } => {
+                            self.state.tab_strip.mark_dirty(&evt_sid, true);
                         }
                         _ => {}
+                    }
+                    if !matches!(
+                        &evt,
+                        AgentEvent::ApprovalRequested { .. }
+                            | AgentEvent::QuestionAsked { .. }
+                            | AgentEvent::Heartbeat { .. }
+                    ) {
+                        self.state
+                            .background_session_events
+                            .entry(evt_sid)
+                            .or_default()
+                            .push_back(evt);
                     }
                     return;
                 }
@@ -8235,6 +8569,15 @@ fn history_turn_summary(text: &str, max_chars: usize) -> String {
 mod app_state_tests {
     use super::*;
 
+    fn test_tui_app() -> TuiApp {
+        let (client_transport, _server_transport) =
+            kkagent_rpc::transport::memory::create_memory_pair();
+        let (event_tx, event_rx) = tokio::sync::mpsc::channel(16);
+        let rpc = kkagent_rpc::RpcClient::new(client_transport, event_tx);
+        let client = kkagent_client::KkagentClient::new(rpc, event_rx);
+        TuiApp::new(AppConfig::default(), client)
+    }
+
     #[test]
     fn reconnect_guidance_is_only_used_for_remote_connections() {
         let remote = connection_loss_message(true, "peer closed");
@@ -8293,6 +8636,118 @@ mod app_state_tests {
             delivery: crate::prompt_queue::DeliveryState::Sent,
             idempotency_key: None,
         }]));
+    }
+
+    #[tokio::test]
+    async fn background_session_events_are_replayed_without_polluting_active_content() {
+        let mut app = test_tui_app();
+        app.state.session_id = Some("a".into());
+        app.state.status = SessionStatus::Thinking;
+        app.state.messages.push(DisplayMessage {
+            role: MessageRole::User,
+            content: "run a".into(),
+            thinking: None,
+            parts: Vec::new(),
+            tool_calls: Vec::new(),
+            delivery: crate::prompt_queue::DeliveryState::Sent,
+            idempotency_key: None,
+        });
+        app.cache_active_session_state("b");
+
+        app.state.session_id = Some("b".into());
+        app.state.status = SessionStatus::Idle;
+        app.state.messages = vec![DisplayMessage {
+            role: MessageRole::User,
+            content: "stay in b".into(),
+            thinking: None,
+            parts: Vec::new(),
+            tool_calls: Vec::new(),
+            delivery: crate::prompt_queue::DeliveryState::Sent,
+            idempotency_key: None,
+        }];
+
+        for event in [
+            AgentEvent::MessageDelta {
+                session_id: "a".into(),
+                text: "answer".into(),
+            },
+            AgentEvent::ToolCall {
+                session_id: "a".into(),
+                tool_call_id: "tool-1".into(),
+                tool_name: "Read".into(),
+                input: serde_json::json!({"path": "a.rs"}),
+            },
+            AgentEvent::ToolResult {
+                session_id: "a".into(),
+                tool_call_id: "tool-1".into(),
+                tool_name: "Read".into(),
+                output: "file body".into(),
+                is_error: false,
+            },
+            AgentEvent::TodoUpdated {
+                session_id: "a".into(),
+                items: vec![kkagent_protocol::TodoItemEvent {
+                    id: "todo-1".into(),
+                    content: "finish".into(),
+                    status: "in_progress".into(),
+                }],
+            },
+            AgentEvent::StatusUpdate {
+                session_id: "a".into(),
+                status: SessionStatus::Idle,
+            },
+        ] {
+            app.handle_server_event(Frame::Event {
+                event: "agent".into(),
+                scope: None,
+                data: serde_json::to_value(event).unwrap(),
+            });
+        }
+
+        assert_eq!(app.state.messages.len(), 1);
+        assert_eq!(app.state.messages[0].content, "stay in b");
+
+        app.resume_session("a").await.unwrap();
+
+        assert_eq!(app.state.messages.len(), 2);
+        let assistant = app.state.messages.last().unwrap();
+        assert_eq!(assistant.content, "answer");
+        assert!(matches!(
+            assistant.parts.get(1),
+            Some(DisplayPart::Tool(tool)) if tool.output.as_deref() == Some("file body")
+        ));
+        assert_eq!(app.state.todos.len(), 1);
+        assert_eq!(app.state.todos[0].content, "finish");
+        assert_eq!(app.state.status, SessionStatus::Idle);
+        assert!(!app.state.background_session_events.contains_key("a"));
+    }
+
+    #[test]
+    fn session_runtime_state_keeps_prompt_queues_isolated() {
+        let mut state = AppState::new(PermissionMode::Manual, false);
+        state.session_id = Some("a".into());
+        state
+            .prompt_queue
+            .push(crate::prompt_queue::QueuedPrompt::next_turn(
+                "a",
+                "next for a",
+            ));
+        state.todos.push(TodoItem {
+            id: "a-todo".into(),
+            content: "only a".into(),
+            status: "pending".into(),
+        });
+        let cached_a = SessionRuntimeState::capture(&state);
+
+        state.session_id = Some("b".into());
+        state.prompt_queue = crate::prompt_queue::PromptQueue::default();
+        state.todos.clear();
+        assert!(state.prompt_queue.is_empty());
+
+        cached_a.restore(&mut state);
+        assert_eq!(state.prompt_queue.items.len(), 1);
+        assert_eq!(state.prompt_queue.items[0].session_id, "a");
+        assert_eq!(state.todos[0].content, "only a");
     }
 
     #[test]

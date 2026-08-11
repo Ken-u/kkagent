@@ -1791,6 +1791,7 @@ dependencies = [
  "kkagent-client",
  "kkagent-config",
  "kkagent-protocol",
+ "kkagent-rpc",
  "pulldown-cmark",
  "ratatui",
  "serde",
