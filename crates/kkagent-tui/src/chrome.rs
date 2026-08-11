@@ -13,22 +13,76 @@ use unicode_width::UnicodeWidthStr;
 use crate::theme::Theme;
 
 const SESSION_TITLE_MAX_COLS: usize = 18;
+const SESSION_SPINNER_FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
-fn session_status_mark(entry: &WorkspaceSessionEntry) -> &'static str {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionIndicator {
+    None,
+    Running(char),
+    Waiting(char),
+    Attention,
+    Dirty,
+}
+
+impl SessionIndicator {
+    fn text(self) -> String {
+        match self {
+            Self::None => String::new(),
+            Self::Running(ch) => ch.to_string(),
+            Self::Waiting(ch) => format!("{ch} ?"),
+            Self::Attention => "!".into(),
+            Self::Dirty => "*".into(),
+        }
+    }
+
+    fn style(self, theme: &Theme) -> Style {
+        match self {
+            Self::Running(_) => Style::default()
+                .fg(theme.primary)
+                .add_modifier(Modifier::BOLD),
+            Self::Waiting(_) | Self::Attention => Style::default()
+                .fg(theme.warning)
+                .add_modifier(Modifier::BOLD),
+            Self::Dirty => Style::default().fg(theme.text_muted),
+            Self::None => Style::default().fg(theme.text_dim),
+        }
+    }
+}
+
+fn session_indicator(entry: &WorkspaceSessionEntry, tick: usize) -> SessionIndicator {
+    let frame = SESSION_SPINNER_FRAMES[(tick / 2) % SESSION_SPINNER_FRAMES.len()];
+    let running = matches!(
+        entry.status,
+        SessionStatus::Thinking
+            | SessionStatus::ToolExecuting
+            | SessionStatus::Compacting
+            | SessionStatus::Cancelling
+    );
+    if running {
+        return SessionIndicator::Running(frame);
+    }
+    if matches!(
+        entry.status,
+        SessionStatus::WaitingApproval | SessionStatus::WaitingQuestion
+    ) {
+        return SessionIndicator::Waiting(frame);
+    }
     if entry.needs_attention {
-        return "!";
+        return SessionIndicator::Attention;
     }
     if entry.dirty {
-        return "*";
+        return SessionIndicator::Dirty;
     }
-    match entry.status {
-        SessionStatus::Thinking
-        | SessionStatus::ToolExecuting
-        | SessionStatus::Compacting
-        | SessionStatus::Cancelling => "…",
-        SessionStatus::WaitingApproval | SessionStatus::WaitingQuestion => "?",
-        SessionStatus::Idle => "",
-    }
+    SessionIndicator::None
+}
+
+#[derive(Debug, Clone)]
+struct SessionRenderLabel {
+    is_active: bool,
+    indicator: SessionIndicator,
+    title: String,
+    text: String,
+    id: String,
 }
 
 #[derive(Debug, Clone)]
@@ -215,28 +269,43 @@ impl WorkspaceSessionStrip {
         &self,
         max_cols: usize,
         theme: &Theme,
+        tick: usize,
     ) -> (Vec<Span<'static>>, Vec<SessionStripHit>) {
         if self.entries.is_empty() || max_cols < 4 {
             return (Vec::new(), Vec::new());
         }
-        let labels: Vec<(bool, String, String)> = self
+        let labels: Vec<SessionRenderLabel> = self
             .entries
             .iter()
             .enumerate()
             .map(|(i, e)| {
-                let mark = session_status_mark(e);
+                let indicator = session_indicator(e, tick);
+                let indicator_text = indicator.text();
                 let title = truncate_cols(&e.title, SESSION_TITLE_MAX_COLS);
-                let label = if i == self.active {
-                    format!("[{mark}{title}]")
+                let body = if indicator_text.is_empty() {
+                    title.clone()
                 } else {
-                    format!("{mark}{title}")
+                    format!("{indicator_text} {title}")
                 };
-                (i == self.active, label, e.id.clone())
+                let text = if i == self.active {
+                    format!("[{body}]")
+                } else {
+                    body
+                };
+                SessionRenderLabel {
+                    is_active: i == self.active,
+                    indicator,
+                    title,
+                    text,
+                    id: e.id.clone(),
+                }
             })
             .collect();
 
-        let label_pairs: Vec<(bool, String)> =
-            labels.iter().map(|(a, l, _)| (*a, l.clone())).collect();
+        let label_pairs: Vec<(bool, String)> = labels
+            .iter()
+            .map(|label| (label.is_active, label.text.clone()))
+            .collect();
         let (start, end, left_overflow, right_overflow) =
             visible_window(&label_pairs, self.active, max_cols);
 
@@ -248,37 +317,44 @@ impl WorkspaceSessionStrip {
             col += UnicodeWidthStr::width(s.as_str());
             spans.push(Span::styled(s, Style::default().fg(theme.text_muted)));
         }
-        for (i, (is_active, label, id)) in labels[start..end].iter().enumerate() {
+        for (i, label) in labels[start..end].iter().enumerate() {
             if i > 0 {
                 let sep = " · ".to_string();
                 col += UnicodeWidthStr::width(sep.as_str());
                 spans.push(Span::styled(sep, Style::default().fg(theme.text_muted)));
             }
-            let w = UnicodeWidthStr::width(label.as_str());
+            let w = UnicodeWidthStr::width(label.text.as_str());
             hits.push(SessionStripHit {
-                session_id: id.clone(),
+                session_id: label.id.clone(),
                 full_title: self
                     .entries
                     .iter()
-                    .find(|e| e.id == *id)
+                    .find(|e| e.id == label.id)
                     .map(|e| e.title.clone())
-                    .unwrap_or_else(|| id.clone()),
+                    .unwrap_or_else(|| label.id.clone()),
                 x0: col,
                 x1: col + w,
             });
             col += w;
-            if *is_active {
-                spans.push(Span::styled(
-                    label.clone(),
-                    Style::default()
-                        .fg(theme.accent)
-                        .add_modifier(Modifier::BOLD),
-                ));
+            let title_style = if label.is_active {
+                Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::BOLD)
             } else {
+                Style::default().fg(theme.text_dim)
+            };
+            if label.is_active {
+                spans.push(Span::styled("[".to_string(), title_style));
+            }
+            if label.indicator != SessionIndicator::None {
                 spans.push(Span::styled(
-                    label.clone(),
-                    Style::default().fg(theme.text_dim),
+                    format!("{} ", label.indicator.text()),
+                    label.indicator.style(theme),
                 ));
+            }
+            spans.push(Span::styled(label.title.clone(), title_style));
+            if label.is_active {
+                spans.push(Span::styled("]".to_string(), title_style));
             }
         }
         if right_overflow {
@@ -290,8 +366,8 @@ impl WorkspaceSessionStrip {
         (spans, hits)
     }
 
-    pub fn render_spans(&self, max_cols: usize, theme: &Theme) -> Vec<Span<'static>> {
-        self.render_spans_with_hits(max_cols, theme).0
+    pub fn render_spans(&self, max_cols: usize, theme: &Theme, tick: usize) -> Vec<Span<'static>> {
+        self.render_spans_with_hits(max_cols, theme, tick).0
     }
 }
 
@@ -711,12 +787,87 @@ mod tests {
             });
         }
         strip.set_entries(entries, Some("id8"));
-        let spans = strip.render_spans(40, &theme);
+        let spans = strip.render_spans(40, &theme, 0);
         let text: String = spans.iter().map(|s| s.content.clone()).collect();
         assert!(text.contains('8') || text.contains('['));
         assert!(
             text.contains('‹') || text.contains('›') || text.contains('·') || text.contains('[')
         );
+    }
+
+    #[test]
+    fn workspace_strip_animates_each_running_session() {
+        let theme = Theme::default();
+        let mut strip = WorkspaceSessionStrip::default();
+        strip.set_entries(
+            vec![
+                WorkspaceSessionEntry {
+                    id: "thinking".into(),
+                    title: "alpha".into(),
+                    status: SessionStatus::Thinking,
+                    dirty: true,
+                    needs_attention: false,
+                },
+                WorkspaceSessionEntry {
+                    id: "tool".into(),
+                    title: "beta".into(),
+                    status: SessionStatus::ToolExecuting,
+                    dirty: true,
+                    needs_attention: false,
+                },
+                WorkspaceSessionEntry {
+                    id: "idle".into(),
+                    title: "gamma".into(),
+                    status: SessionStatus::Idle,
+                    dirty: false,
+                    needs_attention: false,
+                },
+            ],
+            Some("thinking"),
+        );
+
+        let (frame_0_spans, hits) = strip.render_spans_with_hits(80, &theme, 0);
+        let frame_0: String = frame_0_spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        let frame_2: String = strip
+            .render_spans(80, &theme, 2)
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+
+        assert!(frame_0.contains("[⠋ alpha]"), "{frame_0:?}");
+        assert!(frame_0.contains("⠋ beta"), "{frame_0:?}");
+        assert!(frame_0.contains("gamma"), "{frame_0:?}");
+        assert!(!frame_0.contains("⠋ gamma"), "{frame_0:?}");
+        assert!(frame_2.contains("[⠙ alpha]"), "{frame_2:?}");
+        assert!(frame_2.contains("⠙ beta"), "{frame_2:?}");
+        assert_eq!(hits[0].x1 - hits[0].x0, UnicodeWidthStr::width("[⠋ alpha]"));
+        assert_eq!(hits[1].x1 - hits[1].x0, UnicodeWidthStr::width("⠋ beta"));
+    }
+
+    #[test]
+    fn workspace_strip_keeps_waiting_sessions_distinct_from_running() {
+        let theme = Theme::default();
+        let mut strip = WorkspaceSessionStrip::default();
+        strip.set_entries(
+            vec![WorkspaceSessionEntry {
+                id: "approval".into(),
+                title: "review".into(),
+                status: SessionStatus::WaitingApproval,
+                dirty: true,
+                needs_attention: false,
+            }],
+            Some("approval"),
+        );
+
+        let text: String = strip
+            .render_spans(40, &theme, 0)
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert_eq!(text, "[⠋ ? review]");
     }
 
     #[test]

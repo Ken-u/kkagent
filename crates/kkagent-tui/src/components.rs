@@ -1386,7 +1386,8 @@ fn render_footer(
         ));
     }
 
-    // Line 2: [spinner] workspace session strip (left) + sandbox + context (right)
+    // Line 2: per-session activity strip (left) + sandbox + context (right)
+    sync_footer_session_entries(state);
     let context = format_context(state, config);
     let ctx_w = UnicodeWidthStr::width(context.as_str());
     let (sandbox, sandbox_color) = sandbox_indicator(&config.sandbox.mode, theme);
@@ -1396,21 +1397,12 @@ fn render_footer(
     let strip_budget = (area.width as usize)
         .saturating_sub(right_w)
         .saturating_sub(gap);
-    let session_busy = session_strip_has_busy(state);
-    let spinner_cols = if session_busy { 2 } else { 0 }; // "⠋ "
-    let (session_spans, relative_hits) = state
-        .workspace_sessions
-        .render_spans_with_hits(strip_budget.saturating_sub(spinner_cols), theme);
+    let (session_spans, relative_hits) =
+        state
+            .workspace_sessions
+            .render_spans_with_hits(strip_budget, theme, state.tick);
     let mut line2_spans: Vec<Span> = Vec::new();
-    if session_busy {
-        let frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-        let ch = frames[(state.tick / 2) % frames.len()];
-        line2_spans.push(Span::styled(
-            format!("{ch} "),
-            Style::default().fg(theme.primary),
-        ));
-    }
-    let strip_origin_x = area.x.saturating_add(spinner_cols as u16);
+    let strip_origin_x = area.x;
     state.footer_area = area;
     state.session_strip_origin_x = strip_origin_x;
     state.session_strip_hits = relative_hits
@@ -1442,33 +1434,53 @@ fn render_footer(
     );
 }
 
-fn session_status_is_busy(status: SessionStatus) -> bool {
-    matches!(
-        status,
-        SessionStatus::Thinking
-            | SessionStatus::ToolExecuting
-            | SessionStatus::WaitingApproval
-            | SessionStatus::WaitingQuestion
-            | SessionStatus::Compacting
-    )
-}
+fn sync_footer_session_entries(state: &mut AppState) {
+    let Some(current_id) = state.session_id.clone() else {
+        return;
+    };
 
-/// True when the current session or any session in the footer strip is running.
-fn session_strip_has_busy(state: &AppState) -> bool {
-    if session_status_is_busy(state.status) {
-        return true;
+    if !state
+        .workspace_sessions
+        .entries
+        .iter()
+        .any(|entry| entry.id == current_id)
+    {
+        let title = state
+            .tab_strip
+            .tabs
+            .iter()
+            .find(|tab| tab.id == current_id)
+            .map(|tab| tab.title.clone())
+            .filter(|title| !title.is_empty())
+            .unwrap_or_else(|| "session".into());
+        state
+            .workspace_sessions
+            .entries
+            .push(crate::chrome::WorkspaceSessionEntry {
+                id: current_id.clone(),
+                title,
+                status: state.status,
+                dirty: false,
+                needs_attention: false,
+            });
     }
-    for entry in &state.workspace_sessions.entries {
-        if state.session_id.as_deref() == Some(entry.id.as_str()) {
-            continue;
+
+    for entry in &mut state.workspace_sessions.entries {
+        if entry.id == current_id {
+            entry.status = state.status;
+        } else if let Some(tab) = state.tab_strip.tabs.iter().find(|tab| tab.id == entry.id) {
+            entry.status = tab.status;
+            entry.dirty = tab.dirty;
         }
-        if let Some(tab) = state.tab_strip.tabs.iter().find(|t| t.id == entry.id) {
-            if session_status_is_busy(tab.status) || tab.dirty {
-                return true;
-            }
-        }
+        entry.needs_attention = state.parked_approvals.contains_key(&entry.id)
+            || state.parked_questions.contains_key(&entry.id);
     }
-    false
+    state.workspace_sessions.active = state
+        .workspace_sessions
+        .entries
+        .iter()
+        .position(|entry| entry.id == current_id)
+        .unwrap_or(0);
 }
 
 fn render_scroll_hint(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
@@ -2525,6 +2537,28 @@ mod render_smoke {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(footer.contains("● sandbox:off  context:"), "{footer:?}");
+    }
+
+    #[test]
+    fn footer_attaches_spinner_to_the_running_session() {
+        let backend = TestBackend::new(100, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = AppState::new(PermissionMode::Manual, false);
+        state.session_id = Some("session-1".into());
+        state.tab_strip.ensure_active("session-1", "main");
+        state.status = SessionStatus::Thinking;
+        state.tick = 0;
+
+        terminal
+            .draw(|frame| render_ui(frame, &mut state, &AppConfig::default()))
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let footer = (0..buffer.area.width)
+            .filter_map(|x| buffer.cell((x, buffer.area.height - 1)))
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(footer.starts_with("[⠋ main]"), "{footer:?}");
     }
 
     #[test]
