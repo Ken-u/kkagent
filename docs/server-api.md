@@ -78,7 +78,7 @@ curl -sS -H "$AUTH" -H 'Content-Type: application/json' \
 | `GET /api/v1/turns/{task-id}` | 查询持久 turn 状态；也兼容 Session ID 查询最近一项。 |
 | `DELETE /api/v1/turns/{task-id}` | 取消排队/运行/待审批 turn，并中断对应 Session。 |
 | `GET /api/v1/sessions` | 列出会话。 |
-| `POST /api/v1/sessions` | 创建会话；body 为 `{workspace?, title?}`。 |
+| `POST /api/v1/sessions` | 创建会话；body 为 `{workspace, title?}`，`workspace` 必填。 |
 | `GET /api/v1/sessions/{id}` | 读取会话。 |
 | `DELETE /api/v1/sessions/{id}` | 删除会话。 |
 | `POST /api/v1/sessions/{id}/messages` | 提交 `{text}`。 |

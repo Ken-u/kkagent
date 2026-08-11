@@ -1418,8 +1418,9 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
     ) -> Result<serde_json::Value, String> {
         let id = uuid::Uuid::new_v4().to_string();
         let requested = workspace
+            .filter(|value| !value.trim().is_empty())
             .map(PathBuf::from)
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+            .ok_or_else(|| "workspace is required".to_string())?;
         let cwd = std::fs::canonicalize(&requested)
             .map_err(|error| format!("invalid workspace {}: {error}", requested.display()))?;
         if !kkagent_core::is_workspace_trusted(&self.state.config, &cwd) {
@@ -2945,6 +2946,37 @@ fn resolve_session_id(db: &TranscriptDb, query: &str) -> Option<String> {
     }
 }
 
+fn resolve_resume_working_dir(
+    stored_working_dir: &str,
+    requested_workspace: Option<&Path>,
+) -> Result<PathBuf, String> {
+    let requested = requested_workspace
+        .map(std::fs::canonicalize)
+        .transpose()
+        .map_err(|error| format!("invalid current workspace: {error}"))?;
+    let stored = PathBuf::from(stored_working_dir);
+    let candidate = if stored.is_absolute() {
+        stored
+    } else if let Some(root) = requested.as_ref() {
+        root.join(stored)
+    } else {
+        stored
+    };
+    let resolved = std::fs::canonicalize(&candidate).map_err(|error| {
+        format!(
+            "session working directory {} is unavailable: {error}",
+            candidate.display()
+        )
+    })?;
+    if requested.as_ref().is_some_and(|root| root != &resolved) {
+        return Err(format!(
+            "session was created under a different directory: {}. Start kkagent from that directory to resume it",
+            resolved.display()
+        ));
+    }
+    Ok(resolved)
+}
+
 async fn handle_rpc_call(
     state: Arc<ServerState>,
     method: &str,
@@ -2958,7 +2990,8 @@ async fn handle_rpc_call(
                 .as_ref()
                 .and_then(|p| p.get("workspace"))
                 .and_then(|v| v.as_str())
-                .unwrap_or(".")
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| (-32602, "Missing workspace".to_string()))?
                 .to_string();
             let workspace = std::fs::canonicalize(&requested_workspace).map_err(|error| {
                 (
@@ -3423,6 +3456,12 @@ async fn handle_rpc_call(
                 .and_then(|p| p.get("display_limit").or_else(|| p.get("tail")))
                 .and_then(|v| v.as_u64())
                 .map(|n| n as usize);
+            let requested_workspace = params
+                .as_ref()
+                .and_then(|p| p.get("workspace"))
+                .and_then(|v| v.as_str())
+                .filter(|value| !value.trim().is_empty())
+                .map(PathBuf::from);
 
             let (record, messages) = {
                 let db = state.transcript.lock().await;
@@ -3439,6 +3478,11 @@ async fn handle_rpc_call(
             };
 
             let session_id = record.session_id.clone();
+            let resumed_working_dir = resolve_resume_working_dir(
+                &record.working_dir,
+                requested_workspace.as_deref(),
+            )
+            .map_err(|error| (-32602, error))?;
 
             // If already in memory, prefer in-memory messages (may be ahead of DB)
             {
@@ -3453,6 +3497,7 @@ async fn handle_rpc_call(
                         "plan_mode": existing.plan_mode,
                         "permission_mode": existing.get_permission_mode(),
                         "model": existing.get_model_alias(),
+                        "working_dir": existing.working_dir,
                         "history": {
                             "total": total,
                             "oldest_index": oldest_index,
@@ -3469,7 +3514,7 @@ async fn handle_rpc_call(
                 .unwrap_or_default();
             let mut session = Session::resume(
                 session_id.clone(),
-                PathBuf::from(&record.working_dir),
+                resumed_working_dir.clone(),
                 perm_mode,
                 if record.model.is_empty() {
                     state
@@ -3531,6 +3576,7 @@ async fn handle_rpc_call(
                 "plan_mode": false,
                 "permission_mode": perm_mode,
                 "model": resumed_model,
+                "working_dir": resumed_working_dir,
                 "history": {
                     "total": total,
                     "oldest_index": oldest_index,
@@ -4758,6 +4804,36 @@ mod http_path_tests {
             trusted_workspaces: vec![root.display().to_string()],
             ..AppConfig::default()
         }
+    }
+
+    #[test]
+    fn resume_working_dir_is_scoped_to_the_requested_workspace() {
+        let root = std::env::temp_dir().join(format!(
+            "kkagent-resume-workspace-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let other = std::env::temp_dir().join(format!(
+            "kkagent-resume-workspace-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let canonical_root = std::fs::canonicalize(&root).unwrap();
+
+        assert_eq!(
+            resolve_resume_working_dir(root.to_str().unwrap(), Some(&root)).unwrap(),
+            canonical_root
+        );
+        assert_eq!(
+            resolve_resume_working_dir(".", Some(&root)).unwrap(),
+            canonical_root
+        );
+
+        let error = resolve_resume_working_dir(root.to_str().unwrap(), Some(&other)).unwrap_err();
+        assert!(error.contains("different directory"));
+
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(other).unwrap();
     }
 
     #[test]

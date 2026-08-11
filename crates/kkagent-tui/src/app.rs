@@ -48,6 +48,8 @@ pub struct AppState {
     pub permission_mode: PermissionMode,
     pub plan_mode: bool,
     pub session_id: Option<String>,
+    /// Server-authoritative working directory for the active session.
+    pub working_dir: std::path::PathBuf,
     pub mode: AppMode,
     pub should_quit: bool,
     pub quit_confirm: bool,
@@ -640,6 +642,10 @@ pub struct PendingQuestion {
 
 impl AppState {
     pub fn new(permission_mode: PermissionMode, plan_mode: bool) -> Self {
+        let working_dir = std::env::current_dir()
+            .ok()
+            .and_then(|path| std::fs::canonicalize(path).ok())
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
         Self {
             messages: Vec::new(),
             input: InputState::new(),
@@ -647,6 +653,7 @@ impl AppState {
             permission_mode,
             plan_mode,
             session_id: None,
+            working_dir: working_dir.clone(),
             mode: if plan_mode {
                 AppMode::Plan
             } else {
@@ -687,10 +694,7 @@ impl AppState {
             tick: 0,
             last_event_at: None,
             connection_unknown: false,
-            input_history: {
-                let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-                crate::input_history_store::load(&cwd)
-            },
+            input_history: crate::input_history_store::load(&working_dir),
             history_index: None,
             history_draft: String::new(),
             pending_esc_ms: None,
@@ -839,8 +843,7 @@ impl AppState {
         }
         self.history_index = None;
         self.history_draft.clear();
-        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-        self.input_history = crate::input_history_store::push(&cwd, t);
+        self.input_history = crate::input_history_store::push(&self.working_dir, t);
     }
 
     pub fn history_prev(&mut self) {
@@ -915,8 +918,7 @@ impl AppState {
             return;
         };
         let quoted = text[token_start..].starts_with("@\"");
-        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let items = crate::pi::autocomplete::complete_at_files(&cwd, &query, 24);
+        let items = crate::pi::autocomplete::complete_at_files(&self.working_dir, &query, 24);
         let selected = self
             .file_menu
             .as_ref()
@@ -970,7 +972,7 @@ impl TuiApp {
         let startup_started = std::time::Instant::now();
         // Create / resume session BEFORE taking over the terminal, so RPC
         // failures don't leave the user's shell stuck in raw/alternate mode.
-        let cwd = std::env::current_dir()?.to_string_lossy().to_string();
+        let cwd = self.state.working_dir.to_string_lossy().into_owned();
         if let Some(id) = resume {
             if let Err(e) = self.resume_session(&id).await {
                 eprintln!("Resume failed ({}): {}. Starting a new session.", id, e);
@@ -2371,7 +2373,7 @@ impl TuiApp {
                     || (cfg!(target_os = "windows")
                         && key.modifiers.contains(KeyModifiers::ALT)) =>
             {
-                match paste_clipboard_into_workspace() {
+                match paste_clipboard_into_workspace(&self.state.working_dir) {
                     Ok(Some(path)) => {
                         let mention = format!("@{}", path.to_string_lossy());
                         self.state.input.insert_str(&mention);
@@ -3821,8 +3823,7 @@ impl TuiApp {
 
     fn open_context_picker(&mut self) {
         let mut items = Vec::new();
-        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-        for src in crate::instruction_scan::scan_project_instructions(&cwd) {
+        for src in crate::instruction_scan::scan_project_instructions(&self.state.working_dir) {
             let status = if !src.readable {
                 "unreadable"
             } else if src.effective {
@@ -4580,10 +4581,7 @@ impl TuiApp {
     }
 
     fn apply_session_picker_list(&mut self, data: serde_json::Value) {
-        let cwd = std::env::current_dir()
-            .ok()
-            .and_then(|p| std::fs::canonicalize(&p).ok())
-            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let cwd = self.state.working_dir.clone();
         let cwd_key = cwd.to_string_lossy().to_string();
         let mut items = Vec::new();
         let current = self.state.session_id.clone();
@@ -4776,8 +4774,11 @@ impl TuiApp {
             started_at: std::time::Instant::now(),
         });
         // Keep showing the current transcript until the target loads.
-        self.jobs
-            .spawn_session_resume(self.client.requester(), query.to_string());
+        self.jobs.spawn_session_resume(
+            self.client.requester(),
+            query.to_string(),
+            self.state.working_dir.to_string_lossy().into_owned(),
+        );
         // First feedback is the non-blocking job notice (same tick).
         if let Some(ctx) = self.state.resume_switch.as_ref() {
             let _ = ctx.started_at.elapsed();
@@ -4819,6 +4820,10 @@ impl TuiApp {
             .unwrap_or(query)
             .to_string();
         self.state.session_id = Some(sid.clone());
+        if let Some(working_dir) = data.get("working_dir").and_then(|v| v.as_str()) {
+            self.state.working_dir = std::fs::canonicalize(working_dir)
+                .unwrap_or_else(|_| std::path::PathBuf::from(working_dir));
+        }
         if let Some(draft) = crate::draft_store::load_draft(&sid) {
             if self.state.input.is_empty() && !draft.text.is_empty() {
                 self.state.input.set_text(draft.text);
@@ -5588,7 +5593,7 @@ impl TuiApp {
                 if let Some(id) = fallback {
                     self.resume_session(&id).await?;
                 } else {
-                    let cwd = std::env::current_dir()?.to_string_lossy().to_string();
+                    let cwd = self.state.working_dir.to_string_lossy().into_owned();
                     let session_id = self
                         .client
                         .create_session(Some(&cwd), Some(self.state.permission_mode))
@@ -5647,7 +5652,7 @@ impl TuiApp {
                     if let Some(id) = fallback {
                         self.resume_session(&id).await?;
                     } else {
-                        let cwd = std::env::current_dir()?.to_string_lossy().to_string();
+                        let cwd = self.state.working_dir.to_string_lossy().into_owned();
                         let session_id = self
                             .client
                             .create_session(Some(&cwd), Some(self.state.permission_mode))
@@ -5795,8 +5800,8 @@ impl TuiApp {
         });
         self.state.follow_bottom = true;
         self.state.scroll_up = 0;
-        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-        self.jobs.spawn_local_shell(cmd, cwd);
+        self.jobs
+            .spawn_local_shell(cmd, self.state.working_dir.clone());
         Ok(())
     }
 
@@ -5950,7 +5955,7 @@ impl TuiApp {
                 self.state.plan_scroll_to_top = false;
                 self.state.status = SessionStatus::Idle;
                 self.state.turn_started_at = None;
-                let cwd = std::env::current_dir()?.to_string_lossy().to_string();
+                let cwd = self.state.working_dir.to_string_lossy().into_owned();
                 let session_id = self
                     .client
                     .create_session(Some(&cwd), Some(self.state.permission_mode))
@@ -6282,9 +6287,7 @@ impl TuiApp {
                     let abs = if path.is_absolute() {
                         path
                     } else {
-                        std::env::current_dir()
-                            .unwrap_or_else(|_| std::path::PathBuf::from("."))
-                            .join(path)
+                        self.state.working_dir.join(path)
                     };
                     if abs.is_dir() {
                         self.system_message(format!(
@@ -7888,8 +7891,7 @@ fn copy_to_clipboard_native(text: &str) -> anyhow::Result<()> {
     }
 }
 
-fn paste_clipboard_into_workspace() -> anyhow::Result<Option<PathBuf>> {
-    let root = std::env::current_dir()?;
+fn paste_clipboard_into_workspace(root: &std::path::Path) -> anyhow::Result<Option<PathBuf>> {
     let dir = root.join(".kkagent").join("attachments");
     std::fs::create_dir_all(&dir)?;
     let path = dir.join(format!("pasted-{}.png", uuid::Uuid::new_v4()));
@@ -7908,7 +7910,7 @@ fn paste_clipboard_into_workspace() -> anyhow::Result<Option<PathBuf>> {
     })?;
     image.save_with_format(&path, image::ImageFormat::Png)?;
     Ok(Some(
-        path.strip_prefix(&root).unwrap_or(&path).to_path_buf(),
+        path.strip_prefix(root).unwrap_or(&path).to_path_buf(),
     ))
 }
 

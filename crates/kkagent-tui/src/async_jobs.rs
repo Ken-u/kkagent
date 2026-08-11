@@ -311,7 +311,12 @@ impl AsyncJobHub {
         generation
     }
 
-    pub fn spawn_session_resume(&mut self, requester: KkagentRequester, query: String) -> u64 {
+    pub fn spawn_session_resume(
+        &mut self,
+        requester: KkagentRequester,
+        query: String,
+        workspace: String,
+    ) -> u64 {
         let generation = self.next_generation(JobChannel::SessionResume);
         let started = Instant::now();
         self.pending.insert(
@@ -326,6 +331,7 @@ impl AsyncJobHub {
                 retry_params: Some(serde_json::json!({
                     "session_id": query,
                     "display_limit": 60,
+                    "workspace": workspace,
                 })),
             },
         );
@@ -335,6 +341,7 @@ impl AsyncJobHub {
             let params = serde_json::json!({
                 "session_id": q,
                 "display_limit": 60,
+                "workspace": workspace,
             });
             let result = requester
                 .rpc_call("session.resume", Some(params))

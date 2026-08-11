@@ -95,6 +95,7 @@ pub fn render_ui(f: &mut Frame, state: &mut AppState, config: &AppConfig) {
     state.status_bar.tokens = state.approx_tokens;
     state.status_bar.model = state.model_alias.clone();
     state.status_bar.session_id = state.session_id.clone();
+    state.status_bar.cwd = Some(state.working_dir.to_string_lossy().into_owned());
 
     render_messages(f, msg_area, state, &theme);
     render_scroll_hint(f, msg_area, state, &theme);
@@ -1308,13 +1309,14 @@ fn render_footer(f: &mut Frame, area: Rect, state: &mut AppState, config: &AppCo
         ));
     }
 
-    if let Ok(cwd) = std::env::current_dir() {
+    {
+        let cwd = &state.working_dir;
         left.push(Span::raw("  "));
         left.push(Span::styled(
             shorten_path(&cwd.to_string_lossy()),
             Style::default().fg(theme.text_dim),
         ));
-        let git = git_badge::git_badge(&cwd);
+        let git = git_badge::git_badge(cwd);
         if let Some(badge) = git.render() {
             left.push(Span::raw("  "));
             left.push(Span::styled(
