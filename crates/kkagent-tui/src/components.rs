@@ -137,7 +137,11 @@ pub fn render_ui(f: &mut Frame, state: &mut AppState, config: &AppConfig) {
         );
     }
 
-    if let Some(ref mut approval) = state.approval_pending {
+    if let Some(ref mut approval) = state
+        .approval_pending
+        .as_mut()
+        .filter(|approval| !approval.hidden)
+    {
         render_approval_panel(f, size, approval, &theme);
     }
 
@@ -600,8 +604,17 @@ fn build_transcript_lines(state: &mut AppState, theme: &Theme, width: u16) -> Ve
             let frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
             let ch = frames[(state.tick / 2) % frames.len()];
             if state.status == SessionStatus::WaitingApproval {
+                let hidden_plan_review = state
+                    .approval_pending
+                    .as_ref()
+                    .is_some_and(|approval| approval.is_plan_review && approval.hidden);
+                let label = if hidden_plan_review {
+                    "plan review hidden · enter to reopen · ctrl-c to cancel"
+                } else {
+                    "waiting for approval"
+                };
                 lines.push(Line::from(Span::styled(
-                    format!("● {} waiting for approval", ch),
+                    format!("● {ch} {label}"),
                     Style::default()
                         .fg(theme.warning)
                         .add_modifier(Modifier::ITALIC),
@@ -1352,7 +1365,13 @@ fn render_footer(
         left.push(Span::styled(label, Style::default().fg(theme.accent)));
     }
 
-    let tip = if let Some(ref activity) = state.status_bar.activity {
+    let plan_review_hidden = state
+        .approval_pending
+        .as_ref()
+        .is_some_and(|approval| approval.is_plan_review && approval.hidden);
+    let tip = if plan_review_hidden {
+        "plan review hidden · enter reopen · ctrl-c cancel".to_string()
+    } else if let Some(ref activity) = state.status_bar.activity {
         activity.clone()
     } else if let Some(ref hover) = state.strip_hover_title {
         hover.clone()
@@ -2360,7 +2379,7 @@ fn render_approval_panel(f: &mut Frame, area: Rect, approval: &mut PendingApprov
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
             if approval.is_plan_review {
-                "  1·2·3… / ↑↓ / enter · esc 取消"
+                "  1·2·3… / ↑↓ / enter · esc 收起 · ctrl-c 取消"
             } else {
                 "  1·2·3 / enter"
             },

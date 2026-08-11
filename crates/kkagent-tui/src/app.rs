@@ -644,6 +644,9 @@ pub struct PendingApproval {
     pub selected: usize,
     pub choices: Vec<ApprovalChoice>,
     pub is_plan_review: bool,
+    /// The plan review stays pending on the server while its modal is folded.
+    /// This lets users inspect the transcript without accidentally cancelling it.
+    pub hidden: bool,
     /// The original ExitPlanMode waiter disappeared with the previous process;
     /// submit through the restart-safe resolver instead of `approval.respond`.
     pub resumed_plan_review: bool,
@@ -2155,10 +2158,46 @@ impl TuiApp {
             return Ok(());
         }
 
+        // A plan review is a blocking approval, but Esc should only fold its modal.
+        // Keep the server waiter alive so Enter can restore the same approval. Ctrl-C
+        // deliberately falls through to the busy-turn interrupt below.
+        let plan_review_pending = self
+            .state
+            .approval_pending
+            .as_ref()
+            .is_some_and(|approval| approval.is_plan_review);
+        if plan_review_pending && matches!(key.code, KeyCode::Esc) {
+            if let Some(approval) = self.state.approval_pending.as_mut() {
+                if approval.feedback_mode {
+                    approval.feedback_mode = false;
+                    approval.feedback.clear();
+                } else {
+                    approval.hidden = true;
+                }
+            }
+            self.state.pending_esc_ms = None;
+            self.state.quit_confirm = false;
+            return Ok(());
+        }
+        if matches!(key.code, KeyCode::Enter)
+            && self
+                .state
+                .approval_pending
+                .as_ref()
+                .is_some_and(|approval| approval.is_plan_review && approval.hidden)
+        {
+            if let Some(approval) = self.state.approval_pending.as_mut() {
+                approval.hidden = false;
+            }
+            self.state.pending_esc_ms = None;
+            self.state.quit_confirm = false;
+            return Ok(());
+        }
+
         // Busy turn with no overlay: Esc / Ctrl-C interrupt the agent (always Ctrl-C
         // even on macOS so the key to stop a running turn is consistent).
         if !matches!(self.state.status, SessionStatus::Idle)
-            && (matches!(key.code, KeyCode::Esc)
+            && ((matches!(key.code, KeyCode::Esc) && !plan_review_pending)
                 || (matches!(key.code, KeyCode::Char('c'))
                     && key.modifiers.contains(KeyModifiers::CONTROL)))
         {
@@ -2224,7 +2263,17 @@ impl TuiApp {
         }
 
         // Handle approval panel
-        if let Some(ref mut approval) = self.state.approval_pending {
+        if self
+            .state
+            .approval_pending
+            .as_ref()
+            .is_some_and(|approval| !approval.hidden)
+        {
+            let approval = self
+                .state
+                .approval_pending
+                .as_mut()
+                .expect("approval checked above");
             let n = approval.choices.len().max(1);
             if approval.feedback_mode {
                 match key.code {
@@ -8133,6 +8182,7 @@ fn pending_approval_from_request(
         selected: 0,
         choices,
         is_plan_review,
+        hidden: false,
         resumed_plan_review: resumed_plan_review && is_plan_review,
         feedback_mode: false,
         feedback: String::new(),
@@ -8808,12 +8858,69 @@ mod app_state_tests {
                 selected: 0,
                 choices: vec![choice.clone()],
                 is_plan_review: true,
+                hidden: false,
                 resumed_plan_review: false,
                 feedback_mode: true,
                 feedback: String::new(),
             },
             choice,
         )
+    }
+
+    #[tokio::test]
+    async fn plan_review_escape_folds_and_enter_restores_same_approval() {
+        let mut app = test_tui_app();
+        app.state.session_id = Some("session-1".into());
+        app.state.status = SessionStatus::WaitingApproval;
+        let (mut approval, _) = pending_plan_revision();
+        approval.feedback_mode = false;
+        app.state.approval_pending = Some(approval);
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        assert_eq!(app.state.status, SessionStatus::WaitingApproval);
+        assert!(app
+            .state
+            .approval_pending
+            .as_ref()
+            .is_some_and(|approval| approval.approval_id == "approval-1" && approval.hidden));
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        assert_eq!(app.state.status, SessionStatus::WaitingApproval);
+        assert!(app
+            .state
+            .approval_pending
+            .as_ref()
+            .is_some_and(|approval| !approval.hidden));
+    }
+
+    #[tokio::test]
+    async fn plan_review_feedback_escape_returns_to_choices_without_folding() {
+        let mut app = test_tui_app();
+        app.state.session_id = Some("session-1".into());
+        app.state.status = SessionStatus::WaitingApproval;
+        let (mut approval, _) = pending_plan_revision();
+        approval.feedback = "draft feedback".into();
+        app.state.approval_pending = Some(approval);
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        let approval = app
+            .state
+            .approval_pending
+            .as_ref()
+            .expect("plan review should remain pending");
+        assert!(!approval.hidden);
+        assert!(!approval.feedback_mode);
+        assert!(approval.feedback.is_empty());
+        assert_eq!(app.state.status, SessionStatus::WaitingApproval);
     }
 
     #[tokio::test]
