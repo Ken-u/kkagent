@@ -26,7 +26,7 @@ const TIPS: &[&str] = &[
     "tab / ←→ cycle related sessions · ctrl+d close session",
     "ctrl+g toggles /btw side Q&A",
     "shift-tab toggles plan mode (scroll locks to plan)",
-    "! enters shell mode",
+    "! shell (local, immediate)",
     "/yolo auto-approves tools",
     "large pastes collapse to [Pasted text #n]",
     "scroll to review earlier messages",

@@ -1334,7 +1334,12 @@ impl TuiApp {
 
     fn drain_job_results(&mut self) {
         while let Some(outcome) = self.jobs.try_recv() {
-            if !self.jobs.is_current(outcome.channel, outcome.generation) {
+            let is_shell = matches!(
+                outcome.payload,
+                crate::async_jobs::JobPayload::LocalShell { .. }
+            );
+            // Local shells may complete out of order; never drop their results.
+            if !is_shell && !self.jobs.is_current(outcome.channel, outcome.generation) {
                 continue;
             }
             let channel = outcome.channel;
@@ -1448,8 +1453,52 @@ impl TuiApp {
                         }
                     }
                 }
+                crate::async_jobs::JobPayload::LocalShell { command, result } => {
+                    self.jobs.mark_done(channel, generation);
+                    self.apply_local_shell_result(&command, result);
+                }
             }
         }
+    }
+
+    fn apply_local_shell_result(
+        &mut self,
+        command: &str,
+        result: Result<crate::async_jobs::LocalShellResult, String>,
+    ) {
+        match result {
+            Ok(r) => {
+                let code = r
+                    .exit_code
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "?".into());
+                let status = if r.timed_out {
+                    "timeout".into()
+                } else {
+                    format!("exit {code}")
+                };
+                let header = format!("$ {command}  · {status} · {}ms", r.duration_ms);
+                let body = if r.output.trim().is_empty() {
+                    header
+                } else {
+                    format!("{header}\n{}", r.output.trim_end())
+                };
+                self.state.messages.push(DisplayMessage {
+                    role: MessageRole::System,
+                    content: body,
+                    thinking: None,
+                    parts: Vec::new(),
+                    tool_calls: Vec::new(),
+                    delivery: crate::prompt_queue::DeliveryState::Sent,
+                    idempotency_key: None,
+                });
+            }
+            Err(err) => {
+                self.system_message(format!("$ {command} failed: {err}"));
+            }
+        }
+        self.state.follow_bottom = true;
+        self.state.scroll_up = 0;
     }
 
     fn apply_rpc_job_ok(
@@ -4216,7 +4265,7 @@ impl TuiApp {
             ListPickerItem {
                 id: "shell".into(),
                 label: "!".into(),
-                detail: "Shell mode".into(),
+                detail: "Local shell (no agent)".into(),
             },
             ListPickerItem {
                 id: "at".into(),
@@ -5618,13 +5667,21 @@ impl TuiApp {
             return self.handle_slash_command(&text).await;
         }
 
-        // Shell mode: prepend ! for the server
-        let prompt_text = if self.state.mode == AppMode::Shell {
-            self.state.mode = AppMode::Normal;
-            format!("!{}", text)
+        // Local shell: `!cmd` or Shell mode — never send to the agent loop.
+        let shell_cmd = if self.state.mode == AppMode::Shell {
+            Some(text.trim().to_string())
+        } else if let Some(rest) = text.strip_prefix('!') {
+            // Bang in normal mode: "!ls" / "! ls"
+            Some(rest.trim_start().to_string())
         } else {
-            text.clone()
+            None
         };
+        if let Some(cmd) = shell_cmd {
+            if cmd.is_empty() {
+                return Ok(());
+            }
+            return self.submit_local_shell(cmd);
+        }
 
         self.state.push_input_history(&text);
 
@@ -5639,7 +5696,7 @@ impl TuiApp {
         if busy && self.state.queue_when_busy {
             self.state
                 .prompt_queue
-                .push(crate::prompt_queue::QueuedPrompt::next_turn(prompt_text));
+                .push(crate::prompt_queue::QueuedPrompt::next_turn(text.clone()));
             self.state.messages.push(DisplayMessage {
                 role: MessageRole::User,
                 content: text,
@@ -5662,7 +5719,7 @@ impl TuiApp {
         }
         self.state.messages.push(DisplayMessage {
             role: MessageRole::User,
-            content: text,
+            content: text.clone(),
             thinking: None,
             parts: Vec::new(),
             tool_calls: Vec::new(),
@@ -5683,7 +5740,7 @@ impl TuiApp {
             self.jobs.spawn_prompt(
                 self.client.requester(),
                 sid.clone(),
-                prompt_text,
+                text,
                 Vec::new(),
                 idem,
             );
@@ -5696,6 +5753,27 @@ impl TuiApp {
             self.system_message("No active session.".into());
         }
 
+        Ok(())
+    }
+
+    /// Execute `!cmd` / shell-mode input locally without involving the LLM.
+    fn submit_local_shell(&mut self, cmd: String) -> anyhow::Result<()> {
+        self.state.push_input_history(&cmd);
+        // Stay in shell mode so consecutive commands are easy (Esc / empty Backspace exits).
+        let display = format!("!{cmd}");
+        self.state.messages.push(DisplayMessage {
+            role: MessageRole::User,
+            content: display,
+            thinking: None,
+            parts: Vec::new(),
+            tool_calls: Vec::new(),
+            delivery: crate::prompt_queue::DeliveryState::Sent,
+            idempotency_key: None,
+        });
+        self.state.follow_bottom = true;
+        self.state.scroll_up = 0;
+        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        self.jobs.spawn_local_shell(cmd, cwd);
         Ok(())
     }
 

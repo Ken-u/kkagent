@@ -28,6 +28,7 @@ pub enum JobChannel {
     Prompt,
     Compact,
     Interrupt,
+    LocalShell,
     Generic,
 }
 
@@ -45,6 +46,7 @@ impl JobChannel {
             Self::Prompt => "Sending prompt",
             Self::Compact => "Compacting",
             Self::Interrupt => "Interrupting",
+            Self::LocalShell => "Running shell",
             Self::Generic => "Working",
         }
     }
@@ -74,6 +76,18 @@ pub enum JobPayload {
         idempotency_key: String,
         result: Result<(), String>,
     },
+    LocalShell {
+        command: String,
+        result: Result<LocalShellResult, String>,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct LocalShellResult {
+    pub exit_code: Option<i32>,
+    pub output: String,
+    pub duration_ms: u64,
+    pub timed_out: bool,
 }
 
 #[derive(Debug)]
@@ -441,6 +455,46 @@ impl AsyncJobHub {
         generation
     }
 
+    /// Run a user `!` shell command locally without touching the agent loop.
+    /// Multiple shells can complete out of order; results are never generation-cancelled.
+    pub fn spawn_local_shell(&mut self, command: String, cwd: std::path::PathBuf) -> u64 {
+        let generation = self.next_generation(JobChannel::LocalShell);
+        let started = Instant::now();
+        let label = {
+            let short: String = command.chars().take(40).collect();
+            format!("$ {short}")
+        };
+        self.pending.insert(
+            JobChannel::LocalShell,
+            PendingJob {
+                channel: JobChannel::LocalShell,
+                generation,
+                label,
+                started,
+                retryable: false,
+                retry_method: None,
+                retry_params: None,
+            },
+        );
+        self.notices
+            .retain(|n| n.channel != Some(JobChannel::LocalShell) || !matches!(n.kind, NoticeKind::Error));
+        let tx = self.tx.clone();
+        let cmd = command.clone();
+        tokio::spawn(async move {
+            let result = run_local_shell_command(&cmd, &cwd).await;
+            let _ = tx.send(JobOutcome {
+                channel: JobChannel::LocalShell,
+                generation,
+                started,
+                payload: JobPayload::LocalShell {
+                    command: cmd,
+                    result,
+                },
+            });
+        });
+        generation
+    }
+
     pub fn try_recv(&mut self) -> Option<JobOutcome> {
         self.rx.try_recv().ok()
     }
@@ -610,6 +664,93 @@ impl AsyncJobHub {
     }
 }
 
+const LOCAL_SHELL_TIMEOUT: Duration = Duration::from_secs(300);
+const LOCAL_SHELL_OUTPUT_CAP: usize = 64 * 1024;
+
+async fn run_local_shell_command(
+    command: &str,
+    cwd: &std::path::Path,
+) -> Result<LocalShellResult, String> {
+    let started = Instant::now();
+    #[cfg(windows)]
+    let child = tokio::process::Command::new("cmd")
+        .args(["/C", command])
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| format!("failed to spawn shell: {e}"))?;
+    #[cfg(not(windows))]
+    let child = tokio::process::Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| format!("failed to spawn shell: {e}"))?;
+
+    let wait = child.wait_with_output();
+    let output = match tokio::time::timeout(LOCAL_SHELL_TIMEOUT, wait).await {
+        Ok(Ok(out)) => out,
+        Ok(Err(e)) => return Err(format!("shell failed: {e}")),
+        Err(_) => {
+            // kill_on_drop will reap on drop of child — but wait_with_output
+            // already consumed it on timeout path differently; spawn again can't.
+            // Best-effort: the child handle was moved into wait_with_output future.
+            return Ok(LocalShellResult {
+                exit_code: None,
+                output: format!(
+                    "(timed out after {}s; process killed)",
+                    LOCAL_SHELL_TIMEOUT.as_secs()
+                ),
+                duration_ms: started.elapsed().as_millis() as u64,
+                timed_out: true,
+            });
+        }
+    };
+
+    let mut text = String::new();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !stdout.is_empty() {
+        text.push_str(&stdout);
+    }
+    if !stderr.is_empty() {
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str(&stderr);
+    }
+    if text.len() > LOCAL_SHELL_OUTPUT_CAP {
+        let keep = LOCAL_SHELL_OUTPUT_CAP / 2;
+        let head: String = text.chars().take(keep).collect();
+        let tail: String = text
+            .chars()
+            .rev()
+            .take(keep)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect();
+        text = format!("{head}\n… output truncated …\n{tail}");
+    }
+    if text.is_empty() {
+        text = "(no output)".into();
+    }
+
+    Ok(LocalShellResult {
+        exit_code: output.status.code(),
+        output: text,
+        duration_ms: started.elapsed().as_millis() as u64,
+        timed_out: false,
+    })
+}
+
 impl Default for AsyncJobHub {
     fn default() -> Self {
         Self::new()
@@ -643,5 +784,16 @@ mod tests {
         let text = status.footer_text().unwrap();
         assert!(text.contains("MCP connecting"));
         assert!(text.contains("Ctrl-C"));
+    }
+
+    #[tokio::test]
+    async fn local_shell_echo() {
+        let cwd = std::env::temp_dir();
+        let r = run_local_shell_command("echo kkagent-shell-ok", &cwd)
+            .await
+            .expect("shell");
+        assert!(!r.timed_out);
+        assert_eq!(r.exit_code, Some(0));
+        assert!(r.output.contains("kkagent-shell-ok"));
     }
 }
