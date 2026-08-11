@@ -20,6 +20,22 @@ impl TodoListTool {
         }
     }
 
+    pub fn with_items(items: Vec<kkagent_protocol::TodoItemEvent>) -> Self {
+        let todos = items
+            .into_iter()
+            .filter_map(|item| {
+                let title = item.content.trim().to_string();
+                (!title.is_empty()).then(|| TodoItem {
+                    title,
+                    status: Self::normalize_status(&item.status),
+                })
+            })
+            .collect();
+        Self {
+            todos: Mutex::new(todos),
+        }
+    }
+
     fn normalize_status(raw: &str) -> String {
         match raw {
             "completed" | "done" => "done".into(),
@@ -227,5 +243,31 @@ impl TodoListTool {
             }
             _ => Ok(ToolOutput::error(format!("Unknown action: {}", action))),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn seeded_items_preserve_progress_for_the_next_turn() {
+        let tool = TodoListTool::with_items(vec![
+            kkagent_protocol::TodoItemEvent {
+                id: "todo-a".into(),
+                content: "Finished".into(),
+                status: "completed".into(),
+            },
+            kkagent_protocol::TodoItemEvent {
+                id: "todo-b".into(),
+                content: "Running".into(),
+                status: "in_progress".into(),
+            },
+        ]);
+        let todos = tool.todos.lock().unwrap();
+        assert_eq!(todos.len(), 2);
+        assert_eq!(todos[0].status, "done");
+        assert_eq!(todos[1].status, "in_progress");
+        assert!(TodoListTool::render_list(&todos).contains("[in_progress] Running"));
     }
 }

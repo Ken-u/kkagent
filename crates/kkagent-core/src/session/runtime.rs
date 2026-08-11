@@ -29,6 +29,8 @@ pub struct TurnCheckpoint {
 
 const PLAN_MODE_META_KEY: &str = "planMode";
 const PLAN_ID_META_KEY: &str = "planId";
+const PENDING_PLAN_REVIEW_META_KEY: &str = "pendingPlanReview";
+const TODOS_META_KEY: &str = "todos";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionPlanState {
@@ -176,6 +178,10 @@ impl Session {
             Some(services.metadata.read()),
             true,
         );
+        let restored_todos = todo_items_from_metadata(Some(services.metadata.read()));
+        services
+            .todos
+            .set_todos(todo_service_items(&restored_todos));
         if services
             .metadata
             .read()
@@ -270,6 +276,9 @@ impl Session {
         let mut custom = self.services.metadata.read().custom.clone();
         custom.insert(PLAN_MODE_META_KEY.into(), enabled.into());
         custom.insert(PLAN_ID_META_KEY.into(), self.plan_id.clone().into());
+        if !enabled {
+            custom.remove(PENDING_PLAN_REVIEW_META_KEY);
+        }
         self.services.metadata.update(
             SessionMetaPatch {
                 custom: Some(custom),
@@ -299,6 +308,68 @@ impl Session {
             return Err(error);
         }
         Ok(true)
+    }
+
+    pub fn pending_plan_review(&self) -> Option<kkagent_protocol::ApprovalRequest> {
+        pending_plan_review_from_metadata(Some(self.services.metadata.read()))
+    }
+
+    pub fn set_pending_plan_review(
+        &mut self,
+        request: Option<kkagent_protocol::ApprovalRequest>,
+    ) -> anyhow::Result<()> {
+        let mut custom = self.services.metadata.read().custom.clone();
+        if let Some(request) = request {
+            custom.insert(
+                PENDING_PLAN_REVIEW_META_KEY.into(),
+                serde_json::to_value(request)?,
+            );
+        } else {
+            custom.remove(PENDING_PLAN_REVIEW_META_KEY);
+        }
+        self.services.metadata.update(
+            SessionMetaPatch {
+                custom: Some(custom),
+                ..Default::default()
+            },
+            true,
+        )
+    }
+
+    pub fn todo_items(&self) -> Vec<kkagent_protocol::TodoItemEvent> {
+        self.services
+            .todos
+            .get_todos()
+            .into_iter()
+            .enumerate()
+            .map(|(index, item)| kkagent_protocol::TodoItemEvent {
+                id: (index + 1).to_string(),
+                content: item.title,
+                status: match item.status {
+                    crate::session::todo::TodoStatus::Pending => "pending",
+                    crate::session::todo::TodoStatus::InProgress => "in_progress",
+                    crate::session::todo::TodoStatus::Done => "completed",
+                    crate::session::todo::TodoStatus::Cancelled => "cancelled",
+                }
+                .into(),
+            })
+            .collect()
+    }
+
+    pub fn set_todos_persisted(
+        &mut self,
+        items: Vec<kkagent_protocol::TodoItemEvent>,
+    ) -> anyhow::Result<()> {
+        self.services.todos.set_todos(todo_service_items(&items));
+        let mut custom = self.services.metadata.read().custom.clone();
+        custom.insert(TODOS_META_KEY.into(), serde_json::to_value(&items)?);
+        self.services.metadata.update(
+            SessionMetaPatch {
+                custom: Some(custom),
+                ..Default::default()
+            },
+            true,
+        )
     }
 
     /// Finalize `YYYY-MM-DD_<plan-name>.md` from the Markdown H1 written by
@@ -799,12 +870,54 @@ fn read_nonempty_plan(path: &std::path::Path) -> Option<String> {
         .filter(|content| !content.trim().is_empty())
 }
 
-/// Read plan state without constructing a second live `Session`. This is used
-/// while an active session has temporarily moved into the agent loop.
-pub fn load_persisted_plan_state(
+fn pending_plan_review_from_metadata(
+    metadata: Option<&SessionMeta>,
+) -> Option<kkagent_protocol::ApprovalRequest> {
+    metadata?
+        .custom
+        .get(PENDING_PLAN_REVIEW_META_KEY)
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+}
+
+fn todo_items_from_metadata(
+    metadata: Option<&SessionMeta>,
+) -> Vec<kkagent_protocol::TodoItemEvent> {
+    metadata
+        .and_then(|metadata| metadata.custom.get(TODOS_META_KEY))
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+        .unwrap_or_default()
+}
+
+fn todo_service_items(
+    items: &[kkagent_protocol::TodoItemEvent],
+) -> Vec<crate::session::todo::TodoItem> {
+    items
+        .iter()
+        .filter_map(|item| {
+            let title = item.content.trim();
+            if title.is_empty() {
+                return None;
+            }
+            let status = match item.status.as_str() {
+                "in_progress" | "in-progress" => crate::session::todo::TodoStatus::InProgress,
+                "done" | "completed" => crate::session::todo::TodoStatus::Done,
+                "cancelled" | "canceled" => crate::session::todo::TodoStatus::Cancelled,
+                _ => crate::session::todo::TodoStatus::Pending,
+            };
+            Some(crate::session::todo::TodoItem {
+                title: title.to_string(),
+                status,
+            })
+        })
+        .collect()
+}
+
+fn load_persisted_metadata(
     session_id: &str,
     working_dir: &std::path::Path,
-) -> SessionPlanState {
+) -> (PathBuf, Option<SessionMeta>) {
     let store = SessionStore::open_default();
     let session_dir = store
         .get(session_id)
@@ -815,6 +928,16 @@ pub fn load_persisted_plan_state(
     let metadata = std::fs::read_to_string(session_dir.join("state.json"))
         .ok()
         .and_then(|text| serde_json::from_str::<SessionMeta>(&text).ok());
+    (session_dir, metadata)
+}
+
+/// Read plan state without constructing a second live `Session`. This is used
+/// while an active session has temporarily moved into the agent loop.
+pub fn load_persisted_plan_state(
+    session_id: &str,
+    working_dir: &std::path::Path,
+) -> SessionPlanState {
+    let (session_dir, metadata) = load_persisted_metadata(session_id, working_dir);
     plan_state_from_metadata(
         session_id,
         working_dir,
@@ -822,6 +945,22 @@ pub fn load_persisted_plan_state(
         metadata.as_ref(),
         true,
     )
+}
+
+pub fn load_persisted_pending_plan_review(
+    session_id: &str,
+    working_dir: &std::path::Path,
+) -> Option<kkagent_protocol::ApprovalRequest> {
+    let (_, metadata) = load_persisted_metadata(session_id, working_dir);
+    pending_plan_review_from_metadata(metadata.as_ref())
+}
+
+pub fn load_persisted_todos(
+    session_id: &str,
+    working_dir: &std::path::Path,
+) -> Vec<kkagent_protocol::TodoItemEvent> {
+    let (_, metadata) = load_persisted_metadata(session_id, working_dir);
+    todo_items_from_metadata(metadata.as_ref())
 }
 
 fn resolve_session_dir(
@@ -972,6 +1111,58 @@ mod working_directory_tests {
         assert!(context.contains("`/workspace/project`"));
         assert!(context.contains("prefer paths relative to the working directory"));
         assert!(context.contains("git -C"));
+    }
+
+    #[test]
+    fn restores_pending_plan_review_and_todos_from_metadata() {
+        let working_dir = PathBuf::from("/workspace/project");
+        let mut metadata = SessionMeta::new("session-restore", &working_dir);
+        let request = kkagent_protocol::ApprovalRequest {
+            approval_id: "approval-1".into(),
+            session_id: "session-restore".into(),
+            tool_call_id: "tool-1".into(),
+            tool_name: "ExitPlanMode".into(),
+            action: "review".into(),
+            tool_input_display: Some(serde_json::json!({
+                "kind": "plan_review",
+                "plan": "# Restore",
+                "path": "/plans/restore.md",
+            })),
+            created_at: chrono::Utc::now(),
+        };
+        let todos = vec![
+            kkagent_protocol::TodoItemEvent {
+                id: "1".into(),
+                content: "First".into(),
+                status: "completed".into(),
+            },
+            kkagent_protocol::TodoItemEvent {
+                id: "2".into(),
+                content: "Second".into(),
+                status: "in_progress".into(),
+            },
+        ];
+        metadata.custom.insert(
+            PENDING_PLAN_REVIEW_META_KEY.into(),
+            serde_json::to_value(&request).unwrap(),
+        );
+        metadata
+            .custom
+            .insert(TODOS_META_KEY.into(), serde_json::to_value(&todos).unwrap());
+
+        assert_eq!(
+            pending_plan_review_from_metadata(Some(&metadata))
+                .unwrap()
+                .approval_id,
+            "approval-1"
+        );
+        let restored_todos = todo_items_from_metadata(Some(&metadata));
+        assert_eq!(restored_todos.len(), 2);
+        assert_eq!(restored_todos[1].content, "Second");
+        assert_eq!(
+            todo_service_items(&restored_todos)[1].status,
+            crate::session::todo::TodoStatus::InProgress
+        );
     }
 
     #[test]

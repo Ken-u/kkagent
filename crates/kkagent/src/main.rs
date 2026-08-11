@@ -10,6 +10,7 @@ use tokio::task::AbortHandle;
 
 use kkagent_client::KkagentClient;
 use kkagent_config::{load_config, AppConfig, DisabledState};
+use kkagent_core::plan_review::{resolve_exit_plan_approval, PlanReviewDisplay};
 use kkagent_core::SubagentMirrorContext;
 use kkagent_core::{
     AgentLoop, BtwTurn, PermissionChain, Session, SessionBtwService, SessionCloseReason,
@@ -2120,12 +2121,16 @@ fn resolve_http_fs_path(config: &AppConfig, raw: &str, for_write: bool) -> Resul
 async fn build_turn_tool_registry(
     state: &Arc<ServerState>,
     event_tx: mpsc::Sender<AgentEvent>,
+    todos: Vec<kkagent_protocol::TodoItemEvent>,
 ) -> ToolRegistry {
     // MCP discovery starts in the background so the TUI can paint immediately.
     // Synchronize only when a turn actually needs its final tool registry.
     state.mcp.wait_until_initialized().await;
     let mut tools = ToolRegistry::new();
     kkagent_tools::register_builtin_tools(&mut tools);
+    tools.register(Arc::new(kkagent_tools::builtin::TodoListTool::with_items(
+        todos,
+    )));
     let auto_background_on_timeout = state
         .config
         .background
@@ -2297,7 +2302,7 @@ async fn run_http_turn(
     };
     session.begin_turn();
 
-    let tools = build_turn_tool_registry(&state, event_tx.clone()).await;
+    let tools = build_turn_tool_registry(&state, event_tx.clone(), session.todo_items()).await;
 
     let permission_rules = state
         .config
@@ -3034,7 +3039,14 @@ async fn spawn_session_agent_turn(
                 .await;
         }
 
-        let tools = build_turn_tool_registry(&state_clone, agent_event_tx.clone()).await;
+        let todos = {
+            let sessions = state_clone.sessions.lock().await;
+            sessions
+                .get(&sid)
+                .map(Session::todo_items)
+                .unwrap_or_default()
+        };
+        let tools = build_turn_tool_registry(&state_clone, agent_event_tx.clone(), todos).await;
         let permission = PermissionChain::with_shared_mode(shared_mode, permission_rules);
         let agent_loop = Arc::new(
             AgentLoop::new(
@@ -3805,6 +3817,15 @@ async fn handle_rpc_call(
                     let total = existing.messages.len();
                     let usage = existing.usage.snapshot();
                     let plan = plan_state_json(existing.plan_state());
+                    let pending_approval = existing.pending_plan_review();
+                    let todos = existing.todo_items();
+                    let status = if pending_approval.is_some() {
+                        SessionStatus::WaitingApproval
+                    } else if turn_active {
+                        SessionStatus::Thinking
+                    } else {
+                        SessionStatus::Idle
+                    };
                     let (display, oldest_index, older_available) =
                         slice_recent_messages(&existing.messages, display_limit);
                     return Ok(serde_json::json!({
@@ -3816,7 +3837,10 @@ async fn handle_rpc_call(
                         "model": existing.get_model_alias(),
                         "working_dir": existing.working_dir,
                         "turn_active": turn_active,
-                        "status": if turn_active { SessionStatus::Thinking } else { SessionStatus::Idle },
+                        "status": status,
+                        "pending_approval": pending_approval,
+                        "pending_approval_resumed": !turn_active,
+                        "todos": todos,
                         "usage": {
                             "input_tokens": usage.input_tokens,
                             "output_tokens": usage.output_tokens,
@@ -3865,6 +3889,16 @@ async fn handle_rpc_call(
             if turn_active {
                 let plan_state =
                     kkagent_core::load_persisted_plan_state(&session_id, &resumed_working_dir);
+                let pending_approval = kkagent_core::load_persisted_pending_plan_review(
+                    &session_id,
+                    &resumed_working_dir,
+                );
+                let todos = kkagent_core::load_persisted_todos(&session_id, &resumed_working_dir);
+                let status = if pending_approval.is_some() {
+                    SessionStatus::WaitingApproval
+                } else {
+                    SessionStatus::Thinking
+                };
                 let total = messages.len();
                 let (display, oldest_index, older_available) =
                     slice_recent_messages(&messages, display_limit);
@@ -3877,7 +3911,10 @@ async fn handle_rpc_call(
                     "model": resumed_model,
                     "working_dir": resumed_working_dir,
                     "turn_active": true,
-                    "status": SessionStatus::Thinking,
+                    "status": status,
+                    "pending_approval": pending_approval,
+                    "pending_approval_resumed": false,
+                    "todos": todos,
                     "history": {
                         "total": total,
                         "oldest_index": oldest_index,
@@ -3902,6 +3939,13 @@ async fn handle_rpc_call(
             session.services.on_created().await;
             let plan_mode = session.plan_mode;
             let plan = plan_state_json(session.plan_state());
+            let pending_approval = session.pending_plan_review();
+            let todos = session.todo_items();
+            let status = if pending_approval.is_some() {
+                SessionStatus::WaitingApproval
+            } else {
+                SessionStatus::Idle
+            };
 
             state
                 .interrupt_flags
@@ -3951,7 +3995,10 @@ async fn handle_rpc_call(
                 "model": resumed_model,
                 "working_dir": resumed_working_dir,
                 "turn_active": false,
-                "status": SessionStatus::Idle,
+                "status": status,
+                "pending_approval": pending_approval,
+                "pending_approval_resumed": true,
+                "todos": todos,
                 "history": {
                     "total": total,
                     "oldest_index": oldest_index,
@@ -5182,6 +5229,109 @@ async fn handle_rpc_call(
                 })),
                 Err(e) => Err((-32000, e.to_string())),
             }
+        }
+        "session.resolve_pending_plan_review" => {
+            let params = params.ok_or_else(|| (-32602, "Missing approval response".into()))?;
+            let session_id = params
+                .get("session_id")
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| (-32602, "Missing session_id".into()))?
+                .to_string();
+            let response =
+                serde_json::from_value::<kkagent_protocol::ApprovalResponse>(params.clone())
+                    .map_err(|error| (-32602, format!("Invalid approval response: {error}")))?;
+            let turn_permit = state
+                .turn_locks
+                .try_acquire(&session_id)
+                .await
+                .map_err(|message| (-32001, message))?;
+
+            let mut session = {
+                let mut sessions = state.sessions.lock().await;
+                sessions
+                    .remove(&session_id)
+                    .ok_or_else(|| (-32602, format!("Session not found: {session_id}")))?
+            };
+            let resolution = (|| -> Result<(bool, bool), (i32, String)> {
+                let request = session
+                    .pending_plan_review()
+                    .ok_or_else(|| (-32602, "No persisted plan review for this session".into()))?;
+                if request.approval_id != response.approval_id {
+                    return Err((-32602, "Approval id no longer matches".into()));
+                }
+                let display = request
+                    .tool_input_display
+                    .as_ref()
+                    .and_then(PlanReviewDisplay::from_display_json)
+                    .ok_or_else(|| (-32602, "Persisted plan review is invalid".into()))?;
+                let (output, exit_plan_mode) = resolve_exit_plan_approval(&response, &display);
+                if exit_plan_mode {
+                    session
+                        .set_plan_mode_persisted(false)
+                        .map_err(|error| (-32000, error.to_string()))?;
+                } else {
+                    session
+                        .set_pending_plan_review(None)
+                        .map_err(|error| (-32000, error.to_string()))?;
+                }
+
+                let turn_started = !output.stop_turn
+                    && response.decision != kkagent_protocol::ApprovalDecision::Cancelled;
+                if turn_started {
+                    session.clear_interrupt();
+                    session.add_user_message(format!(
+                        "<system-reminder>\nThe application restarted while ExitPlanMode was awaiting review. The user has now resolved that saved review.\n\n{}\n\nContinue from this result. If revisions were requested, update the plan file and call ExitPlanMode again. If the plan was approved, execute the approved plan.\n</system-reminder>",
+                        output.content
+                    ));
+                    session.begin_turn();
+                }
+                Ok((turn_started, exit_plan_mode))
+            })();
+
+            let (turn_started, plan_mode_changed) = match resolution {
+                Ok(result) => result,
+                Err(error) => {
+                    state.sessions.lock().await.insert(session_id, session);
+                    return Err(error);
+                }
+            };
+            {
+                let db = state.transcript.lock().await;
+                if let Err(error) = persist_session_messages(&db, &mut session) {
+                    tracing::warn!(%error, "failed to persist resumed plan review resolution");
+                }
+            }
+            let plan_mode = session.plan_mode;
+            state
+                .sessions
+                .lock()
+                .await
+                .insert(session_id.clone(), session);
+
+            if plan_mode_changed {
+                let data = serde_json::to_value(AgentEvent::PlanModeChanged {
+                    session_id: session_id.clone(),
+                    enabled: plan_mode,
+                })
+                .unwrap_or_default();
+                let _ = rpc_event_tx
+                    .send(Frame::Event {
+                        event: "agent".into(),
+                        scope: None,
+                        data,
+                    })
+                    .await;
+            }
+            if turn_started {
+                spawn_session_agent_turn(state, session_id.clone(), turn_permit, rpc_event_tx)
+                    .await?;
+            }
+            Ok(serde_json::json!({
+                "ok": true,
+                "session_id": session_id,
+                "turn_started": turn_started,
+                "plan_mode": plan_mode,
+            }))
         }
         "approval.respond" => {
             if let Some(params) = params {

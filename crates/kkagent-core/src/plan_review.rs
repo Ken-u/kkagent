@@ -69,6 +69,21 @@ impl PlanReviewDisplay {
         }
         obj
     }
+
+    /// Rebuild the review state persisted with an `ApprovalRequest` so a
+    /// restarted server can resolve the same choices as the original turn.
+    pub fn from_display_json(display: &serde_json::Value) -> Option<Self> {
+        if display.get("kind").and_then(|value| value.as_str()) != Some("plan_review") {
+            return None;
+        }
+        let plan = display.get("plan")?.as_str()?.to_string();
+        let path = display
+            .get("path")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .to_string();
+        Some(Self::from_tool_input(display, plan, path))
+    }
 }
 
 pub fn is_reserved_label(label: &str) -> bool {
@@ -221,5 +236,28 @@ mod tests {
         assert!(!exit);
         assert!(out.is_error);
         assert!(out.stop_turn);
+    }
+
+    #[test]
+    fn display_json_round_trip_restores_review_options() {
+        let display = PlanReviewDisplay {
+            plan: "# Plan\n\ndo stuff".into(),
+            path: "/tmp/p.md".into(),
+            options: vec![
+                PlanReviewOption {
+                    label: "REST".into(),
+                    description: "Use REST".into(),
+                },
+                PlanReviewOption {
+                    label: "GraphQL".into(),
+                    description: "Use GraphQL".into(),
+                },
+            ],
+        };
+        let restored = PlanReviewDisplay::from_display_json(&display.to_display_json()).unwrap();
+        assert_eq!(restored.plan, display.plan);
+        assert_eq!(restored.path, display.path);
+        assert_eq!(restored.options.len(), 2);
+        assert_eq!(restored.options[1].label, "GraphQL");
     }
 }

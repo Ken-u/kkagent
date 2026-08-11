@@ -9,6 +9,7 @@ pub enum TodoStatus {
     Pending,
     InProgress,
     Done,
+    Cancelled,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -57,6 +58,7 @@ pub fn render_todo_list(todos: &[TodoItem], title: &str) -> String {
             TodoStatus::Pending => "[pending]",
             TodoStatus::InProgress => "[in_progress]",
             TodoStatus::Done => "[done]",
+            TodoStatus::Cancelled => "[cancelled]",
         };
         lines.push(format!("  {marker} {}", t.title));
     }
@@ -73,6 +75,7 @@ pub fn parse_todo_items(raw: &serde_json::Value) -> Vec<TodoItem> {
             let status = match v.get("status").and_then(|s| s.as_str()) {
                 Some("in_progress") | Some("in-progress") => TodoStatus::InProgress,
                 Some("done") | Some("completed") => TodoStatus::Done,
+                Some("cancelled") | Some("canceled") => TodoStatus::Cancelled,
                 _ => TodoStatus::Pending,
             };
             Some(TodoItem { title, status })

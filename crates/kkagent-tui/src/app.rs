@@ -644,6 +644,9 @@ pub struct PendingApproval {
     pub selected: usize,
     pub choices: Vec<ApprovalChoice>,
     pub is_plan_review: bool,
+    /// The original ExitPlanMode waiter disappeared with the previous process;
+    /// submit through the restart-safe resolver instead of `approval.respond`.
+    pub resumed_plan_review: bool,
     pub feedback_mode: bool,
     pub feedback: String,
 }
@@ -5408,6 +5411,22 @@ impl TuiApp {
             });
         self.state.approval_pending = self.state.parked_approvals.remove(&sid);
         self.state.question_pending = self.state.parked_questions.remove(&sid);
+        if let Some(value) = data.get("pending_approval") {
+            self.state.approval_pending = if value.is_null() {
+                None
+            } else {
+                serde_json::from_value::<kkagent_protocol::ApprovalRequest>(value.clone())
+                    .ok()
+                    .map(|request| {
+                        pending_approval_from_request(
+                            &request,
+                            data.get("pending_approval_resumed")
+                                .and_then(|value| value.as_bool())
+                                .unwrap_or(false),
+                        )
+                    })
+            };
+        }
         if self.state.approval_pending.is_some() {
             self.state.status = SessionStatus::WaitingApproval;
         } else if self.state.question_pending.is_some() {
@@ -5416,6 +5435,18 @@ impl TuiApp {
 
         if let Some(msgs) = data.get("messages").and_then(|v| v.as_array()) {
             self.state.messages = transcript_messages_to_display(msgs);
+        }
+        if let Some(todos) = data.get("todos").and_then(|value| value.as_array()) {
+            self.state.todos = todos
+                .iter()
+                .filter_map(|item| {
+                    Some(TodoItem {
+                        id: item.get("id")?.as_str()?.to_string(),
+                        content: item.get("content")?.as_str()?.to_string(),
+                        status: item.get("status")?.as_str()?.to_string(),
+                    })
+                })
+                .collect();
         }
 
         if let Some(model) = data.get("model").and_then(|v| v.as_str()) {
@@ -7212,25 +7243,41 @@ impl TuiApp {
             return Ok(());
         }
         let revising_plan = approval.is_plan_review && choice.requires_feedback;
+        let resumed_plan_review = approval.resumed_plan_review;
+        let response = kkagent_protocol::ApprovalResponse {
+            approval_id: approval.approval_id.clone(),
+            decision: choice.decision,
+            scope: choice.scope,
+            feedback,
+            selected_label: Some(choice.selected_label.clone()),
+        };
+        let result = if resumed_plan_review {
+            let mut params = serde_json::to_value(response)?;
+            params["session_id"] = sid.clone().into();
+            self.client
+                .rpc_call("session.resolve_pending_plan_review", Some(params))
+                .await
+                .map(Some)
+        } else {
+            self.client
+                .respond_approval(&sid, response)
+                .await
+                .map(|()| None)
+        };
 
-        if let Err(e) = self
-            .client
-            .respond_approval(
-                &sid,
-                kkagent_protocol::ApprovalResponse {
-                    approval_id: approval.approval_id.clone(),
-                    decision: choice.decision,
-                    scope: choice.scope,
-                    feedback,
-                    selected_label: Some(choice.selected_label.clone()),
-                },
-            )
-            .await
-        {
+        if let Err(e) = result {
             // Restore panel on failure
             self.state.approval_pending = Some(approval);
             self.system_message(format!("Approval failed: {}", e));
         } else {
+            let resumed_result = result.ok().flatten();
+            if let Some(plan_mode) = resumed_result
+                .as_ref()
+                .and_then(|value| value.get("plan_mode"))
+                .and_then(|value| value.as_bool())
+            {
+                self.state.on_plan_mode_changed(plan_mode);
+            }
             if revising_plan {
                 self.state.dismiss_plan_focus();
                 self.jobs.push_info("修改意见已提交，正在更新计划…");
@@ -7239,7 +7286,16 @@ impl TuiApp {
                 self.state.approval_pending = Some(next);
                 self.state.status = SessionStatus::WaitingApproval;
             } else {
-                self.state.status = SessionStatus::Thinking;
+                self.state.status = if resumed_result.as_ref().is_some_and(|value| {
+                    !value
+                        .get("turn_started")
+                        .and_then(|started| started.as_bool())
+                        .unwrap_or(false)
+                }) {
+                    SessionStatus::Idle
+                } else {
+                    SessionStatus::Thinking
+                };
             }
         }
         Ok(())
@@ -7397,7 +7453,7 @@ impl TuiApp {
                 if !is_current {
                     match &evt {
                         AgentEvent::ApprovalRequested { request, .. } => {
-                            let pending = pending_approval_from_request(request);
+                            let pending = pending_approval_from_request(request, false);
                             self.state.parked_approvals.insert(evt_sid.clone(), pending);
                             self.state.tab_strip.mark_dirty(&evt_sid, true);
                             self.state.tab_strip.ensure_tab(&evt_sid, "needs approval");
@@ -7573,7 +7629,7 @@ impl TuiApp {
                                 }
                             }
                         }
-                        let pending = pending_approval_from_request(&request);
+                        let pending = pending_approval_from_request(&request, false);
                         if self.state.approval_pending.is_some() {
                             self.state.approval_queue.push_back(pending);
                             self.system_message(format!(
@@ -8041,7 +8097,10 @@ fn summarize_tool_input(input: &serde_json::Value) -> String {
         .collect()
 }
 
-fn pending_approval_from_request(request: &kkagent_protocol::ApprovalRequest) -> PendingApproval {
+fn pending_approval_from_request(
+    request: &kkagent_protocol::ApprovalRequest,
+    resumed_plan_review: bool,
+) -> PendingApproval {
     let display = request
         .tool_input_display
         .clone()
@@ -8074,6 +8133,7 @@ fn pending_approval_from_request(request: &kkagent_protocol::ApprovalRequest) ->
         selected: 0,
         choices,
         is_plan_review,
+        resumed_plan_review: resumed_plan_review && is_plan_review,
         feedback_mode: false,
         feedback: String::new(),
     }
@@ -8682,6 +8742,55 @@ mod app_state_tests {
         assert!(plan_document_from_resume(&data).is_none());
     }
 
+    #[tokio::test]
+    async fn resume_restores_plan_confirmation_and_todo_progress() {
+        let mut app = test_tui_app();
+        let request: kkagent_protocol::ApprovalRequest =
+            serde_json::from_value(serde_json::json!({
+                "approval_id": "approval-resumed",
+                "session_id": "session-resumed",
+                "tool_call_id": "exit-plan",
+                "tool_name": "ExitPlanMode",
+                "action": "review",
+                "tool_input_display": {
+                "kind": "plan_review",
+                "plan": "# Resume plan\n\nContinue safely.",
+                "path": "/plans/resume.md",
+                },
+                "created_at": "2026-08-11T00:00:00Z",
+            }))
+            .unwrap();
+        app.apply_session_resume_data(
+            "session-resumed",
+            serde_json::json!({
+                "session_id": "session-resumed",
+                "messages": [],
+                "plan_mode": true,
+                "plan": {
+                    "path": "/plans/resume.md",
+                    "content": "# Resume plan\n\nContinue safely."
+                },
+                "pending_approval": request,
+                "pending_approval_resumed": true,
+                "todos": [
+                    {"id": "1", "content": "Done", "status": "completed"},
+                    {"id": "2", "content": "Continue", "status": "in_progress"}
+                ]
+            }),
+        )
+        .unwrap();
+
+        assert!(app.state.plan_focus_active());
+        assert_eq!(app.state.status, SessionStatus::WaitingApproval);
+        assert!(app
+            .state
+            .approval_pending
+            .as_ref()
+            .is_some_and(|approval| approval.resumed_plan_review));
+        assert_eq!(app.state.todos.len(), 2);
+        assert_eq!(app.state.todos[1].status, "in_progress");
+    }
+
     fn pending_plan_revision() -> (PendingApproval, ApprovalChoice) {
         let choice = ApprovalChoice {
             label: "修改意见".into(),
@@ -8699,6 +8808,7 @@ mod app_state_tests {
                 selected: 0,
                 choices: vec![choice.clone()],
                 is_plan_review: true,
+                resumed_plan_review: false,
                 feedback_mode: true,
                 feedback: String::new(),
             },
@@ -8799,6 +8909,58 @@ mod app_state_tests {
                 .map(|plan| plan.path.as_str()),
             Some("/plans/revised.md")
         );
+    }
+
+    #[tokio::test]
+    async fn resumed_plan_revision_uses_restart_safe_resolver() {
+        use futures::FutureExt;
+        use std::sync::Arc;
+
+        let (client_transport, server_transport) =
+            kkagent_rpc::transport::memory::create_memory_pair();
+        let (event_tx, event_rx) = tokio::sync::mpsc::channel(16);
+        let rpc = kkagent_rpc::RpcClient::new(client_transport, event_tx);
+        let client = kkagent_client::KkagentClient::new(rpc, event_rx);
+        let handler: kkagent_rpc::server::RequestHandler =
+            Arc::new(|_id, method, params, _event_tx| {
+                async move {
+                    assert_eq!(method, "session.resolve_pending_plan_review");
+                    assert_eq!(params.as_ref().unwrap()["session_id"], "session-1");
+                    assert_eq!(
+                        params.as_ref().unwrap()["feedback"],
+                        "please revise after restart"
+                    );
+                    Ok(serde_json::json!({
+                        "ok": true,
+                        "turn_started": true,
+                        "plan_mode": true,
+                    }))
+                }
+                .boxed()
+            });
+        tokio::spawn(async move {
+            kkagent_rpc::RpcServer::new(handler)
+                .serve(server_transport)
+                .await;
+        });
+        let mut app = TuiApp::new(AppConfig::default(), client);
+        app.state.session_id = Some("session-1".into());
+        app.state.status = SessionStatus::WaitingApproval;
+        app.state.on_plan_mode_changed(true);
+        app.state
+            .apply_plan_document("/plans/old.md".into(), "# Old plan".into());
+        let (mut approval, choice) = pending_plan_revision();
+        approval.resumed_plan_review = true;
+        app.state.approval_pending = Some(approval);
+
+        app.respond_approval_choice(choice, Some("please revise after restart".into()))
+            .await
+            .unwrap();
+
+        assert!(app.state.approval_pending.is_none());
+        assert_eq!(app.state.status, SessionStatus::Thinking);
+        assert!(app.state.plan_mode);
+        assert!(app.state.plan_document.is_none());
     }
 
     #[tokio::test]

@@ -1222,6 +1222,21 @@ Do not mention this reminder to the user.\n</system-reminder>"
                     output.content.len()
                 );
 
+                // Commit the latest TodoList snapshot before any hook or UI
+                // await so an app exit cannot strand a visibly completed update.
+                let todo_items = if !output.is_error && name == "TodoList" {
+                    session.turns_since_todo = 0;
+                    let items = todo_items_from_output(&output);
+                    if let Some(items) = items.as_ref() {
+                        if let Err(error) = session.set_todos_persisted(items.clone()) {
+                            tracing::warn!(%error, "failed to persist session todo list");
+                        }
+                    }
+                    items
+                } else {
+                    None
+                };
+
                 if let Some(hooks) = &self.hooks {
                     let _ = hooks
                         .fire(
@@ -1249,17 +1264,14 @@ Do not mention this reminder to the user.\n</system-reminder>"
                     })
                     .await;
 
-                if !output.is_error && name == "TodoList" {
-                    session.turns_since_todo = 0;
-                    if let Some(items) = todo_items_from_output(&output) {
-                        let _ = self
-                            .event_tx
-                            .send(AgentEvent::TodoUpdated {
-                                session_id: session_id.clone(),
-                                items,
-                            })
-                            .await;
-                    }
+                if let Some(items) = todo_items {
+                    let _ = self
+                        .event_tx
+                        .send(AgentEvent::TodoUpdated {
+                            session_id: session_id.clone(),
+                            items,
+                        })
+                        .await;
                 }
 
                 if !output.is_error && name == "Skill" {
@@ -1428,25 +1440,6 @@ Do not mention this reminder to the user.\n</system-reminder>"
             }
         }
         session.note_turn_completed();
-        // Sync sticky todos into session services when present in tool results.
-        if let Some(last) = session.messages.iter().rev().find(|m| {
-            m.content
-                .iter()
-                .any(|c| matches!(c, kkagent_llm::ChatContent::ToolResult { .. }))
-        }) {
-            for part in &last.content {
-                if let kkagent_llm::ChatContent::ToolResult { content, .. } = part {
-                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(content) {
-                        if let Some(todos) = v.get("todos").or_else(|| v.get("items")) {
-                            let items = crate::session::todo::parse_todo_items(todos);
-                            if !items.is_empty() {
-                                session.services.todos.set_todos(items);
-                            }
-                        }
-                    }
-                }
-            }
-        }
         let _ = self
             .event_tx
             .send(AgentEvent::StatusUpdate {
@@ -1726,19 +1719,21 @@ Do not mention this reminder to the user.\n</system-reminder>"
             .await;
 
         let approval_id = uuid::Uuid::new_v4().to_string();
+        let request = kkagent_protocol::ApprovalRequest {
+            approval_id: approval_id.clone(),
+            session_id: session_id.to_string(),
+            tool_call_id: tc.id.clone(),
+            tool_name: "ExitPlanMode".into(),
+            action: "Ready to build with this plan?".into(),
+            tool_input_display: Some(display.to_display_json()),
+            created_at: chrono::Utc::now(),
+        };
+        session.set_pending_plan_review(Some(request.clone()))?;
         let _ = self
             .event_tx
             .send(AgentEvent::ApprovalRequested {
                 session_id: session_id.to_string(),
-                request: kkagent_protocol::ApprovalRequest {
-                    approval_id: approval_id.clone(),
-                    session_id: session_id.to_string(),
-                    tool_call_id: tc.id.clone(),
-                    tool_name: "ExitPlanMode".into(),
-                    action: "Ready to build with this plan?".into(),
-                    tool_input_display: Some(display.to_display_json()),
-                    created_at: chrono::Utc::now(),
-                },
+                request,
             })
             .await;
         let _ = self
@@ -1780,6 +1775,8 @@ Do not mention this reminder to the user.\n</system-reminder>"
                 status: SessionStatus::Thinking,
             })
             .await;
+
+        session.set_pending_plan_review(None)?;
 
         if response.decision == kkagent_protocol::ApprovalDecision::Cancelled {
             return Ok(ToolOutput::success(
