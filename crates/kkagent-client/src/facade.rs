@@ -1,5 +1,5 @@
 use kkagent_protocol::{ApprovalResponse, Frame, PermissionMode};
-use kkagent_rpc::RpcClient;
+use kkagent_rpc::{RpcClient, RpcConnectionState};
 use tokio::sync::mpsc;
 
 pub struct KkagentClient {
@@ -35,6 +35,10 @@ impl KkagentClient {
         KkagentRequester {
             rpc: self.rpc.clone(),
         }
+    }
+
+    pub fn connection_state(&self) -> RpcConnectionState {
+        self.rpc.connection_state()
     }
 
     pub async fn create_session(

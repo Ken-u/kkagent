@@ -4,7 +4,7 @@ pub mod http;
 pub mod server;
 pub mod transport;
 
-pub use client::RpcClient;
+pub use client::{RpcClient, RpcConnectionState};
 pub use codec::*;
 pub use http::{
     bind as bind_http, serve as serve_http,

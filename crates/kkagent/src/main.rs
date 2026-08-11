@@ -796,6 +796,7 @@ async fn run_tui(
 
     let client = KkagentClient::new(rpc_client, event_rx);
     let mut app = TuiApp::new(tui_config, client);
+    app.set_remote_connection(is_remote);
     app.set_config_path(config_path);
     app.set_use_alt_screen(!no_alt_screen);
     let result = app.run(resume).await;
@@ -2232,6 +2233,9 @@ async fn run_http_turn(
     let event_state = state.clone();
     tokio::spawn(async move {
         while let Some(event) = event_rx.recv().await {
+            if matches!(&event, AgentEvent::Heartbeat { .. }) {
+                continue;
+            }
             if matches!(event, AgentEvent::ApprovalRequested { .. }) {
                 if let Some(task_id) = durable_task_id.as_deref() {
                     let _ = event_state
@@ -2844,37 +2848,39 @@ async fn spawn_session_agent_turn(
         let _ = wire.ensure_metadata().await;
         while let Some(evt) = agent_event_rx.recv().await {
             let data = serde_json::to_value(&evt).unwrap_or_default();
-            let evt_type = data
-                .get("type")
-                .and_then(|v| v.as_str())
-                .unwrap_or("agent.event")
-                .to_string();
-            let record = kkagent_wire::op_to_wire_record(
-                &evt_type,
-                data.clone(),
-                chrono::Utc::now().timestamp_millis(),
-            );
-            let _ = wire.append(&record).await;
-            match &evt {
-                AgentEvent::TurnStart { .. } => {
-                    telemetry_fwd
-                        .track_json("turn_start", serde_json::json!({}))
-                        .await;
+            if !matches!(&evt, AgentEvent::Heartbeat { .. }) {
+                let evt_type = data
+                    .get("type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("agent.event")
+                    .to_string();
+                let record = kkagent_wire::op_to_wire_record(
+                    &evt_type,
+                    data.clone(),
+                    chrono::Utc::now().timestamp_millis(),
+                );
+                let _ = wire.append(&record).await;
+                match &evt {
+                    AgentEvent::TurnStart { .. } => {
+                        telemetry_fwd
+                            .track_json("turn_start", serde_json::json!({}))
+                            .await;
+                    }
+                    AgentEvent::TurnEnd { .. } => {
+                        telemetry_fwd
+                            .track_json("turn_end", serde_json::json!({}))
+                            .await;
+                    }
+                    AgentEvent::SubagentSpawned { subagent_id, .. } => {
+                        telemetry_fwd
+                            .track_json(
+                                "subagent_created",
+                                serde_json::json!({"subagent_id": subagent_id}),
+                            )
+                            .await;
+                    }
+                    _ => {}
                 }
-                AgentEvent::TurnEnd { .. } => {
-                    telemetry_fwd
-                        .track_json("turn_end", serde_json::json!({}))
-                        .await;
-                }
-                AgentEvent::SubagentSpawned { subagent_id, .. } => {
-                    telemetry_fwd
-                        .track_json(
-                            "subagent_created",
-                            serde_json::json!({"subagent_id": subagent_id}),
-                        )
-                        .await;
-                }
-                _ => {}
             }
             let frame = Frame::Event {
                 event: "agent".into(),

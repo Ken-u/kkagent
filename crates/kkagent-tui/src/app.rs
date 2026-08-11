@@ -6,7 +6,7 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use kkagent_client::KkagentClient;
+use kkagent_client::{KkagentClient, RpcConnectionState};
 use kkagent_config::AppConfig;
 use kkagent_protocol::{AgentEvent, Frame, PermissionMode, SessionStatus};
 use ratatui::{backend::CrosstermBackend, Terminal};
@@ -33,6 +33,8 @@ pub struct TuiApp {
     mouse_mode: MouseMode,
     jobs: crate::async_jobs::AsyncJobHub,
     use_alt_screen: bool,
+    remote_connection: bool,
+    connection_alerted: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -111,10 +113,6 @@ pub struct AppState {
     pub pending_prompt: Option<String>,
     /// Spinner / redraw tick (increments every poll)
     pub tick: usize,
-    /// Last successful agent event time (for idle / reconnect hints).
-    pub last_event_at: Option<std::time::Instant>,
-    /// When RPC appears stalled while busy.
-    pub connection_unknown: bool,
     /// Submitted user prompts for ↑↓ recall
     pub input_history: Vec<String>,
     /// None = not browsing history; Some(i) = viewing history[i]
@@ -706,8 +704,6 @@ impl AppState {
             tasks_panel: None,
             pending_prompt: None,
             tick: 0,
-            last_event_at: None,
-            connection_unknown: false,
             input_history: crate::input_history_store::load(&working_dir),
             history_index: None,
             history_draft: String::new(),
@@ -973,11 +969,17 @@ impl TuiApp {
             mouse_mode: MouseMode::from_env(),
             jobs: crate::async_jobs::AsyncJobHub::new(),
             use_alt_screen: true,
+            remote_connection: false,
+            connection_alerted: false,
         }
     }
 
     pub fn set_use_alt_screen(&mut self, enabled: bool) {
         self.use_alt_screen = enabled;
+    }
+
+    pub fn set_remote_connection(&mut self, enabled: bool) {
+        self.remote_connection = enabled;
     }
 
     pub fn set_config_path(&mut self, path: PathBuf) {
@@ -1267,39 +1269,12 @@ impl TuiApp {
             while let Ok(frame) = self.client.event_rx.try_recv() {
                 self.handle_server_event(frame);
             }
+            self.refresh_connection_notice();
 
             self.state.tick = self.state.tick.wrapping_add(1);
             // Periodic background refresh — never await on the UI loop.
             if self.state.tick.is_multiple_of(100) {
                 self.enqueue_workspace_sessions_refresh();
-            }
-            // Stall detection while busy: surface reconnect / interrupt affordance.
-            if self.state.tick.is_multiple_of(50) {
-                let busy = matches!(
-                    self.state.status,
-                    SessionStatus::Thinking
-                        | SessionStatus::ToolExecuting
-                        | SessionStatus::Cancelling
-                        | SessionStatus::Compacting
-                );
-                if busy {
-                    let stale = self
-                        .state
-                        .last_event_at
-                        .map(|t| t.elapsed().as_secs() >= 45)
-                        .unwrap_or(true);
-                    if stale && !self.state.connection_unknown {
-                        self.state.connection_unknown = true;
-                        let ago = self
-                            .state
-                            .last_event_at
-                            .map(|t| format!("{}s ago", t.elapsed().as_secs()))
-                            .unwrap_or_else(|| "no events yet".into());
-                        self.system_message(format!(
-                            "Still running / no events ({ago}). Esc interrupt · /status check · --connect mode may need reconnect"
-                        ));
-                    }
-                }
             }
             if self.state.tick.is_multiple_of(20)
                 && self.jobs.mcp.configured
@@ -1320,6 +1295,19 @@ impl TuiApp {
             }
         }
         Ok(())
+    }
+
+    fn refresh_connection_notice(&mut self) {
+        match self.client.connection_state() {
+            RpcConnectionState::Connected => {
+                self.connection_alerted = false;
+            }
+            RpcConnectionState::Disconnected { reason } if !self.connection_alerted => {
+                self.connection_alerted = true;
+                self.system_message(connection_loss_message(self.remote_connection, &reason));
+            }
+            RpcConnectionState::Disconnected { .. } => {}
+        }
     }
 
     fn enqueue_workspace_sessions_refresh(&mut self) {
@@ -7002,8 +6990,6 @@ impl TuiApp {
             if let Ok(evt) = serde_json::from_value::<AgentEvent>(data) {
                 let evt_sid = evt.session_id().to_string();
                 let is_current = self.state.session_id.as_deref() == Some(evt_sid.as_str());
-                self.state.last_event_at = Some(std::time::Instant::now());
-                self.state.connection_unknown = false;
                 self.state.event_router.on_event(
                     &evt,
                     &mut self.state.tab_strip,
@@ -7177,6 +7163,7 @@ impl TuiApp {
                             self.flush_prompt_queue_if_idle();
                         }
                     }
+                    AgentEvent::Heartbeat { .. } => {}
                     AgentEvent::ApprovalRequested { request, .. } => {
                         let is_plan_review = request.tool_name == "ExitPlanMode"
                             || request
@@ -7564,6 +7551,18 @@ impl TuiApp {
                 tc.collapsed = !tc.collapsed;
             }
         }
+    }
+}
+
+fn connection_loss_message(remote: bool, reason: &str) -> String {
+    if remote {
+        format!(
+            "Connection to the --connect server was lost ({reason}). Exit kkagent and reconnect after the server is available."
+        )
+    } else {
+        format!(
+            "Embedded agent connection closed unexpectedly ({reason}). Exit and restart kkagent."
+        )
     }
 }
 
@@ -8235,6 +8234,18 @@ fn history_turn_summary(text: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod app_state_tests {
     use super::*;
+
+    #[test]
+    fn reconnect_guidance_is_only_used_for_remote_connections() {
+        let remote = connection_loss_message(true, "peer closed");
+        assert!(remote.contains("--connect"));
+        assert!(remote.contains("reconnect"));
+
+        let embedded = connection_loss_message(false, "peer closed");
+        assert!(embedded.contains("Embedded agent"));
+        assert!(!embedded.contains("--connect"));
+        assert!(!embedded.contains("reconnect"));
+    }
 
     #[test]
     fn parses_and_summarizes_history_edit_turns() {

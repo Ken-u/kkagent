@@ -35,6 +35,10 @@ pub enum AgentEvent {
         session_id: String,
         status: SessionStatus,
     },
+    /// Lightweight turn-liveness signal. Consumers should not persist or render it.
+    Heartbeat {
+        session_id: String,
+    },
     UsageUpdate {
         session_id: String,
         usage: super::TokenUsage,
@@ -169,6 +173,7 @@ impl AgentEvent {
             | Self::TurnStart { session_id, .. }
             | Self::TurnEnd { session_id, .. }
             | Self::StatusUpdate { session_id, .. }
+            | Self::Heartbeat { session_id, .. }
             | Self::UsageUpdate { session_id, .. }
             | Self::ApprovalRequested { session_id, .. }
             | Self::QuestionAsked { session_id, .. }

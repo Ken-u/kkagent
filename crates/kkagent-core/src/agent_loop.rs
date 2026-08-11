@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, Mutex};
-use tokio::task::AbortHandle;
+use tokio::task::{AbortHandle, JoinHandle};
 
 use crate::context_projector::{fold_old_media, project, project_strict, ProjectOptions};
 use crate::file_conflict::FileConflictTracker;
@@ -51,6 +51,45 @@ enum TurnStep {
 }
 
 const TOOL_RESULT_INLINE_MAX: usize = 32_000;
+const TURN_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
+
+struct TurnHeartbeat {
+    task: JoinHandle<()>,
+}
+
+impl TurnHeartbeat {
+    fn spawn(event_tx: mpsc::Sender<AgentEvent>, session_id: String) -> Self {
+        Self::spawn_with_interval(event_tx, session_id, TURN_HEARTBEAT_INTERVAL)
+    }
+
+    fn spawn_with_interval(
+        event_tx: mpsc::Sender<AgentEvent>,
+        session_id: String,
+        interval: Duration,
+    ) -> Self {
+        let task = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(interval).await;
+                if event_tx
+                    .send(AgentEvent::Heartbeat {
+                        session_id: session_id.clone(),
+                    })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        Self { task }
+    }
+}
+
+impl Drop for TurnHeartbeat {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
 
 impl AgentLoop {
     pub fn new(
@@ -103,6 +142,7 @@ impl AgentLoop {
         session: &'a mut Session,
     ) -> futures::future::BoxFuture<'a, anyhow::Result<()>> {
         Box::pin(async move {
+            let _heartbeat = TurnHeartbeat::spawn(self.event_tx.clone(), session.id.clone());
             let mut rounds_left = self.max_rounds;
             loop {
                 match self.run_turn_step(session).await? {
@@ -2319,6 +2359,34 @@ mod retry_tests {
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
     };
+
+    #[tokio::test]
+    async fn turn_heartbeat_reports_liveness_until_dropped() {
+        let (event_tx, mut event_rx) = mpsc::channel(4);
+        let heartbeat = TurnHeartbeat::spawn_with_interval(
+            event_tx.clone(),
+            "heartbeat-session".into(),
+            Duration::from_millis(10),
+        );
+
+        let event = tokio::time::timeout(Duration::from_millis(100), event_rx.recv())
+            .await
+            .expect("heartbeat should arrive")
+            .expect("heartbeat channel should remain open");
+        assert!(matches!(
+            event,
+            AgentEvent::Heartbeat { session_id } if session_id == "heartbeat-session"
+        ));
+
+        drop(heartbeat);
+        while event_rx.try_recv().is_ok() {}
+        assert!(
+            tokio::time::timeout(Duration::from_millis(40), event_rx.recv())
+                .await
+                .is_err(),
+            "dropping the heartbeat guard should stop future heartbeats"
+        );
+    }
 
     #[test]
     fn tool_arguments_must_be_json_objects() {
