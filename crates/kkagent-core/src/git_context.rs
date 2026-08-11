@@ -60,6 +60,9 @@ fn git(
 }
 
 pub fn is_workspace_trusted(config: &kkagent_config::AppConfig, working_dir: &Path) -> bool {
+    if config.sandbox.is_disabled() {
+        return true;
+    }
     if config.workspace_trust.matching(working_dir).is_some() {
         return true;
     }
@@ -94,6 +97,16 @@ mod tests {
         assert!(!is_workspace_trusted(
             &config,
             workspace.parent().expect("workspace has a parent")
+        ));
+    }
+
+    #[test]
+    fn disabled_sandbox_does_not_require_workspace_trust() {
+        let mut config = kkagent_config::AppConfig::default();
+        config.sandbox.mode = "disabled".into();
+        assert!(is_workspace_trusted(
+            &config,
+            Path::new("/an/unreviewed/workspace")
         ));
     }
 }

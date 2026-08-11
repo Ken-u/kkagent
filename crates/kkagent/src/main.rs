@@ -749,14 +749,16 @@ async fn run_tui(
     let workspace = std::env::current_dir()
         .and_then(std::fs::canonicalize)
         .context("cannot resolve the TUI workspace")?;
-    kkagent_tui::ensure_workspace_trust(&mut config, &config_path, &workspace, !no_alt_screen)?;
+    let is_remote = connect.is_some();
+    if !is_remote && !config.sandbox.is_disabled() {
+        kkagent_tui::ensure_workspace_trust(&mut config, &config_path, &workspace, !no_alt_screen)?;
+    }
 
     // Default TUI: 1:1 in-process pair via memory duplex.
     // This process owns both ends — quitting the TUI aborts the paired server
     // task so a subsequent `kkagent` never talks to a leftover in-process agent.
     // Standalone `kkagent server` (UDS) is a separate process with its own lifetime;
     // only that mode can outlive a TUI, and only when you explicitly start it.
-    let is_remote = connect.is_some();
     let (event_tx, event_rx) = mpsc::channel::<Frame>(256);
     let (rpc_client, server_handle) = if let Some(endpoint) = connect {
         let stream =
@@ -782,6 +784,17 @@ async fn run_tui(
             None
         }
     };
+
+    // A remote server is authoritative about sandboxing. Defer review until
+    // after runtime.status so a disabled remote sandbox never causes a local
+    // trust prompt, while an enabled/unknown one still fails closed.
+    if is_remote
+        && !runtime_sandbox_mode
+            .as_deref()
+            .is_some_and(kkagent_config::SandboxConfig::mode_is_disabled)
+    {
+        kkagent_tui::ensure_workspace_trust(&mut config, &config_path, &workspace, !no_alt_screen)?;
+    }
 
     let mut tui_config = config;
     if let Some(mode) = runtime_sandbox_mode {

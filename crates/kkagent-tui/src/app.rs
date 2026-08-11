@@ -1119,12 +1119,15 @@ impl TuiApp {
 
     pub async fn run(mut self, resume: Option<String>) -> anyhow::Result<()> {
         let startup_started = std::time::Instant::now();
-        if let Some(trust) = self
-            .config
-            .workspace_trust
-            .matching(&self.state.working_dir)
-            .cloned()
-        {
+        let startup_trust = if self.config.sandbox.is_disabled() {
+            None
+        } else {
+            self.config
+                .workspace_trust
+                .matching(&self.state.working_dir)
+                .cloned()
+        };
+        if let Some(trust) = startup_trust {
             self.client
                 .rpc_call("workspace.trust", Some(serde_json::to_value(trust)?))
                 .await?;
@@ -1159,10 +1162,12 @@ impl TuiApp {
             "TUI session ready"
         );
 
-        // Defensive consistency check: the startup review or static config must
-        // have established trust before the server creates this session.
+        // With sandboxing enabled, startup review or static config must have
+        // established trust before the server creates this session.
         let cwd_path = std::path::PathBuf::from(&cwd);
-        if self.config.workspace_trust.matching(&cwd_path).is_none() {
+        if !self.config.sandbox.is_disabled()
+            && self.config.workspace_trust.matching(&cwd_path).is_none()
+        {
             self.system_message(format!(
                 "Untrusted workspace {}. Restart kkagent and complete the workspace trust review.",
                 cwd_path.display()

@@ -303,6 +303,21 @@ impl Default for SandboxConfig {
     }
 }
 
+impl SandboxConfig {
+    /// An explicitly disabled sandbox treats workspace access as unrestricted,
+    /// so startup should not gate it on a trust review.
+    pub fn is_disabled(&self) -> bool {
+        Self::mode_is_disabled(&self.mode)
+    }
+
+    pub fn mode_is_disabled(mode: &str) -> bool {
+        matches!(
+            mode.trim().to_ascii_lowercase().as_str(),
+            "disabled" | "off" | "none"
+        )
+    }
+}
+
 fn default_sandbox_mode() -> String {
     "auto".into()
 }
@@ -632,6 +647,20 @@ mod tests {
     #[test]
     fn accepts_consistent_configuration() {
         valid_config().validate().unwrap();
+    }
+
+    #[test]
+    fn recognizes_all_disabled_sandbox_aliases() {
+        for mode in ["disabled", "OFF", " none "] {
+            let sandbox = SandboxConfig {
+                mode: mode.into(),
+                ..SandboxConfig::default()
+            };
+            assert!(sandbox.is_disabled(), "mode {mode:?}");
+        }
+        for mode in ["auto", "process", "workspace", "unknown"] {
+            assert!(!SandboxConfig::mode_is_disabled(mode), "mode {mode:?}");
+        }
     }
 
     #[test]
