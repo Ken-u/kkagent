@@ -4655,9 +4655,20 @@ impl TuiApp {
             self.system_message("No sessions in this workspace.".into());
             return;
         }
-        let selected = current
+        // Preserve the currently *highlighted* session across background
+        // `sessions.list` refreshes. The running session (`current`) is only a
+        // fallback — otherwise navigating the picker gets yanked back to the
+        // running session's position every time a refresh lands.
+        let prior_selected_id = self
+            .state
+            .list_picker
             .as_ref()
-            .and_then(|c| items.iter().position(|i| &i.id == c))
+            .filter(|p| p.kind == ListPickerKind::Session)
+            .and_then(|p| p.items.get(p.selected).map(|i| i.id.clone()));
+        let selected = prior_selected_id
+            .as_deref()
+            .and_then(|id| items.iter().position(|i| &i.id == id))
+            .or_else(|| current.as_ref().and_then(|c| items.iter().position(|i| &i.id == c)))
             .unwrap_or(0);
         let prior_filter = self
             .state
@@ -4686,6 +4697,9 @@ impl TuiApp {
         if picker.kind != ListPickerKind::Session {
             return;
         }
+        // Remember the highlighted item so we can keep the cursor on it after
+        // the visible set changes.
+        let keep_id = picker.items.get(picker.selected).map(|i| i.id.clone());
         let q = picker.filter.to_ascii_lowercase();
         if q.is_empty() {
             picker.items = picker.all_items.clone();
@@ -4709,9 +4723,18 @@ impl TuiApp {
                 picker.all_items.len()
             );
         }
-        if picker.selected >= picker.items.len() {
-            picker.selected = picker.items.len().saturating_sub(1);
-        }
+        // Try to keep the cursor on the same item; fall back to clamp.
+        let new_selected = keep_id
+            .as_deref()
+            .and_then(|id| picker.items.iter().position(|i| &i.id == id))
+            .unwrap_or_else(|| {
+                if picker.selected >= picker.items.len() {
+                    picker.items.len().saturating_sub(1)
+                } else {
+                    picker.selected
+                }
+            });
+        picker.selected = new_selected;
     }
 
     async fn resume_session(&mut self, query: &str) -> anyhow::Result<()> {
