@@ -418,6 +418,17 @@
 - [ ] 保留 `sandbox.extra_read_paths` / `extra_write_paths` 作为高级逃生口，但不得把开放整个用户 HOME 或语言用户目录作为正常修复建议。
 - [ ] 明确并修正 `sandbox.mode` 语义：`disabled` 若承诺完全关闭沙箱，就必须同时跳过文件/网络隔离、Git 环境改写和 OS 资源/Job Object 限制；若保留资源限制则改名或在配置、doctor 和文档中明确展示实际生效层。
 
+### P0：Agent 按需申请外部路径
+
+- [ ] 增加 `RequestSandboxAccess`（名称可在实现时统一）受控工具；Agent 只能提交具体绝对路径、`read` / `read_write` 最小权限和用途说明，不能直接修改 sandbox policy、配置文件或 trust sidecar。
+- [ ] 该工具只在启动后解析出的**有效模式确实具备文件系统路径隔离**时注册到模型工具目录：当前 macOS/Linux 的 `workspace`（包括解析为它的 `auto`）注册；`process`、`disabled`、当前 Windows Job Object 模式以及不支持路径授权的平台不注册。判断必须基于实际生效能力，不只检查配置字符串。
+- [ ] sandbox mode 在启动时决定工具目录；通过 `config set` 改变 mode 后必须重启。若未来支持热切换，应在下一 turn 前原子更新工具目录与 sandbox policy，禁止出现工具可见但授权无法执行的中间状态。
+- [ ] 宿主在 sandbox 外规范化并校验申请路径，拒绝 `~`、环境变量、glob、`..`、文件系统根、整个 HOME、悬空/漂移软链接及普通流程中的凭据目录；不存在的写目标只能按规范化后的最近既有父目录和明确文件名审批。
+- [ ] TUI 展示触发命令/工具、规范化路径、读写权限、申请理由、当前网络能力和敏感风险；默认 `Once`，用户可选 Turn / Session / Workspace，永久 Workspace 授权才写 trust sidecar。
+- [ ] `Once` 授权绑定 `session_id + tool_call_id + command digest + path + access`，只允许重试后的一个新进程消费；已运行进程不得动态扩权。Turn / Session 授权仅驻内存，session 结束即清除。
+- [ ] 拒绝结果在当前 turn 内去重，Agent 不得通过路径别名或重复措辞连续弹窗；敏感路径、读外部文件同时可联网、以及写入共享工具链/依赖缓存时提高风险等级并限制可选 scope。
+- [ ] 记录不含文件内容的授权审计事件，并提供查看、撤销和重试入口；已知 Rust/Node/Python/Go/Java 工具链优先申请结构化 profile，任意目录申请只作为精确兜底。
+
 ### P1：缓存生命周期与诊断
 
 - [ ] kkagent 工具链缓存提供容量上限、LRU 清理、按生态/运行时 fingerprint 分区和可审计清单；不能与用户正常开发缓存互相污染。
@@ -429,6 +440,7 @@
 - [ ] macOS/Linux 在 workspace 模式下完成 Rust、Node、Python、Go 和 Gradle 的离线缓存构建及公共依赖首次下载；不得读取各生态凭据文件，不得修改宿主工具链和用户依赖缓存。
 - [ ] Windows 验证环境隔离、缓存目录和 Job Object 行为；三端对 `auto`、`workspace`、`process`、`disabled` 的用户可见语义一致，unsupported 模式继续 fail-closed。
 - [ ] 覆盖 rustup/nvm/Volta/pyenv/mise/asdf、绝对路径 runtime、自定义 HOME、路径变化、缓存损坏、私有 registry 和工具链缺失场景；拒绝授权后核心对话和非相关工具仍可使用。
+- [ ] 覆盖工具目录条件注册矩阵：macOS/Linux `workspace` 与有效 `auto` 可见，`process` / `disabled` 不可见，当前 Windows 不可见；同时验证 Once 单次消费、Turn/Session 清理、Workspace 持久化、拒绝去重、软链接竞态和重启后 mode 变化。
 
 ## 文末：暂缓 / 手动项
 
