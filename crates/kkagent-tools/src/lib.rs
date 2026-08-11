@@ -198,6 +198,7 @@ pub fn register_builtin_tools(registry: &mut ToolRegistry) {
     registry.register(Arc::new(builtin::TodoListTool::new()));
     registry.register(Arc::new(builtin::AskUserQuestionTool));
     registry.register(Arc::new(builtin::EnterPlanModeTool));
+    registry.register(Arc::new(builtin::WritePlanTool));
     registry.register(Arc::new(builtin::ExitPlanModeTool));
     registry.register(Arc::new(builtin::SelectToolsTool::new()));
     registry.register(Arc::new(builtin::ReadMediaFileTool));

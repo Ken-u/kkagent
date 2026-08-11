@@ -1053,18 +1053,15 @@ Tool results and user messages may include `<system-reminder>` tags. These are a
 }
 
 /// Mirrors kimi-code plan-mode injector `fullReminder`.
-pub fn plan_mode_reminder(plan_file: &std::path::Path) -> String {
-    format!(
-        r#"<system-reminder>
-Plan mode is active. You MUST NOT make any edits (with the exception of the current plan file) or otherwise make changes to the system unless a tool request is explicitly approved. Prefer read-only tools. Use Bash only when needed; Bash follows the normal permission mode and rules. This supersedes any other instructions you have received. TaskStop, CronCreate, and CronDelete are also blocked in plan mode — call ExitPlanMode first if you need them.
-
-Plan file: {plan}
+pub fn plan_mode_reminder() -> String {
+    r#"<system-reminder>
+Plan mode is active. You MUST NOT make edits through normal file tools or otherwise make changes to the system unless a tool request is explicitly approved. Prefer read-only tools. Use WritePlan only for the host-managed plan document; it does not accept a path. Use Bash only when needed; Bash follows the normal permission mode and rules. This supersedes any other instructions you have received. TaskStop, CronCreate, and CronDelete are also blocked in plan mode — call ExitPlanMode first if you need them.
 
 Workflow:
   1. Understand — explore the codebase with Glob, Grep, Read.
   2. Design — converge on the best approach; consider trade-offs but aim for a single recommendation.
   3. Review — re-read key files to verify understanding.
-  4. Write Plan — create/update the plan file with Write or Edit (use Write if it does not exist yet).
+  4. Write Plan — call WritePlan with the complete Markdown document. Call it again with the complete revised document after feedback. Never pass or invent a plan path.
   5. Exit — call ExitPlanMode for user approval (user chooses 执行 / 修改意见 / 拒绝).
 
 ## Plan file format
@@ -1080,9 +1077,8 @@ AskUserQuestion is for clarifying missing requirements or user preferences that 
 Never ask about plan approval via text or AskUserQuestion.
 Your turn must end with either AskUserQuestion (to clarify requirements or preferences) or ExitPlanMode (to request plan approval). Do NOT end your turn any other way.
 Do NOT use AskUserQuestion to ask about plan approval or reference "the plan" — the user cannot see the plan until you call ExitPlanMode.
-</system-reminder>"#,
-        plan = plan_file.display()
-    )
+</system-reminder>"#
+        .into()
 }
 
 /// Build LLM-facing messages; when plan mode is on, append a fresh system-reminder
@@ -1093,7 +1089,7 @@ pub fn messages_for_llm(session: &Session) -> Vec<ChatMessage> {
         messages.push(ChatMessage {
             role: "user".into(),
             content: vec![ChatContent::Text {
-                text: plan_mode_reminder(&session.plan_file_path),
+                text: plan_mode_reminder(),
             }],
         });
     }
@@ -1111,6 +1107,14 @@ mod working_directory_tests {
         assert!(context.contains("`/workspace/project`"));
         assert!(context.contains("prefer paths relative to the working directory"));
         assert!(context.contains("git -C"));
+    }
+
+    #[test]
+    fn plan_reminder_uses_host_managed_write_plan_tool() {
+        let reminder = plan_mode_reminder();
+        assert!(reminder.contains("WritePlan"));
+        assert!(reminder.contains("does not accept a path"));
+        assert!(!reminder.contains("Plan file:"));
     }
 
     #[test]

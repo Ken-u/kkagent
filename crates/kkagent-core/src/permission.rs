@@ -81,6 +81,18 @@ impl PermissionChain {
     ) -> PermissionDecision {
         let mode = self.current_mode();
 
+        // WritePlan is a host-scoped plan primitive: it never accepts a path
+        // and is available without approval only while plan mode is active.
+        if tool_name == "WritePlan" {
+            return if plan_mode && plan_file.is_some() {
+                PermissionDecision::Approve
+            } else {
+                PermissionDecision::Deny(
+                    "WritePlan is only available while plan mode is active.".into(),
+                )
+            };
+        }
+
         // 0. plan-mode-guard-deny (must run before auto/yolo approve)
         if plan_mode {
             if let Some(deny) = plan_mode_guard(tool_name, input, working_dir, plan_file) {
@@ -211,16 +223,19 @@ fn plan_mode_guard(
     if tool_name == "Write" || tool_name == "Edit" {
         let Some(plan_path) = plan_file else {
             return Some(PermissionDecision::Deny(
-                "Plan mode is active. No plan file is set; refuse all writes. Call ExitPlanMode to exit.".into(),
+                "Plan mode is active. Normal file writes are disabled; use WritePlan for the plan document or ExitPlanMode to exit.".into(),
             ));
         };
         if writes_only_plan_file(input, working_dir, plan_path) {
             return None; // allowed — continue normal permission chain
         }
         return Some(PermissionDecision::Deny(format!(
-            "Plan mode is active. You may only write to the current plan file: {}. \
-             Call ExitPlanMode to exit plan mode before editing other files.",
-            plan_path.display()
+            "Plan mode is active. Write/Edit cannot modify `{}`. Use WritePlan for the \
+             host-managed plan document, or call ExitPlanMode before editing project files.",
+            input
+                .get("path")
+                .and_then(|value| value.as_str())
+                .unwrap_or("this path")
         )));
     }
     None
@@ -544,6 +559,37 @@ mod tests {
             Some(&plan),
         );
         assert_eq!(decision, PermissionDecision::Approve);
+    }
+
+    #[test]
+    fn write_plan_is_scoped_to_plan_mode_and_never_prompts() {
+        for mode in [
+            PermissionMode::Auto,
+            PermissionMode::Yolo,
+            PermissionMode::Manual,
+        ] {
+            let chain = PermissionChain::new(mode, vec![]);
+            assert_eq!(
+                chain.evaluate(
+                    "WritePlan",
+                    &serde_json::json!({"content": "# Plan"}),
+                    Path::new("/tmp/ws"),
+                    true,
+                    Some(Path::new("/tmp/session/plans/plan.md")),
+                ),
+                PermissionDecision::Approve
+            );
+            assert!(matches!(
+                chain.evaluate(
+                    "WritePlan",
+                    &serde_json::json!({"content": "# Plan"}),
+                    Path::new("/tmp/ws"),
+                    false,
+                    Some(Path::new("/tmp/session/plans/plan.md")),
+                ),
+                PermissionDecision::Deny(_)
+            ));
+        }
     }
 
     #[test]

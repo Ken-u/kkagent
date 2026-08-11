@@ -818,7 +818,11 @@ Do not mention this reminder to the user.\n</system-reminder>"
                         } else if tc.name == "ExitPlanMode" {
                             Prepared::Done(self.auto_exit_plan_mode(session, &tc.input).await)
                         } else {
-                            if tc.name == "Write" || tc.name == "Edit" {
+                            if tc.name == "WritePlan" {
+                                session
+                                    .record_pre_change(session.plan_file_path.clone())
+                                    .await;
+                            } else if tc.name == "Write" || tc.name == "Edit" {
                                 if let Some(path_str) =
                                     tc.input.get("path").and_then(|v| v.as_str())
                                 {
@@ -1172,9 +1176,7 @@ Do not mention this reminder to the user.\n</system-reminder>"
                     match session.set_plan_mode_persisted(true) {
                         Ok(()) => {
                             output.content =
-                                kkagent_tools::builtin::plan::entered_plan_mode_message(
-                                    &session.plan_file_path,
-                                );
+                                kkagent_tools::builtin::plan::entered_plan_mode_message();
                             let _ = self
                                 .event_tx
                                 .send(AgentEvent::PlanModeChanged {
@@ -1293,6 +1295,26 @@ Do not mention this reminder to the user.\n</system-reminder>"
                                 })
                                 .await;
                         }
+                    }
+                }
+                if !output.is_error && name == "WritePlan" {
+                    if let Some(content) = output
+                        .data
+                        .as_ref()
+                        .filter(|data| {
+                            data.get("kind").and_then(|value| value.as_str()) == Some("plan_write")
+                        })
+                        .and_then(|data| data.get("content"))
+                        .and_then(|content| content.as_str())
+                    {
+                        let _ = self
+                            .event_tx
+                            .send(AgentEvent::PlanFileUpdated {
+                                session_id: session_id.clone(),
+                                path: session.plan_file_path.display().to_string(),
+                                content: content.to_string(),
+                            })
+                            .await;
                     }
                 }
 
@@ -1655,14 +1677,13 @@ Do not mention this reminder to the user.\n</system-reminder>"
                 "ExitPlanMode can only be called while plan mode is active. Use EnterPlanMode (or /plan) first.",
             );
         }
-        let path = session.plan_file_path.display().to_string();
         let plan = tokio::fs::read_to_string(&session.plan_file_path)
             .await
             .unwrap_or_default();
         if plan.trim().is_empty() {
-            return ToolOutput::error(format!(
-                "No plan file found. Write your plan to {path} first, then call ExitPlanMode."
-            ));
+            return ToolOutput::error(
+                "No plan document found. Call WritePlan first, then call ExitPlanMode.",
+            );
         }
         if let Err(error) = session.finalize_plan_filename(&plan) {
             return ToolOutput::error(error.to_string());
@@ -1694,14 +1715,13 @@ Do not mention this reminder to the user.\n</system-reminder>"
                 "ExitPlanMode can only be called while plan mode is active. Use EnterPlanMode (or /plan) first.",
             ));
         }
-        let path = session.plan_file_path.display().to_string();
         let plan = tokio::fs::read_to_string(&session.plan_file_path)
             .await
             .unwrap_or_default();
         if plan.trim().is_empty() {
-            return Ok(ToolOutput::error(format!(
-                "No plan file found. Write your plan to {path} first, then call ExitPlanMode."
-            )));
+            return Ok(ToolOutput::error(
+                "No plan document found. Call WritePlan first, then call ExitPlanMode.",
+            ));
         }
         if let Err(error) = session.finalize_plan_filename(&plan) {
             return Ok(ToolOutput::error(error.to_string()));
@@ -2162,7 +2182,12 @@ fn tool_allowed(session: &Session, name: &str) -> bool {
         // Always keep disclosure / interaction primitives available.
         if !matches!(
             name,
-            "SelectTools" | "AskUserQuestion" | "TodoList" | "ExitPlanMode" | "EnterPlanMode"
+            "SelectTools"
+                | "AskUserQuestion"
+                | "TodoList"
+                | "ExitPlanMode"
+                | "EnterPlanMode"
+                | "WritePlan"
         ) {
             return false;
         }
@@ -2180,6 +2205,7 @@ fn tool_allowed_set(enabled: Option<&std::collections::HashSet<String>>, name: &
                 || name == "TodoList"
                 || name == "ExitPlanMode"
                 || name == "EnterPlanMode"
+                || name == "WritePlan"
         }
     }
 }

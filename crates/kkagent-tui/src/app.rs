@@ -601,7 +601,7 @@ pub enum MessageRole {
     User,
     Assistant,
     System,
-    /// Full plan.md contents shown after Write/Edit in plan mode.
+    /// Full plan.md contents shown after WritePlan in plan mode.
     Plan,
     /// Compact skill activation card (not a normal chat bubble).
     Skill,

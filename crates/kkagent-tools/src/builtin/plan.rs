@@ -3,11 +3,15 @@ use serde_json::{json, Value};
 
 use crate::{Tool, ToolContext, ToolOutput};
 
-pub fn entered_plan_mode_message(plan_path: &std::path::Path) -> String {
-    format!(
-        "Plan mode is now active. Your workflow:\n\nPlan file: {}\n\n1. Use read-only tools (Read, Grep, Glob) to investigate the codebase. Use Bash only when needed.\n2. Design a concrete, step-by-step plan.\n3. Write the plan to the plan file with Write or Edit. The first line MUST be `# <plan name>`; the host finalizes the filename as `YYYY-MM-DD_<plan-name>.md`.\n4. When the plan is ready, call ExitPlanMode for user approval.\n\nDo NOT edit files other than the plan file while plan mode is active.\nUse Bash only when needed; Bash follows the normal permission mode and rules.",
-        plan_path.display()
-    )
+pub fn entered_plan_mode_message() -> String {
+    "Plan mode is now active. Your workflow:\n\n\
+1. Use read-only tools (Read, Grep, Glob) to investigate the codebase. Use Bash only when needed.\n\
+2. Design a concrete, step-by-step plan.\n\
+3. Call WritePlan with the complete Markdown plan. The first line MUST be `# <plan name>`; the host manages the session path and finalizes the filename as `YYYY-MM-DD_<plan-name>.md`.\n\
+4. When the plan is ready, call ExitPlanMode for user approval.\n\n\
+Do NOT pass a path or use Write/Edit for the plan; WritePlan owns the plan destination.\n\
+Use Bash only when needed; Bash follows the normal permission mode and rules."
+        .into()
 }
 
 /// Signal that the agent should leave plan mode after writing a complete plan.
@@ -20,11 +24,11 @@ impl Tool for ExitPlanModeTool {
     }
 
     fn description(&self) -> &str {
-        "Use this tool when you are in plan mode and have finished writing your plan to the plan file \
+        "Use this tool when you are in plan mode and have finished writing your plan with WritePlan \
          and are ready for user approval.\n\n\
          ## How This Tool Works\n\
-         - You should have already written your plan to the plan file specified in the plan mode reminder.\n\
-         - This tool does NOT take the plan content as a parameter — it reads the plan from the file you wrote.\n\
+         - You should have already submitted the complete plan through WritePlan.\n\
+         - This tool does NOT take the plan content as a parameter — it reads the host-managed plan document.\n\
          - The user will see the plan and choose 执行 / 修改意见 / 拒绝. In auto permission mode, the tool \
          exits plan mode without asking.\n\n\
          ## Multiple Approaches\n\
@@ -32,7 +36,7 @@ impl Tool for ExitPlanModeTool {
          user can choose which one to execute. Do not use reserved labels (执行/拒绝/修改意见/Approve/Reject/Revise).\n\n\
          ## Before Using\n\
          - Do NOT use AskUserQuestion to ask \"Is this plan OK?\" — that is exactly what ExitPlanMode does.\n\
-         - If rejected with feedback, revise the plan file and call ExitPlanMode again."
+         - If rejected with feedback, call WritePlan with the complete revised document, then call ExitPlanMode again."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -63,7 +67,7 @@ impl Tool for ExitPlanModeTool {
                 },
                 "summary": {
                     "type": "string",
-                    "description": "Optional brief summary (prefer writing the full plan to the plan file)."
+                    "description": "Optional brief summary (prefer writing the full plan with WritePlan)."
                 }
             },
             "required": []
@@ -79,17 +83,16 @@ impl Tool for ExitPlanModeTool {
         // auto-mode (or allow rules): exit and format the plan from disk.
         let Some(plan_path) = ctx.plan_file_path.as_ref() else {
             return Ok(ToolOutput::error(
-                "No plan file path is available in this host. Wait for the host to provide one before calling ExitPlanMode.",
+                "No host-managed plan document is available. Call WritePlan before ExitPlanMode.",
             ));
         };
         let plan = tokio::fs::read_to_string(&plan_path)
             .await
             .unwrap_or_default();
         if plan.trim().is_empty() {
-            return Ok(ToolOutput::error(format!(
-                "No plan file found. Write your plan to {} first, then call ExitPlanMode.",
-                plan_path.display()
-            )));
+            return Ok(ToolOutput::error(
+                "No plan document found. Call WritePlan first, then call ExitPlanMode.",
+            ));
         }
         let _ = input;
         let path = plan_path.display().to_string();
@@ -102,7 +105,7 @@ impl Tool for ExitPlanModeTool {
     }
 }
 
-/// Enter plan mode — agent may only write the session plan file until ExitPlanMode.
+/// Enter plan mode — agent writes the host-managed document through WritePlan.
 pub struct EnterPlanModeTool;
 
 #[async_trait]
@@ -113,8 +116,8 @@ impl Tool for EnterPlanModeTool {
 
     fn description(&self) -> &str {
         "Enter plan mode. Getting user sign-off on your approach via ExitPlanMode before writing code \
-         prevents wasted effort. While active, you may only write/edit the session plan file. \
-         Explore with read-only tools, write a complete plan, then call ExitPlanMode for approval."
+         prevents wasted effort. Explore with read-only tools, submit the complete Markdown plan \
+         through WritePlan, then call ExitPlanMode for approval."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -128,12 +131,7 @@ impl Tool for EnterPlanModeTool {
         true
     }
 
-    async fn execute(&self, _input: Value, ctx: &ToolContext) -> anyhow::Result<ToolOutput> {
-        let Some(plan_path) = ctx.plan_file_path.as_ref() else {
-            return Ok(ToolOutput::success(
-                "Plan mode is now active. Wait for the host to provide a plan file path before calling ExitPlanMode.",
-            ));
-        };
-        Ok(ToolOutput::success(entered_plan_mode_message(plan_path)))
+    async fn execute(&self, _input: Value, _ctx: &ToolContext) -> anyhow::Result<ToolOutput> {
+        Ok(ToolOutput::success(entered_plan_mode_message()))
     }
 }

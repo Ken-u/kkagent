@@ -202,7 +202,7 @@ pub fn infer_accesses(
             tool_accesses::search_tree(resolve_tool_path(working_dir, root))
         }
         "Bash" | "Task" | "Agent" | "AgentSwarm" | "TaskStop" | "AskUserQuestion"
-        | "EnterPlanMode" | "ExitPlanMode" | "SelectTools" | "TodoList" | "Skill"
+        | "EnterPlanMode" | "WritePlan" | "ExitPlanMode" | "SelectTools" | "TodoList" | "Skill"
         | "CronCreate" | "CronList" | "CronDelete" => tool_accesses::all(),
         "WebSearch" | "FetchURL" | "TaskOutput" | "TaskList" | "GetGoal" => tool_accesses::none(),
         n if n.starts_with("mcp__") => tool_accesses::all(),

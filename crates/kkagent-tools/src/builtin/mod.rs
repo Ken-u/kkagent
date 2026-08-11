@@ -14,6 +14,7 @@ pub mod task;
 pub mod todo;
 pub mod web;
 pub mod write;
+pub mod write_plan;
 
 pub use ask_user::AskUserQuestionTool;
 pub use bash::{BackgroundShellManager, BashOptions, BashTool};
@@ -34,3 +35,4 @@ pub use task::{AgentSwarmTool, AgentTool, TaskListTool, TaskOutputTool, TaskStop
 pub use todo::TodoListTool;
 pub use web::{FetchUrlTool, WebSearchTool};
 pub use write::WriteTool;
+pub use write_plan::WritePlanTool;
