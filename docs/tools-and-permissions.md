@@ -11,7 +11,7 @@
 | 规划 | `TodoList`、`EnterPlanMode`、`ExitPlanMode` | 管理步骤和 Plan 模式。 |
 | 交互 | `AskUserQuestion`、`SelectTools` | 请求用户输入或选择工具集。 |
 | 扩展 | `Skill`、动态 MCP 工具 | 加载 Skill 或调用 MCP Server。 |
-| Web | `WebSearch`、`FetchURL` | 搜索和抓取网页；搜索需要配置服务。 |
+| Web | `WebSearch`、`FetchURL` | 搜索和抓取网页；搜索使用与具体厂商无关的 provider-agnostic 接入。 |
 | 任务 | `Task`、`Agent`、`AgentSwarm`、`TaskOutput`、`TaskList`、`TaskStop` | 管理子任务和后台执行。 |
 | 目标 | `CreateGoal`、`GetGoal`、`UpdateGoal`、`SetGoalBudget` | 管理跨轮目标。 |
 | 定时 | `CronCreate`、`CronList`、`CronDelete` | 管理会话内定时任务。 |
@@ -67,10 +67,13 @@ Plan 模式不是完整沙箱：只读工具和经过策略允许的其他能力
 
 - 明显破坏系统的命令（例如针对根目录的递归删除、格式化磁盘、直接写块设备、下载后直接 pipe 到 Shell）会硬阻断。
 - `sudo`、危险删除和 Git hard reset 等会被标记为高风险并进入更严格决策。
-- 命令支持超时和取消，取消时会尝试结束进程树。
+- 命令支持超时和取消，取消时会尝试结束进程树；取消状态会在 TUI 中正确展示。
 - 后台进程有数量、存活时间和历史记录上限。
+- `!shell` 类命令在本地直接执行，不进入 Agent loop，用于快速 shell 操作。
 
 `Bash` 还会按 `[sandbox]` 应用操作系统隔离和资源上限。Linux/macOS 的 `workspace` 模式限制文件边界，并可关闭网络；Windows 默认通过 Job Object 约束整个进程树。沙箱能降低工具进程越界风险，但不能替代 VM/容器级多租户隔离；`yolo` 和 `auto` 下仍不应把生产凭据放进 workspace。
+
+需要排障时，可使用 `kkagent --disable-sandbox` 仅对当前进程临时关闭沙箱与资源限制；该参数不写回配置，且不能与 `--connect` 同时使用（连接独立 Server 时由 Server 配置决定沙箱模式）。
 
 ## 文件边界
 

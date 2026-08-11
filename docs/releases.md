@@ -67,3 +67,20 @@ cosign verify-blob \
 4. 在 GitHub Release 中确认六个包、校验清单、Sigstore bundle 和自动 release notes。
 
 发布任务会在最后创建 `v<version>` tag 和 Release。需要重新构建已有版本资产时，可手动运行 workflow 并填写现有 tag；上传使用覆盖模式。正式版本不应移动已经对外发布的 tag。
+
+## 版本历史
+
+### v0.1.7
+
+新增：
+
+- **CLI 沙箱临时禁用**：`kkagent --disable-sandbox` 仅在当前进程关闭 Bash OS 沙箱与资源限制，不写回配置，不能与 `--connect` 同时使用。推荐只在受控容器或排障场景使用。
+- **TUI 编辑对话历史**：连按两次 `Esc` 可进入当前对话的编辑/重发模式。
+- **工作区 Git 信任授权**：启动 Bash 时检测仓库 Git 配置与全局 Git 配置，首次访问会询问用户授权；选择结果写入配置同目录的 `<config>.trust.toml`。未授权时 Bash 注入隔离 Git 配置，跳过 global/system config 与全局 ignore/attributes。
+- **无厂商绑定的 Web 搜索**：`WebSearch`/`FetchURL` 工具改为 provider-agnostic 实现，支持更通用的网络抓取配置。
+- **会话恢复增强**：恢复会话时保持原工作目录不变。
+- **TUI 体验修复**：后台刷新时保留会话选择器光标；`!shell` 类命令在本地直接执行，不进入 Agent loop；thinking 转圈动画渲染简化。
+
+### v0.1.6
+
+首个对外发布版本。提供 TUI、CLI prompt、独立 Server、ACP、MCP、Hooks、Skills、会话管理与 Bash OS 沙箱。
