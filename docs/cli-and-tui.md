@@ -46,6 +46,8 @@ answer=$(kkagent -p "总结 README" 2>kkagent.err)
 
 排障时可用 `kkagent --disable-sandbox` 临时覆盖 `[sandbox].mode`。该参数不写回配置，也不能与 `--connect` 同时使用；连接独立 Server 时必须在 Server 启动参数或 Server 配置中决定沙箱模式。
 
+Footer 第二行在 `context` 左侧显示当前有效沙箱模式：绿色 `● sandbox:workspace` 表示工作区文件系统隔离，黄色 `● sandbox:process` 表示仅有进程/资源限制，红色 `● sandbox:off` 表示沙箱及资源限制均已关闭。配置为 `auto` 时显示当前平台解析后的实际模式。
+
 ## TUI 快捷键
 
 | 按键 | 作用 |

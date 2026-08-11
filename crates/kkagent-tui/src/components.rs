@@ -2,7 +2,7 @@ use kkagent_config::AppConfig;
 use kkagent_protocol::{PermissionMode, SessionStatus};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Margin, Rect},
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{Block, Borders, Clear, Paragraph},
     Frame,
@@ -1380,12 +1380,15 @@ fn render_footer(f: &mut Frame, area: Rect, state: &mut AppState, config: &AppCo
         ));
     }
 
-    // Line 2: [spinner] workspace session strip (left) + context meter (right)
+    // Line 2: [spinner] workspace session strip (left) + sandbox + context (right)
     let context = format_context(state, config);
     let ctx_w = UnicodeWidthStr::width(context.as_str());
+    let (sandbox, sandbox_color) = sandbox_indicator(&config.sandbox.mode, theme);
+    let sandbox_w = UnicodeWidthStr::width(sandbox);
     let gap = 2usize;
+    let right_w = sandbox_w.saturating_add(gap).saturating_add(ctx_w);
     let strip_budget = (area.width as usize)
-        .saturating_sub(ctx_w)
+        .saturating_sub(right_w)
         .saturating_sub(gap);
     let session_busy = session_strip_has_busy(state);
     let spinner_cols = if session_busy { 2 } else { 0 }; // "⠋ "
@@ -1418,10 +1421,12 @@ fn render_footer(f: &mut Frame, area: Rect, state: &mut AppState, config: &AppCo
     let pad2 = area
         .width
         .saturating_sub(strip_w as u16)
-        .saturating_sub(ctx_w as u16);
+        .saturating_sub(right_w as u16);
     if pad2 > 0 {
         line2_spans.push(Span::raw(" ".repeat(pad2 as usize)));
     }
+    line2_spans.push(Span::styled(sandbox, Style::default().fg(sandbox_color)));
+    line2_spans.push(Span::raw(" ".repeat(gap)));
     line2_spans.push(Span::styled(context, Style::default().fg(theme.text)));
     let line2 = Line::from(line2_spans);
 
@@ -1613,6 +1618,17 @@ fn thinking_label(config: &AppConfig) -> Option<String> {
         return None;
     }
     Some(format!("thinking: {}", t.effort.as_deref().unwrap_or("on")))
+}
+
+fn sandbox_indicator(mode: &str, theme: &Theme) -> (&'static str, Color) {
+    match mode.trim().to_ascii_lowercase().as_str() {
+        "disabled" | "off" | "none" => ("● sandbox:off", theme.error),
+        "process" => ("● sandbox:process", theme.warning),
+        "workspace" | "strict" => ("● sandbox:workspace", theme.success),
+        "auto" if cfg!(target_os = "windows") => ("● sandbox:process", theme.warning),
+        "auto" => ("● sandbox:workspace", theme.success),
+        _ => ("● sandbox:unknown", theme.text_muted),
+    }
 }
 
 fn format_context(state: &AppState, config: &AppConfig) -> String {
@@ -2449,6 +2465,57 @@ mod render_smoke {
     use super::*;
     use crate::app::AppState;
     use kkagent_protocol::PermissionMode;
+    use ratatui::{backend::TestBackend, Terminal};
+
+    #[test]
+    fn sandbox_indicator_distinguishes_effective_modes() {
+        let theme = Theme::default();
+        assert_eq!(
+            sandbox_indicator("disabled", &theme),
+            ("● sandbox:off", theme.error)
+        );
+        assert_eq!(
+            sandbox_indicator("workspace", &theme),
+            ("● sandbox:workspace", theme.success)
+        );
+        assert_eq!(
+            sandbox_indicator("process", &theme),
+            ("● sandbox:process", theme.warning)
+        );
+        assert_eq!(sandbox_indicator("off", &theme).1, theme.error);
+        assert_eq!(
+            sandbox_indicator("unexpected", &theme),
+            ("● sandbox:unknown", theme.text_muted)
+        );
+        assert_eq!(
+            sandbox_indicator("auto", &theme).0,
+            if cfg!(target_os = "windows") {
+                "● sandbox:process"
+            } else {
+                "● sandbox:workspace"
+            }
+        );
+    }
+
+    #[test]
+    fn footer_places_disabled_sandbox_immediately_before_context() {
+        let backend = TestBackend::new(100, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = AppState::new(PermissionMode::Manual, false);
+        let mut config = AppConfig::default();
+        config.sandbox.mode = "disabled".into();
+
+        terminal
+            .draw(|frame| render_ui(frame, &mut state, &config))
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let footer = (0..buffer.area.width)
+            .filter_map(|x| buffer.cell((x, buffer.area.height - 1)))
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(footer.contains("● sandbox:off  context:"), "{footer:?}");
+    }
 
     #[test]
     fn build_empty_transcript() {

@@ -748,6 +748,7 @@ async fn run_tui(
     // task so a subsequent `kkagent` never talks to a leftover in-process agent.
     // Standalone `kkagent server` (UDS) is a separate process with its own lifetime;
     // only that mode can outlive a TUI, and only when you explicitly start it.
+    let is_remote = connect.is_some();
     let (event_tx, event_rx) = mpsc::channel::<Frame>(256);
     let (rpc_client, server_handle) = if let Some(endpoint) = connect {
         let stream =
@@ -762,7 +763,26 @@ async fn run_tui(
         (RpcClient::new(client_stream, event_tx), Some(handle))
     };
 
+    let runtime_sandbox_mode = match rpc_client.call("runtime.status", None).await {
+        Ok(status) => status
+            .get("sandbox")
+            .and_then(|sandbox| sandbox.get("mode"))
+            .and_then(|mode| mode.as_str())
+            .map(str::to_string),
+        Err(error) => {
+            tracing::warn!(%error, "failed to read the server sandbox status");
+            None
+        }
+    };
+
     let mut tui_config = config;
+    if let Some(mode) = runtime_sandbox_mode {
+        tui_config.sandbox.mode = mode;
+    } else if is_remote {
+        // A local config cannot describe a separately started server. Avoid a
+        // falsely reassuring badge when talking to an older remote instance.
+        tui_config.sandbox.mode = "unknown".into();
+    }
     tui_config.default_permission_mode = Some(permission_mode.to_string());
     tui_config.default_plan_mode = plan_mode;
 
@@ -3120,6 +3140,15 @@ async fn handle_rpc_call(
     rpc_event_tx: mpsc::Sender<Frame>,
 ) -> Result<serde_json::Value, (i32, String)> {
     match method {
+        "runtime.status" => {
+            let sandbox = state.sandbox_snapshot();
+            Ok(serde_json::json!({
+                "sandbox": {
+                    "mode": sandbox.mode_name(),
+                    "network": sandbox.network,
+                }
+            }))
+        }
         "workspace.trust" => {
             let value = params.ok_or_else(|| (-32602, "Missing workspace trust".to_string()))?;
             let trust: kkagent_config::WorkspaceTrust = serde_json::from_value(value)
