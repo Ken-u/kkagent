@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use tokio::process::Command;
 
 #[cfg(windows)]
-pub struct SandboxProcessGuard(windows_sys::Win32::Foundation::HANDLE);
+pub struct SandboxProcessGuard(Option<windows_sys::Win32::Foundation::HANDLE>);
 
 #[cfg(windows)]
 unsafe impl Send for SandboxProcessGuard {}
@@ -16,8 +16,10 @@ pub struct SandboxProcessGuard;
 #[cfg(windows)]
 impl Drop for SandboxProcessGuard {
     fn drop(&mut self) {
-        unsafe {
-            windows_sys::Win32::Foundation::CloseHandle(self.0);
+        if let Some(handle) = self.0 {
+            unsafe {
+                windows_sys::Win32::Foundation::CloseHandle(handle);
+            }
         }
     }
 }
@@ -73,7 +75,9 @@ impl SandboxPolicy {
                 "invalid sandbox.mode {other:?}; expected auto, disabled, process, or workspace"
             ),
         };
-        if config.memory_mb < 64 || config.cpu_seconds == 0 || config.max_processes == 0 {
+        if mode != SandboxMode::Disabled
+            && (config.memory_mb < 64 || config.cpu_seconds == 0 || config.max_processes == 0)
+        {
             anyhow::bail!("sandbox limits must be positive and memory_mb must be at least 64");
         }
         Ok(Self {
@@ -162,6 +166,9 @@ impl SandboxPolicy {
             use windows_sys::Win32::System::Threading::{
                 OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE,
             };
+            if self.mode == SandboxMode::Disabled {
+                return Ok(SandboxProcessGuard(None));
+            }
             let pid = child
                 .id()
                 .ok_or_else(|| anyhow::anyhow!("spawned process has no id"))?;
@@ -201,7 +208,7 @@ impl SandboxPolicy {
                     windows_sys::Win32::Foundation::CloseHandle(job);
                     return Err(error);
                 }
-                Ok(SandboxProcessGuard(job))
+                Ok(SandboxProcessGuard(Some(job)))
             }
         }
         #[cfg(not(windows))]
@@ -438,6 +445,9 @@ fn canonical_or_owned(path: &Path) -> PathBuf {
 }
 
 fn apply_resource_limits(command: &mut Command, policy: &SandboxPolicy) -> anyhow::Result<()> {
+    if policy.mode == SandboxMode::Disabled {
+        return Ok(());
+    }
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -545,6 +555,30 @@ mod tests {
             ..Default::default()
         };
         assert!(SandboxPolicy::from_config(&config).is_err());
+    }
+
+    #[tokio::test]
+    async fn disabled_mode_skips_unused_resource_limits() {
+        let config = kkagent_config::SandboxConfig {
+            mode: "disabled".into(),
+            memory_mb: 0,
+            cpu_seconds: 0,
+            max_processes: 0,
+            ..Default::default()
+        };
+        let policy = SandboxPolicy::from_config(&config).unwrap();
+        assert_eq!(policy.mode, SandboxMode::Disabled);
+
+        #[cfg(unix)]
+        let mut command = policy
+            .command("/bin/sh", "-c", "exit 0", Path::new("/tmp"))
+            .unwrap();
+        #[cfg(windows)]
+        let mut command = policy
+            .command("cmd.exe", "/C", "exit 0", &std::env::temp_dir())
+            .unwrap();
+
+        assert!(command.status().await.unwrap().success());
     }
 
     #[cfg(target_os = "macos")]

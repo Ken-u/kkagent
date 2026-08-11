@@ -416,7 +416,7 @@
 - [ ] 首次 workspace 信任时聚合展示检测到的开发环境、宿主只读路径、kkagent 可写缓存和始终隔离的凭据；默认选择较窄权限，工具链路径或 fingerprint 变化时重新确认。
 - [ ] macOS Seatbelt 为 runtime 添加只读规则、为 kkagent cache 添加读写规则；Linux bwrap 使用对应 ro/rw bind 并在 `HOME=/tmp` 时注入获批的工具专用 HOME；Windows 当前 Job Object 模式复用同一环境隔离策略。
 - [ ] 保留 `sandbox.extra_read_paths` / `extra_write_paths` 作为高级逃生口，但不得把开放整个用户 HOME 或语言用户目录作为正常修复建议。
-- [ ] 明确并修正 `sandbox.mode` 语义：`disabled` 若承诺完全关闭沙箱，就必须同时跳过文件/网络隔离、Git 环境改写和 OS 资源/Job Object 限制；若保留资源限制则改名或在配置、doctor 和文档中明确展示实际生效层。
+- [x] 明确并修正 `sandbox.mode` 语义：`disabled` 与 `--disable-sandbox` 均跳过文件/网络隔离、Git 环境改写和 OS 资源/Job Object 限制；启动参数只覆盖当前进程，不写回配置。
 
 ### P0：Agent 按需申请外部路径
 

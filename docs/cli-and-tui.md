@@ -13,6 +13,7 @@
 | `-p, --prompt <text>` | 执行任务并把最终文本写到 stdout。 |
 | `--resume <id-or-prefix>` | 恢复已有会话。 |
 | `--connect <endpoint>` | 连接独立 Server，仅用于 TUI 或 prompt 模式。 |
+| `--disable-sandbox` | 仅在当前进程完全关闭 Bash OS 沙箱和资源限制，不修改配置；仅建议用于受控容器或 VM。 |
 
 ## 子命令
 
@@ -42,6 +43,8 @@ answer=$(kkagent -p "总结 README" 2>kkagent.err)
 ```
 
 最终回答写到 stdout，诊断日志写到 stderr。有写入需求时按风险显式选择 `-y`；无人值守脚本不应默认使用 `--auto`。
+
+排障时可用 `kkagent --disable-sandbox` 临时覆盖 `[sandbox].mode`。该参数不写回配置，也不能与 `--connect` 同时使用；连接独立 Server 时必须在 Server 启动参数或 Server 配置中决定沙箱模式。
 
 ## TUI 快捷键
 

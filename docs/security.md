@@ -15,6 +15,8 @@ kkagent 能读取和修改文件、运行 Shell、访问网络和调用第三方
 
 `manual`、`yolo`、`auto` 决定工具是否需要交互批准；路径策略和危险命令检测阻止一部分常见误操作。Bash 默认再启用 `[sandbox] mode = "auto"`：Linux/macOS 使用工作区级 OS sandbox，Windows 使用 Job Object 进程隔离。该层只覆盖 Bash 工具进程，不自动包裹 MCP、Hook 或显式开启的 HTTP terminal；合法编译器和脚本仍可能利用允许的工作区或网络能力。处理多租户或恶意代码时仍应叠加低权限账户、容器或 VM。
 
+`--disable-sandbox` 只覆盖当前 kkagent 进程，但会完整关闭 Bash 的 OS 文件/网络隔离、Git 环境隔离和资源/进程限制。它不会关闭工具审批或危险命令检测，也不能覆盖通过 `--connect` 使用的远端 Server。只应在外层已有可信容器或 VM 隔离时使用。
+
 ## Server 暴露
 
 主 HTTP token 是 admin。部署时优先给调用方发 read/write/terminal scoped token，并保持直接 fs write 和 terminal API 关闭。若监听非 loopback 地址：

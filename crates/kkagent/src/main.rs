@@ -75,6 +75,10 @@ struct Cli {
     #[arg(long)]
     no_alt_screen: bool,
 
+    /// Disable Bash OS sandboxing and resource limits for this process (unsafe)
+    #[arg(long)]
+    disable_sandbox: bool,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -196,6 +200,24 @@ enum AuthCommands {
     Status,
 }
 
+fn validate_runtime_cli(cli: &Cli) -> Result<()> {
+    if cli.connect.is_some() && cli.command.is_some() {
+        anyhow::bail!("--connect is only valid for TUI or --prompt mode");
+    }
+    if cli.disable_sandbox && cli.connect.is_some() {
+        anyhow::bail!(
+            "--disable-sandbox cannot be used with --connect; configure the remote server instead"
+        );
+    }
+    Ok(())
+}
+
+fn apply_runtime_overrides(cli: &Cli, config: &mut AppConfig) {
+    if cli.disable_sandbox {
+        config.sandbox.mode = "disabled".into();
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -244,9 +266,7 @@ async fn main() -> Result<()> {
         _ => {}
     }
 
-    if cli.connect.is_some() && cli.command.is_some() {
-        anyhow::bail!("--connect is only valid for TUI or --prompt mode");
-    }
+    validate_runtime_cli(&cli)?;
 
     let config_path = cli
         .config
@@ -264,6 +284,7 @@ async fn main() -> Result<()> {
         }
     }
     let mut config = load_config(Some(&config_path))?;
+    apply_runtime_overrides(&cli, &mut config);
     if cli.connect.is_none() {
         hydrate_provider_oauth(&mut config).await?;
     }
@@ -4973,6 +4994,32 @@ async fn handle_rpc_call(
 #[cfg(test)]
 mod http_path_tests {
     use super::*;
+
+    #[test]
+    fn disable_sandbox_flag_overrides_only_the_runtime_config() {
+        let cli = Cli::try_parse_from(["kkagent", "--disable-sandbox"]).unwrap();
+        let mut config = AppConfig::default();
+        config.sandbox.mode = "workspace".into();
+
+        apply_runtime_overrides(&cli, &mut config);
+
+        assert!(cli.disable_sandbox);
+        assert_eq!(config.sandbox.mode, "disabled");
+    }
+
+    #[test]
+    fn disable_sandbox_flag_rejects_remote_connections() {
+        let cli = Cli::try_parse_from([
+            "kkagent",
+            "--disable-sandbox",
+            "--connect",
+            "/tmp/kkagent.sock",
+        ])
+        .unwrap();
+
+        let error = validate_runtime_cli(&cli).unwrap_err();
+        assert!(error.to_string().contains("configure the remote server"));
+    }
 
     fn config_with_root(root: &std::path::Path) -> AppConfig {
         AppConfig {

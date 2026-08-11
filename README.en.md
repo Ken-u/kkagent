@@ -184,6 +184,8 @@ kkagent config set sandbox.network false
 kkagent config preset safe
 ```
 
+For troubleshooting, `kkagent --disable-sandbox` disables the Bash OS sandbox and resource limits for the current process without modifying the config. Use it only inside a controlled container or VM.
+
 For the full list of config options, providers, models, MCP, and hooks, see [docs/configuration.md](docs/configuration.md).
 
 ## Documentation Index

@@ -184,6 +184,8 @@ kkagent config set sandbox.network false
 kkagent config preset safe
 ```
 
+排障时可用 `kkagent --disable-sandbox` 仅对当前进程关闭 Bash OS 沙箱和资源限制；它不修改配置，只建议在受控容器或 VM 中使用。
+
 完整配置项、Provider、Model、MCP、Hooks 说明见 [docs/configuration.md](docs/configuration.md)。
 
 ## 文档索引
