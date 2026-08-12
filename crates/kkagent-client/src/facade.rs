@@ -146,6 +146,15 @@ impl KkagentClient {
         Ok(())
     }
 
+    pub async fn delete_btw(&self, session_id: &str) -> anyhow::Result<()> {
+        let params = serde_json::json!({"session_id": session_id});
+        self.rpc
+            .call("session.btw_delete", Some(params))
+            .await
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        Ok(())
+    }
+
     pub async fn fork_session(
         &self,
         session_id: &str,

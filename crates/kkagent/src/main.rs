@@ -4445,7 +4445,7 @@ async fn handle_rpc_call(
                     ));
                 }
                 let agent_id = session.services.btw.start(&session.services.agents);
-                let history = session.messages.clone();
+                let history = session.services.btw.context_snapshot(&session.messages);
                 let model_alias = session.get_model_alias();
                 let prior_turns = session.services.btw.turns();
                 let cancel = session.services.btw.cancel_flag();
@@ -4458,6 +4458,7 @@ async fn handle_rpc_call(
             let state_clone = state.clone();
             let sid = session_id.clone();
             let q = question.clone();
+            let event_agent_id = agent_id.clone();
             tokio::spawn(async move {
                 let (stream_tx, mut stream_rx) =
                     mpsc::channel::<kkagent_llm::types::StreamEvent>(256);
@@ -4492,6 +4493,7 @@ async fn handle_rpc_call(
                                 scope: None,
                                 data: serde_json::to_value(AgentEvent::BtwDelta {
                                     session_id: sid.clone(),
+                                    agent_id: event_agent_id.clone(),
                                     text,
                                 })
                                 .unwrap_or_default(),
@@ -4506,6 +4508,7 @@ async fn handle_rpc_call(
                                 scope: None,
                                 data: serde_json::to_value(AgentEvent::BtwThinkingDelta {
                                     session_id: sid.clone(),
+                                    agent_id: event_agent_id.clone(),
                                     text,
                                 })
                                 .unwrap_or_default(),
@@ -4530,15 +4533,17 @@ async fn handle_rpc_call(
 
                 if stream_error.is_none() && !answer.trim().is_empty() {
                     if let Some(session) = state_clone.sessions.lock().await.get(&sid) {
-                        session.services.btw.push_turn(BtwTurn {
-                            question: q,
-                            answer,
-                        });
+                        if session.services.btw.is_current(&cancel) {
+                            session.services.btw.push_turn(BtwTurn {
+                                question: q,
+                                answer,
+                            });
+                        }
                     }
                 }
 
                 if let Some(session) = state_clone.sessions.lock().await.get(&sid) {
-                    session.services.btw.end();
+                    session.services.btw.end(&cancel);
                 }
 
                 let frame = Frame::Event {
@@ -4546,6 +4551,7 @@ async fn handle_rpc_call(
                     scope: None,
                     data: serde_json::to_value(AgentEvent::BtwEnd {
                         session_id: sid,
+                        agent_id: event_agent_id,
                         error: stream_error,
                     })
                     .unwrap_or_default(),
@@ -4568,6 +4574,18 @@ async fn handle_rpc_call(
             let sessions = state.sessions.lock().await;
             if let Some(session) = sessions.get(session_id) {
                 session.services.btw.request_cancel();
+            }
+            Ok(serde_json::json!({"ok": true}))
+        }
+        "session.btw_delete" => {
+            let session_id = params
+                .as_ref()
+                .and_then(|p| p.get("session_id"))
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| (-32602, "Missing session_id".into()))?;
+            let sessions = state.sessions.lock().await;
+            if let Some(session) = sessions.get(session_id) {
+                session.services.btw.clear(&session.services.agents);
             }
             Ok(serde_json::json!({"ok": true}))
         }

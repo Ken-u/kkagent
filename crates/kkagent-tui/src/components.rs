@@ -1447,15 +1447,22 @@ fn render_footer(
         }
     }
 
-    if state.btw.open || !state.btw.turns.is_empty() {
-        left.push(Span::raw("  "));
-        let label = if state.btw.streaming {
-            "btw…".to_string()
+    left.push(Span::raw("  "));
+    let label = if state.btw.streaming {
+        "btw:answering (ctrl+g)".to_string()
+    } else if state.btw.owner_session_id.is_some() || !state.btw.turns.is_empty() {
+        format!("btw:{} (ctrl+g)", state.btw.turns.len())
+    } else {
+        "btw (ctrl+g)".to_string()
+    };
+    left.push(Span::styled(
+        label,
+        Style::default().fg(if state.mode == AppMode::Btw {
+            theme.accent
         } else {
-            format!("btw:{}", state.btw.turns.len())
-        };
-        left.push(Span::styled(label, Style::default().fg(theme.accent)));
-    }
+            theme.text_dim
+        }),
+    ));
 
     let plan_review_hidden = state
         .approval_pending
@@ -1557,17 +1564,6 @@ fn render_footer(
 }
 
 fn sync_footer_session_entries(state: &mut AppState) {
-    state.workspace_sessions.ensure_btw();
-    if let Some(entry) = state.workspace_sessions.entries.first_mut() {
-        entry.status = if state.btw.streaming {
-            SessionStatus::Thinking
-        } else {
-            SessionStatus::Idle
-        };
-    }
-    if state.mode == AppMode::Btw {
-        state.workspace_sessions.active = 0;
-    }
     let Some(current_id) = state.session_id.clone() else {
         return;
     };
@@ -1608,14 +1604,12 @@ fn sync_footer_session_entries(state: &mut AppState) {
         entry.needs_attention = state.parked_approvals.contains_key(&entry.id)
             || state.parked_questions.contains_key(&entry.id);
     }
-    if state.mode != AppMode::Btw {
-        state.workspace_sessions.active = state
-            .workspace_sessions
-            .entries
-            .iter()
-            .position(|entry| entry.id == current_id)
-            .unwrap_or(0);
-    }
+    state.workspace_sessions.active = state
+        .workspace_sessions
+        .entries
+        .iter()
+        .position(|entry| entry.id == current_id)
+        .unwrap_or(0);
 }
 
 fn render_scroll_hint(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
@@ -2779,6 +2773,8 @@ mod render_smoke {
         assert!(!rendered.contains("# Side answer"), "{rendered:?}");
         assert!(!rendered.contains("**bold**"), "{rendered:?}");
         assert!(rendered.contains("btw >"), "{rendered:?}");
+        assert!(rendered.contains("btw:1 (ctrl+g)"), "{rendered:?}");
+        assert!(state.workspace_sessions.entries.is_empty());
         assert!(!rendered.contains("main transcript must be hidden"));
     }
 

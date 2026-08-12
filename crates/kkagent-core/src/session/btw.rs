@@ -35,10 +35,11 @@ pub struct BtwTurn {
 #[derive(Default)]
 pub struct SessionBtwService {
     active_agent_id: RwLock<Option<String>>,
+    context_snapshot: RwLock<Option<Vec<ChatMessage>>>,
     notes: RwLock<Vec<String>>,
     turns: RwLock<Vec<BtwTurn>>,
     /// When true, the in-flight side stream should stop emitting.
-    cancel: Arc<AtomicBool>,
+    cancel: RwLock<Arc<AtomicBool>>,
     busy: AtomicBool,
 }
 
@@ -91,6 +92,50 @@ impl SessionBtwService {
             .clone()
     }
 
+    /// Capture the parent conversation once, when this BTW conversation starts.
+    /// Follow-up questions keep using that stable fork point, just like a real
+    /// child agent, even if the main session continues in the meantime.
+    pub fn context_snapshot(&self, history: &[ChatMessage]) -> Vec<ChatMessage> {
+        let mut snapshot = self
+            .context_snapshot
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        snapshot.get_or_insert_with(|| history.to_vec()).clone()
+    }
+
+    /// Delete this session's side conversation and dispose its virtual child.
+    /// An in-flight request is asked to stop; `busy` remains set until that
+    /// request observes cancellation. A fresh cancellation token allows a new
+    /// `/btw` prompt to start immediately after replacement.
+    pub fn clear(&self, agents: &AgentLifecycleService) {
+        let old_cancel = {
+            let mut cancel = self.cancel.write().unwrap_or_else(|e| e.into_inner());
+            std::mem::replace(&mut *cancel, Arc::new(AtomicBool::new(false)))
+        };
+        old_cancel.store(true, Ordering::SeqCst);
+        self.busy.store(false, Ordering::SeqCst);
+        if let Some(agent_id) = self
+            .active_agent_id
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            agents.remove(&agent_id);
+        }
+        *self
+            .context_snapshot
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+        self.notes
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.turns
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+    }
+
     pub fn add_note(&self, note: impl Into<String>) {
         self.notes
             .write()
@@ -127,17 +172,28 @@ impl SessionBtwService {
             .is_ok()
     }
 
-    pub fn end(&self) {
-        self.busy.store(false, Ordering::SeqCst);
-        self.cancel.store(false, Ordering::SeqCst);
+    pub fn is_current(&self, cancel: &Arc<AtomicBool>) -> bool {
+        Arc::ptr_eq(
+            &self.cancel.read().unwrap_or_else(|e| e.into_inner()),
+            cancel,
+        )
+    }
+
+    pub fn end(&self, cancel: &Arc<AtomicBool>) {
+        if self.is_current(cancel) {
+            self.busy.store(false, Ordering::SeqCst);
+        }
     }
 
     pub fn request_cancel(&self) {
-        self.cancel.store(true, Ordering::SeqCst);
+        self.cancel
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .store(true, Ordering::SeqCst);
     }
 
     pub fn cancel_flag(&self) -> Arc<AtomicBool> {
-        Arc::clone(&self.cancel)
+        Arc::clone(&self.cancel.read().unwrap_or_else(|e| e.into_inner()))
     }
 
     /// Build messages for a side question (history + prior BTW turns + new question).
@@ -303,11 +359,36 @@ mod tests {
     }
 
     #[test]
+    fn context_snapshot_is_stable_until_cleared() {
+        let svc = SessionBtwService::new();
+        let agents = AgentLifecycleService::new();
+        let first = vec![ChatMessage {
+            role: "user".into(),
+            content: vec![ChatContent::Text {
+                text: "first".into(),
+            }],
+        }];
+        let later = vec![ChatMessage {
+            role: "user".into(),
+            content: vec![ChatContent::Text {
+                text: "later".into(),
+            }],
+        }];
+
+        assert_eq!(chat_message_text(&svc.context_snapshot(&first)[0]), "first");
+        assert_eq!(chat_message_text(&svc.context_snapshot(&later)[0]), "first");
+
+        svc.clear(&agents);
+        assert_eq!(chat_message_text(&svc.context_snapshot(&later)[0]), "later");
+    }
+
+    #[test]
     fn try_begin_is_exclusive() {
         let svc = SessionBtwService::new();
         assert!(svc.try_begin());
         assert!(!svc.try_begin());
-        svc.end();
+        let cancel = svc.cancel_flag();
+        svc.end(&cancel);
         assert!(svc.try_begin());
     }
 }

@@ -37,6 +37,9 @@ pub struct BtwPanelState {
     pub error: Option<String>,
     pub pending_questions: std::collections::VecDeque<BtwQueuedQuestion>,
     pub current_session_id: Option<String>,
+    pub current_agent_id: Option<String>,
+    /// Real session whose context was forked for this BTW conversation.
+    pub owner_session_id: Option<String>,
     /// Lines above the bottom; zero follows streaming output.
     pub scroll_offset: u16,
     pub viewport_height: u16,
@@ -51,6 +54,7 @@ impl BtwPanelState {
         self.current_question = question.to_string();
         self.current_answer.clear();
         self.current_thinking.clear();
+        self.current_agent_id = None;
         self.error = None;
     }
 
@@ -85,6 +89,7 @@ impl BtwPanelState {
         self.current_thinking.clear();
         self.error = error;
         self.current_session_id = None;
+        self.current_agent_id = None;
         self.scroll_offset = 0;
     }
 
@@ -274,10 +279,11 @@ pub fn render_btw(
             Style::default().fg(theme.error),
         )));
     }
+    let source = state.owner_session_id.as_deref().unwrap_or("no session");
     let title = if state.streaming {
-        " BTW · streaming "
+        format!(" BTW · {source} · streaming ")
     } else {
-        " BTW "
+        format!(" BTW · {source} ")
     };
     let block = Block::default()
         .borders(Borders::ALL)

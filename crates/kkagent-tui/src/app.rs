@@ -140,7 +140,7 @@ pub struct AppState {
     pub todos: Vec<TodoItem>,
     /// Expand sticky todo beyond the collapsed max rows.
     pub todos_expanded: bool,
-    /// Fixed full-screen BTW workspace (`/btw`).
+    /// Toggleable full-screen BTW surface, advertised beside the git badge.
     pub btw: crate::panes::BtwPanelState,
     /// Active model alias (best-effort).
     pub model_alias: Option<String>,
@@ -1945,7 +1945,7 @@ impl TuiApp {
         self.state.tasks_panel = Some(TasksPanelState { tasks, selected: 0 });
     }
 
-    /// Close the topmost transient UI (menus / pickers / search / btw / shell).
+    /// Close the topmost transient UI (menus / pickers / search / shell).
     /// Returns true if something was dismissed. Does not touch the agent turn.
     fn dismiss_transient_ui(&mut self) -> bool {
         if self.state.session_delete_confirm.take().is_some() {
@@ -1973,10 +1973,6 @@ impl TuiApp {
             return true;
         }
         if self.state.slash_menu.take().is_some() {
-            return true;
-        }
-        if self.state.mode == AppMode::Btw {
-            self.exit_btw_view();
             return true;
         }
         if self.state.mode == AppMode::Shell {
@@ -3026,7 +3022,8 @@ impl TuiApp {
                 self.state.file_menu = None;
                 self.state.list_picker = None;
             }
-            // Ctrl-G toggles the full-screen BTW workspace.
+            // Ctrl-G is the sole show/hide control for the BTW surface. BTW is
+            // advertised beside the git badge, not as a session-strip entry.
             KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if self.state.mode == AppMode::Btw {
                     self.exit_btw_view();
@@ -6085,22 +6082,11 @@ impl TuiApp {
             })
             .collect();
 
-        self.state.workspace_sessions.set_entries_stable(
-            entries,
-            Some(if self.state.mode == AppMode::Btw {
-                crate::chrome::BTW_SESSION_ID
-            } else {
-                current_id.as_str()
-            }),
-        );
-
-        for e in self
-            .state
+        self.state
             .workspace_sessions
-            .entries
-            .iter()
-            .filter(|entry| entry.id != crate::chrome::BTW_SESSION_ID)
-        {
+            .set_entries_stable(entries, Some(current_id.as_str()));
+
+        for e in self.state.workspace_sessions.entries.iter() {
             self.state.tab_strip.ensure_tab(&e.id, e.title.clone());
         }
         let title = self
@@ -6130,14 +6116,7 @@ impl TuiApp {
     fn can_close_current_session_tab(&self) -> bool {
         self.state.input.is_empty()
             && self.state.session_id.is_some()
-            && self
-                .state
-                .workspace_sessions
-                .entries
-                .iter()
-                .filter(|entry| entry.id != crate::chrome::BTW_SESSION_ID)
-                .count()
-                >= 2
+            && self.state.workspace_sessions.entries.len() >= 2
             && self.state.list_picker.is_none()
             && self.state.tasks_panel.is_none()
             && self.state.slash_menu.is_none()
@@ -6184,7 +6163,7 @@ impl TuiApp {
 
     fn can_cycle_fork_sessions(&self) -> bool {
         self.state.input.is_empty()
-            && matches!(self.state.mode, AppMode::Normal | AppMode::Btw)
+            && self.state.mode == AppMode::Normal
             && self.state.slash_menu.is_none()
             && self.state.file_menu.is_none()
             && self.state.list_picker.is_none()
@@ -6216,8 +6195,6 @@ impl TuiApp {
         self.state.mode = AppMode::Btw;
         self.state.btw.open = true;
         self.state.btw.scroll_offset = 0;
-        self.state.workspace_sessions.ensure_btw();
-        self.state.workspace_sessions.active = 0;
         self.clear_selection();
     }
 
@@ -6240,22 +6217,17 @@ impl TuiApp {
     }
 
     async fn delete_btw_workspace(&mut self) {
-        let active_session_id = self.state.btw.current_session_id.clone();
-        let was_streaming = self.state.btw.streaming;
+        let owner_session_id = self.state.btw.owner_session_id.clone();
         self.state.btw = crate::panes::BtwPanelState::default();
         self.exit_btw_view();
-        if was_streaming {
-            if let Some(session_id) = active_session_id {
-                let _ = self.client.cancel_btw(&session_id).await;
+        if let Some(session_id) = owner_session_id {
+            if let Err(error) = self.client.delete_btw(&session_id).await {
+                self.system_message(format!("Failed to delete BTW session: {error}"));
             }
         }
     }
 
     async fn activate_workspace_target(&mut self, id: &str) -> anyhow::Result<()> {
-        if id == crate::chrome::BTW_SESSION_ID {
-            self.enter_btw_view();
-            return Ok(());
-        }
         if self.state.mode == AppMode::Btw {
             self.exit_btw_view();
         }
@@ -6515,7 +6487,7 @@ impl TuiApp {
                     .entries
                     .iter()
                     .map(|e| e.id.clone())
-                    .find(|id| id != &deleted_id && id != crate::chrome::BTW_SESSION_ID)
+                    .find(|id| id != &deleted_id)
                     .or_else(|| {
                         self.state
                             .open_session_group
@@ -6585,7 +6557,7 @@ impl TuiApp {
                         .entries
                         .iter()
                         .map(|e| e.id.clone())
-                        .find(|id| id != &deleted_id && id != crate::chrome::BTW_SESSION_ID)
+                        .find(|id| id != &deleted_id)
                         .or_else(|| {
                             self.state
                                 .open_session_group
@@ -6642,7 +6614,31 @@ impl TuiApp {
         self.state.list_picker = None;
         self.state.push_input_history(&question);
 
-        let Some(session_id) = self.state.session_id.clone() else {
+        if let Some(args) = question
+            .strip_prefix("/btw")
+            .filter(|args| args.is_empty() || args.starts_with(char::is_whitespace))
+            .map(str::trim)
+        {
+            if args.is_empty() {
+                return Ok(());
+            }
+            let Some(session_id) = self.state.session_id.clone() else {
+                self.state.input.set_text(question);
+                self.state.btw.error = Some("No active session for BTW.".into());
+                return Ok(());
+            };
+            self.replace_btw_question(session_id, args.to_string())
+                .await;
+            return Ok(());
+        }
+
+        let Some(session_id) = self
+            .state
+            .btw
+            .owner_session_id
+            .clone()
+            .or_else(|| self.state.session_id.clone())
+        else {
             self.state.input.set_text(question);
             self.state.btw.error = Some("No active session for BTW.".into());
             return Ok(());
@@ -6656,10 +6652,12 @@ impl TuiApp {
     }
 
     async fn start_btw_question(&mut self, session_id: String, question: String) {
+        self.state.btw.owner_session_id = Some(session_id.clone());
         self.state.btw.begin_question(&question);
         self.state.btw.current_session_id = Some(session_id.clone());
-        if let Err(error) = self.client.start_btw(&session_id, &question).await {
-            self.state.btw.finish(Some(error.to_string()));
+        match self.client.start_btw(&session_id, &question).await {
+            Ok(agent_id) => self.state.btw.current_agent_id = Some(agent_id),
+            Err(error) => self.state.btw.finish(Some(error.to_string())),
         }
     }
 
@@ -6668,6 +6666,18 @@ impl TuiApp {
             self.start_btw_question(next.session_id, next.question)
                 .await;
         }
+    }
+
+    async fn replace_btw_question(&mut self, session_id: String, question: String) {
+        let previous_owner = self.state.btw.owner_session_id.clone();
+        self.state.btw = crate::panes::BtwPanelState::default();
+        if let Some(owner) = previous_owner {
+            if let Err(error) = self.client.delete_btw(&owner).await {
+                self.state.btw.error = Some(format!("Failed to clear previous BTW: {error}"));
+                return;
+            }
+        }
+        self.start_btw_question(session_id, question).await;
     }
 
     async fn submit_steer_input(&mut self) -> anyhow::Result<()> {
@@ -7405,11 +7415,7 @@ impl TuiApp {
                 if args.is_empty() {
                     self.state.btw.error = None;
                 } else if let Some(sid) = self.state.session_id.clone() {
-                    if self.state.btw.streaming {
-                        self.state.btw.enqueue(sid, args);
-                    } else {
-                        self.start_btw_question(sid, args).await;
-                    }
+                    self.replace_btw_question(sid, args).await;
                 } else {
                     self.state.btw.error = Some("No active session for BTW.".into());
                 }
@@ -7942,27 +7948,42 @@ impl TuiApp {
                     self.state.session_id.as_deref(),
                 );
 
-                // BTW is a fixed workspace surface rather than per-session
-                // transcript state. Keep streaming it even while another
-                // session tab is active.
+                // BTW is a single toggleable surface. Only events from its
+                // current owner may update it; stale events from a replaced
+                // conversation are ignored.
                 match &evt {
-                    AgentEvent::BtwDelta { session_id, text }
-                        if self.state.btw.current_session_id.as_deref()
-                            == Some(session_id.as_str()) =>
+                    AgentEvent::BtwDelta {
+                        session_id,
+                        agent_id,
+                        text,
+                    } if self.state.btw.current_session_id.as_deref()
+                        == Some(session_id.as_str())
+                        && self.state.btw.current_agent_id.as_deref()
+                            == Some(agent_id.as_str()) =>
                     {
                         self.state.btw.append_delta(text);
                         return;
                     }
-                    AgentEvent::BtwThinkingDelta { session_id, text }
-                        if self.state.btw.current_session_id.as_deref()
-                            == Some(session_id.as_str()) =>
+                    AgentEvent::BtwThinkingDelta {
+                        session_id,
+                        agent_id,
+                        text,
+                    } if self.state.btw.current_session_id.as_deref()
+                        == Some(session_id.as_str())
+                        && self.state.btw.current_agent_id.as_deref()
+                            == Some(agent_id.as_str()) =>
                     {
                         self.state.btw.append_thinking_delta(text);
                         return;
                     }
-                    AgentEvent::BtwEnd { session_id, error }
-                        if self.state.btw.current_session_id.as_deref()
-                            == Some(session_id.as_str()) =>
+                    AgentEvent::BtwEnd {
+                        session_id,
+                        agent_id,
+                        error,
+                    } if self.state.btw.current_session_id.as_deref()
+                        == Some(session_id.as_str())
+                        && self.state.btw.current_agent_id.as_deref()
+                            == Some(agent_id.as_str()) =>
                     {
                         self.state.btw.finish(error.clone());
                         return;
@@ -9284,10 +9305,6 @@ mod app_state_tests {
         assert_eq!(app.state.mode, AppMode::Btw);
         assert!(app.state.btw.open);
         assert!(app.state.btw.streaming);
-        assert_eq!(
-            app.state.workspace_sessions.active_id(),
-            Some(crate::chrome::BTW_SESSION_ID)
-        );
 
         app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL))
             .await
@@ -9376,12 +9393,7 @@ mod app_state_tests {
         assert_eq!(app.state.session_id.as_deref(), Some("real-session"));
         assert!(app.state.btw.turns.is_empty());
         assert!(app.state.btw.pending_questions.is_empty());
-        assert!(app
-            .state
-            .workspace_sessions
-            .entries
-            .iter()
-            .any(|entry| entry.id == crate::chrome::BTW_SESSION_ID));
+        assert!(app.state.workspace_sessions.entries.is_empty());
     }
 
     #[tokio::test]
@@ -9390,18 +9402,22 @@ mod app_state_tests {
         app.state.session_id = Some("another-session".into());
         app.state.btw.begin_question("side question");
         app.state.btw.current_session_id = Some("original-session".into());
+        app.state.btw.current_agent_id = Some("btw-agent".into());
 
         for event in [
             AgentEvent::BtwThinkingDelta {
                 session_id: "original-session".into(),
+                agent_id: "btw-agent".into(),
                 text: "reasoning".into(),
             },
             AgentEvent::BtwDelta {
                 session_id: "original-session".into(),
+                agent_id: "btw-agent".into(),
                 text: "answer".into(),
             },
             AgentEvent::BtwEnd {
                 session_id: "original-session".into(),
+                agent_id: "btw-agent".into(),
                 error: None,
             },
         ] {
@@ -9440,12 +9456,14 @@ mod app_state_tests {
         let mut app = test_tui_app();
         app.state.btw.begin_question("active");
         app.state.btw.current_session_id = Some("active-session".into());
+        app.state.btw.current_agent_id = Some("active-agent".into());
 
         app.handle_server_event(Frame::Event {
             event: "agent".into(),
             scope: None,
             data: serde_json::to_value(AgentEvent::BtwDelta {
                 session_id: "other-session".into(),
+                agent_id: "other-agent".into(),
                 text: "wrong answer".into(),
             })
             .unwrap(),
@@ -9453,6 +9471,29 @@ mod app_state_tests {
 
         assert!(app.state.btw.current_answer.is_empty());
         assert!(app.state.btw.streaming);
+    }
+
+    #[tokio::test]
+    async fn stale_btw_agent_events_do_not_corrupt_a_replacement_in_the_same_session() {
+        let mut app = test_tui_app();
+        app.state.btw.begin_question("replacement");
+        app.state.btw.current_session_id = Some("same-session".into());
+        app.state.btw.current_agent_id = Some("new-agent".into());
+
+        app.handle_server_event(Frame::Event {
+            event: "agent".into(),
+            scope: None,
+            data: serde_json::to_value(AgentEvent::BtwEnd {
+                session_id: "same-session".into(),
+                agent_id: "old-agent".into(),
+                error: Some("cancelled".into()),
+            })
+            .unwrap(),
+        });
+
+        assert!(app.state.btw.streaming);
+        assert_eq!(app.state.btw.current_question, "replacement");
+        assert!(app.state.btw.turns.is_empty());
     }
 
     #[tokio::test]

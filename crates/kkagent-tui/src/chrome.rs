@@ -14,7 +14,6 @@ use crate::theme::Theme;
 
 const SESSION_TITLE_MAX_COLS: usize = 18;
 const SESSION_SPINNER_FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-pub const BTW_SESSION_ID: &str = "__btw__";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SessionIndicator {
@@ -198,29 +197,10 @@ pub struct WorkspaceSessionEntry {
     pub needs_attention: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct WorkspaceSessionStrip {
     pub entries: Vec<WorkspaceSessionEntry>,
     pub active: usize,
-}
-
-impl Default for WorkspaceSessionStrip {
-    fn default() -> Self {
-        Self {
-            entries: vec![btw_entry()],
-            active: 0,
-        }
-    }
-}
-
-fn btw_entry() -> WorkspaceSessionEntry {
-    WorkspaceSessionEntry {
-        id: BTW_SESSION_ID.into(),
-        title: "BTW".into(),
-        status: SessionStatus::Idle,
-        dirty: false,
-        needs_attention: false,
-    }
 }
 
 impl WorkspaceSessionStrip {
@@ -252,29 +232,10 @@ impl WorkspaceSessionStrip {
     }
 
     pub fn set_entries(&mut self, entries: Vec<WorkspaceSessionEntry>, active_id: Option<&str>) {
-        self.entries = std::iter::once(btw_entry())
-            .chain(
-                entries
-                    .into_iter()
-                    .filter(|entry| entry.id != BTW_SESSION_ID),
-            )
-            .collect();
+        self.entries = entries;
         self.active = active_id
             .and_then(|id| self.entries.iter().position(|e| e.id == id))
             .unwrap_or(0);
-    }
-
-    pub fn ensure_btw(&mut self) {
-        if self
-            .entries
-            .first()
-            .is_some_and(|entry| entry.id == BTW_SESSION_ID)
-        {
-            return;
-        }
-        self.entries.retain(|entry| entry.id != BTW_SESSION_ID);
-        self.entries.insert(0, btw_entry());
-        self.active = self.active.saturating_add(1);
     }
 
     pub fn active_id(&self) -> Option<&str> {
@@ -978,14 +939,14 @@ mod tests {
             Some("b"),
         );
         let ids: Vec<_> = strip.entries.iter().map(|e| e.id.as_str()).collect();
-        assert_eq!(ids, vec![BTW_SESSION_ID, "a", "b", "c", "d"]);
+        assert_eq!(ids, vec!["a", "b", "c", "d"]);
         assert_eq!(strip.active_id(), Some("b"));
-        assert_eq!(strip.entries[2].title, "B2");
-        assert!(strip.entries[2].needs_attention);
+        assert_eq!(strip.entries[1].title, "B2");
+        assert!(strip.entries[1].needs_attention);
     }
 
     #[test]
-    fn workspace_strip_always_keeps_btw_first_and_cycles_through_it() {
+    fn workspace_strip_only_cycles_real_sessions() {
         let mut strip = WorkspaceSessionStrip::default();
         strip.set_entries(
             vec![WorkspaceSessionEntry {
@@ -998,8 +959,8 @@ mod tests {
             Some("session"),
         );
 
-        assert_eq!(strip.entries[0].id, BTW_SESSION_ID);
-        assert_eq!(strip.next_id().as_deref(), Some(BTW_SESSION_ID));
-        assert_eq!(strip.next_id().as_deref(), Some("session"));
+        assert_eq!(strip.entries.len(), 1);
+        assert_eq!(strip.entries[0].id, "session");
+        assert!(strip.next_id().is_none());
     }
 }
