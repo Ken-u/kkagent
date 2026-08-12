@@ -26,11 +26,12 @@ The TUI and Agent Server are decoupled and communicate over RPC (default: in-pro
 curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/Ken-u/kkagent/main/install.sh | sh
 ```
 
-The installer detects macOS/Linux and x86_64/arm64, downloads the latest Release, and verifies its SHA-256 checksum. It uses `/usr/local/bin` when writable and otherwise falls back to `~/.local/bin`. You can also pin the directory and version:
+The installer detects macOS/Linux and x86_64/arm64, downloads the latest Release, and verifies its SHA-256 checksum. On Linux it defaults to the musl static build (`unknown-linux-musl`), so no system OpenSSL is required. It uses `/usr/local/bin` when writable and otherwise falls back to `~/.local/bin`. You can also pin the directory, version, or glibc artifact:
 
 ```bash
 curl --proto '=https' --tlsv1.2 -fsSLO https://raw.githubusercontent.com/Ken-u/kkagent/main/install.sh
 KKAGENT_INSTALL_DIR="$HOME/bin" KKAGENT_VERSION=0.2.0 sh install.sh
+KKAGENT_TARGET=x86_64-unknown-linux-gnu sh install.sh
 ```
 
 Rerun the same installer command to upgrade. The TUI checks GitHub Releases in the background at most once every 24 hours and only displays a notice; set `[ui] check_updates = false` to disable it.
@@ -44,6 +45,7 @@ Current release matrix:
 | Platform | Architecture | Artifact |
 |---|---|---|
 | macOS | x86_64 / arm64 | `kkagent-x86_64-apple-darwin.tar.gz` / `kkagent-aarch64-apple-darwin.tar.gz` |
+| Linux (musl, static) | x86_64 / arm64 | `kkagent-x86_64-unknown-linux-musl.tar.gz` / `kkagent-aarch64-unknown-linux-musl.tar.gz` |
 | Linux (glibc) | x86_64 / arm64 | `kkagent-x86_64-unknown-linux-gnu.tar.gz` / `kkagent-aarch64-unknown-linux-gnu.tar.gz` |
 | Windows | x86_64 / arm64 | `kkagent-x86_64-pc-windows-msvc.zip` / `kkagent-aarch64-pc-windows-msvc.zip` |
 

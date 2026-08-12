@@ -71,14 +71,24 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: Linux x86_64
+          - name: Linux x86_64 (glibc)
             os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             archive: tar
-          - name: Linux arm64
+          - name: Linux arm64 (glibc)
             os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             archive: tar
+          - name: Linux x86_64 (musl)
+            os: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            archive: tar
+            musl: true
+          - name: Linux arm64 (musl)
+            os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            archive: tar
+            musl: true
           - name: macOS x86_64
             os: macos-15-intel
             target: x86_64-apple-darwin
@@ -106,6 +116,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: release-${{ matrix.target }}
+      - name: Install musl toolchain
+        if: matrix.musl == true
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
       - name: Build release binary
         run: cargo build --release --locked --target ${{ matrix.target }}
       - name: Package Unix archive

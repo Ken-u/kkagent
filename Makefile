@@ -5,6 +5,8 @@ TARGETS := \
 	aarch64-apple-darwin \
 	x86_64-unknown-linux-gnu \
 	aarch64-unknown-linux-gnu \
+	x86_64-unknown-linux-musl \
+	aarch64-unknown-linux-musl \
 	x86_64-pc-windows-msvc \
 	aarch64-pc-windows-msvc
 
@@ -18,7 +20,7 @@ help:
 	@echo "  make build     - Debug build (current platform)"
 	@echo "  make release   - Release build (current platform)"
 	@echo "  make test      - Run all tests"
-	@echo "  make dist      - Build six release targets (requires their SDKs/linkers)"
+	@echo "  make dist      - Build eight release targets (requires their SDKs/linkers)"
 	@echo "  make clean     - Clean build artifacts"
 
 build:

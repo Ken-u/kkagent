@@ -32,19 +32,21 @@ download() {
   fi
 }
 
-case "$(uname -s)" in
-  Linux) os=unknown-linux-gnu ;;
-  Darwin) os=apple-darwin ;;
-  *) echo "unsupported operating system: $(uname -s)" >&2; exit 1 ;;
-esac
-
 case "$(uname -m)" in
   x86_64|amd64) arch=x86_64 ;;
   arm64|aarch64) arch=aarch64 ;;
   *) echo "unsupported architecture: $(uname -m)" >&2; exit 1 ;;
 esac
 
-target="$arch-$os"
+if [ -n "${KKAGENT_TARGET:-}" ]; then
+  target=$KKAGENT_TARGET
+else
+  case "$(uname -s)" in
+    Linux) target="$arch-unknown-linux-musl" ;;
+    Darwin) target="$arch-apple-darwin" ;;
+    *) echo "unsupported operating system: $(uname -s)" >&2; exit 1 ;;
+  esac
+fi
 archive="kkagent-$target.tar.gz"
 temp_dir=$(mktemp -d "${TMPDIR:-/tmp}/kkagent-install.XXXXXX")
 new_binary=

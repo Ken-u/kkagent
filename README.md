@@ -26,11 +26,12 @@ TUI 与 Agent Server 可分离，中间走 RPC（默认进程内 memory transpor
 curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/Ken-u/kkagent/main/install.sh | sh
 ```
 
-安装器会自动识别 macOS/Linux 与 x86_64/arm64、下载最新 Release 并校验 SHA-256。`/usr/local/bin` 可写时安装到该目录，否则自动使用 `~/.local/bin`。也可指定目录或版本：
+安装器会自动识别 macOS/Linux 与 x86_64/arm64，下载最新 Release 并校验 SHA-256。Linux 默认使用 musl 静态包（`unknown-linux-musl`），无需系统 OpenSSL。`/usr/local/bin` 可写时安装到该目录，否则自动使用 `~/.local/bin`。也可指定目录、版本或 glibc 包：
 
 ```bash
 curl --proto '=https' --tlsv1.2 -fsSLO https://raw.githubusercontent.com/Ken-u/kkagent/main/install.sh
 KKAGENT_INSTALL_DIR="$HOME/bin" KKAGENT_VERSION=0.2.0 sh install.sh
+KKAGENT_TARGET=x86_64-unknown-linux-gnu sh install.sh
 ```
 
 升级时重新执行同一条安装命令即可。TUI 默认每 24 小时在后台检查一次 GitHub Release；只显示提示，不会自动下载。可在配置中设置 `[ui] check_updates = false` 关闭。
@@ -44,6 +45,7 @@ KKAGENT_INSTALL_DIR="$HOME/bin" KKAGENT_VERSION=0.2.0 sh install.sh
 | 平台 | 架构 | 产物 |
 |---|---|---|
 | macOS | x86_64 / arm64 | `kkagent-x86_64-apple-darwin.tar.gz` / `kkagent-aarch64-apple-darwin.tar.gz` |
+| Linux (musl, 静态) | x86_64 / arm64 | `kkagent-x86_64-unknown-linux-musl.tar.gz` / `kkagent-aarch64-unknown-linux-musl.tar.gz` |
 | Linux (glibc) | x86_64 / arm64 | `kkagent-x86_64-unknown-linux-gnu.tar.gz` / `kkagent-aarch64-unknown-linux-gnu.tar.gz` |
 | Windows | x86_64 / arm64 | `kkagent-x86_64-pc-windows-msvc.zip` / `kkagent-aarch64-pc-windows-msvc.zip` |
 
