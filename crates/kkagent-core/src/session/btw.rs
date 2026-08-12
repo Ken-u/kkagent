@@ -219,7 +219,7 @@ impl SessionBtwService {
             model: model_config.model.clone(),
             messages,
             tools: vec![],
-            max_tokens: model_config.max_output_size.unwrap_or(8192) as u32,
+            max_tokens: model_config.max_output_size.unwrap_or(128_000) as u32,
             system: Some(SIDE_QUESTION_SYSTEM_REMINDER.to_string()),
             thinking: None,
         };
