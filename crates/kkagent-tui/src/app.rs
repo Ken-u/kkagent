@@ -6229,7 +6229,10 @@ impl TuiApp {
 
     async fn activate_workspace_target(&mut self, id: &str) -> anyhow::Result<()> {
         if self.state.mode == AppMode::Btw {
-            self.exit_btw_view();
+            // BTW is not a session tab. Keep it visible until Ctrl-G (or the
+            // explicit Ctrl-D delete action) so clicking the real-session
+            // strip cannot accidentally dismiss the side conversation.
+            return Ok(());
         }
         if self.state.session_id.as_deref() == Some(id) {
             return Ok(());
@@ -9346,7 +9349,7 @@ mod app_state_tests {
     }
 
     #[tokio::test]
-    async fn selecting_a_real_session_exits_the_btw_workspace() {
+    async fn selecting_a_real_session_does_not_hide_the_btw_surface() {
         let mut app = test_tui_app();
         app.state.session_id = Some("session-btw".into());
         app.state.workspace_sessions.set_entries(
@@ -9363,8 +9366,8 @@ mod app_state_tests {
 
         app.activate_workspace_target("session-btw").await.unwrap();
 
-        assert_eq!(app.state.mode, AppMode::Normal);
-        assert!(!app.state.btw.open);
+        assert_eq!(app.state.mode, AppMode::Btw);
+        assert!(app.state.btw.open);
         assert_eq!(
             app.state.workspace_sessions.active_id(),
             Some("session-btw")
