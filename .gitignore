@@ -19,6 +19,7 @@
 /tmp/
 /upload.sh
 *.log
+/specs/
 
 # Node build artifacts
 **/node_modules/
