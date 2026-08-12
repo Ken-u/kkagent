@@ -6797,6 +6797,11 @@ impl TuiApp {
         if raw.is_empty() {
             return Ok(());
         }
+        // Clear the persisted draft — input has been submitted and must not
+        // resurface when switching back to this session later (e.g. `/new`).
+        if let Some(sid) = self.state.session_id.clone() {
+            crate::draft_store::clear_draft(&sid);
+        }
         // Expand kimi-style `[Pasted text #n]` markers before send / display.
         let text = self.state.input.expand_pastes(&raw);
         self.state.slash_menu = None;
