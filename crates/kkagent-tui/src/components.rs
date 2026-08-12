@@ -104,7 +104,15 @@ pub fn render_ui(f: &mut Frame, state: &mut AppState, config: &AppConfig) {
 
     if state.mode == AppMode::Btw {
         state.transcript_area = Rect::default();
-        panes::render_btw(f, msg_area, &mut state.btw, &theme);
+        panes::render_btw(
+            f,
+            msg_area,
+            &mut state.btw,
+            &theme,
+            state.tick,
+            state.tool_output_expanded,
+            &mut state.render_cache,
+        );
     } else {
         render_messages(f, msg_area, state, &theme);
         render_scroll_hint(f, msg_area, state, &theme);
@@ -459,33 +467,7 @@ fn build_transcript_lines(state: &mut AppState, theme: &Theme, width: u16) -> Ve
             MessageRole::Assistant => {
                 // Thinking block (dim), like kimi
                 if let Some(ref thinking) = msg.thinking {
-                    if !thinking.is_empty() {
-                        lines.push(Line::from(Span::styled(
-                            "● thinking",
-                            Style::default()
-                                .fg(theme.text_dim)
-                                .add_modifier(Modifier::ITALIC),
-                        )));
-                        let think_lines: Vec<&str> = thinking.lines().collect();
-                        let max_show = 20;
-                        let show = think_lines.len().min(max_show);
-                        for l in &think_lines[..show] {
-                            lines.push(Line::from(Span::styled(
-                                format!("  {}", l),
-                                Style::default().fg(theme.text_muted),
-                            )));
-                        }
-                        if think_lines.len() > max_show {
-                            lines.push(Line::from(Span::styled(
-                                format!(
-                                    "  ... ({} more lines, ctrl+o to expand)",
-                                    think_lines.len() - max_show
-                                ),
-                                Style::default().fg(theme.text_muted),
-                            )));
-                        }
-                        lines.push(Line::from(""));
-                    }
+                    push_thinking_lines(&mut lines, thinking, theme, state.tool_output_expanded);
                 }
 
                 // Chronological parts: tools stay where they were called;
@@ -689,7 +671,7 @@ fn build_transcript_lines(state: &mut AppState, theme: &Theme, width: u16) -> Ve
     lines
 }
 
-fn push_assistant_markdown(
+pub(crate) fn push_assistant_markdown(
     lines: &mut Vec<Line<'static>>,
     text: &str,
     width: u16,
@@ -713,6 +695,47 @@ fn push_assistant_markdown(
         spans.extend(content.spans);
         lines.push(Line::from(spans));
     }
+}
+
+pub(crate) fn push_thinking_lines(
+    lines: &mut Vec<Line<'static>>,
+    thinking: &str,
+    theme: &Theme,
+    expanded: bool,
+) {
+    if thinking.is_empty() {
+        return;
+    }
+    lines.push(Line::from(Span::styled(
+        "● thinking",
+        Style::default()
+            .fg(theme.text_dim)
+            .add_modifier(Modifier::ITALIC),
+    )));
+    let think_lines: Vec<&str> = thinking.lines().collect();
+    let max_show = if expanded { usize::MAX } else { 20 };
+    let show = think_lines.len().min(max_show);
+    for line in &think_lines[..show] {
+        lines.push(Line::from(Span::styled(
+            format!("  {line}"),
+            Style::default().fg(theme.text_muted),
+        )));
+    }
+    if think_lines.len() > show {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "  ... ({} more lines, ctrl+o to expand)",
+                think_lines.len() - show
+            ),
+            Style::default().fg(theme.text_muted),
+        )));
+    } else if expanded && think_lines.len() > 20 {
+        lines.push(Line::from(Span::styled(
+            "  … (ctrl+o to collapse)",
+            Style::default().fg(theme.text_muted),
+        )));
+    }
+    lines.push(Line::from(""));
 }
 
 fn status_icon(tc: &crate::app::DisplayToolCall) -> &'static str {
@@ -1457,6 +1480,8 @@ fn render_footer(
         "↑↓ navigate · enter jump · esc close".to_string()
     } else if state.mode == AppMode::Btw && state.btw.scroll_offset > 0 {
         format!("↑{} lines · end to follow", state.btw.scroll_offset)
+    } else if state.mode == AppMode::Btw {
+        "ctrl+g back · ctrl+o fold thinking · ctrl+d delete BTW".to_string()
     } else if !state.follow_bottom && state.scroll_up > 0 {
         format!("↑{} lines · end to follow", state.scroll_up)
     } else {
@@ -2302,7 +2327,7 @@ fn push_plan_box_lines(
     ]));
 }
 
-fn push_wrapped_prefixed(
+pub(crate) fn push_wrapped_prefixed(
     lines: &mut Vec<Line<'static>>,
     prefix: &str,
     text: &str,
@@ -2602,6 +2627,32 @@ mod render_smoke {
     use ratatui::{backend::TestBackend, Terminal};
 
     #[test]
+    fn thinking_uses_the_same_ctrl_o_folding_in_all_views() {
+        let thinking = (0..25)
+            .map(|index| format!("reason {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let theme = Theme::default();
+        let mut collapsed = Vec::new();
+        push_thinking_lines(&mut collapsed, &thinking, &theme, false);
+        let collapsed_text = collapsed
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<String>();
+        assert!(collapsed_text.contains("5 more lines, ctrl+o to expand"));
+        assert!(!collapsed_text.contains("reason 24"));
+
+        let mut expanded = Vec::new();
+        push_thinking_lines(&mut expanded, &thinking, &theme, true);
+        let expanded_text = expanded
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<String>();
+        assert!(expanded_text.contains("reason 24"));
+        assert!(expanded_text.contains("ctrl+o to collapse"));
+    }
+
+    #[test]
     fn sandbox_indicator_distinguishes_effective_modes() {
         let theme = Theme::default();
         assert_eq!(
@@ -2692,7 +2743,8 @@ mod render_smoke {
         state.btw.open = true;
         state.btw.turns.push(crate::panes::BtwTurnView {
             question: "side question".into(),
-            answer: "side answer".into(),
+            answer: "# Side answer\n\nThis is **bold** and `code`.".into(),
+            thinking: Some("reasoning about the side question".into()),
         });
         state.messages.push(DisplayMessage {
             role: MessageRole::Assistant,
@@ -2718,8 +2770,14 @@ mod render_smoke {
                     output
                 });
 
-        assert!(rendered.contains("Q: side question"), "{rendered:?}");
-        assert!(rendered.contains("side answer"), "{rendered:?}");
+        assert!(rendered.contains("✦ side question"), "{rendered:?}");
+        assert!(rendered.contains("Side answer"), "{rendered:?}");
+        assert!(
+            rendered.contains("reasoning about the side question"),
+            "{rendered:?}"
+        );
+        assert!(!rendered.contains("# Side answer"), "{rendered:?}");
+        assert!(!rendered.contains("**bold**"), "{rendered:?}");
         assert!(rendered.contains("btw >"), "{rendered:?}");
         assert!(!rendered.contains("main transcript must be hidden"));
     }

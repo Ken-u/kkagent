@@ -3,7 +3,7 @@
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
 use crate::theme::Theme;
@@ -17,6 +17,7 @@ pub struct ActivityPane {
 pub struct BtwTurnView {
     pub question: String,
     pub answer: String,
+    pub thinking: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -31,6 +32,7 @@ pub struct BtwPanelState {
     pub streaming: bool,
     pub current_question: String,
     pub current_answer: String,
+    pub current_thinking: String,
     pub turns: Vec<BtwTurnView>,
     pub error: Option<String>,
     pub pending_questions: std::collections::VecDeque<BtwQueuedQuestion>,
@@ -48,11 +50,17 @@ impl BtwPanelState {
         self.scroll_offset = 0;
         self.current_question = question.to_string();
         self.current_answer.clear();
+        self.current_thinking.clear();
         self.error = None;
     }
 
     pub fn append_delta(&mut self, text: &str) {
         self.current_answer.push_str(text);
+        self.scroll_offset = 0;
+    }
+
+    pub fn append_thinking_delta(&mut self, text: &str) {
+        self.current_thinking.push_str(text);
         self.scroll_offset = 0;
     }
 
@@ -66,9 +74,15 @@ impl BtwPanelState {
             self.turns.push(BtwTurnView {
                 question: std::mem::take(&mut self.current_question),
                 answer,
+                thinking: if self.current_thinking.is_empty() {
+                    None
+                } else {
+                    Some(std::mem::take(&mut self.current_thinking))
+                },
             });
         }
         self.current_answer.clear();
+        self.current_thinking.clear();
         self.error = error;
         self.current_session_id = None;
         self.scroll_offset = 0;
@@ -157,7 +171,15 @@ pub fn render_activity(f: &mut Frame, area: Rect, pane: &ActivityPane, theme: &T
     f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
-pub fn render_btw(f: &mut Frame, area: Rect, state: &mut BtwPanelState, theme: &Theme) {
+pub fn render_btw(
+    f: &mut Frame,
+    area: Rect,
+    state: &mut BtwPanelState,
+    theme: &Theme,
+    tick: usize,
+    expanded: bool,
+    render_cache: &mut crate::render_cache::RenderCache,
+) {
     f.render_widget(Clear, area);
     let mut lines: Vec<Line> = Vec::new();
     if state.turns.is_empty()
@@ -174,47 +196,62 @@ pub fn render_btw(f: &mut Frame, area: Rect, state: &mut BtwPanelState, theme: &
         if index > 0 {
             lines.push(Line::default());
         }
-        lines.push(Line::from(Span::styled(
-            format!(" Q: {}", turn.question),
-            Style::default().fg(theme.accent),
-        )));
-        for al in turn.answer.lines() {
-            lines.push(Line::from(Span::styled(
-                format!(" {al}"),
-                Style::default().fg(theme.text),
-            )));
-        }
-        if turn.answer.is_empty() {
-            lines.push(Line::from(Span::styled(
-                " (empty)",
-                Style::default().fg(theme.text_muted),
-            )));
-        }
+        push_btw_question(&mut lines, &turn.question, area.width, theme);
+        crate::components::push_thinking_lines(
+            &mut lines,
+            turn.thinking.as_deref().unwrap_or(""),
+            theme,
+            expanded,
+        );
+        push_btw_answer(&mut lines, &turn.answer, area.width, theme, render_cache);
     }
     if state.streaming || !state.current_question.is_empty() {
         if !lines.is_empty() {
             lines.push(Line::default());
         }
-        lines.push(Line::from(Span::styled(
-            format!(" Q: {}", state.current_question),
-            Style::default().fg(theme.accent),
-        )));
-        if state.current_answer.is_empty() {
+        push_btw_question(&mut lines, &state.current_question, area.width, theme);
+        if state.current_answer.is_empty() && state.current_thinking.is_empty() {
+            let frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+            let spinner = frames[(tick / 2) % frames.len()];
             lines.push(Line::from(Span::styled(
                 if state.streaming {
-                    " …"
+                    format!("● {spinner} thinking")
                 } else {
-                    " (waiting)"
+                    "● (waiting)".into()
                 },
                 Style::default().fg(theme.text_muted),
             )));
-        } else {
-            for al in state.current_answer.lines() {
+        } else if state.current_answer.is_empty() {
+            let frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+            let spinner = frames[(tick / 2) % frames.len()];
+            lines.push(Line::from(Span::styled(
+                format!("● {spinner} thinking"),
+                Style::default()
+                    .fg(theme.text_dim)
+                    .add_modifier(Modifier::ITALIC),
+            )));
+            let thinking_lines: Vec<&str> = state.current_thinking.lines().collect();
+            let start = thinking_lines.len().saturating_sub(12);
+            for line in &thinking_lines[start..] {
                 lines.push(Line::from(Span::styled(
-                    format!(" {al}"),
-                    Style::default().fg(theme.text),
+                    format!("  {line}"),
+                    Style::default().fg(theme.text_muted),
                 )));
             }
+        } else {
+            crate::components::push_thinking_lines(
+                &mut lines,
+                &state.current_thinking,
+                theme,
+                expanded,
+            );
+            push_btw_answer(
+                &mut lines,
+                &state.current_answer,
+                area.width,
+                theme,
+                render_cache,
+            );
             if state.streaming {
                 lines.push(Line::from(Span::styled(
                     " ▍",
@@ -224,9 +261,11 @@ pub fn render_btw(f: &mut Frame, area: Rect, state: &mut BtwPanelState, theme: &
         }
     }
     for queued in &state.pending_questions {
+        lines.push(Line::default());
+        push_btw_question(&mut lines, &queued.question, area.width, theme);
         lines.push(Line::from(Span::styled(
-            format!(" Q: {} (queued)", queued.question),
-            Style::default().fg(theme.text_dim),
+            "  (queued)",
+            Style::default().fg(theme.warning),
         )));
     }
     if let Some(err) = &state.error {
@@ -244,14 +283,9 @@ pub fn render_btw(f: &mut Frame, area: Rect, state: &mut BtwPanelState, theme: &
         .borders(Borders::ALL)
         .title(title)
         .border_style(Style::default().fg(theme.border));
-    let inner_width = area.width.saturating_sub(2).max(1);
     let inner_height = area.height.saturating_sub(2);
-    let content_lines = lines.iter().fold(0usize, |total, line| {
-        total.saturating_add(line.width().max(1).div_ceil(inner_width as usize))
-    });
-    let paragraph = Paragraph::new(lines)
-        .wrap(Wrap { trim: false })
-        .block(block);
+    let content_lines = lines.len();
+    let paragraph = Paragraph::new(lines).block(block);
     state.viewport_height = inner_height;
     state.content_lines = content_lines.min(u16::MAX as usize) as u16;
     state.scroll_offset = state.scroll_offset.min(state.max_scroll_offset());
@@ -273,6 +307,42 @@ pub fn render_btw(f: &mut Frame, area: Rect, state: &mut BtwPanelState, theme: &
             hint_area,
         );
     }
+}
+
+fn push_btw_question(lines: &mut Vec<Line<'static>>, question: &str, width: u16, theme: &Theme) {
+    crate::components::push_wrapped_prefixed(
+        lines,
+        "✦ ",
+        question,
+        width.saturating_sub(2),
+        Style::default()
+            .fg(theme.role_user)
+            .add_modifier(Modifier::BOLD),
+        Style::default().fg(theme.role_user),
+    );
+    lines.push(Line::default());
+}
+
+fn push_btw_answer(
+    lines: &mut Vec<Line<'static>>,
+    answer: &str,
+    width: u16,
+    theme: &Theme,
+    render_cache: &mut crate::render_cache::RenderCache,
+) {
+    if answer.is_empty() {
+        return;
+    }
+    let mut first_bullet = true;
+    crate::components::push_assistant_markdown(
+        lines,
+        answer,
+        width.saturating_sub(2),
+        theme,
+        &mut first_bullet,
+        render_cache,
+    );
+    lines.push(Line::default());
 }
 
 pub fn render_queue(f: &mut Frame, area: Rect, pane: &QueuePane, theme: &Theme) {

@@ -2871,6 +2871,15 @@ impl TuiApp {
                     self.state.list_picker = None;
                 }
             }
+            // Ctrl-D in the virtual BTW workspace clears that workspace; the
+            // fixed entry remains available for a fresh side conversation.
+            KeyCode::Char('d')
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && self.state.input.is_empty()
+                    && self.state.mode == AppMode::Btw =>
+            {
+                self.delete_btw_workspace().await;
+            }
             // Ctrl-D: close current multi-session tab (with confirm), else quit if empty
             KeyCode::Char('d')
                 if key.modifiers.contains(KeyModifiers::CONTROL) && self.state.input.is_empty() =>
@@ -6212,6 +6221,18 @@ impl TuiApp {
         }
     }
 
+    async fn delete_btw_workspace(&mut self) {
+        let active_session_id = self.state.btw.current_session_id.clone();
+        let was_streaming = self.state.btw.streaming;
+        self.state.btw = crate::panes::BtwPanelState::default();
+        self.exit_btw_view();
+        if was_streaming {
+            if let Some(session_id) = active_session_id {
+                let _ = self.client.cancel_btw(&session_id).await;
+            }
+        }
+    }
+
     async fn activate_workspace_target(&mut self, id: &str) -> anyhow::Result<()> {
         if id == crate::chrome::BTW_SESSION_ID {
             self.enter_btw_view();
@@ -7914,7 +7935,13 @@ impl TuiApp {
                         self.state.btw.append_delta(text);
                         return;
                     }
-                    AgentEvent::BtwThinkingDelta { .. } => return,
+                    AgentEvent::BtwThinkingDelta { session_id, text }
+                        if self.state.btw.current_session_id.as_deref()
+                            == Some(session_id.as_str()) =>
+                    {
+                        self.state.btw.append_thinking_delta(text);
+                        return;
+                    }
                     AgentEvent::BtwEnd { session_id, error }
                         if self.state.btw.current_session_id.as_deref()
                             == Some(session_id.as_str()) =>
@@ -7922,7 +7949,9 @@ impl TuiApp {
                         self.state.btw.finish(error.clone());
                         return;
                     }
-                    AgentEvent::BtwDelta { .. } | AgentEvent::BtwEnd { .. } => return,
+                    AgentEvent::BtwDelta { .. }
+                    | AgentEvent::BtwThinkingDelta { .. }
+                    | AgentEvent::BtwEnd { .. } => return,
                     _ => {}
                 }
 
@@ -9308,6 +9337,36 @@ mod app_state_tests {
     }
 
     #[tokio::test]
+    async fn ctrl_d_clears_the_btw_workspace_without_deleting_the_real_session() {
+        let mut app = test_tui_app();
+        app.state.session_id = Some("real-session".into());
+        app.enter_btw_view();
+        app.state.btw.turns.push(crate::panes::BtwTurnView {
+            question: "old question".into(),
+            answer: "old answer".into(),
+            thinking: Some("old thinking".into()),
+        });
+        app.state
+            .btw
+            .enqueue("real-session".into(), "queued".into());
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+
+        assert_eq!(app.state.mode, AppMode::Normal);
+        assert_eq!(app.state.session_id.as_deref(), Some("real-session"));
+        assert!(app.state.btw.turns.is_empty());
+        assert!(app.state.btw.pending_questions.is_empty());
+        assert!(app
+            .state
+            .workspace_sessions
+            .entries
+            .iter()
+            .any(|entry| entry.id == crate::chrome::BTW_SESSION_ID));
+    }
+
+    #[tokio::test]
     async fn background_btw_events_continue_updating_the_fixed_workspace() {
         let mut app = test_tui_app();
         app.state.session_id = Some("another-session".into());
@@ -9315,6 +9374,10 @@ mod app_state_tests {
         app.state.btw.current_session_id = Some("original-session".into());
 
         for event in [
+            AgentEvent::BtwThinkingDelta {
+                session_id: "original-session".into(),
+                text: "reasoning".into(),
+            },
             AgentEvent::BtwDelta {
                 session_id: "original-session".into(),
                 text: "answer".into(),
@@ -9334,6 +9397,10 @@ mod app_state_tests {
         assert!(!app.state.btw.streaming);
         assert_eq!(app.state.btw.turns.len(), 1);
         assert_eq!(app.state.btw.turns[0].answer, "answer");
+        assert_eq!(
+            app.state.btw.turns[0].thinking.as_deref(),
+            Some("reasoning")
+        );
         assert!(!app
             .state
             .background_session_events
