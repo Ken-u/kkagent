@@ -143,9 +143,7 @@ pub fn render_ui(f: &mut Frame, state: &mut AppState, config: &AppConfig) {
         .filter(|approval| !approval.hidden)
     {
         render_approval_panel(f, size, approval, &theme);
-    }
-
-    if let Some(ref mut question) = state.question_pending {
+    } else if let Some(ref mut question) = state.question_pending {
         render_question_panel(f, size, question, &theme);
     }
 
@@ -1369,8 +1367,15 @@ fn render_footer(
         .approval_pending
         .as_ref()
         .is_some_and(|approval| approval.is_plan_review && approval.hidden);
+    let approval_waiting = state.question_pending.is_some()
+        && state
+            .approval_pending
+            .as_ref()
+            .is_some_and(|approval| !approval.hidden);
     let tip = if plan_review_hidden {
         "plan review hidden · enter reopen · ctrl-c cancel".to_string()
+    } else if approval_waiting {
+        "1 approval waiting".to_string()
     } else if let Some(ref activity) = state.status_bar.activity {
         activity.clone()
     } else if let Some(ref hover) = state.strip_hover_title {

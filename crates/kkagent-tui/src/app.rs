@@ -2257,12 +2257,10 @@ impl TuiApp {
             return self.handle_search_key(key);
         }
 
-        // Handle question panel first
-        if self.state.question_pending.is_some() {
-            return self.handle_question_key(key).await;
-        }
-
-        // Handle approval panel
+        // Handle approval panel first (plan review / permission approval).
+        // The agent loop ensures AskUserQuestion and ExitPlanMode never run in
+        // the same step, so in practice only one is pending. If both somehow
+        // exist (e.g. across turns), the approval modal takes precedence.
         if self
             .state
             .approval_pending
@@ -2348,6 +2346,11 @@ impl TuiApp {
                 _ => {}
             }
             return Ok(());
+        }
+
+        // Handle question panel (only when no visible approval modal).
+        if self.state.question_pending.is_some() {
+            return self.handle_question_key(key).await;
         }
 
         // Tasks browser overlay

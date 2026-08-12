@@ -741,6 +741,12 @@ Do not mention this reminder to the user.\n</system-reminder>"
             let dedupe_reminder = dedupe.reminder.clone();
             let dedupe_force_stop = dedupe.force_stop;
 
+            // If AskUserQuestion is present in this step, defer any ExitPlanMode
+            // — answer the user's question first, then let the model regenerate.
+            // The model will call ExitPlanMode again in the next turn if it still
+            // wants to exit plan mode.
+            let has_ask_user = tool_calls.iter().any(|tc| tc.name == "AskUserQuestion");
+
             let _ = self
                 .event_tx
                 .send(AgentEvent::StatusUpdate {
@@ -794,6 +800,25 @@ Do not mention this reminder to the user.\n</system-reminder>"
                         tc.name.clone(),
                         Prepared::Done(ToolOutput::success(
                             "Skipped: duplicate tool call in the same step (identical args).",
+                        )),
+                    ));
+                    continue;
+                }
+
+                // Defer ExitPlanMode when AskUserQuestion is in the same step —
+                // answer the user's question first; the model can call ExitPlanMode
+                // again next turn after incorporating the answer.
+                if has_ask_user && tc.name == "ExitPlanMode" {
+                    tracing::info!(
+                        "Deferring ExitPlanMode: AskUserQuestion is present in the same step"
+                    );
+                    prepared.push((
+                        tc.id.clone(),
+                        tc.name.clone(),
+                        Prepared::Done(ToolOutput::success(
+                            "Deferred: AskUserQuestion is present in this step. \
+                             Answer the user's question first, then call ExitPlanMode \
+                             again in the next turn if you still want to exit plan mode.",
                         )),
                     ));
                     continue;
