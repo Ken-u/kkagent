@@ -28,7 +28,9 @@ use kkagent_telemetry::{
 use kkagent_tools::ToolRegistry;
 use kkagent_tui::TuiApp;
 
+mod diagnostics;
 mod onboarding;
+use diagnostics::RunDiagnostics;
 use onboarding::{run_config, run_doctor, run_init};
 
 struct LocalEndpointGuard(PathBuf);
@@ -226,6 +228,30 @@ async fn main() -> Result<()> {
     let is_tui = cli.command.is_none() && cli.prompt.is_none();
     init_logging(is_tui)?;
 
+    let mut diagnostics = RunDiagnostics::start(runtime_mode(&cli))?;
+    diagnostics.install_panic_hook();
+    diagnostics.start_signal_watchers();
+
+    let result = run(cli).await;
+    diagnostics.finish(result.as_ref().err());
+    result
+}
+
+fn runtime_mode(cli: &Cli) -> &'static str {
+    match (&cli.command, &cli.prompt) {
+        (Some(Commands::Server { .. }), _) => "server",
+        (Some(Commands::Acp), _) => "acp",
+        (Some(Commands::Auth { .. }), _) => "auth",
+        (Some(Commands::Init { .. }), _) => "init",
+        (Some(Commands::Config { .. }), _) => "config",
+        (Some(Commands::Doctor { .. }), _) => "doctor",
+        (Some(Commands::Completions { .. }), _) => "completions",
+        (None, Some(_)) => "print",
+        (None, None) => "tui",
+    }
+}
+
+async fn run(cli: Cli) -> Result<()> {
     if let Some(Commands::Auth { command }) = &cli.command {
         return run_auth(command, cli.config.as_deref()).await;
     }
