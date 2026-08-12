@@ -277,7 +277,13 @@ fn render_messages(f: &mut Frame, area: Rect, state: &mut AppState, theme: &Them
     state.viewport_height = visible_height;
 
     let max_scroll_up = content_height.saturating_sub(visible_height);
-    if state.plan_scroll_to_top && state.plan_focus_active() {
+    if let Some((line, viewport_row)) = state.pending_tool_click_anchor.take() {
+        let scroll_from_top = line
+            .saturating_sub(viewport_row as usize)
+            .min(max_scroll_up as usize) as u16;
+        state.scroll_up = max_scroll_up.saturating_sub(scroll_from_top);
+        state.follow_bottom = false;
+    } else if state.plan_scroll_to_top && state.plan_focus_active() {
         state.scroll_up = max_scroll_up;
         state.follow_bottom = max_scroll_up == 0;
         state.plan_scroll_to_top = false;
@@ -773,6 +779,18 @@ fn render_tool_call_lines(
     }
 
     if !tc.collapsed {
+        let toggle_line = if include_toggle_hint
+            && tc.output.as_ref().map(|o| o.lines().count()).unwrap_or(0) > 1
+        {
+            let line = lines.len();
+            lines.push(Line::from(Span::styled(
+                "  … (ctrl+o to collapse)",
+                Style::default().fg(theme.text_muted),
+            )));
+            Some(line)
+        } else {
+            None
+        };
         let max_preview = if include_toggle_hint { usize::MAX } else { 12 };
         lines.extend(ToolRenderRegistry::summary_lines(
             tc,
@@ -780,14 +798,7 @@ fn render_tool_call_lines(
             theme,
             max_preview,
         ));
-        if include_toggle_hint && tc.output.as_ref().map(|o| o.lines().count()).unwrap_or(0) > 1 {
-            let line = lines.len();
-            lines.push(Line::from(Span::styled(
-                "  … (ctrl+o to collapse)",
-                Style::default().fg(theme.text_muted),
-            )));
-            return Some(line);
-        }
+        return toggle_line;
     } else if include_toggle_hint && tc.output.as_ref().map(|o| o.lines().count()).unwrap_or(0) > 1
     {
         let n = tc.output.as_ref().map(|o| o.lines().count()).unwrap_or(0);

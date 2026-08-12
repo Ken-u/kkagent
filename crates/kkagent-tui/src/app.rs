@@ -73,6 +73,8 @@ pub struct AppState {
     pub tool_output_expanded: bool,
     /// Expand/collapse hints rendered on the last transcript frame.
     pub tool_expand_hits: Vec<ToolExpandHit>,
+    /// Keep a clicked tool hint at the same viewport row after its height changes.
+    pub pending_tool_click_anchor: Option<(usize, u16)>,
     /// Last rendered transcript area (for mouse → cell mapping).
     pub transcript_area: ratatui::layout::Rect,
     /// Footer chrome area (status + session strip).
@@ -320,6 +322,7 @@ impl SessionRuntimeState {
         );
         state.apply_tool_output_mode();
         state.tool_expand_hits.clear();
+        state.pending_tool_click_anchor = None;
     }
 }
 
@@ -817,6 +820,7 @@ impl AppState {
             message_line_starts: Vec::new(),
             tool_output_expanded: false,
             tool_expand_hits: Vec::new(),
+            pending_tool_click_anchor: None,
             transcript_area: ratatui::layout::Rect::default(),
             footer_area: ratatui::layout::Rect::default(),
             session_strip_hits: Vec::new(),
@@ -2124,6 +2128,10 @@ impl TuiApp {
                 self.flush_pending_scroll(scroll_delta);
                 if let Some(pos) = self.mouse_to_cell(&mouse) {
                     if self.toggle_clicked_tool_output(pos.line) {
+                        self.state.pending_tool_click_anchor = Some((
+                            pos.line,
+                            mouse.row.saturating_sub(self.state.transcript_area.y),
+                        ));
                         self.clear_selection();
                         return;
                     }
@@ -10165,6 +10173,77 @@ mod app_state_tests {
         assert!(matches!(
             &app.state.messages[0].parts[0],
             DisplayPart::Tool(tool) if !tool.collapsed
+        ));
+    }
+
+    #[tokio::test]
+    async fn long_tool_output_can_expand_and_collapse_at_the_same_mouse_row() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let mut app = test_tui_app();
+        let mut tool = match tool_history_message(0).parts.remove(0) {
+            DisplayPart::ToolHistory(history) => history.tools.into_iter().next().unwrap(),
+            _ => unreachable!(),
+        };
+        tool.output = Some(
+            (1..=100)
+                .map(|line| format!("long output line {line}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        app.state.messages.push(DisplayMessage {
+            role: MessageRole::Assistant,
+            content: String::new(),
+            thinking: None,
+            parts: vec![DisplayPart::Tool(tool)],
+            tool_calls: Vec::new(),
+            delivery: crate::prompt_queue::DeliveryState::Sent,
+            idempotency_key: None,
+        });
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| components::render_ui(frame, &mut app.state, &app.config))
+            .unwrap();
+        let hit = app.state.tool_expand_hits[0];
+        let initial_top = app
+            .state
+            .max_scroll_up()
+            .saturating_sub(app.state.scroll_up) as usize;
+        let row = app.state.transcript_area.y + (hit.line - initial_top) as u16;
+        let click = crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 10,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        let mut scroll_delta = 0;
+        app.collect_mouse(click, &mut scroll_delta);
+        terminal
+            .draw(|frame| components::render_ui(frame, &mut app.state, &app.config))
+            .unwrap();
+        assert!(matches!(
+            &app.state.messages[0].parts[0],
+            DisplayPart::Tool(tool) if !tool.collapsed
+        ));
+        let expanded_hit = app.state.tool_expand_hits[0];
+        let expanded_top = app
+            .state
+            .max_scroll_up()
+            .saturating_sub(app.state.scroll_up) as usize;
+        assert_eq!(
+            app.state.transcript_area.y + (expanded_hit.line - expanded_top) as u16,
+            row,
+            "the collapse hint should remain under the pointer"
+        );
+
+        app.collect_mouse(click, &mut scroll_delta);
+        terminal
+            .draw(|frame| components::render_ui(frame, &mut app.state, &app.config))
+            .unwrap();
+        assert!(matches!(
+            &app.state.messages[0].parts[0],
+            DisplayPart::Tool(tool) if tool.collapsed
         ));
     }
 
