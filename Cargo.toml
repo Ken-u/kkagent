@@ -42,7 +42,13 @@ ratatui = "0.29"
 crossterm = "0.28"
 
 # HTTP / Streaming
-reqwest = { version = "0.12", features = ["json", "stream", "multipart"] }
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "stream",
+    "multipart",
+    "rustls-tls",
+    "rustls-tls-webpki-roots",
+] }
 reqwest-eventsource = "0.6"
 tokio-stream = "0.1"
 futures = "0.3"
