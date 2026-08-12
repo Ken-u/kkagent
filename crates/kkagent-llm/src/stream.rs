@@ -5,6 +5,32 @@ use tokio::sync::mpsc;
 
 use crate::types::{ChatContent, LlmRequest, StreamEvent, TokenUsage};
 
+const ANTHROPIC_FALLBACK_MAX_TOKENS: u32 = 128_000;
+
+/// Resolve max_tokens for Anthropic with per-model ceiling.
+fn resolve_anthropic_max_tokens(model: &str, override_: Option<u32>) -> Option<u32> {
+    let ceiling = anthropic_model_ceiling(model).unwrap_or(ANTHROPIC_FALLBACK_MAX_TOKENS);
+    Some(override_.map(|o| o.min(ceiling)).unwrap_or(ceiling))
+}
+
+/// Heuristic ceiling based on Anthropic model family/version.
+fn anthropic_model_ceiling(model: &str) -> Option<u32> {
+    let lower = model.to_ascii_lowercase();
+    // Claude 4 series supports 64k+ outputs; treat as 128k for newer endpoints.
+    if lower.contains("claude-opus-4")
+        || lower.contains("claude-sonnet-4")
+        || lower.contains("claude-haiku-4")
+    {
+        return Some(128_000);
+    }
+    // Claude 3.x series is generally limited to 8k output.
+    if lower.contains("claude-3") {
+        return Some(8_192);
+    }
+    // Older/unrecognized Anthropic models: rely on fallback.
+    None
+}
+
 pub async fn anthropic_stream(
     client: &Client,
     base_url: &str,
@@ -50,13 +76,14 @@ pub async fn anthropic_stream(
         })
         .collect();
 
-    let max_tokens = request.max_tokens.min(16384);
     let mut body = json!({
         "model": &request.model,
         "messages": messages,
-        "max_tokens": max_tokens,
         "stream": true,
     });
+    if let Some(max_tokens) = resolve_anthropic_max_tokens(&request.model, request.max_tokens) {
+        body["max_tokens"] = json!(max_tokens);
+    }
 
     if let Some(system) = &request.system {
         body["system"] = json!(system);
@@ -403,12 +430,14 @@ async fn chat_completions_stream(
         "stream_options": {"include_usage": true},
     });
     if kimi {
-        body["max_completion_tokens"] = json!(request.max_tokens);
+        if let Some(max_tokens) = request.max_tokens {
+            body["max_completion_tokens"] = json!(max_tokens);
+        }
         if request.thinking.is_some() {
             body["thinking"] = json!({"type": "enabled"});
         }
-    } else {
-        body["max_tokens"] = json!(request.max_tokens.min(16384));
+    } else if let Some(max_tokens) = request.max_tokens {
+        body["max_tokens"] = json!(max_tokens.min(16_384));
     }
     if !tools.is_empty() {
         body["tools"] = json!(tools);
@@ -657,8 +686,10 @@ pub async fn google_stream(
 
     let mut body = json!({
         "contents": contents,
-        "generationConfig": {"maxOutputTokens": request.max_tokens.min(8192)},
     });
+    if let Some(max_tokens) = request.max_tokens {
+        body["generationConfig"] = json!({"maxOutputTokens": max_tokens.min(8_192)});
+    }
     if let Some(system) = &request.system {
         body["systemInstruction"] = json!({"parts": [{"text": system}]});
     }
@@ -946,7 +977,7 @@ mod tests {
                 }],
             }],
             tools: Vec::new(),
-            max_tokens: 128,
+            max_tokens: Some(128),
             system: Some("be helpful".into()),
             thinking: None,
         }

@@ -42,7 +42,7 @@ pub struct LlmRequest {
     pub model: String,
     pub messages: Vec<ChatMessage>,
     pub tools: Vec<ToolDef>,
-    pub max_tokens: u32,
+    pub max_tokens: Option<u32>,
     pub system: Option<String>,
     pub thinking: Option<ThinkingParams>,
 }

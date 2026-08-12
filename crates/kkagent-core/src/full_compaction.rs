@@ -585,7 +585,7 @@ async fn stream_summary(
         model: model_cfg.model.clone(),
         messages,
         tools: Vec::<ToolDef>::new(),
-        max_tokens: 4096,
+        max_tokens: Some(4096),
         system: Some(
             "You compress conversation history into a concise factual handoff note.".into(),
         ),

@@ -105,9 +105,11 @@ pub async fn openai_responses_stream(
     let mut body = json!({
         "model": &request.model,
         "input": input,
-        "max_output_tokens": request.max_tokens.min(100_000),
         "stream": true,
     });
+    if let Some(max_tokens) = request.max_tokens {
+        body["max_output_tokens"] = json!(max_tokens.min(100_000));
+    }
     if let Some(sys) = &request.system {
         body["instructions"] = json!(sys);
     }
@@ -362,7 +364,7 @@ mod tests {
                 description: "read".into(),
                 input_schema: json!({"type": "object"}),
             }],
-            max_tokens: 128,
+            max_tokens: Some(128),
             system: None,
             thinking: None,
         }

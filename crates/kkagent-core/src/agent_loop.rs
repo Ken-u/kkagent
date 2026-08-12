@@ -376,7 +376,7 @@ Do not mention this reminder to the user.\n</system-reminder>"
                 model: model_config.model.clone(),
                 messages: messages.clone(),
                 tools: tool_defs.clone(),
-                max_tokens: model_config.max_output_size.unwrap_or(128_000) as u32,
+                max_tokens: model_config.max_output_size.map(|v| v as u32),
                 system: Some(system_prompt.clone()),
                 thinking,
             };
