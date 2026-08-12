@@ -2206,18 +2206,7 @@ async fn build_turn_tool_registry(
             abort_manager.set_abort_handle(&abort_agent_id, abort).await;
         });
     });
-    tools.register(Arc::new(kkagent_tools::builtin::TaskTool::new(
-        state.subagents.clone(),
-        launch.clone(),
-    )));
-    tools.register(Arc::new(kkagent_tools::builtin::AgentTool::new(
-        state.subagents.clone(),
-        launch.clone(),
-    )));
-    tools.register(Arc::new(kkagent_tools::builtin::AgentSwarmTool::new(
-        state.subagents.clone(),
-        launch,
-    )));
+    kkagent_tools::register_subagent_tools(&mut tools, state.subagents.clone(), launch, None);
     tools.register(Arc::new(
         kkagent_tools::builtin::TaskOutputTool::with_bash_shells(
             state.subagents.clone(),

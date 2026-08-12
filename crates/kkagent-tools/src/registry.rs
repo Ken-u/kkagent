@@ -26,6 +26,11 @@ impl ToolRegistry {
         self.tools.values().map(|t| t.as_ref()).collect()
     }
 
+    pub fn retain_names(&mut self, allowed_names: &[&str]) {
+        self.tools
+            .retain(|name, _| allowed_names.iter().any(|allowed| name == allowed));
+    }
+
     pub fn tool_definitions(&self) -> Vec<kkagent_protocol::tools::ToolDefinition> {
         self.tools
             .values()

@@ -25,6 +25,9 @@ pub struct SubagentConfig {
     /// Optional profile: explore | coder | general (default).
     #[serde(default)]
     pub profile: Option<String>,
+    /// Profiles this agent may delegate to. `None` means unrestricted.
+    #[serde(default)]
+    pub subagents: Option<Vec<String>>,
     /// Parent session / tool call for TUI mirroring.
     #[serde(default)]
     pub parent_session_id: Option<String>,
@@ -40,6 +43,20 @@ pub struct SubagentState {
     pub result: Option<String>,
     pub error: Option<String>,
     pub turns_used: u32,
+    #[serde(default)]
+    pub profile: Option<String>,
+    #[serde(default)]
+    pub subagents: Option<Vec<String>>,
+}
+
+/// Kimi-compatible delegation policy for built-in profiles.
+pub fn allowed_subagents_for(profile: &str) -> Option<Vec<String>> {
+    match profile.trim().to_ascii_lowercase().as_str() {
+        "coder" => Some(vec!["coder".into(), "explore".into()]),
+        "explore" => Some(Vec::new()),
+        "agent" | "general" => None,
+        _ => None,
+    }
 }
 
 pub struct SubagentManager {
@@ -102,10 +119,14 @@ impl SubagentManager {
                 .lock()
                 .map_err(|_| anyhow::anyhow!("subagent store lock poisoned"))?;
             let mut statement = connection.prepare(
-                "SELECT agent_id, description, status, result, error, turns_used FROM durable_subagents",
+                "SELECT agent_id, description, status, result, error, turns_used, config_json FROM durable_subagents",
             )?;
             let rows = statement.query_map([], |row| {
                 let status: String = row.get(2)?;
+                let config = row
+                    .get::<_, String>(6)
+                    .ok()
+                    .and_then(|json| serde_json::from_str::<SubagentConfig>(&json).ok());
                 Ok(SubagentState {
                     agent_id: row.get(0)?,
                     description: row.get(1)?,
@@ -113,6 +134,8 @@ impl SubagentManager {
                     result: row.get(3)?,
                     error: row.get(4)?,
                     turns_used: row.get(5)?,
+                    profile: config.as_ref().and_then(|config| config.profile.clone()),
+                    subagents: config.and_then(|config| config.subagents),
                 })
             })?;
             for row in rows {
@@ -147,6 +170,8 @@ impl SubagentManager {
             result: None,
             error: None,
             turns_used: 0,
+            profile: config.profile.clone(),
+            subagents: config.subagents.clone(),
         };
 
         self.persist_spawn(&config)?;
@@ -341,6 +366,35 @@ fn parse_status(status: &str) -> SubagentStatus {
 mod tests {
     use super::*;
 
+    #[test]
+    fn built_in_profiles_define_delegation_allowlists() {
+        assert_eq!(
+            allowed_subagents_for("coder"),
+            Some(vec!["coder".into(), "explore".into()])
+        );
+        assert_eq!(allowed_subagents_for("explore"), Some(Vec::new()));
+        assert_eq!(allowed_subagents_for("general"), None);
+    }
+
+    #[test]
+    fn old_subagent_configs_default_to_no_explicit_allowlist() {
+        let config: SubagentConfig = serde_json::from_value(serde_json::json!({
+            "agent_id": "legacy",
+            "description": "old config",
+            "prompt": "continue",
+            "model": null,
+            "working_dir": ".",
+            "profile": "explore"
+        }))
+        .unwrap();
+
+        assert_eq!(config.subagents, None);
+        assert_eq!(
+            allowed_subagents_for(config.profile.as_deref().unwrap()),
+            Some(Vec::new())
+        );
+    }
+
     #[tokio::test]
     async fn persistent_subagent_recovers_after_restart() {
         let path =
@@ -351,7 +405,8 @@ mod tests {
             prompt: "finish the task".into(),
             model: None,
             working_dir: ".".into(),
-            profile: None,
+            profile: Some("coder".into()),
+            subagents: allowed_subagents_for("coder"),
             parent_session_id: Some("session".into()),
             parent_tool_call_id: None,
         };
@@ -373,6 +428,8 @@ mod tests {
             let state = manager.get_state("agent-1").await.unwrap();
             assert_eq!(state.status, SubagentStatus::Complete);
             assert_eq!(state.result.as_deref(), Some("done"));
+            assert_eq!(state.profile.as_deref(), Some("coder"));
+            assert_eq!(state.subagents, allowed_subagents_for("coder"));
         }
         let _ = std::fs::remove_file(path);
     }

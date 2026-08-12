@@ -1,5 +1,7 @@
 use async_trait::async_trait;
-use kkagent_protocol::subagent::{SubagentConfig, SubagentManager, SubagentStatus};
+use kkagent_protocol::subagent::{
+    allowed_subagents_for, SubagentConfig, SubagentManager, SubagentStatus,
+};
 use serde_json::Value;
 use std::sync::Arc;
 use std::time::Duration;
@@ -84,7 +86,7 @@ async fn spawn_subagent(
         .get("model")
         .and_then(|v| v.as_str())
         .map(String::from);
-    let profile = input
+    let requested_profile = input
         .get("profile")
         .or_else(|| input.get("subagent_type"))
         .and_then(|v| v.as_str())
@@ -95,8 +97,17 @@ async fn spawn_subagent(
     }
 
     if let Some(resume) = resume_id {
+        let previous = subagent_mgr.get_state(&resume).await;
         match subagent_mgr.resume(&resume).await {
             Ok(_) => {
+                let profile = previous
+                    .as_ref()
+                    .and_then(|state| state.profile.clone())
+                    .or(requested_profile);
+                let subagents = previous
+                    .as_ref()
+                    .and_then(|state| state.subagents.clone())
+                    .or_else(|| allowed_subagents_for(profile.as_deref().unwrap_or("general")));
                 let mut cfg = SubagentConfig {
                     agent_id: resume.clone(),
                     description: desc.to_string(),
@@ -104,6 +115,7 @@ async fn spawn_subagent(
                     model,
                     working_dir: ctx.working_dir.to_string_lossy().to_string(),
                     profile,
+                    subagents,
                     parent_session_id: Some(ctx.session_id.clone()),
                     parent_tool_call_id: ctx.tool_call_id.clone(),
                 };
@@ -139,7 +151,8 @@ async fn spawn_subagent(
         prompt: prompt.to_string(),
         model,
         working_dir,
-        profile,
+        subagents: allowed_subagents_for(requested_profile.as_deref().unwrap_or("general")),
+        profile: requested_profile,
         parent_session_id: Some(ctx.session_id.clone()),
         parent_tool_call_id: ctx.tool_call_id.clone(),
     };
@@ -339,13 +352,29 @@ impl Tool for TaskListTool {
 pub struct AgentTool {
     subagent_mgr: Arc<SubagentManager>,
     launch: SubagentLaunchFn,
+    allowed_subagents: Option<Vec<String>>,
+    description: String,
 }
 
 impl AgentTool {
     pub fn new(subagent_mgr: Arc<SubagentManager>, launch: SubagentLaunchFn) -> Self {
+        Self::with_allowed_subagents(subagent_mgr, launch, None)
+    }
+
+    pub fn with_allowed_subagents(
+        subagent_mgr: Arc<SubagentManager>,
+        launch: SubagentLaunchFn,
+        allowed_subagents: Option<Vec<String>>,
+    ) -> Self {
+        let description = delegation_description(
+            "Run a profiled subagent (explore/coder/general). By default waits for completion and returns the result. Set run_in_background=true to detach and collect later via TaskOutput. Pass resume to continue an existing agent id.",
+            allowed_subagents.as_deref(),
+        );
         Self {
             subagent_mgr,
             launch,
+            allowed_subagents,
+            description,
         }
     }
 }
@@ -356,9 +385,7 @@ impl Tool for AgentTool {
         "Agent"
     }
     fn description(&self) -> &str {
-        "Run a profiled subagent (explore/coder/general). By default waits for completion and \
-returns the result. Set run_in_background=true to detach and collect later via TaskOutput. \
-Pass resume to continue an existing agent id."
+        &self.description
     }
     fn parameters_schema(&self) -> Value {
         serde_json::json!({
@@ -396,6 +423,9 @@ Pass resume to continue an existing agent id."
             if let Some(obj) = input.as_object_mut() {
                 obj.insert("profile".into(), Value::String("coder".into()));
             }
+        }
+        if let Err(error) = check_requested_profile(&input, &self.allowed_subagents, "coder") {
+            return Ok(ToolOutput::error(error));
         }
         let resume = input
             .get("resume")
@@ -471,13 +501,29 @@ Pass resume to continue an existing agent id."
 pub struct AgentSwarmTool {
     subagent_mgr: Arc<SubagentManager>,
     launch: SubagentLaunchFn,
+    allowed_subagents: Option<Vec<String>>,
+    description: String,
 }
 
 impl AgentSwarmTool {
     pub fn new(subagent_mgr: Arc<SubagentManager>, launch: SubagentLaunchFn) -> Self {
+        Self::with_allowed_subagents(subagent_mgr, launch, None)
+    }
+
+    pub fn with_allowed_subagents(
+        subagent_mgr: Arc<SubagentManager>,
+        launch: SubagentLaunchFn,
+        allowed_subagents: Option<Vec<String>>,
+    ) -> Self {
+        let description = delegation_description(
+            "Launch multiple subagents in parallel. Pass `agents` array, or `prompt_template` + `items` (`{{item}}` placeholder). Optional `resume_agent_ids` map resumes existing agents first.",
+            allowed_subagents.as_deref(),
+        );
         Self {
             subagent_mgr,
             launch,
+            allowed_subagents,
+            description,
         }
     }
 }
@@ -488,8 +534,7 @@ impl Tool for AgentSwarmTool {
         "AgentSwarm"
     }
     fn description(&self) -> &str {
-        "Launch multiple subagents in parallel. Pass `agents` array, or `prompt_template` + `items` \
-(`{{item}}` placeholder). Optional `resume_agent_ids` map resumes existing agents first."
+        &self.description
     }
     fn parameters_schema(&self) -> Value {
         serde_json::json!({
@@ -533,6 +578,9 @@ impl Tool for AgentSwarmTool {
         true
     }
     async fn execute(&self, input: Value, ctx: &ToolContext) -> anyhow::Result<ToolOutput> {
+        if let Err(error) = self.check_requested_profiles(&input) {
+            return Ok(ToolOutput::error(error));
+        }
         let mut launched = Vec::new();
         let swarm_desc = input
             .get("description")
@@ -669,6 +717,71 @@ impl Tool for AgentSwarmTool {
     }
 }
 
+impl AgentSwarmTool {
+    fn check_requested_profiles(&self, input: &Value) -> Result<(), String> {
+        let default_profile = input
+            .get("subagent_type")
+            .or_else(|| input.get("profile"))
+            .and_then(|value| value.as_str())
+            .unwrap_or("coder");
+        check_profile_allowed(default_profile, &self.allowed_subagents)?;
+        if let Some(agents) = input.get("agents").and_then(Value::as_array) {
+            for agent in agents {
+                let profile = agent
+                    .get("profile")
+                    .or_else(|| agent.get("subagent_type"))
+                    .and_then(Value::as_str)
+                    .unwrap_or(default_profile);
+                check_profile_allowed(profile, &self.allowed_subagents)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn check_requested_profile(
+    input: &Value,
+    allowed_subagents: &Option<Vec<String>>,
+    default_profile: &str,
+) -> Result<(), String> {
+    let profile = input
+        .get("profile")
+        .or_else(|| input.get("subagent_type"))
+        .and_then(Value::as_str)
+        .unwrap_or(default_profile);
+    check_profile_allowed(profile, allowed_subagents)
+}
+
+fn check_profile_allowed(
+    requested_profile: &str,
+    allowed_subagents: &Option<Vec<String>>,
+) -> Result<(), String> {
+    let Some(allowlist) = allowed_subagents else {
+        return Ok(());
+    };
+    if allowlist
+        .iter()
+        .any(|allowed| allowed.eq_ignore_ascii_case(requested_profile))
+    {
+        return Ok(());
+    }
+    Err(format!(
+        "Profile '{requested_profile}' is not in the allowed subagent allowlist: [{}]",
+        allowlist.join(", ")
+    ))
+}
+
+fn delegation_description(base: &str, allowed_subagents: Option<&[String]>) -> String {
+    match allowed_subagents {
+        None => format!("{base} Delegation profiles are unrestricted."),
+        Some([]) => format!("{base} This caller cannot delegate to any subagent profile."),
+        Some(allowlist) => format!(
+            "{base} Allowed delegation profiles: {}.",
+            allowlist.join(", ")
+        ),
+    }
+}
+
 pub struct TaskStopTool {
     subagent_mgr: Arc<SubagentManager>,
     bash_shells: Option<Arc<BackgroundShellManager>>,
@@ -738,5 +851,116 @@ impl Tool for TaskStopTool {
             }
         }
         Ok(ToolOutput::error(format!("Unknown task_id: {id}")))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex as StdMutex;
+
+    fn context() -> ToolContext {
+        ToolContext {
+            working_dir: std::env::temp_dir(),
+            session_id: "parent-session".into(),
+            plan_file_path: None,
+            image: kkagent_config::ImageConfig::default(),
+            tool_call_id: Some("tool-call".into()),
+            interrupted: None,
+        }
+    }
+
+    fn recording_launcher() -> (SubagentLaunchFn, Arc<StdMutex<Vec<SubagentConfig>>>) {
+        let launched = Arc::new(StdMutex::new(Vec::new()));
+        let captured = launched.clone();
+        let launch = Arc::new(move |config| {
+            captured.lock().unwrap().push(config);
+        });
+        (launch, launched)
+    }
+
+    #[tokio::test]
+    async fn coder_agent_allows_coder_and_rejects_general() {
+        let manager = Arc::new(SubagentManager::new(4));
+        let (launch, launched) = recording_launcher();
+        let tool =
+            AgentTool::with_allowed_subagents(manager, launch, allowed_subagents_for("coder"));
+        assert!(tool.description().contains("coder, explore"));
+
+        let allowed = tool
+            .execute(
+                serde_json::json!({
+                    "description": "allowed",
+                    "prompt": "do it",
+                    "profile": "coder",
+                    "run_in_background": true
+                }),
+                &context(),
+            )
+            .await
+            .unwrap();
+        assert!(!allowed.is_error);
+        assert_eq!(launched.lock().unwrap().len(), 1);
+
+        let denied = tool
+            .execute(
+                serde_json::json!({
+                    "description": "denied",
+                    "prompt": "do it",
+                    "profile": "general",
+                    "run_in_background": true
+                }),
+                &context(),
+            )
+            .await
+            .unwrap();
+        assert!(denied.is_error);
+        assert!(denied
+            .content
+            .contains("not in the allowed subagent allowlist"));
+        assert_eq!(launched.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn unrestricted_agent_accepts_any_profile() {
+        let manager = Arc::new(SubagentManager::new(2));
+        let (launch, launched) = recording_launcher();
+        let tool = AgentTool::new(manager, launch);
+
+        let output = tool
+            .execute(
+                serde_json::json!({
+                    "description": "custom",
+                    "prompt": "do it",
+                    "profile": "specialized",
+                    "run_in_background": true
+                }),
+                &context(),
+            )
+            .await
+            .unwrap();
+        assert!(!output.is_error);
+        assert_eq!(
+            launched.lock().unwrap()[0].profile.as_deref(),
+            Some("specialized")
+        );
+    }
+
+    #[test]
+    fn swarm_rejects_a_disallowed_profile_before_launching_any_agent() {
+        let manager = Arc::new(SubagentManager::new(4));
+        let (launch, launched) = recording_launcher();
+        let tool =
+            AgentSwarmTool::with_allowed_subagents(manager, launch, allowed_subagents_for("coder"));
+        let input = serde_json::json!({
+            "agents": [
+                {"description": "ok", "prompt": "one", "profile": "explore"},
+                {"description": "no", "prompt": "two", "profile": "general"}
+            ]
+        });
+
+        let error = tool.check_requested_profiles(&input).unwrap_err();
+        assert!(error.contains("not in the allowed subagent allowlist"));
+        assert!(launched.lock().unwrap().is_empty());
     }
 }

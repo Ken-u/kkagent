@@ -187,7 +187,8 @@ impl ToolOutput {
     }
 }
 
-pub fn register_builtin_tools(registry: &mut ToolRegistry) {
+/// Built-in tools that do not require host-owned runtime managers.
+pub fn register_core_tools(registry: &mut ToolRegistry) {
     use std::sync::Arc;
     registry.register(Arc::new(builtin::ReadTool));
     registry.register(Arc::new(builtin::WriteTool));
@@ -202,4 +203,171 @@ pub fn register_builtin_tools(registry: &mut ToolRegistry) {
     registry.register(Arc::new(builtin::ExitPlanModeTool));
     registry.register(Arc::new(builtin::SelectToolsTool::new()));
     registry.register(Arc::new(builtin::ReadMediaFileTool));
+}
+
+/// Register host-backed task and subagent tools with the caller's delegation policy.
+pub fn register_subagent_tools(
+    registry: &mut ToolRegistry,
+    manager: std::sync::Arc<kkagent_protocol::subagent::SubagentManager>,
+    launch: builtin::task::SubagentLaunchFn,
+    allowed_subagents: Option<Vec<String>>,
+) {
+    use std::sync::Arc;
+
+    registry.register(Arc::new(builtin::TaskTool::new(
+        manager.clone(),
+        launch.clone(),
+    )));
+    registry.register(Arc::new(builtin::AgentTool::with_allowed_subagents(
+        manager.clone(),
+        launch.clone(),
+        allowed_subagents.clone(),
+    )));
+    registry.register(Arc::new(builtin::AgentSwarmTool::with_allowed_subagents(
+        manager.clone(),
+        launch,
+        allowed_subagents,
+    )));
+    registry.register(Arc::new(builtin::TaskOutputTool::new(manager.clone())));
+    registry.register(Arc::new(builtin::TaskListTool::new(manager.clone())));
+    registry.register(Arc::new(builtin::TaskStopTool::new(manager)));
+}
+
+/// Backward-compatible main-agent core registration.
+pub fn register_builtin_tools(registry: &mut ToolRegistry) {
+    register_core_tools(registry);
+}
+
+pub struct ProfileToolSet;
+
+impl ProfileToolSet {
+    pub const GENERAL: &'static [&'static str] = &[
+        "Read",
+        "Write",
+        "Edit",
+        "Grep",
+        "Glob",
+        "Bash",
+        "TaskList",
+        "TaskOutput",
+        "TaskStop",
+        "CronCreate",
+        "CronList",
+        "CronDelete",
+        "ReadMediaFile",
+        "TodoList",
+        "Skill",
+        "WebSearch",
+        "Agent",
+        "AgentSwarm",
+        "FetchURL",
+        "AskUserQuestion",
+        "EnterPlanMode",
+        "ExitPlanMode",
+        "CreateGoal",
+        "GetGoal",
+        "SetGoalBudget",
+        "UpdateGoal",
+    ];
+
+    pub const CODER: &'static [&'static str] = &[
+        "Agent",
+        "AgentSwarm",
+        "Bash",
+        "CronCreate",
+        "CronDelete",
+        "CronList",
+        "Edit",
+        "EnterPlanMode",
+        "ExitPlanMode",
+        "Glob",
+        "Grep",
+        "Read",
+        "ReadMediaFile",
+        "Skill",
+        "TaskList",
+        "TaskOutput",
+        "TaskStop",
+        "TodoList",
+        "WebSearch",
+        "FetchURL",
+        "AskUserQuestion",
+    ];
+
+    pub const EXPLORE: &'static [&'static str] = &[
+        "Bash",
+        "Read",
+        "ReadMediaFile",
+        "Glob",
+        "Grep",
+        "WebSearch",
+        "FetchURL",
+    ];
+
+    pub fn for_profile(profile: &str) -> &'static [&'static str] {
+        match profile.trim().to_ascii_lowercase().as_str() {
+            "explore" => Self::EXPLORE,
+            "coder" => Self::CODER,
+            "agent" | "general" => Self::GENERAL,
+            _ => Self::GENERAL,
+        }
+    }
+}
+
+pub fn retain_profile_tools(registry: &mut ToolRegistry, profile: &str) {
+    registry.retain_names(ProfileToolSet::for_profile(profile));
+}
+
+#[cfg(test)]
+mod profile_tool_tests {
+    use super::*;
+    use kkagent_protocol::subagent::SubagentManager;
+    use std::sync::Arc;
+
+    fn registry_for(profile: &str) -> ToolRegistry {
+        let mut registry = ToolRegistry::new();
+        register_core_tools(&mut registry);
+        register_subagent_tools(
+            &mut registry,
+            Arc::new(SubagentManager::new(1)),
+            Arc::new(|_| {}),
+            kkagent_protocol::subagent::allowed_subagents_for(profile),
+        );
+        retain_profile_tools(&mut registry, profile);
+        registry
+    }
+
+    fn names(registry: &ToolRegistry) -> Vec<&str> {
+        registry
+            .list()
+            .into_iter()
+            .map(|tool| tool.name())
+            .collect()
+    }
+
+    #[test]
+    fn explore_profile_is_read_only_and_cannot_delegate() {
+        let registry = registry_for("explore");
+        let names = names(&registry);
+
+        assert!(names.contains(&"Read"));
+        assert!(names.contains(&"Grep"));
+        assert!(!names.contains(&"Write"));
+        assert!(!names.contains(&"Edit"));
+        assert!(!names.contains(&"Agent"));
+        assert!(!names.contains(&"AgentSwarm"));
+    }
+
+    #[test]
+    fn coder_profile_can_delegate_but_cannot_write_new_files() {
+        let registry = registry_for("coder");
+        let names = names(&registry);
+
+        assert!(names.contains(&"Read"));
+        assert!(names.contains(&"Edit"));
+        assert!(names.contains(&"Agent"));
+        assert!(names.contains(&"AgentSwarm"));
+        assert!(!names.contains(&"Write"));
+        assert!(!names.contains(&"Task"));
+    }
 }
