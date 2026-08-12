@@ -14,6 +14,7 @@ use crate::theme::Theme;
 
 const SESSION_TITLE_MAX_COLS: usize = 18;
 const SESSION_SPINNER_FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+pub const BTW_SESSION_ID: &str = "__btw__";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SessionIndicator {
@@ -197,10 +198,29 @@ pub struct WorkspaceSessionEntry {
     pub needs_attention: bool,
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct WorkspaceSessionStrip {
     pub entries: Vec<WorkspaceSessionEntry>,
     pub active: usize,
+}
+
+impl Default for WorkspaceSessionStrip {
+    fn default() -> Self {
+        Self {
+            entries: vec![btw_entry()],
+            active: 0,
+        }
+    }
+}
+
+fn btw_entry() -> WorkspaceSessionEntry {
+    WorkspaceSessionEntry {
+        id: BTW_SESSION_ID.into(),
+        title: "BTW".into(),
+        status: SessionStatus::Idle,
+        dirty: false,
+        needs_attention: false,
+    }
 }
 
 impl WorkspaceSessionStrip {
@@ -232,10 +252,29 @@ impl WorkspaceSessionStrip {
     }
 
     pub fn set_entries(&mut self, entries: Vec<WorkspaceSessionEntry>, active_id: Option<&str>) {
-        self.entries = entries;
+        self.entries = std::iter::once(btw_entry())
+            .chain(
+                entries
+                    .into_iter()
+                    .filter(|entry| entry.id != BTW_SESSION_ID),
+            )
+            .collect();
         self.active = active_id
             .and_then(|id| self.entries.iter().position(|e| e.id == id))
             .unwrap_or(0);
+    }
+
+    pub fn ensure_btw(&mut self) {
+        if self
+            .entries
+            .first()
+            .is_some_and(|entry| entry.id == BTW_SESSION_ID)
+        {
+            return;
+        }
+        self.entries.retain(|entry| entry.id != BTW_SESSION_ID);
+        self.entries.insert(0, btw_entry());
+        self.active = self.active.saturating_add(1);
     }
 
     pub fn active_id(&self) -> Option<&str> {
@@ -843,8 +882,13 @@ mod tests {
         assert!(!frame_0.contains("⠋ gamma"), "{frame_0:?}");
         assert!(frame_2.contains("[⠙ alpha]"), "{frame_2:?}");
         assert!(frame_2.contains("⠙ beta"), "{frame_2:?}");
-        assert_eq!(hits[0].x1 - hits[0].x0, UnicodeWidthStr::width("[⠋ alpha]"));
-        assert_eq!(hits[1].x1 - hits[1].x0, UnicodeWidthStr::width("⠋ beta"));
+        let alpha = hits
+            .iter()
+            .find(|hit| hit.session_id == "thinking")
+            .unwrap();
+        let beta = hits.iter().find(|hit| hit.session_id == "tool").unwrap();
+        assert_eq!(alpha.x1 - alpha.x0, UnicodeWidthStr::width("[⠋ alpha]"));
+        assert_eq!(beta.x1 - beta.x0, UnicodeWidthStr::width("⠋ beta"));
     }
 
     #[test]
@@ -867,7 +911,7 @@ mod tests {
             .iter()
             .map(|span| span.content.as_ref())
             .collect();
-        assert_eq!(text, "[⠋ ? review]");
+        assert!(text.contains("[⠋ ? review]"), "{text:?}");
     }
 
     #[test]
@@ -934,9 +978,28 @@ mod tests {
             Some("b"),
         );
         let ids: Vec<_> = strip.entries.iter().map(|e| e.id.as_str()).collect();
-        assert_eq!(ids, vec!["a", "b", "c", "d"]);
+        assert_eq!(ids, vec![BTW_SESSION_ID, "a", "b", "c", "d"]);
         assert_eq!(strip.active_id(), Some("b"));
-        assert_eq!(strip.entries[1].title, "B2");
-        assert!(strip.entries[1].needs_attention);
+        assert_eq!(strip.entries[2].title, "B2");
+        assert!(strip.entries[2].needs_attention);
+    }
+
+    #[test]
+    fn workspace_strip_always_keeps_btw_first_and_cycles_through_it() {
+        let mut strip = WorkspaceSessionStrip::default();
+        strip.set_entries(
+            vec![WorkspaceSessionEntry {
+                id: "session".into(),
+                title: "main".into(),
+                status: SessionStatus::Idle,
+                dirty: false,
+                needs_attention: false,
+            }],
+            Some("session"),
+        );
+
+        assert_eq!(strip.entries[0].id, BTW_SESSION_ID);
+        assert_eq!(strip.next_id().as_deref(), Some(BTW_SESSION_ID));
+        assert_eq!(strip.next_id().as_deref(), Some("session"));
     }
 }

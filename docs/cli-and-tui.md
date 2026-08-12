@@ -76,7 +76,7 @@ Footer 第二行在 `context` 左侧显示当前有效沙箱模式：绿色 `●
 - 模式：`/permission`、`/yolo`、`/auto`、`/plan`、`/model`、`/effort`、`/thinking`、`/provider`。
 - 扩展：`/mcp`、`/skills`、`/plugins`、`/tasks`、`/goal`、`/swarm`、`/web`、`/prompts`。
 - 工具：`/init`、`/config`、`/auth`、`/reload`、`/add-dir`、`/btw`、`/fork`、`/search`、`/copy`、`/debug`。
-- `/btw <question>`：侧问（不写入主会话）；`Ctrl+G` 打开/关闭侧栏，流式中再按可取消。
+- `/btw <question>`：进入全屏 BTW 标签并侧问（不写入主会话）。BTW 保留输入框与历史，可连续排队提问；`Ctrl+G` 或 `Esc` 返回主会话，回答会在后台继续。
 - `/fork [title]`：派生当前会话副本，仍停留在原会话；仅当存在 fork 族时，footer context 栏显示可切换会话，空输入下 `Tab` / `←` / `→` 循环切换。
 - `/sessions`：仅列出当前 workspace 中有内容的会话（正在查看的空会话仍可见）；离开空会话会自动丢弃记录。
 - `/sessions` 删除：`Ctrl+D` 后 ↑↓ 选 No/Yes（默认 No），Enter 确认。

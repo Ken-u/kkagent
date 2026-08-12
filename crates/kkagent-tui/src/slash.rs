@@ -245,7 +245,7 @@ pub const BUILTIN_SLASH_COMMANDS: &[SlashCommand] = &[
     SlashCommand {
         name: "btw",
         aliases: &[],
-        description: "Ask a side question (does not alter main chat)",
+        description: "Open BTW workspace and ask a side question",
         priority: 55,
         argument_hint: Some("<question>"),
     },

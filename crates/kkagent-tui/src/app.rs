@@ -44,6 +44,7 @@ pub enum AppMode {
     Normal,
     Shell,
     Plan,
+    Btw,
 }
 
 pub struct AppState {
@@ -139,7 +140,7 @@ pub struct AppState {
     pub todos: Vec<TodoItem>,
     /// Expand sticky todo beyond the collapsed max rows.
     pub todos_expanded: bool,
-    /// BTW side-question panel (`/btw`).
+    /// Fixed full-screen BTW workspace (`/btw`).
     pub btw: crate::panes::BtwPanelState,
     /// Active model alias (best-effort).
     pub model_alias: Option<String>,
@@ -239,7 +240,6 @@ pub struct SessionRuntimeState {
     pub approx_tokens: u64,
     pub approval_queue: std::collections::VecDeque<PendingApproval>,
     pub todos: Vec<TodoItem>,
-    pub btw: crate::panes::BtwPanelState,
     pub model_alias: Option<String>,
     pub last_tool_name: Option<String>,
     pub plan_document: Option<PlanDocument>,
@@ -261,13 +261,20 @@ impl SessionRuntimeState {
             permission_mode: state.permission_mode,
             plan_mode: state.plan_mode,
             working_dir: state.working_dir.clone(),
-            mode: state.mode.clone(),
+            mode: if state.mode == AppMode::Btw {
+                if state.plan_mode {
+                    AppMode::Plan
+                } else {
+                    AppMode::Normal
+                }
+            } else {
+                state.mode.clone()
+            },
             thinking_text: state.thinking_text.clone(),
             active_assistant_message: state.active_assistant_message,
             approx_tokens: state.approx_tokens,
             approval_queue: state.approval_queue.clone(),
             todos: state.todos.clone(),
-            btw: state.btw.clone(),
             model_alias: state.model_alias.clone(),
             last_tool_name: state.last_tool_name.clone(),
             plan_document: state.plan_document.clone(),
@@ -294,7 +301,6 @@ impl SessionRuntimeState {
         state.approx_tokens = self.approx_tokens;
         state.approval_queue = self.approval_queue;
         state.todos = self.todos;
-        state.btw = self.btw;
         state.model_alias = self.model_alias;
         state.last_tool_name = self.last_tool_name;
         state.plan_document = self.plan_document;
@@ -1445,9 +1451,7 @@ impl TuiApp {
             if let Some(action) = self.state.pending_strip_action.take() {
                 match action {
                     StripAction::Switch(id) => {
-                        if self.state.session_id.as_deref() != Some(id.as_str()) {
-                            let _ = self.resume_session(&id).await;
-                        }
+                        let _ = self.activate_workspace_target(&id).await;
                     }
                     StripAction::Cycle(dir) => {
                         if self.can_cycle_fork_sessions() {
@@ -1484,6 +1488,7 @@ impl TuiApp {
             while let Ok(frame) = self.client.event_rx.try_recv() {
                 self.handle_server_event(frame);
             }
+            self.start_next_btw_question().await;
             self.refresh_connection_notice();
 
             self.state.tick = self.state.tick.wrapping_add(1);
@@ -1952,8 +1957,8 @@ impl TuiApp {
         if self.state.slash_menu.take().is_some() {
             return true;
         }
-        if self.state.btw.open {
-            self.state.btw.open = false;
+        if self.state.mode == AppMode::Btw {
+            self.exit_btw_view();
             return true;
         }
         if self.state.mode == AppMode::Shell {
@@ -2109,18 +2114,24 @@ impl TuiApp {
                 self.state.pending_strip_action = Some(StripAction::Cycle(1));
             }
             MouseEventKind::ScrollUp => {
-                *scroll_delta = scroll_delta.saturating_add(3);
+                if self.state.mode == AppMode::Btw {
+                    self.state.btw.scroll_lines(3);
+                } else {
+                    *scroll_delta = scroll_delta.saturating_add(3);
+                }
             }
             MouseEventKind::ScrollDown => {
-                *scroll_delta = scroll_delta.saturating_sub(3);
+                if self.state.mode == AppMode::Btw {
+                    self.state.btw.scroll_lines(-3);
+                } else {
+                    *scroll_delta = scroll_delta.saturating_sub(3);
+                }
             }
             MouseEventKind::Down(MouseButton::Left) if over_strip => {
                 self.flush_pending_scroll(scroll_delta);
                 if let Some(hit) = self.hit_session_strip(mouse.column) {
-                    if self.state.session_id.as_deref() != Some(hit.session_id.as_str()) {
-                        self.state.pending_strip_action =
-                            Some(StripAction::Switch(hit.session_id.clone()));
-                    }
+                    self.state.pending_strip_action =
+                        Some(StripAction::Switch(hit.session_id.clone()));
                 }
                 self.clear_selection();
             }
@@ -2988,16 +2999,13 @@ impl TuiApp {
                 self.state.file_menu = None;
                 self.state.list_picker = None;
             }
-            // Ctrl-G: toggle / cancel btw pane
+            // Ctrl-G toggles the full-screen BTW workspace.
             KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if self.state.btw.open && self.state.btw.streaming {
-                    if let Some(sid) = self.state.session_id.clone() {
-                        let _ = self.client.cancel_btw(&sid).await;
-                    }
-                    self.state.btw.streaming = false;
-                    self.state.btw.error = Some("cancelled".into());
+                if self.state.mode == AppMode::Btw {
+                    self.exit_btw_view();
+                } else {
+                    self.enter_btw_view();
                 }
-                self.state.btw.open = !self.state.btw.open;
             }
             // Ctrl-O: toggle tool output folding
             KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -3208,15 +3216,35 @@ impl TuiApp {
                     self.state.history_next();
                 }
             }
-            KeyCode::PageUp => self.state.scroll_lines(10),
-            KeyCode::PageDown => self.state.scroll_lines(-10),
+            KeyCode::PageUp => {
+                if self.state.mode == AppMode::Btw {
+                    self.state.btw.scroll_lines(10);
+                } else {
+                    self.state.scroll_lines(10);
+                }
+            }
+            KeyCode::PageDown => {
+                if self.state.mode == AppMode::Btw {
+                    self.state.btw.scroll_lines(-10);
+                } else {
+                    self.state.scroll_lines(-10);
+                }
+            }
             KeyCode::Home if self.state.input.is_empty() => {
-                self.state.scroll_up = self.state.max_scroll_up();
-                self.state.follow_bottom = false;
+                if self.state.mode == AppMode::Btw {
+                    self.state.btw.scroll_offset = self.state.btw.max_scroll_offset();
+                } else {
+                    self.state.scroll_up = self.state.max_scroll_up();
+                    self.state.follow_bottom = false;
+                }
             }
             KeyCode::End if self.state.input.is_empty() => {
-                self.state.scroll_up = 0;
-                self.state.follow_bottom = true;
+                if self.state.mode == AppMode::Btw {
+                    self.state.btw.scroll_offset = 0;
+                } else {
+                    self.state.scroll_up = 0;
+                    self.state.follow_bottom = true;
+                }
             }
             _ => {}
         }
@@ -4844,7 +4872,7 @@ impl TuiApp {
             ListPickerItem {
                 id: "btw".into(),
                 label: "Ctrl-G".into(),
-                detail: "Toggle /btw side pane".into(),
+                detail: "Toggle the full-screen BTW workspace".into(),
             },
             ListPickerItem {
                 id: "history".into(),
@@ -5465,6 +5493,12 @@ impl TuiApp {
     }
 
     async fn resume_session(&mut self, query: &str) -> anyhow::Result<()> {
+        // Session switches always leave the virtual BTW workspace.  Keep this
+        // guard here as well as in strip activation because resume can also be
+        // reached from pickers, attention cycling, and slash commands.
+        if self.state.mode == AppMode::Btw {
+            self.exit_btw_view();
+        }
         if self
             .state
             .pending_resume_prefill
@@ -5596,7 +5630,6 @@ impl TuiApp {
         self.state.tokens_at_turn_start = 0;
         self.state.approx_tokens = 0;
         self.state.approval_queue.clear();
-        self.state.btw = crate::panes::BtwPanelState::default();
         self.state.prompt_queue = crate::prompt_queue::PromptQueue::default();
         self.state.usage_session = SessionUsageTotals::default();
         self.state.usage_turns.clear();
@@ -5991,45 +6024,56 @@ impl TuiApp {
                 }
             }
         }
+        if !ids.contains(&current_id) {
+            ids.insert(0, current_id.clone());
+        }
 
-        let entries: Vec<crate::chrome::WorkspaceSessionEntry> = if ids.len() < 2 {
-            Vec::new()
-        } else {
-            ids.into_iter()
-                .filter_map(|id| {
-                    let tab = self.state.tab_strip.tabs.iter().find(|t| t.id == id);
-                    let status = tab.map(|t| t.status).unwrap_or(SessionStatus::Idle);
-                    let dirty = tab.map(|t| t.dirty).unwrap_or(false);
-                    let needs_attention = self.state.parked_approvals.contains_key(&id)
-                        || self.state.parked_questions.contains_key(&id);
-                    if let Some((_, _, title)) = rows.iter().find(|(rid, _, _)| rid == &id) {
-                        Some(crate::chrome::WorkspaceSessionEntry {
-                            id,
-                            title: title.clone(),
-                            status,
-                            dirty,
-                            needs_attention,
-                        })
-                    } else if id == current_id {
-                        Some(crate::chrome::WorkspaceSessionEntry {
-                            id,
-                            title: "session".into(),
-                            status,
-                            dirty,
-                            needs_attention,
-                        })
-                    } else {
-                        None
-                    }
-                })
-                .collect()
-        };
+        let entries: Vec<crate::chrome::WorkspaceSessionEntry> = ids
+            .into_iter()
+            .filter_map(|id| {
+                let tab = self.state.tab_strip.tabs.iter().find(|t| t.id == id);
+                let status = tab.map(|t| t.status).unwrap_or(SessionStatus::Idle);
+                let dirty = tab.map(|t| t.dirty).unwrap_or(false);
+                let needs_attention = self.state.parked_approvals.contains_key(&id)
+                    || self.state.parked_questions.contains_key(&id);
+                if let Some((_, _, title)) = rows.iter().find(|(rid, _, _)| rid == &id) {
+                    Some(crate::chrome::WorkspaceSessionEntry {
+                        id,
+                        title: title.clone(),
+                        status,
+                        dirty,
+                        needs_attention,
+                    })
+                } else if id == current_id {
+                    Some(crate::chrome::WorkspaceSessionEntry {
+                        id,
+                        title: "session".into(),
+                        status,
+                        dirty,
+                        needs_attention,
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect();
 
-        self.state
+        self.state.workspace_sessions.set_entries_stable(
+            entries,
+            Some(if self.state.mode == AppMode::Btw {
+                crate::chrome::BTW_SESSION_ID
+            } else {
+                current_id.as_str()
+            }),
+        );
+
+        for e in self
+            .state
             .workspace_sessions
-            .set_entries_stable(entries, Some(current_id.as_str()));
-
-        for e in &self.state.workspace_sessions.entries {
+            .entries
+            .iter()
+            .filter(|entry| entry.id != crate::chrome::BTW_SESSION_ID)
+        {
             self.state.tab_strip.ensure_tab(&e.id, e.title.clone());
         }
         let title = self
@@ -6059,7 +6103,14 @@ impl TuiApp {
     fn can_close_current_session_tab(&self) -> bool {
         self.state.input.is_empty()
             && self.state.session_id.is_some()
-            && self.state.workspace_sessions.entries.len() >= 2
+            && self
+                .state
+                .workspace_sessions
+                .entries
+                .iter()
+                .filter(|entry| entry.id != crate::chrome::BTW_SESSION_ID)
+                .count()
+                >= 2
             && self.state.list_picker.is_none()
             && self.state.tasks_panel.is_none()
             && self.state.slash_menu.is_none()
@@ -6106,7 +6157,7 @@ impl TuiApp {
 
     fn can_cycle_fork_sessions(&self) -> bool {
         self.state.input.is_empty()
-            && self.state.mode == AppMode::Normal
+            && matches!(self.state.mode, AppMode::Normal | AppMode::Btw)
             && self.state.slash_menu.is_none()
             && self.state.file_menu.is_none()
             && self.state.list_picker.is_none()
@@ -6131,10 +6182,48 @@ impl TuiApp {
         let Some(next_id) = next_id else {
             return Ok(());
         };
-        if self.state.session_id.as_deref() == Some(next_id.as_str()) {
+        self.activate_workspace_target(&next_id).await
+    }
+
+    fn enter_btw_view(&mut self) {
+        self.state.mode = AppMode::Btw;
+        self.state.btw.open = true;
+        self.state.btw.scroll_offset = 0;
+        self.state.workspace_sessions.ensure_btw();
+        self.state.workspace_sessions.active = 0;
+        self.clear_selection();
+    }
+
+    fn exit_btw_view(&mut self) {
+        self.state.mode = if self.state.plan_mode {
+            AppMode::Plan
+        } else {
+            AppMode::Normal
+        };
+        self.state.btw.open = false;
+        if let Some(session_id) = self.state.session_id.as_deref() {
+            self.state.workspace_sessions.active = self
+                .state
+                .workspace_sessions
+                .entries
+                .iter()
+                .position(|entry| entry.id == session_id)
+                .unwrap_or(0);
+        }
+    }
+
+    async fn activate_workspace_target(&mut self, id: &str) -> anyhow::Result<()> {
+        if id == crate::chrome::BTW_SESSION_ID {
+            self.enter_btw_view();
             return Ok(());
         }
-        self.resume_session(&next_id).await
+        if self.state.mode == AppMode::Btw {
+            self.exit_btw_view();
+        }
+        if self.state.session_id.as_deref() == Some(id) {
+            return Ok(());
+        }
+        self.resume_session(id).await
     }
 
     async fn cycle_attention_session(&mut self) -> anyhow::Result<()> {
@@ -6387,7 +6476,7 @@ impl TuiApp {
                     .entries
                     .iter()
                     .map(|e| e.id.clone())
-                    .find(|id| id != &deleted_id)
+                    .find(|id| id != &deleted_id && id != crate::chrome::BTW_SESSION_ID)
                     .or_else(|| {
                         self.state
                             .open_session_group
@@ -6457,7 +6546,7 @@ impl TuiApp {
                         .entries
                         .iter()
                         .map(|e| e.id.clone())
-                        .find(|id| id != &deleted_id)
+                        .find(|id| id != &deleted_id && id != crate::chrome::BTW_SESSION_ID)
                         .or_else(|| {
                             self.state
                                 .open_session_group
@@ -6497,7 +6586,49 @@ impl TuiApp {
     }
 
     async fn submit_input(&mut self) -> anyhow::Result<()> {
+        if self.state.mode == AppMode::Btw {
+            return self.submit_btw_input().await;
+        }
         self.submit_input_with_delivery().await
+    }
+
+    async fn submit_btw_input(&mut self) -> anyhow::Result<()> {
+        let raw = self.state.input.take();
+        let question = self.state.input.expand_pastes(&raw).trim().to_string();
+        if question.is_empty() {
+            return Ok(());
+        }
+        self.state.slash_menu = None;
+        self.state.file_menu = None;
+        self.state.list_picker = None;
+        self.state.push_input_history(&question);
+
+        let Some(session_id) = self.state.session_id.clone() else {
+            self.state.input.set_text(question);
+            self.state.btw.error = Some("No active session for BTW.".into());
+            return Ok(());
+        };
+        if self.state.btw.streaming {
+            self.state.btw.enqueue(session_id, question);
+            return Ok(());
+        }
+        self.start_btw_question(session_id, question).await;
+        Ok(())
+    }
+
+    async fn start_btw_question(&mut self, session_id: String, question: String) {
+        self.state.btw.begin_question(&question);
+        self.state.btw.current_session_id = Some(session_id.clone());
+        if let Err(error) = self.client.start_btw(&session_id, &question).await {
+            self.state.btw.finish(Some(error.to_string()));
+        }
+    }
+
+    async fn start_next_btw_question(&mut self) {
+        if let Some(next) = self.state.btw.take_next() {
+            self.start_btw_question(next.session_id, next.question)
+                .await;
+        }
     }
 
     async fn submit_steer_input(&mut self) -> anyhow::Result<()> {
@@ -7231,27 +7362,17 @@ impl TuiApp {
                 }
             }
             "btw" => {
+                self.enter_btw_view();
                 if args.is_empty() {
-                    self.state.btw.open = true;
-                    self.system_message(
-                        "Usage: /btw <question> — side Q&A (does not alter main chat)".into(),
-                    );
-                } else if self.state.btw.streaming {
-                    self.system_message(
-                        "Wait for /btw to finish before sending another question.".into(),
-                    );
+                    self.state.btw.error = None;
                 } else if let Some(sid) = self.state.session_id.clone() {
-                    self.state.btw.begin_question(&args);
-                    match self.client.start_btw(&sid, &args).await {
-                        Ok(_) => {}
-                        Err(e) => {
-                            self.state.btw.streaming = false;
-                            self.state.btw.error = Some(e.to_string());
-                            self.system_message(format!("Failed to start /btw: {e}"));
-                        }
+                    if self.state.btw.streaming {
+                        self.state.btw.enqueue(sid, args);
+                    } else {
+                        self.start_btw_question(sid, args).await;
                     }
                 } else {
-                    self.system_message("No active session for /btw".into());
+                    self.state.btw.error = Some("No active session for BTW.".into());
                 }
             }
             "fork" => {
@@ -7782,6 +7903,29 @@ impl TuiApp {
                     self.state.session_id.as_deref(),
                 );
 
+                // BTW is a fixed workspace surface rather than per-session
+                // transcript state. Keep streaming it even while another
+                // session tab is active.
+                match &evt {
+                    AgentEvent::BtwDelta { session_id, text }
+                        if self.state.btw.current_session_id.as_deref()
+                            == Some(session_id.as_str()) =>
+                    {
+                        self.state.btw.append_delta(text);
+                        return;
+                    }
+                    AgentEvent::BtwThinkingDelta { .. } => return,
+                    AgentEvent::BtwEnd { session_id, error }
+                        if self.state.btw.current_session_id.as_deref()
+                            == Some(session_id.as_str()) =>
+                    {
+                        self.state.btw.finish(error.clone());
+                        return;
+                    }
+                    AgentEvent::BtwDelta { .. } | AgentEvent::BtwEnd { .. } => return,
+                    _ => {}
+                }
+
                 if !is_current {
                     match &evt {
                         AgentEvent::ApprovalRequested { request, .. } => {
@@ -7837,6 +7981,9 @@ impl TuiApp {
                 }
 
                 match evt {
+                    AgentEvent::BtwDelta { .. }
+                    | AgentEvent::BtwThinkingDelta { .. }
+                    | AgentEvent::BtwEnd { .. } => unreachable!("BTW events handled above"),
                     AgentEvent::SteerInput {
                         text,
                         idempotency_key,
@@ -8237,15 +8384,6 @@ impl TuiApp {
                         self.system_message(format!(
                             "MCP OAuth required for `{server_name}`.\nOpen: {authorization_url}"
                         ));
-                    }
-                    AgentEvent::BtwDelta { text, .. } => {
-                        self.state.btw.open = true;
-                        self.state.btw.append_delta(&text);
-                    }
-                    AgentEvent::BtwThinkingDelta { .. } => {}
-                    AgentEvent::BtwEnd { error, .. } => {
-                        self.state.btw.finish(error);
-                        self.state.btw.open = true;
                     }
                     AgentEvent::CompactCompleted {
                         deleted,
@@ -9085,6 +9223,151 @@ mod app_state_tests {
         assert!(embedded.contains("Embedded agent"));
         assert!(!embedded.contains("--connect"));
         assert!(!embedded.contains("reconnect"));
+    }
+
+    #[tokio::test]
+    async fn ctrl_g_toggles_the_btw_workspace_without_cancelling_streaming() {
+        let mut app = test_tui_app();
+        app.state.session_id = Some("session-btw".into());
+        app.state.btw.streaming = true;
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+        assert_eq!(app.state.mode, AppMode::Btw);
+        assert!(app.state.btw.open);
+        assert!(app.state.btw.streaming);
+        assert_eq!(
+            app.state.workspace_sessions.active_id(),
+            Some(crate::chrome::BTW_SESSION_ID)
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+        assert_eq!(app.state.mode, AppMode::Normal);
+        assert!(!app.state.btw.open);
+        assert!(app.state.btw.streaming);
+    }
+
+    #[tokio::test]
+    async fn enter_queues_another_btw_question_while_streaming() {
+        let mut app = test_tui_app();
+        app.state.session_id = Some("session-btw".into());
+        app.enter_btw_view();
+        app.state.btw.streaming = true;
+        app.state.input.set_text("follow-up".into());
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        assert!(app.state.input.is_empty());
+        assert_eq!(app.state.btw.pending_questions.len(), 1);
+        assert_eq!(app.state.btw.pending_questions[0].question, "follow-up");
+        assert!(app.state.prompt_queue.is_empty());
+    }
+
+    #[tokio::test]
+    async fn slash_btw_without_a_question_opens_the_workspace() {
+        let mut app = test_tui_app();
+        app.state.input.set_text("/btw".into());
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        assert_eq!(app.state.mode, AppMode::Btw);
+        assert!(app.state.btw.open);
+    }
+
+    #[tokio::test]
+    async fn selecting_a_real_session_exits_the_btw_workspace() {
+        let mut app = test_tui_app();
+        app.state.session_id = Some("session-btw".into());
+        app.state.workspace_sessions.set_entries(
+            vec![crate::chrome::WorkspaceSessionEntry {
+                id: "session-btw".into(),
+                title: "main".into(),
+                status: SessionStatus::Idle,
+                dirty: false,
+                needs_attention: false,
+            }],
+            Some("session-btw"),
+        );
+        app.enter_btw_view();
+
+        app.activate_workspace_target("session-btw").await.unwrap();
+
+        assert_eq!(app.state.mode, AppMode::Normal);
+        assert!(!app.state.btw.open);
+        assert_eq!(
+            app.state.workspace_sessions.active_id(),
+            Some("session-btw")
+        );
+    }
+
+    #[tokio::test]
+    async fn background_btw_events_continue_updating_the_fixed_workspace() {
+        let mut app = test_tui_app();
+        app.state.session_id = Some("another-session".into());
+        app.state.btw.begin_question("side question");
+        app.state.btw.current_session_id = Some("original-session".into());
+
+        for event in [
+            AgentEvent::BtwDelta {
+                session_id: "original-session".into(),
+                text: "answer".into(),
+            },
+            AgentEvent::BtwEnd {
+                session_id: "original-session".into(),
+                error: None,
+            },
+        ] {
+            app.handle_server_event(Frame::Event {
+                event: "agent".into(),
+                scope: None,
+                data: serde_json::to_value(event).unwrap(),
+            });
+        }
+
+        assert!(!app.state.btw.streaming);
+        assert_eq!(app.state.btw.turns.len(), 1);
+        assert_eq!(app.state.btw.turns[0].answer, "answer");
+        assert!(!app
+            .state
+            .background_session_events
+            .contains_key("original-session"));
+    }
+
+    #[test]
+    fn btw_workspace_is_not_captured_as_a_per_session_mode() {
+        let mut state = AppState::new(PermissionMode::Manual, false);
+        state.mode = AppMode::Btw;
+        assert_eq!(SessionRuntimeState::capture(&state).mode, AppMode::Normal);
+
+        state.plan_mode = true;
+        assert_eq!(SessionRuntimeState::capture(&state).mode, AppMode::Plan);
+    }
+
+    #[tokio::test]
+    async fn unrelated_btw_events_do_not_corrupt_the_active_answer() {
+        let mut app = test_tui_app();
+        app.state.btw.begin_question("active");
+        app.state.btw.current_session_id = Some("active-session".into());
+
+        app.handle_server_event(Frame::Event {
+            event: "agent".into(),
+            scope: None,
+            data: serde_json::to_value(AgentEvent::BtwDelta {
+                session_id: "other-session".into(),
+                text: "wrong answer".into(),
+            })
+            .unwrap(),
+        });
+
+        assert!(app.state.btw.current_answer.is_empty());
+        assert!(app.state.btw.streaming);
     }
 
     #[tokio::test]

@@ -15,7 +15,7 @@ use crate::app::{
 };
 use crate::git_badge;
 use crate::i18n::{self, Locale};
-use crate::panes::{self, BtwPane};
+use crate::panes;
 use crate::theme::Theme;
 
 const TIPS: &[&str] = &[
@@ -24,7 +24,7 @@ const TIPS: &[&str] = &[
     "ctrl+f searches the transcript",
     "ctrl+o expands turn tool history",
     "tab / ←→ cycle related sessions · ctrl+d close session",
-    "ctrl+g toggles /btw side Q&A",
+    "ctrl+g toggles the BTW workspace",
     "shift-tab toggles plan mode (scroll locks to plan)",
     "! shell (local, immediate)",
     "/yolo auto-approves tools",
@@ -48,8 +48,12 @@ pub fn render_ui(f: &mut Frame, state: &mut AppState, config: &AppConfig) {
         .unwrap_or(0);
 
     // Sticky todo sits above the input (highest visual priority).
-    let todo_height = todo_panel_height(state);
-    let queue_height = if state.prompt_queue.is_empty() {
+    let todo_height = if state.mode == AppMode::Btw {
+        0
+    } else {
+        todo_panel_height(state)
+    };
+    let queue_height = if state.mode == AppMode::Btw || state.prompt_queue.is_empty() {
         0u16
     } else {
         (state.prompt_queue.items.len() as u16)
@@ -98,8 +102,13 @@ pub fn render_ui(f: &mut Frame, state: &mut AppState, config: &AppConfig) {
     state.status_bar.session_id = state.session_id.clone();
     state.status_bar.cwd = Some(state.working_dir.to_string_lossy().into_owned());
 
-    render_messages(f, msg_area, state, &theme);
-    render_scroll_hint(f, msg_area, state, &theme);
+    if state.mode == AppMode::Btw {
+        state.transcript_area = Rect::default();
+        panes::render_btw(f, msg_area, &mut state.btw, &theme);
+    } else {
+        render_messages(f, msg_area, state, &theme);
+        render_scroll_hint(f, msg_area, state, &theme);
+    }
     if todo_height > 0 {
         render_todo_panel(f, todo_area, state, &theme);
     }
@@ -113,29 +122,6 @@ pub fn render_ui(f: &mut Frame, state: &mut AppState, config: &AppConfig) {
     }
     render_input(f, input_area, state, &theme);
     render_footer(f, footer_area, state, config, &theme);
-
-    if state.btw.open {
-        let pane_w = (size.width / 3).clamp(28, 56);
-        let pane_h = state
-            .btw
-            .line_budget()
-            .saturating_add(2)
-            .clamp(6, size.height.saturating_sub(4));
-        let area = Rect {
-            x: size.width.saturating_sub(pane_w + 1),
-            y: 1,
-            width: pane_w,
-            height: pane_h,
-        };
-        panes::render_btw(
-            f,
-            area,
-            &BtwPane {
-                state: state.btw.clone(),
-            },
-            &theme,
-        );
-    }
 
     if let Some(ref mut approval) = state
         .approval_pending
@@ -206,6 +192,7 @@ fn input_prefix_str(state: &AppState) -> &'static str {
     match state.mode {
         AppMode::Shell => "! ",
         AppMode::Plan => "plan > ",
+        AppMode::Btw => "btw > ",
         AppMode::Normal => "> ",
     }
 }
@@ -1201,6 +1188,7 @@ fn render_input(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let border = match state.mode {
         AppMode::Shell => theme.shell_mode,
         AppMode::Plan => theme.plan_mode,
+        AppMode::Btw => theme.accent,
         AppMode::Normal => {
             if matches!(
                 state.status,
@@ -1228,12 +1216,20 @@ fn render_input(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
                 .fg(theme.plan_mode)
                 .add_modifier(Modifier::BOLD),
         ),
+        AppMode::Btw => (
+            "btw > ",
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        ),
         AppMode::Normal => ("> ", Style::default().fg(theme.text)),
     };
 
     let title = match state.mode {
         AppMode::Shell => " shell ",
         AppMode::Plan => " plan ",
+        AppMode::Btw if state.btw.streaming => " BTW · answering… ",
+        AppMode::Btw => " BTW question ",
         AppMode::Normal => match state.status {
             SessionStatus::Thinking => " thinking… ",
             SessionStatus::ToolExecuting => " running… ",
@@ -1459,6 +1455,8 @@ fn render_footer(
         "press ctrl-c again to quit".to_string()
     } else if state.search.active {
         "↑↓ navigate · enter jump · esc close".to_string()
+    } else if state.mode == AppMode::Btw && state.btw.scroll_offset > 0 {
+        format!("↑{} lines · end to follow", state.btw.scroll_offset)
     } else if !state.follow_bottom && state.scroll_up > 0 {
         format!("↑{} lines · end to follow", state.scroll_up)
     } else {
@@ -1534,6 +1532,17 @@ fn render_footer(
 }
 
 fn sync_footer_session_entries(state: &mut AppState) {
+    state.workspace_sessions.ensure_btw();
+    if let Some(entry) = state.workspace_sessions.entries.first_mut() {
+        entry.status = if state.btw.streaming {
+            SessionStatus::Thinking
+        } else {
+            SessionStatus::Idle
+        };
+    }
+    if state.mode == AppMode::Btw {
+        state.workspace_sessions.active = 0;
+    }
     let Some(current_id) = state.session_id.clone() else {
         return;
     };
@@ -1574,12 +1583,14 @@ fn sync_footer_session_entries(state: &mut AppState) {
         entry.needs_attention = state.parked_approvals.contains_key(&entry.id)
             || state.parked_questions.contains_key(&entry.id);
     }
-    state.workspace_sessions.active = state
-        .workspace_sessions
-        .entries
-        .iter()
-        .position(|entry| entry.id == current_id)
-        .unwrap_or(0);
+    if state.mode != AppMode::Btw {
+        state.workspace_sessions.active = state
+            .workspace_sessions
+            .entries
+            .iter()
+            .position(|entry| entry.id == current_id)
+            .unwrap_or(0);
+    }
 }
 
 fn render_scroll_hint(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
@@ -2659,7 +2670,7 @@ mod render_smoke {
             .filter_map(|x| buffer.cell((x, buffer.area.height - 1)))
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(footer.starts_with("[⠋ main]"), "{footer:?}");
+        assert!(footer.contains("[⠋ main]"), "{footer:?}");
     }
 
     #[test]
@@ -2670,6 +2681,47 @@ mod render_smoke {
         assert!(!lines.is_empty());
         let lines2 = build_transcript_lines(&mut state, &theme, 1);
         assert!(!lines2.is_empty());
+    }
+
+    #[test]
+    fn btw_mode_uses_full_message_area_and_keeps_the_composer() {
+        let backend = TestBackend::new(90, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = AppState::new(PermissionMode::Manual, false);
+        state.mode = AppMode::Btw;
+        state.btw.open = true;
+        state.btw.turns.push(crate::panes::BtwTurnView {
+            question: "side question".into(),
+            answer: "side answer".into(),
+        });
+        state.messages.push(DisplayMessage {
+            role: MessageRole::Assistant,
+            content: "main transcript must be hidden".into(),
+            thinking: None,
+            parts: Vec::new(),
+            tool_calls: Vec::new(),
+            delivery: crate::prompt_queue::DeliveryState::Sent,
+            idempotency_key: None,
+        });
+
+        terminal
+            .draw(|frame| render_ui(frame, &mut state, &AppConfig::default()))
+            .unwrap();
+        let rendered =
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .fold(String::new(), |mut output, cell| {
+                    output.push_str(cell.symbol());
+                    output
+                });
+
+        assert!(rendered.contains("Q: side question"), "{rendered:?}");
+        assert!(rendered.contains("side answer"), "{rendered:?}");
+        assert!(rendered.contains("btw >"), "{rendered:?}");
+        assert!(!rendered.contains("main transcript must be hidden"));
     }
 
     #[test]

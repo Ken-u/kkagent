@@ -22,6 +22,7 @@ pub const SIDE_QUESTION_SYSTEM_REMINDER: &str = r#"<system-reminder>
 You are answering a side question about the current conversation.
 This is a temporary side conversation - your answer will NOT be added to the main conversation history.
 Answer based on the conversation context provided. Be helpful and concise.
+Match the language of the user's most recent question in your reply; do not default to English or any other fixed language.
 Do not use tools. Respond with text only.
 </system-reminder>"#;
 
