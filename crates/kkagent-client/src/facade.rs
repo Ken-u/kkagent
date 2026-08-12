@@ -89,6 +89,27 @@ impl KkagentClient {
         Ok(())
     }
 
+    pub async fn steer(
+        &self,
+        session_id: &str,
+        text: &str,
+        images: &[(String, String)],
+    ) -> anyhow::Result<()> {
+        let params = serde_json::json!({
+            "session_id": session_id,
+            "text": text,
+            "images": images.iter().map(|(media_type, data)| serde_json::json!({
+                "media_type": media_type,
+                "data": data,
+            })).collect::<Vec<_>>(),
+        });
+        self.rpc
+            .call("session.steer", Some(params))
+            .await
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        Ok(())
+    }
+
     pub async fn interrupt(&self, session_id: &str) -> anyhow::Result<()> {
         let params = serde_json::json!({"session_id": session_id});
         self.rpc

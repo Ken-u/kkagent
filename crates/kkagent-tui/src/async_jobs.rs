@@ -74,6 +74,7 @@ pub enum JobPayload {
     Prompt {
         session_id: String,
         idempotency_key: String,
+        as_steer: bool,
         result: Result<(), String>,
     },
     LocalShell {
@@ -416,6 +417,29 @@ impl AsyncJobHub {
         images: Vec<(String, String)>,
         idempotency_key: String,
     ) -> u64 {
+        self.spawn_user_input(requester, session_id, text, images, idempotency_key, false)
+    }
+
+    pub fn spawn_steer(
+        &mut self,
+        requester: KkagentRequester,
+        session_id: String,
+        text: String,
+        images: Vec<(String, String)>,
+        idempotency_key: String,
+    ) -> u64 {
+        self.spawn_user_input(requester, session_id, text, images, idempotency_key, true)
+    }
+
+    fn spawn_user_input(
+        &mut self,
+        requester: KkagentRequester,
+        session_id: String,
+        text: String,
+        images: Vec<(String, String)>,
+        idempotency_key: String,
+        as_steer: bool,
+    ) -> u64 {
         let generation = self.next_generation(JobChannel::Prompt);
         let started = Instant::now();
         self.pending.insert(
@@ -423,16 +447,29 @@ impl AsyncJobHub {
             PendingJob {
                 channel: JobChannel::Prompt,
                 generation,
-                label: "Sending prompt".into(),
+                label: if as_steer {
+                    "Steering current turn".into()
+                } else {
+                    "Sending prompt".into()
+                },
                 started,
                 retryable: true,
-                retry_method: Some("session.prompt".into()),
+                retry_method: Some(if as_steer {
+                    "session.steer".into()
+                } else {
+                    "session.prompt".into()
+                }),
                 retry_params: None,
             },
         );
         let tx = self.tx.clone();
         let sid = session_id.clone();
         let key = idempotency_key.clone();
+        let method = if as_steer {
+            "session.steer"
+        } else {
+            "session.prompt"
+        };
         tokio::spawn(async move {
             let params = serde_json::json!({
                 "session_id": sid,
@@ -444,7 +481,7 @@ impl AsyncJobHub {
                 })).collect::<Vec<_>>(),
             });
             let result = requester
-                .rpc_call("session.prompt", Some(params))
+                .rpc_call(method, Some(params))
                 .await
                 .map(|_| ())
                 .map_err(|e| e.to_string());
@@ -455,6 +492,7 @@ impl AsyncJobHub {
                 payload: JobPayload::Prompt {
                     session_id: sid,
                     idempotency_key: key,
+                    as_steer,
                     result,
                 },
             });

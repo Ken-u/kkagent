@@ -41,11 +41,12 @@ pub async fn anthropic_stream(
     let url = api_endpoint(base_url, "messages");
     reject_video_inputs(&request, "Anthropic")?;
 
-    let messages: Vec<serde_json::Value> = request
-        .messages
-        .iter()
-        .map(|m| {
-            let content: Vec<serde_json::Value> = m.content.iter().map(|c| match c {
+    let mut messages = Vec::new();
+    for message in &request.messages {
+        let content: Vec<serde_json::Value> = message
+            .content
+            .iter()
+            .map(|content| match content {
                 ChatContent::Text { text } => json!({"type": "text", "text": text}),
                 ChatContent::Image { media_type, data } => json!({
                     "type": "image",
@@ -59,10 +60,12 @@ pub async fn anthropic_stream(
                     json!({"type": "tool_result", "tool_use_id": tool_use_id, "content": content, "is_error": is_error})
                 }
                 ChatContent::Thinking { thinking } => json!({"type": "thinking", "thinking": thinking}),
-            }).collect();
-            json!({"role": &m.role, "content": content})
-        })
-        .collect();
+            })
+            .collect();
+        push_strict_provider_message(&mut messages, &message.role, "content", content, |part| {
+            part.get("type").and_then(serde_json::Value::as_str) == Some("tool_result")
+        });
+    }
 
     let tools: Vec<serde_json::Value> = request
         .tools
@@ -663,7 +666,9 @@ pub async fn google_stream(
             }
         }
         if !parts.is_empty() {
-            contents.push(json!({"role": role, "parts": parts}));
+            push_strict_provider_message(&mut contents, role, "parts", parts, |part| {
+                part.get("functionResponse").is_some()
+            });
         }
     }
 
@@ -805,6 +810,43 @@ pub async fn google_stream(
     }
 }
 
+/// Anthropic and Gemini/Vertex require strictly alternating user/model turns.
+/// Consecutive user turns naturally occur after compaction and when steer input
+/// follows a tool result, so normalize them at the provider boundary while
+/// preserving the provider-agnostic session history.
+///
+/// The merge is asymmetric like Kimi's: a tool-result-only user turn absorbs a
+/// following user turn, and a text user turn absorbs another non-tool user turn.
+/// A text turn never absorbs a following tool-result-only turn because that
+/// result must remain adjacent to its preceding assistant tool use.
+fn push_strict_provider_message(
+    messages: &mut Vec<serde_json::Value>,
+    role: &str,
+    parts_key: &str,
+    parts: Vec<serde_json::Value>,
+    is_tool_result: impl Fn(&serde_json::Value) -> bool,
+) {
+    let current_is_tool_result_only = !parts.is_empty() && parts.iter().all(&is_tool_result);
+    if role == "user" {
+        if let Some(previous) = messages.last_mut().filter(|previous| {
+            previous.get("role").and_then(serde_json::Value::as_str) == Some("user")
+        }) {
+            if let Some(previous_parts) = previous
+                .get_mut(parts_key)
+                .and_then(serde_json::Value::as_array_mut)
+            {
+                let previous_is_tool_result_only =
+                    !previous_parts.is_empty() && previous_parts.iter().all(&is_tool_result);
+                if previous_is_tool_result_only || !current_is_tool_result_only {
+                    previous_parts.extend(parts);
+                    return;
+                }
+            }
+        }
+    }
+    messages.push(json!({"role": role, (parts_key): parts}));
+}
+
 fn truncate_utf8(value: &str, max_bytes: usize) -> &str {
     if value.len() <= max_bytes {
         return value;
@@ -893,9 +935,13 @@ async fn upload_kimi_video(
 
 #[cfg(test)]
 mod tests {
-    use super::{anthropic_stream, google_stream, kimi_stream, openai_stream, truncate_utf8};
+    use super::{
+        anthropic_stream, google_stream, kimi_stream, openai_stream, push_strict_provider_message,
+        truncate_utf8,
+    };
     use crate::types::{ChatContent, ChatMessage, LlmRequest, StreamEvent, ThinkingParams};
     use reqwest::Client;
+    use serde_json::json;
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
@@ -987,6 +1033,78 @@ mod tests {
     fn truncates_at_character_boundary() {
         assert_eq!(truncate_utf8("中文错误", 5), "中");
         assert_eq!(truncate_utf8("plain", 50), "plain");
+    }
+
+    #[test]
+    fn google_merges_steer_after_user_role_tool_result() {
+        let mut contents = vec![json!({
+            "role": "user",
+            "parts": [{"functionResponse": {"name": "Read", "response": {"result": "ok"}}}],
+        })];
+
+        push_strict_provider_message(
+            &mut contents,
+            "user",
+            "parts",
+            vec![json!({"text": "steer guidance"})],
+            |part| part.get("functionResponse").is_some(),
+        );
+        assert_eq!(contents.len(), 1);
+        assert_eq!(contents[0]["parts"].as_array().unwrap().len(), 2);
+
+        push_strict_provider_message(
+            &mut contents,
+            "model",
+            "parts",
+            vec![json!({"text": "done"})],
+            |part| part.get("functionResponse").is_some(),
+        );
+        assert_eq!(contents.len(), 2);
+    }
+
+    #[test]
+    fn anthropic_merges_steer_after_user_role_tool_result() {
+        let mut messages = vec![json!({
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "tool-1", "content": "ok"}],
+        })];
+
+        push_strict_provider_message(
+            &mut messages,
+            "user",
+            "content",
+            vec![json!({"type": "text", "text": "steer guidance"})],
+            |part| part.get("type").and_then(serde_json::Value::as_str) == Some("tool_result"),
+        );
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["content"].as_array().unwrap().len(), 2);
+
+        push_strict_provider_message(
+            &mut messages,
+            "assistant",
+            "content",
+            vec![json!({"type": "text", "text": "done"})],
+            |part| part.get("type").and_then(serde_json::Value::as_str) == Some("tool_result"),
+        );
+        assert_eq!(messages.len(), 2);
+    }
+
+    #[test]
+    fn strict_role_merge_does_not_move_tool_results_after_text() {
+        let mut messages = vec![json!({
+            "role": "user",
+            "content": [{"type": "text", "text": "prompt"}],
+        })];
+
+        push_strict_provider_message(
+            &mut messages,
+            "user",
+            "content",
+            vec![json!({"type": "tool_result", "tool_use_id": "tool-1", "content": "ok"})],
+            |part| part.get("type").and_then(serde_json::Value::as_str) == Some("tool_result"),
+        );
+
+        assert_eq!(messages.len(), 2);
     }
 
     #[tokio::test]

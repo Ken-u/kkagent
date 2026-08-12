@@ -14,7 +14,7 @@ use kkagent_core::plan_review::{resolve_exit_plan_approval, PlanReviewDisplay};
 use kkagent_core::SubagentMirrorContext;
 use kkagent_core::{
     AgentLoop, BtwTurn, PermissionChain, Session, SessionBtwService, SessionCloseReason,
-    SessionCreateSource, SessionStore, TranscriptDb,
+    SessionCreateSource, SessionSteerMailbox, SessionStore, SteerInput, TranscriptDb,
 };
 use kkagent_di::ServiceContainer;
 use kkagent_llm::{ChatContent, ChatMessage};
@@ -1076,6 +1076,11 @@ async fn ensure_session_loaded(state: &Arc<ServerState>, session_id: &str) -> Re
         .await
         .insert(session_id.to_string(), session.question_tx.clone());
     state
+        .steer_mailboxes
+        .lock()
+        .await
+        .insert(session_id.to_string(), session.steer_mailbox.clone());
+    state
         .sessions
         .lock()
         .await
@@ -1235,6 +1240,11 @@ impl kkagent_acp::AcpHost for AgentAcpHost {
             .lock()
             .await
             .insert(session_id.to_string(), session.question_tx.clone());
+        self.state
+            .steer_mailboxes
+            .lock()
+            .await
+            .insert(session_id.to_string(), session.steer_mailbox.clone());
         self.state
             .sessions
             .lock()
@@ -1580,6 +1590,11 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
             .lock()
             .await
             .insert(id.clone(), session.question_tx.clone());
+        self.state
+            .steer_mailboxes
+            .lock()
+            .await
+            .insert(id.clone(), session.steer_mailbox.clone());
         let session_dir = session.session_dir().display().to_string();
         self.state.sessions.lock().await.insert(id.clone(), session);
         Ok(serde_json::json!({
@@ -1631,6 +1646,7 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
         self.state.plan_mode_requests.lock().await.remove(id);
         self.state.approval_txs.lock().await.remove(id);
         self.state.question_txs.lock().await.remove(id);
+        self.state.steer_mailboxes.lock().await.remove(id);
         self.state.turn_locks.remove(id).await;
         self.state
             .transcript
@@ -2325,6 +2341,7 @@ async fn run_http_turn(
     .with_goal_manager(state.goal_mgr.clone());
 
     let result = agent.run_turn(&mut session).await;
+    let steer_result = session.close_and_apply_steers();
     let persist_result = {
         let db = state.transcript.lock().await;
         persist_session_messages(&db, &mut session)
@@ -2338,6 +2355,7 @@ async fn run_http_turn(
         sessions.insert(session_id.to_string(), session);
     }
     result?;
+    steer_result?;
     persist_result
 }
 
@@ -2350,6 +2368,8 @@ struct ServerState {
     /// (agent loop may be waiting on approval while holding the session).
     approval_txs: Mutex<HashMap<String, mpsc::Sender<kkagent_protocol::ApprovalResponse>>>,
     question_txs: Mutex<HashMap<String, mpsc::Sender<kkagent_protocol::QuestionResponse>>>,
+    /// Steer mailboxes remain reachable while Session is owned by the agent loop.
+    steer_mailboxes: Mutex<HashMap<String, SessionSteerMailbox>>,
     /// Interrupt flags remain reachable while the session is out of `sessions` during a turn.
     interrupt_flags: Mutex<HashMap<String, Arc<AtomicBool>>>,
     /// Model alias handles — reachable mid-turn when session is removed from `sessions`.
@@ -2717,6 +2737,7 @@ async fn build_server_state(config: Arc<AppConfig>) -> Result<Arc<ServerState>> 
         sessions: Mutex::new(HashMap::new()),
         approval_txs: Mutex::new(HashMap::new()),
         question_txs: Mutex::new(HashMap::new()),
+        steer_mailboxes: Mutex::new(HashMap::new()),
         interrupt_flags: Mutex::new(HashMap::new()),
         model_aliases: Mutex::new(HashMap::new()),
         permission_modes: Mutex::new(HashMap::new()),
@@ -2883,6 +2904,13 @@ async fn spawn_session_agent_turn(
     turn_permit: tokio::sync::OwnedSemaphorePermit,
     rpc_event_tx: mpsc::Sender<Frame>,
 ) -> Result<(), (i32, String)> {
+    let steer_mailbox = state
+        .steer_mailboxes
+        .lock()
+        .await
+        .get(&session_id)
+        .cloned()
+        .ok_or_else(|| (-32602, format!("Session not found: {session_id}")))?;
     let (agent_event_tx, mut agent_event_rx) = mpsc::channel::<AgentEvent>(256);
 
     let rpc_tx = rpc_event_tx.clone();
@@ -2974,6 +3002,7 @@ async fn spawn_session_agent_turn(
     let state_clone = state.clone();
     let sid = session_id.clone();
     let rpc_progress = rpc_event_tx.clone();
+    steer_mailbox.start_turn();
     tokio::spawn(async move {
         let _turn_permit = turn_permit;
 
@@ -3026,6 +3055,33 @@ async fn spawn_session_agent_turn(
                         session_id: sid.clone(),
                     })
                     .await;
+                // The mailbox was opened before MCP discovery so steering can
+                // be buffered during startup. Close it on this early-abort path
+                // and persist anything accepted before the interrupt won.
+                let session = state_clone.sessions.lock().await.remove(&sid);
+                if let Some(mut session) = session {
+                    if let Err(error) = session.close_and_apply_steers() {
+                        tracing::error!("Failed to preserve pending steer input: {error}");
+                    }
+                    {
+                        let db = state_clone.transcript.lock().await;
+                        if let Err(error) = persist_session_messages(&db, &mut session) {
+                            tracing::error!("Failed to persist interrupted turn: {error}");
+                        }
+                    }
+                    state_clone
+                        .sessions
+                        .lock()
+                        .await
+                        .insert(sid.clone(), session);
+                } else {
+                    let dropped = steer_mailbox.close_and_drain().len();
+                    if dropped > 0 {
+                        tracing::error!(
+                            "Could not preserve {dropped} steer message(s): session {sid} disappeared"
+                        );
+                    }
+                }
                 return;
             }
 
@@ -3066,6 +3122,12 @@ async fn spawn_session_agent_turn(
                 Some(s) => s,
                 None => {
                     tracing::error!("Session {} disappeared before turn", sid);
+                    let dropped = steer_mailbox.close_and_drain().len();
+                    if dropped > 0 {
+                        tracing::error!(
+                            "Could not preserve {dropped} steer message(s): session {sid} disappeared"
+                        );
+                    }
                     return;
                 }
             }
@@ -3089,6 +3151,15 @@ async fn spawn_session_agent_turn(
                     session_id: sid.clone(),
                 })
                 .await;
+            if let Err(error) = session.close_and_apply_steers() {
+                tracing::error!("Failed to preserve pending steer input: {error}");
+            }
+            {
+                let db = state_clone.transcript.lock().await;
+                if let Err(error) = persist_session_messages(&db, &mut session) {
+                    tracing::error!("Failed to persist interrupted turn: {error}");
+                }
+            }
             let mut sessions = state_clone.sessions.lock().await;
             if let Err(error) = session.sync_requested_plan_mode() {
                 tracing::error!("Failed to persist requested plan mode: {error}");
@@ -3105,6 +3176,9 @@ async fn spawn_session_agent_turn(
                     message: e.to_string(),
                 })
                 .await;
+        }
+        if let Err(error) = session.close_and_apply_steers() {
+            tracing::error!("Failed to preserve pending steer input: {error}");
         }
 
         {
@@ -3365,6 +3439,11 @@ async fn handle_rpc_call(
                 .lock()
                 .await
                 .insert(session_id.clone(), session.question_tx.clone());
+            state
+                .steer_mailboxes
+                .lock()
+                .await
+                .insert(session_id.clone(), session.steer_mailbox.clone());
             session.services.on_created().await;
             let session_dir = session.session_dir().display().to_string();
             state
@@ -3580,6 +3659,7 @@ async fn handle_rpc_call(
             state.plan_mode_requests.lock().await.remove(&session_id);
             state.approval_txs.lock().await.remove(&session_id);
             state.question_txs.lock().await.remove(&session_id);
+            state.steer_mailboxes.lock().await.remove(&session_id);
             if let Some(session) = removed {
                 session.services.on_close(SessionCloseReason::Exit).await;
             }
@@ -3978,6 +4058,11 @@ async fn handle_rpc_call(
                 .await
                 .insert(session_id.clone(), session.question_tx.clone());
             state
+                .steer_mailboxes
+                .lock()
+                .await
+                .insert(session_id.clone(), session.steer_mailbox.clone());
+            state
                 .sessions
                 .lock()
                 .await
@@ -4081,14 +4166,15 @@ async fn handle_rpc_call(
                 "turns": turns,
             }))
         }
-        "session.prompt" => {
+        "session.prompt" | "session.steer" => {
+            let steer_requested = method == "session.steer";
             let session_id = params
                 .as_ref()
                 .and_then(|p| p.get("session_id"))
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| (-32602, "Missing session_id".into()))?
                 .to_string();
-            let text = params
+            let mut text = params
                 .as_ref()
                 .and_then(|p| p.get("text"))
                 .and_then(|v| v.as_str())
@@ -4114,7 +4200,7 @@ async fn handle_rpc_call(
                 }
                 seen.insert(stamp, std::time::Instant::now());
             }
-            let images = params
+            let mut images = params
                 .as_ref()
                 .and_then(|p| p.get("images"))
                 .and_then(|value| value.as_array())
@@ -4139,6 +4225,43 @@ async fn handle_rpc_call(
                 .unwrap_or_default();
             if text.trim().is_empty() && images.is_empty() {
                 return Err((-32602, "Prompt text must not be empty".into()));
+            }
+            if steer_requested {
+                let steer_text = text.clone();
+                let mailbox = state
+                    .steer_mailboxes
+                    .lock()
+                    .await
+                    .get(&session_id)
+                    .cloned()
+                    .ok_or_else(|| (-32602, format!("Session not found: {session_id}")))?;
+                match mailbox.try_push(SteerInput { text, images }) {
+                    Ok(()) => {
+                        let _ = rpc_event_tx
+                            .send(Frame::Event {
+                                event: "agent".into(),
+                                scope: None,
+                                data: serde_json::to_value(AgentEvent::SteerInput {
+                                    session_id: session_id.clone(),
+                                    text: steer_text,
+                                    idempotency_key: idempotency_key.clone(),
+                                })
+                                .unwrap_or_default(),
+                            })
+                            .await;
+                        return Ok(serde_json::json!({
+                            "ok": true,
+                            "session_id": session_id,
+                            "steered": true,
+                        }));
+                    }
+                    Err(input) => {
+                        // Kimi-compatible idle behavior: a steer that loses the
+                        // active-turn race becomes a normal new turn.
+                        text = input.text;
+                        images = input.images;
+                    }
+                }
             }
             let turn_permit = state
                 .turn_locks

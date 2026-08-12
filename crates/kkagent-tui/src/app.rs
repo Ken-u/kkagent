@@ -57,6 +57,8 @@ pub struct AppState {
     pub should_quit: bool,
     pub quit_confirm: bool,
     pub thinking_text: String,
+    /// Assistant display message receiving deltas for the current model step.
+    pub active_assistant_message: Option<usize>,
     /// 离底部向上滚动的行数；0 = 贴底跟随新消息
     pub scroll_up: u16,
     pub content_lines: u16,
@@ -225,6 +227,7 @@ pub struct SessionRuntimeState {
     pub working_dir: std::path::PathBuf,
     pub mode: AppMode,
     pub thinking_text: String,
+    pub active_assistant_message: Option<usize>,
     pub approx_tokens: u64,
     pub approval_queue: std::collections::VecDeque<PendingApproval>,
     pub todos: Vec<TodoItem>,
@@ -252,6 +255,7 @@ impl SessionRuntimeState {
             working_dir: state.working_dir.clone(),
             mode: state.mode.clone(),
             thinking_text: state.thinking_text.clone(),
+            active_assistant_message: state.active_assistant_message,
             approx_tokens: state.approx_tokens,
             approval_queue: state.approval_queue.clone(),
             todos: state.todos.clone(),
@@ -278,6 +282,7 @@ impl SessionRuntimeState {
         state.working_dir = self.working_dir;
         state.mode = self.mode;
         state.thinking_text = self.thinking_text;
+        state.active_assistant_message = self.active_assistant_message;
         state.approx_tokens = self.approx_tokens;
         state.approval_queue = self.approval_queue;
         state.todos = self.todos;
@@ -779,6 +784,7 @@ impl AppState {
             should_quit: false,
             quit_confirm: false,
             thinking_text: String::new(),
+            active_assistant_message: None,
             scroll_up: 0,
             content_lines: 0,
             viewport_height: 0,
@@ -1581,14 +1587,17 @@ impl TuiApp {
                 crate::async_jobs::JobPayload::Prompt {
                     session_id,
                     idempotency_key,
+                    as_steer,
                     result,
                 } => {
                     self.jobs.mark_done(channel, generation);
                     let is_current = self.state.session_id.as_deref() == Some(&session_id);
                     match result {
                         Ok(()) => {
-                            self.jobs.mcp.waiting_for_prompt =
-                                self.jobs.mcp.configured && !self.jobs.mcp.initialized;
+                            if !as_steer {
+                                self.jobs.mcp.waiting_for_prompt =
+                                    self.jobs.mcp.configured && !self.jobs.mcp.initialized;
+                            }
                             let messages = if is_current {
                                 Some(&mut self.state.messages)
                             } else {
@@ -1598,7 +1607,7 @@ impl TuiApp {
                                     .map(|runtime| &mut runtime.messages)
                             };
                             if let Some(messages) = messages {
-                                if let Some(msg) = messages.iter_mut().rev().find(|m| {
+                                for msg in messages.iter_mut().filter(|m| {
                                     m.role == MessageRole::User
                                         && m.idempotency_key.as_deref()
                                             == Some(idempotency_key.as_str())
@@ -1609,43 +1618,49 @@ impl TuiApp {
                             self.enqueue_workspace_sessions_refresh();
                         }
                         Err(err) => {
-                            self.jobs.mcp.waiting_for_prompt = false;
+                            if !as_steer {
+                                self.jobs.mcp.waiting_for_prompt = false;
+                            }
                             let failed_text = if is_current {
-                                self.state.status = SessionStatus::Idle;
-                                self.state.messages.iter_mut().rev().find_map(|msg| {
-                                    if msg.role == MessageRole::User
+                                if !as_steer {
+                                    self.state.status = SessionStatus::Idle;
+                                }
+                                let mut failed = Vec::new();
+                                for msg in self.state.messages.iter_mut().filter(|msg| {
+                                    msg.role == MessageRole::User
                                         && msg.idempotency_key.as_deref()
                                             == Some(idempotency_key.as_str())
-                                    {
-                                        msg.delivery = crate::prompt_queue::DeliveryState::Failed;
-                                        Some(msg.content.clone())
-                                    } else {
-                                        None
-                                    }
-                                })
+                                }) {
+                                    msg.delivery = crate::prompt_queue::DeliveryState::Failed;
+                                    failed.push(msg.content.clone());
+                                }
+                                (!failed.is_empty()).then(|| failed.join("\n\n"))
                             } else {
                                 self.state
                                     .session_runtime_states
                                     .get_mut(&session_id)
                                     .and_then(|runtime| {
-                                        runtime.status = SessionStatus::Idle;
-                                        runtime.messages.iter_mut().rev().find_map(|msg| {
-                                            if msg.role == MessageRole::User
+                                        if !as_steer {
+                                            runtime.status = SessionStatus::Idle;
+                                        }
+                                        let mut failed = Vec::new();
+                                        for msg in runtime.messages.iter_mut().filter(|msg| {
+                                            msg.role == MessageRole::User
                                                 && msg.idempotency_key.as_deref()
                                                     == Some(idempotency_key.as_str())
-                                            {
-                                                msg.delivery =
-                                                    crate::prompt_queue::DeliveryState::Failed;
-                                                Some(msg.content.clone())
-                                            } else {
-                                                None
-                                            }
-                                        })
+                                        }) {
+                                            msg.delivery =
+                                                crate::prompt_queue::DeliveryState::Failed;
+                                            failed.push(msg.content.clone());
+                                        }
+                                        (!failed.is_empty()).then(|| failed.join("\n\n"))
                                     })
                             };
                             if let Some(text) = failed_text {
                                 if is_current {
-                                    self.state.input.set_text(text);
+                                    if self.state.input.is_empty() {
+                                        self.state.input.set_text(text);
+                                    }
                                 } else {
                                     let view = self
                                         .state
@@ -1659,12 +1674,18 @@ impl TuiApp {
                             self.jobs.push_error(
                                 Some(channel),
                                 Some(generation),
-                                format!("Send failed: {err}"),
+                                format!(
+                                    "{} failed: {err}",
+                                    if as_steer { "Steer" } else { "Send" }
+                                ),
                                 true,
                                 0,
                             );
                             if is_current {
-                                self.system_message(format!("Error: {err}"));
+                                self.system_message(format!(
+                                    "{} error: {err}",
+                                    if as_steer { "Steer" } else { "Send" }
+                                ));
                             } else if let Some(runtime) =
                                 self.state.session_runtime_states.get_mut(&session_id)
                             {
@@ -2830,16 +2851,31 @@ impl TuiApp {
             {
                 self.cycle_workspace_session(1).await?;
             }
-            // Shift-Enter or Ctrl-J: newline
+            // Shift-Enter steers a running turn; Ctrl-J remains the reliable
+            // multiline shortcut. While idle, Shift-Enter also inserts newline.
             KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                self.state.input.insert_char('\n');
-                self.state.refresh_slash_menu();
+                if self.can_steer_current_turn()
+                    && (!self.state.input.is_empty() || !self.state.prompt_queue.is_empty())
+                {
+                    self.submit_steer_input().await?;
+                } else {
+                    self.state.input.insert_char('\n');
+                    self.state.refresh_slash_menu();
+                }
             }
             KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.state.input.insert_char('\n');
                 self.state.refresh_slash_menu();
             }
-            // Ctrl-F / Ctrl-S: open transcript search
+            // Kimi-compatible Ctrl-S alias for steering while streaming.
+            KeyCode::Char('s')
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && self.can_steer_current_turn()
+                    && (!self.state.input.is_empty() || !self.state.prompt_queue.is_empty()) =>
+            {
+                self.submit_steer_input().await?;
+            }
+            // Ctrl-F / idle Ctrl-S: open transcript search
             KeyCode::Char('f') | KeyCode::Char('s')
                 if key.modifiers.contains(KeyModifiers::CONTROL) =>
             {
@@ -3270,6 +3306,7 @@ impl TuiApp {
                 let undone = data.get("undone").and_then(|v| v.as_u64()).unwrap_or(0);
                 if let Some(msgs) = data.get("messages").and_then(|v| v.as_array()) {
                     self.state.messages = transcript_messages_to_display(msgs);
+                    self.state.active_assistant_message = None;
                 }
                 self.state.thinking_text.clear();
                 self.state.follow_bottom = true;
@@ -4632,7 +4669,17 @@ impl TuiApp {
             ListPickerItem {
                 id: "enter".into(),
                 label: "Enter".into(),
-                detail: "Submit / confirm slash".into(),
+                detail: "Submit; queues while a turn is running".into(),
+            },
+            ListPickerItem {
+                id: "shift_enter".into(),
+                label: "Shift-Enter / Ctrl-S".into(),
+                detail: "Steer a running turn; newline while idle".into(),
+            },
+            ListPickerItem {
+                id: "ctrl_j".into(),
+                label: "Ctrl-J".into(),
+                detail: "Insert newline".into(),
             },
             ListPickerItem {
                 id: "tab".into(),
@@ -5428,6 +5475,7 @@ impl TuiApp {
                 .unwrap_or_else(|_| std::path::PathBuf::from(working_dir));
         }
         self.state.messages.clear();
+        self.state.active_assistant_message = None;
         self.state.todos.clear();
         self.state.todos_expanded = false;
         self.state.thinking_text.clear();
@@ -5487,6 +5535,7 @@ impl TuiApp {
 
         if let Some(msgs) = data.get("messages").and_then(|v| v.as_array()) {
             self.state.messages = transcript_messages_to_display(msgs);
+            self.state.active_assistant_message = None;
         }
         if let Some(todos) = data.get("todos").and_then(|value| value.as_array()) {
             self.state.todos = todos
@@ -5672,6 +5721,10 @@ impl TuiApp {
         let mut merged = older;
         merged.append(&mut self.state.messages);
         self.state.messages = merged;
+        self.state.active_assistant_message = self
+            .state
+            .active_assistant_message
+            .map(|index| index.saturating_add(added));
 
         let new_oldest = data
             .get("history")
@@ -6247,6 +6300,7 @@ impl TuiApp {
                         .create_session(Some(&cwd), Some(self.state.permission_mode))
                         .await?;
                     self.state.messages.clear();
+                    self.state.active_assistant_message = None;
                     self.state.todos.clear();
                     self.state.status = SessionStatus::Idle;
                     self.state.approval_pending = None;
@@ -6308,6 +6362,7 @@ impl TuiApp {
                             .create_session(Some(&cwd), Some(self.state.permission_mode))
                             .await?;
                         self.state.messages.clear();
+                        self.state.active_assistant_message = None;
                         self.state.todos.clear();
                         self.state.status = SessionStatus::Idle;
                         self.state.approval_pending = None;
@@ -6330,6 +6385,119 @@ impl TuiApp {
     }
 
     async fn submit_input(&mut self) -> anyhow::Result<()> {
+        self.submit_input_with_delivery().await
+    }
+
+    async fn submit_steer_input(&mut self) -> anyhow::Result<()> {
+        let raw = self.state.input.take();
+        let draft = self.state.input.expand_pastes(&raw);
+        self.state.slash_menu = None;
+        self.state.file_menu = None;
+        self.state.list_picker = None;
+
+        let Some(session_id) = self.state.session_id.clone() else {
+            self.state.input.set_text(draft);
+            self.system_message("No active session.".into());
+            return Ok(());
+        };
+
+        // Match Kimi's steer behavior: queued user prompts are injected before
+        // the current editor draft, preserving their original order. Prompts
+        // for another session are retained defensively (normally each runtime
+        // state already owns an isolated queue).
+        let mut queued_for_session = Vec::new();
+        self.state.prompt_queue.items.retain(|item| {
+            if item.session_id == session_id {
+                queued_for_session.push(item.clone());
+                false
+            } else {
+                true
+            }
+        });
+        if self.state.prompt_queue.items.is_empty() {
+            self.state.prompt_queue.selected = 0;
+        } else {
+            self.state.prompt_queue.selected = self
+                .state
+                .prompt_queue
+                .selected
+                .min(self.state.prompt_queue.items.len() - 1);
+        }
+
+        let mut text_items = queued_for_session
+            .iter()
+            .map(|item| item.text.trim())
+            .filter(|text| !text.is_empty())
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
+        let draft = draft.trim().to_string();
+        if !draft.is_empty() {
+            text_items.push(draft.clone());
+        }
+        if text_items.is_empty() {
+            return Ok(());
+        }
+        let text = text_items.join("\n\n");
+        let images = queued_for_session
+            .iter()
+            .flat_map(|item| item.images.iter().cloned())
+            .collect::<Vec<_>>();
+        let idem = uuid::Uuid::new_v4().to_string();
+
+        // Queued messages are already visible in the transcript. Promote all
+        // of them to the same in-flight steer request, then append the fresh
+        // editor draft (if any) as its own user entry.
+        for item in &queued_for_session {
+            if let Some(message) = self.state.messages.iter_mut().find(|message| {
+                message.role == MessageRole::User
+                    && message.delivery == crate::prompt_queue::DeliveryState::Queued
+                    && message.content == item.text
+            }) {
+                message.delivery = crate::prompt_queue::DeliveryState::Sending;
+                message.idempotency_key = Some(idem.clone());
+            }
+        }
+        if !draft.is_empty() {
+            self.state.push_input_history(&draft);
+            self.state.messages.push(DisplayMessage {
+                role: MessageRole::User,
+                content: draft,
+                thinking: None,
+                parts: Vec::new(),
+                tool_calls: Vec::new(),
+                delivery: crate::prompt_queue::DeliveryState::Sending,
+                idempotency_key: Some(idem.clone()),
+            });
+        }
+        if let Some(warn) = crate::draft_store::redact_sensitive_preview(&text) {
+            self.system_message(warn);
+        }
+        self.state.scroll_up = 0;
+        self.state.follow_bottom = true;
+        self.jobs.spawn_steer(
+            self.client.requester(),
+            session_id.clone(),
+            text,
+            images,
+            idem,
+        );
+        crate::draft_store::clear_draft(&session_id);
+        self.system_message("Steer sent — applying at the next model step.".into());
+        Ok(())
+    }
+
+    fn can_steer_current_turn(&self) -> bool {
+        matches!(
+            self.state.status,
+            SessionStatus::Thinking
+                | SessionStatus::ToolExecuting
+                | SessionStatus::WaitingApproval
+                | SessionStatus::WaitingQuestion
+                | SessionStatus::Compacting
+        )
+    }
+
+    async fn submit_input_with_delivery(&mut self) -> anyhow::Result<()> {
         let raw = self.state.input.take();
         if raw.is_empty() {
             return Ok(());
@@ -6340,7 +6508,6 @@ impl TuiApp {
         self.state.file_menu = None;
         self.state.list_picker = None;
 
-        // Handle slash commands
         if text.starts_with('/') {
             return self.handle_slash_command(&text).await;
         }
@@ -6595,6 +6762,7 @@ impl TuiApp {
                     }
                 }
                 self.state.messages.clear();
+                self.state.active_assistant_message = None;
                 self.state.todos.clear();
                 self.state.todos_expanded = false;
                 self.state.thinking_text.clear();
@@ -7557,6 +7725,35 @@ impl TuiApp {
                 }
 
                 match evt {
+                    AgentEvent::SteerInput {
+                        text,
+                        idempotency_key,
+                        ..
+                    } => {
+                        let mut found = false;
+                        if let Some(key) = idempotency_key.as_deref() {
+                            for message in self.state.messages.iter_mut().filter(|message| {
+                                message.role == MessageRole::User
+                                    && message.idempotency_key.as_deref() == Some(key)
+                            }) {
+                                message.delivery = crate::prompt_queue::DeliveryState::Sent;
+                                found = true;
+                            }
+                        }
+                        if !found {
+                            self.state.messages.push(DisplayMessage {
+                                role: MessageRole::User,
+                                content: text,
+                                thinking: None,
+                                parts: Vec::new(),
+                                tool_calls: Vec::new(),
+                                delivery: crate::prompt_queue::DeliveryState::Sent,
+                                idempotency_key,
+                            });
+                        }
+                        self.state.follow_bottom = true;
+                        self.state.scroll_up = 0;
+                    }
                     AgentEvent::MessageDelta { text, .. } => {
                         let pending_thinking = if !self.state.thinking_text.is_empty() {
                             Some(std::mem::take(&mut self.state.thinking_text))
@@ -7564,14 +7761,17 @@ impl TuiApp {
                             None
                         };
 
-                        if let Some(last) = self.state.messages.last_mut() {
-                            if last.role == MessageRole::Assistant {
-                                if last.thinking.is_none() {
-                                    last.thinking = pending_thinking;
-                                }
-                                last.append_assistant_text(&text);
-                                return;
+                        if let Some(message) = self
+                            .state
+                            .active_assistant_message
+                            .and_then(|index| self.state.messages.get_mut(index))
+                            .filter(|message| message.role == MessageRole::Assistant)
+                        {
+                            if message.thinking.is_none() {
+                                message.thinking = pending_thinking;
                             }
+                            message.append_assistant_text(&text);
+                            return;
                         }
                         let mut msg = DisplayMessage {
                             role: MessageRole::Assistant,
@@ -7584,6 +7784,8 @@ impl TuiApp {
                         };
                         msg.append_assistant_text(&text);
                         self.state.messages.push(msg);
+                        self.state.active_assistant_message =
+                            Some(self.state.messages.len().saturating_sub(1));
                     }
                     AgentEvent::ThinkingDelta { text, .. } => {
                         self.state.thinking_text.push_str(&text);
@@ -7611,14 +7813,17 @@ impl TuiApp {
                             is_error: false,
                             collapsed: true,
                         };
-                        if let Some(last) = self.state.messages.last_mut() {
-                            if last.role == MessageRole::Assistant {
-                                if last.thinking.is_none() {
-                                    last.thinking = pending_thinking;
-                                }
-                                last.push_tool(tc);
-                                return;
+                        if let Some(message) = self
+                            .state
+                            .active_assistant_message
+                            .and_then(|index| self.state.messages.get_mut(index))
+                            .filter(|message| message.role == MessageRole::Assistant)
+                        {
+                            if message.thinking.is_none() {
+                                message.thinking = pending_thinking;
                             }
+                            message.push_tool(tc);
+                            return;
                         }
                         let mut msg = DisplayMessage {
                             role: MessageRole::Assistant,
@@ -7631,6 +7836,8 @@ impl TuiApp {
                         };
                         msg.push_tool(tc);
                         self.state.messages.push(msg);
+                        self.state.active_assistant_message =
+                            Some(self.state.messages.len().saturating_sub(1));
                     }
                     AgentEvent::ToolResult {
                         tool_call_id,
@@ -7639,16 +7846,17 @@ impl TuiApp {
                         is_error,
                         ..
                     } => {
-                        if let Some(last) = self.state.messages.last_mut() {
-                            if let Some(tc) =
-                                last.find_tool_for_result_mut(&tool_call_id, &tool_name)
-                            {
-                                tc.output = Some(output);
-                                tc.is_error = is_error;
-                                tc.stopping = false;
-                                if is_error {
-                                    tc.collapsed = false;
-                                }
+                        // A steer user message may now be the transcript tail;
+                        // update the assistant tool call by id instead of only
+                        // inspecting the final display message.
+                        if let Some(tc) = self.state.messages.iter_mut().rev().find_map(|message| {
+                            message.find_tool_for_result_mut(&tool_call_id, &tool_name)
+                        }) {
+                            tc.output = Some(output);
+                            tc.is_error = is_error;
+                            tc.stopping = false;
+                            if is_error {
+                                tc.collapsed = false;
                             }
                         }
                     }
@@ -7795,23 +8003,18 @@ impl TuiApp {
                         }
                     }
                     AgentEvent::TurnEnd { .. } => {
+                        let active_assistant = self.state.active_assistant_message.take();
                         if !self.state.thinking_text.is_empty() {
                             let t = std::mem::take(&mut self.state.thinking_text);
-                            if let Some(last) = self.state.messages.last_mut() {
-                                if last.role == MessageRole::Assistant && last.thinking.is_none() {
-                                    last.thinking = Some(t);
-                                } else {
-                                    self.state.messages.push(DisplayMessage {
-                                        role: MessageRole::Assistant,
-                                        content: String::new(),
-                                        thinking: Some(t),
-                                        parts: Vec::new(),
-                                        tool_calls: Vec::new(),
-                                        delivery: crate::prompt_queue::DeliveryState::Sent,
-                                        idempotency_key: None,
-                                    });
-                                }
-                            } else {
+                            let attached = active_assistant
+                                .and_then(|index| self.state.messages.get_mut(index))
+                                .filter(|message| {
+                                    message.role == MessageRole::Assistant
+                                        && message.thinking.is_none()
+                                })
+                                .map(|message| message.thinking = Some(t.clone()))
+                                .is_some();
+                            if !attached {
                                 self.state.messages.push(DisplayMessage {
                                     role: MessageRole::Assistant,
                                     content: String::new(),
@@ -7844,6 +8047,7 @@ impl TuiApp {
                         self.flush_prompt_queue_if_idle();
                     }
                     AgentEvent::TurnStart { .. } => {
+                        self.state.active_assistant_message = None;
                         self.state.thinking_text.clear();
                         self.state.turn_started_at = Some(std::time::Instant::now());
                         self.state.tokens_at_turn_start = self.state.approx_tokens;
@@ -7943,6 +8147,7 @@ impl TuiApp {
                             ));
                         } else {
                             self.state.messages = transcript_messages_to_display(&messages);
+                            self.state.active_assistant_message = None;
                             self.state.follow_bottom = true;
                             self.state.scroll_up = 0;
                             self.system_message(format!(
@@ -8767,6 +8972,278 @@ mod app_state_tests {
         assert!(embedded.contains("Embedded agent"));
         assert!(!embedded.contains("--connect"));
         assert!(!embedded.contains("reconnect"));
+    }
+
+    #[tokio::test]
+    async fn shift_enter_steers_instead_of_queueing_while_turn_runs() {
+        let mut app = test_tui_app();
+        app.state.session_id = Some("session-steer".into());
+        app.state.status = SessionStatus::Thinking;
+        app.state.input.set_text("focus on the failing test".into());
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT))
+            .await
+            .unwrap();
+
+        assert!(app.state.input.is_empty());
+        assert!(app.state.prompt_queue.is_empty());
+        assert_eq!(app.state.status, SessionStatus::Thinking);
+        let user = app
+            .state
+            .messages
+            .iter()
+            .find(|message| message.role == MessageRole::User)
+            .unwrap();
+        assert_eq!(user.content, "focus on the failing test");
+        assert_eq!(user.delivery, crate::prompt_queue::DeliveryState::Sending);
+        assert_eq!(
+            app.jobs
+                .pending
+                .get(&crate::async_jobs::JobChannel::Prompt)
+                .and_then(|job| job.retry_method.as_deref()),
+            Some("session.steer")
+        );
+    }
+
+    #[tokio::test]
+    async fn shift_enter_steers_queued_prompts_before_the_editor_draft() {
+        use futures::FutureExt;
+        use std::sync::Arc;
+
+        let (client_transport, server_transport) =
+            kkagent_rpc::transport::memory::create_memory_pair();
+        let (event_tx, event_rx) = tokio::sync::mpsc::channel(16);
+        let rpc = kkagent_rpc::RpcClient::new(client_transport, event_tx);
+        let client = kkagent_client::KkagentClient::new(rpc, event_rx);
+        let (params_tx, mut params_rx) = tokio::sync::mpsc::unbounded_channel();
+        let handler: kkagent_rpc::server::RequestHandler =
+            Arc::new(move |_id, method, params, _event_tx| {
+                let params_tx = params_tx.clone();
+                async move {
+                    assert_eq!(method, "session.steer");
+                    params_tx.send(params.unwrap()).unwrap();
+                    Ok(serde_json::json!({"ok": true}))
+                }
+                .boxed()
+            });
+        tokio::spawn(async move {
+            kkagent_rpc::RpcServer::new(handler)
+                .serve(server_transport)
+                .await;
+        });
+
+        let mut app = TuiApp::new(AppConfig::default(), client);
+        app.state.session_id = Some("session-steer-queue".into());
+        app.state.status = SessionStatus::ToolExecuting;
+        for text in ["queued first", "queued second"] {
+            app.state
+                .prompt_queue
+                .push(crate::prompt_queue::QueuedPrompt::next_turn(
+                    "session-steer-queue",
+                    text,
+                ));
+            app.state.messages.push(DisplayMessage {
+                role: MessageRole::User,
+                content: text.into(),
+                thinking: None,
+                parts: Vec::new(),
+                tool_calls: Vec::new(),
+                delivery: crate::prompt_queue::DeliveryState::Queued,
+                idempotency_key: None,
+            });
+        }
+        app.state.input.set_text("editor draft".into());
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT))
+            .await
+            .unwrap();
+
+        let params = tokio::time::timeout(std::time::Duration::from_secs(1), params_rx.recv())
+            .await
+            .expect("steer RPC should arrive")
+            .expect("parameter sender should stay alive");
+        assert_eq!(
+            params["text"],
+            "queued first\n\nqueued second\n\neditor draft"
+        );
+        assert!(app.state.prompt_queue.is_empty());
+        assert!(app.state.input.is_empty());
+        let user_messages = app
+            .state
+            .messages
+            .iter()
+            .filter(|message| message.role == MessageRole::User)
+            .collect::<Vec<_>>();
+        assert_eq!(user_messages.len(), 3);
+        assert!(user_messages.iter().all(|message| {
+            message.delivery == crate::prompt_queue::DeliveryState::Sending
+                && message.idempotency_key == user_messages[0].idempotency_key
+        }));
+    }
+
+    #[tokio::test]
+    async fn ctrl_s_steers_an_existing_queue_with_an_empty_editor() {
+        let mut app = test_tui_app();
+        app.state.session_id = Some("session-steer-queue".into());
+        app.state.status = SessionStatus::WaitingQuestion;
+        app.state
+            .prompt_queue
+            .push(crate::prompt_queue::QueuedPrompt::next_turn(
+                "session-steer-queue",
+                "answer without waiting",
+            ));
+        app.state.messages.push(DisplayMessage {
+            role: MessageRole::User,
+            content: "answer without waiting".into(),
+            thinking: None,
+            parts: Vec::new(),
+            tool_calls: Vec::new(),
+            delivery: crate::prompt_queue::DeliveryState::Queued,
+            idempotency_key: None,
+        });
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+
+        assert!(app.state.prompt_queue.is_empty());
+        assert_eq!(app.state.status, SessionStatus::WaitingQuestion);
+        assert_eq!(
+            app.jobs
+                .pending
+                .get(&crate::async_jobs::JobChannel::Prompt)
+                .and_then(|job| job.retry_method.as_deref()),
+            Some("session.steer")
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_deltas_after_steer_stay_on_the_original_assistant_message() {
+        let mut app = test_tui_app();
+        app.state.session_id = Some("session-steer-stream".into());
+        app.state.status = SessionStatus::Thinking;
+        for event in [
+            AgentEvent::TurnStart {
+                session_id: "session-steer-stream".into(),
+            },
+            AgentEvent::MessageDelta {
+                session_id: "session-steer-stream".into(),
+                text: "initial".into(),
+            },
+        ] {
+            app.handle_server_event(Frame::Event {
+                event: "agent".into(),
+                scope: None,
+                data: serde_json::to_value(event).unwrap(),
+            });
+        }
+        app.handle_server_event(Frame::Event {
+            event: "agent".into(),
+            scope: None,
+            data: serde_json::to_value(AgentEvent::ToolCall {
+                session_id: "session-steer-stream".into(),
+                tool_call_id: "tool-1".into(),
+                tool_name: "Read".into(),
+                input: serde_json::json!({"path": "src/main.rs"}),
+            })
+            .unwrap(),
+        });
+        app.state.input.set_text("new direction".into());
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT))
+            .await
+            .unwrap();
+
+        app.handle_server_event(Frame::Event {
+            event: "agent".into(),
+            scope: None,
+            data: serde_json::to_value(AgentEvent::ToolResult {
+                session_id: "session-steer-stream".into(),
+                tool_call_id: "tool-1".into(),
+                tool_name: "Read".into(),
+                output: "file contents".into(),
+                is_error: false,
+            })
+            .unwrap(),
+        });
+        app.handle_server_event(Frame::Event {
+            event: "agent".into(),
+            scope: None,
+            data: serde_json::to_value(AgentEvent::MessageDelta {
+                session_id: "session-steer-stream".into(),
+                text: " tail".into(),
+            })
+            .unwrap(),
+        });
+
+        let assistants = app
+            .state
+            .messages
+            .iter()
+            .filter(|message| message.role == MessageRole::Assistant)
+            .collect::<Vec<_>>();
+        assert_eq!(assistants.len(), 1);
+        assert_eq!(assistants[0].content, "initial tail");
+        assert!(assistants[0].parts.iter().any(|part| matches!(
+            part,
+            DisplayPart::Tool(tool) if tool.id == "tool-1"
+                && tool.output.as_deref() == Some("file contents")
+        )));
+
+        app.handle_server_event(Frame::Event {
+            event: "agent".into(),
+            scope: None,
+            data: serde_json::to_value(AgentEvent::TurnStart {
+                session_id: "session-steer-stream".into(),
+            })
+            .unwrap(),
+        });
+        app.handle_server_event(Frame::Event {
+            event: "agent".into(),
+            scope: None,
+            data: serde_json::to_value(AgentEvent::MessageDelta {
+                session_id: "session-steer-stream".into(),
+                text: "guided".into(),
+            })
+            .unwrap(),
+        });
+        assert_eq!(
+            app.state
+                .messages
+                .iter()
+                .filter(|message| message.role == MessageRole::Assistant)
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn shift_enter_inserts_newline_while_idle() {
+        let mut app = test_tui_app();
+        app.state.status = SessionStatus::Idle;
+        app.state.input.set_text("first line".into());
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT))
+            .await
+            .unwrap();
+
+        assert_eq!(app.state.input.text, "first line\n");
+        assert!(app.state.messages.is_empty());
+    }
+
+    #[tokio::test]
+    async fn enter_still_queues_next_turn_while_busy() {
+        let mut app = test_tui_app();
+        app.state.session_id = Some("session-queue".into());
+        app.state.status = SessionStatus::ToolExecuting;
+        app.state.input.set_text("do this afterward".into());
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        assert_eq!(app.state.prompt_queue.items.len(), 1);
+        assert!(!app.state.prompt_queue.items[0].as_steer);
+        assert_eq!(app.state.prompt_queue.items[0].text, "do this afterward");
     }
 
     #[test]

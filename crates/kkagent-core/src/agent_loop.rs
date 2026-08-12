@@ -142,6 +142,7 @@ impl AgentLoop {
         session: &'a mut Session,
     ) -> futures::future::BoxFuture<'a, anyhow::Result<()>> {
         Box::pin(async move {
+            session.steer_mailbox.start_turn();
             let _heartbeat = TurnHeartbeat::spawn(self.event_tx.clone(), session.id.clone());
             let mut rounds_left = self.max_rounds;
             loop {
@@ -337,6 +338,10 @@ Do not mention this reminder to the user.\n</system-reminder>"
         // Early-trigger / blocking auto-compact (LLM summary + user retention).
         self.ensure_context_budget(session, &tool_defs, &system_prompt, false)
             .await?;
+        let steers = session.drain_steers_into_messages()?;
+        if steers > 0 {
+            tracing::info!("Injected {steers} steer message(s) before the next model step");
+        }
         let mut messages = self.prepare_messages(session, &tool_defs, &system_prompt);
         tracing::debug!("Conversation has {} messages (projected)", messages.len());
 
@@ -1399,6 +1404,10 @@ Do not mention this reminder to the user.\n</system-reminder>"
             return Ok(TurnStep::Continue);
         }
 
+        if session.finish_or_apply_steers()? {
+            tracing::info!("Continuing turn for newly buffered steer input");
+            return Ok(TurnStep::Continue);
+        }
         self.finish_turn(session, true).await?;
         Ok(TurnStep::Done)
     }
@@ -1426,6 +1435,7 @@ Do not mention this reminder to the user.\n</system-reminder>"
         session: &mut Session,
         message: String,
     ) -> anyhow::Result<()> {
+        let _ = session.close_and_apply_steers()?;
         let session_id = session.id.clone();
         tracing::info!("Turn interrupted for session {}", session_id);
         session.note_turn_cancelled();
@@ -1460,6 +1470,7 @@ Do not mention this reminder to the user.\n</system-reminder>"
     }
 
     async fn finish_turn(&self, session: &mut Session, record_goal: bool) -> anyhow::Result<()> {
+        let _ = session.close_and_apply_steers()?;
         {
             let mut perm = self.permission.lock().await;
             perm.clear_turn_approvals();
@@ -2798,6 +2809,134 @@ mod retry_tests {
                 .content
                 .iter()
                 .any(|content| matches!(content, ChatContent::Text { text } if text == "recovered"))
+        }));
+        std::fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[tokio::test]
+    async fn steer_arriving_during_stream_continues_with_another_model_step() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let workspace =
+            std::env::temp_dir().join(format!("kkagent-steer-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let mut session = Session::new(
+            "steer-test".into(),
+            workspace.clone(),
+            PermissionMode::Auto,
+            "test/model".into(),
+        );
+        session.add_user_message("start work".into());
+        let mailbox = session.steer_mailbox.clone();
+
+        let server = tokio::spawn(async move {
+            for step in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                loop {
+                    let mut chunk = [0_u8; 8_192];
+                    let read = socket.read(&mut chunk).await.unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&chunk[..read]);
+                    let Some(header_end) = request.windows(4).position(|w| w == b"\r\n\r\n") else {
+                        continue;
+                    };
+                    let headers = String::from_utf8_lossy(&request[..header_end]);
+                    let content_len = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .and_then(|value| value.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    if request.len() >= header_end + 4 + content_len {
+                        break;
+                    }
+                }
+                let request = String::from_utf8_lossy(&request);
+                if step == 0 {
+                    mailbox
+                        .try_push(crate::session::SteerInput {
+                            text: "focus on the failing test".into(),
+                            images: Vec::new(),
+                        })
+                        .expect("the active turn should accept steer input");
+                } else {
+                    assert!(request.contains("focus on the failing test"));
+                }
+                let answer = if step == 0 { "initial" } else { "guided" };
+                let body = format!(
+                    "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{answer}\"}}}}]}}\n\
+                     data: [DONE]\n"
+                );
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+
+        let mut config = AppConfig {
+            default_model: Some("test/model".into()),
+            loop_control: Some(LoopControlConfig {
+                max_attempts_per_step: 1,
+                reserved_context_size: 1_000,
+                max_steps_per_turn: 4,
+                auto_compact: false,
+                compact_keep_last: 4,
+                token_counting: "estimated".into(),
+                ..Default::default()
+            }),
+            ..AppConfig::default()
+        };
+        config.providers.insert(
+            "test".into(),
+            ProviderConfig {
+                provider_type: "openai-chat".into(),
+                api_key: Some("token".into()),
+                base_url: Some(base_url),
+                custom_headers: HashMap::new(),
+                oauth: None,
+            },
+        );
+        config.models.insert(
+            "test/model".into(),
+            ModelConfig {
+                provider: "test".into(),
+                model: "test-model".into(),
+                max_context_size: Some(16_000),
+                max_output_size: Some(1_000),
+                capabilities: Vec::new(),
+                display_name: None,
+                support_efforts: Vec::new(),
+                default_effort: None,
+                pricing: None,
+            },
+        );
+        let (event_tx, _) = mpsc::channel(64);
+        let loop_ = AgentLoop::new(
+            Arc::new(config),
+            Arc::new(ToolRegistry::new()),
+            Arc::new(Mutex::new(PermissionChain::new(
+                PermissionMode::Auto,
+                Vec::new(),
+            ))),
+            event_tx,
+            Arc::new(Mutex::new(HashMap::new())),
+        );
+
+        loop_.run_turn(&mut session).await.unwrap();
+        server.await.unwrap();
+        assert!(!session.steer_mailbox.is_active());
+        assert!(session.messages.iter().any(|message| {
+            message
+                .content
+                .iter()
+                .any(|content| matches!(content, ChatContent::Text { text } if text == "guided"))
         }));
         std::fs::remove_dir_all(workspace).unwrap();
     }

@@ -3,6 +3,13 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentEvent {
+    /// Follow-up user guidance accepted by an already-running turn.
+    SteerInput {
+        session_id: String,
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        idempotency_key: Option<String>,
+    },
     MessageDelta {
         session_id: String,
         text: String,
@@ -166,7 +173,8 @@ pub enum AgentEvent {
 impl AgentEvent {
     pub fn session_id(&self) -> &str {
         match self {
-            Self::MessageDelta { session_id, .. }
+            Self::SteerInput { session_id, .. }
+            | Self::MessageDelta { session_id, .. }
             | Self::ThinkingDelta { session_id, .. }
             | Self::ToolCall { session_id, .. }
             | Self::ToolResult { session_id, .. }

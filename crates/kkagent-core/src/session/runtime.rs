@@ -1,6 +1,6 @@
 use kkagent_llm::{ChatContent, ChatMessage};
 use kkagent_protocol::{ApprovalResponse, PermissionMode, QuestionResponse};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -25,6 +25,77 @@ pub struct TurnCheckpoint {
     /// Index of the user message that started this turn.
     pub message_start_index: usize,
     pub file_changes: Vec<FileChange>,
+}
+
+/// User input injected into an already-running agent turn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SteerInput {
+    pub text: String,
+    pub images: Vec<(String, String)>,
+}
+
+#[derive(Debug, Default)]
+struct SteerMailboxState {
+    active: bool,
+    pending: VecDeque<SteerInput>,
+}
+
+/// Session-scoped steer buffer shared by the RPC server and the active agent loop.
+///
+/// The mutex makes the end-of-turn empty check atomic with accepting a steer: once
+/// `finish_or_drain` closes an empty mailbox, a racing RPC can no longer report a
+/// steer as accepted by the turn that just ended.
+#[derive(Debug, Clone, Default)]
+pub struct SessionSteerMailbox {
+    inner: Arc<std::sync::Mutex<SteerMailboxState>>,
+}
+
+impl SessionSteerMailbox {
+    pub fn start_turn(&self) {
+        self.lock().active = true;
+    }
+
+    pub fn try_push(&self, input: SteerInput) -> Result<(), SteerInput> {
+        let mut state = self.lock();
+        if !state.active {
+            return Err(input);
+        }
+        state.pending.push_back(input);
+        Ok(())
+    }
+
+    pub fn drain(&self) -> Vec<SteerInput> {
+        self.lock().pending.drain(..).collect()
+    }
+
+    /// Close an empty active turn, or atomically take pending steers while keeping
+    /// the turn active so the agent can run another model step.
+    pub fn finish_or_drain(&self) -> Result<(), Vec<SteerInput>> {
+        let mut state = self.lock();
+        if state.pending.is_empty() {
+            state.active = false;
+            Ok(())
+        } else {
+            Err(state.pending.drain(..).collect())
+        }
+    }
+
+    /// Stop accepting steers and return anything not consumed by the agent loop.
+    pub fn close_and_drain(&self) -> Vec<SteerInput> {
+        let mut state = self.lock();
+        state.active = false;
+        state.pending.drain(..).collect()
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.lock().active
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, SteerMailboxState> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 }
 
 const PLAN_MODE_META_KEY: &str = "planMode";
@@ -69,6 +140,8 @@ pub struct Session {
     pub approval_tx: mpsc::Sender<ApprovalResponse>,
     question_rx: mpsc::Receiver<QuestionResponse>,
     pub question_tx: mpsc::Sender<QuestionResponse>,
+    /// Shared steer buffer remains reachable while the agent loop owns Session.
+    pub steer_mailbox: SessionSteerMailbox,
     /// Set by session.interrupt — agent loop checks between stream/tool steps.
     pub interrupted: Arc<AtomicBool>,
     /// Index of the current turn's user message (set by `begin_turn`).
@@ -225,6 +298,7 @@ impl Session {
             approval_tx,
             question_rx,
             question_tx,
+            steer_mailbox: SessionSteerMailbox::default(),
             interrupted: Arc::new(AtomicBool::new(false)),
             turn_message_start: None,
             current_turn_changes: Vec::new(),
@@ -641,6 +715,40 @@ impl Session {
                 media_type: image.media_type,
                 data: image.data,
             });
+        }
+        Ok(())
+    }
+
+    /// Append every currently buffered steer as a regular user message.
+    pub fn drain_steers_into_messages(&mut self) -> anyhow::Result<usize> {
+        let steers = self.steer_mailbox.drain();
+        let count = steers.len();
+        self.append_steers(steers)?;
+        Ok(count)
+    }
+
+    /// Atomically decide whether the turn may finish. Pending steers keep it open.
+    pub fn finish_or_apply_steers(&mut self) -> anyhow::Result<bool> {
+        match self.steer_mailbox.finish_or_drain() {
+            Ok(()) => Ok(false),
+            Err(steers) => {
+                self.append_steers(steers)?;
+                Ok(true)
+            }
+        }
+    }
+
+    /// Close steer admission on exceptional/hard-stop paths without losing input.
+    pub fn close_and_apply_steers(&mut self) -> anyhow::Result<usize> {
+        let steers = self.steer_mailbox.close_and_drain();
+        let count = steers.len();
+        self.append_steers(steers)?;
+        Ok(count)
+    }
+
+    fn append_steers(&mut self, steers: Vec<SteerInput>) -> anyhow::Result<()> {
+        for steer in steers {
+            self.add_user_message_with_images(steer.text, steer.images)?;
         }
         Ok(())
     }
@@ -1115,6 +1223,47 @@ mod working_directory_tests {
         assert!(reminder.contains("WritePlan"));
         assert!(reminder.contains("does not accept a path"));
         assert!(!reminder.contains("Plan file:"));
+    }
+
+    #[test]
+    fn steer_mailbox_accepts_only_while_turn_is_active() {
+        let mailbox = SessionSteerMailbox::default();
+        let idle = SteerInput {
+            text: "idle".into(),
+            images: Vec::new(),
+        };
+        assert_eq!(mailbox.try_push(idle.clone()), Err(idle));
+
+        mailbox.start_turn();
+        mailbox
+            .try_push(SteerInput {
+                text: "first".into(),
+                images: Vec::new(),
+            })
+            .unwrap();
+        let pending = mailbox.finish_or_drain().unwrap_err();
+        assert_eq!(pending[0].text, "first");
+        assert!(mailbox.is_active());
+
+        assert_eq!(mailbox.finish_or_drain(), Ok(()));
+        assert!(!mailbox.is_active());
+    }
+
+    #[test]
+    fn closing_steer_mailbox_preserves_pending_input() {
+        let mailbox = SessionSteerMailbox::default();
+        mailbox.start_turn();
+        mailbox
+            .try_push(SteerInput {
+                text: "keep me".into(),
+                images: vec![("image/png".into(), "data".into())],
+            })
+            .unwrap();
+
+        let pending = mailbox.close_and_drain();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].text, "keep me");
+        assert!(!mailbox.is_active());
     }
 
     #[test]
