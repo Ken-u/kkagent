@@ -207,6 +207,14 @@ pub struct AppState {
     pub usage_session: SessionUsageTotals,
     /// Recent per-turn usage samples for `/usage`.
     pub usage_turns: Vec<TurnUsageSample>,
+    /// Transient copy feedback shown for 1.5s after a successful copy.
+    pub copy_toast: Option<CopyToast>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CopyToast {
+    pub message: String,
+    pub until: std::time::Instant,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -251,6 +259,7 @@ pub struct SessionRuntimeState {
     pub prompt_queue: crate::prompt_queue::PromptQueue,
     pub usage_session: SessionUsageTotals,
     pub usage_turns: Vec<TurnUsageSample>,
+    pub copy_toast: Option<CopyToast>,
 }
 
 impl SessionRuntimeState {
@@ -286,6 +295,7 @@ impl SessionRuntimeState {
             prompt_queue: state.prompt_queue.clone(),
             usage_session: state.usage_session.clone(),
             usage_turns: state.usage_turns.clone(),
+            copy_toast: state.copy_toast.clone(),
         }
     }
 
@@ -313,6 +323,7 @@ impl SessionRuntimeState {
         state.prompt_queue = self.prompt_queue;
         state.usage_session = self.usage_session;
         state.usage_turns = self.usage_turns;
+        state.copy_toast = self.copy_toast;
         state.stream_cursor = crate::streaming::StreamingCursor::default();
         state.render_cache.invalidate_all();
         state.status_bar.cache_hit = None;
@@ -897,6 +908,7 @@ impl AppState {
             last_switch_metrics: None,
             usage_session: SessionUsageTotals::default(),
             usage_turns: Vec::new(),
+            copy_toast: None,
         }
     }
 
@@ -1493,6 +1505,14 @@ impl TuiApp {
             }
             self.start_next_btw_question().await;
             self.refresh_connection_notice();
+            if self
+                .state
+                .copy_toast
+                .as_ref()
+                .is_some_and(|t| std::time::Instant::now() >= t.until)
+            {
+                self.state.copy_toast = None;
+            }
 
             self.state.tick = self.state.tick.wrapping_add(1);
             // Periodic background refresh — never await on the UI loop.
@@ -2098,11 +2118,17 @@ impl TuiApp {
         match copy_to_clipboard(&text) {
             Ok(()) => {
                 let n = text.chars().count();
-                self.system_message(format!("Copied {n} chars."));
+                self.state.copy_toast = Some(CopyToast {
+                    message: format!("Copied {n} chars."),
+                    until: std::time::Instant::now() + std::time::Duration::from_millis(1500),
+                });
                 true
             }
             Err(e) => {
-                self.system_message(format!("Copy failed: {e}"));
+                self.state.copy_toast = Some(CopyToast {
+                    message: format!("Copy failed: {e}"),
+                    until: std::time::Instant::now() + std::time::Duration::from_millis(1500),
+                });
                 true // still consume the copy shortcut — selection was intentional
             }
         }

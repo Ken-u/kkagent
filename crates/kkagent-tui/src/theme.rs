@@ -13,6 +13,7 @@ pub struct Theme {
     pub success: Color,
     pub warning: Color,
     pub error: Color,
+    pub background: Color,
     pub role_user: Color,
     pub shell_mode: Color,
     pub plan_mode: Color,
@@ -33,6 +34,7 @@ impl Default for Theme {
             // yolo / auto badge — same warm amber as kimi
             warning: Color::Rgb(0xE8, 0xA8, 0x38),
             error: Color::Rgb(0xE8, 0x54, 0x54),
+            background: Color::Rgb(0x1E, 0x1E, 0x1E),
             // user marker + message body (kimi yellow user bubble)
             role_user: Color::Rgb(0xE8, 0xA8, 0x38),
             shell_mode: Color::Rgb(0xBD, 0x93, 0xF9),

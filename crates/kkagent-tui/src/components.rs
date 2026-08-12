@@ -158,6 +158,42 @@ pub fn render_ui(f: &mut Frame, state: &mut AppState, config: &AppConfig) {
     if state.search.active {
         render_search_overlay(f, size, state, &theme);
     }
+
+    if let Some(ref toast) = state.copy_toast {
+        render_copy_toast(f, size, toast, &theme);
+    }
+}
+
+fn render_copy_toast(f: &mut Frame, area: Rect, toast: &crate::app::CopyToast, theme: &Theme) {
+    let text = toast.message.as_str();
+    let width = text.width() as u16 + 4; // 2 padding + 2 border
+    let width = width.clamp(18, area.width.saturating_sub(4));
+    let height = 3u16;
+    if area.width < width + 2 || area.height < height + 1 {
+        return;
+    }
+    let popup = centered_rect(area, width, height);
+    f.render_widget(Clear, popup);
+    let paragraph = Paragraph::new(Text::from(Line::from(Span::styled(
+        text,
+        Style::default().fg(theme.text_strong),
+    ))))
+    .alignment(ratatui::layout::Alignment::Center)
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme.border_focus))
+            .style(Style::default().bg(theme.background)),
+    );
+    f.render_widget(paragraph, popup);
+}
+
+fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
+    let x = area.x.saturating_add(area.width.saturating_sub(width) / 2);
+    let y = area
+        .y
+        .saturating_add(area.height.saturating_sub(height) / 2);
+    Rect::new(x, y, width.min(area.width), height.min(area.height))
 }
 
 fn menu_height(menu_state: &crate::app::SlashMenuState) -> u16 {
