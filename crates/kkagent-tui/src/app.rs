@@ -198,7 +198,7 @@ pub struct AppState {
     pub preview_cache: crate::session_view::PreviewLru,
     /// Queued prompts waiting for the current turn to finish.
     pub prompt_queue: crate::prompt_queue::PromptQueue,
-    /// When session is busy, Enter queues by default (Shift-Enter steers if supported).
+    /// When session is busy, Enter queues by default (Ctrl-S steers immediately).
     pub queue_when_busy: bool,
     /// Last session-switch latency samples (ms) for regression awareness.
     pub last_switch_metrics: Option<SessionSwitchMetrics>,
@@ -2961,23 +2961,17 @@ impl TuiApp {
             {
                 self.cycle_workspace_session(1).await?;
             }
-            // Shift-Enter steers a running turn; Ctrl-J remains the reliable
-            // multiline shortcut. While idle, Shift-Enter also inserts newline.
+            // Shift-Enter inserts a newline. Steering deliberately uses Ctrl-S
+            // because many terminals cannot distinguish Shift-Enter from Enter.
             KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                if self.can_steer_current_turn()
-                    && (!self.state.input.is_empty() || !self.state.prompt_queue.is_empty())
-                {
-                    self.submit_steer_input().await?;
-                } else {
-                    self.state.input.insert_char('\n');
-                    self.state.refresh_slash_menu();
-                }
+                self.state.input.insert_char('\n');
+                self.state.refresh_slash_menu();
             }
             KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.state.input.insert_char('\n');
                 self.state.refresh_slash_menu();
             }
-            // Kimi-compatible Ctrl-S alias for steering while streaming.
+            // Ctrl-S steers the active turn immediately.
             KeyCode::Char('s')
                 if key.modifiers.contains(KeyModifiers::CONTROL)
                     && self.can_steer_current_turn()
@@ -4783,9 +4777,14 @@ impl TuiApp {
                 detail: "Submit; queues while a turn is running".into(),
             },
             ListPickerItem {
+                id: "ctrl_s_steer".into(),
+                label: "Ctrl-S".into(),
+                detail: "Steer a running turn immediately".into(),
+            },
+            ListPickerItem {
                 id: "shift_enter".into(),
-                label: "Shift-Enter / Ctrl-S".into(),
-                detail: "Steer a running turn; newline while idle".into(),
+                label: "Shift-Enter".into(),
+                detail: "Insert newline".into(),
             },
             ListPickerItem {
                 id: "ctrl_j".into(),
@@ -9089,13 +9088,13 @@ mod app_state_tests {
     }
 
     #[tokio::test]
-    async fn shift_enter_steers_instead_of_queueing_while_turn_runs() {
+    async fn ctrl_s_steers_instead_of_queueing_while_turn_runs() {
         let mut app = test_tui_app();
         app.state.session_id = Some("session-steer".into());
         app.state.status = SessionStatus::Thinking;
         app.state.input.set_text("focus on the failing test".into());
 
-        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT))
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL))
             .await
             .unwrap();
 
@@ -9120,7 +9119,7 @@ mod app_state_tests {
     }
 
     #[tokio::test]
-    async fn shift_enter_steers_queued_prompts_before_the_editor_draft() {
+    async fn ctrl_s_steers_queued_prompts_before_the_editor_draft() {
         use futures::FutureExt;
         use std::sync::Arc;
 
@@ -9168,7 +9167,7 @@ mod app_state_tests {
         }
         app.state.input.set_text("editor draft".into());
 
-        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT))
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL))
             .await
             .unwrap();
 
@@ -9263,7 +9262,7 @@ mod app_state_tests {
             .unwrap(),
         });
         app.state.input.set_text("new direction".into());
-        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT))
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL))
             .await
             .unwrap();
 
@@ -9331,9 +9330,10 @@ mod app_state_tests {
     }
 
     #[tokio::test]
-    async fn shift_enter_inserts_newline_while_idle() {
+    async fn shift_enter_inserts_newline_even_while_turn_runs() {
         let mut app = test_tui_app();
-        app.state.status = SessionStatus::Idle;
+        app.state.session_id = Some("session-running".into());
+        app.state.status = SessionStatus::Thinking;
         app.state.input.set_text("first line".into());
 
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT))
@@ -9342,6 +9342,7 @@ mod app_state_tests {
 
         assert_eq!(app.state.input.text, "first line\n");
         assert!(app.state.messages.is_empty());
+        assert!(app.state.prompt_queue.is_empty());
     }
 
     #[tokio::test]

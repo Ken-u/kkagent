@@ -244,10 +244,7 @@ pub fn render_queue(f: &mut Frame, area: Rect, pane: &QueuePane, theme: &Theme) 
     };
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(format!(
-            " queue · {} · Shift-Enter steer ",
-            pane.items.len()
-        ))
+        .title(format!(" queue · {} · Ctrl-S steer ", pane.items.len()))
         .border_style(Style::default().fg(theme.border));
     f.render_widget(Paragraph::new(lines).block(block), area);
 }
