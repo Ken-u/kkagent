@@ -85,6 +85,17 @@ keep = "all"
 
 `keep` 是 Provider 兼容字符串。并非所有端点都支持 thinking 与 tools 同时使用；遇到 400 响应时可先删除 `keep` 并关闭 thinking 验证。
 
+## TUI
+
+```toml
+[ui]
+high_contrast = false
+reduce_motion = false
+check_updates = true
+```
+
+`check_updates` 默认启用：TUI 首屏不会等待网络，而是在后台查询 `Ken-u/kkagent` 的最新 GitHub Release；成功结果缓存 24 小时，失败结果一小时后重试。发现新版本时只显示 Release 链接和重新运行安装器的提示，不会自动下载或替换程序。设为 `false` 可完全关闭检查。
+
 ## Agent 循环
 
 ```toml

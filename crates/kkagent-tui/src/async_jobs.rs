@@ -29,6 +29,7 @@ pub enum JobChannel {
     Compact,
     Interrupt,
     LocalShell,
+    VersionCheck,
     Generic,
 }
 
@@ -47,6 +48,7 @@ impl JobChannel {
             Self::Compact => "Compacting",
             Self::Interrupt => "Interrupting",
             Self::LocalShell => "Running shell",
+            Self::VersionCheck => "Checking for updates",
             Self::Generic => "Working",
         }
     }
@@ -80,6 +82,9 @@ pub enum JobPayload {
     LocalShell {
         command: String,
         result: Result<LocalShellResult, String>,
+    },
+    VersionCheck {
+        result: Result<crate::version_check::LatestRelease, String>,
     },
 }
 
@@ -267,6 +272,28 @@ impl AsyncJobHub {
                 generation,
                 started,
                 payload: JobPayload::Rpc { method, result },
+            });
+        });
+        generation
+    }
+
+    /// Check GitHub Releases without delaying the first TUI frame. This job is
+    /// intentionally absent from `pending`: update checks stay silent unless a
+    /// newer release is found.
+    pub fn spawn_version_check(&mut self) -> u64 {
+        let channel = JobChannel::VersionCheck;
+        let generation = self.next_generation(channel);
+        let started = Instant::now();
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let result = crate::version_check::fetch_latest()
+                .await
+                .map_err(|error| error.to_string());
+            let _ = tx.send(JobOutcome {
+                channel,
+                generation,
+                started,
+                payload: JobPayload::VersionCheck { result },
             });
         });
         generation

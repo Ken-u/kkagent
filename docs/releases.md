@@ -23,10 +23,11 @@ macOS / Linux：
 sh install.sh
 ```
 
-默认写入 `/usr/local/bin`。没有该目录权限时选择用户可写目录，并确保它在 PATH 中：
+`/usr/local/bin` 可写时默认写入该目录，否则自动使用 `~/.local/bin`。也可选择用户目录或固定版本，并确保目录在 PATH 中：
 
 ```bash
 KKAGENT_INSTALL_DIR=/absolute/writable/bin sh install.sh
+KKAGENT_VERSION=0.2.0 sh install.sh
 ```
 
 Windows PowerShell 默认写入 `%LOCALAPPDATA%\Programs\kkagent`，并在缺失时加入用户 PATH：
@@ -34,6 +35,7 @@ Windows PowerShell 默认写入 `%LOCALAPPDATA%\Programs\kkagent`，并在缺失
 ```powershell
 ./install.ps1
 ./install.ps1 -InstallDir 'D:\Tools\kkagent'
+./install.ps1 -Version 0.2.0
 ```
 
 fork 或镜像设置：
@@ -43,7 +45,7 @@ KKAGENT_REPOSITORY=owner/repository sh install.sh
 KKAGENT_RELEASE_BASE_URL=https://mirror.example/kkagent/latest sh install.sh
 ```
 
-PowerShell 使用同名环境变量。两个安装器都会先下载 `SHA256SUMS`，校验目标包，然后通过临时文件替换可执行文件；校验失败不会安装。
+PowerShell 使用同名环境变量。两个安装器都会先下载 `SHA256SUMS`，校验目标包，然后通过临时文件替换可执行文件；校验失败不会安装。重复执行安装器即升级到最新版本，或升级到 `KKAGENT_VERSION` / `-Version` 指定的版本。
 
 ## 独立验证签名
 

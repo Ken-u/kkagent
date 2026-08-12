@@ -2,8 +2,8 @@
 
 [English](README.en.md) | 简体中文
 
-[![CI](https://github.com/bianjinchen/kkagent/actions/workflows/ci.yml/badge.svg)](https://github.com/bianjinchen/kkagent/actions/workflows/ci.yml)
-[![Release](https://github.com/bianjinchen/kkagent/actions/workflows/release.yml/badge.svg)](https://github.com/bianjinchen/kkagent/actions/workflows/release.yml)
+[![CI](https://github.com/Ken-u/kkagent/actions/workflows/ci.yml/badge.svg)](https://github.com/Ken-u/kkagent/actions/workflows/ci.yml)
+[![Release](https://github.com/Ken-u/kkagent/actions/workflows/release.yml/badge.svg)](https://github.com/Ken-u/kkagent/actions/workflows/release.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust: 1.88+](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org/)
 
@@ -23,19 +23,21 @@ TUI 与 Agent Server 可分离，中间走 RPC（默认进程内 memory transpor
 ### macOS / Linux（推荐）
 
 ```bash
-curl -fsSLO https://raw.githubusercontent.com/bianjinchen/kkagent/main/install.sh
-sh install.sh
+curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/Ken-u/kkagent/main/install.sh | sh
 ```
 
-脚本默认安装到 `/usr/local/bin`，可通过环境变量覆盖：
+安装器会自动识别 macOS/Linux 与 x86_64/arm64、下载最新 Release 并校验 SHA-256。`/usr/local/bin` 可写时安装到该目录，否则自动使用 `~/.local/bin`。也可指定目录或版本：
 
 ```bash
-KKAGENT_INSTALL_DIR=$HOME/.local/bin sh install.sh
+curl --proto '=https' --tlsv1.2 -fsSLO https://raw.githubusercontent.com/Ken-u/kkagent/main/install.sh
+KKAGENT_INSTALL_DIR="$HOME/bin" KKAGENT_VERSION=0.2.0 sh install.sh
 ```
+
+升级时重新执行同一条安装命令即可。TUI 默认每 24 小时在后台检查一次 GitHub Release；只显示提示，不会自动下载。可在配置中设置 `[ui] check_updates = false` 关闭。
 
 ### 手动下载
 
-从 [GitHub Releases](https://github.com/bianjinchen/kkagent/releases/latest) 下载对应平台的 tar.gz / zip，解压后将 `kkagent` 放到 `PATH` 中即可。
+从 [GitHub Releases](https://github.com/Ken-u/kkagent/releases/latest) 下载对应平台的 tar.gz / zip，按 `SHA256SUMS` 校验后将 `kkagent` 放到 `PATH` 中即可。
 
 当前发布矩阵：
 
@@ -43,26 +45,25 @@ KKAGENT_INSTALL_DIR=$HOME/.local/bin sh install.sh
 |---|---|---|
 | macOS | x86_64 / arm64 | `kkagent-x86_64-apple-darwin.tar.gz` / `kkagent-aarch64-apple-darwin.tar.gz` |
 | Linux (glibc) | x86_64 / arm64 | `kkagent-x86_64-unknown-linux-gnu.tar.gz` / `kkagent-aarch64-unknown-linux-gnu.tar.gz` |
-| Linux (musl) | x86_64 / arm64 | `kkagent-x86_64-unknown-linux-musl.tar.gz` / `kkagent-aarch64-unknown-linux-musl.tar.gz` |
 | Windows | x86_64 / arm64 | `kkagent-x86_64-pc-windows-msvc.zip` / `kkagent-aarch64-pc-windows-msvc.zip` |
 
 ### Windows（PowerShell）
 
 ```powershell
-irm https://raw.githubusercontent.com/bianjinchen/kkagent/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/Ken-u/kkagent/main/install.ps1 | iex
 ```
 
 或先下载再执行：
 
 ```powershell
-curl -fsSLO https://raw.githubusercontent.com/bianjinchen/kkagent/main/install.ps1
+curl -fsSLO https://raw.githubusercontent.com/Ken-u/kkagent/main/install.ps1
 .\install.ps1
 ```
 
 默认安装到 `%LOCALAPPDATA%\Programs\kkagent`，可通过环境变量覆盖：
 
 ```powershell
-$env:KKAGENT_INSTALL_DIR = "$env:USERPROFILE\bin"; .\install.ps1
+$env:KKAGENT_INSTALL_DIR = "$env:USERPROFILE\bin"; .\install.ps1 -Version 0.2.0
 ```
 
 ## 30 秒上手
@@ -207,7 +208,7 @@ kkagent config preset safe
 ## 开发
 
 ```bash
-git clone https://github.com/bianjinchen/kkagent.git
+git clone https://github.com/Ken-u/kkagent.git
 cd kkagent
 
 cargo build --release --workspace

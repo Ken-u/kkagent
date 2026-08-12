@@ -1,10 +1,19 @@
 param(
-    [string]$InstallDir = $(if ($env:KKAGENT_INSTALL_DIR) { $env:KKAGENT_INSTALL_DIR } else { Join-Path $env:LOCALAPPDATA "Programs\kkagent" })
+    [string]$InstallDir = $(if ($env:KKAGENT_INSTALL_DIR) { $env:KKAGENT_INSTALL_DIR } else { Join-Path $env:LOCALAPPDATA "Programs\kkagent" }),
+    [string]$Version = $(if ($env:KKAGENT_VERSION) { $env:KKAGENT_VERSION } else { "latest" })
 )
 
 $ErrorActionPreference = "Stop"
-$repository = if ($env:KKAGENT_REPOSITORY) { $env:KKAGENT_REPOSITORY } else { "bianjinchen/kkagent" }
-$baseUrl = if ($env:KKAGENT_RELEASE_BASE_URL) { $env:KKAGENT_RELEASE_BASE_URL } else { "https://github.com/$repository/releases/latest/download" }
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+$repository = if ($env:KKAGENT_REPOSITORY) { $env:KKAGENT_REPOSITORY } else { "Ken-u/kkagent" }
+$baseUrl = if ($env:KKAGENT_RELEASE_BASE_URL) {
+    $env:KKAGENT_RELEASE_BASE_URL.TrimEnd("/")
+} elseif ($Version -eq "latest") {
+    "https://github.com/$repository/releases/latest/download"
+} else {
+    "https://github.com/$repository/releases/download/v$($Version.TrimStart('v'))"
+}
+$InstallDir = [System.IO.Path]::GetFullPath($InstallDir)
 $architecture = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
 $target = switch ($architecture) {
     "X64" { "x86_64-pc-windows-msvc" }
@@ -16,6 +25,7 @@ $tempDir = Join-Path ([System.IO.Path]::GetTempPath()) ("kkagent-install-" + [gu
 
 try {
     New-Item -ItemType Directory -Force $tempDir | Out-Null
+    Write-Host "Downloading kkagent $Version for $target..."
     Invoke-WebRequest -Uri "$baseUrl/$archive" -OutFile (Join-Path $tempDir $archive)
     Invoke-WebRequest -Uri "$baseUrl/SHA256SUMS" -OutFile (Join-Path $tempDir "SHA256SUMS")
     $line = Get-Content (Join-Path $tempDir "SHA256SUMS") | Where-Object { $_ -match "\s+$([regex]::Escape($archive))$" } | Select-Object -First 1
@@ -31,7 +41,7 @@ try {
     Move-Item (Join-Path $InstallDir "kkagent.exe.new") (Join-Path $InstallDir "kkagent.exe") -Force
     $kkPath = Join-Path $InstallDir "kk.exe"
     if (Test-Path $kkPath) { Remove-Item -Force $kkPath }
-    New-Item -ItemType SymbolicLink -Path $kkPath -Target (Join-Path $InstallDir "kkagent.exe") | Out-Null
+    Copy-Item (Join-Path $InstallDir "kkagent.exe") $kkPath -Force
 
     $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
     $parts = @($userPath -split ";" | Where-Object { $_ })
@@ -39,7 +49,7 @@ try {
         [Environment]::SetEnvironmentVariable("Path", (($parts + $InstallDir) -join ";"), "User")
         Write-Host "Added $InstallDir to the user PATH; open a new terminal to use it."
     }
-    Write-Host "Installed kkagent to $(Join-Path $InstallDir 'kkagent.exe') and linked kk.exe -> kkagent.exe"
+    Write-Host "Installed kkagent and kk to $InstallDir"
     & (Join-Path $InstallDir "kkagent.exe") --version
 }
 finally {

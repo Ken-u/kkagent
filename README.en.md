@@ -2,8 +2,8 @@
 
 English | [简体中文](README.md)
 
-[![CI](https://github.com/bianjinchen/kkagent/actions/workflows/ci.yml/badge.svg)](https://github.com/bianjinchen/kkagent/actions/workflows/ci.yml)
-[![Release](https://github.com/bianjinchen/kkagent/actions/workflows/release.yml/badge.svg)](https://github.com/bianjinchen/kkagent/actions/workflows/release.yml)
+[![CI](https://github.com/Ken-u/kkagent/actions/workflows/ci.yml/badge.svg)](https://github.com/Ken-u/kkagent/actions/workflows/ci.yml)
+[![Release](https://github.com/Ken-u/kkagent/actions/workflows/release.yml/badge.svg)](https://github.com/Ken-u/kkagent/actions/workflows/release.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust: 1.88+](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org/)
 
@@ -23,19 +23,21 @@ The TUI and Agent Server are decoupled and communicate over RPC (default: in-pro
 ### macOS / Linux (recommended)
 
 ```bash
-curl -fsSLO https://raw.githubusercontent.com/bianjinchen/kkagent/main/install.sh
-sh install.sh
+curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/Ken-u/kkagent/main/install.sh | sh
 ```
 
-The script installs to `/usr/local/bin` by default. Override it with an environment variable:
+The installer detects macOS/Linux and x86_64/arm64, downloads the latest Release, and verifies its SHA-256 checksum. It uses `/usr/local/bin` when writable and otherwise falls back to `~/.local/bin`. You can also pin the directory and version:
 
 ```bash
-KKAGENT_INSTALL_DIR=$HOME/.local/bin sh install.sh
+curl --proto '=https' --tlsv1.2 -fsSLO https://raw.githubusercontent.com/Ken-u/kkagent/main/install.sh
+KKAGENT_INSTALL_DIR="$HOME/bin" KKAGENT_VERSION=0.2.0 sh install.sh
 ```
+
+Rerun the same installer command to upgrade. The TUI checks GitHub Releases in the background at most once every 24 hours and only displays a notice; set `[ui] check_updates = false` to disable it.
 
 ### Manual download
 
-Download the archive for your platform from [GitHub Releases](https://github.com/bianjinchen/kkagent/releases/latest), extract it, and place `kkagent` on your `PATH`.
+Download the archive for your platform from [GitHub Releases](https://github.com/Ken-u/kkagent/releases/latest), verify it against `SHA256SUMS`, extract it, and place `kkagent` on your `PATH`.
 
 Current release matrix:
 
@@ -43,26 +45,25 @@ Current release matrix:
 |---|---|---|
 | macOS | x86_64 / arm64 | `kkagent-x86_64-apple-darwin.tar.gz` / `kkagent-aarch64-apple-darwin.tar.gz` |
 | Linux (glibc) | x86_64 / arm64 | `kkagent-x86_64-unknown-linux-gnu.tar.gz` / `kkagent-aarch64-unknown-linux-gnu.tar.gz` |
-| Linux (musl) | x86_64 / arm64 | `kkagent-x86_64-unknown-linux-musl.tar.gz` / `kkagent-aarch64-unknown-linux-musl.tar.gz` |
 | Windows | x86_64 / arm64 | `kkagent-x86_64-pc-windows-msvc.zip` / `kkagent-aarch64-pc-windows-msvc.zip` |
 
 ### Windows (PowerShell)
 
 ```powershell
-irm https://raw.githubusercontent.com/bianjinchen/kkagent/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/Ken-u/kkagent/main/install.ps1 | iex
 ```
 
 Or download first and then execute:
 
 ```powershell
-curl -fsSLO https://raw.githubusercontent.com/bianjinchen/kkagent/main/install.ps1
+curl -fsSLO https://raw.githubusercontent.com/Ken-u/kkagent/main/install.ps1
 .\install.ps1
 ```
 
 The script installs to `%LOCALAPPDATA%\Programs\kkagent` by default. Override it with an environment variable:
 
 ```powershell
-$env:KKAGENT_INSTALL_DIR = "$env:USERPROFILE\bin"; .\install.ps1
+$env:KKAGENT_INSTALL_DIR = "$env:USERPROFILE\bin"; .\install.ps1 -Version 0.2.0
 ```
 
 ## 30-Second Quickstart
@@ -207,7 +208,7 @@ For the full list of config options, providers, models, MCP, and hooks, see [doc
 ## Development
 
 ```bash
-git clone https://github.com/bianjinchen/kkagent.git
+git clone https://github.com/Ken-u/kkagent.git
 cd kkagent
 
 cargo build --release --workspace

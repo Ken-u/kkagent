@@ -1276,6 +1276,9 @@ impl TuiApp {
         {
             self.system_message(hint);
         }
+        if self.config.ui.check_updates && crate::version_check::cache_is_stale() {
+            self.jobs.spawn_version_check();
+        }
 
         // Sync CLI / config plan mode onto the server session (create starts with plan_mode=false).
         if self.state.plan_mode {
@@ -1773,6 +1776,21 @@ impl TuiApp {
                     self.jobs.mark_done(channel, generation);
                     self.apply_local_shell_result(&command, result);
                 }
+                crate::async_jobs::JobPayload::VersionCheck { result } => match result {
+                    Ok(release) => {
+                        let already_shown = crate::version_check::release_is_cached(&release);
+                        crate::version_check::record_latest(&release);
+                        if !already_shown {
+                            if let Some(hint) = crate::version_check::newer_release_hint(
+                                env!("CARGO_PKG_VERSION"),
+                                &release,
+                            ) {
+                                self.system_message(hint);
+                            }
+                        }
+                    }
+                    Err(error) => crate::version_check::record_check_error(&error),
+                },
             }
         }
     }
