@@ -25,6 +25,8 @@ use crate::slash::{
     is_slash_name_completion, parse_slash_input, SlashSuggestion,
 };
 
+pub const TOOL_EXPAND_TURNS: usize = 5;
+
 pub struct TuiApp {
     config: AppConfig,
     config_path: PathBuf,
@@ -67,6 +69,10 @@ pub struct AppState {
     pub follow_bottom: bool,
     /// Line index (from top) where each `messages[i]` starts — updated each frame.
     pub message_line_starts: Vec<u16>,
+    /// Global Ctrl-O display mode for expandable tool output.
+    pub tool_output_expanded: bool,
+    /// Expand/collapse hints rendered on the last transcript frame.
+    pub tool_expand_hits: Vec<ToolExpandHit>,
     /// Last rendered transcript area (for mouse → cell mapping).
     pub transcript_area: ratatui::layout::Rect,
     /// Footer chrome area (status + session strip).
@@ -312,6 +318,8 @@ impl SessionRuntimeState {
                 | SessionStatus::Compacting
                 | SessionStatus::Cancelling
         );
+        state.apply_tool_output_mode();
+        state.tool_expand_hits.clear();
     }
 }
 
@@ -487,7 +495,22 @@ pub struct ToolHistorySummary {
     pub duration_ms: u64,
     pub tokens: u64,
     pub expanded: bool,
+    /// A mouse click makes this item independent from the global Ctrl-O mode.
+    pub user_overridden: bool,
     pub tools: Vec<DisplayToolCall>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolExpandTarget {
+    Part { message: usize, part: usize },
+    Legacy { message: usize, tool: usize },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ToolExpandHit {
+    /// Absolute visual transcript line, before viewport scrolling.
+    pub line: usize,
+    pub target: ToolExpandTarget,
 }
 
 impl DisplayMessage {
@@ -620,6 +643,8 @@ pub struct DisplayToolCall {
     pub output: Option<String>,
     pub is_error: bool,
     pub collapsed: bool,
+    /// A mouse click makes this item independent from the global Ctrl-O mode.
+    pub user_overridden: bool,
     pub started_at: Option<std::time::Instant>,
     pub stopping: bool,
 }
@@ -790,6 +815,8 @@ impl AppState {
             viewport_height: 0,
             follow_bottom: true,
             message_line_starts: Vec::new(),
+            tool_output_expanded: false,
+            tool_expand_hits: Vec::new(),
             transcript_area: ratatui::layout::Rect::default(),
             footer_area: ratatui::layout::Rect::default(),
             session_strip_hits: Vec::new(),
@@ -948,7 +975,38 @@ impl AppState {
             .map(|i| i + 1)
             .unwrap_or(0);
         let end = self.messages.len();
-        collapse_tools_in_turn(&mut self.messages, start, end, duration_ms, tokens);
+        collapse_tools_in_turn(
+            &mut self.messages,
+            start,
+            end,
+            duration_ms,
+            tokens,
+            self.tool_output_expanded,
+        );
+    }
+
+    /// Apply the global tool-output mode to unmodified items in the most recent
+    /// `TOOL_EXPAND_TURNS` user turns.
+    pub fn apply_tool_output_mode(&mut self) {
+        let cutoff = recent_turn_cutoff(&self.messages, TOOL_EXPAND_TURNS);
+        for message in &mut self.messages[cutoff..] {
+            for part in &mut message.parts {
+                match part {
+                    DisplayPart::Tool(tool) if !tool.user_overridden => {
+                        tool.collapsed = !self.tool_output_expanded;
+                    }
+                    DisplayPart::ToolHistory(history) if !history.user_overridden => {
+                        history.expanded = self.tool_output_expanded;
+                    }
+                    _ => {}
+                }
+            }
+            for tool in &mut message.tool_calls {
+                if !tool.user_overridden {
+                    tool.collapsed = !self.tool_output_expanded;
+                }
+            }
+        }
     }
 
     pub fn max_scroll_up(&self) -> u16 {
@@ -2065,6 +2123,10 @@ impl TuiApp {
             MouseEventKind::Down(MouseButton::Left) => {
                 self.flush_pending_scroll(scroll_delta);
                 if let Some(pos) = self.mouse_to_cell(&mouse) {
+                    if self.toggle_clicked_tool_output(pos.line) {
+                        self.clear_selection();
+                        return;
+                    }
                     self.state.selection = Some(crate::selection::TextSelection::new(pos));
                     self.state.selection_dragging = true;
                 } else {
@@ -2111,6 +2173,46 @@ impl TuiApp {
             && mouse.column >= area.x
             && mouse.column < area.x.saturating_add(area.width)
             && !self.state.session_strip_hits.is_empty()
+    }
+
+    fn toggle_clicked_tool_output(&mut self, line: usize) -> bool {
+        let Some(hit) = self
+            .state
+            .tool_expand_hits
+            .iter()
+            .find(|hit| hit.line == line)
+            .copied()
+        else {
+            return false;
+        };
+        let Some(message) = self.state.messages.get_mut(match hit.target {
+            ToolExpandTarget::Part { message, .. } | ToolExpandTarget::Legacy { message, .. } => {
+                message
+            }
+        }) else {
+            return false;
+        };
+        match hit.target {
+            ToolExpandTarget::Part { part, .. } => match message.parts.get_mut(part) {
+                Some(DisplayPart::Tool(tool)) => {
+                    tool.collapsed = !tool.collapsed;
+                    tool.user_overridden = true;
+                }
+                Some(DisplayPart::ToolHistory(history)) => {
+                    history.expanded = !history.expanded;
+                    history.user_overridden = true;
+                }
+                _ => return false,
+            },
+            ToolExpandTarget::Legacy { tool, .. } => {
+                let Some(tool) = message.tool_calls.get_mut(tool) else {
+                    return false;
+                };
+                tool.collapsed = !tool.collapsed;
+                tool.user_overridden = true;
+            }
+        }
+        true
     }
 
     fn hit_session_strip(&self, column: u16) -> Option<&crate::chrome::SessionStripHit> {
@@ -3306,6 +3408,7 @@ impl TuiApp {
                 let undone = data.get("undone").and_then(|v| v.as_u64()).unwrap_or(0);
                 if let Some(msgs) = data.get("messages").and_then(|v| v.as_array()) {
                     self.state.messages = transcript_messages_to_display(msgs);
+                    self.state.apply_tool_output_mode();
                     self.state.active_assistant_message = None;
                 }
                 self.state.thinking_text.clear();
@@ -4739,7 +4842,7 @@ impl TuiApp {
             ListPickerItem {
                 id: "history".into(),
                 label: "Ctrl-O / Ctrl-T / Ctrl-P/N".into(),
-                detail: "Tool history · todos · input history".into(),
+                detail: "Recent tool output · todos · input history".into(),
             },
         ];
         self.replace_list_picker(ListPickerState {
@@ -5535,6 +5638,7 @@ impl TuiApp {
 
         if let Some(msgs) = data.get("messages").and_then(|v| v.as_array()) {
             self.state.messages = transcript_messages_to_display(msgs);
+            self.state.apply_tool_output_mode();
             self.state.active_assistant_message = None;
         }
         if let Some(todos) = data.get("todos").and_then(|value| value.as_array()) {
@@ -5721,6 +5825,7 @@ impl TuiApp {
         let mut merged = older;
         merged.append(&mut self.state.messages);
         self.state.messages = merged;
+        self.state.apply_tool_output_mode();
         self.state.active_assistant_message = self
             .state
             .active_assistant_message
@@ -7811,7 +7916,8 @@ impl TuiApp {
                             input_summary: summary,
                             output: None,
                             is_error: false,
-                            collapsed: true,
+                            collapsed: !self.state.tool_output_expanded,
+                            user_overridden: false,
                         };
                         if let Some(message) = self
                             .state
@@ -8147,6 +8253,7 @@ impl TuiApp {
                             ));
                         } else {
                             self.state.messages = transcript_messages_to_display(&messages);
+                            self.state.apply_tool_output_mode();
                             self.state.active_assistant_message = None;
                             self.state.follow_bottom = true;
                             self.state.scroll_up = 0;
@@ -8231,26 +8338,8 @@ impl TuiApp {
     }
 
     fn toggle_tool_folding(&mut self) {
-        // Prefer expanding/collapsing the latest turn tool-history overview.
-        for msg in self.state.messages.iter_mut().rev() {
-            for part in msg.parts.iter_mut().rev() {
-                if let DisplayPart::ToolHistory(hist) = part {
-                    hist.expanded = !hist.expanded;
-                    return;
-                }
-            }
-        }
-        // Fallback: toggle per-tool output folding while a turn is still live.
-        for msg in &mut self.state.messages {
-            for part in &mut msg.parts {
-                if let DisplayPart::Tool(tc) = part {
-                    tc.collapsed = !tc.collapsed;
-                }
-            }
-            for tc in &mut msg.tool_calls {
-                tc.collapsed = !tc.collapsed;
-            }
-        }
+        self.state.tool_output_expanded = !self.state.tool_output_expanded;
+        self.state.apply_tool_output_mode();
     }
 }
 
@@ -8429,6 +8518,7 @@ fn collapse_tools_in_turn(
     end: usize,
     duration_ms: u64,
     tokens: u64,
+    expanded: bool,
 ) {
     if start >= messages.len() || start >= end {
         return;
@@ -8464,7 +8554,8 @@ fn collapse_tools_in_turn(
         tool_count: collected.len() as u32,
         duration_ms,
         tokens,
-        expanded: false,
+        expanded,
+        user_overridden: false,
         tools: collected,
     });
 
@@ -8526,8 +8617,22 @@ fn collapse_all_historical_turn_tools(messages: &mut Vec<DisplayMessage>) {
 
     // Reverse so an insert at a later turn does not shift earlier ranges.
     for (start, end) in ranges.into_iter().rev() {
-        collapse_tools_in_turn(messages, start, end, 0, 0);
+        collapse_tools_in_turn(messages, start, end, 0, 0, false);
     }
+}
+
+fn recent_turn_cutoff(messages: &[DisplayMessage], turns: usize) -> usize {
+    if turns == 0 {
+        return messages.len();
+    }
+    messages
+        .iter()
+        .enumerate()
+        .rev()
+        .filter(|(_, message)| message.role == MessageRole::User)
+        .nth(turns.saturating_sub(1))
+        .map(|(index, _)| index)
+        .unwrap_or(0)
 }
 
 /// True when the transcript has user/assistant/plan content worth keeping.
@@ -8683,6 +8788,7 @@ fn transcript_messages_to_display(msgs: &[serde_json::Value]) -> Vec<DisplayMess
                                 output: None,
                                 is_error: false,
                                 collapsed: true,
+                                user_overridden: false,
                             }));
                         }
                         _ => {}
@@ -9831,6 +9937,7 @@ mod app_state_tests {
             output: Some("ok".into()),
             is_error: false,
             collapsed: true,
+            user_overridden: false,
         }));
         asst.parts.push(DisplayPart::Tool(DisplayToolCall {
             id: String::new(),
@@ -9841,6 +9948,7 @@ mod app_state_tests {
             output: Some("x".into()),
             is_error: false,
             collapsed: true,
+            user_overridden: false,
         }));
         asst.parts.push(DisplayPart::Text("done".into()));
         state.messages.push(asst);
@@ -9852,6 +9960,248 @@ mod app_state_tests {
         );
         assert!(matches!(parts.last(), Some(DisplayPart::Text(t)) if t == "done"));
         assert!(!parts.iter().any(|p| matches!(p, DisplayPart::Tool(_))));
+    }
+
+    fn tool_history_message(id: usize) -> DisplayMessage {
+        DisplayMessage {
+            role: MessageRole::Assistant,
+            content: String::new(),
+            thinking: None,
+            parts: vec![DisplayPart::ToolHistory(ToolHistorySummary {
+                tool_count: 1,
+                duration_ms: 0,
+                tokens: 0,
+                expanded: false,
+                user_overridden: false,
+                tools: vec![DisplayToolCall {
+                    id: format!("tool-{id}"),
+                    name: "Bash".into(),
+                    input_summary: "printf test".into(),
+                    output: Some("one\ntwo".into()),
+                    is_error: false,
+                    collapsed: true,
+                    user_overridden: false,
+                    started_at: None,
+                    stopping: false,
+                }],
+            })],
+            tool_calls: Vec::new(),
+            delivery: crate::prompt_queue::DeliveryState::Sent,
+            idempotency_key: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn ctrl_o_updates_only_the_latest_five_turns_and_live_tools() {
+        let mut app = test_tui_app();
+        for turn in 0..6 {
+            app.state.messages.push(DisplayMessage {
+                role: MessageRole::User,
+                content: format!("turn {turn}"),
+                thinking: None,
+                parts: Vec::new(),
+                tool_calls: Vec::new(),
+                delivery: crate::prompt_queue::DeliveryState::Sent,
+                idempotency_key: None,
+            });
+            app.state.messages.push(tool_history_message(turn));
+        }
+        if let Some(DisplayPart::ToolHistory(history)) =
+            app.state.messages.last_mut().unwrap().parts.first_mut()
+        {
+            let mut live = history.tools[0].clone();
+            live.id = "live-tool".into();
+            app.state
+                .messages
+                .last_mut()
+                .unwrap()
+                .parts
+                .push(DisplayPart::Tool(live));
+        }
+
+        app.toggle_tool_folding();
+
+        let histories = app
+            .state
+            .messages
+            .iter()
+            .flat_map(|message| message.parts.iter())
+            .filter_map(|part| match part {
+                DisplayPart::ToolHistory(history) => Some(history),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(histories.len(), 6);
+        assert!(
+            !histories[0].expanded,
+            "the sixth-oldest turn is outside the window"
+        );
+        assert!(histories[1..].iter().all(|history| history.expanded));
+        assert!(matches!(
+            app.state.messages.last().unwrap().parts.last(),
+            Some(DisplayPart::Tool(tool)) if !tool.collapsed
+        ));
+
+        app.toggle_tool_folding();
+        assert!(app
+            .state
+            .messages
+            .iter()
+            .flat_map(|message| message.parts.iter())
+            .filter_map(|part| match part {
+                DisplayPart::ToolHistory(history) => Some(history),
+                _ => None,
+            })
+            .all(|history| !history.expanded));
+    }
+
+    #[tokio::test]
+    async fn clicking_tool_hint_creates_a_persistent_per_item_override() {
+        let mut app = test_tui_app();
+        app.state.messages.push(DisplayMessage {
+            role: MessageRole::User,
+            content: "run it".into(),
+            thinking: None,
+            parts: Vec::new(),
+            tool_calls: Vec::new(),
+            delivery: crate::prompt_queue::DeliveryState::Sent,
+            idempotency_key: None,
+        });
+        app.state.messages.push(tool_history_message(0));
+        app.state.transcript_area = ratatui::layout::Rect::new(0, 0, 80, 10);
+        app.state.content_lines = 20;
+        app.state.viewport_height = 10;
+        app.state.scroll_up = 5;
+        app.state.tool_expand_hits.push(ToolExpandHit {
+            line: 7,
+            target: ToolExpandTarget::Part {
+                message: 1,
+                part: 0,
+            },
+        });
+
+        let mut scroll_delta = 0;
+        app.collect_mouse(
+            crossterm::event::MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 10,
+                row: 2,
+                modifiers: KeyModifiers::NONE,
+            },
+            &mut scroll_delta,
+        );
+
+        let history = match &app.state.messages[1].parts[0] {
+            DisplayPart::ToolHistory(history) => history,
+            _ => panic!("expected tool history"),
+        };
+        assert!(history.expanded);
+        assert!(history.user_overridden);
+        assert!(app.state.selection.is_none());
+
+        app.toggle_tool_folding();
+        app.toggle_tool_folding();
+        let history = match &app.state.messages[1].parts[0] {
+            DisplayPart::ToolHistory(history) => history,
+            _ => panic!("expected tool history"),
+        };
+        assert!(
+            history.expanded,
+            "global Ctrl-O must not reset a mouse override"
+        );
+    }
+
+    #[tokio::test]
+    async fn clicking_a_live_tool_hint_toggles_only_that_tool() {
+        let mut app = test_tui_app();
+        let mut first = match tool_history_message(0).parts.remove(0) {
+            DisplayPart::ToolHistory(history) => history.tools.into_iter().next().unwrap(),
+            _ => unreachable!(),
+        };
+        first.id = "first".into();
+        let mut second = first.clone();
+        second.id = "second".into();
+        app.state.messages.push(DisplayMessage {
+            role: MessageRole::Assistant,
+            content: String::new(),
+            thinking: None,
+            parts: vec![DisplayPart::Tool(first), DisplayPart::Tool(second)],
+            tool_calls: Vec::new(),
+            delivery: crate::prompt_queue::DeliveryState::Sent,
+            idempotency_key: None,
+        });
+        app.state.transcript_area = ratatui::layout::Rect::new(0, 0, 80, 10);
+        app.state.content_lines = 10;
+        app.state.viewport_height = 10;
+        app.state.tool_expand_hits.push(ToolExpandHit {
+            line: 1,
+            target: ToolExpandTarget::Part {
+                message: 0,
+                part: 0,
+            },
+        });
+
+        let mut scroll_delta = 0;
+        app.collect_mouse(
+            crossterm::event::MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 5,
+                row: 1,
+                modifiers: KeyModifiers::NONE,
+            },
+            &mut scroll_delta,
+        );
+
+        assert!(matches!(
+            &app.state.messages[0].parts[0],
+            DisplayPart::Tool(tool) if !tool.collapsed && tool.user_overridden
+        ));
+        assert!(matches!(
+            &app.state.messages[0].parts[1],
+            DisplayPart::Tool(tool) if tool.collapsed && !tool.user_overridden
+        ));
+        app.toggle_tool_folding();
+        app.toggle_tool_folding();
+        assert!(matches!(
+            &app.state.messages[0].parts[0],
+            DisplayPart::Tool(tool) if !tool.collapsed
+        ));
+    }
+
+    #[test]
+    fn completed_tool_history_inherits_the_global_expand_mode() {
+        let mut state = AppState::new(PermissionMode::Manual, false);
+        state.tool_output_expanded = true;
+        state.messages.push(DisplayMessage {
+            role: MessageRole::User,
+            content: "run it".into(),
+            thinking: None,
+            parts: Vec::new(),
+            tool_calls: Vec::new(),
+            delivery: crate::prompt_queue::DeliveryState::Sent,
+            idempotency_key: None,
+        });
+        let mut assistant = tool_history_message(0);
+        assistant.parts = assistant
+            .parts
+            .into_iter()
+            .flat_map(|part| match part {
+                DisplayPart::ToolHistory(history) => history
+                    .tools
+                    .into_iter()
+                    .map(DisplayPart::Tool)
+                    .collect::<Vec<_>>(),
+                other => vec![other],
+            })
+            .collect();
+        state.messages.push(assistant);
+
+        state.collapse_completed_turn_tools();
+
+        assert!(matches!(
+            state.messages[1].parts.first(),
+            Some(DisplayPart::ToolHistory(history)) if history.expanded
+        ));
     }
 
     #[test]
@@ -9926,6 +10276,7 @@ mod app_state_tests {
                     output: None,
                     is_error: false,
                     collapsed: true,
+                    user_overridden: false,
                     started_at: None,
                     stopping: false,
                 }),
@@ -9936,6 +10287,7 @@ mod app_state_tests {
                     output: None,
                     is_error: false,
                     collapsed: true,
+                    user_overridden: false,
                     started_at: None,
                     stopping: false,
                 }),

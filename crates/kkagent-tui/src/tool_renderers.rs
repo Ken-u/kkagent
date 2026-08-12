@@ -209,13 +209,13 @@ fn media_summary(
     max_preview: usize,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
-    lines.extend(default_summary(output, width, theme, max_preview.min(6)));
+    lines.extend(default_summary(output, width, theme, max_preview));
     lines
 }
 
 fn goal_summary(output: &str, width: u16, theme: &Theme, max_preview: usize) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
-    lines.extend(default_summary(output, width, theme, max_preview.min(8)));
+    lines.extend(default_summary(output, width, theme, max_preview));
     lines
 }
 
@@ -270,6 +270,7 @@ mod tests {
             output: None,
             is_error: false,
             collapsed: true,
+            user_overridden: false,
         };
         let label = ToolRenderRegistry::chip_label(&tc, 80);
         assert!(UnicodeWidthStr::width(label.as_str()) <= 80);

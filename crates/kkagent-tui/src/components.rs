@@ -11,7 +11,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::{
     AppMode, AppState, DisplayPart, ListPickerState, MessageRole, PendingApproval, PendingQuestion,
-    TodoItem, ToolHistorySummary,
+    TodoItem, ToolExpandHit, ToolExpandTarget, ToolHistorySummary,
 };
 use crate::git_badge;
 use crate::i18n::{self, Locale};
@@ -298,8 +298,10 @@ fn render_messages(f: &mut Frame, area: Rect, state: &mut AppState, theme: &Them
 fn build_transcript_lines(state: &mut AppState, theme: &Theme, width: u16) -> Vec<Line<'static>> {
     let mut lines: Vec<Line> = Vec::new();
     state.message_line_starts.clear();
+    state.tool_expand_hits.clear();
     state.render_cache.clear_if_width_changed(width);
     let mut render_cache = std::mem::take(&mut state.render_cache);
+    let mut tool_expand_hits = Vec::new();
 
     let browsing_sessions = state
         .list_picker
@@ -328,6 +330,8 @@ fn build_transcript_lines(state: &mut AppState, theme: &Theme, width: u16) -> Ve
         None
     };
     let messages: &[crate::app::DisplayMessage] = browse_msgs.unwrap_or(&state.messages);
+    let interactive_tools = browse_msgs.is_none();
+    let locale = state.locale;
 
     if messages.is_empty() {
         if browsing_sessions {
@@ -496,15 +500,15 @@ fn build_transcript_lines(state: &mut AppState, theme: &Theme, width: u16) -> Ve
                 let mut first_bullet = true;
                 let mut rendered_any = false;
 
-                let parts: Vec<&DisplayPart> = if !msg.parts.is_empty() {
-                    msg.parts.iter().collect()
+                let parts: Vec<(usize, &DisplayPart)> = if !msg.parts.is_empty() {
+                    msg.parts.iter().enumerate().collect()
                 } else {
                     // Legacy fallback: tools then content (prefer tools above text).
                     Vec::new()
                 };
 
                 if !parts.is_empty() {
-                    for part in parts {
+                    for (part_idx, part) in parts {
                         match part {
                             DisplayPart::Text(text) => {
                                 if text.is_empty() {
@@ -521,19 +525,45 @@ fn build_transcript_lines(state: &mut AppState, theme: &Theme, width: u16) -> Ve
                                 rendered_any = true;
                             }
                             DisplayPart::Tool(tc) => {
-                                render_tool_call_lines(&mut lines, tc, width, theme, first_bullet);
+                                if let Some(line) = render_tool_call_lines(
+                                    &mut lines,
+                                    tc,
+                                    width,
+                                    theme,
+                                    first_bullet,
+                                    true,
+                                ) {
+                                    if interactive_tools {
+                                        tool_expand_hits.push(ToolExpandHit {
+                                            line,
+                                            target: ToolExpandTarget::Part {
+                                                message: msg_idx,
+                                                part: part_idx,
+                                            },
+                                        });
+                                    }
+                                }
                                 first_bullet = false;
                                 rendered_any = true;
                             }
                             DisplayPart::ToolHistory(hist) => {
-                                render_tool_history_lines(
+                                let line = render_tool_history_lines(
                                     &mut lines,
                                     hist,
                                     width,
                                     theme,
-                                    state.locale,
+                                    locale,
                                     first_bullet,
                                 );
+                                if interactive_tools {
+                                    tool_expand_hits.push(ToolExpandHit {
+                                        line,
+                                        target: ToolExpandTarget::Part {
+                                            message: msg_idx,
+                                            part: part_idx,
+                                        },
+                                    });
+                                }
                                 first_bullet = false;
                                 rendered_any = true;
                             }
@@ -552,8 +582,20 @@ fn build_transcript_lines(state: &mut AppState, theme: &Theme, width: u16) -> Ve
                     }
                 } else {
                     // Fallback for old messages without parts: tools first, then content.
-                    for tc in &msg.tool_calls {
-                        render_tool_call_lines(&mut lines, tc, width, theme, first_bullet);
+                    for (tool_idx, tc) in msg.tool_calls.iter().enumerate() {
+                        if let Some(line) =
+                            render_tool_call_lines(&mut lines, tc, width, theme, first_bullet, true)
+                        {
+                            if interactive_tools {
+                                tool_expand_hits.push(ToolExpandHit {
+                                    line,
+                                    target: ToolExpandTarget::Legacy {
+                                        message: msg_idx,
+                                        tool: tool_idx,
+                                    },
+                                });
+                            }
+                        }
                         first_bullet = false;
                         rendered_any = true;
                     }
@@ -650,6 +692,7 @@ fn build_transcript_lines(state: &mut AppState, theme: &Theme, width: u16) -> Ve
     }
 
     state.render_cache = render_cache;
+    state.tool_expand_hits = tool_expand_hits;
     lines
 }
 
@@ -700,7 +743,8 @@ fn render_tool_call_lines(
     width: u16,
     theme: &Theme,
     first_bullet: bool,
-) {
+    include_toggle_hint: bool,
+) -> Option<usize> {
     use crate::tool_renderers::ToolRenderRegistry;
 
     if first_bullet {
@@ -729,14 +773,32 @@ fn render_tool_call_lines(
     }
 
     if !tc.collapsed {
-        lines.extend(ToolRenderRegistry::summary_lines(tc, width, theme, 12));
-    } else if tc.output.as_ref().map(|o| o.lines().count()).unwrap_or(0) > 1 {
+        let max_preview = if include_toggle_hint { usize::MAX } else { 12 };
+        lines.extend(ToolRenderRegistry::summary_lines(
+            tc,
+            width,
+            theme,
+            max_preview,
+        ));
+        if include_toggle_hint && tc.output.as_ref().map(|o| o.lines().count()).unwrap_or(0) > 1 {
+            let line = lines.len();
+            lines.push(Line::from(Span::styled(
+                "  … (ctrl+o to collapse)",
+                Style::default().fg(theme.text_muted),
+            )));
+            return Some(line);
+        }
+    } else if include_toggle_hint && tc.output.as_ref().map(|o| o.lines().count()).unwrap_or(0) > 1
+    {
         let n = tc.output.as_ref().map(|o| o.lines().count()).unwrap_or(0);
+        let line = lines.len();
         lines.push(Line::from(Span::styled(
             format!("  … ({n} more lines, ctrl+o to expand)"),
             Style::default().fg(theme.text_muted),
         )));
+        return Some(line);
     }
+    None
 }
 
 const SKILL_ARGS_PREVIEW_MAX: usize = 200;
@@ -819,7 +881,7 @@ fn render_tool_history_lines(
     theme: &Theme,
     locale: Locale,
     first_bullet: bool,
-) {
+) -> usize {
     let explore_only = !hist.tools.is_empty()
         && hist
             .tools
@@ -836,6 +898,7 @@ fn render_tool_history_lines(
         i18n::tool_history_expand_hint(locale)
     };
     let prefix = if first_bullet { "● " } else { "  " };
+    let hint_line = lines.len();
     lines.push(Line::from(vec![
         Span::styled(prefix, Style::default().fg(theme.text_dim)),
         Span::styled(
@@ -849,9 +912,10 @@ fn render_tool_history_lines(
         for tc in &hist.tools {
             let mut shown = tc.clone();
             shown.collapsed = false;
-            render_tool_call_lines(lines, &shown, width, theme, false);
+            let _ = render_tool_call_lines(lines, &shown, width, theme, false, false);
         }
     }
+    hint_line
 }
 
 const TODO_MAX_VISIBLE: usize = 5;
@@ -2509,7 +2573,9 @@ fn shorten_path(path: &str) -> String {
 #[cfg(test)]
 mod render_smoke {
     use super::*;
-    use crate::app::AppState;
+    use crate::app::{
+        AppState, DisplayMessage, DisplayPart, DisplayToolCall, MessageRole, ToolHistorySummary,
+    };
     use kkagent_protocol::PermissionMode;
     use ratatui::{backend::TestBackend, Terminal};
 
@@ -2593,6 +2659,92 @@ mod render_smoke {
         assert!(!lines.is_empty());
         let lines2 = build_transcript_lines(&mut state, &theme, 1);
         assert!(!lines2.is_empty());
+    }
+
+    #[test]
+    fn transcript_records_click_targets_on_tool_toggle_hints() {
+        let mut state = AppState::new(PermissionMode::Manual, false);
+        state.messages.push(DisplayMessage {
+            role: MessageRole::Assistant,
+            content: String::new(),
+            thinking: None,
+            parts: vec![
+                DisplayPart::Tool(DisplayToolCall {
+                    id: "live".into(),
+                    name: "Bash".into(),
+                    input_summary: "printf test".into(),
+                    output: Some("one\ntwo".into()),
+                    is_error: false,
+                    collapsed: true,
+                    user_overridden: false,
+                    started_at: None,
+                    stopping: false,
+                }),
+                DisplayPart::ToolHistory(ToolHistorySummary {
+                    tool_count: 1,
+                    duration_ms: 10,
+                    tokens: 20,
+                    expanded: false,
+                    user_overridden: false,
+                    tools: Vec::new(),
+                }),
+            ],
+            tool_calls: Vec::new(),
+            delivery: crate::prompt_queue::DeliveryState::Sent,
+            idempotency_key: None,
+        });
+
+        let theme = Theme::default();
+        let lines = build_transcript_lines(&mut state, &theme, 80);
+
+        assert_eq!(state.tool_expand_hits.len(), 2);
+        for hit in &state.tool_expand_hits {
+            let text = lines[hit.line].to_string();
+            assert!(text.contains("ctrl+o to"), "unexpected hit line: {text}");
+        }
+    }
+
+    #[test]
+    fn expanded_live_tool_renders_full_output_and_a_clickable_collapse_hint() {
+        let mut state = AppState::new(PermissionMode::Manual, false);
+        let output = (1..=20)
+            .map(|line| format!("output line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        state.messages.push(DisplayMessage {
+            role: MessageRole::Assistant,
+            content: String::new(),
+            thinking: None,
+            parts: vec![DisplayPart::Tool(DisplayToolCall {
+                id: "live".into(),
+                name: "Bash".into(),
+                input_summary: "printf test".into(),
+                output: Some(output),
+                is_error: false,
+                collapsed: false,
+                user_overridden: true,
+                started_at: None,
+                stopping: false,
+            })],
+            tool_calls: Vec::new(),
+            delivery: crate::prompt_queue::DeliveryState::Sent,
+            idempotency_key: None,
+        });
+
+        let theme = Theme::default();
+        let lines = build_transcript_lines(&mut state, &theme, 80);
+        let text = lines
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(text.contains("output line 20"));
+        assert!(!text.contains("more lines, ctrl+o to expand"));
+        assert_eq!(state.tool_expand_hits.len(), 1);
+        assert!(lines[state.tool_expand_hits[0].line]
+            .to_string()
+            .contains("ctrl+o to collapse"));
     }
 
     #[test]
