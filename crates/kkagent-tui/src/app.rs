@@ -3463,45 +3463,57 @@ impl TuiApp {
         }
         let item = menu.items[menu.selected.min(menu.items.len() - 1)].clone();
         let needs_args = item.argument_hint.is_some();
-        let completed = format!("/{} ", item.name);
-        self.state.input.set_text(completed);
+        let opens_immediately = matches!(
+            item.name.as_str(),
+            "model"
+                | "sessions"
+                | "resume"
+                | "tasks"
+                | "task"
+                | "permission"
+                | "config"
+                | "provider"
+                | "providers"
+                | "effort"
+                | "thinking"
+                | "auth"
+                | "help"
+                | "h"
+                | "?"
+                | "info"
+                | "status"
+                | "usage"
+                | "doctor"
+                | "prompts"
+                | "prompt"
+                | "experimental-flags"
+                | "flags"
+                | "plugins"
+                | "plugin"
+                | "swarm"
+                | "mcp"
+                | "skills"
+        );
+
+        if !submit_if_ready || (needs_args && !opens_immediately) {
+            self.state.input.set_text(format!("/{} ", item.name));
+            self.state.slash_menu = None;
+            self.state.refresh_slash_menu();
+            return Ok(());
+        }
+
+        // Enter accepted this suggestion as a command. Consume the composer
+        // before any async work so partial text such as `/sess` cannot remain
+        // visible or come back from a persisted draft while the picker opens.
+        self.state.input.clear();
+        self.state.history_index = None;
+        self.state.history_draft.clear();
+        if let Some(session_id) = self.state.session_id.as_deref() {
+            crate::draft_store::clear_draft(session_id);
+        }
         self.state.slash_menu = None;
 
-        if submit_if_ready && !needs_args {
-            self.submit_input().await?;
-        } else if submit_if_ready
-            && matches!(
-                item.name.as_str(),
-                "model"
-                    | "sessions"
-                    | "resume"
-                    | "tasks"
-                    | "task"
-                    | "permission"
-                    | "config"
-                    | "provider"
-                    | "providers"
-                    | "effort"
-                    | "thinking"
-                    | "auth"
-                    | "help"
-                    | "h"
-                    | "?"
-                    | "info"
-                    | "status"
-                    | "usage"
-                    | "prompts"
-                    | "prompt"
-                    | "experimental-flags"
-                    | "flags"
-                    | "plugins"
-                    | "plugin"
-                    | "swarm"
-                    | "mcp"
-                    | "skills"
-            )
-        {
-            self.state.input.clear();
+        if opens_immediately {
             self.state.list_picker_stack.clear();
             self.state.session_picker_preview = None;
             self.state.session_delete_confirm = None;
@@ -3527,8 +3539,8 @@ impl TuiApp {
                 _ => {}
             }
         } else {
-            // Keep menu closed; user can type args. Re-open only for name completion.
-            self.state.refresh_slash_menu();
+            self.handle_slash_command(&format!("/{}", item.name))
+                .await?;
         }
         Ok(())
     }
@@ -9511,6 +9523,40 @@ mod app_state_tests {
 
         assert_eq!(app.state.mode, AppMode::Btw);
         assert!(app.state.btw.open);
+    }
+
+    #[tokio::test]
+    async fn accepted_partial_slash_command_clears_the_composer_immediately() {
+        let mut app = test_tui_app();
+        app.state.session_id = Some("session-slash".into());
+        app.state.input.set_text("/sess".into());
+        app.state.refresh_slash_menu();
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        assert!(app.state.input.is_empty());
+        assert!(app.state.slash_menu.is_none());
+        assert!(app
+            .state
+            .list_picker
+            .as_ref()
+            .is_some_and(|picker| picker.kind == ListPickerKind::Session));
+    }
+
+    #[tokio::test]
+    async fn partial_slash_command_that_needs_arguments_keeps_the_completion() {
+        let mut app = test_tui_app();
+        app.state.input.set_text("/comp".into());
+        app.state.refresh_slash_menu();
+
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        assert_eq!(app.state.input.text, "/compact ");
+        assert!(app.state.slash_menu.is_none());
     }
 
     #[tokio::test]
