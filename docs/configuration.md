@@ -42,7 +42,7 @@ custom_headers = { "X-Organization" = "example" }
 |---|---|
 | `type` | `anthropic`、`kimi`、`openai`/`openai-chat`、`openai-responses`、`google`/`google-genai`/`gemini`。下划线别名也被接受。 |
 | `api_key` | Provider 密钥。不要提交到 Git。 |
-| `base_url` | `http://` 或 `https://` URL；兼容端点可带或不带 `/v1`。 |
+| `base_url` | `http://` 或 `https://` URL；兼容端点可使用 `/v1`、`/v4` 等版本前缀，也可填写完整资源 endpoint。 |
 | `custom_headers` | 发送给上游的附加 HTTP Header。 |
 | `oauth` | 托管 OAuth 配置，通常由 `kkagent auth login` 管理。 |
 

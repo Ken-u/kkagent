@@ -878,7 +878,14 @@ fn push_strict_provider_message(
 
 pub(crate) fn api_endpoint(base_url: &str, resource: &str) -> String {
     let base = base_url.trim_end_matches('/');
-    if base.ends_with("/v1") {
+    if base.ends_with(&format!("/{resource}")) {
+        base.to_string()
+    } else if base
+        .rsplit('/')
+        .next()
+        .and_then(|segment| segment.strip_prefix('v'))
+        .is_some_and(|version| !version.is_empty() && version.chars().all(|ch| ch.is_ascii_digit()))
+    {
         format!("{base}/{resource}")
     } else {
         format!("{base}/v1/{resource}")
@@ -953,7 +960,8 @@ async fn upload_kimi_video(
 #[cfg(test)]
 mod tests {
     use super::{
-        anthropic_stream, google_stream, kimi_stream, openai_stream, push_strict_provider_message,
+        anthropic_stream, api_endpoint, google_stream, kimi_stream, openai_stream,
+        push_strict_provider_message,
     };
     use crate::types::{ChatContent, ChatMessage, LlmRequest, StreamEvent, ThinkingParams};
     use reqwest::Client;
@@ -967,6 +975,28 @@ mod tests {
     struct CapturedRequest {
         head: String,
         body: String,
+    }
+
+    #[test]
+    fn api_endpoint_preserves_versioned_and_complete_compatible_urls() {
+        assert_eq!(
+            api_endpoint("https://api.openai.com", "chat/completions"),
+            "https://api.openai.com/v1/chat/completions"
+        );
+        assert_eq!(
+            api_endpoint(
+                "https://open.bigmodel.cn/api/coding/paas/v4",
+                "chat/completions"
+            ),
+            "https://open.bigmodel.cn/api/coding/paas/v4/chat/completions"
+        );
+        assert_eq!(
+            api_endpoint(
+                "https://example.test/custom/chat/completions",
+                "chat/completions"
+            ),
+            "https://example.test/custom/chat/completions"
+        );
     }
 
     async fn capture_request(socket: &mut tokio::net::TcpStream) -> CapturedRequest {
