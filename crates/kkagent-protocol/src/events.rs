@@ -129,6 +129,15 @@ pub enum AgentEvent {
         agent_id: String,
         text: String,
     },
+    BtwRetry {
+        session_id: String,
+        agent_id: String,
+        retry_number: u32,
+        reason: String,
+        wait_seconds: u64,
+        remaining_seconds: u64,
+        initial: bool,
+    },
     BtwEnd {
         session_id: String,
         agent_id: String,
@@ -210,6 +219,7 @@ impl AgentEvent {
             | Self::SubagentChildEvent { session_id, .. }
             | Self::BtwDelta { session_id, .. }
             | Self::BtwThinkingDelta { session_id, .. }
+            | Self::BtwRetry { session_id, .. }
             | Self::BtwEnd { session_id, .. }
             | Self::McpAuthRequired { session_id, .. }
             | Self::CompactCompleted { session_id, .. }

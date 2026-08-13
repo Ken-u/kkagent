@@ -5,6 +5,7 @@ use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, RwLock as StdRwLock};
+use std::time::Duration;
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::AbortHandle;
 
@@ -3307,6 +3308,98 @@ fn mcp_status_json(snap: &kkagent_mcp::McpStatusSnapshot) -> serde_json::Value {
     })
 }
 
+fn btw_retry_delay(
+    attempt: u32,
+    server_retry_after: Option<Duration>,
+    rate_limited: bool,
+    rate_limit_base: Duration,
+) -> Duration {
+    server_retry_after.unwrap_or_else(|| {
+        let exponent = attempt.saturating_sub(1).min(5);
+        if rate_limited {
+            rate_limit_base.saturating_mul(1_u32 << exponent)
+        } else {
+            Duration::from_millis(200_u64.saturating_mul(1_u64 << exponent))
+        }
+    })
+}
+
+struct BtwRetryNotice<'a> {
+    session_id: &'a str,
+    agent_id: &'a str,
+    retry_number: u32,
+    reason: &'a str,
+    delay: Duration,
+    remaining: Duration,
+    initial: bool,
+}
+
+async fn send_btw_retry_notice(rpc_tx: &mpsc::Sender<Frame>, notice: BtwRetryNotice<'_>) {
+    let ceil_seconds = |duration: Duration| {
+        let milliseconds = duration.as_millis();
+        u64::try_from(milliseconds.saturating_add(999) / 1_000).unwrap_or(u64::MAX)
+    };
+    let _ = rpc_tx
+        .send(Frame::Event {
+            event: "agent".into(),
+            scope: None,
+            data: serde_json::to_value(AgentEvent::BtwRetry {
+                session_id: notice.session_id.to_string(),
+                agent_id: notice.agent_id.to_string(),
+                retry_number: notice.retry_number,
+                reason: notice.reason.to_string(),
+                wait_seconds: ceil_seconds(notice.delay),
+                remaining_seconds: ceil_seconds(notice.remaining),
+                initial: notice.initial,
+            })
+            .unwrap_or_default(),
+        })
+        .await;
+}
+
+async fn wait_for_btw_retry(
+    rpc_tx: &mpsc::Sender<Frame>,
+    session_id: &str,
+    agent_id: &str,
+    retry_number: u32,
+    reason: &str,
+    delay: Duration,
+    cancel: &AtomicBool,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + delay;
+    let mut displayed_seconds = u64::MAX;
+    let mut initial = true;
+    loop {
+        if cancel.load(std::sync::atomic::Ordering::SeqCst) {
+            return false;
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let remaining_seconds =
+            u64::try_from(remaining.as_millis().saturating_add(999) / 1_000).unwrap_or(u64::MAX);
+        if initial || remaining_seconds != displayed_seconds {
+            displayed_seconds = remaining_seconds;
+            send_btw_retry_notice(
+                rpc_tx,
+                BtwRetryNotice {
+                    session_id,
+                    agent_id,
+                    retry_number,
+                    reason,
+                    delay,
+                    remaining,
+                    initial,
+                },
+            )
+            .await;
+            initial = false;
+        }
+        if remaining.is_zero() {
+            return true;
+        }
+        tokio::time::sleep(remaining.min(Duration::from_millis(100))).await;
+    }
+}
+
 fn is_visible_user_turn_start(message: &ChatMessage) -> bool {
     message.role == "user"
         && message.content.iter().any(|content| match content {
@@ -4590,78 +4683,136 @@ async fn handle_rpc_call(
             let event_agent_id = agent_id.clone();
             let task_btw_service = btw_service.clone();
             tokio::spawn(async move {
-                let (stream_tx, mut stream_rx) =
-                    mpsc::channel::<kkagent_llm::types::StreamEvent>(256);
-                let stream_task = {
-                    let config = config.clone();
-                    let history = history;
-                    let prior = prior_turns;
-                    let question = q.clone();
-                    let cancel = cancel.clone();
-                    tokio::spawn(async move {
-                        SessionBtwService::stream_side_question(
-                            &config,
-                            &model_alias,
-                            &history,
-                            &prior,
-                            &question,
-                            stream_tx,
-                            cancel,
-                        )
-                        .await
-                    })
-                };
-
                 let mut answer = String::new();
                 let mut stream_error: Option<String> = None;
-                while let Some(evt) = stream_rx.recv().await {
-                    match evt {
-                        kkagent_llm::types::StreamEvent::TextDelta(text) => {
-                            answer.push_str(&text);
-                            let frame = Frame::Event {
-                                event: "agent".into(),
-                                scope: None,
-                                data: serde_json::to_value(AgentEvent::BtwDelta {
-                                    session_id: sid.clone(),
-                                    agent_id: event_agent_id.clone(),
-                                    text,
-                                })
-                                .unwrap_or_default(),
-                            };
-                            if rpc_tx.send(frame).await.is_err() {
-                                break;
-                            }
-                        }
-                        kkagent_llm::types::StreamEvent::ThinkingDelta(text) => {
-                            let frame = Frame::Event {
-                                event: "agent".into(),
-                                scope: None,
-                                data: serde_json::to_value(AgentEvent::BtwThinkingDelta {
-                                    session_id: sid.clone(),
-                                    agent_id: event_agent_id.clone(),
-                                    text,
-                                })
-                                .unwrap_or_default(),
-                            };
-                            if rpc_tx.send(frame).await.is_err() {
-                                break;
-                            }
-                        }
-                        kkagent_llm::types::StreamEvent::Error(message) => {
-                            stream_error = Some(message);
-                        }
-                        kkagent_llm::types::StreamEvent::RateLimited { message, .. } => {
-                            stream_error = Some(message);
-                        }
-                        kkagent_llm::types::StreamEvent::MessageEnd { .. } => {}
-                        _ => {}
-                    }
-                }
+                let max_attempts = config
+                    .loop_control
+                    .as_ref()
+                    .map(|control| control.max_attempts_per_step)
+                    .unwrap_or(3)
+                    .max(1);
+                let retry_base = Duration::from_secs(
+                    config
+                        .loop_control
+                        .as_ref()
+                        .map(|control| control.rate_limit_retry_base_seconds)
+                        .unwrap_or(5),
+                );
 
-                if let Err(e) = stream_task.await.unwrap_or(Ok(())) {
-                    if stream_error.is_none() {
-                        stream_error = Some(e.to_string());
+                for attempt in 1..=max_attempts {
+                    let (stream_tx, mut stream_rx) =
+                        mpsc::channel::<kkagent_llm::types::StreamEvent>(256);
+                    let stream_task = {
+                        let config = config.clone();
+                        let history = history.clone();
+                        let prior = prior_turns.clone();
+                        let question = q.clone();
+                        let model_alias = model_alias.clone();
+                        let cancel = cancel.clone();
+                        tokio::spawn(async move {
+                            SessionBtwService::stream_side_question(
+                                &config,
+                                &model_alias,
+                                &history,
+                                &prior,
+                                &question,
+                                stream_tx,
+                                cancel,
+                            )
+                            .await
+                        })
+                    };
+
+                    let mut attempt_error: Option<String> = None;
+                    let mut retry_after = None;
+                    let mut rate_limited = false;
+                    let mut emitted_output = false;
+                    let mut rpc_closed = false;
+                    while let Some(evt) = stream_rx.recv().await {
+                        match evt {
+                            kkagent_llm::types::StreamEvent::TextDelta(text) => {
+                                emitted_output = true;
+                                answer.push_str(&text);
+                                let frame = Frame::Event {
+                                    event: "agent".into(),
+                                    scope: None,
+                                    data: serde_json::to_value(AgentEvent::BtwDelta {
+                                        session_id: sid.clone(),
+                                        agent_id: event_agent_id.clone(),
+                                        text,
+                                    })
+                                    .unwrap_or_default(),
+                                };
+                                if rpc_tx.send(frame).await.is_err() {
+                                    rpc_closed = true;
+                                    break;
+                                }
+                            }
+                            kkagent_llm::types::StreamEvent::ThinkingDelta(text) => {
+                                emitted_output = true;
+                                let frame = Frame::Event {
+                                    event: "agent".into(),
+                                    scope: None,
+                                    data: serde_json::to_value(AgentEvent::BtwThinkingDelta {
+                                        session_id: sid.clone(),
+                                        agent_id: event_agent_id.clone(),
+                                        text,
+                                    })
+                                    .unwrap_or_default(),
+                                };
+                                if rpc_tx.send(frame).await.is_err() {
+                                    rpc_closed = true;
+                                    break;
+                                }
+                            }
+                            kkagent_llm::types::StreamEvent::Error(message) => {
+                                attempt_error = Some(message);
+                            }
+                            kkagent_llm::types::StreamEvent::RateLimited {
+                                message,
+                                retry_after: server_delay,
+                            } => {
+                                attempt_error = Some(message);
+                                retry_after = server_delay;
+                                rate_limited = true;
+                            }
+                            kkagent_llm::types::StreamEvent::MessageEnd { .. } => {}
+                            _ => {}
+                        }
                     }
+
+                    if let Err(error) = stream_task.await.unwrap_or(Ok(())) {
+                        if attempt_error.is_none() {
+                            attempt_error = Some(error.to_string());
+                        }
+                    }
+                    if rpc_closed {
+                        break;
+                    }
+
+                    let retryable = attempt_error.is_some()
+                        && !emitted_output
+                        && attempt < max_attempts
+                        && !cancel.load(std::sync::atomic::Ordering::SeqCst);
+                    if retryable {
+                        let delay = btw_retry_delay(attempt, retry_after, rate_limited, retry_base);
+                        let reason = attempt_error.as_deref().unwrap_or("LLM request failed");
+                        if wait_for_btw_retry(
+                            &rpc_tx,
+                            &sid,
+                            &event_agent_id,
+                            attempt,
+                            reason,
+                            delay,
+                            &cancel,
+                        )
+                        .await
+                        {
+                            continue;
+                        }
+                    }
+                    stream_error = attempt_error;
+                    break;
                 }
 
                 if stream_error.is_none()
@@ -5791,6 +5942,57 @@ mod http_path_tests {
         assert!(locks.is_busy("session").await);
         drop(permit);
         assert!(!locks.is_busy("session").await);
+    }
+
+    #[test]
+    fn btw_rate_limit_backoff_matches_main_agent_policy() {
+        let base = Duration::from_secs(5);
+        assert_eq!(btw_retry_delay(1, None, true, base), Duration::from_secs(5));
+        assert_eq!(
+            btw_retry_delay(2, None, true, base),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            btw_retry_delay(3, None, true, base),
+            Duration::from_secs(20)
+        );
+        assert_eq!(
+            btw_retry_delay(1, Some(Duration::from_secs(17)), true, base),
+            Duration::from_secs(17)
+        );
+    }
+
+    #[tokio::test]
+    async fn btw_retry_wait_publishes_countdown_event() {
+        let (tx, mut rx) = mpsc::channel(2);
+        let cancel = AtomicBool::new(false);
+
+        assert!(
+            wait_for_btw_retry(
+                &tx,
+                "session",
+                "btw-agent",
+                1,
+                "HTTP 429 Too Many Requests",
+                Duration::ZERO,
+                &cancel,
+            )
+            .await
+        );
+
+        let Frame::Event { data, .. } = rx.recv().await.unwrap() else {
+            panic!("expected retry event");
+        };
+        let event: AgentEvent = serde_json::from_value(data).unwrap();
+        assert!(matches!(
+            event,
+            AgentEvent::BtwRetry {
+                retry_number: 1,
+                remaining_seconds: 0,
+                initial: true,
+                ..
+            }
+        ));
     }
 
     #[test]

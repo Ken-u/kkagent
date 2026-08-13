@@ -634,10 +634,14 @@ fn build_transcript_lines(state: &mut AppState, theme: &Theme, width: u16) -> Ve
                     } else {
                         Style::default().fg(theme.text_dim)
                     };
-                    lines.push(Line::from(vec![
-                        Span::styled("● ", Style::default().fg(theme.text_dim)),
-                        Span::styled(line.to_string(), style),
-                    ]));
+                    push_wrapped_prefixed(
+                        &mut lines,
+                        "● ",
+                        line,
+                        width,
+                        Style::default().fg(theme.text_dim),
+                        style,
+                    );
                 }
                 lines.push(Line::from(""));
             }
@@ -2762,6 +2766,32 @@ mod render_smoke {
         assert!(!lines.is_empty());
         let lines2 = build_transcript_lines(&mut state, &theme, 1);
         assert!(!lines2.is_empty());
+    }
+
+    #[test]
+    fn long_system_errors_wrap_without_losing_content() {
+        let mut state = AppState::new(PermissionMode::Manual, false);
+        let reason =
+            "HTTP 429 Too Many Requests: request limit reached; retry after the configured delay";
+        state.messages.push(DisplayMessage {
+            role: MessageRole::System,
+            content: reason.into(),
+            thinking: None,
+            parts: Vec::new(),
+            tool_calls: Vec::new(),
+            delivery: crate::prompt_queue::DeliveryState::Sent,
+            idempotency_key: None,
+        });
+
+        let lines = build_transcript_lines(&mut state, &Theme::default(), 24);
+        let rendered = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert!(lines.len() > 3);
+        assert!(rendered.contains("configured delay"));
     }
 
     #[test]

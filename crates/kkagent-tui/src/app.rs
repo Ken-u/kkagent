@@ -7835,7 +7835,7 @@ impl TuiApp {
         initial: bool,
     ) {
         let prefix = format!("↻ LLM retry #{retry_number}");
-        let reason = compact_retry_reason(reason, 180);
+        let reason = reason.trim();
         let content = if remaining_seconds > 0 {
             format!("{prefix} in {remaining_seconds}s (wait {wait_seconds}s) · {reason}")
         } else {
@@ -8119,6 +8119,23 @@ impl TuiApp {
                         self.state.btw.append_thinking_delta(text);
                         return;
                     }
+                    AgentEvent::BtwRetry {
+                        session_id,
+                        agent_id,
+                        retry_number,
+                        reason,
+                        remaining_seconds,
+                        ..
+                    } if self.state.btw.current_session_id.as_deref()
+                        == Some(session_id.as_str())
+                        && self.state.btw.current_agent_id.as_deref()
+                            == Some(agent_id.as_str()) =>
+                    {
+                        self.state
+                            .btw
+                            .update_retry(*retry_number, reason, *remaining_seconds);
+                        return;
+                    }
                     AgentEvent::BtwEnd {
                         session_id,
                         agent_id,
@@ -8133,6 +8150,7 @@ impl TuiApp {
                     }
                     AgentEvent::BtwDelta { .. }
                     | AgentEvent::BtwThinkingDelta { .. }
+                    | AgentEvent::BtwRetry { .. }
                     | AgentEvent::BtwEnd { .. } => return,
                     _ => {}
                 }
@@ -8204,6 +8222,7 @@ impl TuiApp {
                 match evt {
                     AgentEvent::BtwDelta { .. }
                     | AgentEvent::BtwThinkingDelta { .. }
+                    | AgentEvent::BtwRetry { .. }
                     | AgentEvent::BtwEnd { .. } => unreachable!("BTW events handled above"),
                     AgentEvent::SteerInput {
                         text,
@@ -9086,21 +9105,6 @@ fn slash_command_opens_immediately(name: &str) -> bool {
     )
 }
 
-fn compact_retry_reason(reason: &str, max_chars: usize) -> String {
-    let compact = reason.split_whitespace().collect::<Vec<_>>().join(" ");
-    if compact.chars().count() <= max_chars {
-        compact
-    } else {
-        format!(
-            "{}…",
-            compact
-                .chars()
-                .take(max_chars.saturating_sub(1))
-                .collect::<String>()
-        )
-    }
-}
-
 /// Old builds could persist a command-only composer after Enter accepted its
 /// slash completion. Do not resurrect those consumed commands on resume.
 fn slash_draft_looks_consumed(text: &str) -> bool {
@@ -9551,6 +9555,10 @@ mod app_state_tests {
         app.update_llm_retry_message(2, "connection reset", 1, 1, true);
         assert_eq!(app.state.messages.len(), 2);
         assert!(app.state.messages[1].content.contains("retry #2 in 1s"));
+
+        let long_reason = format!("HTTP 429: {}tail", "x".repeat(240));
+        app.update_llm_retry_message(3, &long_reason, 1, 1, true);
+        assert!(app.state.messages[2].content.ends_with("tail"));
     }
 
     #[tokio::test]

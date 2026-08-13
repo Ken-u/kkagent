@@ -33,6 +33,7 @@ pub struct BtwPanelState {
     pub current_question: String,
     pub current_answer: String,
     pub current_thinking: String,
+    pub retry_status: Option<String>,
     pub turns: Vec<BtwTurnView>,
     pub error: Option<String>,
     pub pending_questions: std::collections::VecDeque<BtwQueuedQuestion>,
@@ -54,17 +55,27 @@ impl BtwPanelState {
         self.current_question = question.to_string();
         self.current_answer.clear();
         self.current_thinking.clear();
+        self.retry_status = None;
         self.current_agent_id = None;
         self.error = None;
     }
 
     pub fn append_delta(&mut self, text: &str) {
+        self.retry_status = None;
         self.current_answer.push_str(text);
         self.scroll_offset = 0;
     }
 
     pub fn append_thinking_delta(&mut self, text: &str) {
+        self.retry_status = None;
         self.current_thinking.push_str(text);
+        self.scroll_offset = 0;
+    }
+
+    pub fn update_retry(&mut self, retry_number: u32, reason: &str, remaining_seconds: u64) {
+        self.retry_status = Some(format!(
+            "retry {retry_number} in {remaining_seconds}s: {reason}"
+        ));
         self.scroll_offset = 0;
     }
 
@@ -87,6 +98,7 @@ impl BtwPanelState {
         }
         self.current_answer.clear();
         self.current_thinking.clear();
+        self.retry_status = None;
         self.error = error;
         self.current_session_id = None;
         self.current_agent_id = None;
@@ -215,7 +227,16 @@ pub fn render_btw(
             lines.push(Line::default());
         }
         push_btw_question(&mut lines, &state.current_question, area.width, theme);
-        if state.current_answer.is_empty() && state.current_thinking.is_empty() {
+        if let Some(retry_status) = state.retry_status.as_deref() {
+            crate::components::push_wrapped_prefixed(
+                &mut lines,
+                "● ",
+                retry_status,
+                area.width.saturating_sub(2),
+                Style::default().fg(theme.warning),
+                Style::default().fg(theme.warning),
+            );
+        } else if state.current_answer.is_empty() && state.current_thinking.is_empty() {
             let frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
             let spinner = frames[(tick / 2) % frames.len()];
             lines.push(Line::from(Span::styled(
@@ -421,5 +442,20 @@ mod tests {
         state.viewport_height = 25;
         state.scroll_lines(0);
         assert_eq!(state.scroll_offset, 5);
+    }
+
+    #[test]
+    fn btw_retry_countdown_replaces_the_current_status() {
+        let mut state = BtwPanelState::default();
+        state.begin_question("why?");
+        state.update_retry(1, "HTTP 429 Too Many Requests", 5);
+        state.update_retry(1, "HTTP 429 Too Many Requests", 4);
+
+        assert_eq!(
+            state.retry_status.as_deref(),
+            Some("retry 1 in 4s: HTTP 429 Too Many Requests")
+        );
+        state.append_delta("answer");
+        assert!(state.retry_status.is_none());
     }
 }
