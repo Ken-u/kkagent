@@ -18,3 +18,4 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 async-trait = { workspace = true }
 uuid = { workspace = true }
+httpdate = { workspace = true }

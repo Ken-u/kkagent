@@ -593,7 +593,7 @@ async fn stream_summary(
     };
     let handle = tokio::spawn(async move {
         if let Err(error) = provider.stream_chat(request, tx.clone()).await {
-            let _ = tx.send(StreamEvent::Error(error.to_string())).await;
+            let _ = tx.send(kkagent_llm::stream_error_event(&error)).await;
         }
     });
     let mut out = String::new();
@@ -607,6 +607,7 @@ async fn stream_summary(
                     break;
                 }
                 StreamEvent::Error(error) => return Err(error),
+                StreamEvent::RateLimited { message, .. } => return Err(message),
                 _ => {}
             }
         }

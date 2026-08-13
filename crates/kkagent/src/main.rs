@@ -4550,6 +4550,9 @@ async fn handle_rpc_call(
                         kkagent_llm::types::StreamEvent::Error(message) => {
                             stream_error = Some(message);
                         }
+                        kkagent_llm::types::StreamEvent::RateLimited { message, .. } => {
+                            stream_error = Some(message);
+                        }
                         kkagent_llm::types::StreamEvent::MessageEnd { .. } => {}
                         _ => {}
                     }

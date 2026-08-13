@@ -80,6 +80,10 @@ pub enum StreamEvent {
         usage: TokenUsage,
         stop_reason: Option<String>,
     },
+    RateLimited {
+        message: String,
+        retry_after: Option<std::time::Duration>,
+    },
     Error(String),
 }
 

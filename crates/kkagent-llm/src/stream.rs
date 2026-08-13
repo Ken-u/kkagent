@@ -133,9 +133,8 @@ pub async fn anthropic_stream(
 
     if !resp.status().is_success() {
         let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        tracing::error!("LLM error: HTTP {} - {}", status, truncate_utf8(&text, 500));
-        anyhow::bail!("HTTP {}: {}", status, text);
+        tracing::error!("LLM error: HTTP {}", status);
+        return Err(crate::response_error(resp).await);
     }
 
     let mut stream = resp.bytes_stream();
@@ -476,9 +475,7 @@ async fn chat_completions_stream(
         .await?;
 
     if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        anyhow::bail!("HTTP {}: {}", status, text);
+        return Err(crate::response_error(resp).await);
     }
 
     let mut stream = resp.bytes_stream();
@@ -741,9 +738,7 @@ pub async fn google_stream(
         .await?;
 
     if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        anyhow::bail!("HTTP {}: {}", status, text);
+        return Err(crate::response_error(resp).await);
     }
 
     let mut stream = resp.bytes_stream();
@@ -881,17 +876,6 @@ fn push_strict_provider_message(
     messages.push(json!({"role": role, (parts_key): parts}));
 }
 
-fn truncate_utf8(value: &str, max_bytes: usize) -> &str {
-    if value.len() <= max_bytes {
-        return value;
-    }
-    let mut end = max_bytes;
-    while end > 0 && !value.is_char_boundary(end) {
-        end -= 1;
-    }
-    &value[..end]
-}
-
 pub(crate) fn api_endpoint(base_url: &str, resource: &str) -> String {
     let base = base_url.trim_end_matches('/');
     if base.ends_with("/v1") {
@@ -954,11 +938,10 @@ async fn upload_kimi_video(
         )
         .send()
         .await?;
-    let status = response.status();
-    let body = response.text().await?;
-    if !status.is_success() {
-        anyhow::bail!("Kimi video upload failed with HTTP {status}: {body}");
+    if !response.status().is_success() {
+        return Err(crate::response_error(response).await);
     }
+    let body = response.text().await?;
     serde_json::from_str::<serde_json::Value>(&body)?
         .get("id")
         .and_then(|id| id.as_str())
@@ -971,7 +954,6 @@ async fn upload_kimi_video(
 mod tests {
     use super::{
         anthropic_stream, google_stream, kimi_stream, openai_stream, push_strict_provider_message,
-        truncate_utf8,
     };
     use crate::types::{ChatContent, ChatMessage, LlmRequest, StreamEvent, ThinkingParams};
     use reqwest::Client;
@@ -1061,12 +1043,6 @@ mod tests {
             system: Some("be helpful".into()),
             thinking: None,
         }
-    }
-
-    #[test]
-    fn truncates_at_character_boundary() {
-        assert_eq!(truncate_utf8("中文错误", 5), "中");
-        assert_eq!(truncate_utf8("plain", 50), "plain");
     }
 
     #[test]

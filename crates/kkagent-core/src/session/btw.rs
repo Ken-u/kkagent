@@ -286,7 +286,7 @@ impl SessionBtwService {
         let err_tx = stream_tx.clone();
         let handle = tokio::spawn(async move {
             if let Err(e) = provider.stream_chat(request, stream_tx).await {
-                let _ = err_tx.send(StreamEvent::Error(e.to_string())).await;
+                let _ = err_tx.send(kkagent_llm::stream_error_event(&e)).await;
             }
         });
 

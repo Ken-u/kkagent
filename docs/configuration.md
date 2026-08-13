@@ -106,6 +106,7 @@ check_updates = true
 ```toml
 [loop_control]
 max_attempts_per_step = 10
+rate_limit_retry_base_seconds = 5
 reserved_context_size = 50000
 max_steps_per_turn = 0
 auto_compact = true
@@ -118,6 +119,8 @@ token_counting = "measured+estimated"
 ```
 
 `max_steps_per_turn` 不设置或设为 `0` 时不限制单轮 Agent 步数；只有正整数才会启用上限。
+
+当 LLM 返回 429 且未提供 `Retry-After` 时，`rate_limit_retry_base_seconds` 控制指数退避的基础时间，默认依次等待 5、10、20 秒。若服务端提供等待时间，则优先使用服务端值（最长 300 秒）。
 
 `token_counting` 可取 `measured+estimated`、`measured` 或 `estimated`。上下文达到 `compact_trigger_ratio`（默认 85%）或逼近 `reserved_context_size` 预留时，`auto_compact` 会用 LLM 摘要压缩历史，并按 token 预算保留用户消息（头+尾）；assistant/tool 交换由摘要覆盖，避免 toolcall 配对 400。手动 `/compact` 在 turn 进行中会被拒绝。
 

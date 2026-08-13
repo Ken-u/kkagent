@@ -379,6 +379,13 @@ Do not mention this reminder to the user.\n</system-reminder>"
             .map(|l| l.max_attempts_per_step)
             .unwrap_or(3)
             .max(1);
+        let rate_limit_retry_base = Duration::from_secs(
+            self.config
+                .loop_control
+                .as_ref()
+                .map(|control| control.rate_limit_retry_base_seconds)
+                .unwrap_or(5),
+        );
 
         let mut assistant_text = String::new();
         let mut thinking_text = String::new();
@@ -397,6 +404,8 @@ Do not mention this reminder to the user.\n</system-reminder>"
             tool_calls.clear();
             let mut stream_failed = false;
             let mut last_stream_error: Option<String> = None;
+            let mut server_retry_after: Option<Duration> = None;
+            let mut rate_limited = false;
             let mut stop_reason: Option<String> = None;
 
             let request = LlmRequest {
@@ -415,7 +424,7 @@ Do not mention this reminder to the user.\n</system-reminder>"
                 if let Err(e) = provider.stream_chat(request, stream_tx).await {
                     tracing::error!("LLM stream error: {}", e);
                     let _ = stream_error_tx
-                        .send(StreamEvent::Error(e.to_string()))
+                        .send(kkagent_llm::stream_error_event(&e))
                         .await;
                 }
             });
@@ -538,6 +547,19 @@ Do not mention this reminder to the user.\n</system-reminder>"
                             last_stream_error = Some(msg);
                             stream_failed = true;
                         }
+                        StreamEvent::RateLimited {
+                            message,
+                            retry_after,
+                        } => {
+                            tracing::warn!(
+                                retry_after_seconds = retry_after.map(|delay| delay.as_secs_f64()),
+                                "LLM rate limited: {message}"
+                            );
+                            last_stream_error = Some(message);
+                            server_retry_after = retry_after;
+                            rate_limited = true;
+                            stream_failed = true;
+                        }
                     },
                     Ok(None) => break,
                     Err(_) => continue, // timeout — re-check interrupt
@@ -658,9 +680,18 @@ Do not mention this reminder to the user.\n</system-reminder>"
                         .as_deref()
                         .unwrap_or("empty/incomplete stream")
                 );
-                let exponent = failure_retries.saturating_sub(1).min(5);
-                let delay_ms = 200_u64.saturating_mul(1_u64 << exponent);
-                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                let delay = retry_delay(
+                    failure_retries,
+                    server_retry_after,
+                    rate_limited,
+                    rate_limit_retry_base,
+                );
+                tracing::warn!(
+                    retry_in_seconds = delay.as_secs_f64(),
+                    server_directed = server_retry_after.is_some(),
+                    "Waiting before LLM retry"
+                );
+                tokio::time::sleep(delay).await;
                 continue;
             }
             if failed {
@@ -2477,6 +2508,22 @@ fn session_has_goal_reminder(session: &Session) -> bool {
     })
 }
 
+fn retry_delay(
+    attempt: u32,
+    server_retry_after: Option<Duration>,
+    rate_limited: bool,
+    rate_limit_base: Duration,
+) -> Duration {
+    server_retry_after.unwrap_or_else(|| {
+        let exponent = attempt.saturating_sub(1).min(5);
+        if rate_limited {
+            rate_limit_base.saturating_mul(1_u32 << exponent)
+        } else {
+            Duration::from_millis(200_u64.saturating_mul(1_u64 << exponent))
+        }
+    })
+}
+
 fn describe_tool_action(name: &str, input: &serde_json::Value) -> String {
     match name {
         "Read" | "Write" | "Edit" => {
@@ -2527,6 +2574,26 @@ mod retry_tests {
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
     };
+
+    #[test]
+    fn server_retry_after_overrides_exponential_backoff() {
+        let base = Duration::from_secs(5);
+        assert_eq!(
+            retry_delay(1, None, false, base),
+            Duration::from_millis(200)
+        );
+        assert_eq!(
+            retry_delay(3, None, false, base),
+            Duration::from_millis(800)
+        );
+        assert_eq!(retry_delay(1, None, true, base), Duration::from_secs(5));
+        assert_eq!(retry_delay(2, None, true, base), Duration::from_secs(10));
+        assert_eq!(retry_delay(3, None, true, base), Duration::from_secs(20));
+        assert_eq!(
+            retry_delay(1, Some(Duration::from_secs(17)), true, base),
+            Duration::from_secs(17)
+        );
+    }
 
     #[tokio::test]
     async fn turn_heartbeat_reports_liveness_until_dropped() {
@@ -2796,6 +2863,7 @@ mod retry_tests {
             default_model: Some("test/model".into()),
             loop_control: Some(LoopControlConfig {
                 max_attempts_per_step: 3,
+                rate_limit_retry_base_seconds: 0,
                 reserved_context_size: 1_000,
                 max_steps_per_turn: 4,
                 auto_compact: true,

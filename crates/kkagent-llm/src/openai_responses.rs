@@ -135,9 +135,7 @@ pub async fn openai_responses_stream(
         .await?;
 
     if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        anyhow::bail!("HTTP {status}: {text}");
+        return Err(crate::response_error(resp).await);
     }
 
     let mut stream = resp.bytes_stream();

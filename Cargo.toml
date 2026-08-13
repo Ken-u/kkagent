@@ -53,6 +53,7 @@ reqwest-eventsource = "0.6"
 tokio-stream = "0.1"
 futures = "0.3"
 futures-util = "0.3"
+httpdate = "1"
 
 # File system
 ignore = "0.4"

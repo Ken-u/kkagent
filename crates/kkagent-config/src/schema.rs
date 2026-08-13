@@ -196,6 +196,9 @@ pub struct ThinkingConfig {
 pub struct LoopControlConfig {
     #[serde(default = "default_max_attempts")]
     pub max_attempts_per_step: u32,
+    /// Base delay for 429 responses without a server-provided retry hint.
+    #[serde(default = "default_rate_limit_retry_base_seconds")]
+    pub rate_limit_retry_base_seconds: u64,
     #[serde(default = "default_reserved_context")]
     pub reserved_context_size: u64,
     #[serde(default = "default_max_steps")]
@@ -224,6 +227,7 @@ impl Default for LoopControlConfig {
     fn default() -> Self {
         Self {
             max_attempts_per_step: default_max_attempts(),
+            rate_limit_retry_base_seconds: default_rate_limit_retry_base_seconds(),
             reserved_context_size: default_reserved_context(),
             max_steps_per_turn: default_max_steps(),
             auto_compact: true,
@@ -248,6 +252,9 @@ fn default_token_strategy() -> String {
 
 fn default_max_attempts() -> u32 {
     10
+}
+fn default_rate_limit_retry_base_seconds() -> u64 {
+    5
 }
 fn default_reserved_context() -> u64 {
     50000
@@ -661,7 +668,12 @@ mod tests {
     fn loop_step_limit_defaults_to_unlimited() {
         let loop_control: LoopControlConfig = toml::from_str("").unwrap();
         assert_eq!(loop_control.max_steps_per_turn, 0);
+        assert_eq!(loop_control.rate_limit_retry_base_seconds, 5);
         assert_eq!(LoopControlConfig::default().max_steps_per_turn, 0);
+        assert_eq!(
+            LoopControlConfig::default().rate_limit_retry_base_seconds,
+            5
+        );
     }
 
     #[test]
