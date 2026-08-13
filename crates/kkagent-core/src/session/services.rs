@@ -33,9 +33,9 @@ pub struct SessionServices {
     pub lifecycle: SessionLifecycleHooks,
     pub activity: SessionActivityView,
     pub interaction: Arc<SessionInteractionService>,
-    pub agents: AgentLifecycleService,
+    pub agents: Arc<AgentLifecycleService>,
     pub todos: SessionTodoService,
-    pub btw: SessionBtwService,
+    pub btw: Arc<SessionBtwService>,
     pub tool_policy_gate: SessionToolPolicyGate,
     pub cron: SessionCronService,
     pub swarm_batch: SessionSwarmBatchService,
@@ -71,7 +71,7 @@ impl SessionServices {
         // Store layer may already have written state.json; always load-or-create.
         let metadata =
             SessionMetadataService::load_or_create(&session_dir, session_id, &working_dir)?;
-        let agents = AgentLifecycleService::new();
+        let agents = Arc::new(AgentLifecycleService::new());
         let tool_policy_gate = SessionToolPolicyGate::default();
         let _ = tool_policy_gate.session_policy.load_from_dir(&session_dir);
         let cron = SessionCronService::new();
@@ -86,7 +86,7 @@ impl SessionServices {
             interaction: Arc::new(SessionInteractionService::new()),
             agents,
             todos: SessionTodoService::new(),
-            btw: SessionBtwService::new(),
+            btw: Arc::new(SessionBtwService::new()),
             tool_policy_gate,
             cron,
             swarm_batch: SessionSwarmBatchService::new(),

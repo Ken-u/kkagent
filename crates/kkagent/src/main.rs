@@ -13,8 +13,9 @@ use kkagent_config::{load_config, AppConfig, DisabledState};
 use kkagent_core::plan_review::{resolve_exit_plan_approval, PlanReviewDisplay};
 use kkagent_core::SubagentMirrorContext;
 use kkagent_core::{
-    AgentLoop, BtwTurn, PermissionChain, Session, SessionBtwService, SessionCloseReason,
-    SessionCreateSource, SessionSteerMailbox, SessionStore, SteerInput, TranscriptDb,
+    AgentLifecycleService, AgentLoop, BtwTurn, PermissionChain, Session, SessionBtwService,
+    SessionCloseReason, SessionCreateSource, SessionSteerMailbox, SessionStore, SteerInput,
+    TranscriptDb,
 };
 use kkagent_di::ServiceContainer;
 use kkagent_llm::{ChatContent, ChatMessage};
@@ -1694,6 +1695,7 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
         self.state.approval_txs.lock().await.remove(id);
         self.state.question_txs.lock().await.remove(id);
         self.state.steer_mailboxes.lock().await.remove(id);
+        self.state.active_btw_sessions.lock().await.remove(id);
         self.state.turn_locks.remove(id).await;
         self.state
             .transcript
@@ -2406,6 +2408,8 @@ struct ServerState {
     question_txs: Mutex<HashMap<String, mpsc::Sender<kkagent_protocol::QuestionResponse>>>,
     /// Steer mailboxes remain reachable while Session is owned by the agent loop.
     steer_mailboxes: Mutex<HashMap<String, SessionSteerMailbox>>,
+    /// BTW services remain reachable while Session is owned by the agent loop.
+    active_btw_sessions: Mutex<HashMap<String, ActiveBtwSession>>,
     /// Interrupt flags remain reachable while the session is out of `sessions` during a turn.
     interrupt_flags: Mutex<HashMap<String, Arc<AtomicBool>>>,
     /// Model alias handles — reachable mid-turn when session is removed from `sessions`.
@@ -2440,6 +2444,23 @@ struct ServerState {
     persistence_durable: bool,
     persistence_error: Option<String>,
     started_at: std::time::Instant,
+}
+
+#[derive(Clone)]
+struct ActiveBtwSession {
+    service: Arc<SessionBtwService>,
+    agents: Arc<AgentLifecycleService>,
+    history: Arc<StdRwLock<Vec<ChatMessage>>>,
+}
+
+impl ActiveBtwSession {
+    fn from_session(session: &Session) -> Self {
+        Self {
+            service: session.services.btw.clone(),
+            agents: session.services.agents.clone(),
+            history: Arc::new(StdRwLock::new(session.messages.clone())),
+        }
+    }
 }
 
 impl ServerState {
@@ -2774,6 +2795,7 @@ async fn build_server_state(config: Arc<AppConfig>) -> Result<Arc<ServerState>> 
         approval_txs: Mutex::new(HashMap::new()),
         question_txs: Mutex::new(HashMap::new()),
         steer_mailboxes: Mutex::new(HashMap::new()),
+        active_btw_sessions: Mutex::new(HashMap::new()),
         interrupt_flags: Mutex::new(HashMap::new()),
         model_aliases: Mutex::new(HashMap::new()),
         permission_modes: Mutex::new(HashMap::new()),
@@ -3038,6 +3060,19 @@ async fn spawn_session_agent_turn(
         }
     };
 
+    let active_btw = {
+        let sessions = state.sessions.lock().await;
+        let session = sessions
+            .get(&session_id)
+            .ok_or_else(|| (-32602, format!("Session not found: {session_id}")))?;
+        ActiveBtwSession::from_session(session)
+    };
+    state
+        .active_btw_sessions
+        .lock()
+        .await
+        .insert(session_id.clone(), active_btw.clone());
+
     let state_clone = state.clone();
     let sid = session_id.clone();
     let rpc_progress = rpc_event_tx.clone();
@@ -3121,6 +3156,7 @@ async fn spawn_session_agent_turn(
                         );
                     }
                 }
+                state_clone.active_btw_sessions.lock().await.remove(&sid);
                 return;
             }
 
@@ -3167,10 +3203,15 @@ async fn spawn_session_agent_turn(
                             "Could not preserve {dropped} steer message(s): session {sid} disappeared"
                         );
                     }
+                    state_clone.active_btw_sessions.lock().await.remove(&sid);
                     return;
                 }
             }
         };
+        *active_btw
+            .history
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = session.messages.clone();
 
         if session.is_interrupted() {
             let _ = agent_event_tx
@@ -3203,7 +3244,9 @@ async fn spawn_session_agent_turn(
             if let Err(error) = session.sync_requested_plan_mode() {
                 tracing::error!("Failed to persist requested plan mode: {error}");
             }
-            sessions.insert(sid, session);
+            sessions.insert(sid.clone(), session);
+            drop(sessions);
+            state_clone.active_btw_sessions.lock().await.remove(&sid);
             return;
         }
 
@@ -3239,7 +3282,9 @@ async fn spawn_session_agent_turn(
                 message: format!("plan mode persistence failed: {error}"),
             });
         }
-        sessions.insert(sid, session);
+        sessions.insert(sid.clone(), session);
+        drop(sessions);
+        state_clone.active_btw_sessions.lock().await.remove(&sid);
     });
 
     Ok(())
@@ -3699,6 +3744,7 @@ async fn handle_rpc_call(
             state.approval_txs.lock().await.remove(&session_id);
             state.question_txs.lock().await.remove(&session_id);
             state.steer_mailboxes.lock().await.remove(&session_id);
+            state.active_btw_sessions.lock().await.remove(&session_id);
             if let Some(session) = removed {
                 session.services.on_close(SessionCloseReason::Exit).await;
             }
@@ -4483,32 +4529,66 @@ async fn handle_rpc_call(
                 return Err((-32602, "BTW question must not be empty".into()));
             }
 
-            let (history, model_alias, prior_turns, cancel, agent_id) = {
+            let idle_target = {
                 let sessions = state.sessions.lock().await;
-                let session = sessions
-                    .get(&session_id)
-                    .ok_or_else(|| (-32602, format!("Session not found: {session_id}")))?;
-                if !session.services.btw.try_begin() {
-                    return Err((
-                        -32001,
-                        "Wait for /btw to finish before sending another question.".into(),
-                    ));
-                }
-                let agent_id = session.services.btw.start(&session.services.agents);
-                let history = session.services.btw.context_snapshot(&session.messages);
-                let model_alias = session.get_model_alias();
-                let prior_turns = session.services.btw.turns();
-                let cancel = session.services.btw.cancel_flag();
-                cancel.store(false, std::sync::atomic::Ordering::SeqCst);
-                (history, model_alias, prior_turns, cancel, agent_id)
+                sessions.get(&session_id).map(|session| {
+                    (
+                        session.services.btw.clone(),
+                        session.services.agents.clone(),
+                        session.messages.clone(),
+                        session.get_model_alias(),
+                    )
+                })
             };
+            let (btw_service, agents, messages, model_alias) = if let Some(target) = idle_target {
+                target
+            } else {
+                let active = state
+                    .active_btw_sessions
+                    .lock()
+                    .await
+                    .get(&session_id)
+                    .cloned()
+                    .ok_or_else(|| (-32602, format!("Session not found: {session_id}")))?;
+                let messages = active
+                    .history
+                    .read()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .clone();
+                let model_alias = state
+                    .model_aliases
+                    .lock()
+                    .await
+                    .get(&session_id)
+                    .map(|alias| {
+                        alias
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .clone()
+                    })
+                    .filter(|alias| !alias.is_empty())
+                    .or_else(|| state.config.default_model_alias().map(str::to_owned))
+                    .ok_or_else(|| (-32000, "No default_model in config".into()))?;
+                (active.service, active.agents, messages, model_alias)
+            };
+            if !btw_service.try_begin() {
+                return Err((
+                    -32001,
+                    "Wait for /btw to finish before sending another question.".into(),
+                ));
+            }
+            let agent_id = btw_service.start(&agents);
+            let history = btw_service.context_snapshot(&messages);
+            let prior_turns = btw_service.turns();
+            let cancel = btw_service.cancel_flag();
+            cancel.store(false, std::sync::atomic::Ordering::SeqCst);
 
             let rpc_tx = rpc_event_tx.clone();
             let config = state.config.clone();
-            let state_clone = state.clone();
             let sid = session_id.clone();
             let q = question.clone();
             let event_agent_id = agent_id.clone();
+            let task_btw_service = btw_service.clone();
             tokio::spawn(async move {
                 let (stream_tx, mut stream_rx) =
                     mpsc::channel::<kkagent_llm::types::StreamEvent>(256);
@@ -4584,20 +4664,17 @@ async fn handle_rpc_call(
                     }
                 }
 
-                if stream_error.is_none() && !answer.trim().is_empty() {
-                    if let Some(session) = state_clone.sessions.lock().await.get(&sid) {
-                        if session.services.btw.is_current(&cancel) {
-                            session.services.btw.push_turn(BtwTurn {
-                                question: q,
-                                answer,
-                            });
-                        }
-                    }
+                if stream_error.is_none()
+                    && !answer.trim().is_empty()
+                    && task_btw_service.is_current(&cancel)
+                {
+                    task_btw_service.push_turn(BtwTurn {
+                        question: q,
+                        answer,
+                    });
                 }
 
-                if let Some(session) = state_clone.sessions.lock().await.get(&sid) {
-                    session.services.btw.end(&cancel);
-                }
+                task_btw_service.end(&cancel);
 
                 let frame = Frame::Event {
                     event: "agent".into(),
@@ -4624,9 +4701,16 @@ async fn handle_rpc_call(
                 .and_then(|p| p.get("session_id"))
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| (-32602, "Missing session_id".into()))?;
-            let sessions = state.sessions.lock().await;
-            if let Some(session) = sessions.get(session_id) {
-                session.services.btw.request_cancel();
+            let service = {
+                let sessions = state.sessions.lock().await;
+                sessions
+                    .get(session_id)
+                    .map(|session| session.services.btw.clone())
+            };
+            if let Some(service) = service {
+                service.request_cancel();
+            } else if let Some(active) = state.active_btw_sessions.lock().await.get(session_id) {
+                active.service.request_cancel();
             }
             Ok(serde_json::json!({"ok": true}))
         }
@@ -4636,9 +4720,19 @@ async fn handle_rpc_call(
                 .and_then(|p| p.get("session_id"))
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| (-32602, "Missing session_id".into()))?;
-            let sessions = state.sessions.lock().await;
-            if let Some(session) = sessions.get(session_id) {
-                session.services.btw.clear(&session.services.agents);
+            let target = {
+                let sessions = state.sessions.lock().await;
+                sessions.get(session_id).map(|session| {
+                    (
+                        session.services.btw.clone(),
+                        session.services.agents.clone(),
+                    )
+                })
+            };
+            if let Some((service, agents)) = target {
+                service.clear(&agents);
+            } else if let Some(active) = state.active_btw_sessions.lock().await.get(session_id) {
+                active.service.clear(&active.agents);
             }
             Ok(serde_json::json!({"ok": true}))
         }
@@ -5697,6 +5791,41 @@ mod http_path_tests {
         assert!(locks.is_busy("session").await);
         drop(permit);
         assert!(!locks.is_busy("session").await);
+    }
+
+    #[test]
+    fn active_btw_handle_survives_session_leaving_idle_map() {
+        let workspace =
+            std::env::temp_dir().join(format!("kkagent-btw-active-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let mut session = Session::new(
+            "btw-active".into(),
+            workspace.clone(),
+            PermissionMode::Manual,
+            "model".into(),
+        );
+        session.add_user_message("main turn is running".into());
+
+        let active = ActiveBtwSession::from_session(&session);
+        drop(session);
+
+        assert!(active.service.try_begin());
+        let agent_id = active.service.start(&active.agents);
+        let messages = active
+            .history
+            .read()
+            .unwrap_or_else(|error| error.into_inner());
+        let history = active.service.context_snapshot(&messages);
+        assert_eq!(
+            active.service.active_agent_id().as_deref(),
+            Some(agent_id.as_str())
+        );
+        assert_eq!(history.len(), 1);
+        assert!(active.service.is_busy());
+
+        active.service.clear(&active.agents);
+        assert!(!active.service.is_busy());
+        std::fs::remove_dir_all(workspace).unwrap();
     }
 
     #[test]
