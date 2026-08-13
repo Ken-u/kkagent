@@ -64,6 +64,21 @@ impl KkagentClient {
         Ok(session_id)
     }
 
+    pub async fn list_sessions(&self, limit: usize) -> anyhow::Result<Vec<serde_json::Value>> {
+        let params = serde_json::json!({"limit": limit});
+        let result = self
+            .rpc
+            .call("sessions.list", Some(params))
+            .await
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        let sessions = result
+            .get("sessions")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        Ok(sessions)
+    }
+
     pub async fn send_prompt(&self, session_id: &str, text: &str) -> anyhow::Result<()> {
         self.send_prompt_with_images(session_id, text, &[]).await
     }

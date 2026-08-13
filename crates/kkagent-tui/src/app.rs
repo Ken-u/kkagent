@@ -158,6 +158,8 @@ pub struct AppState {
     pub session_picker_preview: Option<SessionPickerPreview>,
     /// Pending delete confirmation inside `/sessions` (default = No).
     pub session_delete_confirm: Option<SessionDeleteConfirm>,
+    /// When true, show the session picker on the first UI tick (used by `-r` without id).
+    pub startup_session_picker: bool,
     /// In-flight non-blocking session switch context (last selection wins).
     pub resume_switch: Option<ResumeSwitchCtx>,
     /// Session event router (controllers).
@@ -884,6 +886,7 @@ impl AppState {
             open_session_group: Vec::new(),
             session_picker_preview: None,
             session_delete_confirm: None,
+            startup_session_picker: false,
             resume_switch: None,
             event_router: SessionEventRouter::default(),
             search: SearchState::default(),
@@ -1219,7 +1222,7 @@ impl TuiApp {
         }
     }
 
-    pub async fn run(mut self, resume: Option<String>) -> anyhow::Result<()> {
+    pub async fn run(mut self, resume: Option<Option<String>>) -> anyhow::Result<()> {
         let startup_started = std::time::Instant::now();
         let startup_trust = if self.config.sandbox.is_disabled() {
             None
@@ -1234,12 +1237,27 @@ impl TuiApp {
                 .rpc_call("workspace.trust", Some(serde_json::to_value(trust)?))
                 .await?;
         }
+
         // Create / resume session BEFORE taking over the terminal, so RPC
         // failures don't leave the user's shell stuck in raw/alternate mode.
         let cwd = self.state.working_dir.to_string_lossy().into_owned();
-        if let Some(id) = resume {
-            if let Err(e) = self.resume_session(&id).await {
-                eprintln!("Resume failed ({}): {}. Starting a new session.", id, e);
+        match resume {
+            Some(Some(id)) => {
+                if let Err(e) = self.resume_session(&id).await {
+                    eprintln!("Resume failed ({}): {}. Starting a new session.", id, e);
+                    let session_id = self
+                        .client
+                        .create_session(Some(&cwd), Some(self.state.permission_mode))
+                        .await?;
+                    self.state.tab_strip.ensure_active(&session_id, "main");
+                    self.state.status_bar.session_id = Some(session_id.clone());
+                    self.state.session_id = Some(session_id);
+                    self.bind_config_default_model();
+                }
+            }
+            Some(None) => {
+                // `-r` / `--resume` with no id: show the session picker once we enter the UI loop.
+                self.state.startup_session_picker = true;
                 let session_id = self
                     .client
                     .create_session(Some(&cwd), Some(self.state.permission_mode))
@@ -1249,15 +1267,16 @@ impl TuiApp {
                 self.state.session_id = Some(session_id);
                 self.bind_config_default_model();
             }
-        } else {
-            let session_id = self
-                .client
-                .create_session(Some(&cwd), Some(self.state.permission_mode))
-                .await?;
-            self.state.tab_strip.ensure_active(&session_id, "main");
-            self.state.status_bar.session_id = Some(session_id.clone());
-            self.state.session_id = Some(session_id);
-            self.bind_config_default_model();
+            None => {
+                let session_id = self
+                    .client
+                    .create_session(Some(&cwd), Some(self.state.permission_mode))
+                    .await?;
+                self.state.tab_strip.ensure_active(&session_id, "main");
+                self.state.status_bar.session_id = Some(session_id.clone());
+                self.state.session_id = Some(session_id);
+                self.bind_config_default_model();
+            }
         }
         tracing::info!(
             elapsed_ms = startup_started.elapsed().as_millis() as u64,
@@ -1427,6 +1446,11 @@ impl TuiApp {
             terminal.draw(|f| {
                 components::render_ui(f, &mut self.state, &self.config);
             })?;
+
+            if self.state.startup_session_picker {
+                self.state.startup_session_picker = false;
+                let _ = self.open_session_picker().await;
+            }
 
             self.drain_job_results();
 

@@ -66,9 +66,9 @@ struct Cli {
     #[arg(short = 'p', long)]
     prompt: Option<String>,
 
-    /// Resume an existing session by id (or prefix)
-    #[arg(long)]
-    resume: Option<String>,
+    /// Resume an existing session by id (or prefix); with no id, show the session picker
+    #[arg(long, short = 'r')]
+    resume: Option<Option<String>>,
 
     /// Connect to an existing server
     #[arg(long)]
@@ -431,6 +431,7 @@ _arguments \
   '--plan[Start in plan mode]' \
   '--prompt[Non-interactive prompt]:text:' \
   '--resume[Resume session]:id:' \
+  '-r[Resume session]:id:' \
   '--connect[Connect to server]:endpoint:' \
   '--no-alt-screen[Keep primary screen]' \
   '1:command:(server acp auth init config doctor completions)'
@@ -447,6 +448,7 @@ complete -c kkagent -l auto
 complete -c kkagent -l plan
 complete -c kkagent -l prompt -r
 complete -c kkagent -l resume -r
+complete -c kkagent -s r -l resume -r
 complete -c kkagent -l connect -r
 complete -c kkagent -l no-alt-screen
 "#
@@ -769,7 +771,7 @@ async fn run_tui(
     config_path: PathBuf,
     permission_mode: PermissionMode,
     plan_mode: bool,
-    resume: Option<String>,
+    resume: Option<Option<String>>,
     connect: Option<String>,
     no_alt_screen: bool,
 ) -> Result<()> {
