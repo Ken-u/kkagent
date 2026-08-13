@@ -1610,14 +1610,14 @@ fn sync_footer_session_entries(state: &mut AppState) {
         .iter()
         .any(|entry| entry.id == current_id)
     {
-        let title = state
-            .tab_strip
-            .tabs
-            .iter()
-            .find(|tab| tab.id == current_id)
-            .map(|tab| tab.title.clone())
-            .filter(|title| !title.is_empty())
-            .unwrap_or_else(|| "session".into());
+        let Some(current_tab) = state.tab_strip.tabs.iter().find(|tab| tab.id == current_id) else {
+            return;
+        };
+        let title = if current_tab.title.is_empty() {
+            "session".into()
+        } else {
+            current_tab.title.clone()
+        };
         state
             .workspace_sessions
             .entries

@@ -3029,7 +3029,29 @@ impl TuiApp {
                 if key.modifiers.contains(KeyModifiers::CONTROL) && self.state.input.is_empty() =>
             {
                 if self.can_close_current_session_tab() {
-                    self.begin_close_current_session_confirm();
+                    if session_status_has_active_agent_loop(self.state.status) {
+                        if let Some(sid) = self.state.session_id.clone() {
+                            match self.client.interrupt(&sid).await {
+                                Ok(()) => {
+                                    self.state.status = SessionStatus::Cancelling;
+                                    self.state.status_bar.status = SessionStatus::Cancelling;
+                                    self.state
+                                        .tab_strip
+                                        .set_status(&sid, SessionStatus::Cancelling);
+                                    self.system_message(
+                                        "Stopping this session… press Ctrl-D again after it becomes idle to close it."
+                                            .into(),
+                                    );
+                                }
+                                Err(e) => {
+                                    self.system_message(format!("Failed to stop session: {e}"));
+                                }
+                            }
+                        }
+                    } else {
+                        self.begin_close_current_session_confirm();
+                        self.confirm_delete_session(true).await?;
+                    }
                 } else if self.state.quit_confirm {
                     self.state.should_quit = true;
                 } else {
@@ -5488,7 +5510,11 @@ impl TuiApp {
         let leaving_id = self.state.session_id.clone();
         let leaving_empty = leaving_id
             .as_ref()
-            .map(|id| id != target && !session_has_retained_io(&self.state.messages))
+            .map(|id| {
+                id != target
+                    && !session_status_has_active_agent_loop(self.state.status)
+                    && !session_has_retained_io(&self.state.messages)
+            })
             .unwrap_or(false);
 
         if let Some(ref leaving) = leaving_id {
@@ -6095,7 +6121,21 @@ impl TuiApp {
                 }
                 let empty = s.get("empty").and_then(|v| v.as_bool()).unwrap_or(false);
                 let in_group = self.state.open_session_group.iter().any(|g| g == &id);
-                if empty && id != current_id && !in_group {
+                let has_active_agent_loop = self
+                    .state
+                    .tab_strip
+                    .tabs
+                    .iter()
+                    .find(|tab| tab.id == id)
+                    .is_some_and(|tab| session_status_has_active_agent_loop(tab.status))
+                    || self
+                        .state
+                        .session_runtime_states
+                        .get(&id)
+                        .is_some_and(|runtime| {
+                            session_status_has_active_agent_loop(runtime.status)
+                        });
+                if empty && id != current_id && !in_group && !has_active_agent_loop {
                     continue;
                 }
                 let forked_from = s
@@ -6181,12 +6221,38 @@ impl TuiApp {
         if !ids.contains(&current_id) {
             ids.insert(0, current_id.clone());
         }
+        for tab in &self.state.tab_strip.tabs {
+            if session_status_has_active_agent_loop(tab.status) && !ids.contains(&tab.id) {
+                ids.push(tab.id.clone());
+            }
+        }
+        let mut active_cached_ids = self
+            .state
+            .session_runtime_states
+            .iter()
+            .filter(|(_, runtime)| session_status_has_active_agent_loop(runtime.status))
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        active_cached_ids.sort();
+        for id in active_cached_ids {
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
 
         let entries: Vec<crate::chrome::WorkspaceSessionEntry> = ids
             .into_iter()
             .filter_map(|id| {
                 let tab = self.state.tab_strip.tabs.iter().find(|t| t.id == id);
-                let status = tab.map(|t| t.status).unwrap_or(SessionStatus::Idle);
+                let status = tab
+                    .map(|t| t.status)
+                    .or_else(|| {
+                        self.state
+                            .session_runtime_states
+                            .get(&id)
+                            .map(|runtime| runtime.status)
+                    })
+                    .unwrap_or(SessionStatus::Idle);
                 let dirty = tab.map(|t| t.dirty).unwrap_or(false);
                 let needs_attention = self.state.parked_approvals.contains_key(&id)
                     || self.state.parked_questions.contains_key(&id);
@@ -6202,6 +6268,18 @@ impl TuiApp {
                     Some(crate::chrome::WorkspaceSessionEntry {
                         id,
                         title: "session".into(),
+                        status,
+                        dirty,
+                        needs_attention,
+                    })
+                } else if session_status_has_active_agent_loop(status) {
+                    let title = tab
+                        .map(|tab| tab.title.clone())
+                        .filter(|title| !title.is_empty())
+                        .unwrap_or_else(|| id[..id.len().min(8)].to_string());
+                    Some(crate::chrome::WorkspaceSessionEntry {
+                        id,
+                        title,
                         status,
                         dirty,
                         needs_attention,
@@ -6589,6 +6667,18 @@ impl TuiApp {
             // Close TUI tab only — keep history, optionally leave turn running.
             self.state.open_session_group.retain(|id| id != &deleted_id);
             self.state.tab_strip.tabs.retain(|t| t.id != deleted_id);
+            self.state
+                .workspace_sessions
+                .entries
+                .retain(|entry| entry.id != deleted_id);
+            if self.state.workspace_sessions.active >= self.state.workspace_sessions.entries.len() {
+                self.state.workspace_sessions.active = self
+                    .state
+                    .workspace_sessions
+                    .entries
+                    .len()
+                    .saturating_sub(1);
+            }
             if self.state.tab_strip.active >= self.state.tab_strip.tabs.len() {
                 self.state.tab_strip.active = self.state.tab_strip.tabs.len().saturating_sub(1);
             }
@@ -8137,8 +8227,11 @@ impl TuiApp {
                         AgentEvent::ApprovalRequested { request, .. } => {
                             let pending = pending_approval_from_request(request, false);
                             self.state.parked_approvals.insert(evt_sid.clone(), pending);
-                            self.state.tab_strip.mark_dirty(&evt_sid, true);
                             self.state.tab_strip.ensure_tab(&evt_sid, "needs approval");
+                            self.state
+                                .tab_strip
+                                .set_status(&evt_sid, SessionStatus::WaitingApproval);
+                            self.state.tab_strip.mark_dirty(&evt_sid, true);
                         }
                         AgentEvent::QuestionAsked { question, .. } => {
                             let options: Vec<(String, String)> = question
@@ -8161,6 +8254,10 @@ impl TuiApp {
                                     free_text: String::new(),
                                 },
                             );
+                            self.state.tab_strip.ensure_tab(&evt_sid, "needs question");
+                            self.state
+                                .tab_strip
+                                .set_status(&evt_sid, SessionStatus::WaitingQuestion);
                             self.state.tab_strip.mark_dirty(&evt_sid, true);
                         }
                         AgentEvent::Error { message, .. } if message != "Interrupted" => {
@@ -9009,6 +9106,10 @@ fn session_has_retained_io(messages: &[DisplayMessage]) -> bool {
     })
 }
 
+fn session_status_has_active_agent_loop(status: SessionStatus) -> bool {
+    !matches!(status, SessionStatus::Idle)
+}
+
 /// Convert a list of serialized ChatMessages into display bubbles,
 /// pairing tool_result blocks onto preceding tool_use entries.
 /// Completed turns are folded into tool-history overviews (same as live TurnEnd).
@@ -9582,6 +9683,178 @@ mod app_state_tests {
         assert!(app.state.btw.turns.is_empty());
         assert!(app.state.btw.pending_questions.is_empty());
         assert!(app.state.workspace_sessions.entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn workspace_strip_keeps_unrelated_sessions_with_active_agent_loops() {
+        let mut app = test_tui_app();
+        app.state.session_id = Some("current".into());
+        app.state.tab_strip.ensure_active("current", "current");
+        app.state.tab_strip.ensure_tab("running", "running");
+        app.state
+            .tab_strip
+            .set_status("running", SessionStatus::ToolExecuting);
+        app.state.tab_strip.ensure_tab("idle", "idle");
+
+        app.apply_workspace_sessions_list(Some(serde_json::json!({
+            "sessions": [
+                {"session_id": "current", "title": "current", "empty": false},
+                {"session_id": "running", "title": "running", "empty": false},
+                {"session_id": "idle", "title": "idle", "empty": false}
+            ]
+        })));
+
+        let visible_ids = app
+            .state
+            .workspace_sessions
+            .entries
+            .iter()
+            .map(|entry| entry.id.as_str())
+            .collect::<Vec<_>>();
+        assert!(visible_ids.contains(&"current"));
+        assert!(visible_ids.contains(&"running"));
+        assert!(!visible_ids.contains(&"idle"));
+    }
+
+    #[tokio::test]
+    async fn switching_does_not_delete_an_empty_session_with_an_active_agent_loop() {
+        let mut app = test_tui_app();
+        app.state.session_id = Some("running".into());
+        app.state.status = SessionStatus::Thinking;
+
+        let (leaving_id, leaving_empty) = app.cache_active_session_state("target");
+
+        assert_eq!(leaving_id.as_deref(), Some("running"));
+        assert!(!leaving_empty);
+        assert!(app
+            .state
+            .session_runtime_states
+            .get("running")
+            .is_some_and(|runtime| runtime.status == SessionStatus::Thinking));
+    }
+
+    #[tokio::test]
+    async fn ctrl_d_stops_a_running_session_before_the_next_press_closes_it() {
+        use futures::FutureExt;
+        use std::sync::Arc;
+
+        let (client_transport, server_transport) =
+            kkagent_rpc::transport::memory::create_memory_pair();
+        let (event_tx, event_rx) = tokio::sync::mpsc::channel(16);
+        let rpc = kkagent_rpc::RpcClient::new(client_transport, event_tx);
+        let client = kkagent_client::KkagentClient::new(rpc, event_rx);
+        let (interrupt_tx, mut interrupt_rx) = tokio::sync::mpsc::unbounded_channel();
+        let handler: kkagent_rpc::server::RequestHandler =
+            Arc::new(move |_id, method, params, _event_tx| {
+                let interrupt_tx = interrupt_tx.clone();
+                async move {
+                    match method.as_str() {
+                        "session.interrupt" => {
+                            interrupt_tx.send(params.unwrap()).unwrap();
+                            Ok(serde_json::json!({"ok": true}))
+                        }
+                        "sessions.list" => Ok(serde_json::json!({"sessions": []})),
+                        other => panic!("unexpected RPC method: {other}"),
+                    }
+                }
+                .boxed()
+            });
+        tokio::spawn(async move {
+            kkagent_rpc::RpcServer::new(handler)
+                .serve(server_transport)
+                .await;
+        });
+
+        let mut app = TuiApp::new(AppConfig::default(), client);
+        let mut fallback_state = AppState::new(PermissionMode::Manual, false);
+        fallback_state.session_id = Some("fallback".into());
+        fallback_state.status = SessionStatus::Idle;
+        app.state.session_runtime_states.insert(
+            "fallback".into(),
+            SessionRuntimeState::capture(&fallback_state),
+        );
+
+        app.state.session_id = Some("running".into());
+        app.state.status = SessionStatus::Thinking;
+        app.state.messages.push(DisplayMessage {
+            role: MessageRole::User,
+            content: "keep this session".into(),
+            thinking: None,
+            parts: Vec::new(),
+            tool_calls: Vec::new(),
+            delivery: crate::prompt_queue::DeliveryState::Sent,
+            idempotency_key: None,
+        });
+        app.state.tab_strip.ensure_active("running", "running");
+        app.state.tab_strip.ensure_tab("fallback", "fallback");
+        app.state
+            .tab_strip
+            .set_status("running", SessionStatus::Thinking);
+        app.state.workspace_sessions.set_entries(
+            vec![
+                crate::chrome::WorkspaceSessionEntry {
+                    id: "running".into(),
+                    title: "running".into(),
+                    status: SessionStatus::Thinking,
+                    dirty: false,
+                    needs_attention: false,
+                },
+                crate::chrome::WorkspaceSessionEntry {
+                    id: "fallback".into(),
+                    title: "fallback".into(),
+                    status: SessionStatus::Idle,
+                    dirty: false,
+                    needs_attention: false,
+                },
+            ],
+            Some("running"),
+        );
+
+        let ctrl_d = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL);
+        app.handle_key(ctrl_d).await.unwrap();
+
+        assert_eq!(app.state.status, SessionStatus::Cancelling);
+        assert_eq!(app.state.session_id.as_deref(), Some("running"));
+        assert!(app
+            .state
+            .workspace_sessions
+            .entries
+            .iter()
+            .any(|entry| entry.id == "running"));
+        assert_eq!(
+            interrupt_rx
+                .recv()
+                .await
+                .and_then(|params| params.get("session_id").cloned()),
+            Some(serde_json::json!("running"))
+        );
+
+        app.handle_server_event(Frame::Event {
+            event: "agent".into(),
+            scope: None,
+            data: serde_json::to_value(AgentEvent::TurnEnd {
+                session_id: "running".into(),
+            })
+            .unwrap(),
+        });
+        assert_eq!(app.state.status, SessionStatus::Idle);
+
+        app.handle_key(ctrl_d).await.unwrap();
+
+        assert_eq!(app.state.session_id.as_deref(), Some("fallback"));
+        assert!(!app
+            .state
+            .workspace_sessions
+            .entries
+            .iter()
+            .any(|entry| entry.id == "running"));
+        assert!(!app
+            .state
+            .tab_strip
+            .tabs
+            .iter()
+            .any(|tab| tab.id == "running"));
+        assert!(app.state.session_delete_confirm.is_none());
     }
 
     #[tokio::test]

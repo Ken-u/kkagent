@@ -37,6 +37,9 @@ impl SessionEventRouter {
                 session_id,
                 status: s,
             } => {
+                if !matches!(s, SessionStatus::Idle) {
+                    tabs.ensure_tab(session_id, "session");
+                }
                 tabs.set_status(session_id, *s);
                 if is_current {
                     self.status = *s;
@@ -47,6 +50,7 @@ impl SessionEventRouter {
                 }
             }
             AgentEvent::TurnStart { session_id } => {
+                tabs.ensure_tab(session_id, "session");
                 tabs.mark_dirty(session_id, true);
                 tabs.set_status(session_id, SessionStatus::Thinking);
                 if is_current {
