@@ -50,6 +50,8 @@ KKAGENT_RELEASE_BASE_URL=https://mirror.example/kkagent/latest sh install.sh
 
 PowerShell 使用同名环境变量。两个安装器都会先下载 `SHA256SUMS`，校验目标包，然后通过临时文件替换可执行文件；校验失败不会安装。重复执行安装器即升级到最新版本，或升级到 `KKAGENT_VERSION` / `-Version` 指定的版本。
 
+Release 压缩包同时携带对应平台的安装器，因此安装后会得到可复用的更新命令：macOS/Linux 为 `kkagent-update`，Windows 为 `kkagent-update.ps1`。更新命令从自身位置推断原安装目录；仍可通过 `KKAGENT_VERSION`、`KKAGENT_TARGET`、`KKAGENT_REPOSITORY` 和 `KKAGENT_RELEASE_BASE_URL` 覆盖版本、目标与下载源。为兼容尚未携带安装器的旧 Release，首次安装旧包时会保留当前本地脚本，管道安装则从仓库下载一份更新器。
+
 ## 独立验证签名
 
 安装 Cosign 后，在下载资产的目录执行：

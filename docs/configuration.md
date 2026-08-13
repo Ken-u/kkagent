@@ -99,7 +99,7 @@ reduce_motion = false
 check_updates = true
 ```
 
-`check_updates` 默认启用：TUI 首屏不会等待网络，而是在后台查询 `Ken-u/kkagent` 的最新 GitHub Release；成功结果缓存 24 小时，失败结果一小时后重试。发现新版本时只显示 Release 链接和重新运行安装器的提示，不会自动下载或替换程序。设为 `false` 可完全关闭检查。
+`check_updates` 默认启用：TUI 首屏不会等待网络，而是在后台查询 `Ken-u/kkagent` 的最新 GitHub Release；成功结果缓存 24 小时，失败结果一小时后重试。发现新版本时只显示 Release 链接和 `kkagent-update`（Windows 为 `kkagent-update.ps1`）提示，不会自动下载或替换程序。设为 `false` 可完全关闭检查。
 
 ## Agent 循环
 

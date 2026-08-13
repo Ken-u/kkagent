@@ -17,12 +17,16 @@ curl -fsSLO https://raw.githubusercontent.com/Ken-u/kkagent/main/install.sh
 sh install.sh
 ```
 
+安装完成后，后续升级只需执行 `kkagent-update`。
+
 Windows PowerShell：
 
 ```powershell
 irm https://raw.githubusercontent.com/Ken-u/kkagent/main/install.ps1 -OutFile install.ps1
 ./install.ps1
 ```
+
+安装完成后，后续升级只需执行 `kkagent-update.ps1`。
 
 默认从 `Ken-u/kkagent` 的最新 GitHub Release 下载并校验 SHA-256。镜像、fork、固定版本和自定义安装目录见[发布与安装包](releases.md)。
 

@@ -126,9 +126,12 @@ fn update_hint(current: &str, latest: &str, release_url: Option<&str>) -> String
         .filter(|url| !url.is_empty())
         .map(|url| format!(" — {url}"))
         .unwrap_or_default();
-    format!(
-        "update available: {latest} (current {current}); rerun the installer to upgrade{suffix}"
-    )
+    let updater = if cfg!(windows) {
+        "kkagent-update.ps1"
+    } else {
+        "kkagent-update"
+    };
+    format!("update available: {latest} (current {current}); run {updater} to upgrade{suffix}")
 }
 
 /// Record a freshly fetched latest version.
@@ -183,7 +186,11 @@ mod tests {
             body: String::new(),
         };
         let hint = newer_release_hint("0.2.0", &release).unwrap();
-        assert!(hint.contains("rerun the installer"));
+        assert!(hint.contains(if cfg!(windows) {
+            "run kkagent-update.ps1"
+        } else {
+            "run kkagent-update"
+        }));
         assert!(hint.contains(&release.release_url));
         assert!(newer_release_hint("0.3.0", &release).is_none());
     }

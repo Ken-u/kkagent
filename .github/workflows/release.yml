@@ -130,7 +130,7 @@ jobs:
           set -euo pipefail
           mkdir -p dist/package
           cp "target/${{ matrix.target }}/release/kkagent" dist/package/
-          cp README.md LICENSE dist/package/
+          cp README.md LICENSE install.sh dist/package/
           tar -C dist/package -czf "dist/kkagent-${{ matrix.target }}.tar.gz" .
       - name: Package Windows archive
         if: matrix.archive == 'zip'
@@ -138,7 +138,7 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force dist/package | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/kkagent.exe" dist/package/
-          Copy-Item README.md, LICENSE dist/package/
+          Copy-Item README.md, LICENSE, install.ps1 dist/package/
           Compress-Archive -Path dist/package/* -DestinationPath "dist/kkagent-${{ matrix.target }}.zip"
       - uses: actions/upload-artifact@v7
         with:

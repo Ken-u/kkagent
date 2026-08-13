@@ -34,7 +34,7 @@ KKAGENT_INSTALL_DIR="$HOME/bin" KKAGENT_VERSION=0.2.0 sh install.sh
 KKAGENT_TARGET=x86_64-unknown-linux-gnu sh install.sh
 ```
 
-Rerun the same installer command to upgrade. The TUI checks GitHub Releases in the background at most once every 24 hours and only displays a notice; set `[ui] check_updates = false` to disable it.
+The installer also adds `kkagent-update`; run that command later to upgrade in the original installation directory. The TUI checks GitHub Releases in the background at most once every 24 hours and only displays a notice; set `[ui] check_updates = false` to disable it.
 
 ### Manual download
 
@@ -67,6 +67,8 @@ The script installs to `%LOCALAPPDATA%\Programs\kkagent` by default. Override it
 ```powershell
 $env:KKAGENT_INSTALL_DIR = "$env:USERPROFILE\bin"; .\install.ps1 -Version 0.2.0
 ```
+
+The installer also adds `kkagent-update.ps1`; run it later to upgrade in the original installation directory.
 
 ## 30-Second Quickstart
 

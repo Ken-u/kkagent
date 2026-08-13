@@ -2,8 +2,20 @@
 set -eu
 
 repository=${KKAGENT_REPOSITORY:-Ken-u/kkagent}
+script_path=$0
+case "$script_path" in
+  */*) ;;
+  *)
+    resolved_script=$(command -v "$script_path" 2>/dev/null || true)
+    if [ -n "$resolved_script" ]; then
+      script_path=$resolved_script
+    fi
+    ;;
+esac
 if [ -n "${KKAGENT_INSTALL_DIR:-}" ]; then
   install_dir=$KKAGENT_INSTALL_DIR
+elif [ "${script_path##*/}" = kkagent-update ]; then
+  install_dir=$(CDPATH= cd "$(dirname "$script_path")" && pwd)
 elif [ -d /usr/local/bin ] && [ -w /usr/local/bin ]; then
   install_dir=/usr/local/bin
 else
@@ -50,9 +62,13 @@ fi
 archive="kkagent-$target.tar.gz"
 temp_dir=$(mktemp -d "${TMPDIR:-/tmp}/kkagent-install.XXXXXX")
 new_binary=
+new_updater=
 cleanup() {
   if [ -n "$new_binary" ] && [ -f "$new_binary" ]; then
     rm -f "$new_binary"
+  fi
+  if [ -n "$new_updater" ] && [ -f "$new_updater" ]; then
+    rm -f "$new_updater"
   fi
   if [ -n "${temp_dir:-}" ] && [ -d "$temp_dir" ]; then
     rm -rf "$temp_dir"
@@ -88,7 +104,32 @@ cp "$temp_dir/package/kkagent" "$new_binary"
 chmod 0755 "$new_binary"
 mv "$new_binary" "$install_dir/kkagent"
 ln -sf "kkagent" "$install_dir/kk"
+
+# New releases carry the installer inside the checksum-verified archive. Keep
+# compatibility with older archives and `curl | sh` by falling back to the
+# script currently being run, then to the canonical repository copy.
+installer_source=
+if [ -f "$temp_dir/package/install.sh" ]; then
+  installer_source=$temp_dir/package/install.sh
+elif [ -f "$script_path" ]; then
+  case "${script_path##*/}" in
+    sh|dash|bash|zsh) ;;
+    *) installer_source=$script_path ;;
+  esac
+fi
+if [ -z "$installer_source" ]; then
+  installer_url=${KKAGENT_INSTALLER_URL:-https://raw.githubusercontent.com/$repository/main/install.sh}
+  installer_source=$temp_dir/install.sh
+  echo "Downloading reusable updater..."
+  download "$installer_url" "$installer_source"
+fi
+new_updater="$install_dir/kkagent-update.new.$$"
+cp "$installer_source" "$new_updater"
+chmod 0755 "$new_updater"
+mv "$new_updater" "$install_dir/kkagent-update"
+
 echo "Installed kkagent to $install_dir/kkagent and linked kk -> kkagent"
+echo "Installed updater to $install_dir/kkagent-update; run kkagent-update to upgrade"
 "$install_dir/kkagent" --version
 
 case ":${PATH:-}:" in

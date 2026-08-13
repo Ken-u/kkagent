@@ -34,7 +34,7 @@ KKAGENT_INSTALL_DIR="$HOME/bin" KKAGENT_VERSION=0.2.0 sh install.sh
 KKAGENT_TARGET=x86_64-unknown-linux-gnu sh install.sh
 ```
 
-升级时重新执行同一条安装命令即可。TUI 默认每 24 小时在后台检查一次 GitHub Release；只显示提示，不会自动下载。可在配置中设置 `[ui] check_updates = false` 关闭。
+安装完成后会同时安装 `kkagent-update`，以后直接执行该命令即可升级，且会沿用原安装目录。TUI 默认每 24 小时在后台检查一次 GitHub Release；只显示提示，不会自动下载。可在配置中设置 `[ui] check_updates = false` 关闭。
 
 ### 手动下载
 
@@ -67,6 +67,8 @@ curl -fsSLO https://raw.githubusercontent.com/Ken-u/kkagent/main/install.ps1
 ```powershell
 $env:KKAGENT_INSTALL_DIR = "$env:USERPROFILE\bin"; .\install.ps1 -Version 0.2.0
 ```
+
+安装完成后可执行 `kkagent-update.ps1` 升级，并沿用原安装目录。
 
 ## 30 秒上手
 
