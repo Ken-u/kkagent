@@ -2382,6 +2382,8 @@ impl TuiApp {
     }
 
     async fn handle_key(&mut self, key: KeyEvent) -> anyhow::Result<()> {
+        let key = crate::platform_keys::normalize_key_event(key);
+
         // Esc while a menu/overlay is open: only dismiss that UI — never interrupt
         // an in-flight turn. Ctrl-C still cancels the turn below.
         if matches!(key.code, KeyCode::Esc) && self.dismiss_transient_ui() {
@@ -3326,15 +3328,9 @@ impl TuiApp {
                     self.state.slash_menu = None;
                 } else {
                     // Prefer pi key map for plain inserts
-                    match map_key(key) {
-                        EditorAction::Insert(ch) => {
-                            self.state.input.insert_char(ch);
-                            self.state.refresh_slash_menu();
-                        }
-                        _ => {
-                            self.state.input.insert_char(c);
-                            self.state.refresh_slash_menu();
-                        }
+                    if let EditorAction::Insert(ch) = map_key(key) {
+                        self.state.input.insert_char(ch);
+                        self.state.refresh_slash_menu();
                     }
                 }
             }
@@ -9467,6 +9463,30 @@ mod app_state_tests {
         let rpc = kkagent_rpc::RpcClient::new(client_transport, event_tx);
         let client = kkagent_client::KkagentClient::new(rpc, event_rx);
         TuiApp::new(AppConfig::default(), client)
+    }
+
+    #[tokio::test]
+    async fn ctrl_h_from_terminal_is_handled_as_backspace() {
+        let mut app = test_tui_app();
+        app.state.input.set_text("hello".into());
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+
+        assert_eq!(app.state.input.text, "hell");
+    }
+
+    #[tokio::test]
+    async fn unrecognized_control_chord_is_not_inserted_as_text() {
+        let mut app = test_tui_app();
+        app.state.input.set_text("hello".into());
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+
+        assert_eq!(app.state.input.text, "hello");
     }
 
     #[tokio::test]

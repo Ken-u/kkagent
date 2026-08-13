@@ -42,6 +42,25 @@ pub fn is_platform_copy_modifier(modifiers: KeyModifiers) -> bool {
     }
 }
 
+/// Normalize terminal-specific aliases before dispatching a key event.
+///
+/// Some terminals, notably MobaXterm, report Backspace as the traditional
+/// ASCII Ctrl-H chord instead of `KeyCode::Backspace`. Treat that chord as an
+/// unmodified Backspace so every input surface gets the same behavior.
+#[inline]
+pub fn normalize_key_event(mut key: KeyEvent) -> KeyEvent {
+    if matches!(key.code, KeyCode::Char('h') | KeyCode::Char('H'))
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+        && !key
+            .modifiers
+            .intersects(KeyModifiers::ALT | KeyModifiers::SUPER)
+    {
+        key.code = KeyCode::Backspace;
+        key.modifiers = KeyModifiers::NONE;
+    }
+    key
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -65,5 +84,23 @@ mod tests {
             assert!(!is_copy_shortcut(&cmd_c));
             assert!(is_copy_shortcut(&ctrl_c));
         }
+    }
+
+    #[test]
+    fn ctrl_h_is_normalized_to_unmodified_backspace() {
+        let normalized = normalize_key_event(key(KeyCode::Char('h'), KeyModifiers::CONTROL));
+
+        assert_eq!(normalized.code, KeyCode::Backspace);
+        assert_eq!(normalized.modifiers, KeyModifiers::NONE);
+    }
+
+    #[test]
+    fn modified_ctrl_h_chords_are_not_normalized() {
+        let ctrl_alt_h = key(
+            KeyCode::Char('h'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        );
+
+        assert_eq!(normalize_key_event(ctrl_alt_h), ctrl_alt_h);
     }
 }
