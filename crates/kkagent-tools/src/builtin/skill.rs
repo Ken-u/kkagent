@@ -160,6 +160,7 @@ impl SkillCatalog {
         let mut roots = vec![kkagent_config::default_config_dir().join("skills")];
         roots.extend(self.extra_dirs.iter().cloned());
         roots.push(working_dir.join(".kimi").join("skills"));
+        roots.push(working_dir.join(".agents").join("skills"));
         roots.push(working_dir.join(".kkagent").join("skills"));
         for root in roots {
             scan_dir(&root, &mut entries).await;
@@ -564,6 +565,45 @@ mod tests {
         let (_, content) = catalog.load_for(&workspace, "release").await.unwrap();
         assert!(content.contains("Second"));
         std::fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[tokio::test]
+    async fn discovers_agents_skills_from_each_session_workspace() {
+        let server_workspace = temporary_workspace();
+        let session_workspace = temporary_workspace();
+        let skill_name = "session-agents-test-skill";
+        let skill = session_workspace.join(".agents/skills").join(skill_name);
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(
+            skill.join("SKILL.md"),
+            format!(
+                "---\nname: {skill_name}\ndescription: Review this session workspace\n---\nCheck it."
+            ),
+        )
+        .unwrap();
+
+        let catalog = SkillCatalog::discover(&server_workspace).await;
+        assert!(catalog
+            .list_for(&server_workspace)
+            .await
+            .iter()
+            .all(|entry| entry.name != skill_name));
+
+        let session_skills = catalog.list_for(&session_workspace).await;
+        let review = session_skills
+            .iter()
+            .find(|entry| entry.name == skill_name)
+            .unwrap();
+        assert_eq!(review.description, "Review this session workspace");
+
+        let (_, content) = catalog
+            .load_for(&session_workspace, skill_name)
+            .await
+            .unwrap();
+        assert!(content.contains("Check it."));
+
+        std::fs::remove_dir_all(server_workspace).unwrap();
+        std::fs::remove_dir_all(session_workspace).unwrap();
     }
 
     #[tokio::test]

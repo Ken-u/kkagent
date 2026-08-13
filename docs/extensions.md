@@ -29,7 +29,7 @@ Skill 是一个目录中的 `SKILL.md`。发现顺序包括：
 
 1. `~/.kkagent/skills/<name>/SKILL.md`；
 2. `.kkagent/skills/<name>/SKILL.md`；
-3. 兼容目录 `.kimi/skills/`；
+3. 兼容目录 `.agents/skills/` 和 `.kimi/skills/`；
 4. 工程根目录 `AGENTS.md` 和 `.kkagent/AGENTS.md` 作为项目指令。
 
 最小示例：
@@ -56,7 +56,7 @@ triggers: [review, release]
 
 Skill 名只能包含 ASCII 字母、数字、`-`、`_`。`SKILL.md` 最大 256 KiB；目录中的资源会被列给模型，`Skill` 工具可用 `resource` 参数读取最大 1 MiB 的 UTF-8 文本资源，并阻止绝对路径、`..` 和符号链接逃逸。每次列出或加载都会重新扫描，因此编辑无需重启。
 
-同名优先级为项目 `.kkagent` > 项目 `.kimi` > `extra_skill_dirs` > 用户目录。独立 Server 会按每个 Session workspace 单独发现。Skill 不会绕过工具权限；`merge_all_available_skills = true` 会增加初始上下文占用。
+同名优先级为项目 `.kkagent` > 项目 `.agents` > 项目 `.kimi` > `extra_skill_dirs` > 用户目录。独立 Server 会按每个 Session workspace 单独发现。Skill 不会绕过工具权限；`merge_all_available_skills = true` 会增加初始上下文占用。
 
 ## Hooks
 
