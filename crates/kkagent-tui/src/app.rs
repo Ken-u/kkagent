@@ -96,6 +96,8 @@ pub struct AppState {
     pub selection_dragging: bool,
     /// Last mouse cell (terminal column/row) for scroll-during-drag updates.
     pub last_mouse: Option<(u16, u16)>,
+    /// Recent click history for double/triple click word/line selection.
+    pub click_history: Vec<ClickRecord>,
     pub approx_tokens: u64,
     pub approval_pending: Option<PendingApproval>,
     /// Additional approvals waiting behind the active one (FIFO).
@@ -219,6 +221,13 @@ pub struct CopyToast {
     pub until: std::time::Instant,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct ClickRecord {
+    pub at: crate::selection::CellPos,
+    pub when: std::time::Instant,
+    pub count: u8,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct SessionUsageTotals {
     pub input_tokens: u64,
@@ -262,6 +271,7 @@ pub struct SessionRuntimeState {
     pub usage_session: SessionUsageTotals,
     pub usage_turns: Vec<TurnUsageSample>,
     pub copy_toast: Option<CopyToast>,
+    pub click_history: Vec<ClickRecord>,
 }
 
 impl SessionRuntimeState {
@@ -298,6 +308,7 @@ impl SessionRuntimeState {
             usage_session: state.usage_session.clone(),
             usage_turns: state.usage_turns.clone(),
             copy_toast: state.copy_toast.clone(),
+            click_history: state.click_history.clone(),
         }
     }
 
@@ -326,6 +337,7 @@ impl SessionRuntimeState {
         state.usage_session = self.usage_session;
         state.usage_turns = self.usage_turns;
         state.copy_toast = self.copy_toast;
+        state.click_history = self.click_history;
         state.stream_cursor = crate::streaming::StreamingCursor::default();
         state.render_cache.invalidate_all();
         state.status_bar.cache_hit = None;
@@ -850,6 +862,7 @@ impl AppState {
             selection: None,
             selection_dragging: false,
             last_mouse: None,
+            click_history: Vec::new(),
             approx_tokens: 0,
             approval_pending: None,
             approval_queue: std::collections::VecDeque::new(),
@@ -2123,6 +2136,49 @@ impl TuiApp {
     fn clear_selection(&mut self) {
         self.state.selection = None;
         self.state.selection_dragging = false;
+        self.state.click_history.clear();
+    }
+
+    /// Classify a click as single/double/triple based on recent click history
+    /// and return a selection matching the click count (word / line).
+    fn classify_click(
+        &mut self,
+        pos: crate::selection::CellPos,
+    ) -> (u8, crate::selection::TextSelection) {
+        const MULTI_CLICK_MS: u64 = 500;
+        let now = std::time::Instant::now();
+        // Drop stale click history first.
+        self.state
+            .click_history
+            .retain(|c| now.duration_since(c.when).as_millis() <= MULTI_CLICK_MS as u128 * 2);
+        let last = self.state.click_history.last();
+        let same_line = last.map(|c| c.at.line == pos.line).unwrap_or(false);
+        let distance_ok = last
+            .map(|c| c.at.line == pos.line && c.at.col.abs_diff(pos.col) <= 5)
+            .unwrap_or(false);
+        let count = match last {
+            Some(c)
+                if same_line
+                    && distance_ok
+                    && c.count == 1
+                    && now.duration_since(c.when).as_millis() <= MULTI_CLICK_MS as u128 =>
+            {
+                2
+            }
+            Some(c)
+                if same_line
+                    && distance_ok
+                    && c.count == 2
+                    && now.duration_since(c.when).as_millis() <= MULTI_CLICK_MS as u128 =>
+            {
+                3
+            }
+            _ => 1,
+        };
+        (
+            count,
+            crate::selection::select_by_click(&self.state.select_rows, pos, count),
+        )
     }
 
     fn selection_copy_text(&self) -> Option<String> {
@@ -2146,6 +2202,7 @@ impl TuiApp {
                     message: format!("Copied {n} chars."),
                     until: std::time::Instant::now() + std::time::Duration::from_millis(1500),
                 });
+                self.clear_selection();
                 true
             }
             Err(e) => {
@@ -2210,14 +2267,23 @@ impl TuiApp {
                         self.clear_selection();
                         return;
                     }
-                    self.state.selection = Some(crate::selection::TextSelection::new(pos));
+                    let (count, selection) = self.classify_click(pos);
+                    self.state.selection = Some(selection);
                     self.state.selection_dragging = true;
+                    self.state.click_history = vec![ClickRecord {
+                        at: pos,
+                        when: std::time::Instant::now(),
+                        count,
+                    }];
                 } else {
                     // Click outside transcript clears selection.
                     self.clear_selection();
                 }
             }
             MouseEventKind::Drag(MouseButton::Left) if self.state.selection_dragging => {
+                // A drag is no longer part of a multi-click sequence. Keeping
+                // this record would make the next click look like a double click.
+                self.state.click_history.clear();
                 if let Some(pos) = self.mouse_to_cell(&mouse) {
                     if let Some(sel) = self.state.selection.as_mut() {
                         sel.focus = pos;
@@ -2225,20 +2291,34 @@ impl TuiApp {
                 }
             }
             MouseEventKind::Up(MouseButton::Left) if self.state.selection_dragging => {
-                if let Some(pos) = self.mouse_to_cell(&mouse) {
-                    if let Some(sel) = self.state.selection.as_mut() {
-                        sel.focus = pos;
+                let click_count = self
+                    .state
+                    .click_history
+                    .last()
+                    .map(|click| click.count)
+                    .unwrap_or(1);
+                // Word/line selections already have exact boundaries. Only a
+                // single-click drag should use the mouse-up cell as its focus.
+                if click_count == 1 {
+                    if let Some(pos) = self.mouse_to_cell(&mouse) {
+                        if let Some(sel) = self.state.selection.as_mut() {
+                            sel.focus = pos;
+                        }
                     }
                 }
                 self.state.selection_dragging = false;
-                // Plain click (no drag span) → clear; keep existing click semantics.
+                // Only drop the selection if it is still empty after mouse up
+                // (i.e. a plain click without drag or multi-click). Word/line
+                // selections from double/triple click have non-empty ranges and
+                // are kept.
                 let drop = match self.state.selection {
-                    Some(s) if s.is_empty() => true,
-                    Some(_) => self.selection_copy_text().is_none(),
+                    Some(s) => s.is_empty(),
                     None => true,
                 };
                 if drop {
-                    self.clear_selection();
+                    // Preserve the first click so the next one can be classified
+                    // as a double click. Other clear paths intentionally reset it.
+                    self.state.selection = None;
                 }
             }
             _ => {}
@@ -9337,6 +9417,56 @@ mod app_state_tests {
         let rpc = kkagent_rpc::RpcClient::new(client_transport, event_tx);
         let client = kkagent_client::KkagentClient::new(rpc, event_rx);
         TuiApp::new(AppConfig::default(), client)
+    }
+
+    #[tokio::test]
+    async fn double_and_triple_click_select_word_and_line() {
+        let mut app = test_tui_app();
+        app.state.transcript_area = ratatui::layout::Rect::new(0, 0, 80, 10);
+        app.state.select_rows = vec![crate::selection::SelectRow {
+            plain: "  hello world".into(),
+            content_col: 2,
+        }];
+        let mouse = |kind| crossterm::event::MouseEvent {
+            kind,
+            column: 4,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        };
+        let mut scroll_delta = 0;
+
+        app.collect_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left)),
+            &mut scroll_delta,
+        );
+        app.collect_mouse(
+            mouse(MouseEventKind::Up(MouseButton::Left)),
+            &mut scroll_delta,
+        );
+        assert!(app.state.selection.is_none());
+        assert_eq!(app.state.click_history.last().unwrap().count, 1);
+
+        app.collect_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left)),
+            &mut scroll_delta,
+        );
+        app.collect_mouse(
+            mouse(MouseEventKind::Up(MouseButton::Left)),
+            &mut scroll_delta,
+        );
+        assert_eq!(app.selection_copy_text().as_deref(), Some("hello"));
+        assert_eq!(app.state.click_history.last().unwrap().count, 2);
+
+        app.collect_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left)),
+            &mut scroll_delta,
+        );
+        app.collect_mouse(
+            mouse(MouseEventKind::Up(MouseButton::Left)),
+            &mut scroll_delta,
+        );
+        assert_eq!(app.selection_copy_text().as_deref(), Some("hello world"));
+        assert_eq!(app.state.click_history.last().unwrap().count, 3);
     }
 
     #[test]

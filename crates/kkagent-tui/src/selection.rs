@@ -205,6 +205,120 @@ pub fn extract_text(rows: &[SelectRow], sel: TextSelection) -> String {
     parts.join("\n")
 }
 
+pub fn select_by_click(rows: &[SelectRow], pos: CellPos, count: u8) -> TextSelection {
+    match count {
+        3 => select_line(rows, pos),
+        2 => select_word(rows, pos),
+        _ => TextSelection::new(pos),
+    }
+}
+
+fn select_word(rows: &[SelectRow], pos: CellPos) -> TextSelection {
+    let Some(row) = rows.get(pos.line) else {
+        return TextSelection::new(pos);
+    };
+    let text = &row.plain;
+    let col = pos.col as usize;
+    if text.is_empty() {
+        return TextSelection::new(pos);
+    }
+    let mut char_indices: Vec<(usize, usize)> = Vec::new(); // (byte_start, col)
+    let mut col_acc = 0usize;
+    for (idx, ch) in text.char_indices() {
+        char_indices.push((idx, col_acc));
+        col_acc += UnicodeWidthChar::width(ch).unwrap_or(1);
+    }
+    // Find the character under the click.
+    let mut idx_under = None;
+    for (i, &(_byte_start, _ch_start)) in char_indices.iter().enumerate() {
+        let ch_end = char_indices.get(i + 1).map(|(_, c)| *c).unwrap_or(col_acc);
+        if col < ch_end {
+            idx_under = Some(i);
+            break;
+        }
+    }
+    let idx_under = idx_under.unwrap_or(char_indices.len().saturating_sub(1));
+    let is_word_char = |ch: char| ch.is_alphanumeric() || ch == '_' || ch > '\x7f';
+    let ch_under = text.chars().nth(idx_under).unwrap_or(' ');
+    if !is_word_char(ch_under) {
+        // Punctuation: select just that character.
+        let byte_start = char_indices[idx_under].0;
+        let _byte_end = char_indices
+            .get(idx_under + 1)
+            .map(|(b, _)| *b)
+            .unwrap_or(text.len());
+        let before = &text[..byte_start];
+        let start_col = before.width() as u16;
+        let end_col = start_col + UnicodeWidthChar::width(ch_under).unwrap_or(1) as u16;
+        return TextSelection {
+            anchor: CellPos {
+                line: pos.line,
+                col: start_col,
+            },
+            focus: CellPos {
+                line: pos.line,
+                col: end_col,
+            },
+        };
+    }
+    // Find word boundaries.
+    let mut start_idx = idx_under;
+    while start_idx > 0
+        && text
+            .chars()
+            .nth(start_idx - 1)
+            .map(is_word_char)
+            .unwrap_or(false)
+    {
+        start_idx -= 1;
+    }
+    let mut end_idx = idx_under;
+    while end_idx + 1 < char_indices.len()
+        && text
+            .chars()
+            .nth(end_idx + 1)
+            .map(is_word_char)
+            .unwrap_or(false)
+    {
+        end_idx += 1;
+    }
+    let start_byte = char_indices[start_idx].0;
+    let end_byte = char_indices
+        .get(end_idx + 1)
+        .map(|(b, _)| *b)
+        .unwrap_or(text.len());
+    let start_col = text[..start_byte].width() as u16;
+    let end_col = text[..end_byte].width() as u16;
+    TextSelection {
+        anchor: CellPos {
+            line: pos.line,
+            col: start_col,
+        },
+        focus: CellPos {
+            line: pos.line,
+            col: end_col,
+        },
+    }
+}
+
+fn select_line(rows: &[SelectRow], pos: CellPos) -> TextSelection {
+    let Some(row) = rows.get(pos.line) else {
+        return TextSelection::new(pos);
+    };
+    let start_col = row.content_col;
+    let end_col = row.width();
+    TextSelection {
+        anchor: CellPos {
+            line: pos.line,
+            col: start_col,
+        },
+        focus: CellPos {
+            line: pos.line,
+            col: end_col,
+        },
+    }
+}
+
 fn slice_by_columns(s: &str, start_col: usize, end_col: usize) -> String {
     let mut col = 0usize;
     let mut out = String::new();
