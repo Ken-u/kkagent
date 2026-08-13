@@ -464,7 +464,6 @@ pub struct SessionDeleteConfirm {
 pub struct ResumeSwitchCtx {
     pub target: String,
     pub leaving_id: Option<String>,
-    pub leaving_empty: bool,
     pub started_at: std::time::Instant,
 }
 
@@ -5506,16 +5505,8 @@ impl TuiApp {
         picker.selected = new_selected;
     }
 
-    fn cache_active_session_state(&mut self, target: &str) -> (Option<String>, bool) {
+    fn cache_active_session_state(&mut self, target: &str) -> Option<String> {
         let leaving_id = self.state.session_id.clone();
-        let leaving_empty = leaving_id
-            .as_ref()
-            .map(|id| {
-                id != target
-                    && !session_status_has_active_agent_loop(self.state.status)
-                    && !session_has_retained_io(&self.state.messages)
-            })
-            .unwrap_or(false);
 
         if let Some(ref leaving) = leaving_id {
             if leaving != target {
@@ -5543,7 +5534,7 @@ impl TuiApp {
                 }
             }
         }
-        (leaving_id, leaving_empty)
+        leaving_id
     }
 
     fn restore_session_view(&mut self, session_id: &str) {
@@ -5572,26 +5563,6 @@ impl TuiApp {
             self.state.search = crate::search::SearchState::default();
             self.state.highlight_message = None;
         }
-    }
-
-    fn delete_empty_session_after_switch(&mut self, leaving_id: Option<String>, target: &str) {
-        let Some(prev) = leaving_id else {
-            return;
-        };
-        if prev == target {
-            return;
-        }
-        let requester = self.client.requester();
-        let prev_id = prev.clone();
-        tokio::spawn(async move {
-            let params = serde_json::json!({"session_id": prev_id});
-            let _ = requester.rpc_call("sessions.delete", Some(params)).await;
-        });
-        self.state.tab_strip.tabs.retain(|t| t.id != prev);
-        self.state.open_session_group.retain(|id| id != &prev);
-        self.state.session_views.remove(&prev);
-        self.state.session_runtime_states.remove(&prev);
-        self.state.background_session_events.remove(&prev);
     }
 
     fn replay_background_session_events(&mut self, session_id: &str) {
@@ -5625,8 +5596,6 @@ impl TuiApp {
         &mut self,
         session_id: &str,
         cached: SessionRuntimeState,
-        leaving_id: Option<String>,
-        leaving_empty: bool,
         started_at: std::time::Instant,
     ) {
         use crate::async_jobs::JobChannel;
@@ -5666,9 +5635,6 @@ impl TuiApp {
             first_feedback_ms: 0,
             visible_ms: started_at.elapsed().as_millis() as u64,
         });
-        if leaving_empty {
-            self.delete_empty_session_after_switch(leaving_id, session_id);
-        }
         self.enqueue_workspace_sessions_refresh();
     }
 
@@ -5688,16 +5654,15 @@ impl TuiApp {
             self.state.pending_resume_prefill = None;
         }
         let started_at = std::time::Instant::now();
-        let (leaving_id, leaving_empty) = self.cache_active_session_state(query);
+        let leaving_id = self.cache_active_session_state(query);
         if let Some(cached) = self.state.session_runtime_states.remove(query) {
-            self.activate_cached_session(query, cached, leaving_id, leaving_empty, started_at);
+            self.activate_cached_session(query, cached, started_at);
             return Ok(());
         }
 
         self.state.resume_switch = Some(ResumeSwitchCtx {
             target: query.to_string(),
             leaving_id,
-            leaving_empty,
             started_at,
         });
         // Keep showing the current transcript until the target loads.
@@ -5742,7 +5707,6 @@ impl TuiApp {
             _ => None,
         };
         let leaving_id = ctx.as_ref().and_then(|c| c.leaving_id.clone());
-        let leaving_empty = ctx.as_ref().map(|c| c.leaving_empty).unwrap_or(false);
         if let Some(ref switch) = ctx {
             let visible_ms = switch.started_at.elapsed().as_millis() as u64;
             // Busy notice threshold is ~150ms; treat that as first feedback ceiling.
@@ -5935,10 +5899,6 @@ impl TuiApp {
             }
         }
 
-        if leaving_empty {
-            self.delete_empty_session_after_switch(leaving_id, &sid);
-        }
-
         if !self.state.open_session_group.iter().any(|id| id == &sid) {
             self.state.open_session_group.clear();
         }
@@ -6075,11 +6035,6 @@ impl TuiApp {
         }
     }
 
-    /// True when the transcript has user/assistant/plan content worth keeping.
-    fn current_session_has_io(&self) -> bool {
-        session_has_retained_io(&self.state.messages)
-    }
-
     async fn discard_session_record(&mut self, session_id: &str) -> anyhow::Result<()> {
         let params = serde_json::json!({"session_id": session_id});
         let _ = self.client.rpc_call("sessions.delete", Some(params)).await;
@@ -6104,11 +6059,10 @@ impl TuiApp {
             return;
         };
         let Some(data) = data else {
-            self.state.workspace_sessions.set_entries(Vec::new(), None);
             return;
         };
 
-        let mut rows: Vec<(String, Option<String>, String)> = Vec::new();
+        let mut rows: Vec<(String, String)> = Vec::new();
         if let Some(sessions) = data.get("sessions").and_then(|v| v.as_array()) {
             for s in sessions {
                 let id = s
@@ -6120,28 +6074,10 @@ impl TuiApp {
                     continue;
                 }
                 let empty = s.get("empty").and_then(|v| v.as_bool()).unwrap_or(false);
-                let in_group = self.state.open_session_group.iter().any(|g| g == &id);
-                let has_active_agent_loop = self
-                    .state
-                    .tab_strip
-                    .tabs
-                    .iter()
-                    .find(|tab| tab.id == id)
-                    .is_some_and(|tab| session_status_has_active_agent_loop(tab.status))
-                    || self
-                        .state
-                        .session_runtime_states
-                        .get(&id)
-                        .is_some_and(|runtime| {
-                            session_status_has_active_agent_loop(runtime.status)
-                        });
-                if empty && id != current_id && !in_group && !has_active_agent_loop {
+                let is_open = self.state.tab_strip.tabs.iter().any(|tab| tab.id == id);
+                if empty && id != current_id && !is_open {
                     continue;
                 }
-                let forked_from = s
-                    .get("forked_from")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
                 let title = crate::chrome::session_display_title(
                     s.get("title").and_then(|v| v.as_str()),
                     s.get("is_custom_title")
@@ -6150,12 +6086,12 @@ impl TuiApp {
                     s.get("last_prompt").and_then(|v| v.as_str()),
                     &id,
                 );
-                rows.push((id, forked_from, title));
+                rows.push((id, title));
             }
         }
 
         // Ensure current session is in the graph even if list is momentarily stale.
-        if !rows.iter().any(|(id, _, _)| id == &current_id) {
+        if !rows.iter().any(|(id, _)| id == &current_id) {
             let title = self
                 .state
                 .messages
@@ -6187,62 +6123,25 @@ impl TuiApp {
                         current_id.clone()
                     }
                 });
-            rows.push((current_id.clone(), None, title));
+            rows.push((current_id.clone(), title));
         }
 
-        let parent_rows: Vec<(String, Option<String>)> = rows
-            .iter()
-            .map(|(id, parent, _)| (id.clone(), parent.clone()))
-            .collect();
-        let family_ids = crate::chrome::fork_family_ids(&parent_rows, &current_id);
-
-        // Ephemeral window group (`/new` siblings) — not persisted across process restarts.
-        self.state
-            .open_session_group
-            .retain(|id| id == &current_id || rows.iter().any(|(rid, _, _)| rid == id));
-        let mut ids: Vec<String> = if family_ids.is_empty() {
-            Vec::new()
-        } else {
-            family_ids
-        };
-        if self
+        // The footer is an open-tab strip: refreshes may update metadata and
+        // status, but never close an indicator. Ctrl-D is the only close path.
+        let mut ids = self
             .state
-            .open_session_group
+            .tab_strip
+            .tabs
             .iter()
-            .any(|id| id == &current_id)
-            && self.state.open_session_group.len() >= 2
-        {
-            for id in &self.state.open_session_group {
-                if !ids.contains(id) {
-                    ids.push(id.clone());
-                }
-            }
-        }
+            .map(|tab| tab.id.clone())
+            .collect::<Vec<_>>();
         if !ids.contains(&current_id) {
             ids.insert(0, current_id.clone());
-        }
-        for tab in &self.state.tab_strip.tabs {
-            if session_status_has_active_agent_loop(tab.status) && !ids.contains(&tab.id) {
-                ids.push(tab.id.clone());
-            }
-        }
-        let mut active_cached_ids = self
-            .state
-            .session_runtime_states
-            .iter()
-            .filter(|(_, runtime)| session_status_has_active_agent_loop(runtime.status))
-            .map(|(id, _)| id.clone())
-            .collect::<Vec<_>>();
-        active_cached_ids.sort();
-        for id in active_cached_ids {
-            if !ids.contains(&id) {
-                ids.push(id);
-            }
         }
 
         let entries: Vec<crate::chrome::WorkspaceSessionEntry> = ids
             .into_iter()
-            .filter_map(|id| {
+            .map(|id| {
                 let tab = self.state.tab_strip.tabs.iter().find(|t| t.id == id);
                 let status = tab
                     .map(|t| t.status)
@@ -6256,36 +6155,32 @@ impl TuiApp {
                 let dirty = tab.map(|t| t.dirty).unwrap_or(false);
                 let needs_attention = self.state.parked_approvals.contains_key(&id)
                     || self.state.parked_questions.contains_key(&id);
-                if let Some((_, _, title)) = rows.iter().find(|(rid, _, _)| rid == &id) {
-                    Some(crate::chrome::WorkspaceSessionEntry {
+                if let Some((_, title)) = rows.iter().find(|(rid, _)| rid == &id) {
+                    crate::chrome::WorkspaceSessionEntry {
                         id,
                         title: title.clone(),
                         status,
                         dirty,
                         needs_attention,
-                    })
-                } else if id == current_id {
-                    Some(crate::chrome::WorkspaceSessionEntry {
-                        id,
-                        title: "session".into(),
-                        status,
-                        dirty,
-                        needs_attention,
-                    })
-                } else if session_status_has_active_agent_loop(status) {
+                    }
+                } else {
                     let title = tab
                         .map(|tab| tab.title.clone())
                         .filter(|title| !title.is_empty())
-                        .unwrap_or_else(|| id[..id.len().min(8)].to_string());
-                    Some(crate::chrome::WorkspaceSessionEntry {
+                        .unwrap_or_else(|| {
+                            if id == current_id {
+                                "session".into()
+                            } else {
+                                id[..id.len().min(8)].to_string()
+                            }
+                        });
+                    crate::chrome::WorkspaceSessionEntry {
                         id,
                         title,
                         status,
                         dirty,
                         needs_attention,
-                    })
-                } else {
-                    None
+                    }
                 }
             })
             .collect();
@@ -6306,8 +6201,8 @@ impl TuiApp {
             .map(|e| e.title.clone())
             .or_else(|| {
                 rows.iter()
-                    .find(|(id, _, _)| id == &current_id)
-                    .map(|(_, _, t)| t.clone())
+                    .find(|(id, _)| id == &current_id)
+                    .map(|(_, title)| title.clone())
             })
             .unwrap_or_else(|| "main".into());
         self.state.tab_strip.ensure_active(&current_id, title);
@@ -7260,14 +7155,7 @@ impl TuiApp {
             }
             "new" | "clear" => {
                 let prev = self.state.session_id.clone();
-                let prev_busy = matches!(
-                    self.state.status,
-                    SessionStatus::Thinking
-                        | SessionStatus::ToolExecuting
-                        | SessionStatus::WaitingApproval
-                        | SessionStatus::WaitingQuestion
-                );
-                let prev_empty = !self.current_session_has_io();
+                let prev_status = self.state.status;
                 // Keep the previous turn running in the background — do not interrupt.
                 if let Some(ref leaving) = prev {
                     if let Some(approval) = self.state.approval_pending.take() {
@@ -7299,27 +7187,18 @@ impl TuiApp {
                 if self.state.plan_mode {
                     let _ = self.client.set_plan_mode(&session_id, true).await;
                 }
-                let keep_prev = prev
-                    .as_ref()
-                    .is_some_and(|p| p != &session_id && (prev_busy || !prev_empty));
-                if keep_prev {
+                if prev.as_ref().is_some_and(|p| p != &session_id) {
                     if let Some(ref p) = prev {
                         self.link_open_sessions(p, &session_id);
                         self.state.tab_strip.ensure_tab(p, "background");
+                        self.state.tab_strip.set_status(p, prev_status);
                     }
                     self.state.tab_strip.ensure_active(&session_id, "new");
                     self.system_message(
-                        "New session started. Previous session keeps running — Tab / ←→ to switch."
+                        "New session started. Previous session remains open — Tab / ←→ to switch."
                             .into(),
                     );
                 } else {
-                    if prev_empty {
-                        if let Some(prev) = prev {
-                            if prev != session_id {
-                                let _ = self.discard_session_record(&prev).await;
-                            }
-                        }
-                    }
                     self.state.tab_strip.ensure_active(&session_id, "main");
                     self.system_message("New session started.".into());
                 }
@@ -9686,7 +9565,7 @@ mod app_state_tests {
     }
 
     #[tokio::test]
-    async fn workspace_strip_keeps_unrelated_sessions_with_active_agent_loops() {
+    async fn workspace_strip_keeps_all_open_sessions_until_ctrl_d_closes_them() {
         let mut app = test_tui_app();
         app.state.session_id = Some("current".into());
         app.state.tab_strip.ensure_active("current", "current");
@@ -9698,9 +9577,7 @@ mod app_state_tests {
 
         app.apply_workspace_sessions_list(Some(serde_json::json!({
             "sessions": [
-                {"session_id": "current", "title": "current", "empty": false},
-                {"session_id": "running", "title": "running", "empty": false},
-                {"session_id": "idle", "title": "idle", "empty": false}
+                {"session_id": "current", "title": "current", "empty": false}
             ]
         })));
 
@@ -9713,24 +9590,30 @@ mod app_state_tests {
             .collect::<Vec<_>>();
         assert!(visible_ids.contains(&"current"));
         assert!(visible_ids.contains(&"running"));
-        assert!(!visible_ids.contains(&"idle"));
+        assert!(visible_ids.contains(&"idle"));
     }
 
     #[tokio::test]
-    async fn switching_does_not_delete_an_empty_session_with_an_active_agent_loop() {
+    async fn switching_preserves_an_empty_open_session() {
         let mut app = test_tui_app();
         app.state.session_id = Some("running".into());
-        app.state.status = SessionStatus::Thinking;
+        app.state.status = SessionStatus::Idle;
+        app.state.tab_strip.ensure_active("running", "running");
 
-        let (leaving_id, leaving_empty) = app.cache_active_session_state("target");
+        let leaving_id = app.cache_active_session_state("target");
 
         assert_eq!(leaving_id.as_deref(), Some("running"));
-        assert!(!leaving_empty);
+        assert!(app
+            .state
+            .tab_strip
+            .tabs
+            .iter()
+            .any(|tab| tab.id == "running"));
         assert!(app
             .state
             .session_runtime_states
             .get("running")
-            .is_some_and(|runtime| runtime.status == SessionStatus::Thinking));
+            .is_some_and(|runtime| runtime.status == SessionStatus::Idle));
     }
 
     #[tokio::test]
