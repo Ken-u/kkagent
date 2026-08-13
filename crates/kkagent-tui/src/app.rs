@@ -1528,11 +1528,7 @@ impl TuiApp {
             // Periodically persist the composer draft for the active session.
             if self.state.tick.is_multiple_of(20) {
                 if let Some(sid) = self.state.session_id.clone() {
-                    let text = self.state.input.text.clone();
-                    let cursor = self.state.input.cursor;
-                    if !text.is_empty() {
-                        let _ = crate::draft_store::save_draft(&sid, &text, cursor);
-                    }
+                    persist_composer_draft(&sid, &self.state.input);
                 }
             }
 
@@ -3463,37 +3459,7 @@ impl TuiApp {
         }
         let item = menu.items[menu.selected.min(menu.items.len() - 1)].clone();
         let needs_args = item.argument_hint.is_some();
-        let opens_immediately = matches!(
-            item.name.as_str(),
-            "model"
-                | "sessions"
-                | "resume"
-                | "tasks"
-                | "task"
-                | "permission"
-                | "config"
-                | "provider"
-                | "providers"
-                | "effort"
-                | "thinking"
-                | "auth"
-                | "help"
-                | "h"
-                | "?"
-                | "info"
-                | "status"
-                | "usage"
-                | "doctor"
-                | "prompts"
-                | "prompt"
-                | "experimental-flags"
-                | "flags"
-                | "plugins"
-                | "plugin"
-                | "swarm"
-                | "mcp"
-                | "skills"
-        );
+        let opens_immediately = slash_command_opens_immediately(&item.name);
 
         if !submit_if_ready || (needs_args && !opens_immediately) {
             self.state.input.set_text(format!("/{} ", item.name));
@@ -3505,11 +3471,12 @@ impl TuiApp {
         // Enter accepted this suggestion as a command. Consume the composer
         // before any async work so partial text such as `/sess` cannot remain
         // visible or come back from a persisted draft while the picker opens.
-        self.state.input.clear();
-        self.state.history_index = None;
-        self.state.history_draft.clear();
-        if let Some(session_id) = self.state.session_id.as_deref() {
-            crate::draft_store::clear_draft(session_id);
+        if let Some(session_id) = self.state.session_id.clone() {
+            self.clear_session_composer_draft(&session_id);
+        } else {
+            self.state.input.clear();
+            self.state.history_index = None;
+            self.state.history_draft.clear();
         }
         self.state.slash_menu = None;
 
@@ -3773,7 +3740,11 @@ impl TuiApp {
             }
             ListPickerKind::Session => {
                 self.clear_list_pickers();
-                self.resume_session(&item.id).await?;
+                if self.state.session_id.as_deref() == Some(item.id.as_str()) {
+                    self.clear_session_composer_draft(&item.id);
+                } else {
+                    self.resume_session(&item.id).await?;
+                }
             }
             ListPickerKind::Permission => {
                 self.apply_permission_mode_id(&item.id).await?;
@@ -5522,6 +5493,7 @@ impl TuiApp {
 
         if let Some(ref leaving) = leaving_id {
             if leaving != target {
+                persist_composer_draft(leaving, &self.state.input);
                 let view = crate::session_view::SessionViewState::capture(
                     &self.state.input,
                     self.state.scroll_up,
@@ -5549,8 +5521,26 @@ impl TuiApp {
         leaving_id
     }
 
+    fn clear_session_composer_draft(&mut self, session_id: &str) {
+        if self.state.session_id.as_deref() == Some(session_id) {
+            self.state.input.clear();
+            self.state.history_index = None;
+            self.state.history_draft.clear();
+        }
+        if let Some(view) = self.state.session_views.get_mut(session_id) {
+            view.draft.clear();
+            view.cursor = 0;
+        }
+        crate::draft_store::clear_draft(session_id);
+    }
+
     fn restore_session_view(&mut self, session_id: &str) {
-        if let Some(view) = self.state.session_views.remove(session_id) {
+        if let Some(mut view) = self.state.session_views.remove(session_id) {
+            if slash_draft_looks_consumed(&view.draft) {
+                view.draft.clear();
+                view.cursor = 0;
+                crate::draft_store::clear_draft(session_id);
+            }
             view.restore_into(
                 &mut self.state.input,
                 &mut self.state.scroll_up,
@@ -5560,8 +5550,13 @@ impl TuiApp {
                 &mut self.state.highlight_message,
             );
         } else if let Some(draft) = crate::draft_store::load_draft(session_id) {
-            self.state.input.set_text(draft.text);
-            self.state.input.cursor = draft.cursor.min(self.state.input.text.len());
+            if slash_draft_looks_consumed(&draft.text) {
+                crate::draft_store::clear_draft(session_id);
+                self.state.input.clear();
+            } else {
+                self.state.input.set_text(draft.text);
+                self.state.input.cursor = draft.cursor.min(self.state.input.text.len());
+            }
             self.state.scroll_up = 0;
             self.state.follow_bottom = true;
             self.state.todos_expanded = false;
@@ -9001,6 +8996,69 @@ fn session_status_has_active_agent_loop(status: SessionStatus) -> bool {
     !matches!(status, SessionStatus::Idle)
 }
 
+fn persist_composer_draft(session_id: &str, input: &crate::input::InputState) {
+    if input.is_empty() {
+        crate::draft_store::clear_draft(session_id);
+    } else {
+        let _ = crate::draft_store::save_draft(session_id, &input.text, input.cursor);
+    }
+}
+
+fn slash_command_opens_immediately(name: &str) -> bool {
+    matches!(
+        name,
+        "model"
+            | "sessions"
+            | "resume"
+            | "tasks"
+            | "task"
+            | "permission"
+            | "config"
+            | "provider"
+            | "providers"
+            | "effort"
+            | "thinking"
+            | "auth"
+            | "help"
+            | "h"
+            | "?"
+            | "info"
+            | "status"
+            | "usage"
+            | "doctor"
+            | "prompts"
+            | "prompt"
+            | "experimental-flags"
+            | "flags"
+            | "plugins"
+            | "plugin"
+            | "swarm"
+            | "mcp"
+            | "skills"
+    )
+}
+
+/// Old builds could persist a command-only composer after Enter accepted its
+/// slash completion. Do not resurrect those consumed commands on resume.
+fn slash_draft_looks_consumed(text: &str) -> bool {
+    let Some((command, args)) = parse_slash_input(text) else {
+        return false;
+    };
+    if command.is_empty() || !args.is_empty() {
+        return false;
+    }
+    let canonical = find_slash_command(&command)
+        .map(|entry| entry.name.to_string())
+        .or_else(|| {
+            let matches = crate::slash::filter_slash_commands(&format!("/{command}"));
+            (matches.len() == 1).then(|| matches[0].name.clone())
+        });
+    let Some(canonical) = canonical else {
+        return false;
+    };
+    find_slash_command(&canonical).is_some_and(|entry| slash_command_opens_immediately(entry.name))
+}
+
 /// Convert a list of serialized ChatMessages into display bubbles,
 /// pairing tool_result blocks onto preceding tool_use entries.
 /// Completed turns are folded into tool-history overviews (same as live TurnEnd).
@@ -9528,7 +9586,17 @@ mod app_state_tests {
     #[tokio::test]
     async fn accepted_partial_slash_command_clears_the_composer_immediately() {
         let mut app = test_tui_app();
-        app.state.session_id = Some("session-slash".into());
+        let session_id = format!("session-slash-{}", uuid::Uuid::new_v4());
+        app.state.session_id = Some(session_id.clone());
+        app.state.session_views.insert(
+            session_id.clone(),
+            crate::session_view::SessionViewState {
+                draft: "/sess".into(),
+                cursor: 5,
+                ..Default::default()
+            },
+        );
+        crate::draft_store::save_draft(&session_id, "/sess", 5).unwrap();
         app.state.input.set_text("/sess".into());
         app.state.refresh_slash_menu();
 
@@ -9540,9 +9608,75 @@ mod app_state_tests {
         assert!(app.state.slash_menu.is_none());
         assert!(app
             .state
+            .session_views
+            .get(&session_id)
+            .is_some_and(|view| view.draft.is_empty() && view.cursor == 0));
+        assert!(crate::draft_store::load_draft(&session_id).is_none());
+        assert!(app
+            .state
             .list_picker
             .as_ref()
             .is_some_and(|picker| picker.kind == ListPickerKind::Session));
+    }
+
+    #[tokio::test]
+    async fn session_restore_drops_legacy_consumed_slash_drafts() {
+        let mut app = test_tui_app();
+        let session_id = format!("legacy-slash-{}", uuid::Uuid::new_v4());
+        crate::draft_store::save_draft(&session_id, "/sessions ", 10).unwrap();
+
+        app.restore_session_view(&session_id);
+
+        assert!(app.state.input.is_empty());
+        assert!(crate::draft_store::load_draft(&session_id).is_none());
+
+        let argument_session = format!("argument-slash-{}", uuid::Uuid::new_v4());
+        crate::draft_store::save_draft(&argument_session, "/compact ", 9).unwrap();
+        app.restore_session_view(&argument_session);
+        assert_eq!(app.state.input.text, "/compact ");
+        crate::draft_store::clear_draft(&argument_session);
+    }
+
+    #[test]
+    fn empty_composer_removes_the_persisted_session_draft() {
+        let session_id = format!("empty-draft-{}", uuid::Uuid::new_v4());
+        crate::draft_store::save_draft(&session_id, "stale input", 4).unwrap();
+        let input = crate::input::InputState::new();
+
+        persist_composer_draft(&session_id, &input);
+
+        assert!(crate::draft_store::load_draft(&session_id).is_none());
+    }
+
+    #[tokio::test]
+    async fn selecting_the_current_session_does_not_resume_stale_cached_state() {
+        let mut app = test_tui_app();
+        app.state.session_id = Some("current-session".into());
+        app.state.session_runtime_states.insert(
+            "current-session".into(),
+            SessionRuntimeState::capture(&app.state),
+        );
+        app.replace_list_picker(ListPickerState {
+            kind: ListPickerKind::Session,
+            title: "Sessions".into(),
+            items: vec![ListPickerItem {
+                id: "current-session".into(),
+                label: "current-session".into(),
+                detail: String::new(),
+            }],
+            selected: 0,
+            filter: String::new(),
+            all_items: Vec::new(),
+        });
+
+        app.apply_list_picker().await.unwrap();
+
+        assert!(app.state.input.is_empty());
+        assert!(app
+            .state
+            .session_runtime_states
+            .contains_key("current-session"));
+        assert!(app.state.list_picker.is_none());
     }
 
     #[tokio::test]
