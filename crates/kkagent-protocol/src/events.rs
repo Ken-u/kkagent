@@ -46,6 +46,16 @@ pub enum AgentEvent {
     Heartbeat {
         session_id: String,
     },
+    /// A model request will be retried. Countdown updates reuse the same
+    /// `retry_number` and set `initial` to false.
+    LlmRetry {
+        session_id: String,
+        retry_number: u32,
+        reason: String,
+        wait_seconds: u64,
+        remaining_seconds: u64,
+        initial: bool,
+    },
     UsageUpdate {
         session_id: String,
         usage: super::TokenUsage,
@@ -185,6 +195,7 @@ impl AgentEvent {
             | Self::TurnEnd { session_id, .. }
             | Self::StatusUpdate { session_id, .. }
             | Self::Heartbeat { session_id, .. }
+            | Self::LlmRetry { session_id, .. }
             | Self::UsageUpdate { session_id, .. }
             | Self::ApprovalRequested { session_id, .. }
             | Self::QuestionAsked { session_id, .. }

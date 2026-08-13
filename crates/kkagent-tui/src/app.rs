@@ -7826,6 +7826,36 @@ impl TuiApp {
         });
     }
 
+    fn update_llm_retry_message(
+        &mut self,
+        retry_number: u32,
+        reason: &str,
+        wait_seconds: u64,
+        remaining_seconds: u64,
+        initial: bool,
+    ) {
+        let prefix = format!("↻ LLM retry #{retry_number}");
+        let reason = compact_retry_reason(reason, 180);
+        let content = if remaining_seconds > 0 {
+            format!("{prefix} in {remaining_seconds}s (wait {wait_seconds}s) · {reason}")
+        } else {
+            format!("{prefix} now · {reason}")
+        };
+        if !initial {
+            if let Some(message) = self.state.messages.iter_mut().rev().find(|message| {
+                message.role == MessageRole::System && message.content.starts_with(&prefix)
+            }) {
+                message.content = content;
+                self.state.follow_bottom = true;
+                self.state.scroll_up = 0;
+                return;
+            }
+        }
+        self.system_message(content);
+        self.state.follow_bottom = true;
+        self.state.scroll_up = 0;
+    }
+
     async fn respond_approval_choice(
         &mut self,
         choice: ApprovalChoice,
@@ -8148,6 +8178,9 @@ impl TuiApp {
                         AgentEvent::Error { message, .. } if message != "Interrupted" => {
                             self.state.tab_strip.mark_dirty(&evt_sid, true);
                         }
+                        AgentEvent::LlmRetry { initial: true, .. } => {
+                            self.state.tab_strip.mark_dirty(&evt_sid, true);
+                        }
                         AgentEvent::CompactCompleted { .. } => {
                             self.state.tab_strip.mark_dirty(&evt_sid, true);
                         }
@@ -8315,6 +8348,22 @@ impl TuiApp {
                         }
                     }
                     AgentEvent::Heartbeat { .. } => {}
+                    AgentEvent::LlmRetry {
+                        retry_number,
+                        reason,
+                        wait_seconds,
+                        remaining_seconds,
+                        initial,
+                        ..
+                    } => {
+                        self.update_llm_retry_message(
+                            retry_number,
+                            &reason,
+                            wait_seconds,
+                            remaining_seconds,
+                            initial,
+                        );
+                    }
                     AgentEvent::ApprovalRequested { request, .. } => {
                         let is_plan_review = request.tool_name == "ExitPlanMode"
                             || request
@@ -9037,6 +9086,21 @@ fn slash_command_opens_immediately(name: &str) -> bool {
     )
 }
 
+fn compact_retry_reason(reason: &str, max_chars: usize) -> String {
+    let compact = reason.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.chars().count() <= max_chars {
+        compact
+    } else {
+        format!(
+            "{}…",
+            compact
+                .chars()
+                .take(max_chars.saturating_sub(1))
+                .collect::<String>()
+        )
+    }
+}
+
 /// Old builds could persist a command-only composer after Enter accepted its
 /// slash completion. Do not resurrect those consumed commands on resume.
 fn slash_draft_looks_consumed(text: &str) -> bool {
@@ -9466,6 +9530,27 @@ mod app_state_tests {
         let rpc = kkagent_rpc::RpcClient::new(client_transport, event_tx);
         let client = kkagent_client::KkagentClient::new(rpc, event_rx);
         TuiApp::new(AppConfig::default(), client)
+    }
+
+    #[tokio::test]
+    async fn llm_retry_countdown_updates_one_message_and_each_retry_gets_a_new_one() {
+        let mut app = test_tui_app();
+
+        app.update_llm_retry_message(1, "HTTP 429 Too Many Requests", 5, 5, true);
+        assert_eq!(app.state.messages.len(), 1);
+        assert!(app.state.messages[0].content.contains("in 5s"));
+
+        app.update_llm_retry_message(1, "HTTP 429 Too Many Requests", 5, 4, false);
+        assert_eq!(app.state.messages.len(), 1);
+        assert!(app.state.messages[0].content.contains("in 4s"));
+
+        app.update_llm_retry_message(1, "HTTP 429 Too Many Requests", 5, 0, false);
+        assert_eq!(app.state.messages.len(), 1);
+        assert!(app.state.messages[0].content.contains("now"));
+
+        app.update_llm_retry_message(2, "connection reset", 1, 1, true);
+        assert_eq!(app.state.messages.len(), 2);
+        assert!(app.state.messages[1].content.contains("retry #2 in 1s"));
     }
 
     #[tokio::test]

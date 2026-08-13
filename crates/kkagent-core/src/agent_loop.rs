@@ -397,6 +397,7 @@ Do not mention this reminder to the user.\n</system-reminder>"
         let visible_empty_retry_limit = model_config.experimental_visible_empty_retries;
         let mut visible_empty_retries = 0_u32;
         let mut failure_retries = 0_u32;
+        let mut retry_notice_count = 0_u32;
 
         loop {
             assistant_text.clear();
@@ -590,6 +591,17 @@ Do not mention this reminder to the user.\n</system-reminder>"
                     retry_limit = visible_empty_retry_limit,
                     "Experimental recovery retry for visible-empty response after tool result"
                 );
+                retry_notice_count += 1;
+                send_llm_retry_notice(
+                    &self.event_tx,
+                    &session_id,
+                    retry_notice_count,
+                    "The model returned an empty response after a tool result".into(),
+                    Duration::ZERO,
+                    Duration::ZERO,
+                    true,
+                )
+                .await;
                 continue;
             }
             if failed && empty {
@@ -627,6 +639,17 @@ Do not mention this reminder to the user.\n</system-reminder>"
                         "LLM request too large; folded {folded} older media block(s) before retry"
                     );
                     failure_retries += 1;
+                    retry_notice_count += 1;
+                    send_llm_retry_notice(
+                        &self.event_tx,
+                        &session_id,
+                        retry_notice_count,
+                        format!("Request was too large; folded {folded} older media block(s)"),
+                        Duration::ZERO,
+                        Duration::ZERO,
+                        true,
+                    )
+                    .await;
                     continue;
                 }
                 // Overflow recovery: compact (user retention) then retry.
@@ -667,6 +690,17 @@ Do not mention this reminder to the user.\n</system-reminder>"
                         session.consecutive_overflow_compacts
                     );
                     failure_retries += 1;
+                    retry_notice_count += 1;
+                    send_llm_retry_notice(
+                        &self.event_tx,
+                        &session_id,
+                        retry_notice_count,
+                        "Request was too large; compacted conversation history".into(),
+                        Duration::ZERO,
+                        Duration::ZERO,
+                        true,
+                    )
+                    .await;
                     continue;
                 }
             }
@@ -691,7 +725,23 @@ Do not mention this reminder to the user.\n</system-reminder>"
                     server_directed = server_retry_after.is_some(),
                     "Waiting before LLM retry"
                 );
-                tokio::time::sleep(delay).await;
+                retry_notice_count += 1;
+                let reason = last_stream_error
+                    .clone()
+                    .unwrap_or_else(|| "LLM returned an empty or incomplete stream".into());
+                if !wait_for_llm_retry(
+                    &self.event_tx,
+                    session,
+                    &session_id,
+                    retry_notice_count,
+                    reason,
+                    delay,
+                )
+                .await
+                {
+                    interrupted = true;
+                    break;
+                }
                 continue;
             }
             if failed {
@@ -2524,6 +2574,78 @@ fn retry_delay(
     })
 }
 
+async fn wait_for_llm_retry(
+    event_tx: &mpsc::Sender<AgentEvent>,
+    session: &Session,
+    session_id: &str,
+    retry_number: u32,
+    reason: String,
+    delay: Duration,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + delay;
+    let mut displayed_seconds = duration_ceil_seconds(delay);
+    send_llm_retry_notice(
+        event_tx,
+        session_id,
+        retry_number,
+        reason.clone(),
+        delay,
+        delay,
+        true,
+    )
+    .await;
+
+    while tokio::time::Instant::now() < deadline {
+        if session.is_interrupted() {
+            return false;
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        tokio::time::sleep(remaining.min(Duration::from_millis(100))).await;
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let remaining_seconds = duration_ceil_seconds(remaining);
+        if remaining_seconds != displayed_seconds {
+            displayed_seconds = remaining_seconds;
+            send_llm_retry_notice(
+                event_tx,
+                session_id,
+                retry_number,
+                reason.clone(),
+                delay,
+                remaining,
+                false,
+            )
+            .await;
+        }
+    }
+    !session.is_interrupted()
+}
+
+async fn send_llm_retry_notice(
+    event_tx: &mpsc::Sender<AgentEvent>,
+    session_id: &str,
+    retry_number: u32,
+    reason: String,
+    delay: Duration,
+    remaining: Duration,
+    initial: bool,
+) {
+    let _ = event_tx
+        .send(AgentEvent::LlmRetry {
+            session_id: session_id.to_string(),
+            retry_number,
+            reason,
+            wait_seconds: duration_ceil_seconds(delay),
+            remaining_seconds: duration_ceil_seconds(remaining),
+            initial,
+        })
+        .await;
+}
+
+fn duration_ceil_seconds(duration: Duration) -> u64 {
+    let milliseconds = duration.as_millis();
+    u64::try_from(milliseconds.saturating_add(999) / 1_000).unwrap_or(u64::MAX)
+}
+
 fn describe_tool_action(name: &str, input: &serde_json::Value) -> String {
     match name {
         "Read" | "Write" | "Edit" => {
@@ -2593,6 +2715,9 @@ mod retry_tests {
             retry_delay(1, Some(Duration::from_secs(17)), true, base),
             Duration::from_secs(17)
         );
+        assert_eq!(duration_ceil_seconds(Duration::from_millis(1)), 1);
+        assert_eq!(duration_ceil_seconds(Duration::from_millis(1_001)), 2);
+        assert_eq!(duration_ceil_seconds(Duration::ZERO), 0);
     }
 
     #[tokio::test]
@@ -2621,6 +2746,42 @@ mod retry_tests {
                 .is_err(),
             "dropping the heartbeat guard should stop future heartbeats"
         );
+    }
+
+    #[tokio::test]
+    async fn retry_wait_emits_a_live_countdown() {
+        let (event_tx, mut event_rx) = mpsc::channel(8);
+        let session = Session::new(
+            "countdown-session".into(),
+            std::env::temp_dir(),
+            PermissionMode::Auto,
+            "test/model".into(),
+        );
+
+        assert!(
+            wait_for_llm_retry(
+                &event_tx,
+                &session,
+                "countdown-session",
+                1,
+                "rate limited".into(),
+                Duration::from_millis(1_100),
+            )
+            .await
+        );
+
+        let mut remaining = Vec::new();
+        while let Ok(event) = event_rx.try_recv() {
+            if let AgentEvent::LlmRetry {
+                remaining_seconds, ..
+            } = event
+            {
+                remaining.push(remaining_seconds);
+            }
+        }
+        assert_eq!(remaining.first(), Some(&2));
+        assert!(remaining.contains(&1));
+        assert_eq!(remaining.last(), Some(&0));
     }
 
     #[test]
@@ -2924,12 +3085,21 @@ mod retry_tests {
 
         loop_.run_turn(&mut session).await.unwrap();
         let mut errors = Vec::new();
+        let mut retries = Vec::new();
         while let Ok(event) = event_rx.try_recv() {
-            if let AgentEvent::Error { message, .. } = event {
-                errors.push(message);
+            match event {
+                AgentEvent::Error { message, .. } => errors.push(message),
+                AgentEvent::LlmRetry {
+                    retry_number,
+                    remaining_seconds,
+                    initial,
+                    ..
+                } => retries.push((retry_number, remaining_seconds, initial)),
+                _ => {}
             }
         }
         assert!(errors.is_empty());
+        assert_eq!(retries, vec![(1, 0, true), (2, 0, true)]);
         assert!(session.messages.iter().any(|message| {
             message
                 .content

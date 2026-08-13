@@ -907,6 +907,23 @@ async fn run_print_client(
                     AgentEvent::Error { message, .. } => {
                         return Err(anyhow::anyhow!("Agent turn failed: {message}"));
                     }
+                    AgentEvent::LlmRetry {
+                        retry_number,
+                        remaining_seconds,
+                        reason,
+                        ..
+                    } => {
+                        let when = if remaining_seconds == 0 {
+                            "now".to_string()
+                        } else {
+                            format!("in {remaining_seconds}s")
+                        };
+                        eprint!("\rLLM retry #{retry_number} {when}: {reason}");
+                        let _ = std::io::Write::flush(&mut io::stderr());
+                        if remaining_seconds == 0 {
+                            eprintln!();
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -2941,7 +2958,10 @@ async fn spawn_session_agent_turn(
         let _ = wire.ensure_metadata().await;
         while let Some(evt) = agent_event_rx.recv().await {
             let data = serde_json::to_value(&evt).unwrap_or_default();
-            if !matches!(&evt, AgentEvent::Heartbeat { .. }) {
+            if !matches!(
+                &evt,
+                AgentEvent::Heartbeat { .. } | AgentEvent::LlmRetry { .. }
+            ) {
                 let evt_type = data
                     .get("type")
                     .and_then(|v| v.as_str())
