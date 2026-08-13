@@ -277,6 +277,7 @@ pub async fn openai_responses_stream(
                     let _ = event_tx
                         .send(StreamEvent::MessageEnd {
                             usage: usage.clone(),
+                            stop_reason: None,
                         })
                         .await;
                     return Ok(());

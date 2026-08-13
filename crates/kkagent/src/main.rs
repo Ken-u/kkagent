@@ -717,6 +717,8 @@ async fn provision_managed_kimi_config(
                     .and_then(|value| value.as_str())
                     .map(str::to_string),
                 pricing: None,
+                experimental_adaptive_thinking: false,
+                experimental_visible_empty_retries: 0,
             },
         );
     }

@@ -54,19 +54,32 @@ pub struct ToolDef {
     pub input_schema: serde_json::Value,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct ThinkingParams {
     pub budget_tokens: u32,
+    pub adaptive: bool,
+    pub effort: Option<String>,
 }
 
 #[derive(Debug, Clone)]
 pub enum StreamEvent {
     TextDelta(String),
     ThinkingDelta(String),
-    ToolUseStart { id: String, name: String },
-    ToolUseInputDelta { id: String, delta: String },
-    ToolUseEnd { id: String },
-    MessageEnd { usage: TokenUsage },
+    ToolUseStart {
+        id: String,
+        name: String,
+    },
+    ToolUseInputDelta {
+        id: String,
+        delta: String,
+    },
+    ToolUseEnd {
+        id: String,
+    },
+    MessageEnd {
+        usage: TokenUsage,
+        stop_reason: Option<String>,
+    },
     Error(String),
 }
 

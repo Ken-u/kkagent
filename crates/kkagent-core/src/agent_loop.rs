@@ -349,6 +349,13 @@ Do not mention this reminder to the user.\n</system-reminder>"
             if t.enabled || capability.thinking {
                 Some(ThinkingParams {
                     budget_tokens: 10000,
+                    adaptive: model_config.experimental_adaptive_thinking,
+                    effort: model_config.experimental_adaptive_thinking.then(|| {
+                        t.effort
+                            .clone()
+                            .or_else(|| model_config.default_effort.clone())
+                            .unwrap_or_else(|| "high".into())
+                    }),
                 })
             } else {
                 None
@@ -369,13 +376,18 @@ Do not mention this reminder to the user.\n</system-reminder>"
         let mut interrupted = false;
         let mut terminal_stream_error: Option<String> = None;
         let mut rejected_tool_call_recovery: Option<ToolCallRollback> = None;
+        let follows_tool_result = request_follows_tool_result(&messages);
+        let visible_empty_retry_limit = model_config.experimental_visible_empty_retries;
+        let mut visible_empty_retries = 0_u32;
+        let mut failure_retries = 0_u32;
 
-        for attempt in 1..=max_attempts {
+        loop {
             assistant_text.clear();
             thinking_text.clear();
             tool_calls.clear();
             let mut stream_failed = false;
             let mut last_stream_error: Option<String> = None;
+            let mut stop_reason: Option<String> = None;
 
             let request = LlmRequest {
                 model: model_config.model.clone(),
@@ -383,7 +395,7 @@ Do not mention this reminder to the user.\n</system-reminder>"
                 tools: tool_defs.clone(),
                 max_tokens: model_config.max_output_size.map(|v| v as u32),
                 system: Some(system_prompt.clone()),
-                thinking,
+                thinking: thinking.clone(),
             };
 
             let (stream_tx, mut stream_rx) = mpsc::channel::<StreamEvent>(256);
@@ -475,16 +487,21 @@ Do not mention this reminder to the user.\n</system-reminder>"
                                 tracing::warn!("tool end for unknown call {id}");
                             }
                         }
-                        StreamEvent::MessageEnd { usage } => {
+                        StreamEvent::MessageEnd {
+                            usage,
+                            stop_reason: reason,
+                        } => {
                             for (_, (mut tool, input)) in active_tools.drain() {
                                 (tool.input, tool.input_error) = parse_tool_arguments(&input);
                                 tool_calls.push(tool);
                             }
                             got_message_end = true;
+                            stop_reason = reason;
                             tracing::debug!(
-                                "Message end: in={} out={}",
+                                "Message end: in={} out={} stop_reason={}",
                                 usage.input_tokens,
-                                usage.output_tokens
+                                usage.output_tokens,
+                                stop_reason.as_deref().unwrap_or("unknown")
                             );
                             session
                                 .token_counter
@@ -526,6 +543,23 @@ Do not mention this reminder to the user.\n</system-reminder>"
             let empty =
                 assistant_text.is_empty() && thinking_text.is_empty() && tool_calls.is_empty();
             let failed = stream_failed || !got_message_end;
+            let visible_empty = assistant_text.trim().is_empty() && tool_calls.is_empty();
+            if !failed
+                && follows_tool_result
+                && visible_empty
+                && visible_empty_retries < visible_empty_retry_limit
+            {
+                visible_empty_retries += 1;
+                tracing::warn!(
+                    model = %model_config.model,
+                    stop_reason = stop_reason.as_deref().unwrap_or("unknown"),
+                    thinking_len = thinking_text.len(),
+                    retry = visible_empty_retries,
+                    retry_limit = visible_empty_retry_limit,
+                    "Experimental recovery retry for visible-empty response after tool result"
+                );
+                continue;
+            }
             if failed && empty {
                 if let Some(error) = last_stream_error
                     .as_deref()
@@ -548,7 +582,7 @@ Do not mention this reminder to the user.\n</system-reminder>"
             }
             if failed
                 && empty
-                && attempt < max_attempts
+                && failure_retries + 1 < max_attempts
                 && last_stream_error
                     .as_deref()
                     .is_some_and(is_request_too_large)
@@ -560,6 +594,7 @@ Do not mention this reminder to the user.\n</system-reminder>"
                     tracing::warn!(
                         "LLM request too large; folded {folded} older media block(s) before retry"
                     );
+                    failure_retries += 1;
                     continue;
                 }
                 // Overflow recovery: compact (user retention) then retry.
@@ -599,19 +634,21 @@ Do not mention this reminder to the user.\n</system-reminder>"
                         "LLM request too large; compacted history before retry (overflow attempt {})",
                         session.consecutive_overflow_compacts
                     );
+                    failure_retries += 1;
                     continue;
                 }
             }
-            if failed && empty && attempt < max_attempts {
+            if failed && empty && failure_retries + 1 < max_attempts {
+                failure_retries += 1;
                 tracing::warn!(
                     "LLM step retry {}/{} ({})",
-                    attempt,
+                    failure_retries,
                     max_attempts,
                     last_stream_error
                         .as_deref()
                         .unwrap_or("empty/incomplete stream")
                 );
-                let exponent = attempt.saturating_sub(1).min(5);
+                let exponent = failure_retries.saturating_sub(1).min(5);
                 let delay_ms = 200_u64.saturating_mul(1_u64 << exponent);
                 tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                 continue;
@@ -2011,6 +2048,15 @@ struct ToolCallRollback {
     provider_error: String,
 }
 
+fn request_follows_tool_result(messages: &[ChatMessage]) -> bool {
+    messages
+        .iter()
+        .rev()
+        .take_while(|message| message.role == "user")
+        .flat_map(|message| &message.content)
+        .any(|content| matches!(content, ChatContent::ToolResult { .. }))
+}
+
 fn is_tool_call_arguments_object_error(error: &str) -> bool {
     let lower = error.to_ascii_lowercase();
     lower.contains("assistant tool call")
@@ -2771,6 +2817,8 @@ mod retry_tests {
                 support_efforts: Vec::new(),
                 default_effort: None,
                 pricing: None,
+                experimental_adaptive_thinking: false,
+                experimental_visible_empty_retries: 0,
             },
         );
         let config = Arc::new(config);
@@ -2915,6 +2963,8 @@ mod retry_tests {
                 support_efforts: Vec::new(),
                 default_effort: None,
                 pricing: None,
+                experimental_adaptive_thinking: false,
+                experimental_visible_empty_retries: 0,
             },
         );
         let (event_tx, _) = mpsc::channel(64);
@@ -3004,6 +3054,8 @@ mod retry_tests {
                 support_efforts: Vec::new(),
                 default_effort: None,
                 pricing: None,
+                experimental_adaptive_thinking: false,
+                experimental_visible_empty_retries: 0,
             },
         );
         let (event_tx, _) = mpsc::channel(512);
@@ -3036,6 +3088,119 @@ mod retry_tests {
                 .iter()
                 .any(|content| matches!(content, ChatContent::Text { text } if text == "completed"))
         }));
+        std::fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn visible_empty_after_tool_result_is_retried_when_experimental_flag_is_enabled() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let bodies = [
+                "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-1\",\"function\":{\"name\":\"MissingTool\",\"arguments\":\"{}\"}}]}}]}\n\
+                 data: [DONE]\n",
+                "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"still thinking\"}}]}\n\
+                 data: [DONE]\n",
+                "data: {\"choices\":[{\"delta\":{\"content\":\"completed after retry\"}}]}\n\
+                 data: [DONE]\n",
+            ];
+            for body in bodies {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0_u8; 16_384];
+                let _ = socket.read(&mut request).await.unwrap();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+
+        let mut config = AppConfig {
+            default_model: Some("test/model".into()),
+            loop_control: Some(LoopControlConfig {
+                max_attempts_per_step: 1,
+                reserved_context_size: 1_000,
+                max_steps_per_turn: 4,
+                auto_compact: false,
+                compact_keep_last: 4,
+                token_counting: "estimated".into(),
+                ..Default::default()
+            }),
+            ..AppConfig::default()
+        };
+        config.providers.insert(
+            "test".into(),
+            ProviderConfig {
+                provider_type: "openai-chat".into(),
+                api_key: Some("token".into()),
+                base_url: Some(base_url),
+                custom_headers: HashMap::new(),
+                oauth: None,
+            },
+        );
+        config.models.insert(
+            "test/model".into(),
+            ModelConfig {
+                provider: "test".into(),
+                model: "test-model".into(),
+                max_context_size: Some(16_000),
+                max_output_size: Some(1_000),
+                capabilities: vec!["tool_use".into()],
+                display_name: None,
+                support_efforts: Vec::new(),
+                default_effort: None,
+                pricing: None,
+                experimental_adaptive_thinking: false,
+                experimental_visible_empty_retries: 1,
+            },
+        );
+        let (event_tx, _) = mpsc::channel(64);
+        let loop_ = AgentLoop::new(
+            Arc::new(config),
+            Arc::new(ToolRegistry::new()),
+            Arc::new(Mutex::new(PermissionChain::new(
+                PermissionMode::Auto,
+                Vec::new(),
+            ))),
+            event_tx,
+            Arc::new(Mutex::new(HashMap::new())),
+        );
+        let workspace = std::env::temp_dir().join(format!(
+            "kkagent-visible-empty-retry-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let mut session = Session::new(
+            "visible-empty-retry-test".into(),
+            workspace.clone(),
+            PermissionMode::Auto,
+            "test/model".into(),
+        );
+        session.add_user_message("use a tool, then finish".into());
+
+        loop_.run_turn(&mut session).await.unwrap();
+        server.await.unwrap();
+        assert!(session.messages.iter().any(|message| {
+            message.content.iter().any(
+                |content| matches!(content, ChatContent::Text { text } if text == "completed after retry"),
+            )
+        }));
+        assert!(!session.messages.iter().any(|message| {
+            message.content.iter().any(
+                |content| matches!(content, ChatContent::Thinking { thinking } if thinking == "still thinking"),
+            )
+        }));
+        assert_eq!(
+            session
+                .messages
+                .iter()
+                .flat_map(|message| &message.content)
+                .filter(|content| matches!(content, ChatContent::ToolResult { .. }))
+                .count(),
+            1,
+            "the recovery retry must not execute the completed tool again"
+        );
         std::fs::remove_dir_all(workspace).unwrap();
     }
 
@@ -3090,6 +3255,8 @@ mod retry_tests {
                 support_efforts: Vec::new(),
                 default_effort: None,
                 pricing: None,
+                experimental_adaptive_thinking: false,
+                experimental_visible_empty_retries: 0,
             },
         );
         let (event_tx, mut event_rx) = mpsc::channel(64);

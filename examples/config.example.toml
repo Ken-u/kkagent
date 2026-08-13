@@ -27,6 +27,9 @@ capabilities = ["tool_use", "image_in"]
 display_name = "Default coding model"
 # support_efforts = ["low", "medium", "high"]
 # default_effort = "medium"
+# Experimental Anthropic compatibility workarounds; disabled by default.
+# experimental_adaptive_thinking = true
+# experimental_visible_empty_retries = 1
 
 # OpenAI Responses 示例
 # [providers.openai]

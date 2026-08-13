@@ -96,6 +96,8 @@ pub fn run_init(
             support_efforts: Vec::new(),
             default_effort: None,
             pricing: None,
+            experimental_adaptive_thinking: false,
+            experimental_visible_empty_retries: 0,
         },
     );
     apply_preset(&mut config, preset)?;

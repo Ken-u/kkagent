@@ -66,6 +66,8 @@ mod tests {
             support_efforts: vec![],
             default_effort: None,
             pricing: None,
+            experimental_adaptive_thinking: false,
+            experimental_visible_empty_retries: 0,
         };
         let c = ModelCapability::from_model(&m);
         assert!(c.vision);
@@ -86,6 +88,8 @@ mod tests {
             support_efforts: vec![],
             default_effort: None,
             pricing: None,
+            experimental_adaptive_thinking: false,
+            experimental_visible_empty_retries: 0,
         };
         let c = ModelCapability::from_model(&m);
         assert!(c.vision);

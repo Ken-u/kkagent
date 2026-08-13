@@ -97,10 +97,17 @@ pub async fn anthropic_stream(
     }
 
     if let Some(thinking) = &request.thinking {
-        body["thinking"] = json!({
-            "type": "enabled",
-            "budget_tokens": thinking.budget_tokens,
-        });
+        if thinking.adaptive {
+            body["thinking"] = json!({"type": "adaptive"});
+            if let Some(effort) = &thinking.effort {
+                body["output_config"] = json!({"effort": effort});
+            }
+        } else {
+            body["thinking"] = json!({
+                "type": "enabled",
+                "budget_tokens": thinking.budget_tokens,
+            });
+        }
     }
 
     tracing::debug!("LLM request URL: {}", url);
@@ -136,6 +143,7 @@ pub async fn anthropic_stream(
     let mut chunk_count = 0u64;
     let mut tool_blocks = std::collections::HashMap::<u64, String>::new();
     let mut usage = TokenUsage::default();
+    let mut stop_reason = None;
     let mut completed = false;
 
     while let Some(chunk) = stream.next().await {
@@ -171,7 +179,9 @@ pub async fn anthropic_stream(
                         .unwrap_or("unknown Anthropic stream error");
                     anyhow::bail!("Anthropic stream error: {message}");
                 }
-                if let Some(evt) = parse_sse_event(&event, &mut tool_blocks, &mut usage) {
+                if let Some(evt) =
+                    parse_sse_event(&event, &mut tool_blocks, &mut usage, &mut stop_reason)
+                {
                     completed |= matches!(evt, StreamEvent::MessageEnd { .. });
                     if event_tx.send(evt).await.is_err() {
                         return Ok(());
@@ -192,6 +202,7 @@ fn parse_sse_event(
     event: &serde_json::Value,
     tool_blocks: &mut std::collections::HashMap<u64, String>,
     usage: &mut TokenUsage,
+    stop_reason: &mut Option<String>,
 ) -> Option<StreamEvent> {
     let event_type = event.get("type")?.as_str()?;
     match event_type {
@@ -246,6 +257,13 @@ fn parse_sse_event(
                 .map(|id| StreamEvent::ToolUseEnd { id })
         }
         "message_delta" => {
+            if let Some(reason) = event
+                .get("delta")
+                .and_then(|delta| delta.get("stop_reason"))
+                .and_then(|reason| reason.as_str())
+            {
+                *stop_reason = Some(reason.to_string());
+            }
             if let Some(value) = event.get("usage") {
                 usage.input_tokens = value
                     .get("input_tokens")
@@ -268,6 +286,7 @@ fn parse_sse_event(
         }
         "message_stop" => Some(StreamEvent::MessageEnd {
             usage: usage.clone(),
+            stop_reason: stop_reason.clone(),
         }),
         "message_start" => {
             let value = event.get("message")?.get("usage")?;
@@ -492,7 +511,12 @@ async fn chat_completions_stream(
                             .await;
                     }
                 }
-                let _ = event_tx.send(StreamEvent::MessageEnd { usage }).await;
+                let _ = event_tx
+                    .send(StreamEvent::MessageEnd {
+                        usage,
+                        stop_reason: None,
+                    })
+                    .await;
                 return Ok(());
             }
             let event = serde_json::from_str::<serde_json::Value>(data)
@@ -592,7 +616,12 @@ async fn chat_completions_stream(
         }
     }
     if completed {
-        let _ = event_tx.send(StreamEvent::MessageEnd { usage }).await;
+        let _ = event_tx
+            .send(StreamEvent::MessageEnd {
+                usage,
+                stop_reason: None,
+            })
+            .await;
         Ok(())
     } else {
         anyhow::bail!("OpenAI stream connection closed before [DONE] or finish_reason")
@@ -803,7 +832,12 @@ pub async fn google_stream(
         }
     }
     if completed {
-        let _ = event_tx.send(StreamEvent::MessageEnd { usage }).await;
+        let _ = event_tx
+            .send(StreamEvent::MessageEnd {
+                usage,
+                stop_reason: None,
+            })
+            .await;
         Ok(())
     } else {
         anyhow::bail!("Google stream connection closed before finishReason")
@@ -1132,12 +1166,18 @@ mod tests {
             "data: {\"type\":\"content_block_start\",\"content_block\":{\"type\":\"tool_use\",\"id\":\"call-1\",\"name\":\"Read\"}}\n",
             "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{}\"}}\n",
             "data: {\"type\":\"content_block_stop\"}\n",
-            "data: {\"type\":\"message_delta\",\"usage\":{\"input_tokens\":4,\"output_tokens\":2}}\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"input_tokens\":4,\"output_tokens\":2}}\n",
             "data: {\"type\":\"message_stop\"}\n"
         );
         let (base_url, captured) = serve_once("200 OK", "text/event-stream", sse).await;
         let (tx, mut rx) = mpsc::channel(16);
-        anthropic_stream(&Client::new(), &base_url, "secret", request(), tx)
+        let mut request = request();
+        request.thinking = Some(ThinkingParams {
+            budget_tokens: 10_000,
+            adaptive: true,
+            effort: Some("high".into()),
+        });
+        anthropic_stream(&Client::new(), &base_url, "secret", request, tx)
             .await
             .unwrap();
         let mut events = Vec::new();
@@ -1146,11 +1186,14 @@ mod tests {
         }
         assert!(matches!(&events[0], StreamEvent::TextDelta(text) if text == "hi"));
         assert!(events.iter().any(|event| matches!(event, StreamEvent::ToolUseStart { id, name } if id == "call-1" && name == "Read")));
-        assert!(events.iter().any(|event| matches!(event, StreamEvent::MessageEnd { usage } if usage.input_tokens == 4 && usage.output_tokens == 2)));
+        assert!(events.iter().any(|event| matches!(event, StreamEvent::MessageEnd { usage, stop_reason } if usage.input_tokens == 4 && usage.output_tokens == 2 && stop_reason.as_deref() == Some("tool_use"))));
         let captured = captured.await.unwrap();
         let body: serde_json::Value = serde_json::from_str(&captured.body).unwrap();
         assert_eq!(body["system"], "be helpful");
         assert_eq!(body["messages"][0]["content"][0]["text"], "hello");
+        assert_eq!(body["thinking"]["type"], "adaptive");
+        assert_eq!(body["output_config"]["effort"], "high");
+        assert!(body["thinking"].get("budget_tokens").is_none());
     }
 
     #[tokio::test]
@@ -1257,7 +1300,7 @@ mod tests {
             .unwrap();
         assert!(matches!(rx.recv().await, Some(StreamEvent::TextDelta(text)) if text == "hello"));
         assert!(
-            matches!(rx.recv().await, Some(StreamEvent::MessageEnd { usage }) if usage.input_tokens == 5 && usage.output_tokens == 2)
+            matches!(rx.recv().await, Some(StreamEvent::MessageEnd { usage, .. }) if usage.input_tokens == 5 && usage.output_tokens == 2)
         );
         let captured = captured.await.unwrap();
         assert!(captured.head.starts_with(
@@ -1305,7 +1348,11 @@ mod tests {
         );
         let (base_url, captured) = serve_once("200 OK", "text/event-stream", sse).await;
         let mut request = request();
-        request.thinking = Some(ThinkingParams { budget_tokens: 32 });
+        request.thinking = Some(ThinkingParams {
+            budget_tokens: 32,
+            adaptive: false,
+            effort: None,
+        });
         let (tx, mut rx) = mpsc::channel(8);
         kimi_stream(
             &Client::new(),
@@ -1321,7 +1368,7 @@ mod tests {
         );
         assert!(matches!(rx.recv().await, Some(StreamEvent::TextDelta(text)) if text == "answer"));
         assert!(
-            matches!(rx.recv().await, Some(StreamEvent::MessageEnd { usage }) if usage.input_tokens == 7 && usage.output_tokens == 3)
+            matches!(rx.recv().await, Some(StreamEvent::MessageEnd { usage, .. }) if usage.input_tokens == 7 && usage.output_tokens == 3)
         );
         let captured = captured.await.unwrap();
         assert!(captured

@@ -162,6 +162,12 @@ pub struct ModelConfig {
     /// Optional USD pricing per 1M tokens for `/usage` estimates.
     #[serde(default)]
     pub pricing: Option<ModelPricing>,
+    /// Experimental: use Anthropic adaptive thinking and forward configured effort.
+    #[serde(default)]
+    pub experimental_adaptive_thinking: bool,
+    /// Experimental: retry a thinking-only/empty response immediately after tool results.
+    #[serde(default)]
+    pub experimental_visible_empty_retries: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -639,6 +645,8 @@ mod tests {
                 support_efforts: Vec::new(),
                 default_effort: None,
                 pricing: None,
+                experimental_adaptive_thinking: false,
+                experimental_visible_empty_retries: 0,
             },
         );
         config
@@ -647,6 +655,21 @@ mod tests {
     #[test]
     fn accepts_consistent_configuration() {
         valid_config().validate().unwrap();
+    }
+
+    #[test]
+    fn parses_experimental_model_recovery_options() {
+        let model: ModelConfig = toml::from_str(
+            r#"
+provider = "local"
+model = "claude-opus-4-8"
+experimental_adaptive_thinking = true
+experimental_visible_empty_retries = 1
+"#,
+        )
+        .unwrap();
+        assert!(model.experimental_adaptive_thinking);
+        assert_eq!(model.experimental_visible_empty_retries, 1);
     }
 
     #[test]
