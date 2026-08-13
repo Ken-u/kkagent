@@ -150,9 +150,13 @@ extra_read_paths = []
 extra_write_paths = []
 ```
 
+进程资源限制与文件系统隔离彼此独立，因此 `mode = "disabled"` 仍会应用非零限制：
+Linux 支持内存、CPU 和进程数，macOS 支持 CPU，Windows Job Object 支持内存和进程数。
+这可避免关闭文件隔离时编译器或脚本直接耗尽主机资源；只有显式设为 `0` 的限制项才表示不限。
+
 `auto` 在 Linux/macOS 选择 `workspace`，在 Windows 选择 `process`。Linux 的工作区模式要求 PATH 中存在 `bwrap`，用 user/mount/PID 等 namespace、只读系统目录、独立 `/tmp` 和可选 network namespace 隔离命令；macOS 使用系统 Seatbelt，默认拒绝用户主目录并重新开放当前 workspace；Windows 的 `process` 模式用 Job Object 限制进程树、内存和进程数。显式选择平台不支持的 `workspace` 会拒绝执行，不会静默降级。
 
-`extra_read_paths`/`extra_write_paths` 必须已经存在。`disabled` 会跳过 Bash 的文件/网络隔离、Git 环境改写以及 OS 资源/Job Object 限制，只建议用于受控容器或 VM 内排障。`kkagent --disable-sandbox` 可仅对当前进程做同样的临时覆盖且不写回配置；该参数不能与 `--connect` 同时使用。HTTP terminal 是单独的显式管理接口，不继承 Bash sandbox。
+`extra_read_paths`/`extra_write_paths` 必须已经存在。`disabled` 会跳过 Bash 的文件/网络隔离和 Git 环境改写，但保留上述非零资源限制，只建议用于受控容器或 VM 内排障。`kkagent --disable-sandbox` 可仅对当前进程关闭文件隔离且不写回配置；该参数不能与 `--connect` 同时使用。HTTP terminal 是单独的显式管理接口，不继承 Bash sandbox。
 
 ### 工作区与 Git 信任
 

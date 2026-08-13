@@ -75,8 +75,11 @@ impl SandboxPolicy {
                 "invalid sandbox.mode {other:?}; expected auto, disabled, process, or workspace"
             ),
         };
+        if config.memory_mb > 0 && config.memory_mb < 64 {
+            anyhow::bail!("sandbox memory_mb must be zero (unlimited) or at least 64");
+        }
         if mode != SandboxMode::Disabled
-            && (config.memory_mb < 64 || config.cpu_seconds == 0 || config.max_processes == 0)
+            && (config.memory_mb == 0 || config.cpu_seconds == 0 || config.max_processes == 0)
         {
             anyhow::bail!("sandbox limits must be positive and memory_mb must be at least 64");
         }
@@ -166,7 +169,7 @@ impl SandboxPolicy {
             use windows_sys::Win32::System::Threading::{
                 OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE,
             };
-            if self.mode == SandboxMode::Disabled {
+            if self.memory_mb == 0 && self.max_processes == 0 {
                 return Ok(SandboxProcessGuard(None));
             }
             let pid = child
@@ -178,11 +181,15 @@ impl SandboxPolicy {
                     return Err(std::io::Error::last_os_error().into());
                 }
                 let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
-                info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-                    | JOB_OBJECT_LIMIT_ACTIVE_PROCESS
-                    | JOB_OBJECT_LIMIT_PROCESS_MEMORY;
-                info.BasicLimitInformation.ActiveProcessLimit = self.max_processes;
-                info.ProcessMemoryLimit = self.memory_mb.saturating_mul(1024 * 1024) as usize;
+                info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+                if self.max_processes > 0 {
+                    info.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
+                    info.BasicLimitInformation.ActiveProcessLimit = self.max_processes;
+                }
+                if self.memory_mb > 0 {
+                    info.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_PROCESS_MEMORY;
+                    info.ProcessMemoryLimit = self.memory_mb.saturating_mul(1024 * 1024) as usize;
+                }
                 if SetInformationJobObject(
                     job,
                     JobObjectExtendedLimitInformation,
@@ -445,7 +452,10 @@ fn canonical_or_owned(path: &Path) -> PathBuf {
 }
 
 fn apply_resource_limits(command: &mut Command, policy: &SandboxPolicy) -> anyhow::Result<()> {
-    if policy.mode == SandboxMode::Disabled {
+    // Resource containment is independent from filesystem sandboxing. In
+    // particular, `sandbox.mode = "disabled"` must not let a compiler consume
+    // all host memory. Explicit zero values retain the old unlimited behavior.
+    if policy.memory_mb == 0 && policy.cpu_seconds == 0 && policy.max_processes == 0 {
         return Ok(());
     }
     #[cfg(unix)]
@@ -459,14 +469,20 @@ fn apply_resource_limits(command: &mut Command, policy: &SandboxPolicy) -> anyho
         unsafe {
             command.as_std_mut().pre_exec(move || {
                 #[cfg(target_os = "linux")]
-                set_limit(libc::RLIMIT_AS as libc::c_int, memory)?;
-                set_limit(libc::RLIMIT_CPU as libc::c_int, cpu)?;
+                if memory > 0 {
+                    set_limit(libc::RLIMIT_AS as libc::c_int, memory)?;
+                }
+                if cpu > 0 {
+                    set_limit(libc::RLIMIT_CPU as libc::c_int, cpu)?;
+                }
                 // macOS accounts RLIMIT_NPROC across the entire user rather than
                 // the sandboxed process tree. Applying a per-command value there
                 // prevents ordinary shell commands from forking as soon as the
                 // desktop user owns more processes than the configured limit.
                 #[cfg(target_os = "linux")]
-                set_limit(libc::RLIMIT_NPROC as libc::c_int, processes)?;
+                if processes > 0 {
+                    set_limit(libc::RLIMIT_NPROC as libc::c_int, processes)?;
+                }
                 #[cfg(target_os = "linux")]
                 if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
                     return Err(std::io::Error::last_os_error());
@@ -479,7 +495,9 @@ fn apply_resource_limits(command: &mut Command, policy: &SandboxPolicy) -> anyho
     {
         use std::os::windows::process::CommandExt;
         use windows_sys::Win32::System::Threading::CREATE_SUSPENDED;
-        command.as_std_mut().creation_flags(CREATE_SUSPENDED);
+        if policy.memory_mb > 0 || policy.max_processes > 0 {
+            command.as_std_mut().creation_flags(CREATE_SUSPENDED);
+        }
         let _ = command;
         if policy.mode == SandboxMode::Workspace {
             anyhow::bail!("workspace sandbox is unavailable on Windows");
@@ -579,6 +597,27 @@ mod tests {
             .unwrap();
 
         assert!(command.status().await.unwrap().success());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn disabled_mode_still_applies_configured_memory_limit() {
+        let policy = SandboxPolicy {
+            mode: SandboxMode::Disabled,
+            memory_mb: 256,
+            cpu_seconds: 0,
+            max_processes: 0,
+            ..Default::default()
+        };
+        let mut command = policy
+            .command("/bin/sh", "-c", "ulimit -v", Path::new("/tmp"))
+            .unwrap();
+        let output = command.output().await.unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            (256 * 1024).to_string()
+        );
     }
 
     #[cfg(target_os = "macos")]

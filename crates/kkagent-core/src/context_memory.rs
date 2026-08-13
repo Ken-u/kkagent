@@ -85,6 +85,22 @@ pub fn fold_loop_events(messages: &[ChatMessage]) -> Vec<ChatMessage> {
         .collect()
 }
 
+/// Owned variant used on the hot request path so retained messages are moved
+/// instead of deep-cloned a second time.
+pub fn fold_loop_events_owned(mut messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
+    messages.retain(|message| {
+        !message.content.iter().any(|content| {
+            if let ChatContent::Text { text } = content {
+                let trim = text.trim();
+                trim.starts_with("<loop-event>") && trim.ends_with("</loop-event>")
+            } else {
+                false
+            }
+        })
+    });
+    messages
+}
+
 /// Participants that must coordinate on conversation undo.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UndoParticipant {

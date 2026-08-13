@@ -29,17 +29,22 @@ impl Default for ProjectOptions {
 
 /// Wire-safe projection: fold old tool results / long text while preserving recent turns.
 pub fn project(messages: &[ChatMessage], opts: &ProjectOptions) -> Vec<ChatMessage> {
+    project_owned(messages.to_vec(), opts)
+}
+
+/// Project owned messages, moving the recent intact tail instead of cloning it.
+pub fn project_owned(messages: Vec<ChatMessage>, opts: &ProjectOptions) -> Vec<ChatMessage> {
     if messages.is_empty() {
         return Vec::new();
     }
     let keep = opts.keep_recent.max(2);
     let split = messages.len().saturating_sub(keep);
     let mut out = Vec::with_capacity(messages.len());
-    for (i, msg) in messages.iter().enumerate() {
+    for (i, msg) in messages.into_iter().enumerate() {
         if i < split {
-            out.push(fold_message(msg, opts, true));
+            out.push(fold_message(&msg, opts, true));
         } else {
-            out.push(fold_message(msg, opts, false));
+            out.push(msg);
         }
     }
     out

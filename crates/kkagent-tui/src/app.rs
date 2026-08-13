@@ -201,6 +201,8 @@ pub struct AppState {
     /// Agent events received while their session is not focused.
     pub background_session_events:
         std::collections::HashMap<String, std::collections::VecDeque<AgentEvent>>,
+    /// Serialized byte estimate parallel to `background_session_events`.
+    pub background_session_event_bytes: std::collections::HashMap<String, usize>,
     /// Debounced `/sessions` preview target.
     pub preview_debounce: Option<PreviewDebounce>,
     /// LRU cache of session.preview JSON payloads.
@@ -929,6 +931,7 @@ impl AppState {
             session_views: std::collections::HashMap::new(),
             session_runtime_states: std::collections::HashMap::new(),
             background_session_events: std::collections::HashMap::new(),
+            background_session_event_bytes: std::collections::HashMap::new(),
             preview_debounce: None,
             preview_cache: crate::session_view::PreviewLru::new(12),
             prompt_queue: crate::prompt_queue::PromptQueue::default(),
@@ -5639,6 +5642,7 @@ impl TuiApp {
     }
 
     fn replay_background_session_events(&mut self, session_id: &str) {
+        self.state.background_session_event_bytes.remove(session_id);
         let Some(mut events) = self.state.background_session_events.remove(session_id) else {
             return;
         };
@@ -5650,6 +5654,52 @@ impl TuiApp {
                 data,
             });
         }
+    }
+
+    fn queue_background_session_event(&mut self, session_id: String, event: AgentEvent) {
+        const MAX_SESSIONS: usize = 16;
+        const MAX_EVENTS: usize = 256;
+        const MAX_BYTES: usize = 2 * 1024 * 1024;
+
+        let event_bytes = serde_json::to_vec(&event).map_or(0, |data| data.len());
+        if event_bytes > MAX_BYTES {
+            return;
+        }
+        if !self
+            .state
+            .background_session_events
+            .contains_key(&session_id)
+            && self.state.background_session_events.len() >= MAX_SESSIONS
+        {
+            if let Some(evicted) = self.state.background_session_events.keys().next().cloned() {
+                self.drop_background_session_events(&evicted);
+            }
+        }
+        let queue = self
+            .state
+            .background_session_events
+            .entry(session_id.clone())
+            .or_default();
+        let bytes = self
+            .state
+            .background_session_event_bytes
+            .entry(session_id)
+            .or_default();
+        while queue.len() >= MAX_EVENTS || bytes.saturating_add(event_bytes) > MAX_BYTES {
+            let Some(dropped) = queue.pop_front() else {
+                break;
+            };
+            *bytes = bytes.saturating_sub(
+                serde_json::to_vec(&dropped).map_or(0, |serialized| serialized.len()),
+            );
+        }
+        queue.push_back(event);
+        *bytes = bytes.saturating_add(event_bytes);
+    }
+
+    fn drop_background_session_events(&mut self, session_id: &str) {
+        self.state.background_session_events.remove(session_id);
+        self.state.background_session_event_bytes.remove(session_id);
     }
 
     fn sync_active_session_status(&mut self) {
@@ -6035,7 +6085,7 @@ impl TuiApp {
         if turn_active {
             self.replay_background_session_events(&sid);
         } else {
-            self.state.background_session_events.remove(&sid);
+            self.drop_background_session_events(&sid);
         }
         self.sync_active_session_status();
         Ok(())
@@ -6124,7 +6174,7 @@ impl TuiApp {
         self.state.tab_strip.tabs.retain(|t| t.id != session_id);
         self.state.session_views.remove(session_id);
         self.state.session_runtime_states.remove(session_id);
-        self.state.background_session_events.remove(session_id);
+        self.drop_background_session_events(session_id);
         if self.state.tab_strip.active >= self.state.tab_strip.tabs.len() {
             self.state.tab_strip.active = self.state.tab_strip.tabs.len().saturating_sub(1);
         }
@@ -6748,7 +6798,7 @@ impl TuiApp {
                 self.state.parked_questions.remove(&deleted_id);
                 self.state.session_views.remove(&deleted_id);
                 self.state.session_runtime_states.remove(&deleted_id);
-                self.state.background_session_events.remove(&deleted_id);
+                self.drop_background_session_events(&deleted_id);
                 let was_current = self.state.session_id.as_deref() == Some(deleted_id.as_str());
                 if was_current {
                     self.refresh_workspace_sessions().await?;
@@ -8287,11 +8337,7 @@ impl TuiApp {
                             | AgentEvent::QuestionAsked { .. }
                             | AgentEvent::Heartbeat { .. }
                     ) {
-                        self.state
-                            .background_session_events
-                            .entry(evt_sid)
-                            .or_default()
-                            .push_back(evt);
+                        self.queue_background_session_event(evt_sid, evt);
                     }
                     return;
                 }
@@ -11191,6 +11237,44 @@ mod app_state_tests {
         assert_eq!(app.state.todos[0].content, "finish");
         assert_eq!(app.state.status, SessionStatus::Idle);
         assert!(!app.state.background_session_events.contains_key("a"));
+    }
+
+    #[tokio::test]
+    async fn background_session_event_queue_is_bounded() {
+        let mut app = test_tui_app();
+        for index in 0..300 {
+            app.queue_background_session_event(
+                "background".into(),
+                AgentEvent::MessageDelta {
+                    session_id: "background".into(),
+                    text: format!("event-{index}"),
+                },
+            );
+        }
+        let events = &app.state.background_session_events["background"];
+        assert_eq!(events.len(), 256);
+        assert!(app.state.background_session_event_bytes["background"] < 2 * 1024 * 1024);
+
+        app.queue_background_session_event(
+            "background".into(),
+            AgentEvent::MessageDelta {
+                session_id: "background".into(),
+                text: "x".repeat(2 * 1024 * 1024),
+            },
+        );
+        assert_eq!(app.state.background_session_events["background"].len(), 256);
+
+        for index in 0..20 {
+            app.queue_background_session_event(
+                format!("session-{index}"),
+                AgentEvent::StatusUpdate {
+                    session_id: format!("session-{index}"),
+                    status: SessionStatus::Idle,
+                },
+            );
+        }
+        assert!(app.state.background_session_events.len() <= 16);
+        assert!(app.state.background_session_event_bytes.len() <= 16);
     }
 
     #[test]

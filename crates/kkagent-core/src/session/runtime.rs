@@ -27,6 +27,10 @@ pub struct TurnCheckpoint {
     pub file_changes: Vec<FileChange>,
 }
 
+const MAX_UNDO_TURNS: usize = 32;
+const MAX_UNDO_BYTES: usize = 64 * 1024 * 1024;
+const MAX_UNDO_FILE_BYTES: u64 = 16 * 1024 * 1024;
+
 /// User input injected into an already-running agent turn.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SteerInput {
@@ -526,6 +530,7 @@ impl Session {
                 message_start_index: start,
                 file_changes: std::mem::take(&mut self.current_turn_changes),
             });
+            self.trim_undo_stack();
         }
     }
 
@@ -534,9 +539,68 @@ impl Session {
         if self.current_turn_changes.iter().any(|c| c.path == path) {
             return;
         }
-        let previous = tokio::fs::read(&path).await.ok();
+        let previous = match tokio::fs::metadata(&path).await {
+            Ok(metadata) if metadata.len() > MAX_UNDO_FILE_BYTES => {
+                tracing::warn!(
+                    path = %path.display(),
+                    bytes = metadata.len(),
+                    limit = MAX_UNDO_FILE_BYTES,
+                    "skipping oversized in-memory undo snapshot"
+                );
+                return;
+            }
+            Ok(metadata) => {
+                if !self.make_undo_room(metadata.len() as usize) {
+                    tracing::warn!(
+                        path = %path.display(),
+                        bytes = metadata.len(),
+                        limit = MAX_UNDO_BYTES,
+                        "skipping undo snapshot because the current turn reached its byte budget"
+                    );
+                    return;
+                }
+                match tokio::fs::read(&path).await {
+                    Ok(previous) => Some(previous),
+                    Err(error) => {
+                        tracing::warn!(path = %path.display(), %error, "cannot capture undo snapshot");
+                        return;
+                    }
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                tracing::warn!(path = %path.display(), %error, "cannot inspect file for undo snapshot");
+                return;
+            }
+        };
         self.current_turn_changes
             .push(FileChange { path, previous });
+    }
+
+    fn trim_undo_stack(&mut self) {
+        while self.undo_stack.len() > MAX_UNDO_TURNS
+            || undo_snapshot_bytes(&self.undo_stack) > MAX_UNDO_BYTES
+        {
+            self.undo_stack.remove(0);
+        }
+    }
+
+    fn make_undo_room(&mut self, additional: usize) -> bool {
+        let current = file_change_bytes(&self.current_turn_changes);
+        if current.saturating_add(additional) > MAX_UNDO_BYTES {
+            return false;
+        }
+        while undo_snapshot_bytes(&self.undo_stack)
+            .saturating_add(current)
+            .saturating_add(additional)
+            > MAX_UNDO_BYTES
+        {
+            if self.undo_stack.is_empty() {
+                return false;
+            }
+            self.undo_stack.remove(0);
+        }
+        true
     }
 
     /// Undo the last completed turn: restore files + truncate messages.
@@ -883,6 +947,21 @@ impl Session {
         self.system_prompt
             .push_str(&format!("\n\n# Date\n\nToday's date is {today}.\n"));
     }
+}
+
+fn undo_snapshot_bytes(stack: &[TurnCheckpoint]) -> usize {
+    stack
+        .iter()
+        .flat_map(|checkpoint| &checkpoint.file_changes)
+        .filter_map(|change| change.previous.as_ref())
+        .fold(0usize, |total, bytes| total.saturating_add(bytes.len()))
+}
+
+fn file_change_bytes(changes: &[FileChange]) -> usize {
+    changes
+        .iter()
+        .filter_map(|change| change.previous.as_ref())
+        .fold(0usize, |total, bytes| total.saturating_add(bytes.len()))
 }
 
 fn working_directory_context(working_dir: &std::path::Path) -> String {
@@ -1379,5 +1458,27 @@ mod working_directory_tests {
         assert_eq!(restored.content.as_deref(), Some("# Legacy plan\n"));
         assert!(legacy.exists());
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn undo_history_keeps_only_recent_turn_budget() {
+        let mut session = Session::new(
+            format!("undo-budget-{}", uuid::Uuid::new_v4()),
+            std::env::temp_dir(),
+            PermissionMode::Manual,
+            "test-model".into(),
+        );
+        for index in 0..MAX_UNDO_TURNS + 8 {
+            session.undo_stack.push(TurnCheckpoint {
+                message_start_index: index,
+                file_changes: vec![FileChange {
+                    path: PathBuf::from(format!("file-{index}")),
+                    previous: Some(vec![index as u8]),
+                }],
+            });
+        }
+        session.trim_undo_stack();
+        assert_eq!(session.undo_stack.len(), MAX_UNDO_TURNS);
+        assert_eq!(session.undo_stack[0].message_start_index, 8);
     }
 }

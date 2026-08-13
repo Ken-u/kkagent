@@ -11,7 +11,7 @@ use std::time::Duration;
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::{AbortHandle, JoinHandle};
 
-use crate::context_projector::{fold_old_media, project, project_strict, ProjectOptions};
+use crate::context_projector::{fold_old_media, project_owned, project_strict, ProjectOptions};
 use crate::file_conflict::FileConflictTracker;
 use crate::full_compaction::{
     compact_full, compact_full_async, observe_context_overflow, CompactionPolicy,
@@ -1692,7 +1692,7 @@ Do not mention this reminder to the user.\n</system-reminder>"
             .map(|o| o.min(configured_max))
             .unwrap_or(configured_max);
 
-        let projected = project(&session.build_messages(), &ProjectOptions::default());
+        let projected = project_owned(session.build_messages(), &ProjectOptions::default());
         let used = session
             .token_counter
             .request_size(system, tools, &projected);
@@ -1789,8 +1789,8 @@ Do not mention this reminder to the user.\n</system-reminder>"
         let opts = ProjectOptions::default();
         // contextMemory: drop vacuous noise + loop-event markers before project.
         let _ = crate::context_memory::fold_vacuous(&mut session.messages);
-        let projected = crate::context_memory::fold_loop_events(&session.build_messages());
-        let mut messages = project(&projected, &opts);
+        let projected = crate::context_memory::fold_loop_events_owned(session.build_messages());
+        let mut messages = project_owned(projected, &opts);
         let mut req = session.token_counter.request_size(system, tools, &messages);
 
         if policy.should_compact(max_context, req) {
@@ -1825,7 +1825,7 @@ Do not mention this reminder to the user.\n</system-reminder>"
                 req,
                 after
             );
-            messages = project(&session.build_messages(), &opts);
+            messages = project_owned(session.build_messages(), &opts);
         }
 
         messages

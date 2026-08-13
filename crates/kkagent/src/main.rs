@@ -3209,11 +3209,6 @@ async fn spawn_session_agent_turn(
                 }
             }
         };
-        *active_btw
-            .history
-            .write()
-            .unwrap_or_else(|error| error.into_inner()) = session.messages.clone();
-
         if session.is_interrupted() {
             let _ = agent_event_tx
                 .send(AgentEvent::Error {

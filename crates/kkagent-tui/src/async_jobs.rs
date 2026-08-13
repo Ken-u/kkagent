@@ -5,12 +5,14 @@
 //! channel has a monotonic generation so late results from superseded requests
 //! are discarded.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use kkagent_client::KkagentRequester;
 use serde_json::Value;
-use tokio::sync::mpsc;
+use tokio::io::AsyncReadExt;
+use tokio::sync::{mpsc, Mutex};
 
 /// Soft threshold before showing a non-blocking busy notice.
 pub const SLOW_OP_NOTICE_MS: u64 = 150;
@@ -746,7 +748,7 @@ async fn run_local_shell_command(
 ) -> Result<LocalShellResult, String> {
     let started = Instant::now();
     #[cfg(windows)]
-    let child = tokio::process::Command::new("cmd")
+    let mut child = tokio::process::Command::new("cmd")
         .args(["/C", command])
         .current_dir(cwd)
         .stdin(std::process::Stdio::null())
@@ -756,7 +758,7 @@ async fn run_local_shell_command(
         .spawn()
         .map_err(|e| format!("failed to spawn shell: {e}"))?;
     #[cfg(not(windows))]
-    let child = tokio::process::Command::new("sh")
+    let mut child = tokio::process::Command::new("sh")
         .arg("-c")
         .arg(command)
         .current_dir(cwd)
@@ -767,14 +769,31 @@ async fn run_local_shell_command(
         .spawn()
         .map_err(|e| format!("failed to spawn shell: {e}"))?;
 
-    let wait = child.wait_with_output();
-    let output = match tokio::time::timeout(LOCAL_SHELL_TIMEOUT, wait).await {
-        Ok(Ok(out)) => out,
-        Ok(Err(e)) => return Err(format!("shell failed: {e}")),
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let collected = Arc::new(Mutex::new(BoundedOutput::new(LOCAL_SHELL_OUTPUT_CAP)));
+    let stdout_collected = collected.clone();
+    let stdout_pump = tokio::spawn(async move {
+        pump_local_output(stdout, stdout_collected, None).await;
+    });
+    let stderr_collected = collected.clone();
+    let stderr_pump = tokio::spawn(async move {
+        pump_local_output(stderr, stderr_collected, Some(b"\nSTDERR:\n")).await;
+    });
+
+    let status = match tokio::time::timeout(LOCAL_SHELL_TIMEOUT, child.wait()).await {
+        Ok(Ok(status)) => status,
+        Ok(Err(e)) => {
+            let _ = child.kill().await;
+            join_local_pump(stdout_pump).await;
+            join_local_pump(stderr_pump).await;
+            return Err(format!("shell failed: {e}"));
+        }
         Err(_) => {
-            // kill_on_drop will reap on drop of child — but wait_with_output
-            // already consumed it on timeout path differently; spawn again can't.
-            // Best-effort: the child handle was moved into wait_with_output future.
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            join_local_pump(stdout_pump).await;
+            join_local_pump(stderr_pump).await;
             return Ok(LocalShellResult {
                 exit_code: None,
                 output: format!(
@@ -786,42 +805,100 @@ async fn run_local_shell_command(
             });
         }
     };
-
-    let mut text = String::new();
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    if !stdout.is_empty() {
-        text.push_str(&stdout);
-    }
-    if !stderr.is_empty() {
-        if !text.is_empty() && !text.ends_with('\n') {
-            text.push('\n');
-        }
-        text.push_str(&stderr);
-    }
-    if text.len() > LOCAL_SHELL_OUTPUT_CAP {
-        let keep = LOCAL_SHELL_OUTPUT_CAP / 2;
-        let head: String = text.chars().take(keep).collect();
-        let tail: String = text
-            .chars()
-            .rev()
-            .take(keep)
-            .collect::<String>()
-            .chars()
-            .rev()
-            .collect();
-        text = format!("{head}\n… output truncated …\n{tail}");
-    }
+    join_local_pump(stdout_pump).await;
+    join_local_pump(stderr_pump).await;
+    let mut text = collected.lock().await.render();
     if text.is_empty() {
         text = "(no output)".into();
     }
 
     Ok(LocalShellResult {
-        exit_code: output.status.code(),
+        exit_code: status.code(),
         output: text,
         duration_ms: started.elapsed().as_millis() as u64,
         timed_out: false,
     })
+}
+
+struct BoundedOutput {
+    head: Vec<u8>,
+    tail: VecDeque<u8>,
+    total: usize,
+    cap: usize,
+}
+
+impl BoundedOutput {
+    fn new(cap: usize) -> Self {
+        Self {
+            head: Vec::with_capacity(cap / 2),
+            tail: VecDeque::with_capacity(cap / 2),
+            total: 0,
+            cap,
+        }
+    }
+
+    fn push(&mut self, bytes: &[u8]) {
+        self.total = self.total.saturating_add(bytes.len());
+        let head_cap = self.cap / 2;
+        let take_head = head_cap.saturating_sub(self.head.len()).min(bytes.len());
+        self.head.extend_from_slice(&bytes[..take_head]);
+        let tail_cap = self.cap.saturating_sub(head_cap);
+        for &byte in &bytes[take_head..] {
+            if self.tail.len() == tail_cap {
+                self.tail.pop_front();
+            }
+            self.tail.push_back(byte);
+        }
+    }
+
+    fn render(&self) -> String {
+        let mut bytes = self.head.clone();
+        if self.total > self.cap {
+            bytes.extend_from_slice(b"\n... output truncated ...\n");
+        }
+        bytes.extend(self.tail.iter().copied());
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+}
+
+async fn pump_local_output<R>(
+    reader: Option<R>,
+    collected: Arc<Mutex<BoundedOutput>>,
+    prefix: Option<&'static [u8]>,
+) where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let Some(mut reader) = reader else {
+        return;
+    };
+    let mut buf = [0u8; 4096];
+    let mut prefixed = false;
+    loop {
+        match reader.read(&mut buf).await {
+            Ok(0) => break,
+            Ok(n) => {
+                let mut output = collected.lock().await;
+                if !prefixed {
+                    if let Some(prefix) = prefix {
+                        output.push(prefix);
+                    }
+                    prefixed = true;
+                }
+                output.push(&buf[..n]);
+            }
+            Err(_) => break,
+        }
+    }
+}
+
+async fn join_local_pump(mut pump: tokio::task::JoinHandle<()>) {
+    if tokio::time::timeout(Duration::from_secs(2), &mut pump)
+        .await
+        .is_err()
+    {
+        pump.abort();
+        let _ = pump.await;
+    }
 }
 
 impl Default for AsyncJobHub {
@@ -868,5 +945,17 @@ mod tests {
         assert!(!r.timed_out);
         assert_eq!(r.exit_code, Some(0));
         assert!(r.output.contains("kkagent-shell-ok"));
+    }
+
+    #[test]
+    fn bounded_output_retains_head_and_tail() {
+        let mut output = BoundedOutput::new(64);
+        output.push(&[b'a'; 64]);
+        output.push(&[b'z'; 64]);
+        let rendered = output.render();
+        assert!(rendered.starts_with(&"a".repeat(32)));
+        assert!(rendered.ends_with(&"z".repeat(32)));
+        assert!(rendered.contains("output truncated"));
+        assert!(rendered.len() < 128);
     }
 }
