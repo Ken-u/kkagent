@@ -2541,32 +2541,32 @@ fn render_approval_panel(f: &mut Frame, area: Rect, approval: &mut PendingApprov
 }
 
 fn render_question_panel(f: &mut Frame, area: Rect, question: &mut PendingQuestion, theme: &Theme) {
-    let panel_width = 72.min(area.width.saturating_sub(4)).max(40);
-    let opt_count = question.options.len() as u16;
-    let free_lines: u16 = if question.allow_free_text { 2 } else { 0 };
-    let panel_height = (6 + opt_count + free_lines)
-        .min(area.height.saturating_sub(2))
-        .max(8);
-    let x = (area.width.saturating_sub(panel_width)) / 2;
-    let y = (area.height.saturating_sub(panel_height)) / 2;
-    let panel_area = Rect::new(x, y, panel_width, panel_height);
+    if area.width < 3 || area.height < 3 {
+        return;
+    }
 
-    f.render_widget(Clear, panel_area);
+    // Keep a margin on normal terminals, but never make the modal wider than
+    // the terminal. The old `.max(40)` made its right side disappear below 44
+    // columns.
+    let panel_width = if area.width >= 44 {
+        72.min(area.width.saturating_sub(4))
+    } else {
+        area.width
+    };
+    let content_width = panel_width.saturating_sub(2).max(1);
 
-    let block = Block::default()
-        .title(" question ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.primary));
-
-    let mut lines: Vec<Line> = vec![
-        Line::from(Span::styled(
-            question.text.clone(),
-            Style::default()
-                .fg(theme.text_strong)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-    ];
+    let question_style = Style::default()
+        .fg(theme.text_strong)
+        .add_modifier(Modifier::BOLD);
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    push_wrapped_text(
+        &mut lines,
+        &question.text,
+        content_width as usize,
+        question_style,
+    );
+    lines.push(Line::from(""));
+    let mut selected_range = (0usize, lines.len());
 
     for (i, (_id, label)) in question.options.iter().enumerate() {
         let selected = i == question.selected;
@@ -2590,14 +2590,19 @@ fn render_question_panel(f: &mut Frame, area: Rect, question: &mut PendingQuesti
         } else {
             "( )"
         };
-        lines.push(Line::from(vec![
-            Span::styled(marker, style),
-            Span::styled(
-                format!("{} {}  ", i + 1, boxc),
-                Style::default().fg(theme.text_muted),
-            ),
-            Span::styled(label.clone(), style),
-        ]));
+        let prefix = format!("{marker}{} {boxc}  ", i + 1);
+        let start = lines.len();
+        push_wrapped_prefixed(
+            &mut lines,
+            &prefix,
+            label,
+            content_width,
+            Style::default().fg(theme.text_muted),
+            style,
+        );
+        if selected {
+            selected_range = (start, lines.len());
+        }
     }
 
     if question.allow_free_text {
@@ -2611,12 +2616,18 @@ fn render_question_panel(f: &mut Frame, area: Rect, question: &mut PendingQuesti
         };
         let marker = if selected { "> " } else { "  " };
         lines.push(Line::from(""));
-        lines.push(Line::from(vec![
-            Span::styled(marker, style),
-            Span::styled("text: ", Style::default().fg(theme.text_muted)),
-            Span::styled(question.free_text.clone(), style),
-            Span::styled("▌", style),
-        ]));
+        let start = lines.len();
+        push_wrapped_prefixed(
+            &mut lines,
+            &format!("{marker}text: "),
+            &format!("{}▌", question.free_text),
+            content_width,
+            Style::default().fg(theme.text_muted),
+            style,
+        );
+        if selected {
+            selected_range = (start, lines.len());
+        }
     }
 
     lines.push(Line::from(""));
@@ -2625,12 +2636,55 @@ fn render_question_panel(f: &mut Frame, area: Rect, question: &mut PendingQuesti
     } else {
         "  1-9 submit · ↑↓ move · enter confirm · esc cancel"
     };
-    lines.push(Line::from(Span::styled(
+    push_wrapped_text(
+        &mut lines,
         hint,
+        content_width as usize,
         Style::default().fg(theme.text_muted),
-    )));
+    );
 
-    f.render_widget(Paragraph::new(Text::from(lines)).block(block), panel_area);
+    // Size from visual rows after wrapping, not from the number of logical
+    // options. When the content is taller than the screen, follow the selected
+    // row so keyboard navigation makes every option reachable and visible.
+    let max_panel_height = if area.height >= 10 {
+        area.height.saturating_sub(2)
+    } else {
+        area.height
+    };
+    let desired_height = u16::try_from(lines.len())
+        .unwrap_or(u16::MAX)
+        .saturating_add(2);
+    let panel_height = desired_height.min(max_panel_height).max(3);
+    let inner_height = panel_height.saturating_sub(2) as usize;
+    let selected_end_with_context = selected_range.1.saturating_add(2).min(lines.len());
+    let scroll = selected_end_with_context
+        .saturating_sub(inner_height)
+        .min(lines.len().saturating_sub(inner_height));
+
+    let x = (area.width.saturating_sub(panel_width)) / 2;
+    let y = (area.height.saturating_sub(panel_height)) / 2;
+    let panel_area = Rect::new(x, y, panel_width, panel_height);
+    f.render_widget(Clear, panel_area);
+
+    let block = Block::default()
+        .title(" question ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.primary));
+
+    f.render_widget(
+        Paragraph::new(Text::from(lines))
+            .scroll((u16::try_from(scroll).unwrap_or(u16::MAX), 0))
+            .block(block),
+        panel_area,
+    );
+}
+
+fn push_wrapped_text(lines: &mut Vec<Line<'static>>, text: &str, width: usize, style: Style) {
+    for logical_line in text.split('\n') {
+        for chunk in wrap_str(logical_line, width) {
+            lines.push(Line::from(Span::styled(chunk, style)));
+        }
+    }
 }
 
 fn shorten_path(path: &str) -> String {
@@ -2659,6 +2713,105 @@ mod render_smoke {
     };
     use kkagent_protocol::PermissionMode;
     use ratatui::{backend::TestBackend, Terminal};
+
+    fn pending_question(text: &str, options: Vec<(String, String)>) -> PendingQuestion {
+        PendingQuestion {
+            question_id: "question-1".into(),
+            text: text.into(),
+            toggled: vec![false; options.len()],
+            options,
+            allow_free_text: false,
+            allow_multiple: false,
+            background: false,
+            selected: 0,
+            free_text: String::new(),
+        }
+    }
+
+    fn buffer_text(terminal: &Terminal<TestBackend>) -> String {
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .fold(String::new(), |mut output, cell| {
+                output.push_str(cell.symbol());
+                output
+            })
+    }
+
+    #[test]
+    fn question_modal_sizes_for_wrapped_question_and_options() {
+        let backend = TestBackend::new(60, 18);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut question = pending_question(
+            "A long question that must wrap onto another visual row before the choices",
+            vec![(
+                "one".into(),
+                "A long choice whose distinctive ending remains visible: OPTION_TAIL".into(),
+            )],
+        );
+
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_question_panel(frame, area, &mut question, &Theme::default());
+            })
+            .unwrap();
+
+        let rendered = buffer_text(&terminal);
+        assert!(rendered.contains("another visual row"), "{rendered:?}");
+        assert!(rendered.contains("OPTION_TAIL"), "{rendered:?}");
+        assert!(rendered.contains("enter confirm"), "{rendered:?}");
+    }
+
+    #[test]
+    fn question_modal_stays_within_a_narrow_terminal() {
+        let backend = TestBackend::new(32, 16);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut question = pending_question(
+            "Narrow terminal question",
+            vec![(
+                "one".into(),
+                "This choice wraps across rows and ends with TAIL_OK".into(),
+            )],
+        );
+
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_question_panel(frame, area, &mut question, &Theme::default());
+            })
+            .unwrap();
+
+        let rendered = buffer_text(&terminal);
+        assert!(rendered.contains("TAIL_OK"), "{rendered:?}");
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer.cell((31, 8)).map(|cell| cell.symbol()), Some("│"));
+    }
+
+    #[test]
+    fn overflowing_question_modal_follows_the_selected_option() {
+        let backend = TestBackend::new(50, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let options = (0..12)
+            .map(|index| (format!("option-{index}"), format!("choice {index}")))
+            .collect();
+        let mut question = pending_question("Pick a choice", options);
+        question.selected = 11;
+
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_question_panel(frame, area, &mut question, &Theme::default());
+            })
+            .unwrap();
+
+        let rendered = buffer_text(&terminal);
+        assert!(rendered.contains("choice 11"), "{rendered:?}");
+        assert!(rendered.contains("enter confirm"), "{rendered:?}");
+        assert!(!rendered.contains("choice 0"), "{rendered:?}");
+    }
 
     #[test]
     fn thinking_uses_the_same_ctrl_o_folding_in_all_views() {
