@@ -5,6 +5,7 @@
 
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// One cell in the rendered transcript (visual line + display column).
@@ -219,74 +220,44 @@ fn select_word(rows: &[SelectRow], pos: CellPos) -> TextSelection {
     };
     let text = &row.plain;
     let col = pos.col as usize;
-    if text.is_empty() {
+    if text.is_empty() || col < row.content_col as usize || col >= text.width() {
         return TextSelection::new(pos);
     }
-    let mut char_indices: Vec<(usize, usize)> = Vec::new(); // (byte_start, col)
-    let mut col_acc = 0usize;
-    for (idx, ch) in text.char_indices() {
-        char_indices.push((idx, col_acc));
-        col_acc += UnicodeWidthChar::width(ch).unwrap_or(1);
-    }
-    // Find the character under the click.
-    let mut idx_under = None;
-    for (i, &(_byte_start, _ch_start)) in char_indices.iter().enumerate() {
-        let ch_end = char_indices.get(i + 1).map(|(_, c)| *c).unwrap_or(col_acc);
-        if col < ch_end {
-            idx_under = Some(i);
-            break;
+
+    let clicked_byte = text
+        .grapheme_indices(true)
+        .scan(0usize, |display_col, (byte, grapheme)| {
+            let start = *display_col;
+            *display_col += grapheme.width();
+            Some((byte, grapheme, start, *display_col))
+        })
+        .find(|(_, _, start, end)| col >= *start && col < *end)
+        .map(|(byte, _, _, _)| byte);
+    let Some(clicked_byte) = clicked_byte else {
+        return TextSelection::new(pos);
+    };
+
+    // UAX #29 keeps natural tokens such as apostrophes and decimal numbers
+    // together while separating Unicode punctuation and CJK ideographs.
+    let word = text
+        .split_word_bound_indices()
+        .find(|(start, segment)| clicked_byte >= *start && clicked_byte < *start + segment.len());
+    let (start_byte, end_byte) = match word {
+        Some((start, segment)) if segment.chars().any(|ch| ch.is_alphanumeric() || ch == '_') => {
+            (start, start + segment.len())
         }
-    }
-    let idx_under = idx_under.unwrap_or(char_indices.len().saturating_sub(1));
-    let is_word_char = |ch: char| ch.is_alphanumeric() || ch == '_' || ch > '\x7f';
-    let ch_under = text.chars().nth(idx_under).unwrap_or(' ');
-    if !is_word_char(ch_under) {
-        // Punctuation: select just that character.
-        let byte_start = char_indices[idx_under].0;
-        let _byte_end = char_indices
-            .get(idx_under + 1)
-            .map(|(b, _)| *b)
-            .unwrap_or(text.len());
-        let before = &text[..byte_start];
-        let start_col = before.width() as u16;
-        let end_col = start_col + UnicodeWidthChar::width(ch_under).unwrap_or(1) as u16;
-        return TextSelection {
-            anchor: CellPos {
-                line: pos.line,
-                col: start_col,
-            },
-            focus: CellPos {
-                line: pos.line,
-                col: end_col,
-            },
-        };
-    }
-    // Find word boundaries.
-    let mut start_idx = idx_under;
-    while start_idx > 0
-        && text
-            .chars()
-            .nth(start_idx - 1)
-            .map(is_word_char)
-            .unwrap_or(false)
-    {
-        start_idx -= 1;
-    }
-    let mut end_idx = idx_under;
-    while end_idx + 1 < char_indices.len()
-        && text
-            .chars()
-            .nth(end_idx + 1)
-            .map(is_word_char)
-            .unwrap_or(false)
-    {
-        end_idx += 1;
-    }
-    let start_byte = char_indices[start_idx].0;
-    let end_byte = char_indices
-        .get(end_idx + 1)
-        .map(|(b, _)| *b)
-        .unwrap_or(text.len());
+        _ => {
+            // Punctuation, whitespace and emoji select only the visible
+            // grapheme under the pointer instead of a whole punctuation run.
+            let (start, grapheme) = text
+                .grapheme_indices(true)
+                .find(|(start, grapheme)| {
+                    clicked_byte >= *start && clicked_byte < *start + grapheme.len()
+                })
+                .unwrap_or((clicked_byte, ""));
+            (start, start + grapheme.len())
+        }
+    };
     let start_col = text[..start_byte].width() as u16;
     let end_col = text[..end_byte].width() as u16;
     TextSelection {
@@ -418,5 +389,28 @@ mod tests {
             focus: CellPos { line: 0, col: 7 },
         };
         assert_eq!(extract_text(&rows, sel), "hello");
+    }
+
+    fn double_clicked_text(text: &str, content_col: u16, col: u16) -> String {
+        let rows = vec![SelectRow {
+            plain: text.into(),
+            content_col,
+        }];
+        let selection = select_by_click(&rows, CellPos { line: 0, col }, 2);
+        extract_text(&rows, selection)
+    }
+
+    #[test]
+    fn word_selection_uses_unicode_boundaries() {
+        assert_eq!(double_clicked_text("  can't stop", 2, 5), "can't");
+        assert_eq!(double_clicked_text("  你好，世界", 2, 4), "好");
+        assert_eq!(double_clicked_text("  你好，世界", 2, 6), "，");
+        assert_eq!(double_clicked_text("  你好，世界", 2, 8), "世");
+    }
+
+    #[test]
+    fn word_selection_does_not_snap_to_text_from_empty_space() {
+        assert_eq!(double_clicked_text("  hello", 2, 20), "");
+        assert_eq!(double_clicked_text("  hello", 2, 0), "");
     }
 }

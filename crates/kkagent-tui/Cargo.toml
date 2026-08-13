@@ -19,6 +19,7 @@ futures = { workspace = true }
 reqwest = { workspace = true }
 dirs = { workspace = true }
 unicode-width = "0.2"
+unicode-segmentation = "1"
 base64 = { workspace = true }
 ignore = { workspace = true }
 uuid = { workspace = true }
