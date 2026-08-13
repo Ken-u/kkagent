@@ -1,6 +1,14 @@
 //! Platform-aware modifier helpers for TUI keybindings.
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+
+/// Press and repeat events perform actions; release events must never do so.
+/// Crossterm reports releases on Windows and when enhanced keyboard reporting
+/// is enabled, while most Unix terminals only report presses.
+#[inline]
+pub fn is_actionable_key_event(key: &KeyEvent) -> bool {
+    !matches!(key.kind, KeyEventKind::Release)
+}
 
 /// Returns true when the key event is the platform "copy" shortcut:
 /// - macOS: ⌘Command + C (`SUPER`) — and Ctrl + C as a fallback, because the
@@ -48,7 +56,11 @@ pub fn is_platform_copy_modifier(modifiers: KeyModifiers) -> bool {
 /// ASCII Ctrl-H chord instead of `KeyCode::Backspace`. Treat that chord as an
 /// unmodified Backspace so every input surface gets the same behavior.
 #[inline]
-pub fn normalize_key_event(mut key: KeyEvent) -> KeyEvent {
+pub fn normalize_key_event(key: KeyEvent) -> KeyEvent {
+    normalize_key_event_for_platform(key, cfg!(target_os = "windows"))
+}
+
+fn normalize_key_event_for_platform(mut key: KeyEvent, is_windows: bool) -> KeyEvent {
     if matches!(key.code, KeyCode::Char('h') | KeyCode::Char('H'))
         && key.modifiers.contains(KeyModifiers::CONTROL)
         && !key
@@ -57,6 +69,38 @@ pub fn normalize_key_event(mut key: KeyEvent) -> KeyEvent {
     {
         key.code = KeyCode::Backspace;
         key.modifiers = KeyModifiers::NONE;
+        return key;
+    }
+
+    // Windows exposes AltGr as Ctrl+Alt. When that chord has already produced
+    // a symbol or a non-ASCII character, it is text input rather than an app
+    // shortcut. ASCII letters/digits stay modified so real Ctrl-Alt shortcuts
+    // are not silently converted into text.
+    if is_windows
+        && matches!(key.code, KeyCode::Char(c) if !c.is_ascii_alphanumeric())
+        && key
+            .modifiers
+            .contains(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        && !key.modifiers.contains(KeyModifiers::SUPER)
+    {
+        key.modifiers
+            .remove(KeyModifiers::CONTROL | KeyModifiers::ALT);
+    }
+
+    // Caps Lock can make Windows report Ctrl-C and similar shortcuts with an
+    // uppercase character but without Shift. Normalize that representation;
+    // explicit Ctrl-Shift shortcuts remain uppercase and distinct.
+    if is_windows
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+        && !key
+            .modifiers
+            .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT | KeyModifiers::SUPER)
+    {
+        if let KeyCode::Char(c) = key.code {
+            if c.is_ascii_uppercase() {
+                key.code = KeyCode::Char(c.to_ascii_lowercase());
+            }
+        }
     }
     key
 }
@@ -102,5 +146,55 @@ mod tests {
         );
 
         assert_eq!(normalize_key_event(ctrl_alt_h), ctrl_alt_h);
+    }
+
+    #[test]
+    fn key_release_is_not_actionable_but_repeat_is() {
+        let release = KeyEvent::new_with_kind(
+            KeyCode::Char('a'),
+            KeyModifiers::NONE,
+            KeyEventKind::Release,
+        );
+        let repeat =
+            KeyEvent::new_with_kind(KeyCode::Char('a'), KeyModifiers::NONE, KeyEventKind::Repeat);
+
+        assert!(!is_actionable_key_event(&release));
+        assert!(is_actionable_key_event(&repeat));
+    }
+
+    #[test]
+    fn altgr_symbol_is_normalized_to_text_input() {
+        let altgr_at = key(
+            KeyCode::Char('@'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        );
+
+        assert_eq!(
+            normalize_key_event_for_platform(altgr_at, true),
+            key(KeyCode::Char('@'), KeyModifiers::NONE)
+        );
+        assert_eq!(normalize_key_event_for_platform(altgr_at, false), altgr_at);
+    }
+
+    #[test]
+    fn caps_lock_uppercase_control_chord_is_normalized() {
+        let ctrl_upper_c = key(KeyCode::Char('C'), KeyModifiers::CONTROL);
+        let ctrl_shift_c = key(
+            KeyCode::Char('C'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        );
+
+        assert_eq!(
+            normalize_key_event_for_platform(ctrl_upper_c, true),
+            key(KeyCode::Char('c'), KeyModifiers::CONTROL)
+        );
+        assert_eq!(
+            normalize_key_event_for_platform(ctrl_upper_c, false),
+            ctrl_upper_c
+        );
+        assert_eq!(
+            normalize_key_event_for_platform(ctrl_shift_c, true),
+            ctrl_shift_c
+        );
     }
 }

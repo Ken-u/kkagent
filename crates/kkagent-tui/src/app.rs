@@ -2382,6 +2382,9 @@ impl TuiApp {
     }
 
     async fn handle_key(&mut self, key: KeyEvent) -> anyhow::Result<()> {
+        if !crate::platform_keys::is_actionable_key_event(&key) {
+            return Ok(());
+        }
         let key = crate::platform_keys::normalize_key_event(key);
 
         // Esc while a menu/overlay is open: only dismiss that UI — never interrupt
@@ -9487,6 +9490,26 @@ mod app_state_tests {
             .unwrap();
 
         assert_eq!(app.state.input.text, "hello");
+    }
+
+    #[tokio::test]
+    async fn release_events_are_ignored_while_repeat_events_keep_typing() {
+        let mut app = test_tui_app();
+        let release = KeyEvent::new_with_kind(
+            KeyCode::Char('x'),
+            KeyModifiers::NONE,
+            crossterm::event::KeyEventKind::Release,
+        );
+        let repeat = KeyEvent::new_with_kind(
+            KeyCode::Char('y'),
+            KeyModifiers::NONE,
+            crossterm::event::KeyEventKind::Repeat,
+        );
+
+        app.handle_key(release).await.unwrap();
+        app.handle_key(repeat).await.unwrap();
+
+        assert_eq!(app.state.input.text, "y");
     }
 
     #[tokio::test]

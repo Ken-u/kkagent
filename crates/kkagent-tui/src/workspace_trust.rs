@@ -551,6 +551,9 @@ fn run_questions(questions: &[TrustQuestion], use_alt_screen: bool) -> Result<Ve
             let allowed = loop {
                 terminal.draw(|frame| render_question(frame, question, selected))?;
                 if let Event::Key(key) = event::read()? {
+                    if !crate::platform_keys::is_actionable_key_event(&key) {
+                        continue;
+                    }
                     match key.code {
                         KeyCode::Up | KeyCode::Left => selected = selected.saturating_sub(1),
                         KeyCode::Down | KeyCode::Right => selected = (selected + 1).min(1),
