@@ -253,7 +253,7 @@ fn default_reserved_context() -> u64 {
     50000
 }
 fn default_max_steps() -> u32 {
-    64
+    0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -655,6 +655,13 @@ mod tests {
     #[test]
     fn accepts_consistent_configuration() {
         valid_config().validate().unwrap();
+    }
+
+    #[test]
+    fn loop_step_limit_defaults_to_unlimited() {
+        let loop_control: LoopControlConfig = toml::from_str("").unwrap();
+        assert_eq!(loop_control.max_steps_per_turn, 0);
+        assert_eq!(LoopControlConfig::default().max_steps_per_turn, 0);
     }
 
     #[test]

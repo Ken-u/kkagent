@@ -38,7 +38,7 @@ pub struct AgentLoop {
     permission: Arc<Mutex<PermissionChain>>,
     event_tx: mpsc::Sender<AgentEvent>,
     abort_registry: Arc<Mutex<HashMap<String, AbortHandle>>>,
-    /// Max LLM rounds per top-level run_turn (tool recursion counts).
+    /// Max LLM rounds per top-level run_turn (tool recursion counts); 0 is unlimited.
     max_rounds: u32,
     hooks: Option<Arc<kkagent_mcp::HookManager>>,
     goal_mgr: Option<Arc<GoalManager>>,
@@ -103,7 +103,7 @@ impl AgentLoop {
             .loop_control
             .as_ref()
             .map(|l| l.max_steps_per_turn)
-            .unwrap_or(64);
+            .unwrap_or(0);
         Self::with_max_rounds(config, tools, permission, event_tx, abort_registry, max)
     }
 
@@ -131,7 +131,7 @@ impl AgentLoop {
             permission,
             event_tx,
             abort_registry,
-            max_rounds: max_rounds.max(1),
+            max_rounds,
             hooks: None,
             goal_mgr: None,
         }
@@ -144,22 +144,32 @@ impl AgentLoop {
         Box::pin(async move {
             session.steer_mailbox.start_turn();
             let _heartbeat = TurnHeartbeat::spawn(self.event_tx.clone(), session.id.clone());
-            let mut rounds_left = self.max_rounds;
+            let mut completed_rounds = 0_u32;
             loop {
                 match self.run_turn_step(session).await? {
                     TurnStep::Done => {
                         self.sync_requested_plan_mode(session).await?;
                         return Ok(());
                     }
-                    TurnStep::Continue if rounds_left <= 1 => {
+                    TurnStep::Continue
+                        if self.max_rounds > 0
+                            && completed_rounds.saturating_add(1) >= self.max_rounds =>
+                    {
                         tracing::warn!("Agent turn limit reached for session {}", session.id);
                         self.finish_turn(session, true).await?;
                         self.sync_requested_plan_mode(session).await?;
                         return Ok(());
                     }
                     TurnStep::Continue => {
-                        rounds_left -= 1;
-                        tracing::info!("Continuing turn ({} rounds left)", rounds_left);
+                        completed_rounds = completed_rounds.saturating_add(1);
+                        if self.max_rounds > 0 {
+                            tracing::info!(
+                                "Continuing turn ({} rounds left)",
+                                self.max_rounds.saturating_sub(completed_rounds)
+                            );
+                        } else {
+                            tracing::info!("Continuing turn (no step limit)");
+                        }
                     }
                 }
             }
