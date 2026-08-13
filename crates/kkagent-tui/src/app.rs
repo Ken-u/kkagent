@@ -158,6 +158,10 @@ pub struct AppState {
     pub open_session_group: Vec<String>,
     /// Preview pane while `/sessions` list is open.
     pub session_picker_preview: Option<SessionPickerPreview>,
+    /// Unfiltered session records backing the current/all-workspace picker scopes.
+    pub session_picker_entries: Vec<SessionPickerEntry>,
+    /// False = current workspace only; true = sessions from every known workspace.
+    pub session_picker_all_workspaces: bool,
     /// Pending delete confirmation inside `/sessions` (default = No).
     pub session_delete_confirm: Option<SessionDeleteConfirm>,
     /// When true, show the session picker on the first UI tick (used by `-r` without id).
@@ -439,6 +443,13 @@ pub struct ListPickerItem {
     pub id: String,
     pub label: String,
     pub detail: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionPickerEntry {
+    pub item: ListPickerItem,
+    pub workspace: String,
+    pub same_workspace: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -897,6 +908,8 @@ impl AppState {
             workspace_sessions: crate::chrome::WorkspaceSessionStrip::default(),
             open_session_group: Vec::new(),
             session_picker_preview: None,
+            session_picker_entries: Vec::new(),
+            session_picker_all_workspaces: false,
             session_delete_confirm: None,
             startup_session_picker: false,
             resume_switch: None,
@@ -2765,6 +2778,19 @@ impl TuiApp {
                     self.apply_list_picker().await?;
                     return Ok(());
                 }
+                KeyCode::Tab
+                    if self
+                        .state
+                        .list_picker
+                        .as_ref()
+                        .is_some_and(|p| p.kind == ListPickerKind::Session) =>
+                {
+                    self.state.session_picker_all_workspaces =
+                        !self.state.session_picker_all_workspaces;
+                    self.apply_session_picker_filter();
+                    self.refresh_session_picker_preview();
+                    return Ok(());
+                }
                 KeyCode::Esc => {
                     self.pop_list_picker_level();
                     return Ok(());
@@ -3738,11 +3764,18 @@ impl TuiApp {
                 self.clear_list_pickers();
             }
             ListPickerKind::Session => {
+                let workspace = self
+                    .state
+                    .session_picker_entries
+                    .iter()
+                    .find(|entry| entry.item.id == item.id)
+                    .map(|entry| entry.workspace.clone());
                 self.clear_list_pickers();
                 if self.state.session_id.as_deref() == Some(item.id.as_str()) {
                     self.clear_session_composer_draft(&item.id);
                 } else {
-                    self.resume_session(&item.id).await?;
+                    self.resume_session_in_workspace(&item.id, workspace.as_deref())
+                        .await?;
                 }
             }
             ListPickerKind::Permission => {
@@ -5300,15 +5333,18 @@ impl TuiApp {
 
     async fn open_session_picker(&mut self) -> anyhow::Result<()> {
         // Open a placeholder immediately; list fills when the background job returns.
-        if !self
+        let opening = !self
             .state
             .list_picker
             .as_ref()
-            .is_some_and(|p| p.kind == ListPickerKind::Session)
-        {
+            .is_some_and(|p| p.kind == ListPickerKind::Session);
+        if opening {
+            self.state.session_picker_all_workspaces = false;
+            self.state.session_picker_entries.clear();
             self.replace_list_picker(ListPickerState {
                 kind: ListPickerKind::Session,
-                title: " Sessions (this workspace)  ↑↓  Enter open  Ctrl-D delete ".into(),
+                title: " Sessions · current workspace · Tab show all · ↑↓ Enter · Ctrl-D delete "
+                    .into(),
                 items: Vec::new(),
                 selected: 0,
 
@@ -5321,7 +5357,7 @@ impl TuiApp {
             self.client.requester(),
             crate::async_jobs::JobChannel::SessionsList,
             "sessions.list",
-            Some(serde_json::json!({"limit": 80})),
+            Some(serde_json::json!({"limit": 1000})),
             Some("Loading sessions".into()),
             true,
         );
@@ -5330,8 +5366,8 @@ impl TuiApp {
 
     fn apply_session_picker_list(&mut self, data: serde_json::Value) {
         let cwd = self.state.working_dir.clone();
-        let cwd_key = cwd.to_string_lossy().to_string();
-        let mut items = Vec::new();
+        let cwd_key = normalized_workspace_key(&cwd);
+        let mut entries = Vec::new();
         let current = self.state.session_id.clone();
         if let Some(sessions) = data.get("sessions").and_then(|v| v.as_array()) {
             for s in sessions {
@@ -5344,18 +5380,9 @@ impl TuiApp {
                     continue;
                 }
                 let work = s.get("working_dir").and_then(|v| v.as_str()).unwrap_or("");
-                let same_workspace = if work.is_empty() {
-                    false
-                } else {
-                    std::fs::canonicalize(work)
-                        .map(|p| p.to_string_lossy() == cwd_key)
-                        .unwrap_or_else(|_| {
-                            std::path::Path::new(work) == cwd || work == cwd_key || work == "."
-                        })
-                };
-                if !same_workspace {
-                    continue;
-                }
+                let same_workspace = !work.is_empty()
+                    && (normalized_workspace_key(std::path::Path::new(work)) == cwd_key
+                        || work == ".");
                 let empty = s.get("empty").and_then(|v| v.as_bool()).unwrap_or_else(|| {
                     s.get("message_count").and_then(|v| v.as_u64()).unwrap_or(0) == 0
                         && s.get("last_prompt")
@@ -5388,17 +5415,22 @@ impl TuiApp {
                 } else {
                     ""
                 };
-                items.push(ListPickerItem {
-                    id: id.clone(),
-                    label: format!("{short} — {title}"),
-                    detail: format!("{fork}{mark}"),
+                entries.push(SessionPickerEntry {
+                    item: ListPickerItem {
+                        id: id.clone(),
+                        label: format!("{short} — {title}"),
+                        detail: format!("{fork}{mark}"),
+                    },
+                    workspace: work.to_string(),
+                    same_workspace,
                 });
             }
         }
-        if items.is_empty() {
+        if entries.is_empty() {
             self.state.list_picker = None;
             self.state.session_picker_preview = None;
-            self.system_message("No sessions in this workspace.".into());
+            self.state.session_picker_entries.clear();
+            self.system_message("No sessions found.".into());
             return;
         }
         // Preserve the currently *highlighted* session across background
@@ -5411,15 +5443,6 @@ impl TuiApp {
             .as_ref()
             .filter(|p| p.kind == ListPickerKind::Session)
             .and_then(|p| p.items.get(p.selected).map(|i| i.id.clone()));
-        let selected = prior_selected_id
-            .as_deref()
-            .and_then(|id| items.iter().position(|i| i.id == *id))
-            .or_else(|| {
-                current
-                    .as_ref()
-                    .and_then(|c| items.iter().position(|i| i.id == *c))
-            })
-            .unwrap_or(0);
         let prior_filter = self
             .state
             .list_picker
@@ -5427,20 +5450,47 @@ impl TuiApp {
             .filter(|p| p.kind == ListPickerKind::Session)
             .map(|p| p.filter.clone())
             .unwrap_or_default();
+        self.state.session_picker_entries = entries;
         self.replace_list_picker(ListPickerState {
             kind: ListPickerKind::Session,
-            title: " Sessions (this workspace)  type to filter · ↑↓ Enter · Ctrl-D delete ".into(),
-            items: items.clone(),
-            selected,
+            title: String::new(),
+            items: Vec::new(),
+            selected: 0,
             filter: prior_filter,
-            all_items: items,
+            all_items: Vec::new(),
         });
         self.apply_session_picker_filter();
+        if let Some(picker) = self.state.list_picker.as_mut() {
+            picker.selected = prior_selected_id
+                .as_deref()
+                .and_then(|id| picker.items.iter().position(|item| item.id == *id))
+                .or_else(|| {
+                    current
+                        .as_ref()
+                        .and_then(|id| picker.items.iter().position(|item| item.id == *id))
+                })
+                .unwrap_or(0);
+        }
         self.state.session_delete_confirm = None;
         self.refresh_session_picker_preview();
     }
 
     fn apply_session_picker_filter(&mut self) {
+        let all_workspaces = self.state.session_picker_all_workspaces;
+        let source = self
+            .state
+            .session_picker_entries
+            .iter()
+            .filter(|entry| all_workspaces || entry.same_workspace)
+            .map(|entry| {
+                let mut item = entry.item.clone();
+                if all_workspaces {
+                    item.detail =
+                        format!("{} · {}", item.detail, display_workspace(&entry.workspace));
+                }
+                item
+            })
+            .collect::<Vec<_>>();
         let Some(picker) = self.state.list_picker.as_mut() else {
             return;
         };
@@ -5451,10 +5501,9 @@ impl TuiApp {
         // the visible set changes.
         let keep_id = picker.items.get(picker.selected).map(|i| i.id.clone());
         let q = picker.filter.to_ascii_lowercase();
+        picker.all_items = source;
         if q.is_empty() {
             picker.items = picker.all_items.clone();
-            picker.title =
-                " Sessions (this workspace)  type to filter · ↑↓ Enter · Ctrl-D delete ".into();
         } else {
             picker.items = picker
                 .all_items
@@ -5466,13 +5515,31 @@ impl TuiApp {
                 })
                 .cloned()
                 .collect();
-            picker.title = format!(
-                " Sessions · filter {:?} · {}/{} · workspace scope ",
+        }
+        let scope = if all_workspaces {
+            "all workspaces"
+        } else {
+            "current workspace"
+        };
+        let tab_action = if all_workspaces {
+            "Tab current only"
+        } else {
+            "Tab show all"
+        };
+        picker.title = if picker.filter.is_empty() {
+            format!(
+                " Sessions · {scope} · {tab_action} · ↑↓ Enter · Ctrl-D delete · {}/{} ",
+                picker.items.len(),
+                picker.all_items.len()
+            )
+        } else {
+            format!(
+                " Sessions · {scope} · filter {:?} · {}/{} · {tab_action} ",
                 picker.filter,
                 picker.items.len(),
                 picker.all_items.len()
-            );
-        }
+            )
+        };
         // Try to keep the cursor on the same item; fall back to clamp.
         let new_selected = keep_id
             .as_deref()
@@ -5645,6 +5712,14 @@ impl TuiApp {
     }
 
     async fn resume_session(&mut self, query: &str) -> anyhow::Result<()> {
+        self.resume_session_in_workspace(query, None).await
+    }
+
+    async fn resume_session_in_workspace(
+        &mut self,
+        query: &str,
+        workspace: Option<&str>,
+    ) -> anyhow::Result<()> {
         // Session switches always leave the virtual BTW workspace.  Keep this
         // guard here as well as in strip activation because resume can also be
         // reached from pickers, attention cycling, and slash commands.
@@ -5675,7 +5750,9 @@ impl TuiApp {
         self.jobs.spawn_session_resume(
             self.client.requester(),
             query.to_string(),
-            self.state.working_dir.to_string_lossy().into_owned(),
+            workspace
+                .map(str::to_owned)
+                .unwrap_or_else(|| self.state.working_dir.to_string_lossy().into_owned()),
         );
         // First feedback is the non-blocking job notice (same tick).
         if let Some(ctx) = self.state.resume_switch.as_ref() {
@@ -9508,6 +9585,21 @@ fn history_edit_turns_from_json(data: &serde_json::Value) -> Vec<HistoryEditTurn
     turns
 }
 
+fn normalized_workspace_key(path: &std::path::Path) -> String {
+    std::fs::canonicalize(path)
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn display_workspace(workspace: &str) -> String {
+    let path = std::path::Path::new(workspace);
+    if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
+        return format!("{name} ({workspace})");
+    }
+    workspace.to_string()
+}
+
 fn history_turn_summary(text: &str, max_chars: usize) -> String {
     let first_line = text
         .lines()
@@ -9753,6 +9845,154 @@ mod app_state_tests {
             .list_picker
             .as_ref()
             .is_some_and(|picker| picker.kind == ListPickerKind::Session));
+    }
+
+    #[tokio::test]
+    async fn session_picker_tab_toggles_all_workspaces_and_filters_by_workspace() {
+        let mut app = test_tui_app();
+        let current_workspace = app.state.working_dir.to_string_lossy().into_owned();
+        let other_workspace = std::env::temp_dir()
+            .join("kkagent-other-workspace-search-token")
+            .to_string_lossy()
+            .into_owned();
+        app.state.session_id = Some("current-session".into());
+        app.replace_list_picker(ListPickerState {
+            kind: ListPickerKind::Session,
+            title: String::new(),
+            items: Vec::new(),
+            selected: 0,
+            filter: String::new(),
+            all_items: Vec::new(),
+        });
+        app.apply_session_picker_list(serde_json::json!({
+            "sessions": [
+                {
+                    "session_id": "current-session",
+                    "working_dir": current_workspace,
+                    "title": "current project",
+                    "is_custom_title": true,
+                    "empty": false
+                },
+                {
+                    "session_id": "other-session",
+                    "working_dir": other_workspace,
+                    "title": "another project",
+                    "is_custom_title": true,
+                    "empty": false
+                }
+            ]
+        }));
+
+        let picker = app.state.list_picker.as_ref().unwrap();
+        assert_eq!(picker.items.len(), 1);
+        assert_eq!(picker.items[0].id, "current-session");
+        assert!(picker.title.contains("current workspace"));
+
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        let picker = app.state.list_picker.as_mut().unwrap();
+        assert_eq!(picker.items.len(), 2);
+        assert!(picker.title.contains("all workspaces"));
+        picker.filter = "other-workspace-search-token".into();
+        app.apply_session_picker_filter();
+        let picker = app.state.list_picker.as_ref().unwrap();
+        assert_eq!(picker.items.len(), 1);
+        assert_eq!(picker.items[0].id, "other-session");
+    }
+
+    #[tokio::test]
+    async fn session_picker_stays_open_when_only_other_workspaces_have_sessions() {
+        let mut app = test_tui_app();
+        let other_workspace = std::env::temp_dir()
+            .join("kkagent-only-other-workspace")
+            .to_string_lossy()
+            .into_owned();
+        app.replace_list_picker(ListPickerState {
+            kind: ListPickerKind::Session,
+            title: String::new(),
+            items: Vec::new(),
+            selected: 0,
+            filter: String::new(),
+            all_items: Vec::new(),
+        });
+
+        app.apply_session_picker_list(serde_json::json!({
+            "sessions": [{
+                "session_id": "other-session",
+                "working_dir": other_workspace,
+                "title": "another project",
+                "is_custom_title": true,
+                "empty": false
+            }]
+        }));
+
+        let picker = app.state.list_picker.as_ref().unwrap();
+        assert!(picker.items.is_empty());
+        assert!(picker.title.contains("Tab show all"));
+        assert_eq!(app.state.session_picker_entries.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn cross_workspace_session_selection_resumes_in_its_own_workspace() {
+        use futures::FutureExt;
+        use std::sync::Arc;
+
+        let target_workspace = std::env::temp_dir()
+            .join("kkagent-resume-other-workspace")
+            .to_string_lossy()
+            .into_owned();
+        let (client_transport, server_transport) =
+            kkagent_rpc::transport::memory::create_memory_pair();
+        let (event_tx, event_rx) = tokio::sync::mpsc::channel(16);
+        let rpc = kkagent_rpc::RpcClient::new(client_transport, event_tx);
+        let client = kkagent_client::KkagentClient::new(rpc, event_rx);
+        let (params_tx, mut params_rx) = tokio::sync::mpsc::unbounded_channel();
+        let handler: kkagent_rpc::server::RequestHandler =
+            Arc::new(move |_id, method, params, _event_tx| {
+                let params_tx = params_tx.clone();
+                async move {
+                    if method == "session.resume" {
+                        let _ = params_tx.send(params.unwrap_or_default());
+                    }
+                    Err((-32602, "test stop".into()))
+                }
+                .boxed()
+            });
+        tokio::spawn(async move {
+            kkagent_rpc::RpcServer::new(handler)
+                .serve(server_transport)
+                .await;
+        });
+        let mut app = TuiApp::new(AppConfig::default(), client);
+        app.state.session_id = Some("current-session".into());
+        app.state.session_picker_entries = vec![SessionPickerEntry {
+            item: ListPickerItem {
+                id: "other-session".into(),
+                label: "other".into(),
+                detail: String::new(),
+            },
+            workspace: target_workspace.clone(),
+            same_workspace: false,
+        }];
+        app.replace_list_picker(ListPickerState {
+            kind: ListPickerKind::Session,
+            title: String::new(),
+            items: vec![app.state.session_picker_entries[0].item.clone()],
+            selected: 0,
+            filter: String::new(),
+            all_items: Vec::new(),
+        });
+
+        app.apply_list_picker().await.unwrap();
+
+        let params = tokio::time::timeout(std::time::Duration::from_secs(1), params_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(params["session_id"], "other-session");
+        assert_eq!(params["workspace"], target_workspace);
     }
 
     #[tokio::test]
