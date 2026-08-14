@@ -4,9 +4,10 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Margin, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Clear, Padding, Paragraph},
+    widgets::{Block, Borders, Clear, Padding, Paragraph, Wrap},
     Frame,
 };
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::{
@@ -33,6 +34,54 @@ const TIPS: &[&str] = &[
     "scroll to review earlier messages",
 ];
 
+const NARROW_TERMINAL_WIDTH: u16 = 48;
+
+fn is_narrow(width: u16) -> bool {
+    width < NARROW_TERMINAL_WIDTH
+}
+
+fn footer_height(width: u16) -> u16 {
+    if is_narrow(width) {
+        3
+    } else {
+        2
+    }
+}
+
+/// Return a centered popup that never extends beyond the supplied area.
+///
+/// Phone terminals need the horizontal space more than they need decorative
+/// margins, so progressively drop the margin as the viewport gets smaller.
+fn popup_rect(area: Rect, preferred_width: u16, preferred_height: u16) -> Rect {
+    if area.width == 0 || area.height == 0 {
+        return Rect::new(area.x, area.y, 0, 0);
+    }
+    let horizontal_margin = if area.width >= 16 { 2 } else { 0 };
+    let vertical_margin = if area.height >= 8 { 1 } else { 0 };
+    let width = preferred_width
+        .min(area.width.saturating_sub(horizontal_margin * 2))
+        .max(1)
+        .min(area.width);
+    let height = preferred_height
+        .min(area.height.saturating_sub(vertical_margin * 2))
+        .max(1)
+        .min(area.height);
+    Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    )
+}
+
+fn wrapped_text_height(lines: &[Line<'_>], width: u16) -> u16 {
+    let width = width.max(1) as usize;
+    lines.iter().fold(0u16, |height, line| {
+        let rows = line.width().max(1).div_ceil(width) as u16;
+        height.saturating_add(rows.max(1))
+    })
+}
+
 pub fn render_ui(f: &mut Frame, state: &mut AppState, config: &AppConfig) {
     let theme = Theme::default();
     let size = f.area();
@@ -41,17 +90,27 @@ pub fn render_ui(f: &mut Frame, state: &mut AppState, config: &AppConfig) {
     let slash_height = state
         .slash_menu
         .as_ref()
-        .map(menu_height)
+        .map(|menu| menu_height(menu, size.width))
         .or_else(|| state.file_menu.as_ref().map(file_menu_height))
-        .or_else(|| state.list_picker.as_ref().map(|p| picker_height(p, state)))
-        .or_else(|| state.session_delete_confirm.as_ref().map(|_| 7u16))
+        .or_else(|| {
+            state
+                .list_picker
+                .as_ref()
+                .map(|p| picker_height(p, state, size.width))
+        })
+        .or_else(|| {
+            state
+                .session_delete_confirm
+                .as_ref()
+                .map(|_| if is_narrow(size.width) { 16 } else { 7 })
+        })
         .unwrap_or(0);
 
     // Sticky todo sits above the input (highest visual priority).
     let todo_height = if state.mode == AppMode::Btw {
         0
     } else {
-        todo_panel_height(state)
+        todo_panel_height(state, size.width)
     };
     let queue_height = if state.mode == AppMode::Btw || state.prompt_queue.is_empty() {
         0u16
@@ -65,13 +124,17 @@ pub fn render_ui(f: &mut Frame, state: &mut AppState, config: &AppConfig) {
     // Top TabStrip removed — session switching lives in the footer strip.
     let input_inner = input_inner_height(state, size.width);
     let input_box = input_inner + 2; // borders
-    let bottom_stack = todo_height + queue_height + input_box + slash_height;
+    let bottom_stack = todo_height
+        .saturating_add(queue_height)
+        .saturating_add(input_box)
+        .saturating_add(slash_height);
+    let footer_height = footer_height(size.width).min(size.height);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(1),
             Constraint::Length(bottom_stack),
-            Constraint::Length(2),
+            Constraint::Length(footer_height),
         ])
         .split(size);
 
@@ -196,14 +259,14 @@ fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
     Rect::new(x, y, width.min(area.width), height.min(area.height))
 }
 
-fn menu_height(menu_state: &crate::app::SlashMenuState) -> u16 {
+fn menu_height(menu_state: &crate::app::SlashMenuState, width: u16) -> u16 {
     let max_visible = 8u16;
     let rows = if menu_state.items.is_empty() {
         1
     } else {
         (menu_state.items.len() as u16).min(max_visible)
     };
-    rows + 2 // borders
+    rows.saturating_mul(if is_narrow(width) { 2 } else { 1 }) + 2 // borders
 }
 
 fn file_menu_height(menu: &crate::app::FileMenuState) -> u16 {
@@ -216,18 +279,18 @@ fn file_menu_height(menu: &crate::app::FileMenuState) -> u16 {
     rows + 2
 }
 
-fn picker_height(picker: &ListPickerState, state: &AppState) -> u16 {
+fn picker_height(picker: &ListPickerState, state: &AppState, width: u16) -> u16 {
     let max_visible = 10u16;
     let rows = if picker.items.is_empty() {
         1
     } else {
         (picker.items.len() as u16).min(max_visible)
     };
-    let h = rows + 2;
+    let h = rows.saturating_mul(if is_narrow(width) { 2 } else { 1 }) + 2;
     // Delete confirm replaces the list with a small choice panel.
     if picker.kind == crate::app::ListPickerKind::Session && state.session_delete_confirm.is_some()
     {
-        return 7;
+        return if is_narrow(width) { 16 } else { 7 };
     }
     h.min(28)
 }
@@ -913,7 +976,7 @@ fn push_skill_activation_lines(
             } else {
                 trimmed.to_string()
             };
-            let avail = (width as usize).saturating_sub(2).max(8);
+            let avail = (width as usize).saturating_sub(2).max(1);
             for chunk in wrap_display_cols(&preview, avail) {
                 lines.push(Line::from(Span::styled(
                     format!("  {chunk}"),
@@ -925,20 +988,19 @@ fn push_skill_activation_lines(
 }
 
 fn wrap_display_cols(s: &str, max_width: usize) -> Vec<String> {
-    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
     if max_width == 0 {
         return vec![s.to_string()];
     }
     let mut out = Vec::new();
     let mut cur = String::new();
     let mut cur_w = 0usize;
-    for ch in s.chars() {
-        let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+    for grapheme in s.graphemes(true) {
+        let w = UnicodeWidthStr::width(grapheme);
         if cur_w + w > max_width && !cur.is_empty() {
             out.push(std::mem::take(&mut cur));
             cur_w = 0;
         }
-        cur.push(ch);
+        cur.push_str(grapheme);
         cur_w += w;
     }
     if !cur.is_empty() || out.is_empty() {
@@ -994,7 +1056,7 @@ fn render_tool_history_lines(
 
 const TODO_MAX_VISIBLE: usize = 5;
 
-fn todo_panel_height(state: &AppState) -> u16 {
+fn todo_panel_height(state: &AppState, terminal_width: u16) -> u16 {
     if state.todos.is_empty() {
         return 0;
     }
@@ -1005,7 +1067,26 @@ fn todo_panel_height(state: &AppState) -> u16 {
         state.todos.len().min(TODO_MAX_VISIBLE)
     };
     let overflow = !state.todos_expanded && state.todos.len() > TODO_MAX_VISIBLE;
-    (2 + rows + if overflow { 1 } else { 0 }) as u16
+    if !is_narrow(terminal_width) {
+        return (2 + rows + usize::from(overflow)) as u16;
+    }
+
+    let content_width = terminal_width.saturating_sub(4).max(1) as usize;
+    let visible = if state.todos_expanded {
+        (0..state.todos.len()).collect::<Vec<_>>()
+    } else {
+        select_visible_todos(&state.todos).indices
+    };
+    let wrapped_rows = visible.iter().fold(0u16, |height, index| {
+        let width = state
+            .todos
+            .get(*index)
+            .map(|todo| UnicodeWidthStr::width(todo.content.as_str()))
+            .unwrap_or(0);
+        height.saturating_add(width.max(1).div_ceil(content_width) as u16)
+    });
+    2u16.saturating_add(wrapped_rows)
+        .saturating_add(u16::from(overflow))
 }
 
 fn render_todo_panel(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
@@ -1070,7 +1151,10 @@ fn render_todo_panel(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
         )));
     }
 
-    f.render_widget(Paragraph::new(Text::from(lines)), area);
+    f.render_widget(
+        Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }),
+        area,
+    );
 }
 
 fn todo_row_line(todo: &TodoItem, theme: &Theme) -> Line<'static> {
@@ -1228,16 +1312,6 @@ fn tool_continuation_line(
     ])
 }
 
-fn truncate(s: &str, max: usize) -> String {
-    let count = s.chars().count();
-    if count <= max {
-        s.to_string()
-    } else {
-        let t: String = s.chars().take(max.saturating_sub(1)).collect();
-        format!("{}…", t)
-    }
-}
-
 fn truncate_display_width(s: &str, max_width: usize) -> String {
     if UnicodeWidthStr::width(s) <= max_width {
         return s.to_string();
@@ -1248,13 +1322,13 @@ fn truncate_display_width(s: &str, max_width: usize) -> String {
     let content_width = max_width.saturating_sub(UnicodeWidthChar::width('…').unwrap_or(1));
     let mut width = 0usize;
     let mut out = String::new();
-    for ch in s.chars() {
-        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
-        if width.saturating_add(ch_width) > content_width {
+    for grapheme in s.graphemes(true) {
+        let grapheme_width = UnicodeWidthStr::width(grapheme);
+        if width.saturating_add(grapheme_width) > content_width {
             break;
         }
-        out.push(ch);
-        width = width.saturating_add(ch_width);
+        out.push_str(grapheme);
+        width = width.saturating_add(grapheme_width);
     }
     out.push('…');
     out
@@ -1408,9 +1482,8 @@ fn cursor_position(text: &str, cursor: usize, content_width: usize, prefix_w: u1
             while col_end > 0 && !logical.is_char_boundary(col_end) {
                 col_end -= 1;
             }
-            let col = UnicodeWidthStr::width(&logical[..col_end]);
-            let wrap_row = (col / width) as u16;
-            let x = prefix_w + (col % width) as u16;
+            let (col, wrap_row) = wrapped_cursor_offset(&logical[..col_end], width);
+            let x = prefix_w + col as u16;
             return (x, y.saturating_add(wrap_row));
         }
 
@@ -1424,6 +1497,25 @@ fn cursor_position(text: &str, cursor: usize, content_width: usize, prefix_w: u1
     (prefix_w, y.saturating_sub(1))
 }
 
+fn wrapped_cursor_offset(text: &str, width: usize) -> (usize, u16) {
+    let width = width.max(1);
+    let mut column = 0usize;
+    let mut row = 0u16;
+    for grapheme in text.graphemes(true) {
+        let grapheme_width = UnicodeWidthStr::width(grapheme);
+        if column.saturating_add(grapheme_width) > width && column > 0 {
+            row = row.saturating_add(1);
+            column = 0;
+        }
+        column = column.saturating_add(grapheme_width);
+        if column >= width {
+            row = row.saturating_add(1);
+            column = 0;
+        }
+    }
+    (column, row)
+}
+
 fn render_footer(
     f: &mut Frame,
     area: Rect,
@@ -1431,6 +1523,11 @@ fn render_footer(
     config: &AppConfig,
     theme: &Theme,
 ) {
+    if is_narrow(area.width) {
+        render_narrow_footer(f, area, state, config, theme);
+        return;
+    }
+
     // Line 1: yolo  model  thinking  cwd  git ............ tip
     let mut left: Vec<Span> = Vec::new();
 
@@ -1616,6 +1713,122 @@ fn render_footer(
     );
 }
 
+fn render_narrow_footer(
+    f: &mut Frame,
+    area: Rect,
+    state: &mut AppState,
+    config: &AppConfig,
+    theme: &Theme,
+) {
+    sync_footer_session_entries(state);
+    state.footer_area = area;
+    state.session_strip_origin_x = area.x;
+
+    let mut status_parts = Vec::new();
+    match state.permission_mode {
+        PermissionMode::Auto => status_parts.push("auto".to_string()),
+        PermissionMode::Yolo => status_parts.push("yolo".to_string()),
+        PermissionMode::Manual => {}
+    }
+    if state.plan_mode {
+        status_parts.push("plan".to_string());
+    }
+    status_parts.push(model_label(state, config));
+    if let Some(activity) = state.status_bar.activity.as_ref() {
+        status_parts.push(activity.clone());
+    } else if state.quit_confirm {
+        status_parts.push("ctrl-c again to quit".into());
+    } else {
+        let status = match state.status {
+            SessionStatus::Thinking => Some("thinking…"),
+            SessionStatus::ToolExecuting => Some("running…"),
+            SessionStatus::WaitingApproval => Some("approval"),
+            SessionStatus::WaitingQuestion => Some("question"),
+            SessionStatus::Compacting => Some("compacting…"),
+            SessionStatus::Cancelling => Some("cancelling…"),
+            _ => None,
+        };
+        if let Some(status) = status {
+            status_parts.push(status.into());
+        }
+    }
+    let status = truncate_display_width(&status_parts.join(" · "), area.width as usize);
+    let line1 = Line::from(Span::styled(
+        status,
+        Style::default().fg(if state.status_bar.activity.is_some() {
+            theme.primary
+        } else {
+            theme.text
+        }),
+    ));
+
+    let (session_spans, relative_hits) =
+        state
+            .workspace_sessions
+            .render_spans_with_hits(area.width as usize, theme, state.tick);
+    state.session_strip_hits = relative_hits
+        .into_iter()
+        .map(|mut hit| {
+            hit.x0 = hit.x0.saturating_add(area.x as usize);
+            hit.x1 = hit.x1.saturating_add(area.x as usize);
+            hit
+        })
+        .collect();
+    let has_session_strip = !session_spans.is_empty();
+    let line2 = if !has_session_strip {
+        Line::from(Span::styled(
+            truncate_display_width(
+                &shorten_path(&state.working_dir.to_string_lossy()),
+                area.width as usize,
+            ),
+            Style::default().fg(theme.text_dim),
+        ))
+    } else {
+        Line::from(session_spans)
+    };
+
+    let context = format_context_compact(state, config);
+    let (sandbox, sandbox_color) = sandbox_indicator_compact(&config.sandbox.mode, theme);
+    let right = if area.width >= 32 {
+        format!("{sandbox}  {context}")
+    } else {
+        context
+    };
+    let right = truncate_display_width(&right, area.width as usize);
+    let right_width = UnicodeWidthStr::width(right.as_str());
+    let mut line3_spans = Vec::new();
+    let cwd_budget = (area.width as usize)
+        .saturating_sub(right_width)
+        .saturating_sub(2);
+    if has_session_strip && cwd_budget > 3 {
+        let cwd = shorten_path(&state.working_dir.to_string_lossy());
+        line3_spans.push(Span::styled(
+            truncate_display_width(&cwd, cwd_budget),
+            Style::default().fg(theme.text_dim),
+        ));
+        let used = line3_spans
+            .iter()
+            .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+            .sum::<usize>();
+        line3_spans.push(Span::raw(
+            " ".repeat((area.width as usize).saturating_sub(used + right_width)),
+        ));
+    }
+    line3_spans.push(Span::styled(
+        right,
+        Style::default().fg(if area.width >= 32 {
+            sandbox_color
+        } else {
+            theme.text
+        }),
+    ));
+
+    f.render_widget(
+        Paragraph::new(Text::from(vec![line1, line2, Line::from(line3_spans)])),
+        area,
+    );
+}
+
 fn sync_footer_session_entries(state: &mut AppState) {
     let Some(current_id) = state.session_id.clone() else {
         return;
@@ -1696,18 +1909,16 @@ fn render_scroll_hint(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme
 }
 
 fn render_search_overlay(f: &mut Frame, size: Rect, state: &AppState, theme: &Theme) {
-    let width = size.width.saturating_sub(4).clamp(24, 72);
     let hit_rows = state.search.hits.len().min(10) as u16;
-    let height = hit_rows + 4; // title + query + hits + hint
-    let area = Rect {
-        x: size.x + (size.width.saturating_sub(width)) / 2,
-        y: size.y + (size.height.saturating_sub(height)) / 2,
-        width,
-        height,
-    };
+    let area = popup_rect(size, 72, hit_rows.saturating_add(4));
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let inner_width = area.width.saturating_sub(2) as usize;
     f.render_widget(Clear, area);
 
     let mut lines: Vec<Line> = Vec::new();
+    let query_budget = inner_width.saturating_sub(10).max(1);
     lines.push(Line::from(vec![
         Span::styled(
             " find ",
@@ -1716,7 +1927,10 @@ fn render_search_overlay(f: &mut Frame, size: Rect, state: &AppState, theme: &Th
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
-            format!(" {} ", state.search.query),
+            format!(
+                " {} ",
+                truncate_display_width(&state.search.query, query_budget)
+            ),
             Style::default().fg(theme.text_strong).bg(theme.border),
         ),
         Span::styled(
@@ -1737,7 +1951,7 @@ fn render_search_overlay(f: &mut Frame, size: Rect, state: &AppState, theme: &Th
         ),
     ]));
     lines.push(Line::from(Span::styled(
-        "─".repeat(width.saturating_sub(2) as usize),
+        "─".repeat(inner_width),
         Style::default().fg(theme.border),
     )));
 
@@ -1762,26 +1976,34 @@ fn render_search_overlay(f: &mut Frame, size: Rect, state: &AppState, theme: &Th
             } else {
                 Style::default().fg(theme.text_dim)
             };
-            lines.push(Line::from(vec![
-                Span::styled(format!(" {marker} "), style),
-                Span::styled(
-                    format!("{:8} ", hit.role),
+            let mut spans = vec![Span::styled(format!(" {marker} "), style)];
+            let preview_budget = if area.width < 32 {
+                inner_width.saturating_sub(3)
+            } else {
+                spans.push(Span::styled(
+                    format!("{:8} ", truncate_display_width(&hit.role, 8)),
                     Style::default().fg(if selected {
                         theme.accent
                     } else {
                         theme.text_muted
                     }),
-                ),
-                Span::styled(
-                    truncate(&hit.preview, (width as usize).saturating_sub(14)),
-                    style,
-                ),
-            ]));
+                ));
+                inner_width.saturating_sub(12)
+            };
+            spans.push(Span::styled(
+                truncate_display_width(&hit.preview, preview_budget),
+                style,
+            ));
+            lines.push(Line::from(spans));
         }
     }
 
     lines.push(Line::from(Span::styled(
-        " ↑↓ select · enter jump · esc close",
+        if area.width < 36 {
+            " ↑↓ · enter · esc"
+        } else {
+            " ↑↓ select · enter jump · esc close"
+        },
         Style::default().fg(theme.text_muted),
     )));
 
@@ -1831,6 +2053,17 @@ fn sandbox_indicator(mode: &str, theme: &Theme) -> (&'static str, Color) {
     }
 }
 
+fn sandbox_indicator_compact(mode: &str, theme: &Theme) -> (&'static str, Color) {
+    match mode.trim().to_ascii_lowercase().as_str() {
+        "disabled" | "off" | "none" => ("sbx:off", theme.error),
+        "process" => ("sbx:proc", theme.warning),
+        "workspace" | "strict" => ("sbx:work", theme.success),
+        "auto" if cfg!(target_os = "windows") => ("sbx:proc", theme.warning),
+        "auto" => ("sbx:work", theme.success),
+        _ => ("sbx:?", theme.text_muted),
+    }
+}
+
 fn format_context(state: &AppState, config: &AppConfig) -> String {
     let max = state
         .model_alias
@@ -1867,6 +2100,31 @@ fn format_context(state: &AppState, config: &AppConfig) -> String {
         format_tokens(used),
         format_tokens(max)
     )
+}
+
+fn format_context_compact(state: &AppState, config: &AppConfig) -> String {
+    let max = state
+        .model_alias
+        .as_deref()
+        .or_else(|| config.default_model_alias())
+        .and_then(|alias| config.resolve_model(alias))
+        .and_then(|(model, _)| model.max_context_size)
+        .unwrap_or(256_000);
+    let used = if state.approx_tokens > 0 {
+        state.approx_tokens
+    } else {
+        state
+            .messages
+            .iter()
+            .map(|message| message.content.len() as u64 / 4)
+            .sum::<u64>()
+    };
+    let pct = used
+        .saturating_mul(100)
+        .checked_div(max)
+        .unwrap_or(0)
+        .min(100);
+    format!("ctx:{pct}% {}/{}", format_tokens(used), format_tokens(max))
 }
 
 fn format_tokens(n: u64) -> String {
@@ -1931,19 +2189,39 @@ fn render_slash_menu(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
                 .map(|h| format!(" {}", h))
                 .unwrap_or_default();
             let label = format!("/{}{}", item.name, hint);
+            if is_narrow(area.width) {
+                lines.push(Line::from(vec![
+                    Span::styled(prefix, name_style),
+                    Span::styled(
+                        truncate_display_width(&label, (inner.width as usize).saturating_sub(2)),
+                        name_style,
+                    ),
+                ]));
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "  {}",
+                        truncate_display_width(
+                            &item.description,
+                            (inner.width as usize).saturating_sub(2),
+                        )
+                    ),
+                    Style::default().fg(theme.text_dim),
+                )));
+                continue;
+            }
             // Primary column ~28, then description
-            let primary_w = 28usize;
-            let padded = if label.len() < primary_w {
-                format!("{:width$}", label, width = primary_w)
+            let primary_w = 28usize.min((inner.width as usize).saturating_sub(4).max(1));
+            let label_width = UnicodeWidthStr::width(label.as_str());
+            let padded = if label_width < primary_w {
+                format!("{}{}", label, " ".repeat(primary_w - label_width))
             } else {
-                let t: String = label.chars().take(primary_w.saturating_sub(1)).collect();
-                format!("{}…", t)
+                truncate_display_width(&label, primary_w)
             };
             lines.push(Line::from(vec![
                 Span::styled(prefix, name_style),
                 Span::styled(padded, name_style),
                 Span::styled(
-                    truncate(
+                    truncate_display_width(
                         &item.description,
                         (inner.width as usize).saturating_sub(primary_w + 4),
                     ),
@@ -1974,7 +2252,10 @@ fn render_file_menu(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) 
     let title = if menu.query.is_empty() {
         " @ files ".to_string()
     } else {
-        format!(" @ {} ", truncate(&menu.query, 40))
+        format!(
+            " @ {} ",
+            truncate_display_width(&menu.query, area.width.saturating_sub(6) as usize)
+        )
     };
     let block = Block::default()
         .borders(Borders::ALL)
@@ -2017,7 +2298,7 @@ fn render_file_menu(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) 
                     }),
                 ),
                 Span::styled(
-                    truncate(path, (inner.width as usize).saturating_sub(10)),
+                    truncate_display_width(path, (inner.width as usize).saturating_sub(10)),
                     style,
                 ),
             ]));
@@ -2046,7 +2327,7 @@ fn render_session_delete_confirm(f: &mut Frame, area: Rect, state: &AppState, th
     lines.push(Line::from(Span::styled(
         format!(
             " {}",
-            truncate(&confirm.label, inner.width.saturating_sub(2) as usize)
+            truncate_display_width(&confirm.label, inner.width.saturating_sub(2) as usize)
         ),
         Style::default().fg(theme.text),
     )));
@@ -2095,7 +2376,12 @@ fn render_session_delete_confirm(f: &mut Frame, area: Rect, state: &AppState, th
         " ↑↓ select · Enter confirm · Esc cancel ",
         Style::default().fg(theme.text_muted),
     )));
-    f.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
+    f.render_widget(
+        Paragraph::new(Text::from(lines))
+            .wrap(Wrap { trim: false })
+            .block(block),
+        area,
+    );
 }
 
 fn render_list_picker(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
@@ -2149,11 +2435,35 @@ fn render_list_picker(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme
             } else {
                 Style::default().fg(theme.text)
             };
+            if is_narrow(area.width) {
+                lines.push(Line::from(vec![
+                    Span::styled(prefix, name_style),
+                    Span::styled(
+                        truncate_display_width(
+                            &item.label,
+                            (inner.width as usize).saturating_sub(2),
+                        ),
+                        name_style,
+                    ),
+                ]));
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "  {}",
+                        truncate_display_width(
+                            &item.detail,
+                            (inner.width as usize).saturating_sub(2),
+                        )
+                    ),
+                    Style::default().fg(theme.text_dim),
+                )));
+                continue;
+            }
             let primary_w = if picker.kind == crate::app::ListPickerKind::HistoryEdit {
                 (inner.width as usize).saturating_sub(4)
             } else {
-                36usize
-            };
+                36usize.min((inner.width as usize).saturating_sub(4))
+            }
+            .max(1);
             let label_width = UnicodeWidthStr::width(item.label.as_str());
             let padded = if label_width < primary_w {
                 format!("{}{}", item.label, " ".repeat(primary_w - label_width))
@@ -2164,7 +2474,7 @@ fn render_list_picker(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme
                 Span::styled(prefix, name_style),
                 Span::styled(padded, name_style),
                 Span::styled(
-                    truncate(
+                    truncate_display_width(
                         &item.detail,
                         (inner.width as usize).saturating_sub(primary_w + 4),
                     ),
@@ -2182,11 +2492,10 @@ fn render_tasks_panel(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme
         return;
     };
 
-    let panel_w = area.width.saturating_sub(4).clamp(40, 90);
-    let panel_h = area.height.saturating_sub(4).clamp(12, 28);
-    let x = (area.width.saturating_sub(panel_w)) / 2;
-    let y = (area.height.saturating_sub(panel_h)) / 2;
-    let panel_area = Rect::new(x, y, panel_w, panel_h);
+    let panel_area = popup_rect(area, 90, 28);
+    if panel_area.width == 0 || panel_area.height == 0 {
+        return;
+    }
 
     f.render_widget(Clear, panel_area);
     let block = Block::default()
@@ -2207,7 +2516,8 @@ fn render_tasks_panel(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme
             Style::default().fg(theme.text_dim),
         )));
     } else {
-        let max_visible = inner.height.saturating_sub(1) as usize;
+        let rows_per_task = if is_narrow(panel_area.width) { 2 } else { 1 };
+        let max_visible = (inner.height.saturating_sub(1) as usize / rows_per_task).max(1);
         let start = panel
             .selected
             .saturating_sub(max_visible.saturating_sub(1))
@@ -2225,20 +2535,43 @@ fn render_tasks_panel(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme
                 Style::default().fg(theme.text)
             };
             let status = &task.status;
-            let label = format!(
-                "{}[{}] {} — {}",
-                prefix,
-                status,
-                truncate(&task.task_id, 10),
-                truncate(&task.description, 40)
-            );
-            lines.push(Line::from(Span::styled(label, style)));
+            if is_narrow(panel_area.width) {
+                lines.push(Line::from(Span::styled(
+                    truncate_display_width(
+                        &format!("{}[{}] {}", prefix, status, task.task_id),
+                        inner.width as usize,
+                    ),
+                    style,
+                )));
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "  {}",
+                        truncate_display_width(
+                            &task.description,
+                            (inner.width as usize).saturating_sub(2),
+                        )
+                    ),
+                    Style::default().fg(theme.text_dim),
+                )));
+            } else {
+                let label = format!(
+                    "{}[{}] {} — {}",
+                    prefix,
+                    status,
+                    truncate_display_width(&task.task_id, 10),
+                    truncate_display_width(&task.description, 40)
+                );
+                lines.push(Line::from(Span::styled(
+                    truncate_display_width(&label, inner.width as usize),
+                    style,
+                )));
+            }
             if selected {
                 if let Some(ref r) = task.result {
                     lines.push(Line::from(Span::styled(
                         format!(
                             "    {}",
-                            truncate(r, (inner.width as usize).saturating_sub(4))
+                            truncate_display_width(r, (inner.width as usize).saturating_sub(4))
                         ),
                         Style::default().fg(theme.text_dim),
                     )));
@@ -2247,7 +2580,7 @@ fn render_tasks_panel(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme
                     lines.push(Line::from(Span::styled(
                         format!(
                             "    err: {}",
-                            truncate(e, (inner.width as usize).saturating_sub(8))
+                            truncate_display_width(e, (inner.width as usize).saturating_sub(8))
                         ),
                         Style::default().fg(theme.error),
                     )));
@@ -2257,7 +2590,11 @@ fn render_tasks_panel(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "↑↓ navigate · r refresh · Esc close",
+        if panel_area.width < 36 {
+            "↑↓ · r refresh · Esc"
+        } else {
+            "↑↓ navigate · r refresh · Esc close"
+        },
         Style::default().fg(theme.text_muted),
     )));
 
@@ -2475,13 +2812,13 @@ fn wrap_str(s: &str, max_width: usize) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
     let mut cur_w = 0usize;
-    for ch in s.chars() {
-        let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+    for grapheme in s.graphemes(true) {
+        let w = UnicodeWidthStr::width(grapheme);
         if cur_w + w > max_width && !cur.is_empty() {
             out.push(std::mem::take(&mut cur));
             cur_w = 0;
         }
-        cur.push(ch);
+        cur.push_str(grapheme);
         cur_w += w;
     }
     if !cur.is_empty() || out.is_empty() {
@@ -2491,26 +2828,88 @@ fn wrap_str(s: &str, max_width: usize) -> Vec<String> {
 }
 
 fn render_approval_panel(f: &mut Frame, area: Rect, approval: &mut PendingApproval, theme: &Theme) {
-    let panel_width = 72.min(area.width.saturating_sub(4)).max(40);
-    let choice_count = approval.choices.len().max(1) as u16;
-    let detail_lines = if approval.is_plan_review {
-        0
-    } else {
-        approval.detail.lines().count().min(8) as u16
-    };
-    let feedback_extra: u16 = if approval.feedback_mode { 3 } else { 0 };
-    let panel_height = (8 + choice_count + detail_lines + feedback_extra)
-        .min(area.height.saturating_sub(2))
-        .max(10);
-    let x = (area.width.saturating_sub(panel_width)) / 2;
-    let y = if approval.is_plan_review {
-        // Sit near the bottom so the plan document stays visible above.
-        area.height.saturating_sub(panel_height + 1)
-    } else {
-        (area.height.saturating_sub(panel_height)) / 2
-    };
-    let panel_area = Rect::new(x, y, panel_width, panel_height);
+    let panel_width = popup_rect(area, 72, 1).width;
+    if panel_width == 0 {
+        return;
+    }
 
+    let mut lines: Vec<Line> = vec![
+        Line::from(Span::styled(
+            approval.action.clone(),
+            Style::default()
+                .fg(theme.text_strong)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+    ];
+
+    if !approval.detail.is_empty() && !approval.is_plan_review {
+        for l in approval.detail.lines().take(8) {
+            lines.push(Line::from(Span::styled(
+                l.to_string(),
+                Style::default().fg(theme.text_dim),
+            )));
+        }
+        lines.push(Line::from(""));
+    }
+
+    for (i, choice) in approval.choices.iter().enumerate() {
+        let selected = i == approval.selected;
+        let style = if selected {
+            Style::default()
+                .fg(theme.primary)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.text_dim)
+        };
+        let marker = if selected { "> " } else { "  " };
+        let key = format!("{}", i + 1);
+        push_wrapped_prefixed(
+            &mut lines,
+            &format!("{marker}{key}  "),
+            &choice.label,
+            panel_width.saturating_sub(2),
+            style,
+            style,
+        );
+    }
+
+    if approval.feedback_mode {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "  修改意见:",
+            Style::default().fg(theme.accent),
+        )));
+        lines.push(Line::from(Span::styled(
+            format!("  {}▌", approval.feedback),
+            Style::default().fg(theme.text),
+        )));
+        lines.push(Line::from(Span::styled(
+            "  enter 提交 · esc 取消输入",
+            Style::default().fg(theme.text_muted),
+        )));
+    } else {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            if panel_width < 42 {
+                "  1-9 / ↑↓ · enter · esc"
+            } else if approval.is_plan_review {
+                "  1·2·3… / ↑↓ / enter · esc 取消"
+            } else {
+                "  1·2·3 / enter"
+            },
+            Style::default().fg(theme.text_muted),
+        )));
+    }
+
+    let desired_height = wrapped_text_height(&lines, panel_width.saturating_sub(2))
+        .saturating_add(2)
+        .max(4);
+    let mut panel_area = popup_rect(area, 72, desired_height);
+    if approval.is_plan_review && area.height > panel_area.height {
+        // Sit near the bottom so the plan document stays visible above.
+        panel_area.y = area.y + area.height.saturating_sub(panel_area.height + 1);
+    }
     f.render_widget(Clear, panel_area);
 
     let title = if approval.is_plan_review {
@@ -2533,76 +2932,12 @@ fn render_approval_panel(f: &mut Frame, area: Rect, approval: &mut PendingApprov
         } else {
             theme.warning
         }));
-
-    let mut lines: Vec<Line> = vec![
-        Line::from(Span::styled(
-            approval.action.clone(),
-            Style::default()
-                .fg(theme.text_strong)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-    ];
-
-    if !approval.detail.is_empty() && !approval.is_plan_review {
-        for l in approval.detail.lines().take(8) {
-            let truncated: String = l
-                .chars()
-                .take((panel_width.saturating_sub(4)) as usize)
-                .collect();
-            lines.push(Line::from(Span::styled(
-                truncated,
-                Style::default().fg(theme.text_dim),
-            )));
-        }
-        lines.push(Line::from(""));
-    }
-
-    for (i, choice) in approval.choices.iter().enumerate() {
-        let selected = i == approval.selected;
-        let style = if selected {
-            Style::default()
-                .fg(theme.primary)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(theme.text_dim)
-        };
-        let marker = if selected { "> " } else { "  " };
-        let key = format!("{}", i + 1);
-        lines.push(Line::from(vec![
-            Span::styled(marker, style),
-            Span::styled(format!("{key}  "), Style::default().fg(theme.text_muted)),
-            Span::styled(choice.label.clone(), style),
-        ]));
-    }
-
-    if approval.feedback_mode {
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            "  修改意见:",
-            Style::default().fg(theme.accent),
-        )));
-        lines.push(Line::from(Span::styled(
-            format!("  {}▌", approval.feedback),
-            Style::default().fg(theme.text),
-        )));
-        lines.push(Line::from(Span::styled(
-            "  enter 提交 · esc 取消输入",
-            Style::default().fg(theme.text_muted),
-        )));
-    } else {
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            if approval.is_plan_review {
-                "  1·2·3… / ↑↓ / enter · esc 收起 · ctrl-c 取消"
-            } else {
-                "  1·2·3 / enter"
-            },
-            Style::default().fg(theme.text_muted),
-        )));
-    }
-
-    f.render_widget(Paragraph::new(Text::from(lines)).block(block), panel_area);
+    f.render_widget(
+        Paragraph::new(Text::from(lines))
+            .wrap(Wrap { trim: false })
+            .block(block),
+        panel_area,
+    );
 }
 
 fn render_question_panel(f: &mut Frame, area: Rect, question: &mut PendingQuestion, theme: &Theme) {
@@ -2610,14 +2945,9 @@ fn render_question_panel(f: &mut Frame, area: Rect, question: &mut PendingQuesti
         return;
     }
 
-    // Keep a margin on normal terminals, but never make the modal wider than
-    // the terminal. The old `.max(40)` made its right side disappear below 44
-    // columns.
-    let panel_width = if area.width >= 44 {
-        72.min(area.width.saturating_sub(4))
-    } else {
-        area.width
-    };
+    // Keep both borders visible on phone terminals while allowing the modal
+    // to grow to its normal width on larger viewports.
+    let panel_width = popup_rect(area, 72, 1).width;
     let content_width = panel_width.saturating_sub(4).max(1);
 
     let question_style = Style::default()
@@ -2700,7 +3030,13 @@ fn render_question_panel(f: &mut Frame, area: Rect, question: &mut PendingQuesti
 
     lines.push(Line::from(""));
     let hint = if question.allow_multiple {
-        "  1-9 / space toggle · enter confirm · esc cancel"
+        if panel_width < 42 {
+            "  1-9 / space · enter · esc"
+        } else {
+            "  1-9 / space toggle · enter confirm · esc cancel"
+        }
+    } else if panel_width < 42 {
+        "  1-9 / ↑↓ · enter · esc"
     } else {
         "  1-9 submit · ↑↓ move · enter confirm · esc cancel"
     };
@@ -2722,15 +3058,15 @@ fn render_question_panel(f: &mut Frame, area: Rect, question: &mut PendingQuesti
     let desired_height = u16::try_from(lines.len())
         .unwrap_or(u16::MAX)
         .saturating_add(4);
-    let panel_height = desired_height.min(max_panel_height).max(5);
+    let panel_height = desired_height.min(max_panel_height).max(3).min(area.height);
     let inner_height = panel_height.saturating_sub(4) as usize;
     let selected_end_with_context = selected_range.1.saturating_add(2).min(lines.len());
     let scroll = selected_end_with_context
         .saturating_sub(inner_height)
         .min(lines.len().saturating_sub(inner_height));
 
-    let x = (area.width.saturating_sub(panel_width)) / 2;
-    let y = (area.height.saturating_sub(panel_height)) / 2;
+    let x = area.x + area.width.saturating_sub(panel_width) / 2;
+    let y = area.y + area.height.saturating_sub(panel_height) / 2;
     let panel_area = Rect::new(x, y, panel_width, panel_height);
     f.render_widget(Clear, panel_area);
 
@@ -2823,7 +3159,26 @@ mod render_smoke {
         AppState, DisplayMessage, DisplayPart, DisplayToolCall, MessageRole, ToolHistorySummary,
     };
     use kkagent_protocol::PermissionMode;
-    use ratatui::{backend::TestBackend, Terminal};
+    use ratatui::{backend::TestBackend, buffer::Buffer, Terminal};
+
+    fn buffer_rows(buffer: &Buffer) -> Vec<String> {
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .filter_map(|x| buffer.cell((x, y)))
+                    .map(|cell| cell.symbol())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    fn has_complete_inset_box(buffer: &Buffer) -> bool {
+        buffer_rows(buffer).iter().any(|row| {
+            let left = row.chars().position(|ch| ch == '┌');
+            let right = row.chars().position(|ch| ch == '┐');
+            matches!((left, right), (Some(left), Some(right)) if left > 0 && right < buffer.area.width.saturating_sub(1) as usize)
+        })
+    }
 
     fn pending_question(text: &str, options: Vec<(String, String)>) -> PendingQuestion {
         PendingQuestion {
@@ -2929,8 +3284,7 @@ mod render_smoke {
 
         let rendered = buffer_text(&terminal);
         assert!(rendered.contains("AIL_OK"), "{rendered:?}");
-        let buffer = terminal.backend().buffer();
-        assert_eq!(buffer.cell((31, 8)).map(|cell| cell.symbol()), Some("│"));
+        assert!(has_complete_inset_box(terminal.backend().buffer()));
     }
 
     #[test]
@@ -3205,6 +3559,20 @@ mod render_smoke {
     }
 
     #[test]
+    fn popup_rect_stays_inside_offset_viewports() {
+        for width in [0, 1, 4, 12, 24, 40, 100] {
+            for height in [0, 1, 6, 20, 80] {
+                let viewport = Rect::new(7, 11, width, height);
+                let popup = popup_rect(viewport, 72, 30);
+                assert!(popup.x >= viewport.x);
+                assert!(popup.y >= viewport.y);
+                assert!(popup.right() <= viewport.right());
+                assert!(popup.bottom() <= viewport.bottom());
+            }
+        }
+    }
+
+    #[test]
     fn expanded_live_tool_renders_full_output_and_a_clickable_collapse_hint() {
         let mut state = AppState::new(PermissionMode::Manual, false);
         let output = (1..=20)
@@ -3245,6 +3613,90 @@ mod render_smoke {
         assert!(lines[state.tool_expand_hits[0].line]
             .to_string()
             .contains("ctrl+o to collapse"));
+    }
+
+    #[test]
+    fn narrow_ui_handles_cjk_emoji_input_and_keeps_mobile_footer() {
+        for width in [1, 2, 4, 8, 16, 24, 32, 47] {
+            let backend = TestBackend::new(width, 80);
+            let mut terminal = Terminal::new(backend).unwrap();
+            let mut state = AppState::new(PermissionMode::Manual, false);
+            state
+                .input
+                .set_text("你好👨‍👩‍👧‍👦，这是一段会自动换行的手机输入内容".into());
+            state.approval_pending = Some(PendingApproval {
+                approval_id: "approval-mobile".into(),
+                tool_name: "Bash".into(),
+                action: "Run a command that needs confirmation on a phone terminal".into(),
+                detail: "command: cargo test --workspace --all-targets".into(),
+                selected: 0,
+                choices: PendingApproval::default_tool_choices(),
+                is_plan_review: false,
+                resumed_plan_review: false,
+                feedback_mode: false,
+                feedback: String::new(),
+                hidden: false,
+            });
+
+            terminal
+                .draw(|frame| render_ui(frame, &mut state, &AppConfig::default()))
+                .unwrap();
+            assert_eq!(state.transcript_area.width, width);
+            assert_eq!(state.footer_area.height, 3);
+            assert!(state.footer_area.bottom() <= 80);
+        }
+    }
+
+    #[test]
+    fn narrow_approval_and_question_popups_keep_both_borders_visible() {
+        let backend = TestBackend::new(24, 60);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = AppState::new(PermissionMode::Manual, false);
+        state.approval_pending = Some(PendingApproval {
+            approval_id: "approval-mobile".into(),
+            tool_name: "Bash".into(),
+            action: "Run a command requiring confirmation".into(),
+            detail: "A long command detail that wraps instead of leaving the viewport".into(),
+            selected: 0,
+            choices: PendingApproval::default_tool_choices(),
+            is_plan_review: false,
+            resumed_plan_review: false,
+            feedback_mode: false,
+            feedback: String::new(),
+            hidden: false,
+        });
+        terminal
+            .draw(|frame| render_ui(frame, &mut state, &AppConfig::default()))
+            .unwrap();
+        assert!(has_complete_inset_box(terminal.backend().buffer()));
+        assert!(buffer_rows(terminal.backend().buffer())
+            .join("\n")
+            .contains("allow once"));
+
+        state.approval_pending = None;
+        state.question_pending = Some(PendingQuestion {
+            question_id: "question-mobile".into(),
+            text: "Choose an option from a narrow phone terminal".into(),
+            options: vec![
+                ("first".into(), "first option".into()),
+                ("second".into(), "second option".into()),
+            ],
+            allow_free_text: true,
+            allow_multiple: false,
+            selected: 0,
+            toggled: vec![false, false],
+            free_text: String::new(),
+        });
+        terminal
+            .draw(|frame| render_ui(frame, &mut state, &AppConfig::default()))
+            .unwrap();
+        assert!(has_complete_inset_box(terminal.backend().buffer()));
+        let rows = buffer_rows(terminal.backend().buffer());
+        assert!(
+            rows.iter().any(|row| row.contains("first"))
+                && rows.iter().any(|row| row.contains("option")),
+            "{rows:#?}"
+        );
     }
 
     #[test]
@@ -3310,6 +3762,19 @@ mod render_smoke {
         assert_eq!(rows, 1 + 3);
         let (_, y) = cursor_position(multi, multi.len(), 10, 2);
         assert_eq!(y, 1 + 2);
+    }
+
+    #[test]
+    fn input_wrap_keeps_wide_graphemes_atomic_at_one_column() {
+        let family = "👨‍👩‍👧‍👦";
+        assert_eq!(soft_wrap_line(family, 1), vec![family.to_string()]);
+        assert_eq!(input_visual_row_count("中文", 1), 2);
+        assert_eq!(cursor_position("中文", "中文".len(), 1, 2), (2, 2));
+        assert_eq!(cursor_position(family, family.len(), 1, 2), (2, 1));
+        assert_eq!(
+            truncate_display_width(&format!("{family}ab"), 3),
+            format!("{family}…")
+        );
     }
 
     #[test]

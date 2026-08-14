@@ -8,13 +8,14 @@ use ratatui::{
     style::{Modifier, Style},
     text::{Line, Span},
 };
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use crate::theme::Theme;
 
 /// Render markdown into width-wrapped styled lines (content only, no ● indent).
 pub fn render(text: &str, width: usize, theme: &Theme) -> Vec<Line<'static>> {
-    let width = width.max(8);
+    let width = width.max(1);
     if text.trim().is_empty() {
         return Vec::new();
     }
@@ -563,7 +564,7 @@ impl MdWriter {
 
     fn content_width(&self) -> usize {
         let quote = self.blockquote_depth.saturating_mul(2);
-        self.width.saturating_sub(quote).max(8)
+        self.width.saturating_sub(quote).max(1)
     }
 
     fn flush_line(&mut self) {
@@ -1017,9 +1018,9 @@ fn wrap_spans(spans: &[Span<'static>], max_width: usize) -> Vec<Vec<Span<'static
     for span in spans {
         let style = span.style;
         let content = span.content.as_ref();
-        for ch in content.chars() {
-            let w = UnicodeWidthChar::width(ch).unwrap_or(0);
-            if ch == '\n' {
+        for grapheme in content.graphemes(true) {
+            let w = UnicodeWidthStr::width(grapheme);
+            if grapheme == "\n" {
                 rows.push(std::mem::take(&mut cur));
                 cur_w = 0;
                 continue;
@@ -1030,12 +1031,12 @@ fn wrap_spans(spans: &[Span<'static>], max_width: usize) -> Vec<Vec<Span<'static
             }
             if let Some(last) = cur.last_mut() {
                 if last.style == style {
-                    last.content.to_mut().push(ch);
+                    last.content.to_mut().push_str(grapheme);
                 } else {
-                    cur.push(Span::styled(ch.to_string(), style));
+                    cur.push(Span::styled(grapheme.to_string(), style));
                 }
             } else {
-                cur.push(Span::styled(ch.to_string(), style));
+                cur.push(Span::styled(grapheme.to_string(), style));
             }
             cur_w += w;
         }
@@ -1053,13 +1054,13 @@ fn wrap_str(s: &str, max_width: usize) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
     let mut cur_w = 0usize;
-    for ch in s.chars() {
-        let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+    for grapheme in s.graphemes(true) {
+        let w = UnicodeWidthStr::width(grapheme);
         if cur_w + w > max_width && !cur.is_empty() {
             out.push(std::mem::take(&mut cur));
             cur_w = 0;
         }
-        cur.push(ch);
+        cur.push_str(grapheme);
         cur_w += w;
     }
     if !cur.is_empty() || out.is_empty() {
@@ -1167,5 +1168,14 @@ mod tests {
             .find(|s| s.content.as_ref() == "bold")
             .expect("bold span");
         assert!(bold.style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn renders_cjk_and_emoji_at_mobile_widths() {
+        let theme = Theme::default();
+        for width in 1..=8 {
+            let lines = render("你好 👨‍👩‍👧‍👦 **mobile**\n\n- narrow", width, &theme);
+            assert!(!lines.is_empty(), "width={width}");
+        }
     }
 }

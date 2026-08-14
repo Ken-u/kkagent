@@ -58,7 +58,7 @@ impl RenderCache {
         if let Some(lines) = self.entries.get(&key) {
             return lines.clone();
         }
-        let avail = (width as usize).saturating_sub(2).max(8);
+        let avail = (width as usize).saturating_sub(2).max(1);
         let rendered = crate::markdown::render(text, avail, theme);
         self.insert(key, rendered.clone());
         rendered

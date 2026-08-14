@@ -2,7 +2,8 @@
 
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use crate::app::DisplayToolCall;
 use crate::theme::Theme;
@@ -11,9 +12,11 @@ pub struct ToolRenderRegistry;
 
 impl ToolRenderRegistry {
     pub fn chip_label(tc: &DisplayToolCall, width: u16) -> String {
-        // Leave room for "● ✓ " / status prefix (~6 cols).
-        let budget = (width as usize).saturating_sub(6).max(24);
-        match tc.name.as_str() {
+        // Leave room for the transcript bullet and status icon. Never invent
+        // a minimum wider than the terminal: mobile SSH clients commonly
+        // report widths in the 20–40 column range.
+        let budget = (width as usize).saturating_sub(4);
+        let label = match tc.name.as_str() {
             "Bash" => format!("$ {}", fit(&tc.input_summary, budget.saturating_sub(2))),
             "Read" | "Write" | "Edit" => format!(
                 "{} {}",
@@ -36,7 +39,8 @@ impl ToolRenderRegistry {
                 other,
                 fit(&tc.input_summary, budget.saturating_sub(other.len() + 1))
             ),
-        }
+        };
+        fit(&label, budget)
     }
 
     pub fn chip_style(tc: &DisplayToolCall, theme: &Theme) -> Style {
@@ -87,24 +91,27 @@ fn fit(s: &str, max_cols: usize) -> String {
     }
     let mut out = String::new();
     let mut w = 0usize;
-    for ch in s.chars() {
-        let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+    for grapheme in s.graphemes(true) {
+        let cw = UnicodeWidthStr::width(grapheme);
         if w + cw > max_cols {
             if max_cols >= 1 && UnicodeWidthStr::width(out.as_str()) < max_cols {
                 out.push('…');
             }
             break;
         }
-        out.push(ch);
+        out.push_str(grapheme);
         w += cw;
     }
     out
 }
 
 fn push_wrapped_output_line(lines: &mut Vec<Line<'static>>, raw: &str, width: u16, style: Style) {
-    let avail = (width as usize).saturating_sub(2).max(8);
+    let prefix = if width >= 2 { "  " } else { "" };
+    let avail = (width as usize)
+        .saturating_sub(UnicodeWidthStr::width(prefix))
+        .max(1);
     for chunk in wrap_cols(raw, avail) {
-        lines.push(Line::from(Span::styled(format!("  {chunk}"), style)));
+        lines.push(Line::from(Span::styled(format!("{prefix}{chunk}"), style)));
     }
 }
 
@@ -115,13 +122,13 @@ fn wrap_cols(s: &str, max_width: usize) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
     let mut cur_w = 0usize;
-    for ch in s.chars() {
-        let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+    for grapheme in s.graphemes(true) {
+        let w = UnicodeWidthStr::width(grapheme);
         if cur_w + w > max_width && !cur.is_empty() {
             out.push(std::mem::take(&mut cur));
             cur_w = 0;
         }
-        cur.push(ch);
+        cur.push_str(grapheme);
         cur_w += w;
     }
     if !cur.is_empty() || out.is_empty() {
@@ -275,5 +282,27 @@ mod tests {
         let label = ToolRenderRegistry::chip_label(&tc, 80);
         assert!(UnicodeWidthStr::width(label.as_str()) <= 80);
         assert!(UnicodeWidthStr::width(label.as_str()) > 40);
+    }
+
+    #[test]
+    fn chip_never_invents_a_wider_mobile_budget() {
+        let tc = DisplayToolCall {
+            id: String::new(),
+            started_at: None,
+            stopping: false,
+            name: "Bash".into(),
+            input_summary: "cargo test --workspace --all-targets 你好".into(),
+            output: None,
+            is_error: false,
+            collapsed: true,
+            user_overridden: false,
+        };
+        for width in 4..48 {
+            let label = ToolRenderRegistry::chip_label(&tc, width);
+            assert!(
+                UnicodeWidthStr::width(label.as_str()) <= (width as usize).saturating_sub(4),
+                "width={width}, label={label:?}"
+            );
+        }
     }
 }

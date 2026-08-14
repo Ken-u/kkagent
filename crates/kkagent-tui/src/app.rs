@@ -4,7 +4,10 @@ use crossterm::{
         MouseButton, MouseEventKind,
     },
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{
+        disable_raw_mode, enable_raw_mode, BeginSynchronizedUpdate, EndSynchronizedUpdate,
+        EnterAlternateScreen, LeaveAlternateScreen,
+    },
 };
 use kkagent_client::{KkagentClient, RpcConnectionState};
 use kkagent_config::AppConfig;
@@ -37,6 +40,12 @@ pub struct TuiApp {
     use_alt_screen: bool,
     remote_connection: bool,
     connection_alerted: bool,
+}
+
+fn tick_requires_redraw(previous: usize, current: usize, animation_active: bool) -> bool {
+    (animation_active && previous / 2 != current / 2)
+        || previous / 80 != current / 80
+        || previous / 100 != current / 100
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1465,21 +1474,22 @@ impl TuiApp {
         &mut self,
         terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     ) -> anyhow::Result<()> {
+        self.jobs.refresh_busy_notices();
+        self.state.status_bar.activity = self.jobs.active_notice_text();
+        self.draw_frame(terminal)?;
+
         loop {
+            let mut redraw = false;
+            let previous_activity = self.state.status_bar.activity.clone();
             self.jobs.refresh_busy_notices();
             // Expose async notice / MCP status to the renderer via status_bar activity.
             self.state.status_bar.activity = self.jobs.active_notice_text();
-
-            terminal.draw(|f| {
-                components::render_ui(f, &mut self.state, &self.config);
-            })?;
-
+            redraw |= self.state.status_bar.activity != previous_activity;
             if self.state.startup_session_picker {
                 self.state.startup_session_picker = false;
                 let _ = self.open_session_picker().await;
+                redraw = true;
             }
-
-            self.drain_job_results();
 
             // Drain the full event queue each frame so trackpad bursts stay in-app
             // (one-event-per-poll left a backlog that felt like lag / terminal scroll).
@@ -1513,8 +1523,10 @@ impl TuiApp {
                 }
             }
             self.flush_pending_scroll(&mut scroll_delta);
+            redraw |= saw_event;
 
             if let Some(action) = self.state.pending_strip_action.take() {
+                redraw = true;
                 match action {
                     StripAction::Switch(id) => {
                         let _ = self.activate_workspace_target(&id).await;
@@ -1532,12 +1544,14 @@ impl TuiApp {
                 let fold = self.state.mode != AppMode::Shell;
                 if self.state.input.flush_paste(fold) {
                     self.state.refresh_slash_menu();
+                    redraw = true;
                 }
             }
 
             if let Some(prompt) = self.state.pending_prompt.take() {
                 self.state.input.set_text(prompt);
                 self.submit_input().await?;
+                redraw = true;
             }
 
             // Periodically persist the composer draft for the active session.
@@ -1547,11 +1561,21 @@ impl TuiApp {
                 }
             }
 
+            redraw |= self.drain_job_results();
+            let current_activity = self.jobs.active_notice_text();
+            if self.state.status_bar.activity != current_activity {
+                self.state.status_bar.activity = current_activity;
+                redraw = true;
+            }
+
+            let mut received_server_event = false;
             while let Ok(frame) = self.client.event_rx.try_recv() {
+                received_server_event = true;
                 self.handle_server_event(frame);
             }
+            redraw |= received_server_event;
             self.start_next_btw_question().await;
-            self.refresh_connection_notice();
+            redraw |= self.refresh_connection_notice();
             if self
                 .state
                 .copy_toast
@@ -1559,8 +1583,10 @@ impl TuiApp {
                 .is_some_and(|t| std::time::Instant::now() >= t.until)
             {
                 self.state.copy_toast = None;
+                redraw = true;
             }
 
+            let previous_tick = self.state.tick;
             self.state.tick = self.state.tick.wrapping_add(1);
             // Periodic background refresh — never await on the UI loop.
             if self.state.tick.is_multiple_of(100) {
@@ -1577,26 +1603,66 @@ impl TuiApp {
                 self.state.status,
                 SessionStatus::Thinking | SessionStatus::ToolExecuting
             ) {
-                self.state.stream_cursor.tick();
+                redraw |= self.state.stream_cursor.tick();
             }
+
+            let animation_active = matches!(
+                self.state.status,
+                SessionStatus::Thinking
+                    | SessionStatus::ToolExecuting
+                    | SessionStatus::WaitingApproval
+                    | SessionStatus::WaitingQuestion
+                    | SessionStatus::Compacting
+                    | SessionStatus::Cancelling
+            ) || self.state.workspace_sessions.entries.iter().any(|entry| {
+                matches!(
+                    entry.status,
+                    SessionStatus::Thinking
+                        | SessionStatus::ToolExecuting
+                        | SessionStatus::WaitingApproval
+                        | SessionStatus::WaitingQuestion
+                        | SessionStatus::Compacting
+                        | SessionStatus::Cancelling
+                )
+            });
+            redraw |= tick_requires_redraw(previous_tick, self.state.tick, animation_active);
 
             if self.state.should_quit {
                 break;
+            }
+            if redraw {
+                self.draw_frame(terminal)?;
             }
         }
         Ok(())
     }
 
-    fn refresh_connection_notice(&mut self) {
+    fn draw_frame(
+        &mut self,
+        terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    ) -> anyhow::Result<()> {
+        crossterm::queue!(terminal.backend_mut(), BeginSynchronizedUpdate)?;
+        let draw_result = terminal
+            .draw(|frame| components::render_ui(frame, &mut self.state, &self.config))
+            .map(|_| ());
+        let end_result = execute!(terminal.backend_mut(), EndSynchronizedUpdate);
+        draw_result?;
+        end_result?;
+        Ok(())
+    }
+
+    fn refresh_connection_notice(&mut self) -> bool {
         match self.client.connection_state() {
             RpcConnectionState::Connected => {
                 self.connection_alerted = false;
+                false
             }
             RpcConnectionState::Disconnected { reason } if !self.connection_alerted => {
                 self.connection_alerted = true;
                 self.system_message(connection_loss_message(self.remote_connection, &reason));
+                true
             }
-            RpcConnectionState::Disconnected { .. } => {}
+            RpcConnectionState::Disconnected { .. } => false,
         }
     }
 
@@ -1636,8 +1702,10 @@ impl TuiApp {
         );
     }
 
-    fn drain_job_results(&mut self) {
+    fn drain_job_results(&mut self) -> bool {
+        let mut received = false;
         while let Some(outcome) = self.jobs.try_recv() {
+            received = true;
             let may_finish_out_of_order = matches!(
                 outcome.payload,
                 crate::async_jobs::JobPayload::LocalShell { .. }
@@ -1860,6 +1928,7 @@ impl TuiApp {
                 },
             }
         }
+        received
     }
 
     fn apply_local_shell_result(
@@ -9777,6 +9846,14 @@ mod app_state_tests {
         );
         assert_eq!(app.selection_copy_text().as_deref(), Some("hello world"));
         assert_eq!(app.state.click_history.last().unwrap().count, 3);
+    }
+
+    #[test]
+    fn idle_ticks_do_not_request_high_frequency_redraws() {
+        assert!(!tick_requires_redraw(1, 2, false));
+        assert!(tick_requires_redraw(1, 2, true));
+        assert!(tick_requires_redraw(79, 80, false));
+        assert!(tick_requires_redraw(99, 100, false));
     }
 
     #[test]

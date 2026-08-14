@@ -585,13 +585,15 @@ fn run_questions(questions: &[TrustQuestion], use_alt_screen: bool) -> Result<Ve
 
 fn render_question(frame: &mut Frame, question: &TrustQuestion, selected: usize) {
     let area = frame.area();
-    let width = area.width.saturating_sub(4).clamp(36, 88);
-    let detail_lines = question.details.len().min(12) as u16;
-    let height = (10 + detail_lines)
-        .min(area.height.saturating_sub(2))
-        .max(10);
-    let panel = centered_rect(area, width, height);
-    frame.render_widget(Clear, panel);
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let width = if area.width >= 16 {
+        area.width.saturating_sub(4).min(88)
+    } else {
+        area.width
+    }
+    .max(1);
 
     let mut lines = vec![
         Line::from(Span::styled(
@@ -627,9 +629,22 @@ fn render_question(frame: &mut Frame, question: &TrustQuestion, selected: usize)
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "↑↓ / 1·2 / Enter · Esc cancel",
+        if width < 40 {
+            "↑↓ / 1·2 · Enter · Esc"
+        } else {
+            "↑↓ / 1·2 / Enter · Esc cancel"
+        },
         Style::default().fg(Color::DarkGray),
     )));
+
+    let inner_width = width.saturating_sub(2).max(1) as usize;
+    let content_height = lines.iter().fold(0u16, |height, line| {
+        let rows = line.width().max(1).div_ceil(inner_width) as u16;
+        height.saturating_add(rows.max(1))
+    });
+    let height = content_height.saturating_add(2).max(4);
+    let panel = centered_rect(area, width, height);
+    frame.render_widget(Clear, panel);
 
     let block = Block::default()
         .title(format!(" {} ", question.title))
@@ -655,6 +670,7 @@ fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::{backend::TestBackend, Terminal};
 
     #[test]
     fn detects_new_grants_without_reprompting_denials() {
@@ -680,6 +696,39 @@ mod tests {
         let lines = abbreviated_paths(&paths);
         assert_eq!(lines.len(), 7);
         assert!(lines.last().unwrap().contains("2 more"));
+    }
+
+    #[test]
+    fn trust_prompt_keeps_its_border_and_choices_on_a_phone_terminal() {
+        let backend = TestBackend::new(24, 50);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let question = TrustQuestion {
+            kind: QuestionKind::Workspace,
+            title: "Trust this workspace?".into(),
+            summary: "Allow project instructions and commands in a narrow terminal".into(),
+            details: vec![
+                "Only trust repositories whose code and configuration you accept.".into(),
+            ],
+            allow_label: "Trust workspace".into(),
+            deny_label: "Cancel".into(),
+        };
+
+        terminal
+            .draw(|frame| render_question(frame, &question, 1))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let rows = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .filter_map(|x| buffer.cell((x, y)))
+                    .map(|cell| cell.symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        assert!(rows
+            .iter()
+            .any(|row| row.contains('┌') && row.contains('┐')));
+        assert!(rows.join("\n").contains("Cancel"));
     }
 
     #[test]

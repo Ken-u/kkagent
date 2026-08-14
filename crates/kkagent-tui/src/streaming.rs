@@ -18,9 +18,12 @@ impl Default for StreamingCursor {
 }
 
 impl StreamingCursor {
-    pub fn tick(&mut self) {
+    pub fn tick(&mut self) -> bool {
         // ~530ms blink
-        self.visible = (self.started.elapsed().as_millis() / 530).is_multiple_of(2);
+        let visible = (self.started.elapsed().as_millis() / 530).is_multiple_of(2);
+        let changed = self.visible != visible;
+        self.visible = visible;
+        changed
     }
 
     pub fn glyph(&self) -> &'static str {
