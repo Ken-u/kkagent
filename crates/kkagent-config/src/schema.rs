@@ -27,6 +27,10 @@ pub struct AppConfig {
     /// Also honored when `[mcp_servers.X] enabled = false`.
     #[serde(default)]
     pub disabled_mcp_servers: Vec<String>,
+    /// Optional local path, file URL, or HTTP(S) URL for the KK plugin
+    /// marketplace catalog.
+    #[serde(default)]
+    pub plugin_marketplace: Option<String>,
     #[serde(default)]
     pub telemetry: bool,
     /// Trusted workspace roots (absolute paths). Empty = trust cwd implicitly.
@@ -494,6 +498,13 @@ impl AppConfig {
                 self.effective_permission_mode()
             );
         }
+        if self
+            .plugin_marketplace
+            .as_deref()
+            .is_some_and(|source| source.trim().is_empty())
+        {
+            anyhow::bail!("plugin_marketplace must not be empty");
+        }
         for (name, provider) in &self.providers {
             if !matches!(
                 provider.provider_type.as_str(),
@@ -771,6 +782,17 @@ experimental_visible_empty_retries = 1
             .unwrap_err()
             .to_string()
             .contains("read_byte_budget"));
+    }
+
+    #[test]
+    fn rejects_empty_plugin_marketplace() {
+        let mut config = valid_config();
+        config.plugin_marketplace = Some("   ".into());
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("plugin_marketplace"));
     }
 
     #[test]

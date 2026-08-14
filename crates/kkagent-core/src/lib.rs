@@ -15,6 +15,7 @@ pub mod permission;
 mod plan_filename;
 pub mod plan_review;
 pub mod plugin;
+pub mod plugin_marketplace;
 pub mod replay;
 pub mod scope_context;
 pub mod session;
@@ -54,6 +55,7 @@ pub use permission::*;
 pub use plugin::{
     LoadedPlugin, PluginDiagnostic, PluginInfo, PluginInterface, PluginManager, PluginManifest,
 };
+pub use plugin_marketplace::{InstalledPluginRecord, PluginMarketplace, PluginMarketplaceEntry};
 pub use replay::ReplayBuilder;
 pub use scope_context::ScopeContext;
 pub use session::*;

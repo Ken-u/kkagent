@@ -166,6 +166,9 @@ fn apply_env_overrides(config: &mut AppConfig) {
     if let Ok(v) = std::env::var("KKAGENT_PERMISSION_MODE") {
         config.default_permission_mode = Some(v);
     }
+    if let Ok(v) = std::env::var("KKAGENT_PLUGIN_MARKETPLACE_URL") {
+        config.plugin_marketplace = Some(v);
+    }
     if let Some(value) = env_positive_u32("KKAGENT_IMAGE_MAX_EDGE_PX")
         .or_else(|| env_positive_u32("KIMI_IMAGE_MAX_EDGE_PX"))
     {

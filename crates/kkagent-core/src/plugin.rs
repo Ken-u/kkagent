@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 const KK_ROOT_MANIFEST: &str = "kk.plugin.json";
 const KK_DIR_MANIFEST: &str = ".kk-plugin/plugin.json";
@@ -57,6 +57,9 @@ pub struct LoadedPlugin {
     pub root: PathBuf,
     pub manifest_path: PathBuf,
     pub diagnostics: Vec<PluginDiagnostic>,
+    pub enabled: bool,
+    pub managed: bool,
+    pub source: Option<String>,
     mcp_servers: Vec<kkagent_mcp::McpServerConfig>,
 }
 
@@ -70,12 +73,16 @@ pub struct PluginInfo {
     pub manifest_path: String,
     pub mcp_servers: Vec<String>,
     pub diagnostics: Vec<PluginDiagnostic>,
+    pub enabled: bool,
+    pub managed: bool,
+    pub source: Option<String>,
 }
 
 pub struct PluginManager {
     plugins_dir: PathBuf,
     kkagent_home: PathBuf,
     plugins: RwLock<HashMap<String, LoadedPlugin>>,
+    mutation: Mutex<()>,
 }
 
 impl PluginManager {
@@ -88,6 +95,7 @@ impl PluginManager {
             plugins_dir,
             kkagent_home,
             plugins: RwLock::new(HashMap::new()),
+            mutation: Mutex::new(()),
         }
     }
 
@@ -123,27 +131,62 @@ impl PluginManager {
         if !self.plugins_dir.exists() {
             return Ok(HashMap::new());
         }
-        let mut roots = Vec::new();
+        let installed = crate::plugin_marketplace::read_installed(&self.plugins_dir).await?;
+        let has_installed_state = self.plugins_dir.join("installed.json").is_file();
+        let mut roots: Vec<(PathBuf, bool, bool, Option<String>)> = installed
+            .plugins
+            .iter()
+            .map(|record| {
+                (
+                    PathBuf::from(&record.root),
+                    record.enabled,
+                    true,
+                    record.original_source.clone(),
+                )
+            })
+            .collect();
+        roots.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut direct_roots = Vec::new();
         let mut rd = tokio::fs::read_dir(&self.plugins_dir).await?;
         while let Some(entry) = rd.next_entry().await? {
             let path = entry.path();
             if path.is_dir() && entry.file_name() == "managed" {
-                let mut managed = tokio::fs::read_dir(&path).await?;
-                while let Some(managed_entry) = managed.next_entry().await? {
-                    let managed_path = managed_entry.path();
-                    if managed_path.is_dir() {
-                        roots.push(managed_path);
+                if !has_installed_state {
+                    let mut managed = tokio::fs::read_dir(&path).await?;
+                    while let Some(managed_entry) = managed.next_entry().await? {
+                        let managed_path = managed_entry.path();
+                        if managed_path.is_dir()
+                            && !managed_entry.file_name().to_string_lossy().starts_with('.')
+                        {
+                            direct_roots.push((managed_path, true, true, None));
+                        }
                     }
                 }
             } else if path.is_dir() {
-                roots.push(path);
+                direct_roots.push((path, true, false, None));
             }
         }
-        roots.sort();
+        direct_roots.sort_by(|a, b| a.0.cmp(&b.0));
+        roots.extend(direct_roots);
 
         let mut plugins = HashMap::new();
-        for root in roots {
-            match self.load_plugin(&root).await {
+        for (root, enabled, managed, source) in roots {
+            if managed && has_installed_state {
+                let managed_root = tokio::fs::canonicalize(self.plugins_dir.join("managed")).await;
+                let resolved_root = tokio::fs::canonicalize(&root).await;
+                match (managed_root, resolved_root) {
+                    (Ok(managed_root), Ok(resolved_root))
+                        if resolved_root.starts_with(&managed_root) => {}
+                    _ => {
+                        tracing::warn!(
+                            path = %root.display(),
+                            "managed plugin root is missing or outside the managed directory"
+                        );
+                        continue;
+                    }
+                }
+            }
+            match self.load_plugin(&root, enabled, managed, source).await {
                 Ok(Some(plugin)) => {
                     let name = plugin.manifest.name.clone();
                     if plugins.contains_key(&name) {
@@ -163,7 +206,13 @@ impl PluginManager {
         Ok(plugins)
     }
 
-    async fn load_plugin(&self, root: &Path) -> anyhow::Result<Option<LoadedPlugin>> {
+    async fn load_plugin(
+        &self,
+        root: &Path,
+        enabled: bool,
+        managed: bool,
+        source: Option<String>,
+    ) -> anyhow::Result<Option<LoadedPlugin>> {
         let Some(manifest_path) = select_manifest(root) else {
             return Ok(None);
         };
@@ -194,6 +243,9 @@ impl PluginManager {
             root,
             manifest_path,
             diagnostics,
+            enabled,
+            managed,
+            source,
             mcp_servers,
         }))
     }
@@ -216,6 +268,9 @@ impl PluginManager {
                 manifest_path: plugin.manifest_path.display().to_string(),
                 mcp_servers: plugin.mcp_servers.iter().map(|s| s.name.clone()).collect(),
                 diagnostics: plugin.diagnostics.clone(),
+                enabled: plugin.enabled,
+                managed: plugin.managed,
+                source: plugin.source.clone(),
             })
             .collect();
         out.sort_by(|a, b| a.name.cmp(&b.name));
@@ -228,6 +283,7 @@ impl PluginManager {
         names.sort();
         names
             .into_iter()
+            .filter(|name| plugins[name].enabled)
             .flat_map(|name| plugins[&name].mcp_servers.clone())
             .collect()
     }
@@ -238,6 +294,9 @@ impl PluginManager {
         names.sort();
         let mut out = String::new();
         for name in names {
+            if !plugins[&name].enabled {
+                continue;
+            }
             if let Some(prompt) = plugins[&name].manifest.system_prompt.as_deref() {
                 if !prompt.trim().is_empty() {
                     out.push_str("\n\n");
@@ -247,16 +306,122 @@ impl PluginManager {
         }
         out
     }
+
+    pub async fn marketplace(
+        &self,
+        source: &str,
+        work_dir: &Path,
+    ) -> anyhow::Result<crate::plugin_marketplace::PluginMarketplace> {
+        let mut marketplace = crate::plugin_marketplace::load_marketplace(source, work_dir).await?;
+        let installed = crate::plugin_marketplace::read_installed(&self.plugins_dir).await?;
+        let loaded = self.plugins.read().await;
+        for entry in &mut marketplace.plugins {
+            let managed_record = installed
+                .plugins
+                .iter()
+                .find(|record| record.id == entry.id);
+            let current_version = managed_record
+                .and_then(|record| record.version.clone())
+                .or_else(|| {
+                    loaded
+                        .get(&entry.id)
+                        .map(|plugin| plugin.manifest.version.clone())
+                        .filter(|version| !version.is_empty())
+                });
+            if managed_record.is_none() && !loaded.contains_key(&entry.id) {
+                continue;
+            }
+            entry.installed = true;
+            entry.installed_version = current_version.clone();
+            entry.update_available = match (entry.version.as_deref(), current_version.as_deref()) {
+                (Some(latest), Some(current)) => {
+                    let latest = semver::Version::parse(latest.trim_start_matches('v'));
+                    let current = semver::Version::parse(current.trim_start_matches('v'));
+                    matches!((latest, current), (Ok(latest), Ok(current)) if latest > current)
+                }
+                _ => false,
+            };
+        }
+        Ok(marketplace)
+    }
+
+    pub async fn install(
+        &self,
+        source: &str,
+        marketplace: Option<(&str, &crate::plugin_marketplace::PluginMarketplaceEntry)>,
+    ) -> anyhow::Result<crate::plugin_marketplace::InstalledPluginRecord> {
+        let _guard = self.mutation.lock().await;
+        let record =
+            crate::plugin_marketplace::install_plugin(&self.plugins_dir, source, marketplace)
+                .await?;
+        self.reload().await?;
+        Ok(record)
+    }
+
+    pub async fn update(
+        &self,
+        id: &str,
+    ) -> anyhow::Result<crate::plugin_marketplace::InstalledPluginRecord> {
+        let installed = crate::plugin_marketplace::read_installed(&self.plugins_dir).await?;
+        let record = installed
+            .plugins
+            .into_iter()
+            .find(|record| record.id == id)
+            .ok_or_else(|| anyhow::anyhow!("plugin {id} is not managed by the marketplace"))?;
+        if let Some(marketplace_source) = record.marketplace_source.as_deref() {
+            let work_dir = std::env::current_dir()?;
+            let marketplace = self.marketplace(marketplace_source, &work_dir).await?;
+            let entry = marketplace
+                .plugins
+                .iter()
+                .find(|entry| entry.id == id)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "plugin {id} is no longer present in marketplace {marketplace_source}"
+                    )
+                })?;
+            return self
+                .install(&entry.source, Some((&marketplace.source, entry)))
+                .await;
+        }
+        let source = record
+            .original_source
+            .ok_or_else(|| anyhow::anyhow!("plugin {id} has no update source"))?;
+        self.install(&source, None).await
+    }
+
+    pub async fn is_managed(&self, id: &str) -> anyhow::Result<bool> {
+        validate_plugin_name(id)?;
+        Ok(crate::plugin_marketplace::read_installed(&self.plugins_dir)
+            .await?
+            .plugins
+            .iter()
+            .any(|record| record.id == id))
+    }
+
+    pub async fn set_enabled(&self, id: &str, enabled: bool) -> anyhow::Result<()> {
+        let _guard = self.mutation.lock().await;
+        crate::plugin_marketplace::set_plugin_enabled(&self.plugins_dir, id, enabled).await?;
+        self.reload().await?;
+        Ok(())
+    }
+
+    pub async fn remove(&self, id: &str) -> anyhow::Result<()> {
+        let _guard = self.mutation.lock().await;
+        crate::plugin_marketplace::remove_plugin(&self.plugins_dir, id).await?;
+        self.reload().await?;
+        Ok(())
+    }
 }
 
-fn select_manifest(root: &Path) -> Option<PathBuf> {
+pub(crate) fn select_manifest(root: &Path) -> Option<PathBuf> {
     [KK_ROOT_MANIFEST, KK_DIR_MANIFEST, LEGACY_MANIFEST]
         .into_iter()
         .map(|relative| root.join(relative))
         .find(|path| path.is_file())
 }
 
-fn validate_plugin_name(name: &str) -> anyhow::Result<()> {
+pub(crate) fn validate_plugin_name(name: &str) -> anyhow::Result<()> {
     let bytes = name.as_bytes();
     let valid = !bytes.is_empty()
         && bytes.len() <= 64

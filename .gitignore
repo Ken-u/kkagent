@@ -17,6 +17,7 @@
 # Reference / local scratch
 /ref/
 /tmp/
+/plugins/
 /upload.sh
 *.log
 /specs/

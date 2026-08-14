@@ -97,6 +97,8 @@ base64 = "0.22"
 dotenvy = "0.15"
 rpassword = "7.5"
 image = { version = "0.25", default-features = false, features = ["gif", "jpeg", "png", "webp", "bmp"] }
+semver = "1"
+zip = { version = "4", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
 # HTTP / WebSocket server
 axum = { version = "0.8", features = ["ws"] }

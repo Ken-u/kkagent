@@ -127,3 +127,48 @@ Plugin MCP server 使用 `plugin-<plugin-id>:<server-name>` 作为运行时名�
 旧版 `prompt_append` 仍兼容，等价于 `systemPrompt`。插件 MCP 可通过 `/mcp` 以其运行时
 名称启用或禁用，状态保存在 `~/.kkagent/disabled.toml`。插件进程是本机可执行代码，只应
 安装可信插件；损坏的 MCP 声明会作为 `/plugins` diagnostics 展示，并且不会阻止其他插件加载。
+
+### 插件市场
+
+顶层 `plugin_marketplace` 可配置本地路径、`file://` URL 或 HTTP(S) URL，也可通过
+`KKAGENT_PLUGIN_MARKETPLACE_URL` 覆盖。两者都未设置时，如果
+`~/.kkagent/plugins/marketplace.json` 存在则自动使用。Marketplace JSON 至少包含
+`id` 和 `source`：
+
+```json
+{
+  "version": "1",
+  "plugins": [
+    {
+      "id": "code-search",
+      "tier": "curated",
+      "displayName": "Code Search",
+      "version": "1.2.0",
+      "description": "Search remote source indexes",
+      "keywords": ["code-search"],
+      "source": "./code-search"
+    }
+  ]
+}
+```
+
+本地 marketplace 的 `source` 支持相对目录或 ZIP、绝对路径和 `file://`；远程
+marketplace 的相对 `source` 应指向 ZIP。也支持普通 HTTP(S) ZIP，以及 GitHub 仓库、
+`tree/<ref>`、release tag 和 commit URL。安装内容先进入临时目录，
+验证 `kk.plugin.json` 后复制到 `~/.kkagent/plugins/managed/<id>/`，再原子更新
+`~/.kkagent/plugins/installed.json`；失败时恢复原版本。ZIP 下载限制为 64 MiB、解压后
+限制为 256 MiB/10000 个文件，并拒绝路径逃逸与符号链接。
+
+```text
+/plugins marketplace [source]
+/plugins install <marketplace-id-or-source>
+/plugins update <id>
+/plugins enable <id>
+/plugins disable <id>
+/plugins remove <id>
+/plugins info <id>
+/plugins reload
+```
+
+`remove` 删除安装记录但保留托管副本，重新安装即可恢复。安装和更新会执行插件声明的
+本机程序，因此只能使用可信 marketplace 和插件源。

@@ -2645,6 +2645,68 @@ async fn combined_mcp_servers(
     configs
 }
 
+fn configured_plugin_marketplace(config: &AppConfig, explicit: Option<&str>) -> Result<String> {
+    explicit
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            std::env::var("KKAGENT_PLUGIN_MARKETPLACE_URL")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        })
+        .or_else(|| config.plugin_marketplace.clone())
+        .or_else(|| {
+            let local = kkagent_config::default_config_dir()
+                .join("plugins")
+                .join("marketplace.json");
+            local.is_file().then(|| local.display().to_string())
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "plugin marketplace is not configured; set plugin_marketplace in config.toml, \
+                 KKAGENT_PLUGIN_MARKETPLACE_URL, or pass a source"
+            )
+        })
+}
+
+async fn refresh_plugin_mcp(state: &ServerState) -> Result<(usize, usize)> {
+    let configs = combined_mcp_servers(&state.config, &state.plugins).await;
+    let mut disabled: std::collections::HashSet<String> =
+        state.mcp.disabled_names().await.into_iter().collect();
+    disabled.extend(
+        configs
+            .iter()
+            .filter(|server| !server.enabled)
+            .map(|server| server.name.clone()),
+    );
+    state.mcp.set_disabled_names(disabled).await;
+    state.mcp.replace_configs(configs).await?;
+    Ok((
+        state.mcp.configured_count(),
+        state.mcp.list_tools().await.len(),
+    ))
+}
+
+async fn install_marketplace_plugin(
+    state: &ServerState,
+    id: &str,
+    explicit_marketplace: Option<&str>,
+) -> Result<kkagent_core::InstalledPluginRecord> {
+    let source = configured_plugin_marketplace(&state.config, explicit_marketplace)?;
+    let cwd = std::env::current_dir()?;
+    let marketplace = state.plugins.marketplace(&source, &cwd).await?;
+    let entry = marketplace
+        .plugins
+        .iter()
+        .find(|entry| entry.id == id)
+        .ok_or_else(|| anyhow::anyhow!("plugin {id} was not found in {source}"))?;
+    state
+        .plugins
+        .install(&entry.source, Some((&marketplace.source, entry)))
+        .await
+}
+
 fn open_transcript_with_policy(
     path: &Path,
     allow_in_memory: bool,
@@ -5514,26 +5576,154 @@ async fn handle_rpc_call(
                 .reload()
                 .await
                 .map_err(|error| (-32000, error.to_string()))?;
-            let configs = combined_mcp_servers(&state.config, &state.plugins).await;
-            let mut disabled: std::collections::HashSet<String> =
-                state.mcp.disabled_names().await.into_iter().collect();
-            disabled.extend(
-                configs
-                    .iter()
-                    .filter(|server| !server.enabled)
-                    .map(|server| server.name.clone()),
-            );
-            state.mcp.set_disabled_names(disabled).await;
-            state
-                .mcp
-                .replace_configs(configs)
+            let (mcp_servers, tools) = refresh_plugin_mcp(&state)
                 .await
                 .map_err(|error| (-32000, error.to_string()))?;
             Ok(serde_json::json!({
                 "plugins": count,
-                "mcp_servers": state.mcp.configured_count(),
-                "tools": state.mcp.list_tools().await.len(),
+                "mcp_servers": mcp_servers,
+                "tools": tools,
             }))
+        }
+        "plugins.marketplace" => {
+            let explicit = params
+                .as_ref()
+                .and_then(|value| value.get("source"))
+                .and_then(|value| value.as_str());
+            let source = configured_plugin_marketplace(&state.config, explicit)
+                .map_err(|error| (-32602, error.to_string()))?;
+            let cwd = std::env::current_dir().map_err(|error| (-32000, error.to_string()))?;
+            let marketplace = state
+                .plugins
+                .marketplace(&source, &cwd)
+                .await
+                .map_err(|error| (-32000, error.to_string()))?;
+            serde_json::to_value(marketplace).map_err(|error| (-32000, error.to_string()))
+        }
+        "plugins.install" => {
+            let requested = params
+                .as_ref()
+                .and_then(|value| value.get("source"))
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| (-32602, "Missing plugin source or marketplace id".into()))?;
+            let explicit_marketplace = params
+                .as_ref()
+                .and_then(|value| value.get("marketplace"))
+                .and_then(|value| value.as_str());
+            let local_source_exists = std::path::Path::new(requested).exists();
+            let looks_like_url = requested.starts_with("http://")
+                || requested.starts_with("https://")
+                || requested.starts_with("file://");
+            let record = if local_source_exists || looks_like_url {
+                state
+                    .plugins
+                    .install(requested, None)
+                    .await
+                    .map_err(|error| (-32000, error.to_string()))?
+            } else {
+                install_marketplace_plugin(&state, requested, explicit_marketplace)
+                    .await
+                    .map_err(|error| (-32000, error.to_string()))?
+            };
+            let (mcp_servers, tools) = refresh_plugin_mcp(&state)
+                .await
+                .map_err(|error| (-32000, error.to_string()))?;
+            Ok(serde_json::json!({
+                "plugin": record,
+                "mcp_servers": mcp_servers,
+                "tools": tools,
+            }))
+        }
+        "plugins.update" => {
+            let id = params
+                .as_ref()
+                .and_then(|value| value.get("id"))
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| (-32602, "Missing plugin id".into()))?;
+            let managed = state
+                .plugins
+                .is_managed(id)
+                .await
+                .map_err(|error| (-32000, error.to_string()))?;
+            let record = if managed {
+                state
+                    .plugins
+                    .update(id)
+                    .await
+                    .map_err(|error| (-32000, error.to_string()))?
+            } else {
+                install_marketplace_plugin(&state, id, None)
+                    .await
+                    .map_err(|error| (-32000, error.to_string()))?
+            };
+            let (mcp_servers, tools) = refresh_plugin_mcp(&state)
+                .await
+                .map_err(|error| (-32000, error.to_string()))?;
+            Ok(serde_json::json!({
+                "plugin": record,
+                "mcp_servers": mcp_servers,
+                "tools": tools,
+            }))
+        }
+        "plugins.enable" | "plugins.disable" => {
+            let id = params
+                .as_ref()
+                .and_then(|value| value.get("id"))
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| (-32602, "Missing plugin id".into()))?;
+            let enabled = method == "plugins.enable";
+            state
+                .plugins
+                .set_enabled(id, enabled)
+                .await
+                .map_err(|error| (-32000, error.to_string()))?;
+            let (mcp_servers, tools) = refresh_plugin_mcp(&state)
+                .await
+                .map_err(|error| (-32000, error.to_string()))?;
+            Ok(serde_json::json!({
+                "id": id,
+                "enabled": enabled,
+                "mcp_servers": mcp_servers,
+                "tools": tools,
+            }))
+        }
+        "plugins.remove" => {
+            let id = params
+                .as_ref()
+                .and_then(|value| value.get("id"))
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| (-32602, "Missing plugin id".into()))?;
+            state
+                .plugins
+                .remove(id)
+                .await
+                .map_err(|error| (-32000, error.to_string()))?;
+            let (mcp_servers, tools) = refresh_plugin_mcp(&state)
+                .await
+                .map_err(|error| (-32000, error.to_string()))?;
+            Ok(serde_json::json!({
+                "id": id,
+                "removed": true,
+                "mcp_servers": mcp_servers,
+                "tools": tools,
+            }))
+        }
+        "plugins.info" => {
+            let id = params
+                .as_ref()
+                .and_then(|value| value.get("id"))
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| (-32602, "Missing plugin id".into()))?;
+            let plugin = state
+                .plugins
+                .list()
+                .await
+                .into_iter()
+                .find(|plugin| plugin.name == id)
+                .ok_or_else(|| (-32000, format!("plugin {id} is not installed")))?;
+            serde_json::to_value(plugin).map_err(|error| (-32000, error.to_string()))
         }
         "session.compact" => {
             let session_id = params

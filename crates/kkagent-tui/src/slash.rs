@@ -189,9 +189,9 @@ pub const BUILTIN_SLASH_COMMANDS: &[SlashCommand] = &[
     SlashCommand {
         name: "plugins",
         aliases: &["plugin"],
-        description: "Browse loaded plugins",
+        description: "Browse, install, and manage plugins",
         priority: 50,
-        argument_hint: None,
+        argument_hint: Some("[marketplace|install|update|enable|disable|remove|info|reload]"),
     },
     SlashCommand {
         name: "skills",

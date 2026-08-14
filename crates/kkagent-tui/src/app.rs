@@ -5452,6 +5452,19 @@ impl TuiApp {
                     if diagnostic_count > 0 {
                         detail.push_str(&format!(" · {diagnostic_count} warning(s)"));
                     }
+                    if p.get("managed")
+                        .and_then(|value| value.as_bool())
+                        .unwrap_or(false)
+                    {
+                        detail.push_str(" · managed");
+                    }
+                    if !p
+                        .get("enabled")
+                        .and_then(|value| value.as_bool())
+                        .unwrap_or(true)
+                    {
+                        detail.push_str(" · disabled");
+                    }
                     items.push(ListPickerItem {
                         id: name.clone(),
                         label: name,
@@ -7804,7 +7817,8 @@ impl TuiApp {
                 self.open_auth_picker();
             }
             "plugins" | "plugin" => {
-                if args.trim() == "reload" {
+                let plugin_args = args.trim();
+                if plugin_args == "reload" {
                     match self.client.rpc_call("plugins.reload", None).await {
                         Ok(result) => self.system_message(format!(
                             "Plugins reloaded: {} plugin(s), {} MCP server(s), {} tool(s)",
@@ -7823,6 +7837,116 @@ impl TuiApp {
                         )),
                         Err(error) => self.system_message(format!("Plugin reload failed: {error}")),
                     }
+                    return Ok(());
+                }
+                if plugin_args == "list" {
+                    self.begin_root_picker();
+                    self.open_plugins_picker().await?;
+                    return Ok(());
+                }
+                if plugin_args == "marketplace" || plugin_args.starts_with("marketplace ") {
+                    let source = plugin_args
+                        .strip_prefix("marketplace")
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty());
+                    let params = source.map(|source| serde_json::json!({"source": source}));
+                    match self.client.rpc_call("plugins.marketplace", params).await {
+                        Ok(result) => {
+                            let catalog_source = result
+                                .get("source")
+                                .and_then(|value| value.as_str())
+                                .unwrap_or("configured marketplace");
+                            let mut lines = vec![format!("Plugin marketplace: {catalog_source}")];
+                            if let Some(entries) =
+                                result.get("plugins").and_then(|value| value.as_array())
+                            {
+                                for entry in entries {
+                                    let id = entry
+                                        .get("id")
+                                        .and_then(|value| value.as_str())
+                                        .unwrap_or("plugin");
+                                    let version = entry
+                                        .get("version")
+                                        .and_then(|value| value.as_str())
+                                        .map(|value| format!(" v{value}"))
+                                        .unwrap_or_default();
+                                    let description = entry
+                                        .get("description")
+                                        .and_then(|value| value.as_str())
+                                        .unwrap_or("");
+                                    let status = if entry
+                                        .get("updateAvailable")
+                                        .and_then(|value| value.as_bool())
+                                        .unwrap_or(false)
+                                    {
+                                        " · update available"
+                                    } else if entry
+                                        .get("installed")
+                                        .and_then(|value| value.as_bool())
+                                        .unwrap_or(false)
+                                    {
+                                        " · installed"
+                                    } else {
+                                        ""
+                                    };
+                                    lines.push(format!("- {id}{version}{status}: {description}"));
+                                }
+                            }
+                            lines.push("Install with /plugins install <id>".into());
+                            self.system_message(lines.join("\n"));
+                        }
+                        Err(error) => {
+                            self.system_message(format!("Plugin marketplace failed: {error}"))
+                        }
+                    }
+                    return Ok(());
+                }
+                for (command, method) in [
+                    ("install", "plugins.install"),
+                    ("update", "plugins.update"),
+                    ("enable", "plugins.enable"),
+                    ("disable", "plugins.disable"),
+                    ("remove", "plugins.remove"),
+                    ("info", "plugins.info"),
+                ] {
+                    if let Some(value) = plugin_args
+                        .strip_prefix(command)
+                        .filter(|rest| rest.chars().next().is_some_and(char::is_whitespace))
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                    {
+                        let params = if command == "install" {
+                            serde_json::json!({"source": value})
+                        } else {
+                            serde_json::json!({"id": value})
+                        };
+                        match self.client.rpc_call(method, Some(params)).await {
+                            Ok(result) if command == "info" => {
+                                self.system_message(
+                                    serde_json::to_string_pretty(&result)
+                                        .unwrap_or_else(|_| result.to_string()),
+                                );
+                            }
+                            Ok(result) => {
+                                let id = result
+                                    .get("plugin")
+                                    .and_then(|plugin| plugin.get("id"))
+                                    .or_else(|| result.get("id"))
+                                    .and_then(|value| value.as_str())
+                                    .unwrap_or(value);
+                                self.system_message(format!("Plugin {command} succeeded: {id}"));
+                            }
+                            Err(error) => {
+                                self.system_message(format!("Plugin {command} failed: {error}"));
+                            }
+                        }
+                        return Ok(());
+                    }
+                }
+                if !plugin_args.is_empty() {
+                    self.system_message(
+                        "Usage: /plugins [list|reload|marketplace [source]|install <id-or-source>|update <id>|enable <id>|disable <id>|remove <id>|info <id>]".into(),
+                    );
                     return Ok(());
                 }
                 self.begin_root_picker();
