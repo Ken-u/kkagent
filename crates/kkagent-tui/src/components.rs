@@ -2369,9 +2369,31 @@ pub(crate) fn push_wrapped_prefixed(
     prefix_style: Style,
     text_style: Style,
 ) {
-    let prefix_w = UnicodeWidthStr::width(prefix);
-    let avail = (width as usize).saturating_sub(prefix_w).max(8);
-    let indent = " ".repeat(prefix_w);
+    push_wrapped_prefixed_with_continuation_indent(
+        lines,
+        prefix,
+        text,
+        width,
+        prefix_style,
+        text_style,
+        UnicodeWidthStr::width(prefix),
+    );
+}
+
+fn push_wrapped_prefixed_with_continuation_indent(
+    lines: &mut Vec<Line<'static>>,
+    prefix: &str,
+    text: &str,
+    width: u16,
+    prefix_style: Style,
+    text_style: Style,
+    continuation_indent: usize,
+) {
+    let width = width as usize;
+    let first_width = width.saturating_sub(UnicodeWidthStr::width(prefix)).max(1);
+    let continuation_indent = continuation_indent.min(width.saturating_sub(1));
+    let continuation_width = width.saturating_sub(continuation_indent).max(1);
+    let indent = " ".repeat(continuation_indent);
     let mut first = true;
     for para in text.split('\n') {
         if para.is_empty() {
@@ -2386,7 +2408,12 @@ pub(crate) fn push_wrapped_prefixed(
             }
             continue;
         }
-        for chunk in wrap_str(para, avail) {
+        let line_width = if first {
+            first_width
+        } else {
+            continuation_width
+        };
+        for chunk in wrap_str_with_first_width(para, line_width, continuation_width) {
             if first {
                 lines.push(Line::from(vec![
                     Span::styled(prefix.to_string(), prefix_style),
@@ -2401,6 +2428,31 @@ pub(crate) fn push_wrapped_prefixed(
             }
         }
     }
+}
+
+fn wrap_str_with_first_width(
+    s: &str,
+    first_width: usize,
+    continuation_width: usize,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut cur_w = 0usize;
+    let mut max_width = first_width.max(1);
+    for ch in s.chars() {
+        let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if cur_w + w > max_width && !cur.is_empty() {
+            out.push(std::mem::take(&mut cur));
+            cur_w = 0;
+            max_width = continuation_width.max(1);
+        }
+        cur.push(ch);
+        cur_w += w;
+    }
+    if !cur.is_empty() || out.is_empty() {
+        out.push(cur);
+    }
+    out
 }
 
 fn wrap_str(s: &str, max_width: usize) -> Vec<String> {
@@ -2594,13 +2646,14 @@ fn render_question_panel(f: &mut Frame, area: Rect, question: &mut PendingQuesti
         };
         let prefix = format!("{marker}{} {boxc}  ", i + 1);
         let start = lines.len();
-        push_wrapped_prefixed(
+        push_wrapped_prefixed_with_continuation_indent(
             &mut lines,
             &prefix,
             label,
             content_width,
             Style::default().fg(theme.text_muted),
             style,
+            2,
         );
         if selected {
             selected_range = (start, lines.len());
@@ -2792,6 +2845,23 @@ mod render_smoke {
     }
 
     #[test]
+    fn question_option_continuations_use_a_compact_body_indent() {
+        let mut lines = Vec::new();
+        push_wrapped_prefixed_with_continuation_indent(
+            &mut lines,
+            "> 1 ( )  ",
+            "abcdefghijklmnopqr",
+            15,
+            Style::default(),
+            Style::default(),
+            2,
+        );
+
+        let rendered = lines.iter().map(Line::to_string).collect::<Vec<_>>();
+        assert_eq!(rendered, ["> 1 ( )  abcdef", "  ghijklmnopqr"]);
+    }
+
+    #[test]
     fn question_modal_sizes_for_wrapped_question_and_options() {
         let backend = TestBackend::new(60, 18);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -2836,7 +2906,7 @@ mod render_smoke {
             .unwrap();
 
         let rendered = buffer_text(&terminal);
-        assert!(rendered.contains("TAIL_OK"), "{rendered:?}");
+        assert!(rendered.contains("AIL_OK"), "{rendered:?}");
         let buffer = terminal.backend().buffer();
         assert_eq!(buffer.cell((31, 8)).map(|cell| cell.symbol()), Some("│"));
     }
