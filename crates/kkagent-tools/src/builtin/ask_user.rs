@@ -45,10 +45,6 @@ Unavailable in auto mode."
                 "allow_free_text": {
                     "type": "boolean",
                     "description": "Allow a free-text answer in addition to options (default true if no options)"
-                },
-                "background": {
-                    "type": "boolean",
-                    "description": "If true, park the question as a background task the user can answer later (default false)"
                 }
             },
             "required": ["question"]
@@ -64,5 +60,17 @@ Unavailable in auto mode."
         Ok(ToolOutput::error(
             "AskUserQuestion must be handled by the agent loop",
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn schema_does_not_offer_background_questions() {
+        let schema = AskUserQuestionTool.parameters_schema();
+        let properties = schema["properties"].as_object().unwrap();
+        assert!(!properties.contains_key("background"));
     }
 }

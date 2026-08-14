@@ -2047,11 +2047,6 @@ Do not mention this reminder to the user.\n</system-reminder>"
             .get("allow_free_text")
             .and_then(|v| v.as_bool())
             .unwrap_or(options.is_empty());
-        let background = input
-            .get("background")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-
         let question_id = uuid::Uuid::new_v4().to_string();
         let session_id = session.id.clone();
 
@@ -2065,7 +2060,6 @@ Do not mention this reminder to the user.\n</system-reminder>"
                     options: options.clone(),
                     allow_free_text,
                     allow_multiple,
-                    background,
                 },
             })
             .await;
@@ -2076,16 +2070,6 @@ Do not mention this reminder to the user.\n</system-reminder>"
                 status: SessionStatus::WaitingQuestion,
             })
             .await;
-
-        if background {
-            // Park without blocking the agent turn — deliver a steer when answered elsewhere.
-            return ToolOutput::success(format!(
-                "Background question parked (id={question_id}). Continue other work; the answer will arrive as a follow-up delivery."
-            ))
-            .with_delivery(format!(
-                "<system>Background AskUserQuestion {question_id} is waiting for the user. Do not block on it.</system>"
-            ));
-        }
 
         let response = session.wait_question(&question_id).await;
         if response.cancelled || session.is_interrupted() {

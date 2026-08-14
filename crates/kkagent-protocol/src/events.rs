@@ -260,9 +260,6 @@ pub struct QuestionPayload {
     /// When true, options are multi-select checkboxes.
     #[serde(default)]
     pub allow_multiple: bool,
-    /// When true, do not steal focus from the composer; show a badge instead.
-    #[serde(default)]
-    pub background: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

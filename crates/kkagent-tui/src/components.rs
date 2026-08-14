@@ -2833,7 +2833,6 @@ mod render_smoke {
             options,
             allow_free_text: false,
             allow_multiple: false,
-            background: false,
             selected: 0,
             free_text: String::new(),
         }

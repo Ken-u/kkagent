@@ -827,7 +827,6 @@ pub struct PendingQuestion {
     pub options: Vec<(String, String)>, // id, label
     pub allow_free_text: bool,
     pub allow_multiple: bool,
-    pub background: bool,
     pub selected: usize,
     pub toggled: Vec<bool>,
     pub free_text: String,
@@ -8308,7 +8307,6 @@ impl TuiApp {
                                     options,
                                     allow_free_text: question.allow_free_text,
                                     allow_multiple: question.allow_multiple,
-                                    background: question.background,
                                     selected: 0,
                                     toggled,
                                     free_text: String::new(),
@@ -8553,24 +8551,12 @@ impl TuiApp {
                             options,
                             allow_free_text: question.allow_free_text,
                             allow_multiple: question.allow_multiple,
-                            background: question.background,
                             selected: 0,
                             toggled,
                             free_text: String::new(),
                         };
-                        if question.background {
-                            if let Some(sid) = self.state.session_id.clone() {
-                                self.state.parked_questions.insert(sid.clone(), pending);
-                                self.state.tab_strip.mark_dirty(&sid, true);
-                            }
-                            self.system_message(
-                                "Background question waiting — open via session attention (Ctrl-N)."
-                                    .into(),
-                            );
-                        } else {
-                            self.state.question_pending = Some(pending);
-                            self.state.status = SessionStatus::WaitingQuestion;
-                        }
+                        self.state.question_pending = Some(pending);
+                        self.state.status = SessionStatus::WaitingQuestion;
                     }
                     AgentEvent::UsageUpdate { usage, .. } => {
                         self.state.approx_tokens =
