@@ -115,6 +115,7 @@ max_processes = 128
 # type = "stdio"
 # command = "npx"
 # args = ["-y", "@modelcontextprotocol/server-filesystem", "/absolute/path"]
+# cwd = "/optional/working/directory"
 # env = { "LOG_LEVEL" = "warn" }
 # timeout_ms = 30000
 

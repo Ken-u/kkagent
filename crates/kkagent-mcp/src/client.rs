@@ -22,10 +22,12 @@ pub enum McpTransportKind {
 #[derive(Debug, Clone)]
 pub struct McpServerConfig {
     pub name: String,
+    pub enabled: bool,
     pub transport: McpTransportKind,
     pub command: Option<String>,
     pub args: Vec<String>,
     pub env: HashMap<String, String>,
+    pub cwd: Option<String>,
     pub url: Option<String>,
     pub headers: HashMap<String, String>,
     pub oauth: Option<kkagent_config::McpOAuthConfig>,
@@ -47,10 +49,12 @@ impl McpServerConfig {
         };
         Self {
             name,
+            enabled: cfg.enabled.unwrap_or(true),
             transport,
             command: cfg.command.clone(),
             args: cfg.args.clone(),
             env: cfg.env.clone(),
+            cwd: cfg.cwd.clone(),
             url: cfg.url.clone(),
             headers: cfg.headers.clone(),
             oauth: cfg.oauth.clone(),
@@ -90,6 +94,7 @@ pub struct McpStatusSnapshot {
 pub struct McpCallOutput {
     pub text: String,
     pub images: Vec<kkagent_tools::MediaOutput>,
+    pub is_error: bool,
 }
 
 enum McpConnection {
@@ -99,7 +104,7 @@ enum McpConnection {
 }
 
 pub struct McpManager {
-    configs: Vec<McpServerConfig>,
+    configs: Arc<std::sync::RwLock<Vec<McpServerConfig>>>,
     connections: Arc<Mutex<HashMap<String, McpConnection>>>,
     tools_cache: Arc<Mutex<Vec<McpToolInfo>>>,
     oauth_store: Arc<McpOAuthStore>,
@@ -116,7 +121,7 @@ impl McpManager {
     pub fn new(configs: Vec<McpServerConfig>) -> Self {
         let (initialized, _) = watch::channel(configs.is_empty());
         Self {
-            configs,
+            configs: Arc::new(std::sync::RwLock::new(configs)),
             connections: Arc::new(Mutex::new(HashMap::new())),
             tools_cache: Arc::new(Mutex::new(Vec::new())),
             oauth_store: Arc::new(McpOAuthStore::default_location()),
@@ -131,7 +136,7 @@ impl McpManager {
     }
 
     pub fn configured_count(&self) -> usize {
-        self.configs.len()
+        self.configs_snapshot().len()
     }
 
     pub async fn wait_until_initialized(&self) {
@@ -176,16 +181,17 @@ impl McpManager {
     }
 
     pub async fn status_snapshot(&self) -> McpStatusSnapshot {
+        let configs = self.configs_snapshot();
         let servers = self.list_server_status().await;
         let connected = servers.iter().filter(|s| s.enabled && s.connected).count();
         let enabled = servers.iter().filter(|s| s.enabled).count();
         let tool_count = self.list_tools().await.len();
         McpStatusSnapshot {
-            configured: !self.configs.is_empty(),
+            configured: !configs.is_empty(),
             initialized: self.is_initialized(),
             connected,
             enabled,
-            total: self.configs.len(),
+            total: configs.len(),
             tool_count,
             servers,
         }
@@ -196,22 +202,31 @@ impl McpManager {
         *g = names.into_iter().collect();
     }
 
+    pub async fn disabled_names(&self) -> Vec<String> {
+        let mut names: Vec<_> = self.disabled.lock().await.iter().cloned().collect();
+        names.sort();
+        names
+    }
+
     pub async fn is_enabled(&self, name: &str) -> bool {
         !self.disabled.lock().await.contains(name)
     }
 
     pub fn configured_names(&self) -> Vec<String> {
-        self.configs.iter().map(|c| c.name.clone()).collect()
+        self.configs_snapshot()
+            .into_iter()
+            .map(|config| config.name)
+            .collect()
     }
 
-    pub fn server_configs(&self) -> &[McpServerConfig] {
-        &self.configs
+    pub fn server_configs(&self) -> Vec<McpServerConfig> {
+        self.configs_snapshot()
     }
 
     pub async fn list_server_status(&self) -> Vec<McpServerStatus> {
         let disabled = self.disabled.lock().await.clone();
         let connections = self.connections.lock().await;
-        self.configs
+        self.configs_snapshot()
             .iter()
             .map(|c| McpServerStatus {
                 name: c.name.clone(),
@@ -223,7 +238,11 @@ impl McpManager {
     }
 
     pub async fn set_enabled(&self, name: &str, enabled: bool) -> Result<()> {
-        if !self.configs.iter().any(|c| c.name == name) {
+        if !self
+            .configs_snapshot()
+            .iter()
+            .any(|config| config.name == name)
+        {
             anyhow::bail!("unknown MCP server {name}");
         }
         if enabled {
@@ -252,7 +271,7 @@ impl McpManager {
     pub async fn connect_all(&self) -> Result<()> {
         let disabled = self.disabled.lock().await.clone();
         let to_connect: Vec<McpServerConfig> = self
-            .configs
+            .configs_snapshot()
             .iter()
             .filter(|config| {
                 if disabled.contains(&config.name) {
@@ -289,12 +308,28 @@ impl McpManager {
         result
     }
 
+    /// Replace every configured server and reconnect. Plugin reload uses this
+    /// to atomically publish a newly discovered capability set.
+    pub async fn replace_configs(&self, configs: Vec<McpServerConfig>) -> Result<()> {
+        self.initialized.send_replace(configs.is_empty());
+        *self
+            .configs
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = configs;
+        self.connections.lock().await.clear();
+        self.tools_cache.lock().await.clear();
+        if self.configured_count() == 0 {
+            return Ok(());
+        }
+        self.connect_all().await
+    }
+
     pub async fn reconnect(&self, server_name: &str) -> Result<()> {
         if self.disabled.lock().await.contains(server_name) {
             anyhow::bail!("MCP server {server_name} is disabled");
         }
         let config = self
-            .configs
+            .configs_snapshot()
             .iter()
             .find(|c| c.name == server_name)
             .cloned()
@@ -360,6 +395,9 @@ impl McpManager {
         }
         for (key, val) in &config.env {
             cmd.env(key, val);
+        }
+        if let Some(cwd) = config.cwd.as_deref() {
+            cmd.current_dir(cwd);
         }
         cmd.stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -430,7 +468,7 @@ impl McpManager {
     /// Trigger interactive OAuth for a server (exposed as mcp auth tool).
     pub async fn authorize_server(&self, server_name: &str) -> Result<String> {
         let config = self
-            .configs
+            .configs_snapshot()
             .iter()
             .find(|c| c.name == server_name)
             .cloned()
@@ -492,7 +530,7 @@ impl McpManager {
         }
 
         // Synthetic authenticate tools for remote servers needing OAuth
-        for config in &self.configs {
+        for config in &self.configs_snapshot() {
             if config.url.is_some()
                 && (config.oauth.is_some()
                     || matches!(
@@ -523,6 +561,13 @@ impl McpManager {
         self.tools_cache.lock().await.clone()
     }
 
+    fn configs_snapshot(&self) -> Vec<McpServerConfig> {
+        self.configs
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
     pub async fn call_tool(
         &self,
         server_name: &str,
@@ -533,6 +578,7 @@ impl McpManager {
             return Ok(McpCallOutput {
                 text: self.authorize_server(server_name).await?,
                 images: Vec::new(),
+                is_error: false,
             });
         }
 
@@ -548,7 +594,10 @@ impl McpManager {
                     params = params.with_arguments(map);
                 }
                 let result = client.call_tool(params).await?;
-                let mut output = McpCallOutput::default();
+                let mut output = McpCallOutput {
+                    is_error: result.is_error.unwrap_or(false),
+                    ..McpCallOutput::default()
+                };
                 for content in &result.content {
                     match content {
                         rmcp::model::ContentBlock::Text(text) => {
@@ -614,10 +663,12 @@ mod tests {
     async fn configured_manager_becomes_ready_after_initial_discovery() {
         let manager = McpManager::new(vec![McpServerConfig {
             name: "disabled-test".into(),
+            enabled: false,
             transport: McpTransportKind::Stdio,
             command: None,
             args: Vec::new(),
             env: HashMap::new(),
+            cwd: None,
             url: None,
             headers: HashMap::new(),
             oauth: None,
@@ -638,5 +689,38 @@ mod tests {
         tokio::time::timeout(Duration::from_millis(100), manager.wait_until_initialized())
             .await
             .expect("connect_all should release readiness waiters");
+    }
+
+    #[tokio::test]
+    async fn replacing_configs_refreshes_status_without_starting_disabled_servers() {
+        let manager = McpManager::new(Vec::new());
+        manager
+            .set_disabled_names(["plugin-demo:search".to_string()])
+            .await;
+        manager
+            .replace_configs(vec![McpServerConfig {
+                name: "plugin-demo:search".into(),
+                enabled: false,
+                transport: McpTransportKind::Stdio,
+                command: Some("unused".into()),
+                args: Vec::new(),
+                env: HashMap::new(),
+                cwd: None,
+                url: None,
+                headers: HashMap::new(),
+                oauth: None,
+                timeout_ms: None,
+            }])
+            .await
+            .unwrap();
+
+        let status = manager.status_snapshot().await;
+        assert!(status.initialized);
+        assert_eq!(status.total, 1);
+        assert_eq!(status.enabled, 0);
+        assert_eq!(status.connected, 0);
+
+        manager.replace_configs(Vec::new()).await.unwrap();
+        assert_eq!(manager.status_snapshot().await.total, 0);
     }
 }

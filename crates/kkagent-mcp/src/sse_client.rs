@@ -264,7 +264,13 @@ impl SseMcpClient {
                 }),
             )
             .await?;
-        let mut output = crate::client::McpCallOutput::default();
+        let mut output = crate::client::McpCallOutput {
+            is_error: result
+                .get("isError")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            ..crate::client::McpCallOutput::default()
+        };
         if let Some(content) = result.get("content").and_then(|c| c.as_array()) {
             for block in content {
                 if let Some(text) = block.get("text").and_then(|t| t.as_str()) {

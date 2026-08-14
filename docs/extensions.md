@@ -88,16 +88,42 @@ Hook 进程工作目录是当前 workspace，并收到 `KKAGENT_HOOK_EVENT` 和 
 
 ## 插件
 
-插件从 `~/.kkagent/plugins/<directory>/plugin.json` 发现。当前 manifest 是轻量能力声明：
+插件从 `~/.kkagent/plugins/<directory>/` 发现，也兼容
+`~/.kkagent/plugins/managed/<id>/` 布局。Manifest 按以下优先级读取：
+
+1. `kk.plugin.json`；
+2. `.kk-plugin/plugin.json`；
+3. 旧版 kkagent `plugin.json`。
+
+KK plugin 使用 `mcpServers` 字段声明工具服务。最小示例：
 
 ```json
 {
-  "name": "team-conventions",
+  "name": "code-search",
   "version": "0.1.0",
-  "description": "Team prompt additions",
-  "prompt_append": "Always run the repository verification command before completion.",
-  "slash_commands": ["team-status"]
+  "description": "Remote source search",
+  "systemPrompt": "Use CodeSearch to locate remote source before reading local files.",
+  "mcpServers": {
+    "search": {
+      "transport": "stdio",
+      "command": "python3",
+      "args": ["./scripts/mcp_server.py"],
+      "cwd": "./"
+    }
+  }
 }
 ```
 
-当前插件面主要用于附加 prompt、列出 slash command 声明和展示元数据，不是通用动态 Rust 模块加载器。需要真正调用外部工具时优先使用 MCP，需要流程说明时优先使用 Skill。
+stdio `command` 必须是 PATH 中的命令，或以 `./` 开头、位于插件根目录内的文件；
+`cwd` 同样必须以 `./` 开头且不能通过 `..` 或符号链接逃逸插件目录。未填写
+`cwd` 时默认使用插件根目录。运行时会注入 `KKAGENT_HOME` 和
+`KKAGENT_PLUGIN_ROOT`。
+
+Plugin MCP server 使用 `plugin-<plugin-id>:<server-name>` 作为运行时名称，避免与
+`config.toml` 中的 MCP server 冲突。kkagent 启动时自动连接；每个 Agent turn 构建工具
+注册表时都会读取当前 MCP 工具集，因此新 session 自动获得插件工具。修改或安装插件后
+执行 `/plugins reload`，会重新扫描 manifest、重启 MCP 连接，并让后续 turn 使用新的工具。
+
+旧版 `prompt_append` 仍兼容，等价于 `systemPrompt`。插件 MCP 可通过 `/mcp` 以其运行时
+名称启用或禁用，状态保存在 `~/.kkagent/disabled.toml`。插件进程是本机可执行代码，只应
+安装可信插件；损坏的 MCP 声明会作为 `/plugins` diagnostics 展示，并且不会阻止其他插件加载。

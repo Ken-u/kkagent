@@ -5430,12 +5430,28 @@ impl TuiApp {
                         .and_then(|x| x.as_str())
                         .unwrap_or("plugin")
                         .to_string();
-                    let detail = p
+                    let mut detail = p
                         .get("path")
                         .or_else(|| p.get("version"))
                         .and_then(|x| x.as_str())
                         .unwrap_or("")
                         .to_string();
+                    let mcp_count = p
+                        .get("mcp_servers")
+                        .and_then(|value| value.as_array())
+                        .map(Vec::len)
+                        .unwrap_or(0);
+                    let diagnostic_count = p
+                        .get("diagnostics")
+                        .and_then(|value| value.as_array())
+                        .map(Vec::len)
+                        .unwrap_or(0);
+                    if mcp_count > 0 {
+                        detail.push_str(&format!(" · {mcp_count} MCP"));
+                    }
+                    if diagnostic_count > 0 {
+                        detail.push_str(&format!(" · {diagnostic_count} warning(s)"));
+                    }
                     items.push(ListPickerItem {
                         id: name.clone(),
                         label: name,
@@ -7788,6 +7804,27 @@ impl TuiApp {
                 self.open_auth_picker();
             }
             "plugins" | "plugin" => {
+                if args.trim() == "reload" {
+                    match self.client.rpc_call("plugins.reload", None).await {
+                        Ok(result) => self.system_message(format!(
+                            "Plugins reloaded: {} plugin(s), {} MCP server(s), {} tool(s)",
+                            result
+                                .get("plugins")
+                                .and_then(|value| value.as_u64())
+                                .unwrap_or(0),
+                            result
+                                .get("mcp_servers")
+                                .and_then(|value| value.as_u64())
+                                .unwrap_or(0),
+                            result
+                                .get("tools")
+                                .and_then(|value| value.as_u64())
+                                .unwrap_or(0),
+                        )),
+                        Err(error) => self.system_message(format!("Plugin reload failed: {error}")),
+                    }
+                    return Ok(());
+                }
                 self.begin_root_picker();
                 self.open_plugins_picker().await?;
             }

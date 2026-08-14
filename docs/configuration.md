@@ -233,6 +233,7 @@ type = "stdio"
 command = "npx"
 args = ["-y", "@modelcontextprotocol/server-filesystem", "/absolute/path"]
 env = { "LOG_LEVEL" = "warn" }
+cwd = "/optional/working/directory"
 timeout_ms = 30000
 ```
 

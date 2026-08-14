@@ -433,7 +433,7 @@ pub struct ServiceEndpoint {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpServerConfig {
     /// Transport: `stdio` (default), `sse`, `http`, or `streamable-http`.
-    #[serde(default, rename = "type")]
+    #[serde(default, rename = "type", alias = "transport")]
     pub transport_type: Option<String>,
     /// Stdio command (required for stdio transport).
     #[serde(default)]
@@ -442,6 +442,10 @@ pub struct McpServerConfig {
     pub args: Vec<String>,
     #[serde(default)]
     pub env: HashMap<String, String>,
+    /// Working directory for stdio servers. Plugin manifests restrict this to
+    /// paths inside the plugin root before it reaches the runtime.
+    #[serde(default)]
+    pub cwd: Option<String>,
     /// Remote URL for sse / http / streamable-http transports.
     #[serde(default)]
     pub url: Option<String>,
@@ -779,6 +783,7 @@ experimental_visible_empty_retries = 1
                 command: Some("echo".into()),
                 args: Vec::new(),
                 env: HashMap::new(),
+                cwd: None,
                 url: None,
                 headers: HashMap::new(),
                 oauth: None,

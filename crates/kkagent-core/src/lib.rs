@@ -51,7 +51,9 @@ pub use git_context::{collect_git_context, collect_git_context_with_trust, is_wo
 pub use media_pipeline::{extract_at_paths, resolve_media, MediaLimits, MediaRef};
 pub use model_capability::ModelCapability;
 pub use permission::*;
-pub use plugin::{LoadedPlugin, PluginManager, PluginManifest};
+pub use plugin::{
+    LoadedPlugin, PluginDiagnostic, PluginInfo, PluginInterface, PluginManager, PluginManifest,
+};
 pub use replay::ReplayBuilder;
 pub use scope_context::ScopeContext;
 pub use session::*;

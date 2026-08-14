@@ -2627,14 +2627,22 @@ impl ServerState {
     }
 }
 
-fn mcp_manager_from_config(config: &AppConfig) -> McpManager {
+fn configured_mcp_servers(config: &AppConfig) -> Vec<kkagent_mcp::McpServerConfig> {
     // Keep every configured server so /mcp can re-enable at runtime.
-    let configs: Vec<kkagent_mcp::McpServerConfig> = config
+    config
         .mcp_servers
         .iter()
         .map(|(name, cfg)| kkagent_mcp::McpServerConfig::from_app(name.clone(), cfg))
-        .collect();
-    McpManager::new(configs)
+        .collect()
+}
+
+async fn combined_mcp_servers(
+    config: &AppConfig,
+    plugins: &kkagent_core::PluginManager,
+) -> Vec<kkagent_mcp::McpServerConfig> {
+    let mut configs = configured_mcp_servers(config);
+    configs.extend(plugins.mcp_server_configs().await);
+    configs
 }
 
 fn open_transcript_with_policy(
@@ -2678,15 +2686,25 @@ async fn build_server_state(config: Arc<AppConfig>) -> Result<Arc<ServerState>> 
     let subagents = Arc::new(SubagentManager::from_shared(4, shared_sqlite)?);
     let sandbox_policy = kkagent_tools::sandbox::SandboxPolicy::from_app_config(&config)?;
 
-    let mcp = Arc::new(mcp_manager_from_config(&config));
+    let plugins_dir = kkagent_config::default_config_dir().join("plugins");
+    let plugins = kkagent_core::PluginManager::discover(&plugins_dir).await;
+    let mcp_configs = combined_mcp_servers(&config, &plugins).await;
+    let mcp_server_count = mcp_configs.len();
+    let mcp_servers_configured = !mcp_configs.is_empty();
+    let initially_disabled: Vec<String> = mcp_configs
+        .iter()
+        .filter(|server| {
+            !server.enabled
+                || config
+                    .disabled_mcp_servers
+                    .iter()
+                    .any(|name| name == &server.name)
+        })
+        .map(|server| server.name.clone())
+        .collect();
+    let mcp = Arc::new(McpManager::new(mcp_configs));
     {
-        let disabled: Vec<String> = config
-            .mcp_servers
-            .keys()
-            .filter(|name| config.is_mcp_disabled(name))
-            .cloned()
-            .collect();
-        mcp.set_disabled_names(disabled).await;
+        mcp.set_disabled_names(initially_disabled).await;
     }
 
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -2694,11 +2712,8 @@ async fn build_server_state(config: Arc<AppConfig>) -> Result<Arc<ServerState>> 
     hooks_mgr.load_from_app_config(&config.hooks).await;
     let cron_path = kkagent_config::default_config_dir().join("cron.json");
     let mcp_connect = mcp.clone();
-    let mcp_servers_configured = !config.mcp_servers.is_empty();
-    let mcp_server_count = config.mcp_servers.len();
     let extra_skill_dirs = config.extra_skill_dirs.clone();
     let merge_all_available_skills = config.merge_all_available_skills;
-    let plugins_dir = kkagent_config::default_config_dir().join("plugins");
     let mut background_tasks = Vec::new();
 
     // MCP startup can involve subprocess launches, remote handshakes, or OAuth.
@@ -2719,7 +2734,7 @@ async fn build_server_state(config: Arc<AppConfig>) -> Result<Arc<ServerState>> 
     }
 
     // Only local state needed by session creation remains on the critical path.
-    let (skills, hooks_discover, cron, plugins) = tokio::join!(
+    let (skills, hooks_discover, cron) = tokio::join!(
         kkagent_tools::SkillCatalog::configured(
             &cwd,
             &extra_skill_dirs,
@@ -2727,7 +2742,6 @@ async fn build_server_state(config: Arc<AppConfig>) -> Result<Arc<ServerState>> 
         ),
         hooks_mgr.discover(),
         kkagent_tools::CronManager::with_persist(cron_path),
-        kkagent_core::PluginManager::discover(&plugins_dir),
     );
 
     if let Err(e) = hooks_discover {
@@ -5493,6 +5507,33 @@ async fn handle_rpc_call(
         "plugins.list" => {
             let list = state.plugins.list().await;
             Ok(serde_json::json!({"plugins": list}))
+        }
+        "plugins.reload" => {
+            let count = state
+                .plugins
+                .reload()
+                .await
+                .map_err(|error| (-32000, error.to_string()))?;
+            let configs = combined_mcp_servers(&state.config, &state.plugins).await;
+            let mut disabled: std::collections::HashSet<String> =
+                state.mcp.disabled_names().await.into_iter().collect();
+            disabled.extend(
+                configs
+                    .iter()
+                    .filter(|server| !server.enabled)
+                    .map(|server| server.name.clone()),
+            );
+            state.mcp.set_disabled_names(disabled).await;
+            state
+                .mcp
+                .replace_configs(configs)
+                .await
+                .map_err(|error| (-32000, error.to_string()))?;
+            Ok(serde_json::json!({
+                "plugins": count,
+                "mcp_servers": state.mcp.configured_count(),
+                "tools": state.mcp.list_tools().await.len(),
+            }))
         }
         "session.compact" => {
             let session_id = params

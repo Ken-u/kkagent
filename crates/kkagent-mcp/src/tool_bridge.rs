@@ -86,7 +86,7 @@ impl Tool for McpProxyTool {
             .await
         {
             Ok(result) => {
-                let mut output = ToolOutput::success(if result.text.is_empty() {
+                let content = if result.text.is_empty() {
                     if result.images.is_empty() {
                         "(empty MCP result)".into()
                     } else {
@@ -94,7 +94,12 @@ impl Tool for McpProxyTool {
                     }
                 } else {
                     result.text
-                });
+                };
+                let mut output = if result.is_error {
+                    ToolOutput::error(content)
+                } else {
+                    ToolOutput::success(content)
+                };
                 for image in result.images {
                     match kkagent_tools::builtin::media::normalize_external_image(
                         &image.data,
