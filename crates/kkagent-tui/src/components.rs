@@ -4,7 +4,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Margin, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Clear, Paragraph},
+    widgets::{Block, Borders, Clear, Padding, Paragraph},
     Frame,
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -2553,17 +2553,18 @@ fn render_question_panel(f: &mut Frame, area: Rect, question: &mut PendingQuesti
     } else {
         area.width
     };
-    let content_width = panel_width.saturating_sub(2).max(1);
+    let content_width = panel_width.saturating_sub(4).max(1);
 
     let question_style = Style::default()
         .fg(theme.text_strong)
         .add_modifier(Modifier::BOLD);
     let mut lines: Vec<Line<'static>> = Vec::new();
-    push_wrapped_text(
+    push_wrapped_text_with_indent(
         &mut lines,
         &question.text,
         content_width as usize,
         question_style,
+        "  ",
     );
     lines.push(Line::from(""));
     let mut selected_range = (0usize, lines.len());
@@ -2653,9 +2654,9 @@ fn render_question_panel(f: &mut Frame, area: Rect, question: &mut PendingQuesti
     };
     let desired_height = u16::try_from(lines.len())
         .unwrap_or(u16::MAX)
-        .saturating_add(2);
-    let panel_height = desired_height.min(max_panel_height).max(3);
-    let inner_height = panel_height.saturating_sub(2) as usize;
+        .saturating_add(4);
+    let panel_height = desired_height.min(max_panel_height).max(5);
+    let inner_height = panel_height.saturating_sub(4) as usize;
     let selected_end_with_context = selected_range.1.saturating_add(2).min(lines.len());
     let scroll = selected_end_with_context
         .saturating_sub(inner_height)
@@ -2669,7 +2670,8 @@ fn render_question_panel(f: &mut Frame, area: Rect, question: &mut PendingQuesti
     let block = Block::default()
         .title(" question ")
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.primary));
+        .border_style(Style::default().fg(theme.primary))
+        .padding(Padding::uniform(1));
 
     f.render_widget(
         Paragraph::new(Text::from(lines))
@@ -2677,6 +2679,37 @@ fn render_question_panel(f: &mut Frame, area: Rect, question: &mut PendingQuesti
             .block(block),
         panel_area,
     );
+}
+
+fn push_wrapped_text_with_indent(
+    lines: &mut Vec<Line<'static>>,
+    text: &str,
+    width: usize,
+    style: Style,
+    indent: &str,
+) {
+    let indent_w = UnicodeWidthStr::width(indent);
+    let avail = width.saturating_sub(indent_w).max(1);
+    let mut first = true;
+    for logical_line in text.split('\n') {
+        if logical_line.is_empty() {
+            if first {
+                first = false;
+            }
+            lines.push(Line::from(""));
+            continue;
+        }
+        for chunk in wrap_str(logical_line, avail) {
+            if first {
+                lines.push(Line::from(Span::styled(chunk, style)));
+                first = false;
+            } else {
+                let mut s = indent.to_string();
+                s.push_str(&chunk);
+                lines.push(Line::from(Span::styled(s, style)));
+            }
+        }
+    }
 }
 
 fn push_wrapped_text(lines: &mut Vec<Line<'static>>, text: &str, width: usize, style: Style) {
@@ -2760,7 +2793,7 @@ mod render_smoke {
             .unwrap();
 
         let rendered = buffer_text(&terminal);
-        assert!(rendered.contains("another visual row"), "{rendered:?}");
+        assert!(rendered.contains("wrap onto another"), "{rendered:?}");
         assert!(rendered.contains("OPTION_TAIL"), "{rendered:?}");
         assert!(rendered.contains("enter confirm"), "{rendered:?}");
     }
