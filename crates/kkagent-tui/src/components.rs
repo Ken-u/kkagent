@@ -503,7 +503,13 @@ fn build_transcript_lines(state: &mut AppState, theme: &Theme, width: u16) -> Ve
             MessageRole::Assistant => {
                 // Thinking block (dim), like kimi
                 if let Some(ref thinking) = msg.thinking {
-                    push_thinking_lines(&mut lines, thinking, theme, state.tool_output_expanded);
+                    push_thinking_lines(
+                        &mut lines,
+                        thinking,
+                        width,
+                        theme,
+                        state.tool_output_expanded,
+                    );
                 }
 
                 // Chronological parts: tools stay where they were called;
@@ -685,10 +691,13 @@ fn build_transcript_lines(state: &mut AppState, theme: &Theme, width: u16) -> Ve
                 let all: Vec<&str> = state.thinking_text.lines().collect();
                 let start = all.len().saturating_sub(12);
                 for l in &all[start..] {
-                    lines.push(Line::from(Span::styled(
-                        format!("  {}", l),
+                    push_wrapped_indented_text(
+                        &mut lines,
+                        l,
+                        width,
+                        2,
                         Style::default().fg(theme.text_muted),
-                    )));
+                    );
                 }
             }
         }
@@ -740,6 +749,7 @@ pub(crate) fn push_assistant_markdown(
 pub(crate) fn push_thinking_lines(
     lines: &mut Vec<Line<'static>>,
     thinking: &str,
+    width: u16,
     theme: &Theme,
     expanded: bool,
 ) {
@@ -756,24 +766,27 @@ pub(crate) fn push_thinking_lines(
     let max_show = if expanded { usize::MAX } else { 20 };
     let show = think_lines.len().min(max_show);
     for line in &think_lines[..show] {
-        lines.push(Line::from(Span::styled(
-            format!("  {line}"),
-            Style::default().fg(theme.text_muted),
-        )));
+        push_wrapped_indented_text(lines, line, width, 2, Style::default().fg(theme.text_muted));
     }
     if think_lines.len() > show {
-        lines.push(Line::from(Span::styled(
-            format!(
-                "  ... ({} more lines, ctrl+o to expand)",
+        push_wrapped_indented_text(
+            lines,
+            &format!(
+                "... ({} more lines, ctrl+o to expand)",
                 think_lines.len() - show
             ),
+            width,
+            2,
             Style::default().fg(theme.text_muted),
-        )));
+        );
     } else if expanded && think_lines.len() > 20 {
-        lines.push(Line::from(Span::styled(
-            "  … (ctrl+o to collapse)",
+        push_wrapped_indented_text(
+            lines,
+            "… (ctrl+o to collapse)",
+            width,
+            2,
             Style::default().fg(theme.text_muted),
-        )));
+        );
     }
     lines.push(Line::from(""));
 }
@@ -2767,6 +2780,16 @@ fn push_wrapped_text_with_first_line_indent(
     }
 }
 
+pub(crate) fn push_wrapped_indented_text(
+    lines: &mut Vec<Line<'static>>,
+    text: &str,
+    width: u16,
+    indent: usize,
+    style: Style,
+) {
+    push_wrapped_text_with_first_line_indent(lines, text, width as usize, style, indent, 0);
+}
+
 fn push_wrapped_text(lines: &mut Vec<Line<'static>>, text: &str, width: usize, style: Style) {
     for logical_line in text.split('\n') {
         for chunk in wrap_str(logical_line, width) {
@@ -2942,7 +2965,7 @@ mod render_smoke {
             .join("\n");
         let theme = Theme::default();
         let mut collapsed = Vec::new();
-        push_thinking_lines(&mut collapsed, &thinking, &theme, false);
+        push_thinking_lines(&mut collapsed, &thinking, 80, &theme, false);
         let collapsed_text = collapsed
             .iter()
             .map(|line| line.to_string())
@@ -2951,13 +2974,34 @@ mod render_smoke {
         assert!(!collapsed_text.contains("reason 24"));
 
         let mut expanded = Vec::new();
-        push_thinking_lines(&mut expanded, &thinking, &theme, true);
+        push_thinking_lines(&mut expanded, &thinking, 80, &theme, true);
         let expanded_text = expanded
             .iter()
             .map(|line| line.to_string())
             .collect::<String>();
         assert!(expanded_text.contains("reason 24"));
         assert!(expanded_text.contains("ctrl+o to collapse"));
+    }
+
+    #[test]
+    fn thinking_wraps_wide_text_within_the_terminal_width() {
+        let mut lines = Vec::new();
+        push_thinking_lines(
+            &mut lines,
+            "你好世界abcdefghij",
+            10,
+            &Theme::default(),
+            false,
+        );
+
+        assert!(lines.len() > 3);
+        for line in &lines[1..lines.len() - 1] {
+            assert!(
+                UnicodeWidthStr::width(line.to_string().as_str()) <= 10,
+                "{:?}",
+                line.to_string()
+            );
+        }
     }
 
     #[test]

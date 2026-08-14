@@ -217,6 +217,7 @@ pub fn render_btw(
         crate::components::push_thinking_lines(
             &mut lines,
             turn.thinking.as_deref().unwrap_or(""),
+            area.width,
             theme,
             expanded,
         );
@@ -259,15 +260,19 @@ pub fn render_btw(
             let thinking_lines: Vec<&str> = state.current_thinking.lines().collect();
             let start = thinking_lines.len().saturating_sub(12);
             for line in &thinking_lines[start..] {
-                lines.push(Line::from(Span::styled(
-                    format!("  {line}"),
+                crate::components::push_wrapped_indented_text(
+                    &mut lines,
+                    line,
+                    area.width,
+                    2,
                     Style::default().fg(theme.text_muted),
-                )));
+                );
             }
         } else {
             crate::components::push_thinking_lines(
                 &mut lines,
                 &state.current_thinking,
+                area.width,
                 theme,
                 expanded,
             );
