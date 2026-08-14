@@ -418,6 +418,10 @@ pub struct FileMenuState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ListPickerKind {
     Model,
+    /// Decide whether fallback remains enabled when primary equals global fallback.
+    FallbackDecision,
+    /// Select a session-specific fallback model.
+    FallbackModel,
     Session,
     Permission,
     /// Toggle skills on/off (Enter toggles, Esc goes back).
@@ -3821,17 +3825,21 @@ impl TuiApp {
         let item = picker.items[picker.selected.min(picker.items.len() - 1)].clone();
         match picker.kind {
             ListPickerKind::Model => {
-                // Bind model to this session only; keep config default for /new.
-                if let Some(warn) = self.model_capability_precheck(&item.id) {
-                    self.system_message(warn);
+                self.apply_model_selection(item.id).await;
+            }
+            ListPickerKind::FallbackDecision => match item.id.as_str() {
+                "disabled" => {
+                    self.apply_fallback_selection("disabled", None).await;
+                    self.clear_list_pickers();
                 }
-                self.state.model_alias = Some(item.id.clone());
-                if let Some(sid) = &self.state.session_id {
-                    if let Err(e) = self.client.set_model(sid, &item.id).await {
-                        self.system_message(format!("Failed to set model on server: {}", e));
-                    }
+                "choose" => {
+                    self.state.list_picker_stack.push(picker);
+                    self.open_fallback_model_picker();
                 }
-                self.system_message(format!("Model set to: {}", item.id));
+                _ => self.clear_list_pickers(),
+            },
+            ListPickerKind::FallbackModel => {
+                self.apply_fallback_selection("model", Some(&item.id)).await;
                 self.clear_list_pickers();
             }
             ListPickerKind::Session => {
@@ -4369,6 +4377,137 @@ impl TuiApp {
 
     fn open_model_picker(&mut self) {
         self.open_model_picker_for_provider("");
+    }
+
+    async fn apply_model_selection(&mut self, model: String) {
+        // Bind model to this session only; keep config default for /new.
+        if let Some(warn) = self.model_capability_precheck(&model) {
+            self.system_message(warn);
+        }
+        let session_id = self.state.session_id.clone();
+        if let Some(session_id) = session_id.as_deref() {
+            if let Err(error) = self.client.set_model(session_id, &model).await {
+                self.system_message(format!("Failed to set model on server: {error}"));
+                self.clear_list_pickers();
+                return;
+            }
+        }
+        self.state.model_alias = Some(model.clone());
+        self.clear_list_pickers();
+
+        if model_matches_global_fallback(&self.config, &model) {
+            self.open_fallback_decision_picker();
+            self.system_message(format!(
+                "Model set to: {model}. It matches global fallback_model; choose this session's fallback policy."
+            ));
+        } else {
+            if let Some(session_id) = session_id.as_deref() {
+                if let Err(error) = self
+                    .client
+                    .set_fallback_model(session_id, "inherit", None)
+                    .await
+                {
+                    self.system_message(format!(
+                        "Model set, but failed to restore global fallback: {error}"
+                    ));
+                    return;
+                }
+            }
+            let suffix = self
+                .config
+                .fallback_model
+                .as_deref()
+                .map(|fallback| format!(" · fallback: {fallback}"))
+                .unwrap_or_default();
+            self.system_message(format!("Model set to: {model}{suffix}"));
+        }
+    }
+
+    async fn apply_fallback_selection(&mut self, mode: &str, model: Option<&str>) {
+        let Some(session_id) = self.state.session_id.clone() else {
+            self.system_message("No active session for fallback selection".into());
+            return;
+        };
+        match self
+            .client
+            .set_fallback_model(&session_id, mode, model)
+            .await
+        {
+            Ok(()) if mode == "disabled" => {
+                self.system_message("Fallback disabled for this session".into());
+            }
+            Ok(()) => {
+                self.system_message(format!(
+                    "Session fallback model set to: {}",
+                    model.unwrap_or("global config")
+                ));
+            }
+            Err(error) => {
+                self.system_message(format!("Failed to set session fallback: {error}"));
+            }
+        }
+    }
+
+    fn open_fallback_decision_picker(&mut self) {
+        let alternatives = self.fallback_model_items();
+        let mut items = vec![ListPickerItem {
+            id: "disabled".into(),
+            label: "Disable fallback".into(),
+            detail: "Use the selected model only for this session".into(),
+        }];
+        if !alternatives.is_empty() {
+            items.push(ListPickerItem {
+                id: "choose".into(),
+                label: "Enable with another model".into(),
+                detail: "Choose a different fallback for this session".into(),
+            });
+        }
+        self.replace_list_picker(ListPickerState {
+            kind: ListPickerKind::FallbackDecision,
+            title: " Primary equals global fallback ".into(),
+            items,
+            selected: 0,
+            filter: String::new(),
+            all_items: Vec::new(),
+        });
+    }
+
+    fn open_fallback_model_picker(&mut self) {
+        self.replace_list_picker(ListPickerState {
+            kind: ListPickerKind::FallbackModel,
+            title: " Select session fallback model ".into(),
+            items: self.fallback_model_items(),
+            selected: 0,
+            filter: String::new(),
+            all_items: Vec::new(),
+        });
+    }
+
+    fn fallback_model_items(&self) -> Vec<ListPickerItem> {
+        let primary = self.state.model_alias.as_deref();
+        let mut names = self
+            .config
+            .models
+            .keys()
+            .filter(|name| Some(name.as_str()) != primary)
+            .cloned()
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+            .into_iter()
+            .map(|name| {
+                let detail = self
+                    .config
+                    .resolve_model(&name)
+                    .map(|(model, _)| format!("{} · {}", model.provider, model.model))
+                    .unwrap_or_default();
+                ListPickerItem {
+                    id: name.clone(),
+                    label: name,
+                    detail,
+                }
+            })
+            .collect()
     }
 
     fn open_model_picker_for_provider(&mut self, provider: &str) {
@@ -7500,14 +7639,7 @@ impl TuiApp {
                     self.begin_root_picker();
                     self.open_model_picker();
                 } else if self.config.resolve_model(&args).is_some() {
-                    // Session-scoped; do not rewrite global config.default_model.
-                    self.state.model_alias = Some(args.clone());
-                    if let Some(sid) = &self.state.session_id {
-                        if let Err(e) = self.client.set_model(sid, &args).await {
-                            self.system_message(format!("Failed to set model on server: {}", e));
-                        }
-                    }
-                    self.system_message(format!("Model set to: {}", args));
+                    self.apply_model_selection(args.clone()).await;
                 } else {
                     self.system_message(format!(
                         "Unknown model '{}'. Use /model to pick from the list.",
@@ -9716,6 +9848,10 @@ fn history_turn_summary(text: &str, max_chars: usize) -> String {
     }
 }
 
+fn model_matches_global_fallback(config: &AppConfig, model: &str) -> bool {
+    config.fallback_model.as_deref() == Some(model)
+}
+
 #[cfg(test)]
 mod app_state_tests {
     use super::*;
@@ -9727,6 +9863,57 @@ mod app_state_tests {
         let rpc = kkagent_rpc::RpcClient::new(client_transport, event_tx);
         let client = kkagent_client::KkagentClient::new(rpc, event_rx);
         TuiApp::new(AppConfig::default(), client)
+    }
+
+    #[tokio::test]
+    async fn selecting_global_fallback_offers_disable_or_alternate_model() {
+        let mut app = test_tui_app();
+        app.config.fallback_model = Some("backup".into());
+        for model in ["primary", "backup", "alternate"] {
+            app.config.models.insert(
+                model.into(),
+                kkagent_config::ModelConfig {
+                    provider: "test".into(),
+                    model: model.into(),
+                    max_context_size: None,
+                    max_output_size: None,
+                    capabilities: Vec::new(),
+                    display_name: None,
+                    support_efforts: Vec::new(),
+                    default_effort: None,
+                    pricing: None,
+                    experimental_adaptive_thinking: false,
+                    experimental_visible_empty_retries: 0,
+                },
+            );
+        }
+        app.state.model_alias = Some("backup".into());
+
+        assert!(model_matches_global_fallback(&app.config, "backup"));
+        app.open_fallback_decision_picker();
+        let decision = app.state.list_picker.as_ref().unwrap();
+        assert_eq!(decision.kind, ListPickerKind::FallbackDecision);
+        assert_eq!(
+            decision
+                .items
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            ["disabled", "choose"]
+        );
+
+        app.open_fallback_model_picker();
+        let picker = app.state.list_picker.as_ref().unwrap();
+        assert_eq!(picker.kind, ListPickerKind::FallbackModel);
+        assert!(picker.items.iter().all(|item| item.id != "backup"));
+        assert_eq!(
+            picker
+                .items
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            ["alternate", "primary"]
+        );
     }
 
     #[tokio::test]

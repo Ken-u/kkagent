@@ -20,6 +20,7 @@ kkagent config preset safe
 | 字段 | 类型 | 默认值 | 说明 |
 |---|---:|---:|---|
 | `default_model` | string | 必填 | 默认模型别名，必须存在于 `models`。 |
+| `fallback_model` | string | 无 | 全局 fallback 模型别名；主模型耗尽单步重试后使用，必须存在于 `models`。 |
 | `secondary_model` | string | 无 | 可选的辅助模型别名。 |
 | `default_permission_mode` | string | `manual` | `manual`、`yolo` 或 `auto`。 |
 | `default_plan_mode` | bool | `false` | 新会话是否以 Plan 模式开始。 |
@@ -119,6 +120,10 @@ token_counting = "measured+estimated"
 ```
 
 `max_steps_per_turn` 不设置或设为 `0` 时不限制单轮 Agent 步数；只有正整数才会启用上限。
+
+`max_attempts_per_step` 是每个模型在单步推理中的尝试总数（包含首次请求）。配置顶层 `fallback_model` 后，主模型先完成这里指定的全部正常重试；仍失败时自动切换到 fallback，并重新获得同样的尝试次数。fallback 成功不会永久改变会话主模型，下一步仍从主模型开始；主模型与 fallback 相同则自动跳过 fallback。只有两个阶段都失败才向上返回错误。
+
+TUI 使用 `/model` 切换到全局 `fallback_model` 时，会要求为本次会话选择“禁用 fallback”或指定另一个 fallback 模型。该选择写入会话记录，恢复会话时继续生效；以后切换到其他主模型会恢复继承全局 fallback。
 
 当 LLM 返回 429 且未提供 `Retry-After` 时，`rate_limit_retry_base_seconds` 控制指数退避的基础时间，默认依次等待 5、10、20 秒。若服务端提供等待时间，则优先使用服务端值（最长 300 秒）。
 

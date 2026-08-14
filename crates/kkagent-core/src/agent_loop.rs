@@ -222,16 +222,16 @@ impl AgentLoop {
                 alias
             }
         };
-        let (model_config, provider_config) = self
+        let (primary_model_config, _) = self
             .config
             .resolve_model(&model_alias)
             .ok_or_else(|| anyhow::anyhow!("Model '{}' not found", model_alias))?;
         tracing::info!(
             "Using model alias={} id={}",
             model_alias,
-            model_config.model
+            primary_model_config.model
         );
-        let capability = ModelCapability::from_model(model_config);
+        let capability = ModelCapability::from_model(primary_model_config);
 
         // Sync token counting strategy from config.
         if let Some(lc) = &self.config.loop_control {
@@ -355,23 +355,6 @@ Do not mention this reminder to the user.\n</system-reminder>"
         let mut messages = self.prepare_messages(session, &tool_defs, &system_prompt);
         tracing::debug!("Conversation has {} messages (projected)", messages.len());
 
-        let thinking = self.config.thinking.as_ref().and_then(|t| {
-            if t.enabled || capability.thinking {
-                Some(ThinkingParams {
-                    budget_tokens: 10000,
-                    adaptive: model_config.experimental_adaptive_thinking,
-                    effort: model_config.experimental_adaptive_thinking.then(|| {
-                        t.effort
-                            .clone()
-                            .or_else(|| model_config.default_effort.clone())
-                            .unwrap_or_else(|| "high".into())
-                    }),
-                })
-            } else {
-                None
-            }
-        });
-
         let max_attempts = self
             .config
             .loop_control
@@ -394,7 +377,10 @@ Do not mention this reminder to the user.\n</system-reminder>"
         let mut terminal_stream_error: Option<String> = None;
         let mut rejected_tool_call_recovery: Option<ToolCallRollback> = None;
         let follows_tool_result = request_follows_tool_result(&messages);
-        let visible_empty_retry_limit = model_config.experimental_visible_empty_retries;
+        let mut active_model_alias = model_alias.clone();
+        let fallback_model_alias = session.resolve_fallback_model(&self.config);
+        let mut using_fallback = false;
+        let mut visible_empty_retry_limit = primary_model_config.experimental_visible_empty_retries;
         let mut visible_empty_retries = 0_u32;
         let mut failure_retries = 0_u32;
         let mut retry_notice_count = 0_u32;
@@ -409,10 +395,51 @@ Do not mention this reminder to the user.\n</system-reminder>"
             let mut rate_limited = false;
             let mut stop_reason: Option<String> = None;
 
+            let (model_config, provider_config) = self
+                .config
+                .resolve_model(&active_model_alias)
+                .ok_or_else(|| anyhow::anyhow!("Model '{}' not found", active_model_alias))?;
+            let active_capability = ModelCapability::from_model(model_config);
+            if using_fallback
+                && !active_capability.vision
+                && messages.iter().any(|message| {
+                    message
+                        .content
+                        .iter()
+                        .any(|content| matches!(content, ChatContent::Image { .. }))
+                })
+            {
+                terminal_stream_error = Some(format!(
+                    "Fallback model '{active_model_alias}' does not declare image input support"
+                ));
+                break;
+            }
+            let thinking = self.config.thinking.as_ref().and_then(|thinking_config| {
+                if thinking_config.enabled || active_capability.thinking {
+                    Some(ThinkingParams {
+                        budget_tokens: 10000,
+                        adaptive: model_config.experimental_adaptive_thinking,
+                        effort: model_config.experimental_adaptive_thinking.then(|| {
+                            thinking_config
+                                .effort
+                                .clone()
+                                .or_else(|| model_config.default_effort.clone())
+                                .unwrap_or_else(|| "high".into())
+                        }),
+                    })
+                } else {
+                    None
+                }
+            });
+
             let request = LlmRequest {
                 model: model_config.model.clone(),
                 messages: messages.clone(),
-                tools: tool_defs.clone(),
+                tools: if active_capability.tools {
+                    tool_defs.clone()
+                } else {
+                    Vec::new()
+                },
                 max_tokens: model_config.max_output_size.map(|v| v as u32),
                 system: Some(system_prompt.clone()),
                 thinking: thinking.clone(),
@@ -672,7 +699,7 @@ Do not mention this reminder to the user.\n</system-reminder>"
                     .request_size(&system_prompt, &tool_defs, &messages);
                 let configured = self
                     .config
-                    .resolve_model(&session.get_model_alias())
+                    .resolve_model(&active_model_alias)
                     .and_then(|(m, _)| m.max_context_size)
                     .unwrap_or(200_000);
                 session.observed_max_context = Some(observe_context_overflow(
@@ -743,6 +770,43 @@ Do not mention this reminder to the user.\n</system-reminder>"
                     break;
                 }
                 continue;
+            }
+            if failed && empty && !using_fallback {
+                if let Some(fallback_alias) = fallback_model_alias.as_ref() {
+                    let reason = last_stream_error
+                        .clone()
+                        .unwrap_or_else(|| "LLM returned an empty or incomplete stream".into());
+                    tracing::warn!(
+                        primary_model = %model_alias,
+                        fallback_model = %fallback_alias,
+                        attempts = max_attempts,
+                        %reason,
+                        "Primary model exhausted retries; switching to fallback model"
+                    );
+                    retry_notice_count += 1;
+                    send_llm_retry_notice(
+                        &self.event_tx,
+                        &session_id,
+                        retry_notice_count,
+                        format!(
+                            "Model {model_alias} failed after {max_attempts} attempt(s); switching to fallback {fallback_alias}: {reason}"
+                        ),
+                        Duration::ZERO,
+                        Duration::ZERO,
+                        true,
+                    )
+                    .await;
+                    active_model_alias.clone_from(fallback_alias);
+                    using_fallback = true;
+                    failure_retries = 0;
+                    visible_empty_retries = 0;
+                    visible_empty_retry_limit = self
+                        .config
+                        .resolve_model(fallback_alias)
+                        .map(|(model, _)| model.experimental_visible_empty_retries)
+                        .unwrap_or(0);
+                    continue;
+                }
             }
             if failed {
                 terminal_stream_error = Some(last_stream_error.unwrap_or_else(|| {
@@ -3090,6 +3154,225 @@ mod retry_tests {
                 .iter()
                 .any(|content| matches!(content, ChatContent::Text { text } if text == "recovered"))
         }));
+        std::fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[tokio::test]
+    async fn falls_back_only_after_primary_and_fallback_retry_budgets() {
+        let primary_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let primary_url = format!("http://{}", primary_listener.local_addr().unwrap());
+        let primary_server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut socket, _) = primary_listener.accept().await.unwrap();
+                let mut request = [0_u8; 8192];
+                let _ = socket.read(&mut request).await.unwrap();
+                let body = "primary unavailable";
+                let response = format!(
+                    "HTTP/1.1 503 Service Unavailable\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+
+        let fallback_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let fallback_url = format!("http://{}", fallback_listener.local_addr().unwrap());
+        let fallback_server = tokio::spawn(async move {
+            for attempt in 1..=2 {
+                let (mut socket, _) = fallback_listener.accept().await.unwrap();
+                let mut request = [0_u8; 8192];
+                let _ = socket.read(&mut request).await.unwrap();
+                let (status, content_type, body) = if attempt == 1 {
+                    (
+                        "503 Service Unavailable",
+                        "application/json",
+                        "fallback retry",
+                    )
+                } else {
+                    (
+                        "200 OK",
+                        "text/event-stream",
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"fallback recovered\"}}]}\n\
+                         data: [DONE]\n",
+                    )
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+
+        let mut config = AppConfig {
+            default_model: Some("primary".into()),
+            fallback_model: Some("fallback".into()),
+            loop_control: Some(LoopControlConfig {
+                max_attempts_per_step: 2,
+                rate_limit_retry_base_seconds: 0,
+                reserved_context_size: 1_000,
+                max_steps_per_turn: 1,
+                auto_compact: false,
+                compact_keep_last: 4,
+                token_counting: "estimated".into(),
+                ..Default::default()
+            }),
+            ..AppConfig::default()
+        };
+        for (name, base_url) in [("primary", primary_url), ("fallback", fallback_url)] {
+            config.providers.insert(
+                name.into(),
+                ProviderConfig {
+                    provider_type: "openai-chat".into(),
+                    api_key: Some("token".into()),
+                    base_url: Some(base_url),
+                    custom_headers: HashMap::new(),
+                    oauth: None,
+                },
+            );
+            config.models.insert(
+                name.into(),
+                ModelConfig {
+                    provider: name.into(),
+                    model: format!("{name}-model"),
+                    max_context_size: Some(16_000),
+                    max_output_size: Some(1_000),
+                    capabilities: Vec::new(),
+                    display_name: None,
+                    support_efforts: Vec::new(),
+                    default_effort: None,
+                    pricing: None,
+                    experimental_adaptive_thinking: false,
+                    experimental_visible_empty_retries: 0,
+                },
+            );
+        }
+
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let loop_ = AgentLoop::new(
+            Arc::new(config),
+            Arc::new(ToolRegistry::new()),
+            Arc::new(Mutex::new(PermissionChain::new(
+                PermissionMode::Auto,
+                Vec::new(),
+            ))),
+            event_tx,
+            Arc::new(Mutex::new(HashMap::new())),
+        );
+        let workspace =
+            std::env::temp_dir().join(format!("kkagent-fallback-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let mut session = Session::new(
+            "fallback-test".into(),
+            workspace.clone(),
+            PermissionMode::Auto,
+            "primary".into(),
+        );
+        session.add_user_message("recover this step".into());
+
+        loop_.run_turn(&mut session).await.unwrap();
+        primary_server.await.unwrap();
+        fallback_server.await.unwrap();
+        let retry_reasons = std::iter::from_fn(|| event_rx.try_recv().ok())
+            .filter_map(|event| match event {
+                AgentEvent::LlmRetry {
+                    reason, initial, ..
+                } if initial => Some(reason),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(retry_reasons.len(), 3);
+        assert!(retry_reasons[1].contains("switching to fallback fallback"));
+        assert_eq!(session.get_model_alias(), "primary");
+        assert!(session.messages.iter().any(|message| {
+            message.content.iter().any(
+                |content| matches!(content, ChatContent::Text { text } if text == "fallback recovered"),
+            )
+        }));
+        std::fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[tokio::test]
+    async fn returns_error_only_after_fallback_also_fails() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            for body in ["primary failed", "fallback failed"] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0_u8; 8192];
+                let _ = socket.read(&mut request).await.unwrap();
+                let response = format!(
+                    "HTTP/1.1 503 Service Unavailable\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+
+        let mut config = AppConfig {
+            default_model: Some("primary".into()),
+            fallback_model: Some("fallback".into()),
+            loop_control: Some(LoopControlConfig {
+                max_attempts_per_step: 1,
+                max_steps_per_turn: 1,
+                auto_compact: false,
+                ..Default::default()
+            }),
+            ..AppConfig::default()
+        };
+        config.providers.insert(
+            "test".into(),
+            ProviderConfig {
+                provider_type: "openai-chat".into(),
+                api_key: Some("token".into()),
+                base_url: Some(base_url),
+                custom_headers: HashMap::new(),
+                oauth: None,
+            },
+        );
+        for alias in ["primary", "fallback"] {
+            config.models.insert(
+                alias.into(),
+                ModelConfig {
+                    provider: "test".into(),
+                    model: alias.into(),
+                    max_context_size: Some(16_000),
+                    max_output_size: Some(1_000),
+                    capabilities: Vec::new(),
+                    display_name: None,
+                    support_efforts: Vec::new(),
+                    default_effort: None,
+                    pricing: None,
+                    experimental_adaptive_thinking: false,
+                    experimental_visible_empty_retries: 0,
+                },
+            );
+        }
+        let (event_tx, _) = mpsc::channel(16);
+        let loop_ = AgentLoop::new(
+            Arc::new(config),
+            Arc::new(ToolRegistry::new()),
+            Arc::new(Mutex::new(PermissionChain::new(
+                PermissionMode::Auto,
+                Vec::new(),
+            ))),
+            event_tx,
+            Arc::new(Mutex::new(HashMap::new())),
+        );
+        let workspace =
+            std::env::temp_dir().join(format!("kkagent-fallback-error-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let mut session = Session::new(
+            "fallback-error-test".into(),
+            workspace.clone(),
+            PermissionMode::Auto,
+            "primary".into(),
+        );
+        session.add_user_message("fail only after both models".into());
+
+        let error = loop_.run_turn(&mut session).await.unwrap_err();
+        server.await.unwrap();
+        assert!(error.to_string().contains("fallback failed"));
         std::fs::remove_dir_all(workspace).unwrap();
     }
 

@@ -82,6 +82,8 @@ Or create `~/.kkagent/config.toml` manually:
 
 ```toml
 default_model = "kimi-k2-0711-preview"
+# Optional: use after the primary exhausts its normal per-step retries
+# fallback_model = "backup-model"
 
 [providers.kimi]
 api_base = "https://api.moonshot.cn/v1"

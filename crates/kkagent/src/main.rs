@@ -15,8 +15,8 @@ use kkagent_core::plan_review::{resolve_exit_plan_approval, PlanReviewDisplay};
 use kkagent_core::SubagentMirrorContext;
 use kkagent_core::{
     AgentLifecycleService, AgentLoop, BtwTurn, PermissionChain, Session, SessionBtwService,
-    SessionCloseReason, SessionCreateSource, SessionSteerMailbox, SessionStore, SteerInput,
-    TranscriptDb,
+    SessionCloseReason, SessionCreateSource, SessionFallbackModel, SessionSteerMailbox,
+    SessionStore, SteerInput, TranscriptDb,
 };
 use kkagent_di::ServiceContainer;
 use kkagent_llm::{ChatContent, ChatMessage};
@@ -1080,12 +1080,14 @@ async fn ensure_session_loaded(state: &Arc<ServerState>, session_id: &str) -> Re
     } else {
         record.model
     };
+    let fallback_model = SessionFallbackModel::from_persisted(record.fallback_model.as_deref());
     let mut session = Session::resume(
         session_id.to_string(),
         PathBuf::from(record.working_dir),
         permission_mode,
         model,
     );
+    session.set_fallback_model(fallback_model);
     initialize_session_context(state, &mut session).await;
     session.messages = messages;
     session.persisted_message_count = session.messages.len();
@@ -1104,6 +1106,11 @@ async fn ensure_session_loaded(state: &Arc<ServerState>, session_id: &str) -> Re
         .lock()
         .await
         .insert(session_id.to_string(), session.model_alias.clone());
+    state
+        .fallback_models
+        .lock()
+        .await
+        .insert(session_id.to_string(), session.fallback_model.clone());
     state
         .permission_modes
         .lock()
@@ -1269,6 +1276,11 @@ impl kkagent_acp::AcpHost for AgentAcpHost {
             .lock()
             .await
             .insert(session_id.to_string(), session.model_alias.clone());
+        self.state
+            .fallback_models
+            .lock()
+            .await
+            .insert(session_id.to_string(), session.fallback_model.clone());
         self.state
             .permission_modes
             .lock()
@@ -1620,6 +1632,11 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
             .await
             .insert(id.clone(), session.model_alias.clone());
         self.state
+            .fallback_models
+            .lock()
+            .await
+            .insert(id.clone(), session.fallback_model.clone());
+        self.state
             .permission_modes
             .lock()
             .await
@@ -1691,6 +1708,7 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
         }
         self.state.interrupt_flags.lock().await.remove(id);
         self.state.model_aliases.lock().await.remove(id);
+        self.state.fallback_models.lock().await.remove(id);
         self.state.permission_modes.lock().await.remove(id);
         self.state.plan_mode_requests.lock().await.remove(id);
         self.state.approval_txs.lock().await.remove(id);
@@ -2415,6 +2433,8 @@ struct ServerState {
     interrupt_flags: Mutex<HashMap<String, Arc<AtomicBool>>>,
     /// Model alias handles — reachable mid-turn when session is removed from `sessions`.
     model_aliases: Mutex<HashMap<String, Arc<std::sync::Mutex<String>>>>,
+    /// Session fallback policy handles — reachable while a turn owns the Session.
+    fallback_models: Mutex<HashMap<String, Arc<std::sync::Mutex<SessionFallbackModel>>>>,
     /// Permission mode handles — reachable mid-turn so `/permission` → manual takes effect immediately.
     permission_modes: Mutex<HashMap<String, Arc<std::sync::Mutex<PermissionMode>>>>,
     /// Desired plan mode handles — reachable while the agent loop owns the Session.
@@ -2799,6 +2819,7 @@ async fn build_server_state(config: Arc<AppConfig>) -> Result<Arc<ServerState>> 
         active_btw_sessions: Mutex::new(HashMap::new()),
         interrupt_flags: Mutex::new(HashMap::new()),
         model_aliases: Mutex::new(HashMap::new()),
+        fallback_models: Mutex::new(HashMap::new()),
         permission_modes: Mutex::new(HashMap::new()),
         plan_mode_requests: Mutex::new(HashMap::new()),
         abort_registry: Arc::new(Mutex::new(HashMap::new())),
@@ -3592,6 +3613,11 @@ async fn handle_rpc_call(
                 .await
                 .insert(session_id.clone(), session.model_alias.clone());
             state
+                .fallback_models
+                .lock()
+                .await
+                .insert(session_id.clone(), session.fallback_model.clone());
+            state
                 .permission_modes
                 .lock()
                 .await
@@ -3827,6 +3853,7 @@ async fn handle_rpc_call(
             let removed = state.sessions.lock().await.remove(&session_id);
             state.interrupt_flags.lock().await.remove(&session_id);
             state.model_aliases.lock().await.remove(&session_id);
+            state.fallback_models.lock().await.remove(&session_id);
             state.permission_modes.lock().await.remove(&session_id);
             state.plan_mode_requests.lock().await.remove(&session_id);
             state.approval_txs.lock().await.remove(&session_id);
@@ -4181,6 +4208,9 @@ async fn handle_rpc_call(
                 perm_mode,
                 resumed_model,
             );
+            session.set_fallback_model(SessionFallbackModel::from_persisted(
+                record.fallback_model.as_deref(),
+            ));
             let resumed_model = session.get_model_alias();
             initialize_session_context(&state, &mut session).await;
             session.messages = messages.clone();
@@ -4210,6 +4240,11 @@ async fn handle_rpc_call(
                 .lock()
                 .await
                 .insert(session_id.clone(), session.model_alias.clone());
+            state
+                .fallback_models
+                .lock()
+                .await
+                .insert(session_id.clone(), session.fallback_model.clone());
             state
                 .permission_modes
                 .lock()
@@ -5047,6 +5082,78 @@ async fn handle_rpc_call(
                 })
                 .await;
             Ok(serde_json::json!({"ok": true, "model": model}))
+        }
+        "session.set_fallback_model" => {
+            let session_id = params
+                .as_ref()
+                .and_then(|p| p.get("session_id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let mode = params
+                .as_ref()
+                .and_then(|p| p.get("mode"))
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| (-32602, "Missing fallback mode".into()))?;
+            let fallback = match mode {
+                "inherit" => SessionFallbackModel::Inherit,
+                "disabled" => SessionFallbackModel::Disabled,
+                "model" => {
+                    let model = params
+                        .as_ref()
+                        .and_then(|p| p.get("model"))
+                        .and_then(|v| v.as_str())
+                        .filter(|model| !model.is_empty())
+                        .ok_or_else(|| (-32602, "Missing fallback model".into()))?;
+                    if state.config.resolve_model(model).is_none() {
+                        return Err((-32602, format!("Unknown fallback model: {model}")));
+                    }
+                    let primary = state
+                        .model_aliases
+                        .lock()
+                        .await
+                        .get(&session_id)
+                        .map(|alias| alias.lock().unwrap_or_else(|e| e.into_inner()).clone())
+                        .or_else(|| {
+                            state.sessions.try_lock().ok().and_then(|sessions| {
+                                sessions.get(&session_id).map(Session::get_model_alias)
+                            })
+                        });
+                    if primary.as_deref() == Some(model) {
+                        return Err((
+                            -32602,
+                            "Fallback model must differ from the session model".into(),
+                        ));
+                    }
+                    SessionFallbackModel::Model(model.to_string())
+                }
+                _ => return Err((-32602, format!("Unknown fallback mode: {mode}"))),
+            };
+
+            let mut updated = false;
+            if let Some(handle) = state.fallback_models.lock().await.get(&session_id) {
+                *handle.lock().unwrap_or_else(|e| e.into_inner()) = fallback.clone();
+                updated = true;
+            }
+            if let Some(session) = state.sessions.lock().await.get(&session_id) {
+                session.set_fallback_model(fallback.clone());
+                updated = true;
+            }
+            if !updated {
+                return Err((-32602, format!("Session not found: {session_id}")));
+            }
+            state
+                .transcript
+                .lock()
+                .await
+                .set_fallback_model(&session_id, fallback.persisted_value())
+                .map_err(|e| (-32000, e.to_string()))?;
+            tracing::info!(session_id, mode, "Session fallback model updated");
+            Ok(serde_json::json!({
+                "ok": true,
+                "mode": mode,
+                "model": fallback.persisted_value().filter(|model| !model.is_empty()),
+            }))
         }
         "session.cancel_tool" => {
             let session_id = params

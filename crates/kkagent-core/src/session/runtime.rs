@@ -38,6 +38,45 @@ pub struct SteerInput {
     pub images: Vec<(String, String)>,
 }
 
+/// Per-session override for the global `fallback_model` setting.
+///
+/// SQLite stores `NULL` for inherit, an empty string for disabled, and a model
+/// alias for an explicit override.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum SessionFallbackModel {
+    #[default]
+    Inherit,
+    Disabled,
+    Model(String),
+}
+
+impl SessionFallbackModel {
+    pub fn from_persisted(value: Option<&str>) -> Self {
+        match value {
+            None => Self::Inherit,
+            Some("") => Self::Disabled,
+            Some(model) => Self::Model(model.to_string()),
+        }
+    }
+
+    pub fn persisted_value(&self) -> Option<&str> {
+        match self {
+            Self::Inherit => None,
+            Self::Disabled => Some(""),
+            Self::Model(model) => Some(model.as_str()),
+        }
+    }
+
+    pub fn resolve(&self, config: &kkagent_config::AppConfig, primary: &str) -> Option<String> {
+        let fallback = match self {
+            Self::Inherit => config.fallback_model.as_deref(),
+            Self::Disabled => None,
+            Self::Model(model) => Some(model.as_str()),
+        }?;
+        (fallback != primary).then(|| fallback.to_string())
+    }
+}
+
 #[derive(Debug, Default)]
 struct SteerMailboxState {
     active: bool,
@@ -135,6 +174,8 @@ pub struct Session {
     /// Model alias from config (e.g. "local/claude-opus-4-8").
     /// Shared Arc so `/model` can update mid-turn while the session is out of the map.
     pub model_alias: Arc<std::sync::Mutex<String>>,
+    /// Session-level fallback policy; shared for mid-turn RPC updates.
+    pub fallback_model: Arc<std::sync::Mutex<SessionFallbackModel>>,
     /// How many messages have already been written to the transcript DB.
     pub persisted_message_count: usize,
     /// The in-memory history was compacted and must atomically replace the DB transcript.
@@ -295,6 +336,7 @@ impl Session {
             plan_id: plan_state.id,
             plan_file_path: plan_state.path,
             model_alias: Arc::new(std::sync::Mutex::new(model_alias)),
+            fallback_model: Arc::new(std::sync::Mutex::new(SessionFallbackModel::Inherit)),
             persisted_message_count: 0,
             transcript_rewrite_required: false,
             approval_waiters: HashMap::new(),
@@ -665,6 +707,25 @@ impl Session {
 
     pub fn set_model_alias(&self, alias: impl Into<String>) {
         *self.model_alias.lock().unwrap_or_else(|e| e.into_inner()) = alias.into();
+    }
+
+    pub fn get_fallback_model(&self) -> SessionFallbackModel {
+        self.fallback_model
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    pub fn set_fallback_model(&self, fallback: SessionFallbackModel) {
+        *self
+            .fallback_model
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = fallback;
+    }
+
+    pub fn resolve_fallback_model(&self, config: &kkagent_config::AppConfig) -> Option<String> {
+        self.get_fallback_model()
+            .resolve(config, &self.get_model_alias())
     }
 
     pub fn get_permission_mode(&self) -> PermissionMode {
@@ -1480,5 +1541,37 @@ mod working_directory_tests {
         session.trim_undo_stack();
         assert_eq!(session.undo_stack.len(), MAX_UNDO_TURNS);
         assert_eq!(session.undo_stack[0].message_start_index, 8);
+    }
+
+    #[test]
+    fn session_fallback_policy_resolves_global_disabled_and_custom_modes() {
+        let config = kkagent_config::AppConfig {
+            fallback_model: Some("backup".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            SessionFallbackModel::Inherit.resolve(&config, "primary"),
+            Some("backup".into())
+        );
+        assert_eq!(
+            SessionFallbackModel::Inherit.resolve(&config, "backup"),
+            None
+        );
+        assert_eq!(
+            SessionFallbackModel::Disabled.resolve(&config, "primary"),
+            None
+        );
+        assert_eq!(
+            SessionFallbackModel::Model("alternate".into()).resolve(&config, "primary"),
+            Some("alternate".into())
+        );
+        assert_eq!(
+            SessionFallbackModel::from_persisted(None),
+            SessionFallbackModel::Inherit
+        );
+        assert_eq!(
+            SessionFallbackModel::from_persisted(Some("")),
+            SessionFallbackModel::Disabled
+        );
     }
 }

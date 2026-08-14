@@ -15,6 +15,8 @@ pub struct SessionRecord {
     pub session_id: String,
     pub title: Option<String>,
     pub model: String,
+    /// `NULL` inherits global config, `""` disables fallback, otherwise an alias.
+    pub fallback_model: Option<String>,
     pub working_dir: String,
     pub created_at: String,
     pub updated_at: String,
@@ -91,6 +93,7 @@ impl TranscriptDb {
                 session_id TEXT PRIMARY KEY,
                 title TEXT,
                 model TEXT NOT NULL DEFAULT '',
+                fallback_model TEXT,
                 working_dir TEXT NOT NULL DEFAULT '.',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
@@ -115,6 +118,16 @@ impl TranscriptDb {
                 ON sessions(updated_at DESC);
             ",
         )?;
+        let has_fallback_model: bool = conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM pragma_table_info('sessions') WHERE name = 'fallback_model'
+            )",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_fallback_model {
+            conn.execute("ALTER TABLE sessions ADD COLUMN fallback_model TEXT", [])?;
+        }
         Ok(())
     }
 
@@ -148,6 +161,21 @@ impl TranscriptDb {
         let changed = self.lock()?.execute(
             "UPDATE sessions SET model = ?1, updated_at = ?2 WHERE session_id = ?3",
             params![model, Utc::now().to_rfc3339(), session_id],
+        )?;
+        if changed == 0 {
+            anyhow::bail!("session not found: {session_id}");
+        }
+        Ok(())
+    }
+
+    pub fn set_fallback_model(
+        &self,
+        session_id: &str,
+        fallback_model: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let changed = self.lock()?.execute(
+            "UPDATE sessions SET fallback_model = ?1, updated_at = ?2 WHERE session_id = ?3",
+            params![fallback_model, Utc::now().to_rfc3339(), session_id],
         )?;
         if changed == 0 {
             anyhow::bail!("session not found: {session_id}");
@@ -267,7 +295,7 @@ impl TranscriptDb {
     pub fn list_sessions(&self, limit: usize) -> anyhow::Result<Vec<SessionRecord>> {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
-            "SELECT session_id, title, model, working_dir, created_at, updated_at,
+            "SELECT session_id, title, model, fallback_model, working_dir, created_at, updated_at,
                     message_count, is_archived
              FROM sessions WHERE is_archived = 0
              ORDER BY updated_at DESC LIMIT ?1",
@@ -277,11 +305,12 @@ impl TranscriptDb {
                 session_id: row.get(0)?,
                 title: row.get(1)?,
                 model: row.get(2)?,
-                working_dir: row.get(3)?,
-                created_at: row.get(4)?,
-                updated_at: row.get(5)?,
-                message_count: row.get(6)?,
-                is_archived: row.get::<_, i32>(7)? != 0,
+                fallback_model: row.get(3)?,
+                working_dir: row.get(4)?,
+                created_at: row.get(5)?,
+                updated_at: row.get(6)?,
+                message_count: row.get(7)?,
+                is_archived: row.get::<_, i32>(8)? != 0,
             })
         })?;
         let mut sessions = Vec::new();
@@ -294,7 +323,7 @@ impl TranscriptDb {
     pub fn get_session(&self, session_id: &str) -> anyhow::Result<Option<SessionRecord>> {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
-            "SELECT session_id, title, model, working_dir, created_at, updated_at,
+            "SELECT session_id, title, model, fallback_model, working_dir, created_at, updated_at,
                     message_count, is_archived
              FROM sessions WHERE session_id = ?1",
         )?;
@@ -303,11 +332,12 @@ impl TranscriptDb {
                 session_id: row.get(0)?,
                 title: row.get(1)?,
                 model: row.get(2)?,
-                working_dir: row.get(3)?,
-                created_at: row.get(4)?,
-                updated_at: row.get(5)?,
-                message_count: row.get(6)?,
-                is_archived: row.get::<_, i32>(7)? != 0,
+                fallback_model: row.get(3)?,
+                working_dir: row.get(4)?,
+                created_at: row.get(5)?,
+                updated_at: row.get(6)?,
+                message_count: row.get(7)?,
+                is_archived: row.get::<_, i32>(8)? != 0,
             })
         })?;
         Ok(rows.next().and_then(|r| r.ok()))
@@ -382,12 +412,13 @@ impl TranscriptDb {
         let now = Utc::now().to_rfc3339();
         transaction.execute(
             "INSERT INTO sessions
-             (session_id, title, model, working_dir, created_at, updated_at, message_count, is_archived, summary)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, 0, ?7)",
+             (session_id, title, model, fallback_model, working_dir, created_at, updated_at, message_count, is_archived, summary)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, 0, ?8)",
             params![
                 target_id,
                 title.or(source.title.as_deref()),
                 source.model,
+                source.fallback_model,
                 source.working_dir,
                 now,
                 messages.len() as u32,
@@ -586,6 +617,7 @@ mod tests {
         let session = db.get_session("s1").unwrap().unwrap();
         assert_eq!(session.session_id, "s1");
         assert_eq!(session.model, "claude");
+        assert!(session.fallback_model.is_none());
         assert_eq!(session.message_count, 0);
     }
 
@@ -682,6 +714,73 @@ mod tests {
         let session = db.get_session("s1").unwrap().unwrap();
         assert_eq!(session.model, "kimi-code/kimi-k2.5");
         assert!(db.set_model("missing", "x").is_err());
+    }
+
+    #[test]
+    fn test_set_fallback_model_persists_all_session_modes() {
+        let db = test_db();
+        db.create_session("s1", "primary", ".").unwrap();
+
+        db.set_fallback_model("s1", Some("backup")).unwrap();
+        assert_eq!(
+            db.get_session("s1")
+                .unwrap()
+                .unwrap()
+                .fallback_model
+                .as_deref(),
+            Some("backup")
+        );
+
+        db.set_fallback_model("s1", Some("")).unwrap();
+        assert_eq!(
+            db.get_session("s1")
+                .unwrap()
+                .unwrap()
+                .fallback_model
+                .as_deref(),
+            Some("")
+        );
+
+        db.set_fallback_model("s1", None).unwrap();
+        assert!(db
+            .get_session("s1")
+            .unwrap()
+            .unwrap()
+            .fallback_model
+            .is_none());
+    }
+
+    #[test]
+    fn migration_adds_fallback_model_to_existing_session_table() {
+        let shared = open_shared_sqlite_memory().unwrap();
+        shared
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE sessions (
+                    session_id TEXT PRIMARY KEY,
+                    title TEXT,
+                    model TEXT NOT NULL DEFAULT '',
+                    working_dir TEXT NOT NULL DEFAULT '.',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    message_count INTEGER NOT NULL DEFAULT 0,
+                    is_archived INTEGER NOT NULL DEFAULT 0,
+                    summary TEXT
+                );",
+            )
+            .unwrap();
+        let db = TranscriptDb::from_shared(shared).unwrap();
+        db.create_session("legacy", "primary", ".").unwrap();
+        db.set_fallback_model("legacy", Some("backup")).unwrap();
+        assert_eq!(
+            db.get_session("legacy")
+                .unwrap()
+                .unwrap()
+                .fallback_model
+                .as_deref(),
+            Some("backup")
+        );
     }
 
     #[test]

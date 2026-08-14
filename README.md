@@ -82,6 +82,8 @@ kkagent init
 
 ```toml
 default_model = "kimi-k2-0711-preview"
+# 可选：主模型耗尽正常单步重试后切换到此模型
+# fallback_model = "backup-model"
 
 [providers.kimi]
 api_base = "https://api.moonshot.cn/v1"

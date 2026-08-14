@@ -80,6 +80,7 @@ Footer 第二行在 `context` 左侧显示当前有效沙箱模式：绿色 `●
 - `/fork [title]`：派生当前会话副本，仍停留在原会话；仅当存在 fork 族时，footer context 栏显示可切换会话，空输入下 `Tab` / `←` / `→` 循环切换。
 - `/sessions`：仅列出当前 workspace 中有内容的会话（正在查看的空会话仍可见）；离开空会话会自动丢弃记录。
 - `/sessions` 删除：`Ctrl+D` 后 ↑↓ 选 No/Yes（默认 No），Enter 确认。
+- `/model`：切换会话主模型。若选中的模型等于顶层 `fallback_model`，会继续弹出选择框，可为本次会话禁用 fallback，或另选一个不同的 fallback 模型。
 - 帮助与退出：`/help`、`/release-notes`、`/feedback`、`/info`、`/exit`、`/quit`、`/q`。
 
 部分命令仅展示状态或排队执行；输入 `/help` 可查看当前版本的参数提示。

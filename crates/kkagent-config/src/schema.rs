@@ -5,6 +5,10 @@ use std::collections::HashMap;
 pub struct AppConfig {
     #[serde(default)]
     pub default_model: Option<String>,
+    /// Global fallback model alias used after the primary model exhausts its
+    /// normal per-step retry budget.
+    #[serde(default)]
+    pub fallback_model: Option<String>,
     /// Optional secondary model alias for subagents / summarization.
     #[serde(default)]
     pub secondary_model: Option<String>,
@@ -542,6 +546,11 @@ impl AppConfig {
                 anyhow::bail!("secondary_model {secondary} is not present in [models]");
             }
         }
+        if let Some(fallback) = self.fallback_model.as_deref() {
+            if !self.models.contains_key(fallback) {
+                anyhow::bail!("fallback_model {fallback} is not present in [models]");
+            }
+        }
         for root in &self.trusted_workspaces {
             if !std::path::Path::new(root).is_absolute() {
                 anyhow::bail!("trusted workspace must be absolute: {root}");
@@ -628,6 +637,7 @@ mod tests {
     fn valid_config() -> AppConfig {
         let mut config = AppConfig {
             default_model: Some("test/model".into()),
+            fallback_model: None,
             ..AppConfig::default()
         };
         config.providers.insert(
@@ -662,6 +672,20 @@ mod tests {
     #[test]
     fn accepts_consistent_configuration() {
         valid_config().validate().unwrap();
+    }
+
+    #[test]
+    fn validates_global_fallback_model() {
+        let mut config = valid_config();
+        config.fallback_model = Some("missing/model".into());
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("fallback_model missing/model"));
+
+        config.fallback_model = Some("test/model".into());
+        config.validate().unwrap();
     }
 
     #[test]

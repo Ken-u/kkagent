@@ -257,6 +257,24 @@ impl KkagentClient {
         Ok(())
     }
 
+    pub async fn set_fallback_model(
+        &self,
+        session_id: &str,
+        mode: &str,
+        model: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let params = serde_json::json!({
+            "session_id": session_id,
+            "mode": mode,
+            "model": model,
+        });
+        self.rpc
+            .call("session.set_fallback_model", Some(params))
+            .await
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        Ok(())
+    }
+
     pub async fn rpc_call(
         &self,
         method: &str,
