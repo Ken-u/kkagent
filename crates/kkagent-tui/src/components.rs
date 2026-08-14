@@ -2559,12 +2559,13 @@ fn render_question_panel(f: &mut Frame, area: Rect, question: &mut PendingQuesti
         .fg(theme.text_strong)
         .add_modifier(Modifier::BOLD);
     let mut lines: Vec<Line<'static>> = Vec::new();
-    push_wrapped_text_with_indent(
+    push_wrapped_text_with_first_line_indent(
         &mut lines,
         &question.text,
         content_width as usize,
         question_style,
-        "  ",
+        2,
+        2,
     );
     lines.push(Line::from(""));
     let mut selected_range = (0usize, lines.len());
@@ -2681,33 +2682,34 @@ fn render_question_panel(f: &mut Frame, area: Rect, question: &mut PendingQuesti
     );
 }
 
-fn push_wrapped_text_with_indent(
+fn push_wrapped_text_with_first_line_indent(
     lines: &mut Vec<Line<'static>>,
     text: &str,
     width: usize,
     style: Style,
-    indent: &str,
+    left_padding: usize,
+    first_line_indent: usize,
 ) {
-    let indent_w = UnicodeWidthStr::width(indent);
-    let avail = width.saturating_sub(indent_w).max(1);
-    let mut first = true;
+    let left_padding = left_padding.min(width.saturating_sub(1));
+    let paragraph_width = width.saturating_sub(left_padding).max(1);
+    let first_line_indent = first_line_indent.min(paragraph_width.saturating_sub(1));
+    let padding = " ".repeat(left_padding);
+
     for logical_line in text.split('\n') {
         if logical_line.is_empty() {
-            if first {
-                first = false;
-            }
             lines.push(Line::from(""));
             continue;
         }
-        for chunk in wrap_str(logical_line, avail) {
-            if first {
-                lines.push(Line::from(Span::styled(chunk, style)));
-                first = false;
-            } else {
-                let mut s = indent.to_string();
-                s.push_str(&chunk);
-                lines.push(Line::from(Span::styled(s, style)));
-            }
+
+        // Keep every visual row away from the panel edge, then prefix the
+        // logical paragraph before wrapping so only its first row is indented
+        // one additional level.
+        let mut paragraph =
+            String::with_capacity(first_line_indent.saturating_add(logical_line.len()));
+        paragraph.push_str(&" ".repeat(first_line_indent));
+        paragraph.push_str(logical_line);
+        for chunk in wrap_str(&paragraph, paragraph_width) {
+            lines.push(Line::from(Span::styled(format!("{padding}{chunk}"), style)));
         }
     }
 }
@@ -2771,6 +2773,22 @@ mod render_smoke {
                 output.push_str(cell.symbol());
                 output
             })
+    }
+
+    #[test]
+    fn question_paragraphs_indent_only_the_first_visual_row() {
+        let mut lines = Vec::new();
+        push_wrapped_text_with_first_line_indent(
+            &mut lines,
+            "abcdefghij\n你好世界",
+            8,
+            Style::default(),
+            2,
+            2,
+        );
+
+        let rendered = lines.iter().map(Line::to_string).collect::<Vec<_>>();
+        assert_eq!(rendered, ["    abcd", "  efghij", "    你好", "  世界"]);
     }
 
     #[test]
