@@ -159,6 +159,13 @@ marketplace 的相对 `source` 应指向 ZIP。也支持普通 HTTP(S) ZIP，以
 `~/.kkagent/plugins/installed.json`；失败时恢复原版本。ZIP 下载限制为 64 MiB、解压后
 限制为 256 MiB/10000 个文件，并拒绝路径逃逸与符号链接。
 
+直接执行 `/plugins` 会打开多级管理弹窗：首页可进入已安装插件、插件市场，也可添加
+marketplace、从本地目录/ZIP/GitHub 来源安装或重新加载。选择 marketplace 后会先显示
+插件列表，再进入插件详情执行安装或更新；已安装插件详情支持启用、禁用、更新和带确认
+的移除。通过弹窗添加的 marketplace 会验证后保存到
+`~/.kkagent/plugins/marketplaces.json`，下次启动仍然可用。配置文件或环境变量指定的默认
+marketplace 也会显示在同一列表中。
+
 ```text
 /plugins marketplace [source]
 /plugins install <marketplace-id-or-source>
@@ -169,6 +176,8 @@ marketplace 的相对 `source` 应指向 ZIP。也支持普通 HTTP(S) ZIP，以
 /plugins info <id>
 /plugins reload
 ```
+
+这些子命令保留用于脚本和快速操作；不带参数的 `/plugins` 是推荐的交互入口。
 
 `remove` 删除安装记录但保留托管副本，重新安装即可恢复。安装和更新会执行插件声明的
 本机程序，因此只能使用可信 marketplace 和插件源。

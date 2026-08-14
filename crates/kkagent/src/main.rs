@@ -5585,6 +5585,69 @@ async fn handle_rpc_call(
                 "tools": tools,
             }))
         }
+        "plugins.marketplaces.list" => {
+            let mut marketplaces = Vec::new();
+            let mut sources = std::collections::HashSet::new();
+            if let Ok(source) = configured_plugin_marketplace(&state.config, None) {
+                sources.insert(source.clone());
+                marketplaces.push(serde_json::json!({
+                    "id": "default",
+                    "name": "Default marketplace",
+                    "source": source,
+                    "removable": false,
+                }));
+            }
+            for marketplace in state
+                .plugins
+                .registered_marketplaces()
+                .await
+                .map_err(|error| (-32000, error.to_string()))?
+            {
+                if sources.insert(marketplace.source.clone()) {
+                    marketplaces.push(serde_json::json!({
+                        "id": marketplace.id,
+                        "name": marketplace.name,
+                        "source": marketplace.source,
+                        "addedAt": marketplace.added_at,
+                        "removable": true,
+                    }));
+                }
+            }
+            Ok(serde_json::json!({"marketplaces": marketplaces}))
+        }
+        "plugins.marketplaces.add" => {
+            let source = params
+                .as_ref()
+                .and_then(|value| value.get("source"))
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| (-32602, "Missing plugin marketplace source".into()))?;
+            let name = params
+                .as_ref()
+                .and_then(|value| value.get("name"))
+                .and_then(|value| value.as_str());
+            let cwd = std::env::current_dir().map_err(|error| (-32000, error.to_string()))?;
+            let marketplace = state
+                .plugins
+                .add_marketplace(source, name, &cwd)
+                .await
+                .map_err(|error| (-32000, error.to_string()))?;
+            serde_json::to_value(marketplace).map_err(|error| (-32000, error.to_string()))
+        }
+        "plugins.marketplaces.remove" => {
+            let id = params
+                .as_ref()
+                .and_then(|value| value.get("id"))
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| (-32602, "Missing plugin marketplace id".into()))?;
+            state
+                .plugins
+                .remove_marketplace(id)
+                .await
+                .map_err(|error| (-32000, error.to_string()))?;
+            Ok(serde_json::json!({"id": id, "removed": true}))
+        }
         "plugins.marketplace" => {
             let explicit = params
                 .as_ref()

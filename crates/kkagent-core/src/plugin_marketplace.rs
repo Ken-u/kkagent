@@ -7,6 +7,7 @@ use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 
 const INSTALLED_VERSION: u32 = 1;
+const MARKETPLACES_VERSION: u32 = 1;
 const MAX_CATALOG_BYTES: usize = 4 * 1024 * 1024;
 const MAX_ARCHIVE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_EXTRACTED_BYTES: u64 = 256 * 1024 * 1024;
@@ -76,6 +77,31 @@ pub struct InstalledPluginRecord {
     pub marketplace_version: Option<String>,
     #[serde(default)]
     pub version: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginMarketplacesFile {
+    pub version: u32,
+    #[serde(default)]
+    pub marketplaces: Vec<RegisteredPluginMarketplace>,
+}
+
+impl Default for PluginMarketplacesFile {
+    fn default() -> Self {
+        Self {
+            version: MARKETPLACES_VERSION,
+            marketplaces: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RegisteredPluginMarketplace {
+    pub id: String,
+    pub name: String,
+    pub source: String,
+    pub added_at: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -217,6 +243,96 @@ pub async fn read_installed(plugins_dir: &Path) -> Result<InstalledPluginsFile> 
         )
     }
     Ok(installed)
+}
+
+pub async fn read_marketplaces(plugins_dir: &Path) -> Result<PluginMarketplacesFile> {
+    let path = plugins_dir.join("marketplaces.json");
+    let text = match tokio::fs::read_to_string(&path).await {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(PluginMarketplacesFile::default());
+        }
+        Err(error) => return Err(error).with_context(|| format!("cannot read {}", path.display())),
+    };
+    let marketplaces: PluginMarketplacesFile = serde_json::from_str(&text)
+        .with_context(|| format!("invalid plugin marketplace registry {}", path.display()))?;
+    if marketplaces.version != MARKETPLACES_VERSION {
+        anyhow::bail!(
+            "unsupported plugin marketplace registry version {}",
+            marketplaces.version
+        )
+    }
+    Ok(marketplaces)
+}
+
+pub async fn add_marketplace(
+    plugins_dir: &Path,
+    source: &str,
+    name: Option<&str>,
+    work_dir: &Path,
+) -> Result<RegisteredPluginMarketplace> {
+    let catalog = load_marketplace(source, work_dir).await?;
+    let mut marketplaces = read_marketplaces(plugins_dir).await?;
+    if marketplaces
+        .marketplaces
+        .iter()
+        .any(|marketplace| marketplace.source == catalog.source)
+    {
+        anyhow::bail!("plugin marketplace is already added")
+    }
+    let name = name
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| marketplace_name(&catalog.source));
+    if name.chars().count() > 80 {
+        anyhow::bail!("plugin marketplace name must be at most 80 characters")
+    }
+    let record = RegisteredPluginMarketplace {
+        id: uuid::Uuid::new_v4().to_string(),
+        name,
+        source: catalog.source,
+        added_at: chrono::Utc::now().to_rfc3339(),
+    };
+    marketplaces.marketplaces.push(record.clone());
+    marketplaces
+        .marketplaces
+        .sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
+    write_marketplaces(plugins_dir, &marketplaces).await?;
+    Ok(record)
+}
+
+pub async fn remove_marketplace(plugins_dir: &Path, id: &str) -> Result<()> {
+    let mut marketplaces = read_marketplaces(plugins_dir).await?;
+    let old_len = marketplaces.marketplaces.len();
+    marketplaces.marketplaces.retain(|entry| entry.id != id);
+    if marketplaces.marketplaces.len() == old_len {
+        anyhow::bail!("plugin marketplace {id} is not registered")
+    }
+    write_marketplaces(plugins_dir, &marketplaces).await
+}
+
+fn marketplace_name(source: &str) -> String {
+    reqwest::Url::parse(source)
+        .ok()
+        .and_then(|url| {
+            url.host_str().map(|host| {
+                let tail = url
+                    .path_segments()
+                    .and_then(|mut segments| segments.next_back())
+                    .filter(|value| !value.is_empty() && *value != "marketplace.json");
+                tail.map_or_else(|| host.to_string(), |value| format!("{host}/{value}"))
+            })
+        })
+        .or_else(|| {
+            Path::new(source)
+                .parent()
+                .and_then(Path::file_name)
+                .or_else(|| Path::new(source).file_stem())
+                .and_then(|value| value.to_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "Plugin marketplace".into())
 }
 
 pub async fn install_plugin(
@@ -700,6 +816,39 @@ async fn write_installed(plugins_dir: &Path, installed: &InstalledPluginsFile) -
     Ok(())
 }
 
+async fn write_marketplaces(
+    plugins_dir: &Path,
+    marketplaces: &PluginMarketplacesFile,
+) -> Result<()> {
+    tokio::fs::create_dir_all(plugins_dir).await?;
+    let target = plugins_dir.join("marketplaces.json");
+    let staging = plugins_dir.join(format!(".marketplaces-{}.tmp", uuid::Uuid::new_v4()));
+    tokio::fs::write(&staging, serde_json::to_vec_pretty(marketplaces)?).await?;
+    if let Err(error) = replace_file(&staging, &target, plugins_dir, "marketplaces").await {
+        let _ = tokio::fs::remove_file(&staging).await;
+        return Err(error);
+    }
+    Ok(())
+}
+
+async fn replace_file(staging: &Path, target: &Path, dir: &Path, prefix: &str) -> Result<()> {
+    let backup = dir.join(format!(".{prefix}-{}.backup", uuid::Uuid::new_v4()));
+    let had_target = tokio::fs::metadata(target).await.is_ok();
+    if had_target {
+        tokio::fs::rename(target, &backup).await?;
+    }
+    if let Err(error) = tokio::fs::rename(staging, target).await {
+        if had_target {
+            let _ = tokio::fs::rename(&backup, target).await;
+        }
+        return Err(error.into());
+    }
+    if had_target {
+        let _ = tokio::fs::remove_file(backup).await;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -744,6 +893,49 @@ mod tests {
             catalog.plugins[0].installed_version.as_deref(),
             Some("1.0.0")
         );
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    #[tokio::test]
+    async fn adds_and_removes_a_marketplace_registry_entry() {
+        let root = temp_dir();
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        tokio::fs::write(root.join("marketplace.json"), r#"{"plugins":[]}"#)
+            .await
+            .unwrap();
+
+        let added = add_marketplace(
+            &root.join("plugins"),
+            "marketplace.json",
+            Some("Local test"),
+            &root,
+        )
+        .await
+        .unwrap();
+        assert_eq!(added.name, "Local test");
+        assert!(
+            add_marketplace(&root.join("plugins"), "marketplace.json", None, &root,)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("already added")
+        );
+        assert_eq!(
+            read_marketplaces(&root.join("plugins"))
+                .await
+                .unwrap()
+                .marketplaces
+                .len(),
+            1
+        );
+        remove_marketplace(&root.join("plugins"), &added.id)
+            .await
+            .unwrap();
+        assert!(read_marketplaces(&root.join("plugins"))
+            .await
+            .unwrap()
+            .marketplaces
+            .is_empty());
         let _ = tokio::fs::remove_dir_all(root).await;
     }
 

@@ -55,7 +55,9 @@ pub use permission::*;
 pub use plugin::{
     LoadedPlugin, PluginDiagnostic, PluginInfo, PluginInterface, PluginManager, PluginManifest,
 };
-pub use plugin_marketplace::{InstalledPluginRecord, PluginMarketplace, PluginMarketplaceEntry};
+pub use plugin_marketplace::{
+    InstalledPluginRecord, PluginMarketplace, PluginMarketplaceEntry, RegisteredPluginMarketplace,
+};
 pub use replay::ReplayBuilder;
 pub use scope_context::ScopeContext;
 pub use session::*;

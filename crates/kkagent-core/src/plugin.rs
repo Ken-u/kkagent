@@ -345,6 +345,31 @@ impl PluginManager {
         Ok(marketplace)
     }
 
+    pub async fn registered_marketplaces(
+        &self,
+    ) -> anyhow::Result<Vec<crate::plugin_marketplace::RegisteredPluginMarketplace>> {
+        Ok(
+            crate::plugin_marketplace::read_marketplaces(&self.plugins_dir)
+                .await?
+                .marketplaces,
+        )
+    }
+
+    pub async fn add_marketplace(
+        &self,
+        source: &str,
+        name: Option<&str>,
+        work_dir: &Path,
+    ) -> anyhow::Result<crate::plugin_marketplace::RegisteredPluginMarketplace> {
+        let _guard = self.mutation.lock().await;
+        crate::plugin_marketplace::add_marketplace(&self.plugins_dir, source, name, work_dir).await
+    }
+
+    pub async fn remove_marketplace(&self, id: &str) -> anyhow::Result<()> {
+        let _guard = self.mutation.lock().await;
+        crate::plugin_marketplace::remove_marketplace(&self.plugins_dir, id).await
+    }
+
     pub async fn install(
         &self,
         source: &str,

@@ -129,6 +129,12 @@ pub struct AppState {
     pub list_picker: Option<ListPickerState>,
     /// Parents for nested pickers; Esc pops one level instead of closing all.
     pub list_picker_stack: Vec<ListPickerState>,
+    /// Text entry shown inside the plugin manager (marketplace/source URL or path).
+    pub plugin_prompt: Option<PluginPromptState>,
+    /// Marketplace currently being browsed by the plugin picker.
+    pub plugin_marketplace_source: Option<String>,
+    /// Plugin currently being inspected by the plugin picker.
+    pub plugin_selected_id: Option<String>,
     /// Background tasks browser overlay
     pub tasks_panel: Option<TasksPanelState>,
     /// Queued user prompt to send after a slash command (avoids async recursion)
@@ -444,6 +450,25 @@ pub enum ListPickerKind {
     Swarm,
     /// Select an earlier user prompt, fork before it, and edit the prompt.
     HistoryEdit,
+    PluginHome,
+    PluginInstalled,
+    PluginInstalledDetail,
+    PluginMarketplaces,
+    PluginMarketplaceEntries,
+    PluginMarketplaceDetail,
+    PluginConfirm,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PluginPromptKind {
+    AddMarketplace,
+    InstallSource,
+}
+
+#[derive(Debug, Clone)]
+pub struct PluginPromptState {
+    pub kind: PluginPromptKind,
+    pub value: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -899,6 +924,9 @@ impl AppState {
             file_menu: None,
             list_picker: None,
             list_picker_stack: Vec::new(),
+            plugin_prompt: None,
+            plugin_marketplace_source: None,
+            plugin_selected_id: None,
             tasks_panel: None,
             pending_prompt: None,
             tick: 0,
@@ -1515,10 +1543,14 @@ impl TuiApp {
                     }
                     Event::Paste(text) => {
                         self.flush_pending_scroll(&mut scroll_delta);
-                        let fold = self.state.mode != AppMode::Shell;
-                        self.state.input.paste_chunk(&text);
-                        self.state.input.force_flush_paste(fold);
-                        self.state.refresh_slash_menu();
+                        if let Some(prompt) = self.state.plugin_prompt.as_mut() {
+                            prompt.value.push_str(&text.replace(['\r', '\n'], ""));
+                        } else {
+                            let fold = self.state.mode != AppMode::Shell;
+                            self.state.input.paste_chunk(&text);
+                            self.state.input.force_flush_paste(fold);
+                            self.state.refresh_slash_menu();
+                        }
                     }
                     Event::Resize(_, _) => {
                         // Selection is clamped on the next render against new rows.
@@ -2088,6 +2120,9 @@ impl TuiApp {
     /// Close the topmost transient UI (menus / pickers / search / shell).
     /// Returns true if something was dismissed. Does not touch the agent turn.
     fn dismiss_transient_ui(&mut self) -> bool {
+        if self.state.plugin_prompt.take().is_some() {
+            return true;
+        }
         if self.state.session_delete_confirm.take().is_some() {
             return true;
         }
@@ -2144,6 +2179,9 @@ impl TuiApp {
     fn clear_list_pickers(&mut self) {
         self.state.list_picker = None;
         self.state.list_picker_stack.clear();
+        self.state.plugin_prompt = None;
+        self.state.plugin_marketplace_source = None;
+        self.state.plugin_selected_id = None;
         self.state.session_picker_preview = None;
         self.state.session_delete_confirm = None;
         self.state.history_edit_turns.clear();
@@ -2159,6 +2197,9 @@ impl TuiApp {
     /// Reset picker navigation before opening a slash-command root surface.
     fn begin_root_picker(&mut self) {
         self.state.list_picker_stack.clear();
+        self.state.plugin_prompt = None;
+        self.state.plugin_marketplace_source = None;
+        self.state.plugin_selected_id = None;
         self.state.session_picker_preview = None;
         self.state.session_delete_confirm = None;
         self.state.history_edit_turns.clear();
@@ -2480,6 +2521,27 @@ impl TuiApp {
         if matches!(key.code, KeyCode::Esc) && self.dismiss_transient_ui() {
             self.state.pending_esc_ms = None;
             self.state.quit_confirm = false;
+            return Ok(());
+        }
+
+        if self.state.plugin_prompt.is_some() {
+            match key.code {
+                KeyCode::Enter => self.submit_plugin_prompt().await?,
+                KeyCode::Backspace => {
+                    if let Some(prompt) = self.state.plugin_prompt.as_mut() {
+                        prompt.value.pop();
+                    }
+                }
+                KeyCode::Char(c)
+                    if !key.modifiers.contains(KeyModifiers::CONTROL)
+                        && !key.modifiers.contains(KeyModifiers::ALT) =>
+                {
+                    if let Some(prompt) = self.state.plugin_prompt.as_mut() {
+                        prompt.value.push(c);
+                    }
+                }
+                _ => {}
+            }
             return Ok(());
         }
 
@@ -3975,6 +4037,90 @@ impl TuiApp {
                     self.system_message(format!("Failed to fork conversation history: {error}"));
                 }
             }
+            ListPickerKind::PluginHome => {
+                self.state.list_picker_stack.push(picker);
+                let result = match item.id.as_str() {
+                    "installed" => self.open_installed_plugins_picker().await,
+                    "marketplaces" => self.open_plugin_marketplaces_picker().await,
+                    "add_marketplace" => {
+                        self.pop_list_picker_level();
+                        self.open_plugin_prompt(PluginPromptKind::AddMarketplace);
+                        Ok(())
+                    }
+                    "install_source" => {
+                        self.pop_list_picker_level();
+                        self.open_plugin_prompt(PluginPromptKind::InstallSource);
+                        Ok(())
+                    }
+                    "reload" => {
+                        self.pop_list_picker_level();
+                        self.reload_plugins_from_picker().await;
+                        Ok(())
+                    }
+                    _ => {
+                        self.pop_list_picker_level();
+                        Ok(())
+                    }
+                };
+                if let Err(error) = result {
+                    self.pop_list_picker_level();
+                    self.system_message(format!("Failed to open plugin manager: {error}"));
+                }
+            }
+            ListPickerKind::PluginInstalled => {
+                self.state.plugin_selected_id = Some(item.id.clone());
+                self.state.list_picker_stack.push(picker);
+                if let Err(error) = self.open_installed_plugin_detail(&item.id).await {
+                    self.pop_list_picker_level();
+                    self.system_message(format!("Failed to load plugin details: {error}"));
+                }
+            }
+            ListPickerKind::PluginInstalledDetail => {
+                self.apply_installed_plugin_action(picker, &item.id).await?;
+            }
+            ListPickerKind::PluginMarketplaces => {
+                if item.id == "__add__" {
+                    self.state.list_picker = Some(picker);
+                    self.open_plugin_prompt(PluginPromptKind::AddMarketplace);
+                } else {
+                    let source = serde_json::from_str::<serde_json::Value>(&item.id)
+                        .ok()
+                        .and_then(|descriptor| {
+                            descriptor
+                                .get("source")
+                                .and_then(|value| value.as_str())
+                                .map(str::to_string)
+                        });
+                    if let Some(source) = source {
+                        self.state.plugin_marketplace_source = Some(source.clone());
+                        self.state.list_picker_stack.push(picker);
+                        if let Err(error) = self.open_marketplace_entries_picker(&source).await {
+                            self.pop_list_picker_level();
+                            self.system_message(format!(
+                                "Failed to load plugin marketplace: {error}"
+                            ));
+                        }
+                    } else {
+                        self.state.list_picker = Some(picker);
+                        self.system_message("Plugin marketplace source is missing.".into());
+                    }
+                }
+            }
+            ListPickerKind::PluginMarketplaceEntries => {
+                self.state.plugin_selected_id = Some(item.id.clone());
+                self.state.list_picker_stack.push(picker);
+                if let Err(error) = self.open_marketplace_plugin_detail(&item.id).await {
+                    self.pop_list_picker_level();
+                    self.system_message(format!("Failed to load marketplace plugin: {error}"));
+                }
+            }
+            ListPickerKind::PluginMarketplaceDetail => {
+                self.apply_marketplace_plugin_action(picker, &item.id)
+                    .await?;
+            }
+            ListPickerKind::PluginConfirm => {
+                self.apply_plugin_confirmation(picker, &item.id).await?;
+            }
             ListPickerKind::SkillManage | ListPickerKind::McpManage => {
                 // Enter is handled by toggle_manage_picker; keep picker open.
                 self.state.list_picker = Some(picker);
@@ -5420,84 +5566,587 @@ impl TuiApp {
     }
 
     async fn open_plugins_picker(&mut self) -> anyhow::Result<()> {
-        let mut items = Vec::new();
-        if let Ok(v) = self.client.rpc_call("plugins.list", None).await {
-            if let Some(arr) = v.get("plugins").and_then(|p| p.as_array()) {
-                for p in arr {
-                    let name = p
-                        .get("name")
-                        .or_else(|| p.get("id"))
-                        .and_then(|x| x.as_str())
-                        .unwrap_or("plugin")
-                        .to_string();
-                    let mut detail = p
-                        .get("path")
-                        .or_else(|| p.get("version"))
-                        .and_then(|x| x.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let mcp_count = p
-                        .get("mcp_servers")
-                        .and_then(|value| value.as_array())
-                        .map(Vec::len)
-                        .unwrap_or(0);
-                    let diagnostic_count = p
-                        .get("diagnostics")
-                        .and_then(|value| value.as_array())
-                        .map(Vec::len)
-                        .unwrap_or(0);
-                    if mcp_count > 0 {
-                        detail.push_str(&format!(" · {mcp_count} MCP"));
-                    }
-                    if diagnostic_count > 0 {
-                        detail.push_str(&format!(" · {diagnostic_count} warning(s)"));
-                    }
-                    if p.get("managed")
-                        .and_then(|value| value.as_bool())
-                        .unwrap_or(false)
-                    {
-                        detail.push_str(" · managed");
-                    }
-                    if !p
-                        .get("enabled")
-                        .and_then(|value| value.as_bool())
-                        .unwrap_or(true)
-                    {
-                        detail.push_str(" · disabled");
-                    }
-                    items.push(ListPickerItem {
-                        id: name.clone(),
-                        label: name,
-                        detail,
-                    });
-                }
-            } else if let Some(obj) = v.as_object() {
-                for (k, val) in obj {
-                    items.push(ListPickerItem {
-                        id: k.clone(),
-                        label: k.clone(),
-                        detail: val.to_string(),
-                    });
-                }
-            }
-        }
-        if items.is_empty() {
-            let dir = kkagent_config::default_config_dir().join("plugins");
-            items.push(ListPickerItem {
-                id: "hint".into(),
-                label: "(none loaded)".into(),
-                detail: format!("drop plugin.json under {}", dir.display()),
-            });
-        }
+        let items = vec![
+            ListPickerItem {
+                id: "installed".into(),
+                label: "Installed plugins".into(),
+                detail: "view, update, enable, disable, or remove".into(),
+            },
+            ListPickerItem {
+                id: "marketplaces".into(),
+                label: "Plugin marketplaces".into(),
+                detail: "browse marketplaces and plugin details".into(),
+            },
+            ListPickerItem {
+                id: "add_marketplace".into(),
+                label: "Add marketplace".into(),
+                detail: "register a catalog URL or local JSON path".into(),
+            },
+            ListPickerItem {
+                id: "install_source".into(),
+                label: "Install from source".into(),
+                detail: "local directory, ZIP URL, or GitHub repository".into(),
+            },
+            ListPickerItem {
+                id: "reload".into(),
+                label: "Reload plugins".into(),
+                detail: "rediscover plugins and restart plugin MCP servers".into(),
+            },
+        ];
         self.replace_list_picker(ListPickerState {
-            kind: ListPickerKind::Browse,
-            title: " Plugins ".into(),
+            kind: ListPickerKind::PluginHome,
+            title: " Plugins · Enter select · Esc close ".into(),
             items,
             selected: 0,
 
             filter: String::new(),
             all_items: Vec::new(),
         });
+        Ok(())
+    }
+
+    async fn open_installed_plugins_picker(&mut self) -> anyhow::Result<()> {
+        let result = self.client.rpc_call("plugins.list", None).await?;
+        let mut items = Vec::new();
+        for plugin in result
+            .get("plugins")
+            .and_then(|value| value.as_array())
+            .into_iter()
+            .flatten()
+        {
+            let id = plugin
+                .get("name")
+                .and_then(|value| value.as_str())
+                .unwrap_or("plugin");
+            let display_name = plugin
+                .get("display_name")
+                .and_then(|value| value.as_str())
+                .unwrap_or(id);
+            let version = plugin
+                .get("version")
+                .and_then(|value| value.as_str())
+                .unwrap_or("?");
+            let enabled = plugin
+                .get("enabled")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(true);
+            let managed = plugin
+                .get("managed")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false);
+            items.push(ListPickerItem {
+                id: id.into(),
+                label: display_name.into(),
+                detail: format!(
+                    "v{version} · {}{}",
+                    if enabled { "enabled" } else { "disabled" },
+                    if managed { " · managed" } else { "" }
+                ),
+            });
+        }
+        self.replace_list_picker(ListPickerState {
+            kind: ListPickerKind::PluginInstalled,
+            title: " Installed plugins · Enter details · Esc back ".into(),
+            all_items: items.clone(),
+            items,
+            selected: 0,
+            filter: String::new(),
+        });
+        Ok(())
+    }
+
+    async fn open_installed_plugin_detail(&mut self, id: &str) -> anyhow::Result<()> {
+        let plugin = self
+            .client
+            .rpc_call("plugins.info", Some(serde_json::json!({"id": id})))
+            .await?;
+        let enabled = plugin
+            .get("enabled")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(true);
+        let managed = plugin
+            .get("managed")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        let mut items = vec![ListPickerItem {
+            id: if enabled { "disable" } else { "enable" }.into(),
+            label: if enabled { "Disable" } else { "Enable" }.into(),
+            detail: "apply to this plugin and its MCP servers".into(),
+        }];
+        if managed {
+            items.push(ListPickerItem {
+                id: "update".into(),
+                label: "Update".into(),
+                detail: "reinstall from the recorded source".into(),
+            });
+            items.push(ListPickerItem {
+                id: "remove".into(),
+                label: "Remove".into(),
+                detail: "remove it from the managed plugin set".into(),
+            });
+        }
+        for (label, value) in [
+            ("Version", plugin.get("version").and_then(|v| v.as_str())),
+            (
+                "Description",
+                plugin.get("description").and_then(|v| v.as_str()),
+            ),
+            ("Path", plugin.get("path").and_then(|v| v.as_str())),
+        ] {
+            if let Some(value) = value.filter(|value| !value.is_empty()) {
+                items.push(ListPickerItem {
+                    id: "__info__".into(),
+                    label: label.into(),
+                    detail: value.into(),
+                });
+            }
+        }
+        let mcp = plugin
+            .get("mcp_servers")
+            .and_then(|value| value.as_array())
+            .map(|servers| {
+                servers
+                    .iter()
+                    .filter_map(|value| value.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default();
+        if !mcp.is_empty() {
+            items.push(ListPickerItem {
+                id: "__info__".into(),
+                label: "MCP servers".into(),
+                detail: mcp,
+            });
+        }
+        self.replace_list_picker(ListPickerState {
+            kind: ListPickerKind::PluginInstalledDetail,
+            title: format!(" {id} · plugin details · Esc back "),
+            all_items: items.clone(),
+            items,
+            selected: 0,
+            filter: String::new(),
+        });
+        Ok(())
+    }
+
+    async fn open_plugin_marketplaces_picker(&mut self) -> anyhow::Result<()> {
+        let result = self
+            .client
+            .rpc_call("plugins.marketplaces.list", None)
+            .await?;
+        let mut items = Vec::new();
+        for marketplace in result
+            .get("marketplaces")
+            .and_then(|value| value.as_array())
+            .into_iter()
+            .flatten()
+        {
+            let source = marketplace
+                .get("source")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default();
+            let descriptor = serde_json::json!({
+                "id": marketplace.get("id").and_then(|value| value.as_str()),
+                "source": source,
+                "removable": marketplace.get("removable").and_then(|value| value.as_bool()).unwrap_or(false),
+            });
+            items.push(ListPickerItem {
+                id: descriptor.to_string(),
+                label: marketplace
+                    .get("name")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("Marketplace")
+                    .into(),
+                detail: source.into(),
+            });
+        }
+        items.push(ListPickerItem {
+            id: "__add__".into(),
+            label: "+ Add marketplace".into(),
+            detail: "catalog URL or local marketplace.json".into(),
+        });
+        self.replace_list_picker(ListPickerState {
+            kind: ListPickerKind::PluginMarketplaces,
+            title: " Plugin marketplaces · Enter browse · Esc back ".into(),
+            all_items: items.clone(),
+            items,
+            selected: 0,
+            filter: String::new(),
+        });
+        Ok(())
+    }
+
+    async fn open_marketplace_entries_picker(&mut self, source: &str) -> anyhow::Result<()> {
+        let result = self
+            .client
+            .rpc_call(
+                "plugins.marketplace",
+                Some(serde_json::json!({"source": source})),
+            )
+            .await?;
+        let items = result
+            .get("plugins")
+            .and_then(|value| value.as_array())
+            .into_iter()
+            .flatten()
+            .map(|plugin| {
+                let id = plugin
+                    .get("id")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("plugin");
+                let name = plugin
+                    .get("displayName")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or(id);
+                let version = plugin
+                    .get("version")
+                    .and_then(|value| value.as_str())
+                    .map(|version| format!("v{version}"))
+                    .unwrap_or_default();
+                let status = if plugin
+                    .get("updateAvailable")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false)
+                {
+                    "update available"
+                } else if plugin
+                    .get("installed")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false)
+                {
+                    "installed"
+                } else {
+                    "available"
+                };
+                ListPickerItem {
+                    id: id.into(),
+                    label: name.into(),
+                    detail: format!("{version} · {status}"),
+                }
+            })
+            .collect::<Vec<_>>();
+        self.replace_list_picker(ListPickerState {
+            kind: ListPickerKind::PluginMarketplaceEntries,
+            title: " Marketplace plugins · Enter details · Esc back ".into(),
+            all_items: items.clone(),
+            items,
+            selected: 0,
+            filter: String::new(),
+        });
+        Ok(())
+    }
+
+    async fn marketplace_plugin(&self, id: &str) -> anyhow::Result<serde_json::Value> {
+        let source = self
+            .state
+            .plugin_marketplace_source
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("no marketplace is selected"))?;
+        let result = self
+            .client
+            .rpc_call(
+                "plugins.marketplace",
+                Some(serde_json::json!({"source": source})),
+            )
+            .await?;
+        result
+            .get("plugins")
+            .and_then(|value| value.as_array())
+            .and_then(|plugins| {
+                plugins
+                    .iter()
+                    .find(|plugin| plugin.get("id").and_then(|value| value.as_str()) == Some(id))
+            })
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("plugin {id} is no longer in the marketplace"))
+    }
+
+    async fn open_marketplace_plugin_detail(&mut self, id: &str) -> anyhow::Result<()> {
+        let plugin = self.marketplace_plugin(id).await?;
+        let installed = plugin
+            .get("installed")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        let update = plugin
+            .get("updateAvailable")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        let mut items = vec![ListPickerItem {
+            id: if update { "update" } else { "install" }.into(),
+            label: if update {
+                "Update plugin"
+            } else if installed {
+                "Reinstall plugin"
+            } else {
+                "Install plugin"
+            }
+            .into(),
+            detail: plugin
+                .get("version")
+                .and_then(|value| value.as_str())
+                .map(|version| format!("marketplace version {version}"))
+                .unwrap_or_default(),
+        }];
+        for (label, key) in [
+            ("Description", "description"),
+            ("Homepage", "homepage"),
+            ("Keywords", "keywords"),
+            ("Source", "source"),
+        ] {
+            let value = plugin.get(key).map(|value| {
+                value
+                    .as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| value.to_string())
+            });
+            if let Some(value) = value.filter(|value| !value.is_empty() && value != "[]") {
+                items.push(ListPickerItem {
+                    id: "__info__".into(),
+                    label: label.into(),
+                    detail: value,
+                });
+            }
+        }
+        self.replace_list_picker(ListPickerState {
+            kind: ListPickerKind::PluginMarketplaceDetail,
+            title: format!(" {id} · marketplace details · Esc back "),
+            all_items: items.clone(),
+            items,
+            selected: 0,
+            filter: String::new(),
+        });
+        Ok(())
+    }
+
+    fn open_plugin_prompt(&mut self, kind: PluginPromptKind) {
+        self.state.plugin_prompt = Some(PluginPromptState {
+            kind,
+            value: String::new(),
+        });
+    }
+
+    async fn submit_plugin_prompt(&mut self) -> anyhow::Result<()> {
+        let Some(prompt) = self.state.plugin_prompt.take() else {
+            return Ok(());
+        };
+        let value = prompt.value.trim();
+        if value.is_empty() {
+            self.state.plugin_prompt = Some(prompt);
+            return Ok(());
+        }
+        let result = match prompt.kind {
+            PluginPromptKind::AddMarketplace => {
+                self.client
+                    .rpc_call(
+                        "plugins.marketplaces.add",
+                        Some(serde_json::json!({"source": value})),
+                    )
+                    .await
+            }
+            PluginPromptKind::InstallSource => {
+                self.client
+                    .rpc_call(
+                        "plugins.install",
+                        Some(serde_json::json!({"source": value})),
+                    )
+                    .await
+            }
+        };
+        match result {
+            Ok(_) => {
+                self.system_message(match prompt.kind {
+                    PluginPromptKind::AddMarketplace => {
+                        format!("Plugin marketplace added: {value}")
+                    }
+                    PluginPromptKind::InstallSource => format!("Plugin installed from {value}"),
+                });
+                self.begin_root_picker();
+                self.open_plugins_picker().await?;
+                let root = self.state.list_picker.take().expect("plugin root picker");
+                self.state.list_picker_stack.push(root);
+                let open_result = match prompt.kind {
+                    PluginPromptKind::AddMarketplace => {
+                        self.open_plugin_marketplaces_picker().await
+                    }
+                    PluginPromptKind::InstallSource => self.open_installed_plugins_picker().await,
+                };
+                if let Err(error) = open_result {
+                    self.pop_list_picker_level();
+                    self.system_message(format!("Failed to refresh plugin manager: {error}"));
+                }
+            }
+            Err(error) => {
+                self.system_message(format!("Plugin operation failed: {error}"));
+                self.state.plugin_prompt = Some(prompt);
+            }
+        }
+        Ok(())
+    }
+
+    async fn reload_plugins_from_picker(&mut self) {
+        match self.client.rpc_call("plugins.reload", None).await {
+            Ok(result) => self.system_message(format!(
+                "Plugins reloaded: {} plugin(s), {} MCP server(s), {} tool(s)",
+                result
+                    .get("plugins")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(0),
+                result
+                    .get("mcp_servers")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(0),
+                result
+                    .get("tools")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(0),
+            )),
+            Err(error) => self.system_message(format!("Plugin reload failed: {error}")),
+        }
+    }
+
+    async fn apply_installed_plugin_action(
+        &mut self,
+        picker: ListPickerState,
+        action: &str,
+    ) -> anyhow::Result<()> {
+        if action == "__info__" {
+            self.state.list_picker = Some(picker);
+            return Ok(());
+        }
+        let Some(id) = self.state.plugin_selected_id.clone() else {
+            self.state.list_picker = Some(picker);
+            return Ok(());
+        };
+        if action == "remove" {
+            self.state.list_picker_stack.push(picker);
+            let items = vec![
+                ListPickerItem {
+                    id: "cancel".into(),
+                    label: "Cancel".into(),
+                    detail: "keep the plugin installed".into(),
+                },
+                ListPickerItem {
+                    id: "remove_plugin".into(),
+                    label: "Remove plugin".into(),
+                    detail: format!("remove {id} from the managed plugin set"),
+                },
+            ];
+            self.replace_list_picker(ListPickerState {
+                kind: ListPickerKind::PluginConfirm,
+                title: format!(" Remove {id}? "),
+                all_items: items.clone(),
+                items,
+                selected: 0,
+                filter: String::new(),
+            });
+            return Ok(());
+        }
+        let method = match action {
+            "enable" => "plugins.enable",
+            "disable" => "plugins.disable",
+            "update" => "plugins.update",
+            _ => {
+                self.state.list_picker = Some(picker);
+                return Ok(());
+            }
+        };
+        match self
+            .client
+            .rpc_call(method, Some(serde_json::json!({"id": id})))
+            .await
+        {
+            Ok(_) => {
+                self.system_message(format!("Plugin {action} succeeded: {id}"));
+                if let Err(error) = self.open_installed_plugin_detail(&id).await {
+                    self.state.list_picker = Some(picker);
+                    self.system_message(format!("Failed to refresh plugin details: {error}"));
+                }
+            }
+            Err(error) => {
+                self.state.list_picker = Some(picker);
+                self.system_message(format!("Plugin {action} failed: {error}"));
+            }
+        }
+        Ok(())
+    }
+
+    async fn apply_marketplace_plugin_action(
+        &mut self,
+        picker: ListPickerState,
+        action: &str,
+    ) -> anyhow::Result<()> {
+        if action == "__info__" {
+            self.state.list_picker = Some(picker);
+            return Ok(());
+        }
+        let Some(id) = self.state.plugin_selected_id.clone() else {
+            self.state.list_picker = Some(picker);
+            return Ok(());
+        };
+        let Some(source) = self.state.plugin_marketplace_source.clone() else {
+            self.state.list_picker = Some(picker);
+            return Ok(());
+        };
+        if !matches!(action, "install" | "update") {
+            self.state.list_picker = Some(picker);
+            return Ok(());
+        }
+        let params = serde_json::json!({"source": id, "marketplace": source});
+        match self.client.rpc_call("plugins.install", Some(params)).await {
+            Ok(_) => {
+                self.system_message(format!("Plugin {action} succeeded: {id}"));
+                if let Err(error) = self.open_marketplace_plugin_detail(&id).await {
+                    self.state.list_picker = Some(picker);
+                    self.system_message(format!("Failed to refresh marketplace plugin: {error}"));
+                }
+            }
+            Err(error) => {
+                self.state.list_picker = Some(picker);
+                self.system_message(format!("Plugin {action} failed: {error}"));
+            }
+        }
+        Ok(())
+    }
+
+    async fn apply_plugin_confirmation(
+        &mut self,
+        picker: ListPickerState,
+        action: &str,
+    ) -> anyhow::Result<()> {
+        if action == "cancel" {
+            self.pop_list_picker_level();
+            return Ok(());
+        }
+        let Some(id) = self.state.plugin_selected_id.clone() else {
+            self.state.list_picker = Some(picker);
+            return Ok(());
+        };
+        if action != "remove_plugin" {
+            self.state.list_picker = Some(picker);
+            return Ok(());
+        }
+        match self
+            .client
+            .rpc_call("plugins.remove", Some(serde_json::json!({"id": id})))
+            .await
+        {
+            Ok(_) => {
+                self.system_message(format!("Plugin removed: {id}"));
+                self.begin_root_picker();
+                self.open_plugins_picker().await?;
+                let root = self.state.list_picker.take().expect("plugin root picker");
+                self.state.list_picker_stack.push(root);
+                if let Err(error) = self.open_installed_plugins_picker().await {
+                    self.pop_list_picker_level();
+                    self.system_message(format!("Failed to refresh installed plugins: {error}"));
+                }
+            }
+            Err(error) => {
+                self.state.list_picker = Some(picker);
+                self.system_message(format!("Plugin remove failed: {error}"));
+            }
+        }
         Ok(())
     }
 
@@ -10074,6 +10723,58 @@ mod app_state_tests {
                 .map(|item| item.id.as_str())
                 .collect::<Vec<_>>(),
             ["alternate", "primary"]
+        );
+    }
+
+    #[tokio::test]
+    async fn plugins_command_opens_management_home_and_marketplace_prompt() {
+        let mut app = test_tui_app();
+        app.open_plugins_picker().await.unwrap();
+        let picker = app.state.list_picker.as_ref().unwrap();
+        assert_eq!(picker.kind, ListPickerKind::PluginHome);
+        assert_eq!(
+            picker
+                .items
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "installed",
+                "marketplaces",
+                "add_marketplace",
+                "install_source",
+                "reload"
+            ]
+        );
+
+        app.state.list_picker.as_mut().unwrap().selected = 2;
+        app.apply_list_picker().await.unwrap();
+        assert_eq!(
+            app.state.plugin_prompt.as_ref().map(|prompt| &prompt.kind),
+            Some(&PluginPromptKind::AddMarketplace)
+        );
+        assert_eq!(
+            app.state.list_picker.as_ref().map(|picker| &picker.kind),
+            Some(&ListPickerKind::PluginHome)
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert_eq!(
+            app.state
+                .plugin_prompt
+                .as_ref()
+                .map(|prompt| prompt.value.as_str()),
+            Some("x")
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert!(app.state.plugin_prompt.is_none());
+        assert_eq!(
+            app.state.list_picker.as_ref().map(|picker| &picker.kind),
+            Some(&ListPickerKind::PluginHome)
         );
     }
 

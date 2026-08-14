@@ -88,9 +88,15 @@ pub fn render_ui(f: &mut Frame, state: &mut AppState, config: &AppConfig) {
 
     // Reserve space for slash / list picker popup above the input box
     let slash_height = state
-        .slash_menu
+        .plugin_prompt
         .as_ref()
-        .map(|menu| menu_height(menu, size.width))
+        .map(|_| 7)
+        .or_else(|| {
+            state
+                .slash_menu
+                .as_ref()
+                .map(|menu| menu_height(menu, size.width))
+        })
         .or_else(|| state.file_menu.as_ref().map(file_menu_height))
         .or_else(|| {
             state
@@ -204,7 +210,9 @@ pub fn render_ui(f: &mut Frame, state: &mut AppState, config: &AppConfig) {
         render_question_panel(f, size, question, &theme);
     }
 
-    if state.slash_menu.is_some() {
+    if state.plugin_prompt.is_some() {
+        render_plugin_prompt(f, slash_area, state, &theme);
+    } else if state.slash_menu.is_some() {
         render_slash_menu(f, slash_area, state, &theme);
     } else if state.file_menu.is_some() {
         render_file_menu(f, slash_area, state, &theme);
@@ -225,6 +233,41 @@ pub fn render_ui(f: &mut Frame, state: &mut AppState, config: &AppConfig) {
     if let Some(ref toast) = state.copy_toast {
         render_copy_toast(f, size, toast, &theme);
     }
+}
+
+fn render_plugin_prompt(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    let Some(prompt) = state.plugin_prompt.as_ref() else {
+        return;
+    };
+    f.render_widget(Clear, area);
+    let (title, help) = match prompt.kind {
+        crate::app::PluginPromptKind::AddMarketplace => (
+            " Add plugin marketplace ",
+            "Enter a catalog URL or local marketplace.json path",
+        ),
+        crate::app::PluginPromptKind::InstallSource => (
+            " Install plugin from source ",
+            "Enter a directory, ZIP URL, or GitHub repository URL",
+        ),
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.primary))
+        .title(title);
+    let lines = vec![
+        Line::from(Span::styled(help, Style::default().fg(theme.text_dim))),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("> ", Style::default().fg(theme.primary)),
+            Span::styled(&prompt.value, Style::default().fg(theme.text)),
+            Span::styled("█", Style::default().fg(theme.primary)),
+        ]),
+        Line::from(Span::styled(
+            "Enter confirm · Esc cancel · paste supported",
+            Style::default().fg(theme.text_muted),
+        )),
+    ];
+    f.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
 }
 
 fn render_copy_toast(f: &mut Frame, area: Rect, toast: &crate::app::CopyToast, theme: &Theme) {
