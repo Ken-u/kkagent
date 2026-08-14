@@ -27,3 +27,4 @@ sdk/node/dist/
 
 # Release dist
 /target/release-dist/
+LOCAL.md
