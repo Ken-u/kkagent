@@ -1528,6 +1528,7 @@ dependencies = [
  "kkagent-mcp",
  "kkagent-protocol",
  "kkagent-tools",
+ "libc",
  "reqwest 0.12.28",
  "rusqlite",
  "semver",
@@ -1538,6 +1539,7 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+ "windows-sys 0.59.0",
  "zip",
 ]
 

@@ -71,6 +71,7 @@ fn run_subagent_mirrored_boxed(
             model.clone(),
         );
         session.image_config = app_config.image.clone();
+        session.attach_workspace_concurrency_guard();
         session.inject_workspace_instructions().await;
         session
             .system_prompt

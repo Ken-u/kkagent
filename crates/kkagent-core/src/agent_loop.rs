@@ -1397,6 +1397,24 @@ Do not mention this reminder to the user.\n</system-reminder>"
                 }
             }
 
+            // Server-side stale-file hard gate before Edit/Write execute.
+            for prep_slot in prepared.iter_mut() {
+                let (_id, _name, prep) = prep_slot;
+                let Prepared::Ready { name, input } = prep else {
+                    continue;
+                };
+                if name != "Edit" && name != "Write" {
+                    continue;
+                }
+                let Some(path_str) = input.get("path").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                let path = session.resolve_tracked_path(path_str);
+                if let Some(err) = session.check_stale_before_write(&path) {
+                    *prep = Prepared::Done(ToolOutput::error(err));
+                }
+            }
+
             let _ = self
                 .event_tx
                 .send(AgentEvent::StatusUpdate {
@@ -1461,23 +1479,26 @@ Do not mention this reminder to the user.\n</system-reminder>"
                 ToolScheduler::run_all(tasks).await
             };
             let mut parallel_iter = parallel_outputs.into_iter();
-            let mut resolved: Vec<(String, String, ToolOutput)> = Vec::new();
+            let mut resolved: Vec<(String, String, Option<serde_json::Value>, ToolOutput)> =
+                Vec::new();
             for (i, (id, name, prep)) in prepared.into_iter().enumerate() {
-                let output = match prep {
-                    Prepared::Done(o) => o,
-                    Prepared::Ready { .. } => {
+                let tc_input = tool_calls.get(i).map(|tc| tc.input.clone());
+                let (input, output) = match prep {
+                    Prepared::Done(o) => (tc_input, o),
+                    Prepared::Ready { input, .. } => {
                         let _ = ready_indices.contains(&i);
-                        parallel_iter
+                        let output = parallel_iter
                             .next()
                             .unwrap_or_else(|| Err("scheduler missing result".into()))
-                            .unwrap_or_else(ToolOutput::error)
+                            .unwrap_or_else(ToolOutput::error);
+                        (Some(input), output)
                     }
                 };
-                resolved.push((id, name, output));
+                resolved.push((id, name, input, output));
             }
 
             let mut tool_results = Vec::new();
-            for (id, name, mut output) in resolved {
+            for (id, name, input, mut output) in resolved {
                 // ExitPlanMode / EnterPlanMode flip plan_mode inside their helpers /
                 // execute paths; mirror to the TUI here.
                 if name == "ExitPlanMode" {
@@ -1531,6 +1552,37 @@ Do not mention this reminder to the user.\n</system-reminder>"
                         session.add_user_message(reminder.into());
                     }
                 }
+
+                if !output.is_error {
+                    if name == "Read" {
+                        if let Some(path_str) = input
+                            .as_ref()
+                            .and_then(|v| v.get("path"))
+                            .and_then(|v| v.as_str())
+                        {
+                            if let Some(hash) = output
+                                .data
+                                .as_ref()
+                                .and_then(|d| d.get("content_hash"))
+                                .and_then(|v| v.as_str())
+                            {
+                                let path = session.resolve_tracked_path(path_str);
+                                session.record_read_content_hash(&path, hash.to_string());
+                            }
+                        }
+                    } else if name == "Edit" || name == "Write" {
+                        if let Some(path_str) = input
+                            .as_ref()
+                            .and_then(|v| v.get("path"))
+                            .and_then(|v| v.as_str())
+                        {
+                            let path = session.resolve_tracked_path(path_str);
+                            session.refresh_tracked_file_hash(&path);
+                        }
+                    }
+                }
+
+                session.maybe_append_concurrent_write_reminder(&name, &mut output);
 
                 let output = truncate_tool_output(
                     self.tool_result_store.as_deref(),

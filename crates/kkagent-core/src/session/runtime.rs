@@ -217,6 +217,14 @@ pub struct Session {
     pub usage: crate::usage::UsageService,
     /// Session-scoped services (metadata, agents, activity, store paths, …).
     pub services: SessionServices,
+    /// Disk registry lease for concurrent-session awareness (RAII unregister).
+    pub workspace_registry: Option<crate::workspace_registry::WorkspaceRegistryLease>,
+    /// Soft→strong concurrent-write reminder already emitted for this session.
+    pub concurrent_write_warned: bool,
+    /// First Bash already ran the concurrent-session check.
+    pub bash_concurrent_checked: bool,
+    /// Paths last Read (or successfully written) → full-content SHA-256 hex.
+    pub read_file_hashes: HashMap<String, String>,
 }
 
 impl Session {
@@ -362,6 +370,10 @@ impl Session {
             swarm: crate::swarm::SwarmService::new(),
             usage: crate::usage::UsageService::new(),
             services,
+            workspace_registry: None,
+            concurrent_write_warned: false,
+            bash_concurrent_checked: false,
+            read_file_hashes: HashMap::new(),
         }
     }
 
@@ -1007,6 +1019,117 @@ impl Session {
         let today = chrono::Local::now().format("%Y-%m-%d (%A)");
         self.system_prompt
             .push_str(&format!("\n\n# Date\n\nToday's date is {today}.\n"));
+    }
+
+    /// Register this session in the workspace registry and inject a soft concurrent reminder.
+    pub fn attach_workspace_concurrency_guard(&mut self) {
+        self.attach_workspace_concurrency_guard_in(None);
+    }
+
+    /// Like [`Self::attach_workspace_concurrency_guard`], with an optional registry root (tests).
+    pub fn attach_workspace_concurrency_guard_in(
+        &mut self,
+        registry_root: Option<&std::path::Path>,
+    ) {
+        if self.workspace_registry.is_none() {
+            self.workspace_registry = match registry_root {
+                Some(root) => crate::workspace_registry::WorkspaceRegistryLease::start_in(
+                    root,
+                    &self.id,
+                    &self.working_dir,
+                ),
+                None => crate::workspace_registry::WorkspaceRegistryLease::start(
+                    &self.id,
+                    &self.working_dir,
+                ),
+            };
+        }
+        let peers = self.list_workspace_peers();
+        if !peers.is_empty() {
+            self.system_prompt
+                .push_str(&crate::workspace_registry::startup_concurrent_reminder(
+                    &peers,
+                ));
+        }
+    }
+
+    fn registry_root_path(&self) -> PathBuf {
+        self.workspace_registry
+            .as_ref()
+            .map(|lease| lease.registry_root().to_path_buf())
+            .unwrap_or_else(crate::workspace_registry::default_registry_root)
+    }
+
+    pub fn list_workspace_peers(&self) -> Vec<crate::workspace_registry::SessionRegistration> {
+        crate::workspace_registry::list_active_peers(
+            &self.registry_root_path(),
+            &self.working_dir,
+            &self.id,
+        )
+    }
+
+    pub fn resolve_tracked_path(&self, path_str: &str) -> PathBuf {
+        crate::workspace_registry::resolve_tool_path(&self.working_dir, path_str)
+    }
+
+    pub fn record_read_content_hash(&mut self, path: &std::path::Path, hash: String) {
+        let key = crate::workspace_registry::file_track_key(&self.working_dir, path);
+        self.read_file_hashes.insert(key, hash);
+    }
+
+    pub fn refresh_tracked_file_hash(&mut self, path: &std::path::Path) {
+        match crate::workspace_registry::file_content_hash(path) {
+            Ok(hash) => self.record_read_content_hash(path, hash),
+            Err(error) => {
+                tracing::debug!(
+                    %error,
+                    path = %path.display(),
+                    "failed to refresh tracked file hash after write"
+                );
+            }
+        }
+    }
+
+    /// Server-side stale-file gate. `None` means allow.
+    pub fn check_stale_before_write(&self, path: &std::path::Path) -> Option<String> {
+        let key = crate::workspace_registry::file_track_key(&self.working_dir, path);
+        let expected = self.read_file_hashes.get(&key)?;
+        crate::workspace_registry::stale_write_rejection(path, expected)
+    }
+
+    /// Append a one-shot strong concurrent-session reminder to a write/Bash tool result.
+    pub fn maybe_append_concurrent_write_reminder(
+        &mut self,
+        tool_name: &str,
+        output: &mut kkagent_tools::ToolOutput,
+    ) {
+        let is_bash = tool_name == "Bash";
+        let is_write = tool_name == "Edit" || tool_name == "Write";
+        if !is_bash && !is_write {
+            return;
+        }
+        if is_bash {
+            if self.bash_concurrent_checked {
+                return;
+            }
+            self.bash_concurrent_checked = true;
+        }
+        if self.concurrent_write_warned {
+            return;
+        }
+        let peers = self.list_workspace_peers();
+        if peers.is_empty() {
+            return;
+        }
+        self.concurrent_write_warned = true;
+        if !output.content.is_empty() {
+            output.content.push_str("\n\n");
+        }
+        output
+            .content
+            .push_str(&crate::workspace_registry::write_concurrent_reminder(
+                &peers,
+            ));
     }
 }
 

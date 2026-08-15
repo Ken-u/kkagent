@@ -1400,6 +1400,7 @@ async fn initialize_session_context(state: &ServerState, session: &mut Session) 
         .matching(&session.working_dir)
         .cloned();
     session.inject_git_context_with_trust(workspace_trust.as_ref());
+    session.attach_workspace_concurrency_guard();
     let skill_section = state
         .skills
         .catalog_prompt_section_for(&session.working_dir)
