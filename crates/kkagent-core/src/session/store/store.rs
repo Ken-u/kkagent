@@ -24,6 +24,8 @@ pub struct SessionSummary {
     pub archived: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_prompt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_prompt: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -308,6 +310,14 @@ fn summary_from_meta(id: &str, dir: &Path, work: &Path, meta: &SessionMeta) -> S
         is_custom_title: meta.is_custom_title,
         archived: meta.archived,
         last_prompt: meta.last_prompt.clone(),
+        first_prompt: meta.first_prompt.clone().or_else(|| {
+            // Legacy sessions: auto-title was derived from the first real user text.
+            if !meta.is_custom_title {
+                meta.title.clone()
+            } else {
+                None
+            }
+        }),
         created_at: meta.created_at,
         updated_at: meta.updated_at,
         forked_from: meta.forked_from.clone(),

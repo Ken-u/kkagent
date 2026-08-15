@@ -6516,7 +6516,7 @@ impl TuiApp {
                     s.get("is_custom_title")
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false),
-                    s.get("last_prompt").and_then(|v| v.as_str()),
+                    s.get("first_prompt").and_then(|v| v.as_str()),
                     &id,
                 );
                 let short = &id[..8.min(id.len())];
@@ -7593,7 +7593,7 @@ impl TuiApp {
                     s.get("is_custom_title")
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false),
-                    s.get("last_prompt").and_then(|v| v.as_str()),
+                    s.get("first_prompt").and_then(|v| v.as_str()),
                     &id,
                 );
                 rows.push((id, title));
@@ -7602,37 +7602,32 @@ impl TuiApp {
 
         // Ensure current session is in the graph even if list is momentarily stale.
         if !rows.iter().any(|(id, _)| id == &current_id) {
-            let title = self
-                .state
-                .messages
-                .iter()
-                .find_map(|m| {
-                    if m.role != MessageRole::User {
-                        return None;
-                    }
-                    if kkagent_protocol::is_harness_only_user_text(&m.content) {
-                        return None;
-                    }
-                    let visible = kkagent_protocol::visible_user_text(&m.content);
-                    let pick = if visible.is_empty() {
-                        m.content.trim()
-                    } else {
-                        visible.as_str()
-                    };
-                    let snippet: String = pick.chars().take(40).collect();
-                    if snippet.trim().is_empty() {
-                        None
-                    } else {
-                        Some(snippet)
-                    }
-                })
-                .unwrap_or_else(|| {
-                    if current_id.len() > 8 {
-                        current_id[..8].to_string()
-                    } else {
-                        current_id.clone()
-                    }
-                });
+            let first_prompt = self.state.messages.iter().find_map(|m| {
+                if m.role != MessageRole::User {
+                    return None;
+                }
+                if kkagent_protocol::is_harness_only_user_text(&m.content) {
+                    return None;
+                }
+                let visible = kkagent_protocol::visible_user_text(&m.content);
+                let pick = if visible.is_empty() {
+                    m.content.trim()
+                } else {
+                    visible.as_str()
+                };
+                let snippet: String = pick.chars().take(40).collect();
+                if snippet.trim().is_empty() {
+                    None
+                } else {
+                    Some(snippet)
+                }
+            });
+            let title = crate::chrome::session_display_title(
+                None,
+                false,
+                first_prompt.as_deref(),
+                &current_id,
+            );
             rows.push((current_id.clone(), title));
         }
 

@@ -380,12 +380,12 @@ pub struct SessionStripHit {
     pub x1: usize,
 }
 
-/// Prefer custom `/title`, else first/last prompt snippet, else short id.
+/// Prefer custom `/title`, else first real user prompt snippet, else short id.
 /// Harness-only injections (`<system-reminder>`, …) never become the label.
 pub fn session_display_title(
     title: Option<&str>,
     is_custom_title: bool,
-    last_prompt: Option<&str>,
+    first_prompt: Option<&str>,
     session_id: &str,
 ) -> String {
     let clean = |s: &str| {
@@ -420,7 +420,7 @@ pub fn session_display_title(
             return t;
         }
     }
-    if let Some(p) = last_prompt.and_then(usable) {
+    if let Some(p) = first_prompt.and_then(usable) {
         return p;
     }
     if let Some(t) = title.and_then(usable) {
@@ -742,6 +742,20 @@ mod tests {
         assert_eq!(t, "My Name");
         let t = session_display_title(Some("auto"), false, Some("first prompt here"), "abcdef12");
         assert_eq!(t, "first prompt here");
+    }
+
+    #[test]
+    fn display_title_prefers_first_prompt_over_title() {
+        let t = session_display_title(
+            Some("stale auto title"),
+            false,
+            Some("first prompt here"),
+            "abcdef12",
+        );
+        assert_eq!(t, "first prompt here");
+        // Without first_prompt, fall back to stored title (legacy auto-title).
+        let t = session_display_title(Some("legacy first"), false, None, "abcdef12");
+        assert_eq!(t, "legacy first");
     }
 
     #[test]

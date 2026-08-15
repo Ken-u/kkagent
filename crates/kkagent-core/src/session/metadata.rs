@@ -52,6 +52,9 @@ pub struct SessionMeta {
     pub is_custom_title: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_prompt: Option<String>,
+    /// First real user prompt snippet (stable session label; not updated on later turns).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_prompt: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
     #[serde(default)]
@@ -85,6 +88,7 @@ impl SessionMeta {
             title: None,
             is_custom_title: false,
             last_prompt: None,
+            first_prompt: None,
             created_at: now,
             updated_at: now,
             archived: false,
@@ -111,6 +115,7 @@ pub struct SessionMetaPatch {
     pub title: Option<Option<String>>,
     pub is_custom_title: Option<bool>,
     pub last_prompt: Option<Option<String>>,
+    pub first_prompt: Option<Option<String>>,
     pub archived: Option<bool>,
     pub cwd: Option<Option<String>>,
     pub forked_from: Option<Option<String>>,
@@ -168,6 +173,9 @@ impl SessionMetadataService {
         }
         if let Some(v) = patch.last_prompt {
             self.data.last_prompt = v;
+        }
+        if let Some(v) = patch.first_prompt {
+            self.data.first_prompt = v;
         }
         if let Some(v) = patch.archived {
             self.data.archived = v;
@@ -233,13 +241,15 @@ impl SessionMetadataService {
     pub fn set_last_prompt(&mut self, prompt: impl Into<String>) -> anyhow::Result<()> {
         let p = prompt.into();
         let short: String = p.chars().take(200).collect();
-        self.update(
-            SessionMetaPatch {
-                last_prompt: Some(Some(short)),
-                ..Default::default()
-            },
-            true,
-        )
+        let mut patch = SessionMetaPatch {
+            last_prompt: Some(Some(short.clone())),
+            ..Default::default()
+        };
+        // Freeze the first real user prompt for stable tab / picker labels.
+        if self.data.first_prompt.is_none() {
+            patch.first_prompt = Some(Some(short));
+        }
+        self.update(patch, true)
     }
 
     pub fn set_last_turn_reason(&mut self, reason: TurnReason) -> anyhow::Result<()> {
@@ -277,6 +287,18 @@ mod tests {
         let loaded = SessionMetadataService::load_or_create(&dir, "abc", Path::new("/w")).unwrap();
         assert_eq!(loaded.read().title.as_deref(), Some("hello"));
         assert!(loaded.read().is_custom_title);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn first_prompt_freezes_on_first_real_user_text() {
+        let dir = std::env::temp_dir().join(format!("kkagent-meta-fp-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut svc = SessionMetadataService::create_new(&dir, "abc", Path::new("/w")).unwrap();
+        svc.set_last_prompt("first question").unwrap();
+        svc.set_last_prompt("second question").unwrap();
+        assert_eq!(svc.read().first_prompt.as_deref(), Some("first question"));
+        assert_eq!(svc.read().last_prompt.as_deref(), Some("second question"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -64,6 +64,23 @@ pub fn visible_user_text(text: &str) -> String {
         .to_string()
 }
 
+/// First non-harness user text from a sequence of raw user message bodies.
+///
+/// Skips empty / harness-only injections (`<system-reminder>`, `<cron-fire>`, …)
+/// and returns [`visible_user_text`] of the first usable message.
+pub fn first_real_user_text<'a>(texts: impl IntoIterator<Item = &'a str>) -> Option<String> {
+    for text in texts {
+        if is_harness_only_user_text(text) {
+            continue;
+        }
+        let visible = visible_user_text(text);
+        if !visible.is_empty() {
+            return Some(visible);
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -90,5 +107,19 @@ mod tests {
         assert!(is_harness_only_user_text(
             "<kimi-skill-loaded name=\"x\">\nonly\n</kimi-skill-loaded>"
         ));
+    }
+
+    #[test]
+    fn first_real_user_text_skips_harness_only() {
+        let rem = "<system-reminder>\nToday\n</system-reminder>";
+        assert_eq!(
+            first_real_user_text([rem, "real question"]),
+            Some("real question".into())
+        );
+        assert_eq!(first_real_user_text([rem, rem]), None);
+        assert_eq!(
+            first_real_user_text(["hello", "later"]),
+            Some("hello".into())
+        );
     }
 }

@@ -4007,24 +4007,17 @@ fn persist_session_messages(db: &TranscriptDb, session: &mut Session) -> anyhow:
 
     // Auto-title from first real user text (skip harness-only injections).
     if session.title.is_none() {
-        if let Some(text) = session.messages.iter().find_map(|m| {
-            if m.role != "user" {
-                return None;
-            }
-            let text = m.content.iter().find_map(|c| match c {
-                ChatContent::Text { text } => Some(text.as_str()),
-                _ => None,
-            })?;
-            if kkagent_protocol::is_harness_only_user_text(text) {
-                return None;
-            }
-            let visible = kkagent_protocol::visible_user_text(text);
-            if visible.is_empty() {
-                None
-            } else {
-                Some(visible)
-            }
-        }) {
+        if let Some(text) =
+            kkagent_protocol::first_real_user_text(session.messages.iter().filter_map(|m| {
+                if m.role != "user" {
+                    return None;
+                }
+                m.content.iter().find_map(|c| match c {
+                    ChatContent::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+            }))
+        {
             let title: String = text.chars().take(60).collect();
             db.set_title(&session.id, &title)?;
             session.title = Some(title);
@@ -4867,6 +4860,7 @@ async fn handle_rpc_call(
                                 "session_dir": s.session_dir,
                                 "archived": s.archived,
                                 "last_prompt": s.last_prompt,
+                                "first_prompt": s.first_prompt,
                                 "created_at": s.created_at,
                                 "updated_at": s.updated_at,
                                 "forked_from": s.forked_from,
@@ -4886,6 +4880,21 @@ async fn handle_rpc_call(
                 .into_iter()
                 .map(|s| {
                     let empty = s.message_count == 0;
+                    let first_prompt = db.load_messages(&s.session_id).ok().and_then(|records| {
+                        let texts: Vec<String> = records
+                            .into_iter()
+                            .filter(|r| r.role == "user")
+                            .filter_map(|r| {
+                                let content: Vec<ChatContent> =
+                                    serde_json::from_str(&r.content_json).ok()?;
+                                content.into_iter().find_map(|c| match c {
+                                    ChatContent::Text { text } => Some(text),
+                                    _ => None,
+                                })
+                            })
+                            .collect();
+                        kkagent_protocol::first_real_user_text(texts.iter().map(String::as_str))
+                    });
                     serde_json::json!({
                         "session_id": s.session_id,
                         "title": s.title,
@@ -4895,6 +4904,7 @@ async fn handle_rpc_call(
                         "updated_at": s.updated_at,
                         "message_count": s.message_count,
                         "empty": empty,
+                        "first_prompt": first_prompt,
                     })
                 })
                 .collect();
