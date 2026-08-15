@@ -194,6 +194,28 @@ impl AgentLoop {
         self
     }
 
+    async fn emit_goal_updated(&self, session: &Session, change: &str) {
+        let Some(goal_mgr) = &self.goal_mgr else {
+            return;
+        };
+        let (goal_json, budget_json) = match goal_mgr.snapshot_with_budget().await {
+            Some((goal, budget)) => (
+                Some(serde_json::to_value(&goal).unwrap_or(serde_json::Value::Null)),
+                Some(serde_json::to_value(&budget).unwrap_or(serde_json::Value::Null)),
+            ),
+            None => (None, None),
+        };
+        let _ = self
+            .event_tx
+            .send(AgentEvent::GoalUpdated {
+                session_id: session.id.clone(),
+                goal: goal_json,
+                budget: budget_json,
+                change: change.to_string(),
+            })
+            .await;
+    }
+
     /// Attach the oversized-tool-result store (and optional transcript DB).
     pub fn with_tool_result_store(mut self, store: Arc<ToolResultStore>) -> Self {
         self.tool_result_store = Some(store);
@@ -229,10 +251,31 @@ impl AgentLoop {
             session.steer_mailbox.start_turn();
             let _heartbeat = TurnHeartbeat::spawn(self.event_tx.clone(), session.id.clone());
             let mut completed_rounds = 0_u32;
+            let mut goal_continuations = 0_u32;
+            const MAX_GOAL_CONTINUATIONS: u32 = 64;
             loop {
                 match self.run_turn_step(session).await? {
                     TurnStep::Done => {
                         self.sync_requested_plan_mode(session).await?;
+                        if let Some(goal_mgr) = &self.goal_mgr {
+                            if goal_mgr.should_continue().await
+                                && goal_continuations < MAX_GOAL_CONTINUATIONS
+                                && !session.is_interrupted()
+                            {
+                                goal_continuations = goal_continuations.saturating_add(1);
+                                tracing::info!(
+                                    "Goal continuation {} for session {}",
+                                    goal_continuations,
+                                    session.id
+                                );
+                                session.add_user_message(format!(
+                                    "<system-reminder>\n{}\n</system-reminder>",
+                                    kkagent_protocol::goal::GOAL_CONTINUATION_PROMPT
+                                ));
+                                completed_rounds = 0;
+                                continue;
+                            }
+                        }
                         return Ok(());
                     }
                     TurnStep::Continue
@@ -242,6 +285,22 @@ impl AgentLoop {
                         tracing::warn!("Agent turn limit reached for session {}", session.id);
                         self.finish_turn(session, true).await?;
                         self.sync_requested_plan_mode(session).await?;
+                        // Step-cap: still allow goal continuation with a fresh turn budget.
+                        if let Some(goal_mgr) = &self.goal_mgr {
+                            if goal_mgr.should_continue().await
+                                && goal_continuations < MAX_GOAL_CONTINUATIONS
+                                && !session.is_interrupted()
+                            {
+                                goal_continuations = goal_continuations.saturating_add(1);
+                                session.add_user_message(format!(
+                                    "<system-reminder>\nThe previous goal turn reached the per-turn step limit. \
+{}\n</system-reminder>",
+                                    kkagent_protocol::goal::GOAL_CONTINUATION_PROMPT
+                                ));
+                                completed_rounds = 0;
+                                continue;
+                            }
+                        }
                         return Ok(());
                     }
                     TurnStep::Continue => {
@@ -329,15 +388,11 @@ impl AgentLoop {
                     && goal.is_budget_exhausted()
                 {
                     goal_mgr
-                        .fail_goal("Goal budget exhausted (turns/tokens/wall-clock)")
+                        .block_goal("Blocked after goal budget reached")
                         .await;
                     session.add_user_message(format!(
-                        "<system-reminder>\nActive goal budget exhausted \
-(turns={}/{:?} tokens={}/{:?}). Stop autonomous work and summarize progress.\n</system-reminder>",
-                        goal.turns_used,
-                        goal.budget.turn_budget,
-                        goal.tokens_used,
-                        goal.budget.token_budget
+                        "<system-reminder>\n{}\n</system-reminder>",
+                        kkagent_protocol::goal::GOAL_BUDGET_STOP_REMINDER
                     ));
                     let _ = self
                         .event_tx
@@ -346,21 +401,14 @@ impl AgentLoop {
                             message: "Goal budget exhausted".into(),
                         })
                         .await;
+                    self.emit_goal_updated(session, "budget_blocked").await;
                     self.finish_turn(session, false).await?;
                     return Ok(TurnStep::Done);
                 }
                 if goal.status == kkagent_protocol::goal::GoalStatus::Active
                     && !session_has_goal_reminder(session)
                 {
-                    session.add_user_message(format!(
-                        "<system-reminder>\nActive goal: {}\n\
-Progress: turns={}/{:?} tokens={}/{:?}. Continue working toward this goal.\n</system-reminder>",
-                        goal.description,
-                        goal.turns_used,
-                        goal.budget.turn_budget,
-                        goal.tokens_used,
-                        goal.budget.token_budget
-                    ));
+                    session.add_user_message(goal.active_reminder());
                 }
             }
         }
@@ -1840,7 +1888,12 @@ Do not mention this reminder to the user.\n</system-reminder>"
                     if goal.is_budget_exhausted()
                         && goal.status == kkagent_protocol::goal::GoalStatus::Active
                     {
-                        goal_mgr.fail_goal("Goal budget exhausted after turn").await;
+                        goal_mgr
+                            .block_goal("Blocked after goal budget reached")
+                            .await;
+                        self.emit_goal_updated(session, "budget_blocked").await;
+                    } else {
+                        self.emit_goal_updated(session, "account_usage").await;
                     }
                 }
             }
@@ -2724,7 +2777,9 @@ fn truncate_tool_output(
 fn session_has_goal_reminder(session: &Session) -> bool {
     session.messages.iter().rev().take(6).any(|m| {
         m.content.iter().any(|c| match c {
-            ChatContent::Text { text } => text.contains("Active goal:"),
+            ChatContent::Text { text } => {
+                text.contains("Active goal:") || text.contains("<untrusted_objective>")
+            }
             _ => false,
         })
     })

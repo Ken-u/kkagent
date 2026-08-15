@@ -8983,26 +8983,97 @@ impl TuiApp {
                 }
             }
             "goal" => {
-                let sub = args.split_whitespace().next().unwrap_or("");
+                let Some(session_id) = self.state.session_id.clone() else {
+                    self.system_message("No active session.".into());
+                    return Ok(());
+                };
+                let mut parts = args.splitn(2, char::is_whitespace);
+                let sub = parts.next().unwrap_or("").trim();
+                let rest = parts.next().unwrap_or("").trim();
                 match sub {
                     "" | "status" => {
-                        self.system_message(
-                            "Goal: (client-side status — use CreateGoal tool in chat for now)"
-                                .into(),
-                        );
+                        match self
+                            .client
+                            .rpc_call(
+                                "session.goal",
+                                Some(serde_json::json!({
+                                    "session_id": session_id,
+                                    "action": "status",
+                                })),
+                            )
+                            .await
+                        {
+                            Ok(body) => {
+                                if body.get("goal").and_then(|g| g.as_object()).is_none() {
+                                    self.system_message("No active goal.".into());
+                                } else {
+                                    self.system_message(
+                                        serde_json::to_string_pretty(&body).unwrap_or_default(),
+                                    );
+                                }
+                            }
+                            Err(e) => self.system_message(format!("Goal status failed: {e}")),
+                        }
                     }
                     "pause" | "resume" | "cancel" => {
-                        self.system_message(format!(
-                            "Goal {} — send via agent tools (UpdateGoal).",
-                            sub
-                        ));
+                        match self
+                            .client
+                            .rpc_call(
+                                "session.goal",
+                                Some(serde_json::json!({
+                                    "session_id": session_id,
+                                    "action": sub,
+                                })),
+                            )
+                            .await
+                        {
+                            Ok(body) => self.system_message(format!(
+                                "Goal {sub}: {}",
+                                serde_json::to_string_pretty(&body).unwrap_or_default()
+                            )),
+                            Err(e) => self.system_message(format!("Goal {sub} failed: {e}")),
+                        }
+                    }
+                    "replace" => {
+                        if rest.is_empty() {
+                            self.system_message("Usage: /goal replace <objective>".into());
+                        } else {
+                            match self
+                                .client
+                                .rpc_call(
+                                    "session.goal",
+                                    Some(serde_json::json!({
+                                        "session_id": session_id,
+                                        "action": "replace",
+                                        "objective": rest,
+                                    })),
+                                )
+                                .await
+                            {
+                                Ok(_) => self.system_message(format!("Goal replaced: {rest}")),
+                                Err(e) => self.system_message(format!("Goal replace failed: {e}")),
+                            }
+                        }
                     }
                     _ => {
-                        // Treat as objective — queue a create-goal prompt
-                        self.state.pending_prompt = Some(format!(
-                            "Create a goal with this objective and start working on it:\n\n{}",
-                            args
-                        ));
+                        let objective = if rest.is_empty() { sub } else { args.trim() };
+                        match self
+                            .client
+                            .rpc_call(
+                                "session.goal",
+                                Some(serde_json::json!({
+                                    "session_id": session_id,
+                                    "action": "create",
+                                    "objective": objective,
+                                })),
+                            )
+                            .await
+                        {
+                            Ok(_) => {
+                                self.system_message(format!("Goal started: {objective}"));
+                            }
+                            Err(e) => self.system_message(format!("Goal start failed: {e}")),
+                        }
                     }
                 }
             }
@@ -10291,6 +10362,24 @@ impl TuiApp {
                             .collect();
                         if self.state.todos.is_empty() {
                             self.state.todos_expanded = false;
+                        }
+                    }
+                    AgentEvent::GoalUpdated { goal, change, .. } => {
+                        let status = goal
+                            .as_ref()
+                            .and_then(|g| g.get("status"))
+                            .and_then(|s| s.as_str())
+                            .unwrap_or("none");
+                        let objective = goal
+                            .as_ref()
+                            .and_then(|g| g.get("description"))
+                            .and_then(|s| s.as_str())
+                            .unwrap_or("");
+                        if objective.is_empty() {
+                            self.system_message(format!("Goal {change} ({status})"));
+                        } else {
+                            let preview: String = objective.chars().take(80).collect();
+                            self.system_message(format!("Goal {change} ({status}): {preview}"));
                         }
                     }
                     AgentEvent::TurnEnd { .. } => {

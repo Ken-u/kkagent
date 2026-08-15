@@ -210,6 +210,11 @@ impl ToolOutput {
         self
     }
 
+    pub fn with_stop_turn(mut self) -> Self {
+        self.stop_turn = true;
+        self
+    }
+
     /// Content projected to the model (content + optional `<system>` note).
     pub fn model_content(&self) -> String {
         match &self.note {

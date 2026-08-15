@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use kkagent_protocol::goal::{GoalBudget, GoalManager, GoalStatus};
+use kkagent_protocol::goal::{GoalBudget, GoalManager};
 use serde_json::Value;
 use std::sync::Arc;
 
@@ -80,9 +80,21 @@ Use SetGoalBudget afterwards to attach hard limits."
                     existing.description
                 )));
             }
+            if replace {
+                let goal = self
+                    .goal_mgr
+                    .replace_goal(objective, GoalBudget::default())
+                    .await;
+                if let Some(c) = criterion {
+                    self.goal_mgr.set_completion_criterion(&c).await;
+                }
+                let goal = self.goal_mgr.get_goal().await.unwrap_or(goal);
+                return Ok(ToolOutput::success(
+                    serde_json::to_string_pretty(&goal).unwrap_or_default(),
+                ));
+            }
         }
 
-        // Budgets are set via SetGoalBudget (kimi-aligned).
         let mut goal = self
             .goal_mgr
             .create_goal(objective, GoalBudget::default())
@@ -91,8 +103,6 @@ Use SetGoalBudget afterwards to attach hard limits."
             self.goal_mgr.set_completion_criterion(&c).await;
             if let Some(g) = self.goal_mgr.get_goal().await {
                 goal = g;
-            } else {
-                let _ = c;
             }
         }
         Ok(ToolOutput::success(
@@ -130,9 +140,13 @@ impl Tool for GetGoalTool {
     }
 
     async fn execute(&self, _input: Value, _ctx: &ToolContext) -> anyhow::Result<ToolOutput> {
-        match self.goal_mgr.get_goal().await {
-            Some(goal) => Ok(ToolOutput::success(
-                serde_json::to_string_pretty(&goal).unwrap_or_default(),
+        match self.goal_mgr.snapshot_with_budget().await {
+            Some((goal, budget)) => Ok(ToolOutput::success(
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "goal": goal,
+                    "budget": budget,
+                }))
+                .unwrap_or_default(),
             )),
             None => Ok(ToolOutput::success("No active goal.")),
         }
@@ -176,20 +190,27 @@ impl Tool for UpdateGoalTool {
 
         match status {
             "complete" => {
-                self.goal_mgr.complete_goal("completed").await;
-                Ok(ToolOutput::success("Goal completed.").with_delivery(
-                    "Goal marked complete. Summarize outcomes for the user and stop autonomous goal work.",
-                ))
+                let finished = self.goal_mgr.complete_goal("completed").await;
+                let body = finished
+                    .map(|g| serde_json::to_string_pretty(&g).unwrap_or_default())
+                    .unwrap_or_else(|| "Goal completed.".into());
+                Ok(ToolOutput::success(body)
+                    .with_delivery(
+                        "Goal marked complete and cleared. Summarize outcomes for the user and stop autonomous goal work.",
+                    )
+                    .with_stop_turn())
             }
             "blocked" => {
                 self.goal_mgr.block_goal("blocked").await;
-                Ok(ToolOutput::success("Goal blocked.").with_delivery(
-                    "Goal marked blocked. Explain the blocker and wait for user direction.",
-                ))
+                Ok(ToolOutput::success("Goal blocked.")
+                    .with_delivery(
+                        "Goal marked blocked. Explain the blocker and wait for user direction.",
+                    )
+                    .with_stop_turn())
             }
             "paused" => {
                 self.goal_mgr.pause_goal().await;
-                Ok(ToolOutput::success("Goal paused."))
+                Ok(ToolOutput::success("Goal paused.").with_stop_turn())
             }
             "active" => {
                 self.goal_mgr.resume_goal().await;
@@ -198,9 +219,10 @@ impl Tool for UpdateGoalTool {
             // Legacy alias kept for old transcripts.
             "failed" => {
                 self.goal_mgr.block_goal("failed").await;
-                Ok(ToolOutput::success(
-                    "Goal blocked (legacy status `failed` mapped to blocked).",
-                ))
+                Ok(
+                    ToolOutput::success("Goal blocked (legacy status `failed` mapped to blocked).")
+                        .with_stop_turn(),
+                )
             }
             _ => Ok(ToolOutput::error(format!(
                 "Unknown status: {status}. Use active, complete, or blocked."
@@ -263,8 +285,8 @@ Legacy multi-field token_budget/turn_budget/wall_clock_budget_ms still accepted.
             .or_else(|| input.get("budget_unit"))
             .and_then(|v| v.as_str());
         if let (Some(unit), Some(value)) = (unit, input.get("value").and_then(|v| v.as_f64())) {
-            if value <= 0.0 {
-                return Ok(ToolOutput::error("value must be positive"));
+            if !value.is_finite() || value <= 0.0 {
+                return Ok(ToolOutput::error("value must be a finite positive number"));
             }
             match unit {
                 "turns" | "turn" => budget.turn_budget = Some(value.round() as u32),
@@ -310,9 +332,13 @@ Legacy multi-field token_budget/turn_budget/wall_clock_budget_ms still accepted.
 
         self.goal_mgr.update_budget(budget).await;
         goal = self.goal_mgr.get_goal().await.unwrap_or(goal);
-        let _ = GoalStatus::Active;
+        let report = goal.budget_report();
         Ok(ToolOutput::success(
-            serde_json::to_string_pretty(&goal).unwrap_or_default(),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "goal": goal,
+                "budget": report,
+            }))
+            .unwrap_or_default(),
         ))
     }
 }

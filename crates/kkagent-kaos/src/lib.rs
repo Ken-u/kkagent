@@ -579,11 +579,7 @@ impl KaosHandle {
         }
     }
 
-    pub async fn exec(
-        &self,
-        command: &str,
-        cwd: Option<&Path>,
-    ) -> Result<ExecResult, KaosError> {
+    pub async fn exec(&self, command: &str, cwd: Option<&Path>) -> Result<ExecResult, KaosError> {
         self.as_environment().exec(command, cwd).await
     }
 }

@@ -87,6 +87,15 @@ pub enum AgentEvent {
         session_id: String,
         items: Vec<TodoItemEvent>,
     },
+    /// Goal lifecycle snapshot for TUI / headless clients.
+    GoalUpdated {
+        session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        goal: Option<serde_json::Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        budget: Option<serde_json::Value>,
+        change: String,
+    },
     /// Subagent lifecycle mirrored onto the parent session/TUI.
     SubagentSpawned {
         session_id: String,
@@ -212,6 +221,7 @@ impl AgentEvent {
             | Self::PlanModeChanged { session_id, .. }
             | Self::PlanFileUpdated { session_id, .. }
             | Self::TodoUpdated { session_id, .. }
+            | Self::GoalUpdated { session_id, .. }
             | Self::SubagentSpawned { session_id, .. }
             | Self::SubagentStarted { session_id, .. }
             | Self::SubagentCompleted { session_id, .. }

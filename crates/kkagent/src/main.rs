@@ -1164,6 +1164,14 @@ async fn run_print_client(
     let session_id = client
         .create_session(Some(&cwd), Some(permission_mode))
         .await?;
+
+    let trimmed = prompt.trim();
+    let goal_mode = trimmed.strip_prefix("/goal").map(str::trim);
+    if let Some(goal_args) = goal_mode {
+        let exit = run_print_goal(client, &session_id, goal_args).await?;
+        std::process::exit(exit);
+    }
+
     client.send_prompt(&session_id, &prompt).await?;
 
     while let Some(frame) = client.event_rx.recv().await {
@@ -1205,6 +1213,160 @@ async fn run_print_client(
     Err(anyhow::anyhow!(
         "Agent event stream closed before the turn completed"
     ))
+}
+
+async fn session_goal_rpc(
+    requester: &kkagent_client::KkagentRequester,
+    session_id: &str,
+    action: &str,
+    objective: Option<&str>,
+) -> Result<serde_json::Value> {
+    let mut params = serde_json::json!({
+        "session_id": session_id,
+        "action": action,
+    });
+    if let Some(obj) = objective {
+        params
+            .as_object_mut()
+            .unwrap()
+            .insert("objective".into(), serde_json::json!(obj));
+    }
+    requester
+        .rpc_call("session.goal", Some(params))
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+/// Headless `/goal` driver: create/manage goal and wait until it leaves `active`.
+async fn run_print_goal(client: &mut KkagentClient, session_id: &str, args: &str) -> Result<i32> {
+    use kkagent_protocol::goal::exit_codes;
+
+    let mut parts = args.splitn(2, char::is_whitespace);
+    let sub = parts.next().unwrap_or("").trim();
+    let rest = parts.next().unwrap_or("").trim();
+    let requester = client.requester();
+
+    match sub {
+        "" | "status" => {
+            let body = session_goal_rpc(&requester, session_id, "status", None).await?;
+            println!("{}", serde_json::to_string_pretty(&body)?);
+            return Ok(exit_codes::SUCCESS_COMPLETE);
+        }
+        "pause" => {
+            let body = session_goal_rpc(&requester, session_id, "pause", None).await?;
+            println!("{}", serde_json::to_string_pretty(&body)?);
+            return Ok(exit_codes::PAUSED);
+        }
+        "resume" => {
+            let _ = session_goal_rpc(&requester, session_id, "resume", None).await?;
+        }
+        "cancel" => {
+            let body = session_goal_rpc(&requester, session_id, "cancel", None).await?;
+            println!("{}", serde_json::to_string_pretty(&body)?);
+            return Ok(exit_codes::CANCELLED);
+        }
+        "replace" => {
+            if rest.is_empty() {
+                anyhow::bail!("Usage: /goal replace <objective>");
+            }
+            let _ = session_goal_rpc(&requester, session_id, "replace", Some(rest)).await?;
+        }
+        _ => {
+            let objective = if rest.is_empty() { sub } else { args };
+            let _ = session_goal_rpc(&requester, session_id, "create", Some(objective)).await?;
+        }
+    }
+
+    let mut last_summary = serde_json::json!({"goal": null});
+    while let Some(frame) = client.event_rx.recv().await {
+        if let Frame::Event { data, .. } = frame {
+            if let Ok(evt) = serde_json::from_value::<AgentEvent>(data) {
+                match evt {
+                    AgentEvent::MessageDelta { text, .. } => {
+                        print!("{}", text);
+                    }
+                    AgentEvent::GoalUpdated {
+                        goal,
+                        budget,
+                        change,
+                        ..
+                    } => {
+                        last_summary = serde_json::json!({
+                            "goal": goal,
+                            "budget": budget,
+                            "change": change,
+                        });
+                        let status = last_summary
+                            .pointer("/goal/status")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        if status != "active" && change != "created" && change != "resumed" {
+                            println!();
+                            println!("{}", serde_json::to_string_pretty(&last_summary)?);
+                            return Ok(match status {
+                                "blocked" => exit_codes::BLOCKED,
+                                "paused" => exit_codes::PAUSED,
+                                "" if change == "cancelled" => exit_codes::CANCELLED,
+                                _ => exit_codes::SUCCESS_COMPLETE,
+                            });
+                        }
+                        if goal.is_none() && (change == "cancelled" || change.contains("complete"))
+                        {
+                            println!();
+                            println!("{}", serde_json::to_string_pretty(&last_summary)?);
+                            return Ok(if change == "cancelled" {
+                                exit_codes::CANCELLED
+                            } else {
+                                exit_codes::SUCCESS_COMPLETE
+                            });
+                        }
+                    }
+                    AgentEvent::TurnEnd { .. } => {
+                        // Keep waiting while goal remains active (auto-continuation).
+                        let body = session_goal_rpc(&requester, session_id, "status", None).await?;
+                        let status = body
+                            .pointer("/goal/status")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        if status != "active" {
+                            println!();
+                            println!("{}", serde_json::to_string_pretty(&body)?);
+                            return Ok(match status {
+                                "blocked" => exit_codes::BLOCKED,
+                                "paused" => exit_codes::PAUSED,
+                                "" => exit_codes::SUCCESS_COMPLETE,
+                                _ => exit_codes::SUCCESS_COMPLETE,
+                            });
+                        }
+                    }
+                    AgentEvent::Error { message, .. } => {
+                        eprintln!("Agent error: {message}");
+                        return Ok(exit_codes::ERROR);
+                    }
+                    AgentEvent::LlmRetry {
+                        retry_number,
+                        remaining_seconds,
+                        reason,
+                        ..
+                    } => {
+                        let when = if remaining_seconds == 0 {
+                            "now".to_string()
+                        } else {
+                            format!("in {remaining_seconds}s")
+                        };
+                        eprint!("\rLLM retry #{retry_number} {when}: {reason}");
+                        let _ = std::io::Write::flush(&mut io::stderr());
+                        if remaining_seconds == 0 {
+                            eprintln!();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    println!("{}", serde_json::to_string_pretty(&last_summary)?);
+    Ok(exit_codes::ERROR)
 }
 
 async fn run_server(
@@ -5899,6 +6061,164 @@ async fn handle_rpc_call(
 
             spawn_session_agent_turn(state, session_id, turn_permit).await?;
             Ok(serde_json::json!({"ok": true}))
+        }
+        "session.goal" => {
+            let session_id = params
+                .as_ref()
+                .and_then(|p| p.get("session_id"))
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| (-32602, "Missing session_id".into()))?
+                .to_string();
+            let action = params
+                .as_ref()
+                .and_then(|p| p.get("action"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("status");
+            let objective = params
+                .as_ref()
+                .and_then(|p| p.get("objective"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+
+            async fn goal_snapshot(mgr: &kkagent_protocol::goal::GoalManager) -> serde_json::Value {
+                match mgr.snapshot_with_budget().await {
+                    Some((goal, budget)) => serde_json::json!({
+                        "goal": goal,
+                        "budget": budget,
+                    }),
+                    None => serde_json::json!({
+                        "goal": null,
+                        "budget": null,
+                    }),
+                }
+            }
+
+            let publish_goal = |sid: String, body: &serde_json::Value, change: &str| {
+                state.publish_rpc_event(Frame::Event {
+                    event: "agent".into(),
+                    scope: None,
+                    data: serde_json::to_value(AgentEvent::GoalUpdated {
+                        session_id: sid,
+                        goal: body.get("goal").cloned(),
+                        budget: body.get("budget").cloned(),
+                        change: change.to_string(),
+                    })
+                    .unwrap_or_default(),
+                });
+            };
+
+            match action {
+                "status" | "get" => Ok(goal_snapshot(&state.goal_mgr).await),
+                "pause" => {
+                    state.goal_mgr.pause_goal().await;
+                    let body = goal_snapshot(&state.goal_mgr).await;
+                    publish_goal(session_id, &body, "paused");
+                    Ok(body)
+                }
+                "resume" => {
+                    state.goal_mgr.resume_goal().await;
+                    let body = goal_snapshot(&state.goal_mgr).await;
+                    let should_prompt = state.goal_mgr.should_continue().await;
+                    publish_goal(session_id.clone(), &body, "resumed");
+                    if should_prompt {
+                        let prompt = format!(
+                            "<system-reminder>\n{}\n</system-reminder>",
+                            kkagent_protocol::goal::GOAL_CONTINUATION_PROMPT
+                        );
+                        {
+                            let mut sessions = state.sessions.lock().await;
+                            if let Some(session) = sessions.get_mut(&session_id) {
+                                session.add_user_message(prompt);
+                            }
+                        }
+                        match state.turn_locks.try_acquire(&session_id).await {
+                            Ok(turn_permit) => {
+                                let _ = spawn_session_agent_turn(
+                                    state.clone(),
+                                    session_id,
+                                    turn_permit,
+                                )
+                                .await;
+                            }
+                            Err(err) => tracing::warn!("goal resume turn skipped: {err}"),
+                        }
+                    }
+                    Ok(body)
+                }
+                "cancel" => {
+                    let _ = state.goal_mgr.cancel_goal().await;
+                    let body = goal_snapshot(&state.goal_mgr).await;
+                    publish_goal(session_id.clone(), &body, "cancelled");
+                    {
+                        let mut sessions = state.sessions.lock().await;
+                        if let Some(session) = sessions.get_mut(&session_id) {
+                            session.add_user_message(format!(
+                                "<system-reminder>\n{}\n</system-reminder>",
+                                kkagent_protocol::goal::GOAL_CANCELLED_REMINDER
+                            ));
+                        }
+                    }
+                    Ok(body)
+                }
+                "create" | "replace" | "start" => {
+                    if objective.is_empty() {
+                        return Err((-32602, "objective is required".into()));
+                    }
+                    let replace = action == "replace"
+                        || params
+                            .as_ref()
+                            .and_then(|p| p.get("replace"))
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                    if let Some(existing) = state.goal_mgr.get_goal().await {
+                        if !existing.is_terminal() && !replace && action != "replace" {
+                            return Err((
+                                -32000,
+                                format!(
+                                    "A goal is already active ({}). Use action=replace.",
+                                    existing.description
+                                ),
+                            ));
+                        }
+                    }
+                    let goal = if replace || action == "replace" {
+                        state
+                            .goal_mgr
+                            .replace_goal(&objective, kkagent_protocol::goal::GoalBudget::default())
+                            .await
+                    } else {
+                        state
+                            .goal_mgr
+                            .create_goal(&objective, kkagent_protocol::goal::GoalBudget::default())
+                            .await
+                    };
+                    let body = goal_snapshot(&state.goal_mgr).await;
+                    publish_goal(session_id.clone(), &body, "created");
+                    let prompt = format!(
+                        "Pursue this goal until complete or blocked.\n\n{}\n\n{}",
+                        goal.untrusted_objective_xml(),
+                        kkagent_protocol::goal::GOAL_CONTINUATION_PROMPT
+                    );
+                    {
+                        let mut sessions = state.sessions.lock().await;
+                        if let Some(session) = sessions.get_mut(&session_id) {
+                            session.add_user_message(prompt);
+                        } else {
+                            return Err((-32602, format!("Session not found: {session_id}")));
+                        }
+                    }
+                    let turn_permit = state
+                        .turn_locks
+                        .try_acquire(&session_id)
+                        .await
+                        .map_err(|e| (-32000, e))?;
+                    spawn_session_agent_turn(state.clone(), session_id, turn_permit).await?;
+                    Ok(body)
+                }
+                other => Err((-32602, format!("Unknown goal action: {other}"))),
+            }
         }
         "session.interrupt" => {
             let session_id = params
