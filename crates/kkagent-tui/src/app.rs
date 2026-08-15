@@ -1572,9 +1572,6 @@ impl TuiApp {
                             self.state.refresh_slash_menu();
                         }
                     }
-                    Event::Resize(_, _) => {
-                        // Selection is clamped on the next render against new rows.
-                    }
                     _ => {}
                 }
             }

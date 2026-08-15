@@ -135,6 +135,12 @@ pub fn render_ui(f: &mut Frame, state: &mut AppState, config: &AppConfig) {
         .saturating_add(input_box)
         .saturating_add(slash_height);
     let footer_height = footer_height(size.width).min(size.height);
+    // Clamp the bottom stack so the message area always gets at least 2 rows.
+    // On very short (phone) terminals an unclamped stack can consume the entire
+    // viewport, causing the message area to flip between 0 and 1 rows every frame
+    // — visible as vertical flicker.
+    let max_bottom_stack = size.height.saturating_sub(footer_height).saturating_sub(2);
+    let bottom_stack = bottom_stack.min(max_bottom_stack);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -393,7 +399,11 @@ fn input_inner_height(state: &AppState, terminal_width: u16) -> u16 {
         prefix_w as u16,
     );
     // Include the cursor row (exact wrap boundary may need one extra visual line).
-    rows.max(cursor_y.saturating_add(1)).clamp(1, 8)
+    // On narrow (phone) terminals cap lower so the input box cannot crowd out the
+    // message area — a tall input box on a 20-row screen leaves almost nothing for
+    // the transcript, and the resulting squeeze causes visible vertical oscillation.
+    let cap = if is_narrow(terminal_width) { 4 } else { 8 };
+    rows.max(cursor_y.saturating_add(1)).clamp(1, cap)
 }
 
 fn render_messages(f: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) {
