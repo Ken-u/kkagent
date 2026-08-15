@@ -110,6 +110,12 @@ pub fn render_ui(f: &mut Frame, state: &mut AppState, config: &AppConfig) {
                 .as_ref()
                 .map(|_| if is_narrow(size.width) { 16 } else { 7 })
         })
+        .or_else(|| {
+            state
+                .quit_dialog
+                .as_ref()
+                .map(|_| if is_narrow(size.width) { 16 } else { 9 })
+        })
         .unwrap_or(0);
 
     // Sticky todo sits above the input (highest visual priority).
