@@ -27,6 +27,8 @@ pub struct BashOptions {
     pub default_timeout_s: u64,
     /// Toolchain config used for global-install deny checks.
     pub toolchain: kkagent_config::ToolchainConfig,
+    /// Execution environment (local or SSH).
+    pub kaos: kkagent_kaos::KaosHandle,
 }
 
 impl Default for BashOptions {
@@ -36,6 +38,9 @@ impl Default for BashOptions {
             sandbox: crate::sandbox::SandboxPolicy::default(),
             default_timeout_s: DEFAULT_TIMEOUT_S,
             toolchain: kkagent_config::ToolchainConfig::default(),
+            kaos: kkagent_kaos::KaosHandle::Local(std::sync::Arc::new(
+                kkagent_kaos::LocalKaos::cwd(),
+            )),
         }
     }
 }
@@ -451,7 +456,38 @@ impl BashTool {
         let mgr = self.backgrounds.clone();
         let id_clone = id.clone();
         let sandbox = self.options.sandbox.clone();
+        let kaos = self.options.kaos.clone();
+        let desc_for_kaos = description.clone();
         tokio::spawn(async move {
+            if kaos.kind() == "ssh" {
+                match run_via_kaos(
+                    &kaos,
+                    &command,
+                    &cwd,
+                    timeout_ms,
+                    Some(&cancel),
+                    &desc_for_kaos,
+                    &session_id,
+                )
+                .await
+                {
+                    Ok(out) => {
+                        mgr.append_output(&id_clone, &out.content).await;
+                        let status = if out.is_error {
+                            ShellStatus::Failed
+                        } else {
+                            ShellStatus::Complete
+                        };
+                        mgr.finish(&id_clone, status, None).await;
+                    }
+                    Err(error) => {
+                        mgr.append_output(&id_clone, &format!("Kaos failed: {error}"))
+                            .await;
+                        mgr.finish(&id_clone, ShellStatus::Failed, None).await;
+                    }
+                }
+                return;
+            }
             run_shell_job(
                 mgr,
                 id_clone,
@@ -482,6 +518,18 @@ Also available as task_id={id} via TaskOutput/TaskStop."
         timeout_ms: u64,
         interrupted: Option<Arc<std::sync::atomic::AtomicBool>>,
     ) -> anyhow::Result<ToolOutput> {
+        if self.options.kaos.kind() == "ssh" {
+            return run_via_kaos(
+                &self.options.kaos,
+                &command,
+                &cwd,
+                Some(timeout_ms),
+                interrupted.as_ref(),
+                &description,
+                &session_id,
+            )
+            .await;
+        }
         let (shell, flag) = shell_and_flag();
         let mut cmd = match self.options.sandbox.command_for_session(
             shell,
@@ -931,6 +979,63 @@ fn shell_and_flag() -> (&'static str, &'static str) {
         ("cmd", "/C")
     } else {
         ("bash", "-c")
+    }
+}
+
+async fn run_via_kaos(
+    kaos: &kkagent_kaos::KaosHandle,
+    command: &str,
+    cwd: &Path,
+    timeout_ms: Option<u64>,
+    interrupted: Option<&Arc<std::sync::atomic::AtomicBool>>,
+    description: &str,
+    session_id: &str,
+) -> anyhow::Result<ToolOutput> {
+    tracing::info!(
+        %session_id,
+        kaos = kaos.kind(),
+        cwd = %cwd.display(),
+        "Executing Bash via Kaos"
+    );
+    let exec = kaos.exec(command, Some(cwd));
+    let result = if let Some(ms) = timeout_ms {
+        match tokio::time::timeout(std::time::Duration::from_millis(ms), exec).await {
+            Ok(r) => r,
+            Err(_) => {
+                return Ok(ToolOutput::error(format!(
+                    "Remote command timed out after {ms}ms ({description})"
+                )));
+            }
+        }
+    } else {
+        exec.await
+    };
+    if interrupted.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst)) {
+        return Ok(ToolOutput::error("Interrupted"));
+    }
+    match result {
+        Ok(out) => {
+            let mut body = String::new();
+            if !out.stdout.is_empty() {
+                body.push_str(&out.stdout);
+            }
+            if !out.stderr.is_empty() {
+                if !body.is_empty() {
+                    body.push('\n');
+                }
+                body.push_str(&out.stderr);
+            }
+            if let Some(remote_cwd) = out.cwd {
+                body.push_str(&format!("\n[kaos cwd: {}]", remote_cwd.display()));
+            }
+            body.push_str(&format!("\n[kaos exit: {}]", out.status));
+            if out.status == 0 {
+                Ok(ToolOutput::success(truncate_chars(&body, MAX_OUTPUT)))
+            } else {
+                Ok(ToolOutput::error(truncate_chars(&body, MAX_OUTPUT)))
+            }
+        }
+        Err(error) => Ok(ToolOutput::error(format!("Kaos exec failed: {error}"))),
     }
 }
 

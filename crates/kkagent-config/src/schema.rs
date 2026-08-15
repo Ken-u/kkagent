@@ -76,6 +76,30 @@ pub struct AppConfig {
     /// Application-layer path-policy and sensitive-file settings.
     #[serde(default)]
     pub tools: ToolsConfig,
+    /// Optional SSH remote execution target (`[remote]`).
+    #[serde(default)]
+    pub remote: RemoteConfig,
+}
+
+/// Optional SSH remote environment (`[remote]` in config.toml).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RemoteConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub host: String,
+    #[serde(default = "default_ssh_port")]
+    pub port: u16,
+    #[serde(default)]
+    pub user: Option<String>,
+    #[serde(default)]
+    pub identity_file: Option<String>,
+    #[serde(default)]
+    pub remote_cwd: Option<String>,
+}
+
+fn default_ssh_port() -> u16 {
+    22
 }
 
 /// Standalone RPC server preferences (`[server]` in config.toml).

@@ -1706,6 +1706,7 @@ dependencies = [
  "image",
  "jsonschema",
  "kkagent-config",
+ "kkagent-kaos",
  "kkagent-protocol",
  "libc",
  "reqwest 0.12.28",

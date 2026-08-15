@@ -2612,6 +2612,21 @@ async fn build_turn_tool_registry(
             },
             default_timeout_s,
             toolchain: state.config().toolchain.clone(),
+            kaos: {
+                let cfg = state.config();
+                let remote = kkagent_kaos::RemoteConfig {
+                    enabled: cfg.remote.enabled,
+                    host: cfg.remote.host.clone(),
+                    port: cfg.remote.port,
+                    user: cfg.remote.user.clone(),
+                    identity_file: cfg.remote.identity_file.clone(),
+                    remote_cwd: cfg.remote.remote_cwd.clone(),
+                };
+                kkagent_kaos::environment_from_remote(
+                    Some(&remote),
+                    std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+                )
+            },
         },
     )));
     let path_isolation = matches!(

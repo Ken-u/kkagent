@@ -654,6 +654,11 @@ fn apply_workspace_env_whitelist(command: &mut Command) {
             kept.insert((*key).to_string(), value);
         }
     }
+    // Prefer login-shell PATH when available so workspace builds see
+    // rustup/homebrew/etc. without inheriting the full process env.
+    if let Some(login_path) = kkagent_kaos::detect_login_shell_path() {
+        kept.insert("PATH".into(), login_path);
+    }
     for (key, value) in std::env::vars() {
         if key.starts_with("LC_") {
             kept.insert(key, value);

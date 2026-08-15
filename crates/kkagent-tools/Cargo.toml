@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 kkagent-protocol = { workspace = true }
 kkagent-config = { workspace = true }
+kkagent-kaos = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
