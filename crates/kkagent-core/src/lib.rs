@@ -25,8 +25,10 @@ pub mod system_reminder;
 pub mod token_counting;
 pub mod tool_dedupe;
 pub mod tool_policy;
+pub mod tool_results;
 pub mod tool_scheduler;
 pub mod transcript;
+pub mod trash;
 pub mod undo_service;
 pub mod usage;
 
@@ -66,10 +68,15 @@ pub use swarm::{SwarmModeTrigger, SwarmService};
 pub use token_counting::{ContextSize, TokenCounter, TokenCountingStrategy};
 pub use tool_dedupe::{canonical_args, ToolDedupeTracker};
 pub use tool_policy::{ToolPolicyLayers, ToolPolicyService};
+pub use tool_results::{
+    parse_result_filename, persist as persist_tool_result, sanitize_fragment, tool_results_root,
+    PersistedToolResult, TOOL_RESULT_MAX_CHARS, TOOL_RESULT_PREVIEW_CHARS,
+};
 pub use tool_scheduler::{ToolCallTask, ToolScheduler};
 pub use transcript::{
     open_shared_sqlite, open_shared_sqlite_memory, IntegrityReport, IsolatedMessage, SharedSqlite,
     TranscriptDb,
 };
+pub use trash::{archive_session_to_trash, TrashSummary};
 pub use undo_service::{UndoResult, UndoService};
 pub use usage::UsageService;

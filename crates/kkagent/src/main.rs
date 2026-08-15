@@ -2070,12 +2070,23 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
         self.state.steer_mailboxes.lock().await.remove(id);
         self.state.active_btw_sessions.lock().await.remove(id);
         self.state.turn_locks.remove(id).await;
-        self.state
-            .transcript
-            .lock()
-            .await
-            .archive_session(id)
-            .map_err(|e| e.to_string())?;
+        {
+            let db = self.state.transcript.lock().await;
+            // Archive the full session (messages + oversized tool results) to
+            // `<config_dir>/trash/<id>.jsonl`, then purge DB rows. File
+            // cleanup happens inside the archive call; leftovers are logged
+            // but never fail the delete.
+            if let Err(error) = kkagent_core::trash::archive_session_to_trash(
+                &db,
+                &kkagent_config::default_config_dir(),
+                id,
+            ) {
+                if session.is_none() && error.to_string().contains("session not found") {
+                    return Err("session not found".into());
+                }
+                tracing::warn!("session {id}: trash archival failed ({error}); keeping DB rows");
+            }
+        }
         if let Some(session) = session.as_ref() {
             fire_session_hook(
                 &self.state,
@@ -2749,7 +2760,8 @@ async fn run_http_turn(
         state.abort_registry.clone(),
     )
     .with_hooks(state.hooks.clone())
-    .with_goal_manager(state.goal_mgr.clone());
+    .with_goal_manager(state.goal_mgr.clone())
+    .with_tool_result_store(state.tool_result_store.clone());
 
     let result = agent.run_turn(&mut session).await;
     let steer_result = session.close_and_apply_steers();
@@ -2795,6 +2807,9 @@ struct ServerState {
     plan_mode_requests: Mutex<HashMap<String, Arc<AtomicBool>>>,
     abort_registry: Arc<Mutex<HashMap<String, AbortHandle>>>,
     transcript: Mutex<TranscriptDb>,
+    /// Oversized tool-result store shared by every agent loop; also records
+    /// DB rows so trash archival can map files back to sessions.
+    tool_result_store: Arc<kkagent_core::agent_loop::ToolResultStore>,
     durable_http: kkagent_rpc::DurableHttpStore,
     subagents: Arc<SubagentManager>,
     /// Connected MCP servers; tools registered per turn from this manager.
@@ -3695,6 +3710,7 @@ async fn build_server_state_with_shutdown(
         open_transcript_with_policy(&transcript_path, allow_in_memory)?;
     // One Connection for transcript + durable HTTP + subagents (avoid triple open/busy_timeout).
     let transcript = TranscriptDb::from_shared(shared_sqlite.clone())?;
+    let db_for_tool_results = TranscriptDb::from_shared(shared_sqlite.clone())?;
     let durable_http = kkagent_rpc::DurableHttpStore::from_shared(shared_sqlite.clone())?;
     let subagents = Arc::new(SubagentManager::from_shared(4, shared_sqlite)?);
     let sandbox_policy = kkagent_tools::sandbox::SandboxPolicy::from_app_config(&config)?;
@@ -3851,6 +3867,10 @@ async fn build_server_state_with_shutdown(
         plan_mode_requests: Mutex::new(HashMap::new()),
         abort_registry: Arc::new(Mutex::new(HashMap::new())),
         transcript: Mutex::new(transcript),
+        tool_result_store: Arc::new(kkagent_core::agent_loop::ToolResultStore::new(
+            kkagent_config::default_config_dir(),
+            Some(db_for_tool_results),
+        )),
         durable_http,
         subagents,
         mcp,
@@ -4260,7 +4280,8 @@ async fn spawn_session_agent_turn(
                 state_clone.abort_registry.clone(),
             )
             .with_hooks(state_clone.hooks.clone())
-            .with_goal_manager(state_clone.goal_mgr.clone()),
+            .with_goal_manager(state_clone.goal_mgr.clone())
+            .with_tool_result_store(state_clone.tool_result_store.clone()),
         );
 
         let mut session = {

@@ -196,7 +196,7 @@ fn run_subagent_mirrored_boxed(
             "coder" => 32,
             _ => 24,
         };
-        let agent = AgentLoop::with_max_rounds(
+        let mut agent = AgentLoop::with_max_rounds(
             app_config,
             Arc::new(tools),
             Arc::new(Mutex::new(permission)),
@@ -204,6 +204,15 @@ fn run_subagent_mirrored_boxed(
             abort_registry,
             max_rounds,
         );
+        // Subagent oversized outputs spill into the parent session's bucket so
+        // they are swept together when the parent session is deleted.
+        if let Some(parent_session_id) = sub_cfg.parent_session_id.clone() {
+            let store = crate::agent_loop::ToolResultStore::for_subagent(
+                kkagent_config::default_config_dir(),
+                parent_session_id,
+            );
+            agent = agent.with_tool_result_store(Arc::new(store));
+        }
 
         let run_result = agent.run_turn(&mut session).await;
         match run_result {

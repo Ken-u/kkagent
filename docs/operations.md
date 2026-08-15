@@ -17,7 +17,8 @@
 | `~/.kkagent/telemetry/events.jsonl` | 本地遥测事件。 |
 | `~/.kkagent/http-audit.jsonl` | HTTP 请求审计日志，不记录原始 token。 |
 | `~/.kkagent/sessions/<workDirKey>/<sessionId>/agents/main/plans/` | Session 计划，文件名为 `YYYY-MM-DD_<plan-name>.md`。 |
-| `<workspace>/.kkagent/tool-results/` | 被外置保存的超大工具结果。 |
+| `~/.kkagent/tool-results/<session_id>/` | 被外置保存的超大工具结果，按 session 分桶；文件名含 tool 名、tool call id 和 UUID，并在 `transcripts.db` 记录映射。subagent 的外置结果写入父 session 桶（无 DB 行）。 |
+| `~/.kkagent/trash/<session_id>.jsonl` | 删除 session 时的回收站归档：完整导出 session 行、全部消息和每个超大工具结果内容，仅供离线分析；运行时不读取。 |
 
 ## 日志
 
@@ -76,6 +77,6 @@ Linux 生产主机需安装 Bubblewrap 并允许非特权 user namespace；否�
 
 ## 容量与清理
 
-Session journal、SQLite transcript、日志、telemetry 和 tool-results 会随使用增长。当前没有统一保留策略；应按组织要求定期归档或删除旧会话。删除前先导出需要保留的 Session，并避免在进程活跃时手工编辑数据库。
+Session journal、SQLite transcript、日志、telemetry 和 tool-results 会随使用增长。当前没有统一保留策略；应按组织要求定期归档或删除旧会话。删除 session 会把数据完整导出到 `~/.kkagent/trash/<session_id>.jsonl`（含超大工具结果全文）后从 DB 与磁盘清除，之后不再出现在任何列表里；trash 目录可按组织要求定期清理或归档。避免在进程活跃时手工编辑数据库。
 
 HTTP terminal 最大 64 个，单个 stdout/stderr 各约 1 MiB；Agent 后台任务默认并发 4，Bash 内部还有运行数量和最长存活时间限制。资源不足时先检查 `/api/v1/tasks`、`/api/v1/terminals` 和进程树。

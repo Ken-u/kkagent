@@ -116,6 +116,24 @@ impl TranscriptDb {
 
             CREATE INDEX IF NOT EXISTS idx_sessions_updated
                 ON sessions(updated_at DESC);
+
+            CREATE TABLE IF NOT EXISTS tool_results (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                turn_id TEXT,
+                tool_call_id TEXT NOT NULL,
+                tool_name TEXT NOT NULL,
+                file_path TEXT NOT NULL,
+                output_size_chars INTEGER NOT NULL,
+                output_size_bytes INTEGER NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_tool_results_session_id
+                ON tool_results(session_id);
+
+            CREATE INDEX IF NOT EXISTS idx_tool_results_tool_call_id
+                ON tool_results(tool_call_id);
             ",
         )?;
         let has_fallback_model: bool = conn.query_row(
@@ -345,6 +363,102 @@ impl TranscriptDb {
 
     pub fn archive_session(&self, session_id: &str) -> anyhow::Result<()> {
         self.set_archived(session_id, true)
+    }
+
+    /// Record a persisted oversized tool result.
+    pub fn record_tool_result(&self, record: &ToolResultRecord) -> anyhow::Result<()> {
+        self.lock()?.execute(
+            "INSERT INTO tool_results
+             (id, session_id, turn_id, tool_call_id, tool_name, file_path,
+              output_size_chars, output_size_bytes, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                record.id,
+                record.session_id,
+                record.turn_id,
+                record.tool_call_id,
+                record.tool_name,
+                record.file_path,
+                record.output_size_chars as u32,
+                record.output_size_bytes as u32,
+                record.created_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_tool_results(&self, session_id: &str) -> anyhow::Result<Vec<ToolResultRecord>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, session_id, turn_id, tool_call_id, tool_name, file_path,
+                    output_size_chars, output_size_bytes, created_at
+             FROM tool_results WHERE session_id = ?1 ORDER BY created_at",
+        )?;
+        let rows = stmt.query_map(params![session_id], |row| {
+            Ok(ToolResultRecord {
+                id: row.get(0)?,
+                session_id: row.get(1)?,
+                turn_id: row.get(2)?,
+                tool_call_id: row.get(3)?,
+                tool_name: row.get(4)?,
+                file_path: row.get(5)?,
+                output_size_chars: row.get::<_, i64>(6)? as usize,
+                output_size_bytes: row.get::<_, i64>(7)? as usize,
+                created_at: row.get(8)?,
+            })
+        })?;
+        let mut records = Vec::new();
+        for row in rows {
+            records.push(row?);
+        }
+        Ok(records)
+    }
+
+    /// Delete one tool-result record (DB row only; for migration/tests).
+    pub fn delete_tool_result_record(&self, id: &str) -> anyhow::Result<()> {
+        self.lock()?
+            .execute("DELETE FROM tool_results WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    /// Delete every DB row belonging to `session_id` in a single transaction:
+    /// `tool_results`, `messages`, `messages_quarantine`, `sessions`.
+    ///
+    /// Called by the trash archival flow after the JSONL export succeeded.
+    /// `messages_quarantine` is created lazily by integrity checks, so its
+    /// delete is skipped when the table does not exist yet.
+    pub fn purge_session(&self, session_id: &str) -> anyhow::Result<()> {
+        let conn = self.lock()?;
+        let has_quarantine: bool = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name = 'messages_quarantine'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )? > 0;
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM tool_results WHERE session_id = ?1",
+            params![session_id],
+        )?;
+        if has_quarantine {
+            tx.execute(
+                "DELETE FROM messages_quarantine WHERE session_id = ?1",
+                params![session_id],
+            )?;
+        }
+        tx.execute(
+            "DELETE FROM messages WHERE session_id = ?1",
+            params![session_id],
+        )?;
+        let changed = tx.execute(
+            "DELETE FROM sessions WHERE session_id = ?1",
+            params![session_id],
+        )?;
+        tx.commit()?;
+        if changed == 0 {
+            anyhow::bail!("session not found: {session_id}");
+        }
+        Ok(())
     }
 
     pub fn set_archived(&self, session_id: &str, archived: bool) -> anyhow::Result<()> {
@@ -598,6 +712,20 @@ pub struct IsolatedMessage {
     pub id: i64,
     pub session_id: String,
     pub reason: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ToolResultRecord {
+    pub id: String,
+    pub session_id: String,
+    pub turn_id: Option<String>,
+    pub tool_call_id: String,
+    pub tool_name: String,
+    pub file_path: String,
+    pub output_size_chars: usize,
+    pub output_size_bytes: usize,
+    /// Unix timestamp (seconds).
+    pub created_at: i64,
 }
 
 #[cfg(test)]

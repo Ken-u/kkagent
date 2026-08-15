@@ -24,7 +24,10 @@ use crate::plan_review::{
 };
 use crate::session::Session;
 use crate::token_counting::TokenCountingStrategy;
+use crate::tool_results::{TOOL_RESULT_MAX_CHARS, TOOL_RESULT_PREVIEW_CHARS};
 use crate::tool_scheduler::{box_start, ToolCallTask, ToolScheduler};
+use crate::transcript::TranscriptDb;
+use std::path::PathBuf;
 use std::sync::OnceLock;
 
 fn global_file_tracker() -> &'static FileConflictTracker {
@@ -42,6 +45,81 @@ pub struct AgentLoop {
     max_rounds: u32,
     hooks: Option<Arc<kkagent_mcp::HookManager>>,
     goal_mgr: Option<Arc<GoalManager>>,
+    /// Where oversized tool results are spilled. `None` keeps results inline
+    /// (truncated with a notice) — used by subagent loops that share the
+    /// parent's store instead of owning one.
+    tool_result_store: Option<Arc<ToolResultStore>>,
+}
+
+/// Spills oversized tool results to `<config_dir>/tool-results/` and, when a
+/// transcript DB is attached, records the mapping for trash archival.
+pub struct ToolResultStore {
+    config_dir: PathBuf,
+    db: Option<TranscriptDb>,
+    /// When set (subagents), files are bucketed under this parent session id
+    /// and no DB rows are written — the parent's trash sweep covers the files.
+    bucket_override: Option<String>,
+}
+
+pub struct RecordedToolResult {
+    pub file_path: PathBuf,
+}
+
+impl ToolResultStore {
+    pub fn new(config_dir: PathBuf, db: Option<TranscriptDb>) -> Self {
+        Self {
+            config_dir,
+            db,
+            bucket_override: None,
+        }
+    }
+
+    /// A store shared by a subagent run: oversized outputs spill into the
+    /// parent session's bucket (no DB rows; `crate::trash` sweeps the whole
+    /// directory when the parent session is deleted).
+    pub fn for_subagent(config_dir: PathBuf, parent_session_id: String) -> Self {
+        Self {
+            config_dir,
+            db: None,
+            bucket_override: Some(parent_session_id),
+        }
+    }
+
+    fn persist(
+        &self,
+        session: &Session,
+        tool_name: &str,
+        tool_call_id: &str,
+        content: &str,
+    ) -> Result<RecordedToolResult, String> {
+        let bucket = self.bucket_override.as_deref().unwrap_or(&session.id);
+        let persisted = crate::tool_results::persist(
+            &self.config_dir,
+            bucket,
+            tool_name,
+            tool_call_id,
+            content,
+        )?;
+        if let (Some(db), None) = (&self.db, &self.bucket_override) {
+            let record = crate::transcript::ToolResultRecord {
+                id: uuid::Uuid::new_v4().to_string(),
+                session_id: session.id.clone(),
+                turn_id: None,
+                tool_call_id: tool_call_id.to_string(),
+                tool_name: tool_name.to_string(),
+                file_path: persisted.path.display().to_string(),
+                output_size_chars: persisted.output_size_chars,
+                output_size_bytes: persisted.output_size_bytes,
+                created_at: chrono::Utc::now().timestamp(),
+            };
+            if let Err(error) = db.record_tool_result(&record) {
+                tracing::warn!("failed to record tool result in DB: {error}");
+            }
+        }
+        Ok(RecordedToolResult {
+            file_path: persisted.path,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,7 +128,6 @@ enum TurnStep {
     Done,
 }
 
-const TOOL_RESULT_INLINE_MAX: usize = 32_000;
 const TURN_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 
 struct TurnHeartbeat {
@@ -117,6 +194,12 @@ impl AgentLoop {
         self
     }
 
+    /// Attach the oversized-tool-result store (and optional transcript DB).
+    pub fn with_tool_result_store(mut self, store: Arc<ToolResultStore>) -> Self {
+        self.tool_result_store = Some(store);
+        self
+    }
+
     pub fn with_max_rounds(
         config: Arc<AppConfig>,
         tools: Arc<ToolRegistry>,
@@ -134,6 +217,7 @@ impl AgentLoop {
             max_rounds,
             hooks: None,
             goal_mgr: None,
+            tool_result_store: None,
         }
     }
 
@@ -1437,7 +1521,13 @@ Do not mention this reminder to the user.\n</system-reminder>"
                     }
                 }
 
-                let output = truncate_tool_output(session, &name, output);
+                let output = truncate_tool_output(
+                    self.tool_result_store.as_deref(),
+                    session,
+                    &name,
+                    &id,
+                    output,
+                );
 
                 tracing::info!(
                     "Tool {} result: error={} len={}",
@@ -2523,78 +2613,42 @@ async fn execute_tool_parallel(request: ParallelToolRequest) -> ToolOutput {
     }
 }
 
-fn truncate_tool_output(session: &Session, tool_name: &str, mut output: ToolOutput) -> ToolOutput {
-    if output.content.len() <= TOOL_RESULT_INLINE_MAX {
+fn truncate_tool_output(
+    store: Option<&ToolResultStore>,
+    session: &Session,
+    tool_name: &str,
+    tool_call_id: &str,
+    mut output: ToolOutput,
+) -> ToolOutput {
+    if output.content.chars().count() <= TOOL_RESULT_MAX_CHARS {
         return output;
     }
-    let full_len = output.content.chars().count();
-    let preview: String = output.content.chars().take(4000).collect();
-    output.content = match persist_tool_output(&session.working_dir, &output.content) {
-        Ok(path) => format!(
-            "{preview}\n\n… tool result truncated ({tool_name}, {full_len} chars). Full output saved to {} — use Read on that path if needed.",
-            path.display()
+    let full_chars = output.content.chars().count();
+    let full_bytes = output.content.len();
+    let preview: String = output
+        .content
+        .chars()
+        .take(TOOL_RESULT_PREVIEW_CHARS)
+        .collect();
+    let store = match store {
+        Some(store) => store,
+        None => {
+            output.content = format!(
+                "{preview}\n\n… tool result truncated ({tool_name}, {full_chars} chars). The full output could not be saved: transcript store unavailable"
+            );
+            return output;
+        }
+    };
+    output.content = match store.persist(session, tool_name, tool_call_id, &output.content) {
+        Ok(record) => format!(
+            "{preview}\n\n… tool result truncated. Full output saved to disk.\ntool_name: {tool_name}\ntool_call_id: {tool_call_id}\noutput_size_chars: {full_chars}\noutput_size_bytes: {full_bytes}\noutput_path: {path}\nnext_step: use the Read tool on output_path to inspect the full result if needed.",
+            path = record.file_path.display()
         ),
         Err(error) => format!(
-            "{preview}\n\n… tool result truncated ({tool_name}, {full_len} chars). The full output could not be saved: {error}"
+            "{preview}\n\n… tool result truncated ({tool_name}, {full_chars} chars). The full output could not be saved: {error}"
         ),
     };
     output
-}
-
-fn persist_tool_output(
-    working_dir: &std::path::Path,
-    content: &str,
-) -> Result<std::path::PathBuf, String> {
-    let root = std::fs::canonicalize(working_dir)
-        .map_err(|error| format!("workspace is unavailable ({error})"))?;
-    let app_dir = root.join(".kkagent");
-    reject_symlink(&app_dir)?;
-    std::fs::create_dir_all(&app_dir)
-        .map_err(|error| format!("cannot create .kkagent directory ({error})"))?;
-    let dir = app_dir.join("tool-results");
-    reject_symlink(&dir)?;
-    std::fs::create_dir_all(&dir)
-        .map_err(|error| format!("cannot create tool-results directory ({error})"))?;
-
-    let canonical_dir = std::fs::canonicalize(&dir)
-        .map_err(|error| format!("cannot resolve tool-results directory ({error})"))?;
-    if !canonical_dir.starts_with(&root) {
-        return Err("tool-results directory escapes the workspace".into());
-    }
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&app_dir, std::fs::Permissions::from_mode(0o700));
-        let _ = std::fs::set_permissions(&canonical_dir, std::fs::Permissions::from_mode(0o700));
-    }
-
-    let path = canonical_dir.join(format!("{}.txt", uuid::Uuid::new_v4()));
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options
-        .open(&path)
-        .map_err(|error| format!("cannot create result file ({error})"))?;
-    std::io::Write::write_all(&mut file, content.as_bytes())
-        .map_err(|error| format!("cannot write result file ({error})"))?;
-    Ok(path)
-}
-
-fn reject_symlink(path: &std::path::Path) -> Result<(), String> {
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => Err(format!(
-            "refusing symlinked output directory {}",
-            path.display()
-        )),
-        Ok(_) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(format!("cannot inspect {} ({error})", path.display())),
-    }
 }
 
 fn session_has_goal_reminder(session: &Session) -> bool {
@@ -2958,31 +3012,98 @@ mod retry_tests {
     }
 
     #[test]
-    fn persists_large_tool_results_inside_workspace() {
-        let workspace =
-            std::env::temp_dir().join(format!("kkagent-output-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&workspace).unwrap();
-        let path = persist_tool_output(&workspace, "full output").unwrap();
-        assert!(path.starts_with(std::fs::canonicalize(&workspace).unwrap()));
-        assert_eq!(std::fs::read_to_string(path).unwrap(), "full output");
-        std::fs::remove_dir_all(workspace).unwrap();
+    fn truncates_oversized_output_with_metadata_notice() {
+        let base = std::env::temp_dir().join(format!("kkagent-output-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&base).unwrap();
+        let store = crate::agent_loop::ToolResultStore::new(base.clone(), None);
+        let mut session = crate::session::Session::new(
+            "sess-1".to_string(),
+            base.clone(),
+            kkagent_protocol::PermissionMode::Manual,
+            "test-model".into(),
+        );
+        session.working_dir = base.clone();
+        let big = "x".repeat(TOOL_RESULT_MAX_CHARS + 1);
+        let output = truncate_tool_output(
+            Some(&store),
+            &session,
+            "Bash",
+            "call-1",
+            kkagent_tools::ToolOutput::success(big),
+        );
+        assert!(output.content.contains("tool_name: Bash"));
+        assert!(output.content.contains("tool_call_id: call-1"));
+        assert!(output.content.contains("output_size_chars:"));
+        assert!(output.content.contains("output_size_bytes:"));
+        assert!(output.content.contains("output_path:"));
+        assert!(output.content.contains("next_step:"));
+        assert!(!output.is_error);
+        std::fs::remove_dir_all(&base).unwrap();
     }
 
-    #[cfg(unix)]
     #[test]
-    fn refuses_symlinked_tool_result_directory() {
-        use std::os::unix::fs::symlink;
+    fn small_output_stays_inline() {
         let base =
-            std::env::temp_dir().join(format!("kkagent-output-link-{}", uuid::Uuid::new_v4()));
-        let workspace = base.join("workspace");
-        let outside = base.join("outside");
-        std::fs::create_dir_all(&workspace).unwrap();
-        std::fs::create_dir_all(&outside).unwrap();
-        symlink(&outside, workspace.join(".kkagent")).unwrap();
-        let error = persist_tool_output(&workspace, "must not escape").unwrap_err();
-        assert!(error.contains("symlinked"));
-        assert!(std::fs::read_dir(&outside).unwrap().next().is_none());
-        std::fs::remove_dir_all(base).unwrap();
+            std::env::temp_dir().join(format!("kkagent-output-inline-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&base).unwrap();
+        let store = crate::agent_loop::ToolResultStore::new(base.clone(), None);
+        let mut session = crate::session::Session::new(
+            "sess-1".to_string(),
+            base.clone(),
+            kkagent_protocol::PermissionMode::Manual,
+            "test-model".into(),
+        );
+        session.working_dir = base.clone();
+        // Multi-byte characters: char count below the threshold even though
+        // the byte length exceeds it.
+        let big = "汉".repeat(TOOL_RESULT_PREVIEW_CHARS + 1);
+        assert!(big.len() > TOOL_RESULT_PREVIEW_CHARS * 3);
+        let output = truncate_tool_output(
+            Some(&store),
+            &session,
+            "Bash",
+            "call-1",
+            kkagent_tools::ToolOutput::success(big.clone()),
+        );
+        assert_eq!(output.content, big);
+        assert!(!crate::tool_results::tool_results_root(&base)
+            .join("sess-1")
+            .exists());
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn subagent_store_buckets_into_parent_session() {
+        let base =
+            std::env::temp_dir().join(format!("kkagent-output-sub-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&base).unwrap();
+        let store =
+            crate::agent_loop::ToolResultStore::for_subagent(base.clone(), "parent-1".into());
+        let mut session = crate::session::Session::new(
+            "sub-1".to_string(),
+            base.clone(),
+            kkagent_protocol::PermissionMode::Manual,
+            "test-model".into(),
+        );
+        session.working_dir = base.clone();
+        let big = "y".repeat(TOOL_RESULT_MAX_CHARS + 1);
+        let output = truncate_tool_output(
+            Some(&store),
+            &session,
+            "Grep",
+            "call-9",
+            kkagent_tools::ToolOutput::success(big),
+        );
+        assert!(output.content.contains("output_path:"));
+        // File lands in the parent session's bucket...
+        assert!(crate::tool_results::tool_results_root(&base)
+            .join("parent-1")
+            .exists());
+        // ...and no sub-1 bucket is created.
+        assert!(!crate::tool_results::tool_results_root(&base)
+            .join("sub-1")
+            .exists());
+        std::fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]

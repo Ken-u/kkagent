@@ -60,10 +60,11 @@ HTTP WebSocket 是进程级实时广播；事件先写入 SQLite、再发送给�
 
 ## 持久化
 
-- SQLite transcript 保存结构化消息和会话索引数据。
+- SQLite transcript 保存结构化消息和会话索引数据；`tool_results` 表记录超大工具结果文件与 session/tool call 的映射。
 - 同一 SQLite 数据库保存 HTTP 事件、幂等 turn 队列、租约/重试状态和后台 Agent 配置。启动时 `running`/待审批任务会进入恢复队列，最多尝试三次。
 - session 目录保存事件 journal、元数据和运行产物。
-- workspace 下 `.kkagent/` 保存计划、超大工具结果等项目相关产物。
+- 超大工具结果外置到 `~/.kkagent/tool-results/<session_id>/`，不占用 workspace；subagent 结果写入父 session 桶。
+- 删除 session 时先完整导出到 `~/.kkagent/trash/<session_id>.jsonl` 回收站（session 行、全部消息、工具结果全文），再清空 DB 行与文件；回收站仅供离线分析，运行时不读取。
 - wire 记录包含迁移支持，升级时不应手工编辑。
 
 详细路径见[运维指南](operations.md)。
