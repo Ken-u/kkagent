@@ -2815,6 +2815,10 @@ struct ServerState {
     pending_questions: Mutex<HashMap<String, serde_json::Value>>,
     /// In-flight tool/plan approval requests while a turn owns the Session (keyed by session_id).
     pending_tool_approvals: Mutex<HashMap<String, kkagent_protocol::ApprovalRequest>>,
+    /// Last status / partial stream buffers so reattach can catch up without replaying wire.
+    reconnect_ui: Mutex<HashMap<String, SessionReconnectUi>>,
+    /// Live `/btw` panel state (survives TUI detach).
+    pending_btw: Mutex<HashMap<String, PendingBtwUi>>,
     background_tasks: Mutex<Vec<AbortHandle>>,
     turn_locks: SessionTurnLocks,
     /// Recent session.prompt idempotency keys → first-seen time.
@@ -2835,6 +2839,32 @@ struct ActiveBtwSession {
     service: Arc<SessionBtwService>,
     agents: Arc<AgentLifecycleService>,
     history: Arc<StdRwLock<Vec<ChatMessage>>>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct SessionReconnectUi {
+    status: Option<SessionStatus>,
+    thinking_text: String,
+    assistant_text: String,
+    llm_retry: Option<LlmRetryUi>,
+}
+
+#[derive(Debug, Clone)]
+struct LlmRetryUi {
+    retry_number: u32,
+    reason: String,
+    remaining_seconds: u64,
+}
+
+#[derive(Debug, Clone)]
+struct PendingBtwUi {
+    agent_id: String,
+    question: String,
+    answer: String,
+    thinking: String,
+    streaming: bool,
+    turns: Vec<BtwTurn>,
+    retry_status: Option<String>,
 }
 
 impl ActiveBtwSession {
@@ -3108,6 +3138,106 @@ impl ServerState {
             .cloned()
     }
 
+    async fn set_reconnect_status(&self, session_id: &str, status: SessionStatus) {
+        let mut map = self.reconnect_ui.lock().await;
+        let entry = map.entry(session_id.to_string()).or_default();
+        entry.status = Some(status);
+        if matches!(status, SessionStatus::Idle) {
+            entry.thinking_text.clear();
+            entry.assistant_text.clear();
+            entry.llm_retry = None;
+        }
+    }
+
+    async fn clear_reconnect_ui(&self, session_id: &str) {
+        self.reconnect_ui.lock().await.remove(session_id);
+    }
+
+    async fn reconnect_status_for_session(&self, session_id: &str) -> Option<SessionStatus> {
+        self.reconnect_ui
+            .lock()
+            .await
+            .get(session_id)
+            .and_then(|ui| ui.status)
+    }
+
+    async fn reconnect_live_for_session(&self, session_id: &str) -> Option<serde_json::Value> {
+        let ui = self.reconnect_ui.lock().await.get(session_id)?.clone();
+        if ui.thinking_text.is_empty() && ui.assistant_text.is_empty() && ui.llm_retry.is_none() {
+            return None;
+        }
+        Some(serde_json::json!({
+            "thinking_text": ui.thinking_text,
+            "assistant_text": ui.assistant_text,
+            "llm_retry": ui.llm_retry.as_ref().map(|retry| serde_json::json!({
+                "retry_number": retry.retry_number,
+                "reason": retry.reason,
+                "remaining_seconds": retry.remaining_seconds,
+            })),
+        }))
+    }
+
+    async fn remember_pending_btw(&self, session_id: &str, snapshot: PendingBtwUi) {
+        self.pending_btw
+            .lock()
+            .await
+            .insert(session_id.to_string(), snapshot);
+    }
+
+    async fn clear_pending_btw(&self, session_id: &str) {
+        self.pending_btw.lock().await.remove(session_id);
+    }
+
+    async fn pending_btw_for_session(&self, session_id: &str) -> Option<serde_json::Value> {
+        let btw = self.pending_btw.lock().await.get(session_id)?.clone();
+        Some(serde_json::json!({
+            "agent_id": btw.agent_id,
+            "question": btw.question,
+            "answer": btw.answer,
+            "thinking": btw.thinking,
+            "streaming": btw.streaming,
+            "retry_status": btw.retry_status,
+            "turns": btw.turns,
+        }))
+    }
+
+    async fn resume_status_for_session(
+        &self,
+        session_id: &str,
+        turn_active: bool,
+        has_pending_approval: bool,
+        has_pending_question: bool,
+    ) -> SessionStatus {
+        if has_pending_approval {
+            return SessionStatus::WaitingApproval;
+        }
+        if has_pending_question {
+            return SessionStatus::WaitingQuestion;
+        }
+        if let Some(status) = self.reconnect_status_for_session(session_id).await {
+            return status;
+        }
+        if turn_active {
+            SessionStatus::Thinking
+        } else {
+            SessionStatus::Idle
+        }
+    }
+
+    async fn resume_reconnect_fields(
+        &self,
+        session_id: &str,
+    ) -> serde_json::Map<String, serde_json::Value> {
+        let mut extra = serde_json::Map::new();
+        if let Some(live) = self.reconnect_live_for_session(session_id).await {
+            extra.insert("live_ui".into(), live);
+        }
+        if let Some(btw) = self.pending_btw_for_session(session_id).await {
+            extra.insert("pending_btw".into(), btw);
+        }
+        extra
+    }
+
     async fn note_agent_event_for_resume(&self, evt: &AgentEvent) {
         match evt {
             AgentEvent::QuestionAsked {
@@ -3115,13 +3245,83 @@ impl ServerState {
                 question,
             } => {
                 self.remember_pending_question(session_id, question).await;
+                self.set_reconnect_status(session_id, SessionStatus::WaitingQuestion)
+                    .await;
             }
             AgentEvent::ApprovalRequested { request, .. } => {
                 self.remember_pending_tool_approval(request.clone()).await;
+                self.set_reconnect_status(&request.session_id, SessionStatus::WaitingApproval)
+                    .await;
+            }
+            AgentEvent::StatusUpdate {
+                session_id, status, ..
+            } => {
+                self.set_reconnect_status(session_id, *status).await;
+                if matches!(
+                    status,
+                    SessionStatus::Thinking | SessionStatus::ToolExecuting
+                ) {
+                    let mut map = self.reconnect_ui.lock().await;
+                    if let Some(ui) = map.get_mut(session_id) {
+                        ui.llm_retry = None;
+                    }
+                }
+            }
+            AgentEvent::ThinkingDelta {
+                session_id, text, ..
+            } => {
+                let mut map = self.reconnect_ui.lock().await;
+                let entry = map.entry(session_id.clone()).or_default();
+                entry.thinking_text.push_str(text);
+            }
+            AgentEvent::MessageDelta {
+                session_id, text, ..
+            } => {
+                let mut map = self.reconnect_ui.lock().await;
+                let entry = map.entry(session_id.clone()).or_default();
+                entry.assistant_text.push_str(text);
+            }
+            AgentEvent::ToolCall { session_id, .. } => {
+                // Tool boundary closes the current assistant stream buffer; fresh
+                // deltas after tools start a new bubble on the TUI.
+                let mut map = self.reconnect_ui.lock().await;
+                if let Some(ui) = map.get_mut(session_id) {
+                    ui.assistant_text.clear();
+                    ui.thinking_text.clear();
+                }
+            }
+            AgentEvent::LlmRetry {
+                session_id,
+                retry_number,
+                reason,
+                remaining_seconds,
+                ..
+            } => {
+                let mut map = self.reconnect_ui.lock().await;
+                let entry = map.entry(session_id.clone()).or_default();
+                entry.llm_retry = Some(LlmRetryUi {
+                    retry_number: *retry_number,
+                    reason: reason.clone(),
+                    remaining_seconds: *remaining_seconds,
+                });
+                entry.status = Some(SessionStatus::Thinking);
+            }
+            AgentEvent::TurnStart { session_id, .. } => {
+                let mut map = self.reconnect_ui.lock().await;
+                let entry = map.entry(session_id.clone()).or_default();
+                entry.thinking_text.clear();
+                entry.assistant_text.clear();
+                entry.llm_retry = None;
+                entry.status = Some(SessionStatus::Thinking);
             }
             AgentEvent::TurnEnd { session_id, .. } => {
                 self.clear_pending_question(session_id, None).await;
                 self.clear_pending_tool_approval(session_id, None).await;
+                self.clear_reconnect_ui(session_id).await;
+            }
+            AgentEvent::CompactCompleted { session_id, .. } => {
+                self.set_reconnect_status(session_id, SessionStatus::Idle)
+                    .await;
             }
             _ => {}
         }
@@ -3442,6 +3642,8 @@ async fn build_server_state_with_shutdown(
         events,
         pending_questions: Mutex::new(HashMap::new()),
         pending_tool_approvals: Mutex::new(HashMap::new()),
+        reconnect_ui: Mutex::new(HashMap::new()),
+        pending_btw: Mutex::new(HashMap::new()),
         background_tasks: Mutex::new(background_tasks),
         turn_locks: SessionTurnLocks::default(),
         prompt_idempotency: Mutex::new(HashMap::new()),
@@ -4767,19 +4969,18 @@ async fn handle_rpc_call(
                         None => plan_pending_approval,
                     };
                 let pending_question = state.pending_question_for_session(&session_id).await;
-                let status = if pending_approval.is_some() {
-                    SessionStatus::WaitingApproval
-                } else if pending_question.is_some() {
-                    SessionStatus::WaitingQuestion
-                } else if turn_active {
-                    SessionStatus::Thinking
-                } else {
-                    SessionStatus::Idle
-                };
+                let status = state
+                    .resume_status_for_session(
+                        &session_id,
+                        turn_active,
+                        pending_approval.is_some(),
+                        pending_question.is_some(),
+                    )
+                    .await;
                 let total = messages.len();
                 let (display, oldest_index, older_available) =
                     slice_recent_messages(&messages, display_limit);
-                return Ok(serde_json::json!({
+                let mut payload = serde_json::json!({
                     "session_id": session_id,
                     "messages": display,
                     "plan_mode": plan_mode,
@@ -4804,7 +5005,11 @@ async fn handle_rpc_call(
                         "oldest_index": oldest_index,
                         "older_available": older_available,
                     },
-                }));
+                });
+                if let Some(obj) = payload.as_object_mut() {
+                    obj.extend(state.resume_reconnect_fields(&session_id).await);
+                }
+                return Ok(payload);
             }
 
             let configured_perm_mode = state
@@ -4850,17 +5055,18 @@ async fn handle_rpc_call(
                     };
                 let pending_question = state.pending_question_for_session(&session_id).await;
                 let todos = kkagent_core::load_persisted_todos(&session_id, &resumed_working_dir);
-                let status = if pending_approval.is_some() {
-                    SessionStatus::WaitingApproval
-                } else if pending_question.is_some() {
-                    SessionStatus::WaitingQuestion
-                } else {
-                    SessionStatus::Thinking
-                };
+                let status = state
+                    .resume_status_for_session(
+                        &session_id,
+                        true,
+                        pending_approval.is_some(),
+                        pending_question.is_some(),
+                    )
+                    .await;
                 let total = messages.len();
                 let (display, oldest_index, older_available) =
                     slice_recent_messages(&messages, display_limit);
-                return Ok(serde_json::json!({
+                let mut payload = serde_json::json!({
                     "session_id": session_id,
                     "messages": display,
                     "plan_mode": plan_state.enabled,
@@ -4879,7 +5085,11 @@ async fn handle_rpc_call(
                         "oldest_index": oldest_index,
                         "older_available": older_available,
                     },
-                }));
+                });
+                if let Some(obj) = payload.as_object_mut() {
+                    obj.extend(state.resume_reconnect_fields(&session_id).await);
+                }
+                return Ok(payload);
             }
             let mut session = Session::resume(
                 session_id.clone(),
@@ -4904,13 +5114,14 @@ async fn handle_rpc_call(
             let pending_approval = session.pending_plan_review();
             let pending_question = state.pending_question_for_session(&session_id).await;
             let todos = session.todo_items();
-            let status = if pending_approval.is_some() {
-                SessionStatus::WaitingApproval
-            } else if pending_question.is_some() {
-                SessionStatus::WaitingQuestion
-            } else {
-                SessionStatus::Idle
-            };
+            let status = state
+                .resume_status_for_session(
+                    &session_id,
+                    false,
+                    pending_approval.is_some(),
+                    pending_question.is_some(),
+                )
+                .await;
 
             state
                 .interrupt_flags
@@ -4961,7 +5172,7 @@ async fn handle_rpc_call(
             let total = messages.len();
             let (display, oldest_index, older_available) =
                 slice_recent_messages(&messages, display_limit);
-            Ok(serde_json::json!({
+            let mut payload = serde_json::json!({
                 "session_id": session_id,
                 "messages": display,
                 "plan_mode": plan_mode,
@@ -4980,7 +5191,11 @@ async fn handle_rpc_call(
                     "oldest_index": oldest_index,
                     "older_available": older_available,
                 },
-            }))
+            });
+            if let Some(obj) = payload.as_object_mut() {
+                obj.extend(state.resume_reconnect_fields(&session_id).await);
+            }
+            Ok(payload)
         }
         "session.history" => {
             let session_id = params
@@ -5308,6 +5523,9 @@ async fn handle_rpc_call(
             }
             state.clear_pending_question(&session_id, None).await;
             state.clear_pending_tool_approval(&session_id, None).await;
+            state
+                .set_reconnect_status(&session_id, SessionStatus::Cancelling)
+                .await;
             if let Some(session) = state.sessions.lock().await.get(&session_id) {
                 session.request_interrupt();
             }
@@ -5391,6 +5609,21 @@ async fn handle_rpc_call(
             let cancel = btw_service.cancel_flag();
             cancel.store(false, std::sync::atomic::Ordering::SeqCst);
 
+            state
+                .remember_pending_btw(
+                    &session_id,
+                    PendingBtwUi {
+                        agent_id: agent_id.clone(),
+                        question: question.clone(),
+                        answer: String::new(),
+                        thinking: String::new(),
+                        streaming: true,
+                        turns: prior_turns.clone(),
+                        retry_status: None,
+                    },
+                )
+                .await;
+
             let rpc_state = state.clone();
             let config = state.config.clone();
             let sid = session_id.clone();
@@ -5399,6 +5632,7 @@ async fn handle_rpc_call(
             let task_btw_service = btw_service.clone();
             tokio::spawn(async move {
                 let mut answer = String::new();
+                let mut thinking = String::new();
                 let mut stream_error: Option<String> = None;
                 let max_attempts = config
                     .loop_control
@@ -5447,6 +5681,15 @@ async fn handle_rpc_call(
                             kkagent_llm::types::StreamEvent::TextDelta(text) => {
                                 emitted_output = true;
                                 answer.push_str(&text);
+                                {
+                                    let mut pending = rpc_state.pending_btw.lock().await;
+                                    if let Some(btw) = pending.get_mut(&sid) {
+                                        if btw.agent_id == event_agent_id {
+                                            btw.answer.push_str(&text);
+                                            btw.retry_status = None;
+                                        }
+                                    }
+                                }
                                 rpc_state.publish_rpc_event(Frame::Event {
                                     event: "agent".into(),
                                     scope: None,
@@ -5460,6 +5703,16 @@ async fn handle_rpc_call(
                             }
                             kkagent_llm::types::StreamEvent::ThinkingDelta(text) => {
                                 emitted_output = true;
+                                thinking.push_str(&text);
+                                {
+                                    let mut pending = rpc_state.pending_btw.lock().await;
+                                    if let Some(btw) = pending.get_mut(&sid) {
+                                        if btw.agent_id == event_agent_id {
+                                            btw.thinking.push_str(&text);
+                                            btw.retry_status = None;
+                                        }
+                                    }
+                                }
                                 rpc_state.publish_rpc_event(Frame::Event {
                                     event: "agent".into(),
                                     scope: None,
@@ -5499,6 +5752,17 @@ async fn handle_rpc_call(
                     if retryable {
                         let delay = btw_retry_delay(attempt, retry_after, rate_limited, retry_base);
                         let reason = attempt_error.as_deref().unwrap_or("LLM request failed");
+                        {
+                            let mut pending = rpc_state.pending_btw.lock().await;
+                            if let Some(btw) = pending.get_mut(&sid) {
+                                if btw.agent_id == event_agent_id {
+                                    btw.retry_status = Some(format!(
+                                        "retry {attempt} in {}s: {reason}",
+                                        delay.as_secs().max(1)
+                                    ));
+                                }
+                            }
+                        }
                         let publish = |frame: Frame| rpc_state.publish_rpc_event(frame);
                         if wait_for_btw_retry(
                             &publish,
@@ -5523,12 +5787,31 @@ async fn handle_rpc_call(
                     && task_btw_service.is_current(&cancel)
                 {
                     task_btw_service.push_turn(BtwTurn {
-                        question: q,
-                        answer,
+                        question: q.clone(),
+                        answer: answer.clone(),
                     });
                 }
 
                 task_btw_service.end(&cancel);
+
+                {
+                    let mut pending = rpc_state.pending_btw.lock().await;
+                    if let Some(btw) = pending.get_mut(&sid) {
+                        if btw.agent_id == event_agent_id {
+                            btw.streaming = false;
+                            btw.retry_status = None;
+                            btw.turns = task_btw_service.turns();
+                            if stream_error.is_some() {
+                                btw.answer = answer;
+                                btw.thinking = thinking;
+                            } else {
+                                btw.question.clear();
+                                btw.answer.clear();
+                                btw.thinking.clear();
+                            }
+                        }
+                    }
+                }
 
                 rpc_state.publish_rpc_event(Frame::Event {
                     event: "agent".into(),
@@ -5587,6 +5870,7 @@ async fn handle_rpc_call(
             } else if let Some(active) = state.active_btw_sessions.lock().await.get(session_id) {
                 active.service.clear(&active.agents);
             }
+            state.clear_pending_btw(session_id).await;
             Ok(serde_json::json!({"ok": true}))
         }
         "session.set_permission_mode" => {
@@ -6429,20 +6713,20 @@ async fn handle_rpc_call(
                 return Err((-32000, "No messages to compact in current history.".into()));
             }
 
-            let _ = rpc_event_tx
-                .send(Frame::Event {
-                    event: "agent".into(),
-                    scope: None,
-                    data: serde_json::to_value(AgentEvent::StatusUpdate {
-                        session_id: session_id.clone(),
-                        status: SessionStatus::Compacting,
-                    })
-                    .unwrap_or_default(),
-                })
+            let _ = state
+                .set_reconnect_status(&session_id, SessionStatus::Compacting)
                 .await;
+            state.publish_rpc_event(Frame::Event {
+                event: "agent".into(),
+                scope: None,
+                data: serde_json::to_value(AgentEvent::StatusUpdate {
+                    session_id: session_id.clone(),
+                    status: SessionStatus::Compacting,
+                })
+                .unwrap_or_default(),
+            });
 
             let state_clone = state.clone();
-            let rpc_tx = rpc_event_tx.clone();
             let sid = session_id.clone();
             tokio::spawn(async move {
                 let _turn_permit = turn_permit;
@@ -6509,24 +6793,21 @@ async fn handle_rpc_call(
                     }
                 };
 
-                let _ = rpc_tx
-                    .send(Frame::Event {
-                        event: "agent".into(),
-                        scope: None,
-                        data: serde_json::to_value(&completed).unwrap_or_default(),
+                state_clone.note_agent_event_for_resume(&completed).await;
+                state_clone.publish_rpc_event(Frame::Event {
+                    event: "agent".into(),
+                    scope: None,
+                    data: serde_json::to_value(&completed).unwrap_or_default(),
+                });
+                state_clone.publish_rpc_event(Frame::Event {
+                    event: "agent".into(),
+                    scope: None,
+                    data: serde_json::to_value(AgentEvent::StatusUpdate {
+                        session_id: sid,
+                        status: SessionStatus::Idle,
                     })
-                    .await;
-                let _ = rpc_tx
-                    .send(Frame::Event {
-                        event: "agent".into(),
-                        scope: None,
-                        data: serde_json::to_value(AgentEvent::StatusUpdate {
-                            session_id: sid,
-                            status: SessionStatus::Idle,
-                        })
-                        .unwrap_or_default(),
-                    })
-                    .await;
+                    .unwrap_or_default(),
+                });
             });
 
             Ok(serde_json::json!({

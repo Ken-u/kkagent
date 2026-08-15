@@ -7000,6 +7000,120 @@ impl TuiApp {
             self.state.apply_tool_output_mode();
             self.state.active_assistant_message = None;
         }
+        if let Some(live) = data.get("live_ui") {
+            if let Some(thinking) = live.get("thinking_text").and_then(|v| v.as_str()) {
+                self.state.thinking_text = thinking.to_string();
+            }
+            if let Some(assistant) = live
+                .get("assistant_text")
+                .and_then(|v| v.as_str())
+                .filter(|text| !text.is_empty())
+            {
+                let mut msg = DisplayMessage {
+                    role: MessageRole::Assistant,
+                    content: String::new(),
+                    thinking: if self.state.thinking_text.is_empty() {
+                        None
+                    } else {
+                        Some(std::mem::take(&mut self.state.thinking_text))
+                    },
+                    parts: Vec::new(),
+                    tool_calls: Vec::new(),
+                    delivery: crate::prompt_queue::DeliveryState::Sent,
+                    idempotency_key: None,
+                };
+                msg.append_assistant_text(assistant);
+                self.state.messages.push(msg);
+                self.state.active_assistant_message =
+                    Some(self.state.messages.len().saturating_sub(1));
+            }
+            if let Some(retry) = live.get("llm_retry") {
+                let number = retry
+                    .get("retry_number")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                let reason = retry
+                    .get("reason")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("LLM request failed");
+                let remaining = retry
+                    .get("remaining_seconds")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                self.system_message(format!(
+                    "Model retry #{number} — {remaining}s left ({reason})"
+                ));
+            }
+        }
+        if let Some(btw) = data.get("pending_btw") {
+            let agent_id = btw
+                .get("agent_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let streaming = btw
+                .get("streaming")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let question = btw
+                .get("question")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let answer = btw
+                .get("answer")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let thinking = btw
+                .get("thinking")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let retry_status = btw
+                .get("retry_status")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let turns = btw
+                .get("turns")
+                .and_then(|v| v.as_array())
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| {
+                            Some(crate::panes::BtwTurnView {
+                                question: item.get("question")?.as_str()?.to_string(),
+                                answer: item.get("answer")?.as_str()?.to_string(),
+                                thinking: None,
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if streaming || !turns.is_empty() || !question.is_empty() {
+                self.state.btw.open = true;
+                self.state.btw.owner_session_id = Some(sid.clone());
+                self.state.btw.current_session_id = Some(sid.clone());
+                self.state.btw.current_agent_id = if agent_id.is_empty() {
+                    None
+                } else {
+                    Some(agent_id)
+                };
+                self.state.btw.streaming = streaming;
+                self.state.btw.current_question = question;
+                self.state.btw.current_answer = answer;
+                self.state.btw.current_thinking = thinking;
+                self.state.btw.retry_status = retry_status;
+                self.state.btw.turns = turns;
+                self.state.btw.scroll_offset = 0;
+                self.state.btw.error = None;
+                // Keep the main transcript visible; Ctrl+G still toggles BTW.
+                // Auto-open only when a stream is live so the answer isn't lost.
+                if streaming {
+                    self.state.mode = AppMode::Btw;
+                }
+            }
+        }
         if let Some(todos) = data.get("todos").and_then(|value| value.as_array()) {
             self.state.todos = todos
                 .iter()
@@ -12098,6 +12212,52 @@ mod app_state_tests {
         assert_eq!(question.text, "Pick a path");
         assert_eq!(question.options.len(), 2);
         assert_eq!(question.options[0].1, "Alpha");
+    }
+
+    #[tokio::test]
+    async fn resume_restores_live_stream_and_btw_panel() {
+        let mut app = test_tui_app();
+        app.apply_session_resume_data(
+            "session-live",
+            serde_json::json!({
+                "session_id": "session-live",
+                "messages": [],
+                "turn_active": true,
+                "status": "tool_executing",
+                "live_ui": {
+                    "thinking_text": "",
+                    "assistant_text": "partial answer",
+                    "llm_retry": {
+                        "retry_number": 2,
+                        "reason": "HTTP 429",
+                        "remaining_seconds": 3
+                    }
+                },
+                "pending_btw": {
+                    "agent_id": "btw-1",
+                    "question": "side q",
+                    "answer": "side a",
+                    "thinking": "",
+                    "streaming": true,
+                    "turns": [{"question": "old", "answer": "done"}],
+                    "retry_status": null
+                }
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(app.state.status, SessionStatus::ToolExecuting);
+        assert!(app
+            .state
+            .messages
+            .iter()
+            .any(|m| { m.role == MessageRole::Assistant && m.content == "partial answer" }));
+        assert!(app.state.active_assistant_message.is_some());
+        assert_eq!(app.state.mode, AppMode::Btw);
+        assert!(app.state.btw.streaming);
+        assert_eq!(app.state.btw.current_question, "side q");
+        assert_eq!(app.state.btw.current_answer, "side a");
+        assert_eq!(app.state.btw.turns.len(), 1);
     }
 
     fn pending_plan_revision() -> (PendingApproval, ApprovalChoice) {

@@ -19,7 +19,7 @@ TUI / prompt / ACP / HTTP+WS
 
 `Ctrl+B` 或确认退出时写入 `~/.kkagent/active-session`；下次 `kk` 检测到存活 server 后自动 resume。无客户端且无 active turn 超过 `[server].idle_timeout_secs` 时 server 自动退出；也可用 `kkagent server stop` / `kkagent server status` 管理。
 
-Agent turn 事件（含 Thinking / StatusUpdate / TurnEnd）由 server 扇出到当前所有已连接的 RPC writer；TUI detach 后 turn 继续在 server 内跑，重新 attach 后新连接会立刻收到后续事件（断线窗口内的增量不补发，完整 transcript 靠 resume/history）。`AskUserQuestion` / 工具审批等待会记在 server 的 pending 表里，`session.resume` 带回面板状态，避免重连后只剩 Thinking 转圈、回答后看似卡住。
+Agent turn 事件（含 Thinking / StatusUpdate / TurnEnd）由 server 扇出到当前所有已连接的 RPC writer；TUI detach 后 turn 继续在 server 内跑，重新 attach 后新连接会立刻收到后续事件（断线窗口内的增量不补发，完整 transcript 靠 resume/history）。`AskUserQuestion` / 工具审批 / `/btw` / compact / 最近 StatusUpdate 与部分 streaming 缓冲会记在 server，由 `session.resume` 带回，避免重连后面板丢失或状态卡死。
 
 ## Crate 职责
 
