@@ -169,6 +169,12 @@ impl SandboxPolicy {
             use windows_sys::Win32::System::Threading::{
                 OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE,
             };
+            if self.mode == SandboxMode::Disabled {
+                // `disabled` skips Job Object containment entirely; the child
+                // is spawned without CREATE_SUSPENDED, so there is nothing to
+                // resume either.
+                return Ok(SandboxProcessGuard(None));
+            }
             if self.memory_mb == 0 && self.max_processes == 0 {
                 return Ok(SandboxProcessGuard(None));
             }
@@ -452,9 +458,17 @@ fn canonical_or_owned(path: &Path) -> PathBuf {
 }
 
 fn apply_resource_limits(command: &mut Command, policy: &SandboxPolicy) -> anyhow::Result<()> {
-    // Resource containment is independent from filesystem sandboxing. In
-    // particular, `sandbox.mode = "disabled"` must not let a compiler consume
-    // all host memory. Explicit zero values retain the old unlimited behavior.
+    // `sandbox.mode = "disabled"` opts out of every containment layer,
+    // including OS resource limits, Job Objects and NO_NEW_PRIVS: users
+    // disable the sandbox precisely so long builds, memory-hungry
+    // toolchains, or setuid commands (sudo) can run unmodified.
+    if policy.mode == SandboxMode::Disabled {
+        return Ok(());
+    }
+    // For the remaining modes resource containment is independent from
+    // filesystem sandboxing, so `process`/`workspace` still bound CPU and
+    // memory even where file isolation is limited. Explicit zero values
+    // retain the old unlimited behavior.
     if policy.memory_mb == 0 && policy.cpu_seconds == 0 && policy.max_processes == 0 {
         return Ok(());
     }
@@ -464,8 +478,6 @@ fn apply_resource_limits(command: &mut Command, policy: &SandboxPolicy) -> anyho
         #[cfg(target_os = "linux")]
         let memory = policy.memory_mb.saturating_mul(1024 * 1024);
         let cpu = policy.cpu_seconds;
-        #[cfg(target_os = "linux")]
-        let processes = policy.max_processes as u64;
         unsafe {
             command.as_std_mut().pre_exec(move || {
                 #[cfg(target_os = "linux")]
@@ -475,14 +487,12 @@ fn apply_resource_limits(command: &mut Command, policy: &SandboxPolicy) -> anyho
                 if cpu > 0 {
                     set_limit(libc::RLIMIT_CPU as libc::c_int, cpu)?;
                 }
-                // macOS accounts RLIMIT_NPROC across the entire user rather than
-                // the sandboxed process tree. Applying a per-command value there
-                // prevents ordinary shell commands from forking as soon as the
-                // desktop user owns more processes than the configured limit.
-                #[cfg(target_os = "linux")]
-                if processes > 0 {
-                    set_limit(libc::RLIMIT_NPROC as libc::c_int, processes)?;
-                }
+                // RLIMIT_NPROC is accounted per real UID on Linux and macOS
+                // alike, not per sandboxed process tree. Applying the
+                // configured value here makes every fork fail with EAGAIN on
+                // desktop systems where the user already owns more processes
+                // than the limit, so process-count containment stays a
+                // Windows Job Object feature (ACTIVE_PROCESS_LIMIT).
                 #[cfg(target_os = "linux")]
                 if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
                     return Err(std::io::Error::last_os_error());
@@ -576,7 +586,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn disabled_mode_skips_unused_resource_limits() {
+    async fn disabled_mode_runs_commands() {
         let config = kkagent_config::SandboxConfig {
             mode: "disabled".into(),
             memory_mb: 0,
@@ -599,11 +609,64 @@ mod tests {
         assert!(command.status().await.unwrap().success());
     }
 
+    #[cfg(unix)]
+    fn current_soft_ulimit(resource: libc::c_int) -> String {
+        // `disabled` must not clamp limits below what the kkagent process
+        // itself inherited (e.g. when the test binary runs inside an outer
+        // sandboxed shell), so compare against the parent's soft limit.
+        unsafe {
+            let mut lim: libc::rlimit = std::mem::zeroed();
+            assert_eq!(libc::getrlimit(resource, &mut lim), 0);
+            if lim.rlim_cur == libc::RLIM_INFINITY {
+                "unlimited".to_string()
+            } else {
+                lim.rlim_cur.to_string()
+            }
+        }
+    }
+
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn disabled_mode_still_applies_configured_memory_limit() {
+    async fn disabled_mode_skips_all_resource_limits() {
         let policy = SandboxPolicy {
             mode: SandboxMode::Disabled,
+            memory_mb: 256,
+            cpu_seconds: 1,
+            max_processes: 1,
+            ..Default::default()
+        };
+        let mut command = policy
+            .command(
+                "/bin/sh",
+                "-c",
+                "ulimit -v; ulimit -t; ulimit -u",
+                Path::new("/tmp"),
+            )
+            .unwrap();
+        let output = command.output().await.unwrap();
+        assert!(output.status.success());
+        let limits: Vec<String> = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(|l| l.trim().to_string())
+            .collect();
+        // `disabled` must not clamp virtual memory, CPU time or process
+        // count, even when non-zero values are configured: the child keeps
+        // exactly the limits the parent inherited.
+        assert_eq!(
+            limits,
+            vec![
+                current_soft_ulimit(libc::RLIMIT_AS as libc::c_int),
+                current_soft_ulimit(libc::RLIMIT_CPU as libc::c_int),
+                current_soft_ulimit(libc::RLIMIT_NPROC as libc::c_int),
+            ]
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn process_mode_still_applies_configured_memory_limit() {
+        let policy = SandboxPolicy {
+            mode: SandboxMode::Process,
             memory_mb: 256,
             cpu_seconds: 0,
             max_processes: 0,
@@ -617,6 +680,62 @@ mod tests {
         assert_eq!(
             String::from_utf8_lossy(&output.stdout).trim(),
             (256 * 1024).to_string()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn process_mode_never_applies_per_uid_process_limit() {
+        let policy = SandboxPolicy {
+            mode: SandboxMode::Process,
+            memory_mb: 0,
+            cpu_seconds: 0,
+            max_processes: 1,
+            ..Default::default()
+        };
+        let mut command = policy
+            .command(
+                "/bin/bash",
+                "-c",
+                "/bin/echo child-process-ran; ulimit -u",
+                Path::new("/tmp"),
+            )
+            .unwrap();
+        let output = command.output().await.unwrap();
+        assert!(output.status.success());
+        let text = String::from_utf8_lossy(&output.stdout);
+        assert!(text.contains("child-process-ran"));
+        // RLIMIT_NPROC is per-UID on Linux; kkagent must never clamp it.
+        assert!(
+            !text.lines().any(|l| l.trim() == "1"),
+            "unexpected RLIMIT_NPROC=1 in output: {text}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn disabled_mode_skips_cpu_limit() {
+        // `disabled` must not clamp CPU time even when cpu_seconds is
+        // configured; this is the regression behind long builds being
+        // killed by SIGXCPU after disabling the sandbox.
+        let policy = SandboxPolicy {
+            mode: SandboxMode::Disabled,
+            memory_mb: 256,
+            cpu_seconds: 1,
+            max_processes: 1,
+            ..Default::default()
+        };
+        let mut command = policy
+            .command("/bin/sh", "-c", "ulimit -t", Path::new("/tmp"))
+            .unwrap();
+        let output = command.output().await.unwrap();
+        assert!(output.status.success());
+        // The child must keep exactly the CPU limit this process inherited
+        // (600s when the test binary itself runs inside kkagent's sandbox,
+        // unlimited in CI) — proving disabled added no clamp of its own.
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            current_soft_ulimit(libc::RLIMIT_CPU as libc::c_int)
         );
     }
 

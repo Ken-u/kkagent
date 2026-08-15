@@ -81,7 +81,7 @@ mode = "auto"       # auto | workspace | process | disabled
 network = true
 memory_mb = 4096
 cpu_seconds = 600
-max_processes = 128
+max_processes = 128 # Windows Job Object only; Linux/macOS cannot enforce this per process tree
 # extra_read_paths = ["/absolute/read-only/input"]
 # extra_write_paths = ["/absolute/writable/cache"]
 

@@ -174,13 +174,13 @@ extra_read_paths = []
 extra_write_paths = []
 ```
 
-进程资源限制与文件系统隔离彼此独立，因此 `mode = "disabled"` 仍会应用非零限制：
-Linux 支持内存、CPU 和进程数，macOS 支持 CPU，Windows Job Object 支持内存和进程数。
-这可避免关闭文件隔离时编译器或脚本直接耗尽主机资源；只有显式设为 `0` 的限制项才表示不限。
+在 `disabled` 之外的模式中，进程资源限制与文件系统隔离彼此独立：即便文件隔离能力有限，非零限制仍然生效。
+Linux 支持内存和 CPU，macOS 支持 CPU，Windows Job Object 支持内存和进程数。
+`mode = "disabled"` 会完整跳过文件/网络隔离、Git 环境改写以及全部 OS 资源与 Job Object 限制（包括 `NO_NEW_PRIVS`），只建议在已有外层容器或 VM 隔离时使用；非 `disabled` 模式下只有显式设为 `0` 的限制项才表示不限。`max_processes` 仅在 Windows Job Object 上生效：Linux/macOS 的 `RLIMIT_NPROC` 按真实 UID 全局计数而非进程树，设置它会让桌面用户的所有 fork 失败。
 
 `auto` 在 Linux/macOS 选择 `workspace`，在 Windows 选择 `process`。Linux 的工作区模式要求 PATH 中存在 `bwrap`，用 user/mount/PID 等 namespace、只读系统目录、独立 `/tmp` 和可选 network namespace 隔离命令；macOS 使用系统 Seatbelt，默认拒绝用户主目录并重新开放当前 workspace；Windows 的 `process` 模式用 Job Object 限制进程树、内存和进程数。显式选择平台不支持的 `workspace` 会拒绝执行，不会静默降级。
 
-`extra_read_paths`/`extra_write_paths` 必须已经存在。`disabled` 会跳过 Bash 的文件/网络隔离和 Git 环境改写，但保留上述非零资源限制，只建议用于受控容器或 VM 内排障。`kkagent --disable-sandbox` 可仅对当前进程关闭文件隔离且不写回配置；该参数不能与 `--connect` 同时使用。HTTP terminal 是单独的显式管理接口，不继承 Bash sandbox。
+`extra_read_paths`/`extra_write_paths` 必须已经存在。`disabled` 会跳过 Bash 的文件/网络隔离、Git 环境改写和全部资源限制，只建议用于受控容器或 VM 内排障。`kkagent --disable-sandbox` 可仅对当前进程关闭上述全部隔离且不写回配置；该参数不能与 `--connect` 同时使用。HTTP terminal 是单独的显式管理接口，不继承 Bash sandbox。
 
 ### 工作区与 Git 信任
 
