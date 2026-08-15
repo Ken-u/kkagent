@@ -119,6 +119,12 @@ pub fn render_ui(f: &mut Frame, state: &mut AppState, config: &AppConfig) {
         .unwrap_or(0);
 
     // Sticky todo sits above the input (highest visual priority).
+    // Subagent strip sits above todo (and input) so child floods never enter the transcript.
+    let agents_height = if state.mode == AppMode::Btw {
+        0
+    } else {
+        subagent_strip_height(state)
+    };
     let todo_height = if state.mode == AppMode::Btw {
         0
     } else {
@@ -132,11 +138,12 @@ pub fn render_ui(f: &mut Frame, state: &mut AppState, config: &AppConfig) {
             .min(6)
     };
 
-    // kimi 布局：消息区 | todo(可选) | queue(可选) | 带边框输入框 | footer 两行
+    // kimi 布局：消息区 | agents(可选) | todo(可选) | queue(可选) | 带边框输入框 | footer 两行
     // Top TabStrip removed — session switching lives in the footer strip.
     let input_inner = input_inner_height(state, size.width);
     let input_box = input_inner + 2; // borders
-    let bottom_stack = todo_height
+    let bottom_stack = agents_height
+        .saturating_add(todo_height)
         .saturating_add(queue_height)
         .saturating_add(input_box)
         .saturating_add(slash_height);
@@ -162,6 +169,7 @@ pub fn render_ui(f: &mut Frame, state: &mut AppState, config: &AppConfig) {
     let bottom_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
+            Constraint::Length(agents_height),
             Constraint::Length(todo_height),
             Constraint::Length(queue_height),
             Constraint::Length(slash_height),
@@ -169,10 +177,11 @@ pub fn render_ui(f: &mut Frame, state: &mut AppState, config: &AppConfig) {
         ])
         .split(bottom);
 
-    let todo_area = bottom_chunks[0];
-    let queue_area = bottom_chunks[1];
-    let slash_area = bottom_chunks[2];
-    let input_area = bottom_chunks[3];
+    let agents_area = bottom_chunks[0];
+    let todo_area = bottom_chunks[1];
+    let queue_area = bottom_chunks[2];
+    let slash_area = bottom_chunks[3];
+    let input_area = bottom_chunks[4];
 
     // Keep status_bar in sync for chrome consumers / future status line.
     state.status_bar.permission = state.permission_mode;
@@ -197,6 +206,9 @@ pub fn render_ui(f: &mut Frame, state: &mut AppState, config: &AppConfig) {
     } else {
         render_messages(f, msg_area, state, &theme);
         render_scroll_hint(f, msg_area, state, &theme);
+    }
+    if agents_height > 0 {
+        render_subagent_strip(f, agents_area, state, &theme);
     }
     if todo_height > 0 {
         render_todo_panel(f, todo_area, state, &theme);
@@ -238,6 +250,9 @@ pub fn render_ui(f: &mut Frame, state: &mut AppState, config: &AppConfig) {
 
     if state.tasks_panel.is_some() {
         render_tasks_panel(f, size, state, &theme);
+    }
+    if state.subagents_panel.is_some() {
+        render_subagents_panel(f, size, state, &theme);
     }
 
     if state.search.active {
@@ -1116,6 +1131,38 @@ fn render_tool_history_lines(
 }
 
 const TODO_MAX_VISIBLE: usize = 5;
+
+fn subagent_strip_height(state: &AppState) -> u16 {
+    let lines = state.subagents.strip_lines(std::time::Instant::now());
+    if lines.is_empty() {
+        0
+    } else {
+        // separator + one row per strip line
+        1u16.saturating_add(lines.len() as u16)
+    }
+}
+
+fn render_subagent_strip(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    if area.height == 0 {
+        return;
+    }
+    let lines_text = state.subagents.strip_lines(std::time::Instant::now());
+    if lines_text.is_empty() {
+        return;
+    }
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(Span::styled(
+        "─".repeat(area.width as usize),
+        Style::default().fg(theme.border),
+    )));
+    for text in lines_text {
+        lines.push(Line::from(Span::styled(
+            truncate_display_width(&format!("  {text}"), area.width as usize),
+            Style::default().fg(theme.text_dim),
+        )));
+    }
+    f.render_widget(Paragraph::new(Text::from(lines)), area);
+}
 
 fn todo_panel_height(state: &AppState, terminal_width: u16) -> u16 {
     if state.todos.is_empty() {
@@ -2714,6 +2761,154 @@ fn render_tasks_panel(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme
         Style::default().fg(theme.text_muted),
     )));
 
+    f.render_widget(Paragraph::new(Text::from(lines)).block(block), panel_area);
+}
+
+fn render_subagents_panel(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    let Some(panel) = state.subagents_panel.as_ref() else {
+        return;
+    };
+
+    let panel_area = popup_rect(area, 92, 40);
+    if panel_area.width == 0 || panel_area.height == 0 {
+        return;
+    }
+
+    f.render_widget(Clear, panel_area);
+    let title = if panel.detail {
+        " subagent detail "
+    } else {
+        " subagents "
+    };
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.border));
+    let inner = panel_area.inner(Margin::new(1, 1));
+    let mut lines: Vec<Line> = Vec::new();
+    let now = std::time::Instant::now();
+
+    if state.subagents.entries.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "No subagents in this session yet.",
+            Style::default().fg(theme.text_muted),
+        )));
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "When the main agent spawns a child, status appears here and in the strip above Todo.",
+            Style::default().fg(theme.text_dim),
+        )));
+    } else if panel.detail {
+        let Some(entry) = state.subagents.entries.get(panel.selected) else {
+            return;
+        };
+        lines.push(Line::from(Span::styled(
+            truncate_display_width(
+                &format!(
+                    "[{}] {} ({})",
+                    entry.status,
+                    entry.name,
+                    crate::subagents::short_id(&entry.id)
+                ),
+                inner.width as usize,
+            ),
+            Style::default()
+                .fg(theme.primary)
+                .add_modifier(Modifier::BOLD),
+        )));
+        if !entry.description.is_empty() {
+            lines.push(Line::from(Span::styled(
+                truncate_display_width(&entry.description, inner.width as usize),
+                Style::default().fg(theme.text_dim),
+            )));
+        }
+        lines.push(Line::from(Span::styled(
+            format!("elapsed {}s", entry.elapsed_secs(now)),
+            Style::default().fg(theme.text_muted),
+        )));
+        if let Some(ref result) = entry.result_or_error {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "result / error:",
+                Style::default().fg(theme.text_muted),
+            )));
+            for chunk in result.lines().take(6) {
+                lines.push(Line::from(Span::styled(
+                    truncate_display_width(chunk, inner.width as usize),
+                    Style::default().fg(theme.text),
+                )));
+            }
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "recent activity:",
+            Style::default().fg(theme.text_muted),
+        )));
+        if entry.events.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "(waiting for child output…)",
+                Style::default().fg(theme.text_dim),
+            )));
+        } else {
+            let max_events = inner.height.saturating_sub(10) as usize;
+            let start = entry.events.len().saturating_sub(max_events.max(1));
+            for event in entry.events.iter().skip(start) {
+                lines.push(Line::from(Span::styled(
+                    truncate_display_width(&format!("· {event}"), inner.width as usize),
+                    Style::default().fg(theme.text_dim),
+                )));
+            }
+        }
+    } else {
+        let max_visible = (inner.height.saturating_sub(2) as usize).max(1);
+        let start = panel
+            .selected
+            .saturating_sub(max_visible.saturating_sub(1))
+            .min(
+                state
+                    .subagents
+                    .entries
+                    .len()
+                    .saturating_sub(max_visible.max(1)),
+            );
+        let end = (start + max_visible).min(state.subagents.entries.len());
+        for (i, entry) in state.subagents.entries[start..end].iter().enumerate() {
+            let idx = start + i;
+            let selected = idx == panel.selected;
+            let prefix = if selected { "> " } else { "  " };
+            let style = if selected {
+                Style::default()
+                    .fg(theme.primary)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme.text)
+            };
+            let label = format!("{}{}", prefix, entry.strip_line(now));
+            lines.push(Line::from(Span::styled(
+                truncate_display_width(&label, inner.width as usize),
+                style,
+            )));
+            if selected {
+                lines.push(Line::from(Span::styled(
+                    truncate_display_width(
+                        &format!("    status={} · Enter for log", entry.status),
+                        inner.width as usize,
+                    ),
+                    Style::default().fg(theme.text_muted),
+                )));
+            }
+        }
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        if panel.detail {
+            "Enter list · Esc back"
+        } else {
+            "↑↓ · Enter detail · Esc close"
+        },
+        Style::default().fg(theme.text_muted),
+    )));
     f.render_widget(Paragraph::new(Text::from(lines)).block(block), panel_area);
 }
 

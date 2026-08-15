@@ -168,7 +168,14 @@ pub const BUILTIN_SLASH_COMMANDS: &[SlashCommand] = &[
     SlashCommand {
         name: "tasks",
         aliases: &["task"],
-        description: "Browse background tasks / subagents",
+        description: "Browse background tasks",
+        priority: 60,
+        argument_hint: None,
+    },
+    SlashCommand {
+        name: "agents",
+        aliases: &["agent"],
+        description: "Browse subagent status and recent activity",
         priority: 60,
         argument_hint: None,
     },

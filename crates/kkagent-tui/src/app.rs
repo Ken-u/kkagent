@@ -161,6 +161,10 @@ pub struct AppState {
     pub todos: Vec<TodoItem>,
     /// Expand sticky todo beyond the collapsed max rows.
     pub todos_expanded: bool,
+    /// Live / recent subagents for the sticky strip + `/agents` panel.
+    pub subagents: crate::subagents::SubagentStore,
+    /// Overlay browser for subagent detail (`/agents`).
+    pub subagents_panel: Option<crate::subagents::SubagentsPanelState>,
     /// Toggleable full-screen BTW surface, advertised beside the git badge.
     pub btw: crate::panes::BtwPanelState,
     /// Active model alias (best-effort).
@@ -284,6 +288,7 @@ pub struct SessionRuntimeState {
     pub approx_tokens: u64,
     pub approval_queue: std::collections::VecDeque<PendingApproval>,
     pub todos: Vec<TodoItem>,
+    pub subagents: crate::subagents::SubagentStore,
     pub model_alias: Option<String>,
     pub last_tool_name: Option<String>,
     pub plan_document: Option<PlanDocument>,
@@ -321,6 +326,7 @@ impl SessionRuntimeState {
             approx_tokens: state.approx_tokens,
             approval_queue: state.approval_queue.clone(),
             todos: state.todos.clone(),
+            subagents: state.subagents.clone(),
             model_alias: state.model_alias.clone(),
             last_tool_name: state.last_tool_name.clone(),
             plan_document: state.plan_document.clone(),
@@ -349,6 +355,7 @@ impl SessionRuntimeState {
         state.approx_tokens = self.approx_tokens;
         state.approval_queue = self.approval_queue;
         state.todos = self.todos;
+        state.subagents = self.subagents;
         state.model_alias = self.model_alias;
         state.last_tool_name = self.last_tool_name;
         state.plan_document = self.plan_document;
@@ -950,6 +957,8 @@ impl AppState {
             pending_resume_prefill: None,
             todos: Vec::new(),
             todos_expanded: false,
+            subagents: crate::subagents::SubagentStore::default(),
+            subagents_panel: None,
             btw: crate::panes::BtwPanelState::default(),
             model_alias: None,
             stream_cursor: crate::streaming::StreamingCursor::default(),
@@ -1677,7 +1686,12 @@ impl TuiApp {
                         | SessionStatus::Compacting
                         | SessionStatus::Cancelling
                 )
-            });
+            }) || self.state.subagents.any_active();
+            if self.state.tick.is_multiple_of(10) {
+                self.state
+                    .subagents
+                    .prune_finished(std::time::Instant::now());
+            }
             redraw |= tick_requires_redraw(previous_tick, self.state.tick, animation_active);
 
             if self.state.should_quit {
@@ -3004,6 +3018,49 @@ impl TuiApp {
             return self.handle_question_key(key).await;
         }
 
+        // Subagents browser overlay (`/agents`)
+        if self.state.subagents_panel.is_some() {
+            match key.code {
+                KeyCode::Up => {
+                    if let Some(ref mut p) = self.state.subagents_panel {
+                        if p.detail {
+                            // no-op in detail for now
+                        } else if p.selected > 0 {
+                            p.selected -= 1;
+                        }
+                    }
+                    return Ok(());
+                }
+                KeyCode::Down => {
+                    if let Some(ref mut p) = self.state.subagents_panel {
+                        if !p.detail && !self.state.subagents.entries.is_empty() {
+                            p.selected = (p.selected + 1) % self.state.subagents.entries.len();
+                        }
+                    }
+                    return Ok(());
+                }
+                KeyCode::Enter => {
+                    if let Some(ref mut p) = self.state.subagents_panel {
+                        if !self.state.subagents.entries.is_empty() {
+                            p.detail = !p.detail;
+                        }
+                    }
+                    return Ok(());
+                }
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    if let Some(ref mut p) = self.state.subagents_panel {
+                        if p.detail {
+                            p.detail = false;
+                        } else {
+                            self.state.subagents_panel = None;
+                        }
+                    }
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
+
         // Tasks browser overlay
         if self.state.tasks_panel.is_some() {
             match key.code {
@@ -3856,6 +3913,7 @@ impl TuiApp {
                 "model" => self.open_model_picker(),
                 "sessions" | "resume" => self.open_session_picker().await?,
                 "tasks" | "task" => self.open_tasks_panel().await?,
+                "agents" | "agent" => self.open_agents_panel(),
                 "permission" => self.open_permission_picker(),
                 "config" => self.open_config_picker(),
                 "provider" | "providers" => self.open_provider_picker(),
@@ -3920,6 +3978,27 @@ impl TuiApp {
             Err(e) => self.system_message(format!("Failed to list tasks: {}", e)),
         }
         Ok(())
+    }
+
+    fn open_agents_panel(&mut self) {
+        let selected = self
+            .state
+            .subagents_panel
+            .as_ref()
+            .map(|p| {
+                p.selected
+                    .min(self.state.subagents.entries.len().saturating_sub(1))
+            })
+            .unwrap_or(0);
+        self.state.subagents_panel = Some(crate::subagents::SubagentsPanelState {
+            selected,
+            detail: false,
+        });
+        if self.state.subagents.entries.is_empty() {
+            self.system_message(
+                "No subagents in this session yet. Spawned agents appear here live.".into(),
+            );
+        }
     }
 
     async fn undo_turns(&mut self, count: usize) -> anyhow::Result<()> {
@@ -4191,6 +4270,8 @@ impl TuiApp {
                         | "resume"
                         | "tasks"
                         | "task"
+                        | "agents"
+                        | "agent"
                         | "mcp"
                         | "skills"
                         | "swarm"
@@ -5662,6 +5743,7 @@ impl TuiApp {
             "experimental-flags" | "flags" => self.open_flags_picker(),
             "sessions" | "resume" => self.open_session_picker().await?,
             "tasks" | "task" => self.open_tasks_panel().await?,
+            "agents" | "agent" => self.open_agents_panel(),
             "mcp" => self.open_mcp_manager().await?,
             "skills" => self.open_skill_manager().await?,
             "swarm" => self.open_swarm_picker(),
@@ -6371,7 +6453,7 @@ impl TuiApp {
             ListPickerItem {
                 id: "tasks".into(),
                 label: "Background tasks".into(),
-                detail: "view subagents / tasks".into(),
+                detail: "view background tasks".into(),
             },
         ];
         self.replace_list_picker(ListPickerState {
@@ -7010,6 +7092,8 @@ impl TuiApp {
         self.state.messages.clear();
         self.state.active_assistant_message = None;
         self.state.todos.clear();
+        self.state.subagents = crate::subagents::SubagentStore::default();
+        self.state.subagents_panel = None;
         self.state.todos_expanded = false;
         self.state.thinking_text.clear();
         self.state.last_tool_name = None;
@@ -7297,37 +7381,36 @@ impl TuiApp {
                 let id = item
                     .get("subagent_id")
                     .and_then(|v| v.as_str())
-                    .unwrap_or("?");
+                    .unwrap_or("?")
+                    .to_string();
                 let name = item
                     .get("subagent_name")
                     .and_then(|v| v.as_str())
-                    .unwrap_or("subagent");
+                    .unwrap_or("subagent")
+                    .to_string();
                 let status = item
                     .get("status")
                     .and_then(|v| v.as_str())
                     .unwrap_or("unknown");
-                let parent = item
-                    .get("parent_tool_call_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("-");
                 let desc = item
                     .get("description")
                     .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let detail = item.get("detail").and_then(|v| v.as_str()).unwrap_or("");
-                let mut line =
-                    format!("⊟ subagent [{name}] id={id} status={status} under {parent}");
-                if !desc.is_empty() {
-                    line.push_str(&format!(": {desc}"));
+                    .unwrap_or("")
+                    .to_string();
+                self.state
+                    .subagents
+                    .upsert_spawned(id.clone(), name, desc, status);
+                if let Some(detail) = item.get("detail").and_then(|v| v.as_str()) {
+                    if !detail.is_empty() {
+                        self.state
+                            .subagents
+                            .set_status(&id, status, Some(detail.to_string()));
+                    }
                 }
-                if !detail.is_empty() {
-                    line.push_str(&format!(" — {detail}"));
-                }
-                self.system_message(line);
                 if let Some(children) = item.get("recent_child_events").and_then(|v| v.as_array()) {
-                    for child in children.iter().rev().take(6).rev() {
+                    for child in children.iter().rev().take(12).rev() {
                         if let Some(text) = child.as_str() {
-                            self.system_message(format!("  ↳ [{id}] {text}"));
+                            self.state.subagents.note_child_event(&id, text.to_string());
                         }
                     }
                 }
@@ -8137,6 +8220,8 @@ impl TuiApp {
                     self.state.messages.clear();
                     self.state.active_assistant_message = None;
                     self.state.todos.clear();
+                    self.state.subagents = crate::subagents::SubagentStore::default();
+                    self.state.subagents_panel = None;
                     self.state.status = SessionStatus::Idle;
                     self.state.approval_pending = None;
                     self.state.question_pending = None;
@@ -8199,6 +8284,8 @@ impl TuiApp {
                         self.state.messages.clear();
                         self.state.active_assistant_message = None;
                         self.state.todos.clear();
+                        self.state.subagents = crate::subagents::SubagentStore::default();
+                        self.state.subagents_panel = None;
                         self.state.status = SessionStatus::Idle;
                         self.state.approval_pending = None;
                         self.state.question_pending = None;
@@ -8682,6 +8769,8 @@ impl TuiApp {
                 self.state.messages.clear();
                 self.state.active_assistant_message = None;
                 self.state.todos.clear();
+                self.state.subagents = crate::subagents::SubagentStore::default();
+                self.state.subagents_panel = None;
                 self.state.todos_expanded = false;
                 self.state.thinking_text.clear();
                 self.state.plan_document = None;
@@ -8881,6 +8970,10 @@ impl TuiApp {
             "tasks" | "task" => {
                 self.begin_root_picker();
                 self.open_tasks_panel().await?;
+            }
+            "agents" | "agent" => {
+                self.begin_root_picker();
+                self.open_agents_panel();
             }
             "init" => {
                 self.state.pending_prompt = Some(
@@ -10191,32 +10284,41 @@ impl TuiApp {
                     AgentEvent::SubagentSpawned {
                         subagent_id,
                         subagent_name,
-                        parent_tool_call_id,
                         description,
                         ..
                     } => {
                         let desc = description.unwrap_or_default();
-                        self.system_message(format!(
-                            "⊟ subagent spawned [{subagent_name}] id={subagent_id} under {parent_tool_call_id}: {desc}"
-                        ));
+                        self.state.subagents.upsert_spawned(
+                            subagent_id,
+                            subagent_name,
+                            desc,
+                            "pending",
+                        );
                     }
                     AgentEvent::SubagentStarted { subagent_id, .. } => {
-                        self.system_message(format!("⊟ subagent started: {subagent_id}"));
+                        self.state
+                            .subagents
+                            .set_status(&subagent_id, "running", None);
                     }
                     AgentEvent::SubagentCompleted {
                         subagent_id,
                         result_summary,
                         ..
                     } => {
-                        self.system_message(format!(
-                            "⊟ subagent completed [{subagent_id}]: {}",
-                            result_summary.chars().take(200).collect::<String>()
-                        ));
+                        self.state.subagents.set_status(
+                            &subagent_id,
+                            "complete",
+                            Some(result_summary.chars().take(240).collect()),
+                        );
                     }
                     AgentEvent::SubagentFailed {
                         subagent_id, error, ..
                     } => {
-                        self.system_message(format!("⊟ subagent failed [{subagent_id}]: {error}"));
+                        self.state.subagents.set_status(
+                            &subagent_id,
+                            "failed",
+                            Some(error.chars().take(240).collect()),
+                        );
                     }
                     AgentEvent::SubagentChildEvent {
                         subagent_id, event, ..
@@ -10224,30 +10326,24 @@ impl TuiApp {
                         AgentEvent::ToolCall {
                             tool_name, input, ..
                         } => {
-                            let brief = serde_json::to_string(&input)
-                                .unwrap_or_default()
-                                .chars()
-                                .take(80)
-                                .collect::<String>();
-                            self.system_message(format!(
-                                "  ↳ [{subagent_id}] tool {tool_name} {brief}"
-                            ));
+                            let line = crate::subagents::format_tool_activity(&tool_name, &input);
+                            self.state.subagents.note_child_event(&subagent_id, line);
                         }
                         AgentEvent::ToolResult {
                             tool_name,
-                            output,
                             is_error,
                             ..
                         } => {
-                            let mark = if is_error { "!" } else { "ok" };
-                            self.system_message(format!(
-                                "  ↳ [{subagent_id}] {tool_name} [{mark}] {}",
-                                output.chars().take(120).collect::<String>()
-                            ));
+                            let mark = if is_error { "failed" } else { "ok" };
+                            self.state
+                                .subagents
+                                .note_child_event(&subagent_id, format!("{tool_name} [{mark}]"));
                         }
-                        AgentEvent::MessageDelta { .. } => {}
                         AgentEvent::Error { message, .. } => {
-                            self.system_message(format!("  ↳ [{subagent_id}] error: {message}"));
+                            self.state.subagents.note_child_event(
+                                &subagent_id,
+                                format!("error: {}", message.chars().take(80).collect::<String>()),
+                            );
                         }
                         _ => {}
                     },
@@ -12520,16 +12616,19 @@ mod app_state_tests {
                 && m.delivery == crate::prompt_queue::DeliveryState::Queued
                 && m.content == "follow up later"
         }));
-        assert!(app.state.messages.iter().any(|m| {
-            m.role == MessageRole::System
-                && m.content.contains("sa-1")
-                && m.content.contains("running")
-        }));
-        assert!(app
+        assert_eq!(app.state.subagents.entries.len(), 1);
+        assert_eq!(app.state.subagents.entries[0].id, "sa-1");
+        assert_eq!(app.state.subagents.entries[0].name, "explore");
+        assert_eq!(app.state.subagents.entries[0].status, "running");
+        assert!(app.state.subagents.entries[0]
+            .events
+            .iter()
+            .any(|line| line.contains("Read")));
+        assert!(!app
             .state
             .messages
             .iter()
-            .any(|m| { m.role == MessageRole::System && m.content.contains("Read") }));
+            .any(|m| m.role == MessageRole::System && m.content.contains("sa-1")));
     }
 
     fn pending_plan_revision() -> (PendingApproval, ApprovalChoice) {
