@@ -42,6 +42,10 @@ pub struct TuiApp {
     /// Standalone / --connect mode: Ctrl+B detaches without killing the server.
     allows_background_detach: bool,
     connection_alerted: bool,
+    /// Wall-clock anchor for the fixed-rate tick counter.  Without this, bursts
+    /// of input events (mouse movement, trackpad scrolling) spin the event loop
+    /// faster and accelerate the spinner / loading animations.
+    last_tick_at: std::time::Instant,
 }
 
 fn tick_requires_redraw(previous: usize, current: usize, animation_active: bool) -> bool {
@@ -1267,6 +1271,7 @@ impl TuiApp {
             remote_connection: false,
             allows_background_detach: false,
             connection_alerted: false,
+            last_tick_at: std::time::Instant::now(),
         }
     }
 
@@ -1649,16 +1654,29 @@ impl TuiApp {
             }
 
             let previous_tick = self.state.tick;
-            self.state.tick = self.state.tick.wrapping_add(1);
-            // Periodic background refresh — never await on the UI loop.
-            if self.state.tick.is_multiple_of(100) {
-                self.enqueue_workspace_sessions_refresh();
-            }
-            if self.state.tick.is_multiple_of(20)
-                && self.jobs.mcp.configured
-                && !self.jobs.mcp.initialized
-            {
-                self.enqueue_mcp_status_poll();
+            // Tick advances at a fixed 50 ms wall-clock cadence, not per loop
+            // iteration.  Without this guard, bursts of input events (mouse
+            // movement, trackpad scrolling) spin the loop faster and accelerate
+            // the spinner / loading animations.
+            let now = std::time::Instant::now();
+            if now.duration_since(self.last_tick_at) >= std::time::Duration::from_millis(50) {
+                self.last_tick_at = now;
+                self.state.tick = self.state.tick.wrapping_add(1);
+                // Periodic background refresh — never await on the UI loop.
+                if self.state.tick.is_multiple_of(100) {
+                    self.enqueue_workspace_sessions_refresh();
+                }
+                if self.state.tick.is_multiple_of(20)
+                    && self.jobs.mcp.configured
+                    && !self.jobs.mcp.initialized
+                {
+                    self.enqueue_mcp_status_poll();
+                }
+                if self.state.tick.is_multiple_of(10) {
+                    self.state
+                        .subagents
+                        .prune_finished(std::time::Instant::now());
+                }
             }
             self.flush_preview_debounce();
             if matches!(
@@ -1687,11 +1705,6 @@ impl TuiApp {
                         | SessionStatus::Cancelling
                 )
             }) || self.state.subagents.any_active();
-            if self.state.tick.is_multiple_of(10) {
-                self.state
-                    .subagents
-                    .prune_finished(std::time::Instant::now());
-            }
             redraw |= tick_requires_redraw(previous_tick, self.state.tick, animation_active);
 
             if self.state.should_quit {
