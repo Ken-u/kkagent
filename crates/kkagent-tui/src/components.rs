@@ -453,14 +453,20 @@ fn render_messages(f: &mut Frame, area: Rect, state: &mut AppState, theme: &Them
             .min(max_scroll_up as usize) as u16;
         state.scroll_up = max_scroll_up.saturating_sub(scroll_from_top);
         state.follow_bottom = false;
+        state.prev_content_lines = Some(content_height);
     } else if state.plan_scroll_to_top && state.plan_focus_active() {
         state.scroll_up = max_scroll_up;
         state.follow_bottom = max_scroll_up == 0;
         state.plan_scroll_to_top = false;
+        state.prev_content_lines = Some(content_height);
     } else if state.follow_bottom {
         state.scroll_up = 0;
-    } else if state.scroll_up > max_scroll_up {
-        state.scroll_up = max_scroll_up;
+        state.prev_content_lines = Some(content_height);
+    } else {
+        // User is reading history (!follow_bottom). Compensate scroll_up
+        // for content growth so the viewport stays anchored on what they
+        // were reading instead of drifting downward every frame.
+        state.compensate_scroll_anchor(content_height);
     }
 
     // scroll_up = 离底部的行数；0 表示贴底跟随

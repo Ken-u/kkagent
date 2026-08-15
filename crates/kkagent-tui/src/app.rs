@@ -85,6 +85,12 @@ pub struct AppState {
     pub viewport_height: u16,
     /// When true, keep transcript pinned to the latest content.
     pub follow_bottom: bool,
+    /// Previous-frame content height. When the user has scrolled up
+    /// (`!follow_bottom`) and new content streams in at the bottom, we
+    /// grow `scroll_up` by the delta so the user's viewport stays anchored
+    /// on what they were reading instead of jumping. `None` means "next
+    /// render should not compensate" (e.g. just after a session switch).
+    pub prev_content_lines: Option<u16>,
     /// Line index (from top) where each `messages[i]` starts — updated each frame.
     pub message_line_starts: Vec<u16>,
     /// Global Ctrl-O display mode for expandable tool output.
@@ -920,6 +926,7 @@ impl AppState {
             content_lines: 0,
             viewport_height: 0,
             follow_bottom: true,
+            prev_content_lines: None,
             message_line_starts: Vec::new(),
             tool_output_expanded: false,
             tool_expand_hits: Vec::new(),
@@ -1130,6 +1137,30 @@ impl AppState {
     pub fn max_scroll_up(&self) -> u16 {
         self.content_lines
             .saturating_sub(self.viewport_height.max(1))
+    }
+
+    /// Compensate `scroll_up` for content-height changes so the viewport
+    /// stays anchored on what the user is reading while new output streams
+    /// in at the bottom. Returns the previous-frame content height to
+    /// cache for the next call.
+    ///
+    /// Only active when `!follow_bottom` (user scrolled up). When
+    /// `prev_content_lines` is `None` (e.g. just after a session switch),
+    /// no compensation is applied — we only record the current height.
+    pub fn compensate_scroll_anchor(&mut self, new_content_height: u16) {
+        if !self.follow_bottom {
+            if let Some(prev) = self.prev_content_lines {
+                let delta = new_content_height as i32 - prev as i32;
+                if delta != 0 {
+                    self.scroll_up = (self.scroll_up as i32 + delta).max(0) as u16;
+                }
+            }
+            let max = new_content_height.saturating_sub(self.viewport_height.max(1));
+            if self.scroll_up > max {
+                self.scroll_up = max;
+            }
+        }
+        self.prev_content_lines = Some(new_content_height);
     }
 
     pub fn scroll_lines(&mut self, delta: i32) {
@@ -6846,6 +6877,10 @@ impl TuiApp {
             self.state.search = crate::search::SearchState::default();
             self.state.highlight_message = None;
         }
+        // Reset scroll-anchor tracking so the first render of the newly
+        // activated session doesn't compute a bogus content-height delta
+        // against the previous session.
+        self.state.prev_content_lines = None;
     }
 
     fn replay_background_session_events(&mut self, session_id: &str) {
@@ -7614,6 +7649,13 @@ impl TuiApp {
                 .state
                 .scroll_up
                 .saturating_add((added as u16).saturating_mul(3));
+            // The render-time scroll-anchor compensator (render_messages)
+            // measures total content growth and bumps scroll_up to match.
+            // That logic exists for *bottom* growth (streaming output), but
+            // here we just grew the *top*. The bump above already accounts
+            // for the new top lines, so skip the next-frame compensation to
+            // avoid double-counting.
+            self.state.prev_content_lines = None;
         }
 
         let mut merged = older;
@@ -13744,5 +13786,84 @@ mod app_state_tests {
             .unwrap();
         assert!(app.state.quit_dialog.is_some());
         assert!(interrupt_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn compensate_scroll_anchor_keeps_viewport_stable_on_bottom_growth() {
+        let mut state = AppState::new(PermissionMode::Manual, false);
+
+        // Simulate a 30-line transcript in a 10-line viewport.
+        state.content_lines = 30;
+        state.viewport_height = 10;
+        state.scroll_up = 10; // user scrolled up 10 lines from bottom
+        state.follow_bottom = false;
+        state.prev_content_lines = None;
+
+        // Frame 1: first render after switch — should record height, not
+        // compensate (delta unknown).
+        state.compensate_scroll_anchor(30);
+        assert_eq!(
+            state.scroll_up, 10,
+            "first frame should not compensate when prev is None"
+        );
+
+        // Frame 2: 5 new lines stream in at the bottom.
+        // Without compensation, scroll_up stays 10 and the viewport
+        // drifts down by 5. With compensation, scroll_up grows to 15.
+        state.compensate_scroll_anchor(35);
+        assert_eq!(
+            state.scroll_up, 15,
+            "scroll_up should grow by the content delta to anchor the view"
+        );
+
+        // Frame 3: another 3 lines stream in.
+        state.compensate_scroll_anchor(38);
+        assert_eq!(state.scroll_up, 18);
+
+        // Frame 4: content shrinks (e.g. a message collapsed) — scroll_up
+        // should decrease too, clamped at 0.
+        state.compensate_scroll_anchor(20);
+        assert_eq!(
+            state.scroll_up, 0,
+            "scroll_up should decrease when content shrinks"
+        );
+    }
+
+    #[test]
+    fn compensate_scroll_anchor_skipped_when_following_bottom() {
+        let mut state = AppState::new(PermissionMode::Manual, false);
+        state.content_lines = 30;
+        state.viewport_height = 10;
+        state.scroll_up = 0;
+        state.follow_bottom = true;
+        state.prev_content_lines = Some(30);
+
+        // Even though content grew by 5, follow_bottom means we stay
+        // pinned to the latest — compensate should NOT touch scroll_up.
+        state.compensate_scroll_anchor(35);
+        assert_eq!(
+            state.scroll_up, 0,
+            "follow_bottom should bypass compensation"
+        );
+        // prev_content_lines still updated for continuity.
+        assert_eq!(state.prev_content_lines, Some(35));
+    }
+
+    #[test]
+    fn compensate_scroll_anchor_clamps_when_content_shrinks_below_viewport() {
+        let mut state = AppState::new(PermissionMode::Manual, false);
+        state.content_lines = 30;
+        state.viewport_height = 10;
+        state.scroll_up = 20; // at max (30 - 10)
+        state.follow_bottom = false;
+        state.prev_content_lines = Some(30);
+
+        // Content shrinks drastically (e.g. messages collapsed) — delta is
+        // -25, scroll_up would go to -5, clamped to 0. Max is 0 (5 - 10).
+        state.compensate_scroll_anchor(5);
+        assert_eq!(
+            state.scroll_up, 0,
+            "scroll_up should be clamped to 0 when content fits in viewport"
+        );
     }
 }
