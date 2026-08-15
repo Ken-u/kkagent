@@ -60,13 +60,18 @@ Rejects binary/image files — use ReadMediaFile for media."
         if !path.exists() {
             return Ok(ToolOutput::error(format!("File not found: {}", path_str)));
         }
+        // S1-4: workspace directory constraint
+        if let Err(reason) = ctx.check_path_guard(&path) {
+            return Ok(ToolOutput::error(reason));
+        }
         if looks_binary_ext(&path) {
             return Ok(ToolOutput::error(format!(
                 "Refusing to Read binary/media file `{}`. Use ReadMediaFile instead.",
                 path_str
             )));
         }
-        if is_sensitive_path(&path) {
+        // S2-6: sensitive path check can be disabled via config
+        if ctx.sensitive_check_enabled() && is_sensitive_path(&path) {
             return Ok(ToolOutput::error(format!(
                 "Refusing to read sensitive file `{}`. Ask the user to provide only the specific non-secret value needed.",
                 path_str
@@ -474,6 +479,7 @@ mod tests {
             image: kkagent_config::ImageConfig::default(),
             tool_call_id: None,
             interrupted: None,
+            tools_config: kkagent_config::ToolsConfig::default(),
         }
     }
 

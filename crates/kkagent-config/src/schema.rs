@@ -68,6 +68,9 @@ pub struct AppConfig {
     /// Standalone server lifecycle (idle exit, default detach mode).
     #[serde(default)]
     pub server: ServerConfig,
+    /// Application-layer path-policy and sensitive-file settings.
+    #[serde(default)]
+    pub tools: ToolsConfig,
 }
 
 /// Standalone RPC server preferences (`[server]` in config.toml).
@@ -390,6 +393,36 @@ fn default_sandbox_cpu_seconds() -> u64 {
 
 fn default_sandbox_processes() -> u32 {
     128
+}
+
+/// Application-layer path-policy and sensitive-file settings (`[tools]` in config.toml).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolsConfig {
+    /// `warn` (default) — allow access outside workspace but log a warning.
+    /// `strict` — deny any path outside the workspace and `additional_dirs`.
+    #[serde(default = "default_path_guard_mode")]
+    pub path_guard_mode: String,
+    /// Default `true`. Set to `false` to skip sensitive-file detection entirely
+    /// (escape hatch — use with caution).
+    #[serde(default = "default_true")]
+    pub sensitive_path_check: bool,
+    /// Additional directories allowed for file access in strict mode.
+    #[serde(default)]
+    pub additional_dirs: Vec<std::path::PathBuf>,
+}
+
+impl Default for ToolsConfig {
+    fn default() -> Self {
+        Self {
+            path_guard_mode: default_path_guard_mode(),
+            sensitive_path_check: true,
+            additional_dirs: Vec::new(),
+        }
+    }
+}
+
+fn default_path_guard_mode() -> String {
+    "warn".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

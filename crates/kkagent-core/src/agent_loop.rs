@@ -1441,6 +1441,7 @@ Do not mention this reminder to the user.\n</system-reminder>"
                     let interrupted = session.interrupted.clone();
                     let plan_file_path = session.plan_file_path.clone();
                     let image = self.config.image.clone();
+                    let tools_config = self.config.tools.clone();
                     tasks.push(ToolCallTask {
                         accesses,
                         start: box_start(move || {
@@ -1452,6 +1453,7 @@ Do not mention this reminder to the user.\n</system-reminder>"
                             let name = name;
                             let input = input;
                             let tool_call_id = tool_call_id;
+                            let tools_config = tools_config;
                             async move {
                                 execute_tool_parallel(ParallelToolRequest {
                                     tools,
@@ -1465,6 +1467,7 @@ Do not mention this reminder to the user.\n</system-reminder>"
                                     tool_call_id: Some(tool_call_id),
                                     interrupted,
                                     plan_file_path,
+                                    tools_config,
                                 })
                                 .await
                             }
@@ -2223,6 +2226,7 @@ Do not mention this reminder to the user.\n</system-reminder>"
             tool_call_id: None,
             interrupted: session.interrupted.clone(),
             plan_file_path: session.plan_file_path.clone(),
+            tools_config: self.config.tools.clone(),
         })
         .await
     }
@@ -2596,6 +2600,7 @@ struct ParallelToolRequest {
     tool_call_id: Option<String>,
     interrupted: Arc<std::sync::atomic::AtomicBool>,
     plan_file_path: std::path::PathBuf,
+    tools_config: kkagent_config::ToolsConfig,
 }
 
 async fn execute_tool_parallel(request: ParallelToolRequest) -> ToolOutput {
@@ -2611,6 +2616,7 @@ async fn execute_tool_parallel(request: ParallelToolRequest) -> ToolOutput {
         tool_call_id,
         interrupted,
         plan_file_path,
+        tools_config,
     } = request;
     if !tool_allowed_set(enabled_tools.as_ref(), &name) {
         return ToolOutput::error(format!(
@@ -2668,6 +2674,7 @@ async fn execute_tool_parallel(request: ParallelToolRequest) -> ToolOutput {
         image,
         tool_call_id,
         interrupted: Some(interrupted),
+        tools_config,
     };
 
     match tool.execute(input, &ctx).await {

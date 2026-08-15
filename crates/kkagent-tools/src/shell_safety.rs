@@ -52,7 +52,79 @@ pub fn analyze_shell_command(command: &str) -> ShellRisk {
         }
     }
 
+    // S1-5: Best-effort sensitive path detection in shell commands.
+    // This is a heuristic — not a reliable isolation mechanism.  Reliable
+    // isolation is the responsibility of the OS-level sandbox.
+    if let Some(reason) = detect_sensitive_path_in_command(c) {
+        return ShellRisk::Caution(reason);
+    }
+
     ShellRisk::Safe
+}
+
+/// S1-5: Best-effort detection of sensitive file paths in a shell command string.
+///
+/// Scans whitespace-separated tokens for known sensitive patterns.  This is
+/// intentionally simple — it does NOT attempt to parse shell syntax (quotes,
+/// variable expansion, subcommands).  The OS sandbox is the reliable defense.
+fn detect_sensitive_path_in_command(command: &str) -> Option<String> {
+    use crate::path_policy;
+
+    let lower = command.to_lowercase();
+
+    // Quick reject: if none of the sensitive tokens appear, skip the per-token check
+    let sensitive_tokens = [
+        ".env",
+        "id_rsa",
+        "id_ed25519",
+        "id_ecdsa",
+        ".pem",
+        ".key",
+        "credentials",
+        ".netrc",
+        ".npmrc",
+        "secret",
+        ".aws",
+        ".gcp",
+        ".kube",
+        ".docker",
+        "gcloud",
+    ];
+    if !sensitive_tokens.iter().any(|t| lower.contains(t)) {
+        return None;
+    }
+
+    // Tokenize by whitespace and check each token as a path
+    for token in command.split_whitespace() {
+        // Strip common shell metacharacters from the token
+        let cleaned = token
+            .trim_start_matches(['\'', '"', '<', '>', '|', '&', ';'])
+            .trim_end_matches(['\'', '"', '<', '>', '|', '&', ';']);
+
+        if cleaned.is_empty() {
+            continue;
+        }
+
+        // Also strip option prefixes like `--` or `-` but keep paths
+        if cleaned.starts_with('-') && !cleaned.starts_with("/-") {
+            // It's an option flag, but it might be `--file=.env` style
+            if let Some(eq_val) = cleaned.split_once('=') {
+                let val = eq_val.1;
+                let path = std::path::Path::new(val);
+                if path_policy::is_sensitive_path(path) {
+                    return Some(format!("command may access sensitive file: `{}`", val));
+                }
+            }
+            continue;
+        }
+
+        let path = std::path::Path::new(cleaned);
+        if path_policy::is_sensitive_path(path) {
+            return Some(format!("command may access sensitive file: `{}`", cleaned));
+        }
+    }
+
+    None
 }
 
 fn walk_dangerous(node: &AstNode) -> Option<ShellRisk> {
@@ -205,6 +277,55 @@ mod tests {
         assert!(matches!(
             analyze_shell_command("git reset --hard HEAD"),
             ShellRisk::Caution(_)
+        ));
+    }
+
+    // S1-5: Sensitive path detection in shell commands
+
+    #[test]
+    fn cat_ssh_key_caution() {
+        let r = analyze_shell_command("cat ~/.ssh/id_rsa");
+        assert!(matches!(r, ShellRisk::Caution(_)));
+    }
+
+    #[test]
+    fn cat_env_file_caution() {
+        let r = analyze_shell_command("cat .env");
+        assert!(matches!(r, ShellRisk::Caution(_)));
+    }
+
+    #[test]
+    fn cp_credentials_caution() {
+        let r = analyze_shell_command("cp credentials /tmp/creds");
+        assert!(matches!(r, ShellRisk::Caution(_)));
+    }
+
+    #[test]
+    fn env_example_not_flagged() {
+        // .env.example should NOT trigger sensitive path detection
+        // (it might still be Caution for other reasons, but not for sensitive path)
+        let r2 = detect_sensitive_path_in_command("grep KEY .env.example");
+        assert!(r2.is_none());
+    }
+
+    #[test]
+    fn aws_credentials_caution() {
+        let r = analyze_shell_command("cat ~/.aws/credentials");
+        assert!(matches!(r, ShellRisk::Caution(_)));
+    }
+
+    #[test]
+    fn kube_config_caution() {
+        let r = analyze_shell_command("cat ~/.kube/config");
+        assert!(matches!(r, ShellRisk::Caution(_)));
+    }
+
+    #[test]
+    fn safe_command_not_flagged() {
+        assert!(matches!(analyze_shell_command("ls -la"), ShellRisk::Safe));
+        assert!(matches!(
+            analyze_shell_command("cargo build --release"),
+            ShellRisk::Safe
         ));
     }
 }

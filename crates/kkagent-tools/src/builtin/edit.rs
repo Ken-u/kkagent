@@ -68,7 +68,12 @@ Preserves original CRLF/LF line endings."
             ctx.working_dir.join(path_str)
         };
 
-        if is_sensitive_path(&path) {
+        // S1-4: workspace directory constraint
+        if let Err(reason) = ctx.check_path_guard(&path) {
+            return Ok(ToolOutput::error(reason));
+        }
+        // S2-6: sensitive path check can be disabled via config
+        if ctx.sensitive_check_enabled() && is_sensitive_path(&path) {
             return Ok(ToolOutput::error(format!(
                 "Refusing to edit sensitive file `{}`.",
                 path_str
@@ -167,6 +172,7 @@ mod tests {
             image: kkagent_config::ImageConfig::default(),
             tool_call_id: None,
             interrupted: None,
+            tools_config: kkagent_config::ToolsConfig::default(),
         };
         let output = EditTool
             .execute(

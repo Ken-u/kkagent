@@ -58,6 +58,12 @@ Returns paths sorted by modification time (newest first)."
         } else {
             ctx.working_dir.join(root)
         };
+
+        // S1-4: workspace directory constraint
+        if let Err(reason) = ctx.check_path_guard(&requested_root) {
+            return Ok(ToolOutput::error(reason));
+        }
+
         let root_dir = std::fs::canonicalize(&requested_root).unwrap_or(requested_root);
         let workspace_dir =
             std::fs::canonicalize(&ctx.working_dir).unwrap_or_else(|_| ctx.working_dir.clone());
@@ -98,7 +104,7 @@ Returns paths sorted by modification time (newest first)."
             if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
                 continue;
             }
-            if is_sensitive_path(entry.path()) {
+            if ctx.sensitive_check_enabled() && is_sensitive_path(entry.path()) {
                 continue;
             }
             let rel = entry.path().strip_prefix(&root_dir).unwrap_or(entry.path());
@@ -177,6 +183,7 @@ mod tests {
                     image: kkagent_config::ImageConfig::default(),
                     tool_call_id: None,
                     interrupted: None,
+                    tools_config: kkagent_config::ToolsConfig::default(),
                 },
             )
             .await
@@ -200,6 +207,7 @@ mod tests {
                     image: kkagent_config::ImageConfig::default(),
                     tool_call_id: None,
                     interrupted: None,
+                    tools_config: kkagent_config::ToolsConfig::default(),
                 },
             )
             .await

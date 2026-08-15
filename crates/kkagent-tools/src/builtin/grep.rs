@@ -124,6 +124,12 @@ multiline, head_limit/offset, and glob/type filters."
         } else {
             ctx.working_dir.join(search_path)
         };
+
+        // S1-4: workspace directory constraint
+        if let Err(reason) = ctx.check_path_guard(&search_dir) {
+            return Ok(ToolOutput::error(reason));
+        }
+
         let workspace_dir =
             std::fs::canonicalize(&ctx.working_dir).unwrap_or_else(|_| ctx.working_dir.clone());
         let resolved_search_dir =
@@ -172,8 +178,11 @@ multiline, head_limit/offset, and glob/type filters."
         if let Some(glob) = glob_pattern {
             cmd.arg("--glob").arg(glob);
         }
-        for exclude in sensitive_glob_excludes() {
-            cmd.arg("--glob").arg(exclude);
+        // S2-6: sensitive glob excludes can be disabled via config
+        if ctx.sensitive_check_enabled() {
+            for exclude in sensitive_glob_excludes() {
+                cmd.arg("--glob").arg(exclude);
+            }
         }
         if let Some(t) = file_type {
             cmd.arg("--type").arg(t);
@@ -418,6 +427,7 @@ mod tests {
             image: kkagent_config::ImageConfig::default(),
             tool_call_id: None,
             interrupted: None,
+            tools_config: kkagent_config::ToolsConfig::default(),
         }
     }
 

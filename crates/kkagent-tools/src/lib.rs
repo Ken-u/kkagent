@@ -65,6 +65,42 @@ pub struct ToolContext {
     pub tool_call_id: Option<String>,
     /// Cooperative cancellation flag owned by the active session.
     pub interrupted: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Application-layer path-policy config (S1-4 / S2-6).
+    pub tools_config: kkagent_config::ToolsConfig,
+}
+
+impl ToolContext {
+    /// Returns `true` if `path` is within the workspace or any configured
+    /// `additional_dirs`.
+    pub fn is_path_allowed(&self, path: &std::path::Path) -> bool {
+        crate::path_policy::is_within_workspace(
+            &self.working_dir,
+            &self.tools_config.additional_dirs,
+            path,
+        )
+    }
+
+    /// Returns `Ok(())` if the path is allowed by the current `path_guard_mode`,
+    /// or an `Err` with the reason when `strict` mode denies it.
+    pub fn check_path_guard(&self, path: &std::path::Path) -> Result<(), String> {
+        if self.is_path_allowed(path) {
+            return Ok(());
+        }
+        match self.tools_config.path_guard_mode.as_str() {
+            "strict" => Err(format!(
+                "Path `{}` is outside the workspace and `path_guard_mode = strict` is enabled. \
+                 Only paths within `{}` or `tools.additional_dirs` are allowed.",
+                path.display(),
+                self.working_dir.display()
+            )),
+            _ => Ok(()), // warn mode — allow but the caller may log
+        }
+    }
+
+    /// Returns `true` if sensitive-path checking is enabled (S2-6).
+    pub fn sensitive_check_enabled(&self) -> bool {
+        self.tools_config.sensitive_path_check
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]

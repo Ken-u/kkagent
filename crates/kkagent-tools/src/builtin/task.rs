@@ -867,6 +867,7 @@ mod tests {
             image: kkagent_config::ImageConfig::default(),
             tool_call_id: Some("tool-call".into()),
             interrupted: None,
+            tools_config: kkagent_config::ToolsConfig::default(),
         }
     }
 

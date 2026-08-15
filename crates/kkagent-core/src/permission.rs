@@ -28,7 +28,14 @@ const SENSITIVE_PATTERNS: &[&str] = &[
     "credentials",
     "secret",
     ".key",
-    "token",
+    ".aws/credentials",
+    ".aws/config",
+    ".gcp/credentials",
+    ".kube/config",
+    ".docker/config.json",
+    ".config/gcloud/credentials",
+    ".netrc",
+    ".npmrc",
 ];
 
 /// Default-approve set aligned with kimi `default-tool-approve`
@@ -369,6 +376,10 @@ fn has_sensitive_file_access(tool_name: &str, input: &serde_json::Value) -> bool
                 || path_str.contains(".env.sample")
                 || path_str.contains(".env.template")
             {
+                continue;
+            }
+            // S0-2: public key files are not secrets
+            if path_str.contains(".pub") {
                 continue;
             }
             return true;
