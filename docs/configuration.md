@@ -145,7 +145,7 @@ bash_task_timeout_s = 120
 approval_timeout_s = 900
 ```
 
-`max_running_tasks` 控制 Agent 后台任务并发；`approval_timeout_s` 到期后按拒绝处理，范围在运行时限制为 1 秒到 24 小时。
+`max_running_tasks` 控制 Agent 后台任务并发；`approval_timeout_s` 到期后按拒绝处理，范围在运行时限制为 1 秒到 24 小时。`bash_auto_background_on_timeout` 控制前台 Bash 命令超时后是否自动转入后台（默认 `true`）。`bash_task_timeout_s` 控制前台 Bash 命令的默认超时秒数（默认 `120`，即 2 分钟），LLM 可通过 `timeout` 参数覆盖。
 
 ## Standalone Server
 

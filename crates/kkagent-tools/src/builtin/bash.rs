@@ -11,7 +11,7 @@ use uuid::Uuid;
 use crate::{Tool, ToolContext, ToolOutput};
 
 const MAX_OUTPUT: usize = 50_000;
-const DEFAULT_TIMEOUT_S: u64 = 60;
+pub const DEFAULT_TIMEOUT_S: u64 = 120; // 2 minutes foreground default
 const MAX_TIMEOUT_S: u64 = 300; // 5 minutes foreground
 const DEFAULT_BG_TIMEOUT_S: u64 = 600;
 const MAX_BG_TIMEOUT_S: u64 = 86_400; // 24h
@@ -23,6 +23,8 @@ pub struct BashOptions {
     /// When a foreground command times out, detach into background instead of killing.
     pub auto_background_on_timeout: bool,
     pub sandbox: crate::sandbox::SandboxPolicy,
+    /// Default foreground timeout in seconds, overridable via `bash_task_timeout_s` config.
+    pub default_timeout_s: u64,
 }
 
 impl Default for BashOptions {
@@ -30,6 +32,7 @@ impl Default for BashOptions {
         Self {
             auto_background_on_timeout: true,
             sandbox: crate::sandbox::SandboxPolicy::default(),
+            default_timeout_s: DEFAULT_TIMEOUT_S,
         }
     }
 }
@@ -310,7 +313,11 @@ for background jobs (shell_id/stop remain as aliases)."
         let timeout_ms = if disable_timeout {
             None
         } else {
-            Some(resolve_timeout_ms(&input, run_in_background))
+            Some(resolve_timeout_ms(
+                &input,
+                run_in_background,
+                self.options.default_timeout_s,
+            ))
         };
 
         if run_in_background {
@@ -355,7 +362,7 @@ for background jobs (shell_id/stop remain as aliases)."
     }
 }
 
-fn resolve_timeout_ms(input: &Value, run_in_background: bool) -> u64 {
+fn resolve_timeout_ms(input: &Value, run_in_background: bool, default_fg_timeout_s: u64) -> u64 {
     if let Some(ms) = input.get("timeout_ms").and_then(|v| v.as_u64()) {
         let cap = if run_in_background {
             MAX_BG_TIMEOUT_S * 1000
@@ -367,7 +374,7 @@ fn resolve_timeout_ms(input: &Value, run_in_background: bool) -> u64 {
     let default_s = if run_in_background {
         DEFAULT_BG_TIMEOUT_S
     } else {
-        DEFAULT_TIMEOUT_S
+        default_fg_timeout_s
     };
     let cap_s = if run_in_background {
         MAX_BG_TIMEOUT_S

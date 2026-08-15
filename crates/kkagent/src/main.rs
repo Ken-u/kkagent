@@ -2589,17 +2589,21 @@ async fn build_turn_tool_registry(
     tools.register(Arc::new(kkagent_tools::builtin::TodoListTool::with_items(
         todos,
     )));
-    let auto_background_on_timeout = state
-        .config()
-        .background
+    let background_config = state.config().background.clone();
+    let auto_background_on_timeout = background_config
         .as_ref()
         .and_then(|background| background.bash_auto_background_on_timeout)
         .unwrap_or(true);
+    let default_timeout_s = background_config
+        .as_ref()
+        .and_then(|background| background.bash_task_timeout_s)
+        .unwrap_or(kkagent_tools::builtin::bash::DEFAULT_TIMEOUT_S);
     tools.register(Arc::new(kkagent_tools::builtin::BashTool::new(
         state.bash_shells.clone(),
         kkagent_tools::builtin::BashOptions {
             auto_background_on_timeout,
             sandbox: state.sandbox_snapshot(),
+            default_timeout_s,
         },
     )));
     register_mcp_tools(&mut tools, &state.mcp).await;
