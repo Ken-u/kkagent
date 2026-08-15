@@ -294,7 +294,14 @@ for background jobs (shell_id/stop remain as aliases)."
             .unwrap_or("")
             .trim()
             .to_string();
-        let cwd = resolve_cwd(input.get("cwd").and_then(|v| v.as_str()), &ctx.working_dir);
+        let cwd = match resolve_cwd(
+            input.get("cwd").and_then(|v| v.as_str()),
+            &ctx.working_dir,
+            &self.options.sandbox,
+        ) {
+            Ok(cwd) => cwd,
+            Err(error) => return Ok(ToolOutput::error(error.to_string())),
+        };
         let run_in_background = input
             .get("run_in_background")
             .and_then(|v| v.as_bool())
@@ -332,6 +339,7 @@ for background jobs (shell_id/stop remain as aliases)."
                     command,
                     description,
                     cwd,
+                    ctx.working_dir.clone(),
                     timeout_ms,
                 )
                 .await?;
@@ -351,6 +359,7 @@ for background jobs (shell_id/stop remain as aliases)."
                 command,
                 description,
                 cwd,
+                ctx.working_dir.clone(),
                 timeout_ms.unwrap_or(DEFAULT_TIMEOUT_S * 1000),
                 ctx.interrupted.clone(),
             )
@@ -418,6 +427,7 @@ impl BashTool {
         command: String,
         description: String,
         cwd: PathBuf,
+        session_root: PathBuf,
         timeout_ms: Option<u64>,
     ) -> anyhow::Result<ToolOutput> {
         let id = Uuid::new_v4().to_string();
@@ -434,7 +444,17 @@ impl BashTool {
         let id_clone = id.clone();
         let sandbox = self.options.sandbox.clone();
         tokio::spawn(async move {
-            run_shell_job(mgr, id_clone, command, cwd, timeout_ms, cancel, sandbox).await;
+            run_shell_job(
+                mgr,
+                id_clone,
+                command,
+                cwd,
+                session_root,
+                timeout_ms,
+                cancel,
+                sandbox,
+            )
+            .await;
         });
 
         Ok(ToolOutput::success(format!(
@@ -443,17 +463,25 @@ Also available as task_id={id} via TaskOutput/TaskStop."
         )))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run_foreground(
         &self,
         session_id: String,
         command: String,
         description: String,
         cwd: PathBuf,
+        session_root: PathBuf,
         timeout_ms: u64,
         interrupted: Option<Arc<std::sync::atomic::AtomicBool>>,
     ) -> anyhow::Result<ToolOutput> {
         let (shell, flag) = shell_and_flag();
-        let mut cmd = match self.options.sandbox.command(shell, flag, &command, &cwd) {
+        let mut cmd = match self.options.sandbox.command_for_session(
+            shell,
+            flag,
+            &command,
+            &cwd,
+            &session_root,
+        ) {
             Ok(command) => command,
             Err(error) => return Ok(ToolOutput::error(format!("Sandbox setup failed: {error}"))),
         };
@@ -638,17 +666,19 @@ Poll with Bash({{\"shell_id\":\"{id}\"}})."
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_shell_job(
     mgr: Arc<BackgroundShellManager>,
     id: String,
     command: String,
     cwd: PathBuf,
+    session_root: PathBuf,
     timeout_ms: Option<u64>,
     cancel: Arc<std::sync::atomic::AtomicBool>,
     sandbox: crate::sandbox::SandboxPolicy,
 ) {
     let (shell, flag) = shell_and_flag();
-    let mut cmd = match sandbox.command(shell, flag, &command, &cwd) {
+    let mut cmd = match sandbox.command_for_session(shell, flag, &command, &cwd, &session_root) {
         Ok(command) => command,
         Err(error) => {
             mgr.append_output(&id, &format!("Sandbox setup failed: {error}"))
@@ -896,8 +926,12 @@ fn shell_and_flag() -> (&'static str, &'static str) {
     }
 }
 
-fn resolve_cwd(cwd: Option<&str>, session_cwd: &Path) -> PathBuf {
-    match cwd {
+fn resolve_cwd(
+    cwd: Option<&str>,
+    session_cwd: &Path,
+    sandbox: &crate::sandbox::SandboxPolicy,
+) -> anyhow::Result<PathBuf> {
+    let requested = match cwd {
         Some(c) if !c.is_empty() => {
             let p = PathBuf::from(c);
             if p.is_absolute() {
@@ -907,7 +941,9 @@ fn resolve_cwd(cwd: Option<&str>, session_cwd: &Path) -> PathBuf {
             }
         }
         _ => session_cwd.to_path_buf(),
-    }
+    };
+    let (resolved, _) = sandbox.resolve_workspace_paths(&requested, session_cwd)?;
+    Ok(resolved)
 }
 
 fn truncate_chars(s: &str, max: usize) -> String {
@@ -982,9 +1018,10 @@ mod tests {
     #[test]
     fn cwd_defaults_to_the_session_and_schema_does_not_invite_absolute_paths() {
         let root = PathBuf::from("workspace-root");
-        assert_eq!(resolve_cwd(None, &root), root.clone());
+        let sandbox = crate::sandbox::SandboxPolicy::default();
+        assert_eq!(resolve_cwd(None, &root, &sandbox).unwrap(), root.clone());
         assert_eq!(
-            resolve_cwd(Some("crates/core"), &root),
+            resolve_cwd(Some("crates/core"), &root, &sandbox).unwrap(),
             root.join("crates/core")
         );
 
@@ -992,6 +1029,25 @@ mod tests {
         let description = schema["properties"]["cwd"]["description"].as_str().unwrap();
         assert!(description.contains("session's working directory"));
         assert!(!description.contains("absolute or relative"));
+    }
+
+    #[test]
+    fn workspace_mode_rejects_cwd_outside_session_root() {
+        let session = std::env::temp_dir().join(format!("kkagent-cwd-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&session).unwrap();
+        let sandbox = crate::sandbox::SandboxPolicy::from_config(&kkagent_config::SandboxConfig {
+            mode: "workspace".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        let outside = std::env::temp_dir();
+        let err = resolve_cwd(Some(outside.to_str().unwrap()), &session, &sandbox).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("escapes the sandbox writable root"),
+            "{err}"
+        );
+        std::fs::remove_dir_all(&session).ok();
     }
 
     #[cfg(unix)]

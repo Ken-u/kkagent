@@ -13,9 +13,23 @@ kkagent 能读取和修改文件、运行 Shell、访问网络和调用第三方
 
 ## 权限与沙箱是两层控制
 
-`manual`、`yolo`、`auto` 决定工具是否需要交互批准；路径策略和危险命令检测阻止一部分常见误操作。Bash 默认再启用 `[sandbox] mode = "auto"`：Linux/macOS 使用工作区级 OS sandbox，Windows 使用 Job Object 进程隔离。该层只覆盖 Bash 工具进程，不自动包裹 MCP、Hook 或显式开启的 HTTP terminal；合法编译器和脚本仍可能利用允许的工作区或网络能力。处理多租户或恶意代码时仍应叠加低权限账户、容器或 VM。
+`manual`、`yolo`、`auto` 决定工具是否需要交互批准；路径策略和危险命令检测阻止一部分常见误操作。Bash 默认再启用 `[sandbox] mode = "auto"`：Linux/macOS 在探测到 bubblewrap / `sandbox-exec` 后使用工作区级 OS sandbox，否则回退 `process`（Job Object / rlimit）；Windows 使用 Job Object 进程隔离。该层只覆盖 Bash 工具进程，不自动包裹 MCP、Hook 或显式开启的 HTTP terminal；合法编译器和脚本仍可能利用允许的工作区或网络能力。处理多租户或恶意代码时仍应叠加低权限账户、容器或 VM。
 
-`--disable-sandbox` 只覆盖当前 kkagent 进程，但会完整关闭 Bash 的 OS 文件/网络隔离、Git 环境隔离和资源/进程限制。它不会关闭工具审批或危险命令检测，也不能覆盖通过 `--connect` 使用的远端 Server。只应在外层已有可信容器或 VM 隔离时使用。
+`--disable-sandbox` 只覆盖当前 kkagent 进程，会完整关闭 Bash 的 OS 文件/网络隔离、Git 环境隔离和资源/进程限制。它不会关闭工具审批或危险命令检测，也不能覆盖通过 `--connect` 使用的远端 Server。只应在外层已有可信容器或 VM 隔离时使用。
+
+### 沙箱模式差异
+
+| 行为 | disabled | process | workspace |
+| --- | --- | --- | --- |
+| 文件系统隔离 | 无 | 无 | bwrap / sandbox-exec |
+| 网络 | 无隔离 | 无隔离 | 默认拒绝（`sandbox.network = false`） |
+| 环境变量 | 继承进程环境 | 继承进程环境 | 白名单（PATH/TERM/代理/`LC_*` 等），清除 API key 等机密 |
+| `cwd` | 任意存在路径 | 任意存在路径 | 必须落在 session 工作目录（可写根）内 |
+| 资源限制 | 关闭 | 生效 | 生效 |
+
+workspace 模式不限制进程能力（macOS profile 含 `(allow process*)`，shell 需要自由 exec）。`extra_read_paths` / `extra_write_paths` 默认拒绝 HOME 与凭据目录（`.ssh` / `.aws` / `.kube` 等）；确需开放时设置 `sandbox.allow_sensitive_extra_paths = true`。
+
+应用层路径策略（`tools.path_guard_mode`、敏感文件检测）是第二道防线，在 disabled/process 模式下尤为重要，但不能替代 OS 沙盒。Bash 命令中的敏感路径扫描是 best-effort，不是可靠隔离。
 
 ## Server 暴露
 

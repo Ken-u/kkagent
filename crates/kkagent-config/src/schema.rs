@@ -291,6 +291,10 @@ impl Default for LoopControlConfig {
 fn default_true() -> bool {
     true
 }
+
+fn default_false() -> bool {
+    false
+}
 fn default_compact_keep() -> u32 {
     8
 }
@@ -336,7 +340,8 @@ pub struct SandboxConfig {
     #[serde(default = "default_sandbox_mode")]
     pub mode: String,
     /// Permit network access from tool processes.
-    #[serde(default = "default_true")]
+    /// Defaults to `false` (least privilege). Set `true` explicitly when builds need network.
+    #[serde(default = "default_false")]
     pub network: bool,
     #[serde(default = "default_sandbox_memory_mb")]
     pub memory_mb: u64,
@@ -348,18 +353,23 @@ pub struct SandboxConfig {
     pub extra_read_paths: Vec<String>,
     #[serde(default)]
     pub extra_write_paths: Vec<String>,
+    /// Escape hatch: allow `extra_*_paths` to include HOME / credential dirs.
+    /// Default `false` — opening those paths defeats workspace isolation.
+    #[serde(default)]
+    pub allow_sensitive_extra_paths: bool,
 }
 
 impl Default for SandboxConfig {
     fn default() -> Self {
         Self {
             mode: default_sandbox_mode(),
-            network: true,
+            network: false,
             memory_mb: default_sandbox_memory_mb(),
             cpu_seconds: default_sandbox_cpu_seconds(),
             max_processes: default_sandbox_processes(),
             extra_read_paths: Vec::new(),
             extra_write_paths: Vec::new(),
+            allow_sensitive_extra_paths: false,
         }
     }
 }
@@ -377,6 +387,86 @@ impl SandboxConfig {
             "disabled" | "off" | "none"
         )
     }
+
+    /// Reject `extra_read_paths` / `extra_write_paths` that open HOME or
+    /// credential directories unless `allow_sensitive_extra_paths` is set.
+    pub fn validate_extra_paths(&self) -> anyhow::Result<()> {
+        if self.allow_sensitive_extra_paths {
+            return Ok(());
+        }
+        let home = dirs::home_dir();
+        for (kind, path) in self
+            .extra_read_paths
+            .iter()
+            .map(|p| ("extra_read_paths", p.as_str()))
+            .chain(
+                self.extra_write_paths
+                    .iter()
+                    .map(|p| ("extra_write_paths", p.as_str())),
+            )
+        {
+            let expanded = expand_user_path(path);
+            if let Some(home) = home.as_ref() {
+                if paths_equal_or_same(&expanded, home) {
+                    anyhow::bail!(
+                        "sandbox.{kind} must not include the user HOME ({}); \
+set sandbox.allow_sensitive_extra_paths = true to override (unsafe)",
+                        home.display()
+                    );
+                }
+            }
+            if is_sensitive_extra_path(&expanded) {
+                anyhow::bail!(
+                    "sandbox.{kind} includes sensitive path `{}`; \
+set sandbox.allow_sensitive_extra_paths = true to override (unsafe)",
+                    expanded.display()
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+fn expand_user_path(raw: &str) -> std::path::PathBuf {
+    let path = std::path::PathBuf::from(raw);
+    if let Some(stripped) = raw.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(stripped);
+        }
+    }
+    if raw == "~" {
+        if let Some(home) = dirs::home_dir() {
+            return home;
+        }
+    }
+    path
+}
+
+fn paths_equal_or_same(a: &std::path::Path, b: &std::path::Path) -> bool {
+    let a = std::fs::canonicalize(a).unwrap_or_else(|_| a.to_path_buf());
+    let b = std::fs::canonicalize(b).unwrap_or_else(|_| b.to_path_buf());
+    a == b
+}
+
+fn is_sensitive_extra_path(path: &std::path::Path) -> bool {
+    let components: Vec<String> = path
+        .components()
+        .filter_map(|c| c.as_os_str().to_str().map(|s| s.to_ascii_lowercase()))
+        .collect();
+    for name in &components {
+        if matches!(
+            name.as_str(),
+            ".ssh" | ".gnupg" | ".aws" | ".gcp" | ".docker" | ".kube"
+        ) {
+            return true;
+        }
+    }
+    for window in components.windows(2) {
+        if window[0] == ".config" && window[1] == "gcloud" {
+            return true;
+        }
+    }
+    false
 }
 
 fn default_sandbox_mode() -> String {
@@ -678,6 +768,7 @@ impl AppConfig {
         for entry in &self.workspace_trust.workspaces {
             entry.validate()?;
         }
+        self.sandbox.validate_extra_paths()?;
         if self.image.max_edge_px == 0 || self.image.max_edge_px > 16_384 {
             anyhow::bail!("image.max_edge_px must be between 1 and 16384");
         }

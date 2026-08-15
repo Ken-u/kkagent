@@ -31,15 +31,46 @@ pub enum SandboxMode {
     Workspace,
 }
 
+/// Environment variables forwarded into workspace-mode sandboxes.
+/// Keep this list minimal — secrets loaded into the kkagent process must not leak.
+pub const WORKSPACE_ENV_ALLOWLIST: &[&str] = &[
+    "PATH",
+    "TERM",
+    "TZ",
+    "LANG",
+    "LANGUAGE",
+    "TMPDIR",
+    "TEMP",
+    "TMP",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+    "ALL_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "no_proxy",
+    "all_proxy",
+    "KKAGENT_SANDBOX",
+];
+
 #[derive(Debug, Clone)]
 pub struct SandboxPolicy {
     pub mode: SandboxMode,
+    /// Configured mode string before auto-resolution (`auto` / `workspace` / …).
+    pub configured_mode: String,
     pub network: bool,
     pub memory_mb: u64,
     pub cpu_seconds: u64,
     pub max_processes: u32,
     pub extra_read_paths: Vec<PathBuf>,
     pub extra_write_paths: Vec<PathBuf>,
+    pub allow_sensitive_extra_paths: bool,
+    /// Set when `auto` fell back because workspace tooling was missing.
+    pub auto_fallback_warning: Option<String>,
     workspace_trust: Vec<kkagent_config::WorkspaceTrust>,
 }
 
@@ -47,12 +78,15 @@ impl Default for SandboxPolicy {
     fn default() -> Self {
         Self {
             mode: SandboxMode::Process,
-            network: true,
+            configured_mode: "process".into(),
+            network: false,
             memory_mb: 4096,
             cpu_seconds: 600,
             max_processes: 128,
             extra_read_paths: Vec::new(),
             extra_write_paths: Vec::new(),
+            allow_sensitive_extra_paths: false,
+            auto_fallback_warning: None,
             workspace_trust: Vec::new(),
         }
     }
@@ -60,14 +94,11 @@ impl Default for SandboxPolicy {
 
 impl SandboxPolicy {
     pub fn from_config(config: &kkagent_config::SandboxConfig) -> anyhow::Result<Self> {
-        let mode = match config.mode.trim().to_ascii_lowercase().as_str() {
-            "auto" => {
-                if cfg!(target_os = "windows") {
-                    SandboxMode::Process
-                } else {
-                    SandboxMode::Workspace
-                }
-            }
+        config.validate_extra_paths()?;
+        let configured = config.mode.trim().to_ascii_lowercase();
+        let mut auto_fallback_warning = None;
+        let mode = match configured.as_str() {
+            "auto" => resolve_auto_mode(&mut auto_fallback_warning),
             "disabled" | "off" | "none" => SandboxMode::Disabled,
             "process" => SandboxMode::Process,
             "workspace" | "strict" => SandboxMode::Workspace,
@@ -83,14 +114,20 @@ impl SandboxPolicy {
         {
             anyhow::bail!("sandbox limits must be positive and memory_mb must be at least 64");
         }
+        if let Some(warning) = auto_fallback_warning.as_ref() {
+            tracing::warn!("{warning}");
+        }
         Ok(Self {
             mode,
+            configured_mode: configured,
             network: config.network,
             memory_mb: config.memory_mb,
             cpu_seconds: config.cpu_seconds,
             max_processes: config.max_processes,
             extra_read_paths: config.extra_read_paths.iter().map(PathBuf::from).collect(),
             extra_write_paths: config.extra_write_paths.iter().map(PathBuf::from).collect(),
+            allow_sensitive_extra_paths: config.allow_sensitive_extra_paths,
+            auto_fallback_warning,
             workspace_trust: Vec::new(),
         })
     }
@@ -119,6 +156,40 @@ impl SandboxPolicy {
         Ok(())
     }
 
+    /// Build a sandboxed command. `session_root` is the session working directory
+    /// (writable root in workspace mode). Prefer this over [`Self::command`].
+    pub fn command_for_session(
+        &self,
+        shell: &str,
+        flag: &str,
+        script: &str,
+        cwd: &Path,
+        session_root: &Path,
+    ) -> anyhow::Result<Command> {
+        let (cwd, writable_root) = self.resolve_workspace_paths(cwd, session_root)?;
+        let trust = self.workspace_trust_for(&writable_root);
+        let mut command = match self.mode {
+            SandboxMode::Disabled | SandboxMode::Process => shell_command(shell, flag, script),
+            SandboxMode::Workspace => {
+                workspace_command(self, trust, shell, flag, script, &cwd, &writable_root)?
+            }
+        };
+        command.current_dir(&cwd);
+        if self.mode == SandboxMode::Workspace {
+            apply_workspace_env_whitelist(&mut command);
+            #[cfg(unix)]
+            command.env("HOME", "/tmp");
+            #[cfg(windows)]
+            command.env("HOME", std::env::temp_dir());
+        }
+        command.env("KKAGENT_SANDBOX", self.mode_name());
+        apply_git_environment(&mut command, self.mode, trust);
+        apply_resource_limits(&mut command, self)?;
+        Ok(command)
+    }
+
+    /// Convenience wrapper that treats `cwd` as both the chdir target and the
+    /// session writable root (tests / simple callers).
     pub fn command(
         &self,
         shell: &str,
@@ -126,18 +197,77 @@ impl SandboxPolicy {
         script: &str,
         cwd: &Path,
     ) -> anyhow::Result<Command> {
-        let cwd = std::fs::canonicalize(cwd)
-            .map_err(|error| anyhow::anyhow!("cannot sandbox cwd {}: {error}", cwd.display()))?;
-        let trust = self.workspace_trust_for(&cwd);
-        let mut command = match self.mode {
-            SandboxMode::Disabled | SandboxMode::Process => shell_command(shell, flag, script),
-            SandboxMode::Workspace => workspace_command(self, trust, shell, flag, script, &cwd)?,
+        self.command_for_session(shell, flag, script, cwd, cwd)
+    }
+
+    /// Resolve and validate `cwd` against the session writable root.
+    pub fn resolve_workspace_paths(
+        &self,
+        cwd: &Path,
+        session_root: &Path,
+    ) -> anyhow::Result<(PathBuf, PathBuf)> {
+        let session_root = match std::fs::canonicalize(session_root) {
+            Ok(p) => p,
+            Err(error) => {
+                if self.mode == SandboxMode::Workspace {
+                    anyhow::bail!(
+                        "cannot resolve session working dir {}: {error}",
+                        session_root.display()
+                    );
+                }
+                return Ok((cwd.to_path_buf(), session_root.to_path_buf()));
+            }
         };
-        command.current_dir(&cwd);
-        command.env("KKAGENT_SANDBOX", self.mode_name());
-        apply_git_environment(&mut command, self.mode, trust);
-        apply_resource_limits(&mut command, self)?;
-        Ok(command)
+        let cwd = match std::fs::canonicalize(cwd) {
+            Ok(p) => p,
+            Err(error) => {
+                let kind = match self.mode {
+                    SandboxMode::Workspace => "sandbox cwd",
+                    SandboxMode::Process => "process cwd",
+                    SandboxMode::Disabled => "working directory",
+                };
+                anyhow::bail!("cannot resolve {kind} {}: {error}", cwd.display());
+            }
+        };
+
+        if self.mode != SandboxMode::Workspace {
+            return Ok((cwd, session_root));
+        }
+
+        let writable_root = self.writable_root_for(&session_root);
+        if path_is_within(&cwd, &writable_root) {
+            return Ok((cwd, writable_root));
+        }
+
+        // Ancestor of session root is allowed only when listed in extra_write_paths.
+        if path_is_within(&writable_root, &cwd) {
+            let cwd_allowed = self.extra_write_paths.iter().any(|p| {
+                let extra = canonical_or_owned(p);
+                cwd == extra || path_is_within(&cwd, &extra)
+            });
+            if cwd_allowed {
+                return Ok((cwd, writable_root));
+            }
+        }
+
+        anyhow::bail!(
+            "cwd `{}` escapes the sandbox writable root `{}`. \
+Use a path inside the session working directory (relative paths preferred).",
+            cwd.display(),
+            writable_root.display()
+        );
+    }
+
+    fn writable_root_for(&self, session_root: &Path) -> PathBuf {
+        // Prefer the more precise (deeper) of session root vs matching trust workspace.
+        if let Some(trust) = self.workspace_trust_for(session_root) {
+            let trust_root = canonical_or_owned(&trust.workspace_path());
+            if path_is_within(session_root, &trust_root) {
+                // session is inside trust → session is more precise
+                return session_root.to_path_buf();
+            }
+        }
+        session_root.to_path_buf()
     }
 
     pub fn mode_name(&self) -> &'static str {
@@ -246,12 +376,13 @@ fn workspace_command(
     flag: &str,
     script: &str,
     cwd: &Path,
+    writable_root: &Path,
 ) -> anyhow::Result<Command> {
     let sandbox = Path::new("/usr/bin/sandbox-exec");
     if !sandbox.is_file() {
         anyhow::bail!("workspace sandbox requires /usr/bin/sandbox-exec on macOS");
     }
-    let profile = macos_profile(policy, trust, cwd)?;
+    let profile = macos_profile(policy, trust, cwd, writable_root)?;
     let mut command = Command::new(sandbox);
     command.args(["-p", &profile, shell, flag, script]);
     Ok(command)
@@ -265,6 +396,7 @@ fn workspace_command(
     flag: &str,
     script: &str,
     cwd: &Path,
+    writable_root: &Path,
 ) -> anyhow::Result<Command> {
     let bwrap = which::which("bwrap")
         .map_err(|_| anyhow::anyhow!("workspace sandbox requires bubblewrap (bwrap) on Linux"))?;
@@ -279,7 +411,13 @@ fn workspace_command(
         }
     }
     command.args(["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"]);
-    bind_path(&mut command, "--bind", cwd)?;
+    // Writable root is the session workspace, not an attacker-controlled cwd.
+    bind_path(&mut command, "--bind", writable_root)?;
+    if cwd != writable_root && path_is_within(cwd, writable_root) {
+        // cwd is already covered by the writable_root bind.
+    } else if cwd != writable_root {
+        bind_path(&mut command, "--bind", cwd)?;
+    }
     for path in &policy.extra_read_paths {
         bind_path(&mut command, "--ro-bind", path)?;
     }
@@ -289,12 +427,12 @@ fn workspace_command(
     if let Some(trust) = trust {
         if trust.global_git_config_allowed == Some(true) {
             for path in trust.global_git_read_paths().map(Path::new) {
-                bind_trusted_path(&mut command, "--ro-bind", path, cwd)?;
+                bind_trusted_path(&mut command, "--ro-bind", path, writable_root)?;
             }
         }
         if trust.git_metadata_allowed == Some(true) {
             for path in trust.git_metadata_paths.iter().map(Path::new) {
-                bind_trusted_path(&mut command, "--bind", path, cwd)?;
+                bind_trusted_path(&mut command, "--bind", path, writable_root)?;
             }
         }
     }
@@ -320,6 +458,7 @@ fn workspace_command(
     _flag: &str,
     _script: &str,
     _cwd: &Path,
+    _writable_root: &Path,
 ) -> anyhow::Result<Command> {
     anyhow::bail!("workspace filesystem sandbox is unavailable on Windows; use process mode or run kkagent in Windows Sandbox/WDAG")
 }
@@ -332,6 +471,7 @@ fn workspace_command(
     _flag: &str,
     _script: &str,
     _cwd: &Path,
+    _writable_root: &Path,
 ) -> anyhow::Result<Command> {
     anyhow::bail!("workspace sandbox is unsupported on this platform")
 }
@@ -374,6 +514,7 @@ fn macos_profile(
     policy: &SandboxPolicy,
     trust: Option<&kkagent_config::WorkspaceTrust>,
     cwd: &Path,
+    writable_root: &Path,
 ) -> anyhow::Result<String> {
     fn literal(path: &Path) -> anyhow::Result<String> {
         let value = path_text(path)?;
@@ -402,8 +543,16 @@ fn macos_profile(
     } else {
         profile.push_str("(allow file-read*)\n");
     }
-    let cwd = literal(cwd)?;
-    profile.push_str(&format!("(allow file-read* file-write* (subpath {cwd}))\n"));
+    let root = literal(writable_root)?;
+    profile.push_str(&format!(
+        "(allow file-read* file-write* (subpath {root}))\n"
+    ));
+    if cwd != writable_root {
+        let cwd_lit = literal(cwd)?;
+        profile.push_str(&format!(
+            "(allow file-read* file-write* (subpath {cwd_lit}))\n"
+        ));
+    }
     for path in &policy.extra_read_paths {
         let path = literal(&std::fs::canonicalize(path)?)?;
         profile.push_str(&format!("(allow file-read* (subpath {path}))\n"));
@@ -451,6 +600,69 @@ fn apply_git_environment(
         return;
     }
     command.envs(kkagent_config::git_environment(trust));
+}
+
+fn apply_workspace_env_whitelist(command: &mut Command) {
+    let mut kept = std::collections::HashMap::new();
+    for key in WORKSPACE_ENV_ALLOWLIST {
+        if let Ok(value) = std::env::var(key) {
+            kept.insert((*key).to_string(), value);
+        }
+    }
+    for (key, value) in std::env::vars() {
+        if key.starts_with("LC_") {
+            kept.insert(key, value);
+        }
+    }
+    command.env_clear();
+    command.envs(kept);
+}
+
+fn resolve_auto_mode(warning: &mut Option<String>) -> SandboxMode {
+    if cfg!(target_os = "windows") {
+        return SandboxMode::Process;
+    }
+    if workspace_sandbox_available() {
+        SandboxMode::Workspace
+    } else {
+        *warning = Some(auto_fallback_message());
+        SandboxMode::Process
+    }
+}
+
+fn workspace_sandbox_available() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        which::which("bwrap").is_ok()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Path::new("/usr/bin/sandbox-exec").is_file()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        false
+    }
+}
+
+fn auto_fallback_message() -> String {
+    if cfg!(target_os = "linux") {
+        "sandbox.mode=auto: bubblewrap (bwrap) not found; falling back to process mode. \
+Install bubblewrap for workspace filesystem isolation."
+            .into()
+    } else if cfg!(target_os = "macos") {
+        "sandbox.mode=auto: /usr/bin/sandbox-exec not found; falling back to process mode.".into()
+    } else {
+        "sandbox.mode=auto: workspace isolation unavailable; using process mode.".into()
+    }
+}
+
+/// True when `path` is equal to or a descendant of `root`.
+fn path_is_within(path: &Path, root: &Path) -> bool {
+    if path == root {
+        return true;
+    }
+    path.starts_with(root)
 }
 
 fn canonical_or_owned(path: &Path) -> PathBuf {
@@ -575,6 +787,50 @@ fn set_limit(resource: libc::c_int, value: u64) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workspace_env_allowlist_is_minimal() {
+        assert!(WORKSPACE_ENV_ALLOWLIST.contains(&"PATH"));
+        assert!(WORKSPACE_ENV_ALLOWLIST.contains(&"TERM"));
+        assert!(!WORKSPACE_ENV_ALLOWLIST
+            .iter()
+            .any(|k| k.contains("API_KEY")));
+        assert!(!WORKSPACE_ENV_ALLOWLIST.contains(&"OPENAI_API_KEY"));
+    }
+
+    #[test]
+    fn auto_mode_resolves_to_effective_mode() {
+        let config = kkagent_config::SandboxConfig {
+            mode: "auto".into(),
+            ..Default::default()
+        };
+        let policy = SandboxPolicy::from_config(&config).unwrap();
+        if cfg!(target_os = "windows") {
+            assert_eq!(policy.mode, SandboxMode::Process);
+        } else if workspace_sandbox_available() {
+            assert_eq!(policy.mode, SandboxMode::Workspace);
+            assert!(policy.auto_fallback_warning.is_none());
+        } else {
+            assert_eq!(policy.mode, SandboxMode::Process);
+            assert!(policy.auto_fallback_warning.is_some());
+        }
+    }
+
+    #[test]
+    fn rejects_sensitive_extra_write_paths_by_default() {
+        let home = dirs::home_dir().expect("home");
+        let config = kkagent_config::SandboxConfig {
+            mode: "process".into(),
+            extra_write_paths: vec![home.join(".ssh").display().to_string()],
+            ..Default::default()
+        };
+        let err = SandboxPolicy::from_config(&config).unwrap_err();
+        assert!(
+            err.to_string().contains("sensitive path")
+                || err.to_string().contains("allow_sensitive_extra_paths"),
+            "{err}"
+        );
+    }
 
     #[test]
     fn validates_config() {
@@ -747,7 +1003,13 @@ mod tests {
             network: false,
             ..Default::default()
         };
-        let profile = macos_profile(&policy, None, Path::new("/tmp/work")).unwrap();
+        let profile = macos_profile(
+            &policy,
+            None,
+            Path::new("/tmp/work"),
+            Path::new("/tmp/work"),
+        )
+        .unwrap();
         assert!(profile.contains("/tmp/work"));
         assert!(!profile.contains("allow network"));
     }
