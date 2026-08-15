@@ -8,6 +8,7 @@ pub mod path_policy;
 pub mod registry;
 pub mod sandbox;
 pub mod shell_safety;
+pub mod toolchain;
 pub mod web_providers;
 
 pub use accesses::{infer_accesses, tool_accesses, ToolAccesses, ToolResourceAccess};
@@ -21,6 +22,10 @@ pub use builtin::{
     BackgroundShellManager, BashOptions, BashTool, CronManager, SkillCatalog, SkillTool,
 };
 pub use registry::*;
+pub use toolchain::{
+    deny_toolchain_mutation, doctor_report, toolchain_sandbox_overlay, GrantAccess, ToolchainGrant,
+    ToolchainGrantStore, ToolchainSandboxOverlay,
+};
 pub use web_providers::WebServicesConfig;
 
 use async_trait::async_trait;

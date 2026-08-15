@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+use crate::toolchain::ToolchainConfig;
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AppConfig {
     #[serde(default)]
@@ -54,6 +56,9 @@ pub struct AppConfig {
     pub background: Option<BackgroundConfig>,
     #[serde(default)]
     pub sandbox: SandboxConfig,
+    /// Declarative language toolchain sandbox profiles (`[toolchain]`).
+    #[serde(default)]
+    pub toolchain: ToolchainConfig,
     #[serde(default)]
     pub permission: Option<PermissionConfig>,
     #[serde(default)]

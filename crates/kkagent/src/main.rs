@@ -2602,9 +2602,31 @@ async fn build_turn_tool_registry(
         state.bash_shells.clone(),
         kkagent_tools::builtin::BashOptions {
             auto_background_on_timeout,
-            sandbox: state.sandbox_snapshot(),
+            sandbox: {
+                let mut sandbox = state.sandbox_snapshot();
+                sandbox.refresh_toolchain(
+                    &state.config().toolchain,
+                    &state.toolchain_grants.snapshot(),
+                );
+                sandbox
+            },
             default_timeout_s,
+            toolchain: state.config().toolchain.clone(),
         },
+    )));
+    let path_isolation = matches!(
+        state.sandbox_snapshot().mode,
+        kkagent_tools::sandbox::SandboxMode::Workspace
+    );
+    tools.register(Arc::new(
+        kkagent_tools::builtin::RequestToolchainAccessTool::new(
+            state.toolchain_grants.clone(),
+            path_isolation,
+        ),
+    ));
+    tools.register(Arc::new(kkagent_tools::builtin::ToolchainDoctorTool::new(
+        state.config().toolchain.clone(),
+        state.toolchain_grants.clone(),
     )));
     register_mcp_tools(&mut tools, &state.mcp).await;
 
@@ -2832,6 +2854,7 @@ struct ServerState {
     mcp: Arc<McpManager>,
     /// Shared background shell jobs for Bash tool.
     bash_shells: Arc<kkagent_tools::builtin::BackgroundShellManager>,
+    toolchain_grants: Arc<kkagent_tools::toolchain::ToolchainGrantStore>,
     cron: Arc<kkagent_tools::CronManager>,
     /// Pending cron-fire XML injections for the next turn.
     cron_fires: Arc<Mutex<Vec<String>>>,
@@ -3910,6 +3933,7 @@ async fn build_server_state_with_shutdown(
         subagents,
         mcp,
         bash_shells: Arc::new(kkagent_tools::builtin::BackgroundShellManager::new()),
+        toolchain_grants: Arc::new(kkagent_tools::toolchain::ToolchainGrantStore::new()),
         cron,
         cron_fires,
         goal_mgr,

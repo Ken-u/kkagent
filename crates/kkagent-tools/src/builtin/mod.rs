@@ -12,6 +12,7 @@ pub mod select_tools;
 pub mod skill;
 pub mod task;
 pub mod todo;
+pub mod toolchain;
 pub mod web;
 pub mod write;
 pub mod write_plan;
@@ -33,6 +34,7 @@ pub use skill::{
 };
 pub use task::{AgentSwarmTool, AgentTool, TaskListTool, TaskOutputTool, TaskStopTool, TaskTool};
 pub use todo::TodoListTool;
+pub use toolchain::{RequestToolchainAccessTool, ToolchainDoctorTool};
 pub use web::{FetchUrlTool, WebSearchTool};
 pub use write::WriteTool;
 pub use write_plan::WritePlanTool;

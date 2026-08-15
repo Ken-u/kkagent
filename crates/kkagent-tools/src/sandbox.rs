@@ -71,6 +71,8 @@ pub struct SandboxPolicy {
     pub allow_sensitive_extra_paths: bool,
     /// Set when `auto` fell back because workspace tooling was missing.
     pub auto_fallback_warning: Option<String>,
+    /// Toolchain-derived mounts/env applied in workspace mode.
+    pub toolchain_overlay: crate::toolchain::ToolchainSandboxOverlay,
     workspace_trust: Vec<kkagent_config::WorkspaceTrust>,
 }
 
@@ -87,6 +89,7 @@ impl Default for SandboxPolicy {
             extra_write_paths: Vec::new(),
             allow_sensitive_extra_paths: false,
             auto_fallback_warning: None,
+            toolchain_overlay: crate::toolchain::ToolchainSandboxOverlay::default(),
             workspace_trust: Vec::new(),
         }
     }
@@ -128,6 +131,7 @@ impl SandboxPolicy {
             extra_write_paths: config.extra_write_paths.iter().map(PathBuf::from).collect(),
             allow_sensitive_extra_paths: config.allow_sensitive_extra_paths,
             auto_fallback_warning,
+            toolchain_overlay: crate::toolchain::ToolchainSandboxOverlay::default(),
             workspace_trust: Vec::new(),
         })
     }
@@ -135,7 +139,23 @@ impl SandboxPolicy {
     pub fn from_app_config(config: &kkagent_config::AppConfig) -> anyhow::Result<Self> {
         let mut policy = Self::from_config(&config.sandbox)?;
         policy.workspace_trust = config.workspace_trust.workspaces.clone();
+        policy.toolchain_overlay =
+            crate::toolchain::toolchain_sandbox_overlay(&config.toolchain, &[]);
+        if policy.toolchain_overlay.force_network {
+            policy.network = true;
+        }
         Ok(policy)
+    }
+
+    pub fn refresh_toolchain(
+        &mut self,
+        config: &kkagent_config::ToolchainConfig,
+        grants: &[crate::toolchain::ToolchainGrant],
+    ) {
+        self.toolchain_overlay = crate::toolchain::toolchain_sandbox_overlay(config, grants);
+        if self.toolchain_overlay.force_network {
+            self.network = true;
+        }
     }
 
     pub fn upsert_workspace_trust(
@@ -181,6 +201,9 @@ impl SandboxPolicy {
             command.env("HOME", "/tmp");
             #[cfg(windows)]
             command.env("HOME", std::env::temp_dir());
+            for (key, value) in &self.toolchain_overlay.env {
+                command.env(key, value);
+            }
         }
         command.env("KKAGENT_SANDBOX", self.mode_name());
         apply_git_environment(&mut command, self.mode, trust);
@@ -421,7 +444,13 @@ fn workspace_command(
     for path in &policy.extra_read_paths {
         bind_path(&mut command, "--ro-bind", path)?;
     }
+    for path in &policy.toolchain_overlay.extra_read {
+        bind_path(&mut command, "--ro-bind", path)?;
+    }
     for path in &policy.extra_write_paths {
+        bind_path(&mut command, "--bind", path)?;
+    }
+    for path in &policy.toolchain_overlay.extra_write {
         bind_path(&mut command, "--bind", path)?;
     }
     if let Some(trust) = trust {
@@ -557,7 +586,23 @@ fn macos_profile(
         let path = literal(&std::fs::canonicalize(path)?)?;
         profile.push_str(&format!("(allow file-read* (subpath {path}))\n"));
     }
+    for path in &policy.toolchain_overlay.extra_read {
+        if !path.exists() {
+            continue;
+        }
+        let path = literal(&std::fs::canonicalize(path)?)?;
+        profile.push_str(&format!("(allow file-read* (subpath {path}))\n"));
+    }
     for path in &policy.extra_write_paths {
+        let path = literal(&std::fs::canonicalize(path)?)?;
+        profile.push_str(&format!(
+            "(allow file-read* file-write* (subpath {path}))\n"
+        ));
+    }
+    for path in &policy.toolchain_overlay.extra_write {
+        if !path.exists() {
+            continue;
+        }
         let path = literal(&std::fs::canonicalize(path)?)?;
         profile.push_str(&format!(
             "(allow file-read* file-write* (subpath {path}))\n"

@@ -653,6 +653,32 @@ fn doctor_sandbox(config: &AppConfig, checks: &mut Vec<JsonValue>) {
             )),
         },
     }
+    doctor_toolchain(config, checks);
+}
+
+fn doctor_toolchain(config: &AppConfig, checks: &mut Vec<JsonValue>) {
+    let tc = &config.toolchain;
+    if !tc.enabled {
+        checks.push(check(
+            "toolchain",
+            "ok",
+            "toolchain sandbox disabled",
+            Some("set [toolchain] enabled = true to isolate language caches"),
+        ));
+        return;
+    }
+    let profiles = tc.all_resolved();
+    let names: Vec<_> = profiles.iter().map(|p| p.name.as_str()).collect();
+    checks.push(check(
+        "toolchain",
+        "ok",
+        format!(
+            "root={}, profiles=[{}]",
+            tc.cache_root().display(),
+            names.join(", ")
+        ),
+        None,
+    ));
 }
 
 async fn probe_provider(config: &AppConfig) -> JsonValue {

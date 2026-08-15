@@ -25,6 +25,8 @@ pub struct BashOptions {
     pub sandbox: crate::sandbox::SandboxPolicy,
     /// Default foreground timeout in seconds, overridable via `bash_task_timeout_s` config.
     pub default_timeout_s: u64,
+    /// Toolchain config used for global-install deny checks.
+    pub toolchain: kkagent_config::ToolchainConfig,
 }
 
 impl Default for BashOptions {
@@ -33,6 +35,7 @@ impl Default for BashOptions {
             auto_background_on_timeout: true,
             sandbox: crate::sandbox::SandboxPolicy::default(),
             default_timeout_s: DEFAULT_TIMEOUT_S,
+            toolchain: kkagent_config::ToolchainConfig::default(),
         }
     }
 }
@@ -285,6 +288,11 @@ for background jobs (shell_id/stop remain as aliases)."
             return Ok(ToolOutput::error(format!(
                 "Blocked dangerous shell command ({reason}). Rephrase or ask the user for confirmation with a safer variant."
             )));
+        }
+        if let Some(reason) =
+            crate::toolchain::deny_toolchain_mutation(&command, &self.options.toolchain)
+        {
+            return Ok(ToolOutput::error(reason));
         }
         let safety_note = crate::shell_safety::safety_prefix(&risk).unwrap_or_default();
 
