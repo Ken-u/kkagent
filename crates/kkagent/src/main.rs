@@ -15,9 +15,9 @@ use kkagent_config::{load_config, AppConfig, DisabledState};
 use kkagent_core::plan_review::{resolve_exit_plan_approval, PlanReviewDisplay};
 use kkagent_core::SubagentMirrorContext;
 use kkagent_core::{
-    AgentLifecycleService, AgentLoop, BtwTurn, PermissionChain, Session, SessionBtwService,
-    SessionCloseReason, SessionCreateSource, SessionFallbackModel, SessionSteerMailbox,
-    SessionStore, SteerInput, TranscriptDb,
+    is_safe_session_id, AgentLifecycleService, AgentLoop, BtwTurn, PermissionChain, Session,
+    SessionBtwService, SessionCloseReason, SessionCreateSource, SessionFallbackModel,
+    SessionSteerMailbox, SessionStore, SteerInput, TranscriptDb,
 };
 use kkagent_di::ServiceContainer;
 use kkagent_llm::{ChatContent, ChatMessage};
@@ -4009,6 +4009,8 @@ fn persist_session_messages(db: &TranscriptDb, session: &mut Session) -> anyhow:
     }
 
     // Auto-title from first real user text (skip harness-only injections).
+    // Use the same 200-char truncation as `first_prompt` so the DB title stays
+    // consistent with the disk-store label shown in the session picker.
     if session.title.is_none() {
         if let Some(text) =
             kkagent_protocol::first_real_user_text(session.messages.iter().filter_map(|m| {
@@ -4021,7 +4023,7 @@ fn persist_session_messages(db: &TranscriptDb, session: &mut Session) -> anyhow:
                 })
             }))
         {
-            let title: String = text.chars().take(60).collect();
+            let title: String = text.chars().take(200).collect();
             db.set_title(&session.id, &title)?;
             session.title = Some(title);
         }
@@ -4577,10 +4579,22 @@ fn resolve_session_id(db: &TranscriptDb, query: &str) -> Option<String> {
         .filter(|s| s.session_id.starts_with(query))
         .collect();
     if matches.len() == 1 {
-        Some(matches[0].session_id.clone())
-    } else {
-        None
+        return Some(matches[0].session_id.clone());
     }
+    // Disk store fallback — the session exists on disk but not in the transcript
+    // DB (e.g. after a DB migration/reset or created by an older code path).
+    // Backfill the DB record so subsequent message persistence works.
+    if is_safe_session_id(query) {
+        if let Ok(summary) = SessionStore::open_default().get(query) {
+            let working_dir = summary.work_dir.clone();
+            let _ = db.create_session(query, "unknown", &working_dir);
+            if let Some(title) = &summary.title {
+                let _ = db.set_title(query, title);
+            }
+            return Some(query.to_string());
+        }
+    }
+    None
 }
 
 fn resolve_resume_working_dir(
@@ -4848,6 +4862,13 @@ async fn handle_rpc_call(
                                 .map(|r| r.message_count)
                                 .unwrap_or(0);
                             let empty = message_count == 0
+                                && s.first_prompt
+                                    .as_ref()
+                                    .map(|p| {
+                                        p.trim().is_empty()
+                                            || kkagent_protocol::is_harness_only_user_text(p)
+                                    })
+                                    .unwrap_or(true)
                                 && s.last_prompt
                                     .as_ref()
                                     .map(|p| {
@@ -5267,6 +5288,15 @@ async fn handle_rpc_call(
                     .map_err(|error| (-32602, error))?;
             let turn_active = state.turn_locks.is_busy(&session_id).await;
 
+            // Prefer the disk-store first_prompt (200-char, stable) for the TUI
+            // tab/picker label; fall back to the DB record title so the field is
+            // always present even when the disk store is unavailable.
+            let first_prompt = SessionStore::open_default()
+                .get(&session_id)
+                .ok()
+                .and_then(|s| s.first_prompt)
+                .or_else(|| record.title.clone());
+
             // If already in memory, prefer in-memory messages (may be ahead of DB)
             let in_memory = {
                 let sessions = state.sessions.lock().await;
@@ -5327,6 +5357,7 @@ async fn handle_rpc_call(
                     "pending_approval_resumed": !turn_active,
                     "pending_question": pending_question,
                     "todos": todos,
+                    "first_prompt": first_prompt,
                     "usage": {
                         "input_tokens": usage.input_tokens,
                         "output_tokens": usage.output_tokens,
@@ -5413,6 +5444,7 @@ async fn handle_rpc_call(
                     "pending_approval_resumed": false,
                     "pending_question": pending_question,
                     "todos": todos,
+                    "first_prompt": first_prompt,
                     "history": {
                         "total": total,
                         "oldest_index": oldest_index,
@@ -5519,6 +5551,7 @@ async fn handle_rpc_call(
                 "pending_approval_resumed": true,
                 "pending_question": pending_question,
                 "todos": todos,
+                "first_prompt": first_prompt,
                 "history": {
                     "total": total,
                     "oldest_index": oldest_index,
@@ -5798,7 +5831,7 @@ async fn handle_rpc_call(
                                     Some(visible)
                                 }
                             }) {
-                                let title: String = text.chars().take(60).collect();
+                                let title: String = text.chars().take(200).collect();
                                 if db.set_title(&session_id, &title).is_ok() {
                                     new_title = Some(title);
                                 }
@@ -6811,7 +6844,7 @@ async fn handle_rpc_call(
                             session.transcript_rewrite_required = false;
                             if session.title.is_none() {
                                 let title: String =
-                                    format!("/{resolved_name}").chars().take(60).collect();
+                                    format!("/{resolved_name}").chars().take(200).collect();
                                 let db = state.transcript.lock().await;
                                 if db.set_title(&session_id, &title).is_ok() {
                                     session.title = Some(title);

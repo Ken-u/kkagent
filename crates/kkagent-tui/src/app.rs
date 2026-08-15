@@ -7495,7 +7495,15 @@ impl TuiApp {
         }
 
         self.state.status_bar.session_id = Some(sid.clone());
-        self.state.tab_strip.ensure_active(&sid, "session");
+        // Use the first_prompt from the resume response for a stable tab title
+        // that matches the session picker label.
+        let tab_title = data
+            .get("first_prompt")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "session".to_string());
+        self.state.tab_strip.ensure_active(&sid, &tab_title);
         self.state.list_picker = None;
         self.state.session_picker_preview = None;
         self.enqueue_workspace_sessions_refresh();
