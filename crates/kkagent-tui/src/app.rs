@@ -6963,6 +6963,32 @@ impl TuiApp {
                     })
             };
         }
+        if let Some(value) = data.get("pending_question") {
+            self.state.question_pending = if value.is_null() {
+                None
+            } else {
+                serde_json::from_value::<kkagent_protocol::QuestionPayload>(value.clone())
+                    .ok()
+                    .map(|question| {
+                        let options: Vec<(String, String)> = question
+                            .options
+                            .into_iter()
+                            .map(|o| (o.id, o.label))
+                            .collect();
+                        let toggled = vec![false; options.len()];
+                        PendingQuestion {
+                            question_id: question.question_id,
+                            text: question.text,
+                            options,
+                            allow_free_text: question.allow_free_text,
+                            allow_multiple: question.allow_multiple,
+                            selected: 0,
+                            toggled,
+                            free_text: String::new(),
+                        }
+                    })
+            };
+        }
         if self.state.approval_pending.is_some() {
             self.state.status = SessionStatus::WaitingApproval;
         } else if self.state.question_pending.is_some() {
@@ -9332,9 +9358,16 @@ impl TuiApp {
         {
             self.state.question_pending = Some(q);
             self.system_message(format!("Question reply failed: {}", e));
-        } else if !cancelled {
+        } else if cancelled {
+            self.state.status = SessionStatus::Cancelling;
+            self.sync_active_session_status();
+        } else {
             let preview: String = answer_preview.chars().take(80).collect();
             self.system_message(format!("Answered: {preview}"));
+            // AskUserQuestion itself does not emit Thinking; keep the spinner alive
+            // until the next StatusUpdate / tool event arrives.
+            self.state.status = SessionStatus::Thinking;
+            self.sync_active_session_status();
         }
         Ok(())
     }
@@ -12033,6 +12066,38 @@ mod app_state_tests {
             .is_some_and(|approval| approval.resumed_plan_review));
         assert_eq!(app.state.todos.len(), 2);
         assert_eq!(app.state.todos[1].status, "in_progress");
+    }
+
+    #[tokio::test]
+    async fn resume_restores_ask_user_question_panel() {
+        let mut app = test_tui_app();
+        app.apply_session_resume_data(
+            "session-question",
+            serde_json::json!({
+                "session_id": "session-question",
+                "messages": [],
+                "turn_active": true,
+                "status": "thinking",
+                "pending_question": {
+                    "question_id": "q-1",
+                    "text": "Pick a path",
+                    "options": [
+                        {"id": "a", "label": "Alpha"},
+                        {"id": "b", "label": "Beta"}
+                    ],
+                    "allow_free_text": false,
+                    "allow_multiple": false
+                }
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(app.state.status, SessionStatus::WaitingQuestion);
+        let question = app.state.question_pending.expect("question panel");
+        assert_eq!(question.question_id, "q-1");
+        assert_eq!(question.text, "Pick a path");
+        assert_eq!(question.options.len(), 2);
+        assert_eq!(question.options[0].1, "Alpha");
     }
 
     fn pending_plan_revision() -> (PendingApproval, ApprovalChoice) {

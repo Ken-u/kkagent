@@ -2811,7 +2811,10 @@ struct ServerState {
     plugins: Arc<kkagent_core::PluginManager>,
     telemetry: kkagent_telemetry::TelemetryServiceHandle,
     events: tokio::sync::broadcast::Sender<serde_json::Value>,
+    /// In-flight AskUserQuestion payloads (keyed by question_id) for HTTP + TUI resume.
     pending_questions: Mutex<HashMap<String, serde_json::Value>>,
+    /// In-flight tool/plan approval requests while a turn owns the Session (keyed by session_id).
+    pending_tool_approvals: Mutex<HashMap<String, kkagent_protocol::ApprovalRequest>>,
     background_tasks: Mutex<Vec<AbortHandle>>,
     turn_locks: SessionTurnLocks,
     /// Recent session.prompt idempotency keys → first-seen time.
@@ -3027,6 +3030,101 @@ impl ServerState {
             .write()
             .unwrap_or_else(|error| error.into_inner());
         retain_rpc_event_subscribers(&mut subscribers, frame);
+    }
+
+    async fn remember_pending_question(
+        &self,
+        session_id: &str,
+        question: &kkagent_protocol::QuestionPayload,
+    ) {
+        self.pending_questions.lock().await.insert(
+            question.question_id.clone(),
+            serde_json::json!({
+                "session_id": session_id,
+                "question": question,
+            }),
+        );
+    }
+
+    async fn clear_pending_question(&self, session_id: &str, question_id: Option<&str>) {
+        let mut pending = self.pending_questions.lock().await;
+        if let Some(qid) = question_id.filter(|id| !id.is_empty()) {
+            pending.remove(qid);
+            return;
+        }
+        pending.retain(|_, value| {
+            value
+                .get("session_id")
+                .and_then(|v| v.as_str())
+                .map(|sid| sid != session_id)
+                .unwrap_or(true)
+        });
+    }
+
+    async fn pending_question_for_session(&self, session_id: &str) -> Option<serde_json::Value> {
+        self.pending_questions
+            .lock()
+            .await
+            .values()
+            .find_map(|value| {
+                let sid = value.get("session_id").and_then(|v| v.as_str())?;
+                if sid != session_id {
+                    return None;
+                }
+                value.get("question").cloned()
+            })
+    }
+
+    async fn remember_pending_tool_approval(&self, request: kkagent_protocol::ApprovalRequest) {
+        self.pending_tool_approvals
+            .lock()
+            .await
+            .insert(request.session_id.clone(), request);
+    }
+
+    async fn clear_pending_tool_approval(&self, session_id: &str, approval_id: Option<&str>) {
+        let mut pending = self.pending_tool_approvals.lock().await;
+        if let Some(aid) = approval_id.filter(|id| !id.is_empty()) {
+            if pending
+                .get(session_id)
+                .map(|req| req.approval_id == aid)
+                .unwrap_or(false)
+            {
+                pending.remove(session_id);
+            }
+            return;
+        }
+        pending.remove(session_id);
+    }
+
+    async fn pending_tool_approval_for_session(
+        &self,
+        session_id: &str,
+    ) -> Option<kkagent_protocol::ApprovalRequest> {
+        self.pending_tool_approvals
+            .lock()
+            .await
+            .get(session_id)
+            .cloned()
+    }
+
+    async fn note_agent_event_for_resume(&self, evt: &AgentEvent) {
+        match evt {
+            AgentEvent::QuestionAsked {
+                session_id,
+                question,
+            } => {
+                self.remember_pending_question(session_id, question).await;
+            }
+            AgentEvent::ApprovalRequested { request, .. } => {
+                self.remember_pending_tool_approval(request.clone()).await;
+            }
+            AgentEvent::TurnEnd { session_id, .. } => {
+                self.clear_pending_question(session_id, None).await;
+                self.clear_pending_tool_approval(session_id, None).await;
+            }
+            _ => {}
+        }
     }
 
     async fn shutdown(&self) {
@@ -3343,6 +3441,7 @@ async fn build_server_state_with_shutdown(
         telemetry: telemetry.clone(),
         events,
         pending_questions: Mutex::new(HashMap::new()),
+        pending_tool_approvals: Mutex::new(HashMap::new()),
         background_tasks: Mutex::new(background_tasks),
         turn_locks: SessionTurnLocks::default(),
         prompt_idempotency: Mutex::new(HashMap::new()),
@@ -3566,6 +3665,7 @@ async fn spawn_session_agent_turn(
                     _ => {}
                 }
             }
+            event_state.note_agent_event_for_resume(&evt).await;
             // Fan-out to every attached TUI. Never stop draining when a client
             // disconnects — otherwise detach/reattach leaves Thinking stuck and
             // interrupt status updates never reach the new connection.
@@ -4633,49 +4733,78 @@ async fn handle_rpc_call(
             let turn_active = state.turn_locks.is_busy(&session_id).await;
 
             // If already in memory, prefer in-memory messages (may be ahead of DB)
-            {
+            let in_memory = {
                 let sessions = state.sessions.lock().await;
-                if let Some(existing) = sessions.get(&session_id) {
-                    let total = existing.messages.len();
-                    let usage = existing.usage.snapshot();
-                    let plan = plan_state_json(existing.plan_state());
-                    let pending_approval = existing.pending_plan_review();
-                    let todos = existing.todo_items();
-                    let status = if pending_approval.is_some() {
-                        SessionStatus::WaitingApproval
-                    } else if turn_active {
-                        SessionStatus::Thinking
-                    } else {
-                        SessionStatus::Idle
+                sessions.get(&session_id).map(|existing| {
+                    (
+                        existing.messages.clone(),
+                        existing.usage.snapshot(),
+                        plan_state_json(existing.plan_state()),
+                        existing.pending_plan_review(),
+                        existing.todo_items(),
+                        existing.plan_mode,
+                        existing.get_permission_mode(),
+                        existing.get_model_alias(),
+                        existing.working_dir.clone(),
+                    )
+                })
+            };
+            if let Some((
+                messages,
+                usage,
+                plan,
+                plan_pending_approval,
+                todos,
+                plan_mode,
+                permission_mode,
+                model,
+                working_dir,
+            )) = in_memory
+            {
+                let pending_approval =
+                    match state.pending_tool_approval_for_session(&session_id).await {
+                        Some(request) => Some(request),
+                        None => plan_pending_approval,
                     };
-                    let (display, oldest_index, older_available) =
-                        slice_recent_messages(&existing.messages, display_limit);
-                    return Ok(serde_json::json!({
-                        "session_id": session_id,
-                        "messages": display,
-                        "plan_mode": existing.plan_mode,
-                        "plan": plan,
-                        "permission_mode": existing.get_permission_mode(),
-                        "model": existing.get_model_alias(),
-                        "working_dir": existing.working_dir,
-                        "turn_active": turn_active,
-                        "status": status,
-                        "pending_approval": pending_approval,
-                        "pending_approval_resumed": !turn_active,
-                        "todos": todos,
-                        "usage": {
-                            "input_tokens": usage.input_tokens,
-                            "output_tokens": usage.output_tokens,
-                            "cache_creation_tokens": usage.cache_creation_input_tokens,
-                            "cache_read_tokens": usage.cache_read_input_tokens,
-                        },
-                        "history": {
-                            "total": total,
-                            "oldest_index": oldest_index,
-                            "older_available": older_available,
-                        },
-                    }));
-                }
+                let pending_question = state.pending_question_for_session(&session_id).await;
+                let status = if pending_approval.is_some() {
+                    SessionStatus::WaitingApproval
+                } else if pending_question.is_some() {
+                    SessionStatus::WaitingQuestion
+                } else if turn_active {
+                    SessionStatus::Thinking
+                } else {
+                    SessionStatus::Idle
+                };
+                let total = messages.len();
+                let (display, oldest_index, older_available) =
+                    slice_recent_messages(&messages, display_limit);
+                return Ok(serde_json::json!({
+                    "session_id": session_id,
+                    "messages": display,
+                    "plan_mode": plan_mode,
+                    "plan": plan,
+                    "permission_mode": permission_mode,
+                    "model": model,
+                    "working_dir": working_dir,
+                    "turn_active": turn_active,
+                    "status": status,
+                    "pending_approval": pending_approval,
+                    "pending_approval_resumed": !turn_active,
+                    "pending_question": pending_question,
+                    "todos": todos,
+                    "usage": {
+                        "input_tokens": usage.input_tokens,
+                        "output_tokens": usage.output_tokens,
+                        "cache_creation_tokens": usage.cache_creation_input_tokens,
+                        "cache_read_tokens": usage.cache_read_input_tokens,
+                    },
+                    "history": {
+                        "total": total,
+                        "oldest_index": oldest_index,
+                        "older_available": older_available,
+                    },
+                }));
             }
 
             let configured_perm_mode = state
@@ -4711,13 +4840,20 @@ async fn handle_rpc_call(
             if turn_active {
                 let plan_state =
                     kkagent_core::load_persisted_plan_state(&session_id, &resumed_working_dir);
-                let pending_approval = kkagent_core::load_persisted_pending_plan_review(
-                    &session_id,
-                    &resumed_working_dir,
-                );
+                let pending_approval =
+                    match state.pending_tool_approval_for_session(&session_id).await {
+                        Some(request) => Some(request),
+                        None => kkagent_core::load_persisted_pending_plan_review(
+                            &session_id,
+                            &resumed_working_dir,
+                        ),
+                    };
+                let pending_question = state.pending_question_for_session(&session_id).await;
                 let todos = kkagent_core::load_persisted_todos(&session_id, &resumed_working_dir);
                 let status = if pending_approval.is_some() {
                     SessionStatus::WaitingApproval
+                } else if pending_question.is_some() {
+                    SessionStatus::WaitingQuestion
                 } else {
                     SessionStatus::Thinking
                 };
@@ -4736,6 +4872,7 @@ async fn handle_rpc_call(
                     "status": status,
                     "pending_approval": pending_approval,
                     "pending_approval_resumed": false,
+                    "pending_question": pending_question,
                     "todos": todos,
                     "history": {
                         "total": total,
@@ -4765,9 +4902,12 @@ async fn handle_rpc_call(
             let plan_mode = session.plan_mode;
             let plan = plan_state_json(session.plan_state());
             let pending_approval = session.pending_plan_review();
+            let pending_question = state.pending_question_for_session(&session_id).await;
             let todos = session.todo_items();
             let status = if pending_approval.is_some() {
                 SessionStatus::WaitingApproval
+            } else if pending_question.is_some() {
+                SessionStatus::WaitingQuestion
             } else {
                 SessionStatus::Idle
             };
@@ -4833,6 +4973,7 @@ async fn handle_rpc_call(
                 "status": status,
                 "pending_approval": pending_approval,
                 "pending_approval_resumed": true,
+                "pending_question": pending_question,
                 "todos": todos,
                 "history": {
                     "total": total,
@@ -5165,6 +5306,8 @@ async fn handle_rpc_call(
                     cancelled: true,
                 });
             }
+            state.clear_pending_question(&session_id, None).await;
+            state.clear_pending_tool_approval(&session_id, None).await;
             if let Some(session) = state.sessions.lock().await.get(&session_id) {
                 session.request_interrupt();
             }
@@ -6625,12 +6768,16 @@ async fn handle_rpc_call(
                         let tx = txs.get(&sid).ok_or_else(|| {
                             (-32602, format!("No approval channel for session: {sid}"))
                         })?;
-                        tx.try_send(response).map_err(|error| {
+                        tx.try_send(response.clone()).map_err(|error| {
                             (
                                 -32000,
                                 format!("Failed to deliver approval response: {error}"),
                             )
                         })?;
+                        drop(txs);
+                        state
+                            .clear_pending_tool_approval(&sid, Some(response.approval_id.as_str()))
+                            .await;
                         return Ok(serde_json::json!({"ok": true}));
                     }
                     let mut delivered = 0usize;
@@ -6662,12 +6809,16 @@ async fn handle_rpc_call(
                         let tx = txs.get(&sid).ok_or_else(|| {
                             (-32602, format!("No question channel for session: {sid}"))
                         })?;
-                        tx.try_send(response).map_err(|error| {
+                        tx.try_send(response.clone()).map_err(|error| {
                             (
                                 -32000,
                                 format!("Failed to deliver question response: {error}"),
                             )
                         })?;
+                        drop(txs);
+                        state
+                            .clear_pending_question(&sid, Some(response.question_id.as_str()))
+                            .await;
                         return Ok(serde_json::json!({"ok": true}));
                     }
                     let mut delivered = 0usize;
