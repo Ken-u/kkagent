@@ -111,6 +111,10 @@ max_processes = 128
 # api_key_env = "WEB_FETCH_API_KEY"
 # timeout_ms = 30000
 
+[server]
+idle_timeout_secs = 1800
+standalone = true
+
 # stdio MCP
 # [mcp_servers.filesystem]
 # type = "stdio"

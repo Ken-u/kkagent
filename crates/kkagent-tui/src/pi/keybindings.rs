@@ -58,7 +58,6 @@ pub fn map_key(key: KeyEvent) -> EditorAction {
         KeyCode::Down => EditorAction::DownHistory,
         KeyCode::Char('a') if m.contains(KeyModifiers::CONTROL) => EditorAction::Home,
         KeyCode::Char('e') if m.contains(KeyModifiers::CONTROL) => EditorAction::End,
-        KeyCode::Char('b') if m.contains(KeyModifiers::CONTROL) => EditorAction::Left,
         KeyCode::Char('f') if m.contains(KeyModifiers::CONTROL) => EditorAction::Right,
         KeyCode::Char('d') if m.contains(KeyModifiers::CONTROL) => EditorAction::Delete,
         KeyCode::Char('k') if m.contains(KeyModifiers::CONTROL) => EditorAction::KillLine,

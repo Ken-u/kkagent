@@ -4,6 +4,8 @@ use tokio::io::{AsyncRead, AsyncWrite};
 pub mod memory;
 pub mod uds;
 
+pub use uds::{try_connect_uds, ConnectError};
+
 #[derive(Debug, Clone)]
 pub enum TransportConfig {
     Memory,

@@ -1,13 +1,14 @@
 # 架构
 
-kkagent 是 Rust workspace。交互前端不直接运行 Agent loop，而是通过 RPC facade 操作会话；默认模式把两端放在同一进程，独立 Server 模式则复用相同协议边界。
+kkagent 是 Rust workspace。交互前端不直接运行 Agent loop，而是通过 RPC facade 操作会话。默认 TUI 模式会自动启动并连接独立 standalone server（UDS / Windows loopback endpoint）；也可用 `--connect` 连接已有 server，或在 `[server] standalone = false` 时退回同进程 memory pair。
 
 ```text
 TUI / prompt / ACP / HTTP+WS
             │
-        client + RPC
+     client + RPC (UDS)
             │
-      session runtime
+   standalone server process
+      session runtime + agent tasks
        ┌────┴────┐
    LLM provider  tool scheduler
                     │
@@ -15,6 +16,10 @@ TUI / prompt / ACP / HTTP+WS
             │
  transcript DB + session journal + files
 ```
+
+`Ctrl+B` 或确认退出时写入 `~/.kkagent/active-session`；下次 `kk` 检测到存活 server 后自动 resume。无客户端且无 active turn 超过 `[server].idle_timeout_secs` 时 server 自动退出；也可用 `kkagent server stop` / `kkagent server status` 管理。
+
+Agent turn 事件（含 Thinking / StatusUpdate / TurnEnd）由 server 扇出到当前所有已连接的 RPC writer；TUI detach 后 turn 继续在 server 内跑，重新 attach 后新连接会立刻收到后续事件（断线窗口内的增量不补发，完整 transcript 靠 resume/history）。
 
 ## Crate 职责
 

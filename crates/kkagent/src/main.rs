@@ -3,10 +3,11 @@ use clap::{Parser, Subcommand};
 use std::collections::HashMap;
 use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
+use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock as StdRwLock};
-use std::time::Duration;
-use tokio::sync::{mpsc, Mutex};
+use std::time::{Duration, Instant};
+use tokio::sync::{mpsc, watch, Mutex};
 use tokio::task::AbortHandle;
 
 use kkagent_client::KkagentClient;
@@ -90,10 +91,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Run as standalone RPC server (memory/socket)
+    /// Run or manage the standalone RPC server
     Server {
-        /// Socket path to listen on
-        #[arg(long)]
+        #[command(subcommand)]
+        command: Option<ServerCommand>,
+        /// Socket path to listen on / connect to for stop|status
+        #[arg(long, global = true)]
         listen: Option<String>,
         /// Also serve REST+WS on this address (e.g. 127.0.0.1:8787)
         #[arg(long)]
@@ -163,6 +166,18 @@ enum Commands {
     Completions {
         /// bash | zsh | fish | powershell
         shell: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum ServerCommand {
+    /// Stop the running standalone server (refuses when a turn is active)
+    Stop,
+    /// Show standalone server status
+    Status {
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -327,6 +342,17 @@ async fn run(cli: Cli) -> Result<()> {
 
     match cli.command {
         Some(Commands::Server {
+            command: Some(ServerCommand::Stop),
+            listen,
+            ..
+        }) => run_server_stop(listen).await,
+        Some(Commands::Server {
+            command: Some(ServerCommand::Status { json }),
+            listen,
+            ..
+        }) => run_server_status(listen, json).await,
+        Some(Commands::Server {
+            command: None,
             listen,
             http,
             http_token,
@@ -415,6 +441,8 @@ _kkagent() {{
   local cmds="server acp auth init config doctor completions"
   if [[ ${{COMP_CWORD}} -eq 1 ]]; then
     COMPREPLY=( $(compgen -W "$cmds --help --version --config --yolo --auto --plan --prompt --resume --connect --no-alt-screen" -- "$cur") )
+  elif [[ ${{COMP_WORDS[1]}} == server ]]; then
+    COMPREPLY=( $(compgen -W "stop status --listen --http --help" -- "$cur") )
   fi
 }}
 complete -F _kkagent {name}
@@ -787,23 +815,43 @@ async fn run_tui(
         kkagent_tui::ensure_workspace_trust(&mut config, &config_path, &workspace, !no_alt_screen)?;
     }
 
-    // Default TUI: 1:1 in-process pair via memory duplex.
-    // This process owns both ends — quitting the TUI aborts the paired server
-    // task so a subsequent `kkagent` never talks to a leftover in-process agent.
-    // Standalone `kkagent server` (UDS) is a separate process with its own lifetime;
-    // only that mode can outlive a TUI, and only when you explicitly start it.
     let (event_tx, event_rx) = mpsc::channel::<Frame>(256);
-    let (rpc_client, server_handle) = if let Some(endpoint) = connect {
+    let mut resume = resume;
+    let (rpc_client, server_handle, allows_background_detach) = if let Some(endpoint) = connect {
         let stream =
             kkagent_rpc::transport::uds::connect_uds(std::path::Path::new(&endpoint)).await?;
-        (RpcClient::new(stream, event_tx), None)
+        maybe_auto_resume(&mut resume, true);
+        (RpcClient::new(stream, event_tx), None, true)
+    } else if config.server.standalone {
+        match connect_or_spawn_standalone(&config_path).await {
+            Ok(stream) => {
+                maybe_auto_resume(&mut resume, true);
+                (RpcClient::new(stream, event_tx), None, true)
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "standalone server unavailable; falling back to in-process server (Ctrl+B disabled)"
+                );
+                maybe_auto_resume(&mut resume, false);
+                let (client_stream, server_stream) = create_memory_pair();
+                let server_config = Arc::new(config.clone());
+                let handle =
+                    tokio::spawn(
+                        async move { run_server_handler(server_stream, server_config).await },
+                    );
+                tokio::task::yield_now().await;
+                (RpcClient::new(client_stream, event_tx), Some(handle), false)
+            }
+        }
     } else {
+        maybe_auto_resume(&mut resume, false);
         let (client_stream, server_stream) = create_memory_pair();
         let server_config = Arc::new(config.clone());
         let handle =
             tokio::spawn(async move { run_server_handler(server_stream, server_config).await });
         tokio::task::yield_now().await;
-        (RpcClient::new(client_stream, event_tx), Some(handle))
+        (RpcClient::new(client_stream, event_tx), Some(handle), false)
     };
 
     let runtime_sandbox_mode = match rpc_client.call("runtime.status", None).await {
@@ -843,17 +891,234 @@ async fn run_tui(
     let client = KkagentClient::new(rpc_client, event_rx);
     let mut app = TuiApp::new(tui_config, client);
     app.set_remote_connection(is_remote);
+    app.set_allows_background_detach(allows_background_detach);
     app.set_config_path(config_path);
     app.set_use_alt_screen(!no_alt_screen);
     let result = app.run(resume).await;
 
-    // Drop the paired server (and any in-flight agent/LLM tasks it owns).
+    // Only abort an in-process server. Standalone servers outlive the TUI.
     if let Some(server_handle) = server_handle {
         server_handle.abort();
         let _ = server_handle.await;
     }
 
     result
+}
+
+fn maybe_auto_resume(resume: &mut Option<Option<String>>, server_alive: bool) {
+    if resume.is_some() {
+        return;
+    }
+    let Some(session_id) = kkagent_config::load_active_session() else {
+        return;
+    };
+    if server_alive {
+        tracing::info!(%session_id, "Auto-resuming session from active-session");
+        *resume = Some(Some(session_id));
+        return;
+    }
+    // Stale marker after a dead server: clear it, but still resume history from DB.
+    kkagent_config::clear_active_session();
+    eprintln!(
+        "Previous standalone server is gone; in-flight tasks were lost. Restoring conversation history for session {session_id}."
+    );
+    *resume = Some(Some(session_id));
+}
+
+fn resolve_listen_path(listen: Option<String>) -> PathBuf {
+    listen
+        .map(PathBuf::from)
+        .unwrap_or_else(kkagent_config::default_server_socket_path)
+}
+
+async fn connect_or_spawn_standalone(
+    config_path: &Path,
+) -> anyhow::Result<kkagent_rpc::transport::uds::LocalStream> {
+    let socket_path = kkagent_config::default_server_socket_path();
+    match kkagent_rpc::transport::uds::try_connect_uds(&socket_path).await {
+        Ok(stream) => Ok(stream),
+        Err(_) => {
+            spawn_standalone_server(&socket_path, config_path)?;
+            wait_for_socket(&socket_path, Duration::from_secs(5)).await
+        }
+    }
+}
+
+fn spawn_standalone_server(socket_path: &Path, config_path: &Path) -> anyhow::Result<()> {
+    if socket_path.exists() {
+        let _ = kkagent_rpc::transport::uds::remove_endpoint(socket_path);
+    }
+    let exe = std::env::current_exe().context("failed to resolve kkagent executable")?;
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.arg("--config")
+        .arg(config_path)
+        .arg("server")
+        .arg("--listen")
+        .arg(socket_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // Detach from the TUI process group so terminal signals don't kill the server.
+        cmd.process_group(0);
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
+    }
+
+    cmd.spawn()
+        .with_context(|| format!("Failed to spawn standalone server ({})", exe.display()))?;
+    Ok(())
+}
+
+async fn wait_for_socket(
+    path: &Path,
+    timeout: Duration,
+) -> anyhow::Result<kkagent_rpc::transport::uds::LocalStream> {
+    let deadline = Instant::now() + timeout;
+    let mut delay = Duration::from_millis(5);
+    loop {
+        match kkagent_rpc::transport::uds::try_connect_uds(path).await {
+            Ok(stream) => return Ok(stream),
+            Err(error) if Instant::now() < deadline => {
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(Duration::from_millis(50));
+                let _ = error;
+            }
+            Err(error) => {
+                anyhow::bail!("Server did not start within {timeout:?}: {error}");
+            }
+        }
+    }
+}
+
+async fn run_server_stop(listen: Option<String>) -> Result<()> {
+    let socket_path = resolve_listen_path(listen);
+    let stream = match kkagent_rpc::transport::uds::try_connect_uds(&socket_path).await {
+        Ok(stream) => stream,
+        Err(_) => anyhow::bail!("kkagent server is not running"),
+    };
+    let (event_tx, _event_rx) = mpsc::channel::<Frame>(1);
+    let client = RpcClient::new(stream, event_tx);
+    match client.call("runtime.shutdown", None).await {
+        Ok(_) => {
+            kkagent_config::clear_active_session();
+            // Wait briefly for the endpoint to disappear.
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while socket_path.exists() && Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            println!("kkagent server stopped");
+            Ok(())
+        }
+        Err(error) => Err(anyhow::anyhow!("{error}")),
+    }
+}
+
+async fn run_server_status(listen: Option<String>, json: bool) -> Result<()> {
+    let socket_path = resolve_listen_path(listen);
+    let stream = match kkagent_rpc::transport::uds::try_connect_uds(&socket_path).await {
+        Ok(stream) => stream,
+        Err(_) => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "alive": false,
+                        "socket": socket_path.display().to_string(),
+                        "active_turns": 0,
+                        "client_count": 0,
+                        "uptime_secs": 0,
+                        "pid": serde_json::Value::Null,
+                    })
+                );
+            } else {
+                println!("kkagent server is not running");
+            }
+            std::process::exit(1);
+        }
+    };
+    let (event_tx, _event_rx) = mpsc::channel::<Frame>(1);
+    let client = RpcClient::new(stream, event_tx);
+    let status = client
+        .call("runtime.status", None)
+        .await
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    let active_turns = status
+        .get("active_turns")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let client_count = status
+        .get("client_count")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let uptime_secs = status
+        .get("uptime_secs")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let pid = status.get("pid").and_then(|v| v.as_u64());
+
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "alive": true,
+                "socket": socket_path.display().to_string(),
+                "active_turns": active_turns,
+                "client_count": client_count,
+                "uptime_secs": uptime_secs,
+                "pid": pid,
+            })
+        );
+    } else {
+        let pid_text = pid
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "?".into());
+        println!(
+            "kkagent server is running (pid {pid_text}, uptime {})",
+            format_uptime(uptime_secs)
+        );
+        println!("  active turns: {active_turns}");
+        println!("  connected clients: {client_count}");
+    }
+    Ok(())
+}
+
+fn format_uptime(secs: u64) -> String {
+    let hours = secs / 3600;
+    let minutes = (secs % 3600) / 60;
+    let seconds = secs % 60;
+    if hours > 0 {
+        format!("{hours}h{minutes}m")
+    } else if minutes > 0 {
+        format!("{minutes}m{seconds}s")
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+/// Idle-watchdog decision helper (unit-tested).
+fn should_idle_shutdown(
+    idle_timeout: Duration,
+    last_activity_elapsed: Duration,
+    has_active_turns: bool,
+    has_clients: bool,
+) -> bool {
+    if idle_timeout.is_zero() {
+        return false;
+    }
+    if has_active_turns || has_clients {
+        return false;
+    }
+    last_activity_elapsed > idle_timeout
 }
 
 async fn run_print_mode(
@@ -944,78 +1209,167 @@ async fn run_server(
     http_security: kkagent_rpc::HttpSecurityOptions,
 ) -> Result<()> {
     let socket_path = listen.unwrap_or_else(|| {
-        let dir = kkagent_config::default_config_dir();
-        dir.join("server.sock").to_string_lossy().to_string()
+        kkagent_config::default_server_socket_path()
+            .to_string_lossy()
+            .to_string()
     });
 
     tracing::info!("Starting server on {}", socket_path);
     let endpoint_path = std::path::PathBuf::from(&socket_path);
     let listener = kkagent_rpc::transport::uds::bind_uds(&endpoint_path)?;
     let _endpoint_guard = LocalEndpointGuard(endpoint_path.clone());
-    let config_arc = Arc::new(config);
-    let state = build_server_state(config_arc.clone()).await?;
 
-    let mut recovery_backend = None;
-    let mut http_ready = None;
-    let http_handle = if let Some(addr) = http {
-        let concrete_backend = Arc::new(AgentHttpBackend {
-            state: state.clone(),
-        });
-        recovery_backend = Some(concrete_backend.clone());
-        let backend: Arc<dyn kkagent_rpc::HttpBackend> = concrete_backend;
-        let token = http_token;
-        let durable_http = state.durable_http.clone();
-        let http_listener = kkagent_rpc::bind_http(&addr, token.as_deref()).await?;
-        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-        http_ready = Some(ready_rx);
-        Some(tokio::spawn(async move {
-            if let Err(e) = kkagent_rpc::serve_http_listener_with_backend_security_and_persistence(
-                http_listener,
-                backend,
-                token,
-                http_security,
-                durable_http,
-                Some(ready_tx),
-            )
-            .await
-            {
-                tracing::error!("HTTP server error: {e}");
+    let idle_timeout = Duration::from_secs(config.server.idle_timeout_secs);
+    let config_arc = Arc::new(config);
+    let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+    let (state_tx, state_rx) = watch::channel(None::<Result<Arc<ServerState>, String>>);
+
+    let init_config = config_arc.clone();
+    let init_shutdown = shutdown_tx.clone();
+    tokio::spawn(async move {
+        match build_server_state_with_shutdown(init_config, init_shutdown).await {
+            Ok(state) => {
+                let _ = state_tx.send(Some(Ok(state)));
             }
-        }))
-    } else {
-        None
-    };
-    if let Some(ready) = http_ready {
-        ready
+            Err(error) => {
+                tracing::error!("Server state init failed: {error}");
+                let _ = state_tx.send(Some(Err(error.to_string())));
+            }
+        }
+    });
+
+    let mut state_wait = state_rx.clone();
+    let http_setup = async {
+        let state = wait_for_server_state(&mut state_wait)
             .await
-            .map_err(|_| anyhow::anyhow!("HTTP server stopped before initialization"))?;
-    }
-    if let Some(backend) = recovery_backend {
-        recover_durable_turns(backend).await;
-    }
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        let http_handle = if let Some(addr) = http {
+            let concrete_backend = Arc::new(AgentHttpBackend {
+                state: state.clone(),
+            });
+            let recovery_backend = concrete_backend.clone();
+            let backend: Arc<dyn kkagent_rpc::HttpBackend> = concrete_backend;
+            let token = http_token;
+            let durable_http = state.durable_http.clone();
+            let http_listener = kkagent_rpc::bind_http(&addr, token.as_deref()).await?;
+            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+            let handle = tokio::spawn(async move {
+                if let Err(e) =
+                    kkagent_rpc::serve_http_listener_with_backend_security_and_persistence(
+                        http_listener,
+                        backend,
+                        token,
+                        http_security,
+                        durable_http,
+                        Some(ready_tx),
+                    )
+                    .await
+                {
+                    tracing::error!("HTTP server error: {e}");
+                }
+            });
+            ready_rx
+                .await
+                .map_err(|_| anyhow::anyhow!("HTTP server stopped before initialization"))?;
+            recover_durable_turns(recovery_backend).await;
+            Some(handle)
+        } else {
+            None
+        };
+        Ok::<_, anyhow::Error>((state, http_handle))
+    };
+
+    // Race: serve accepts immediately while HTTP setup (and state init) continue.
+    let mut http_handle = None;
+    let mut shared_state: Option<Arc<ServerState>> = None;
+    let mut last_activity = Instant::now();
+    let mut http_setup = std::pin::pin!(http_setup);
+    let mut http_setup_done = false;
 
     loop {
         tokio::select! {
             accepted = listener.accept() => {
+                last_activity = Instant::now();
                 let (stream, _) = accepted?;
-                let st = state.clone();
+                let mut rx = state_rx.clone();
                 tokio::spawn(async move {
-                    run_server_handler_with_state(stream, st).await;
+                    let state = match wait_for_server_state(&mut rx).await {
+                        Ok(state) => state,
+                        Err(error) => {
+                            tracing::error!("Rejecting client; server init failed: {error}");
+                            return;
+                        }
+                    };
+                    state.client_count.fetch_add(1, Ordering::SeqCst);
+                    run_server_handler_with_state(stream, state.clone()).await;
+                    state.client_count.fetch_sub(1, Ordering::SeqCst);
                 });
+            }
+            setup = &mut http_setup, if !http_setup_done => {
+                http_setup_done = true;
+                let (state, handle) = setup?;
+                shared_state = Some(state);
+                http_handle = handle;
+                last_activity = Instant::now();
+            }
+            changed = shutdown_rx.changed() => {
+                if changed.is_err() || *shutdown_rx.borrow() {
+                    tracing::info!("Shutdown requested");
+                    break;
+                }
             }
             signal = tokio::signal::ctrl_c() => {
                 signal?;
                 tracing::info!("Shutdown signal received");
                 break;
             }
+            _ = tokio::time::sleep(Duration::from_secs(60)), if http_setup_done => {
+                let Some(state) = shared_state.as_ref() else {
+                    last_activity = Instant::now();
+                    continue;
+                };
+                let has_active_turns = state.has_active_turns().await;
+                let has_clients = state.client_count() > 0;
+                if has_active_turns || has_clients {
+                    last_activity = Instant::now();
+                    continue;
+                }
+                if should_idle_shutdown(
+                    idle_timeout,
+                    last_activity.elapsed(),
+                    false,
+                    false,
+                ) {
+                    tracing::info!("Server idle for {:?}, shutting down", idle_timeout);
+                    break;
+                }
+            }
         }
     }
+
     if let Some(handle) = http_handle {
         handle.abort();
         let _ = handle.await;
     }
-    state.shutdown().await;
+    if let Some(state) = shared_state {
+        state.shutdown().await;
+    } else if let Some(Ok(state)) = state_rx.borrow().clone() {
+        state.shutdown().await;
+    }
     Ok(())
+}
+
+async fn wait_for_server_state(
+    rx: &mut watch::Receiver<Option<Result<Arc<ServerState>, String>>>,
+) -> Result<Arc<ServerState>, String> {
+    loop {
+        if let Some(ready) = rx.borrow().clone() {
+            return ready;
+        }
+        rx.changed()
+            .await
+            .map_err(|_| "server init dropped".to_string())?;
+    }
 }
 
 struct AgentHttpBackend {
@@ -2465,6 +2819,12 @@ struct ServerState {
     persistence_durable: bool,
     persistence_error: Option<String>,
     started_at: std::time::Instant,
+    client_count: AtomicUsize,
+    shutdown_tx: watch::Sender<bool>,
+    /// Live TUI/RPC writers that should receive agent event frames.
+    /// Turns publish here so Ctrl+B detach + reattach keeps streaming.
+    rpc_event_subscribers: StdRwLock<HashMap<u64, mpsc::Sender<Frame>>>,
+    rpc_event_subscriber_seq: AtomicUsize,
 }
 
 #[derive(Clone)]
@@ -2614,9 +2974,61 @@ impl SessionTurnLocks {
             .get(session_id)
             .is_some_and(|semaphore| semaphore.available_permits() == 0)
     }
+
+    async fn active_session_ids(&self) -> Vec<String> {
+        self.entries
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, semaphore)| semaphore.available_permits() == 0)
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
+    async fn active_count(&self) -> usize {
+        self.active_session_ids().await.len()
+    }
 }
 
 impl ServerState {
+    fn client_count(&self) -> usize {
+        self.client_count.load(Ordering::SeqCst)
+    }
+
+    async fn has_active_turns(&self) -> bool {
+        self.turn_locks.active_count().await > 0
+    }
+
+    fn request_shutdown(&self) {
+        let _ = self.shutdown_tx.send(true);
+    }
+
+    fn register_rpc_event_subscriber(&self, tx: mpsc::Sender<Frame>) -> u64 {
+        let id = self.rpc_event_subscriber_seq.fetch_add(1, Ordering::SeqCst) as u64 + 1;
+        self.rpc_event_subscribers
+            .write()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(id, tx);
+        id
+    }
+
+    fn unregister_rpc_event_subscriber(&self, id: u64) {
+        self.rpc_event_subscribers
+            .write()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&id);
+    }
+
+    /// Fan-out an event frame to every attached RPC client.
+    /// Slow/full clients skip a frame; closed clients are pruned.
+    fn publish_rpc_event(&self, frame: Frame) {
+        let mut subscribers = self
+            .rpc_event_subscribers
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        retain_rpc_event_subscribers(&mut subscribers, frame);
+    }
+
     async fn shutdown(&self) {
         for (_, handle) in self.abort_registry.lock().await.drain() {
             handle.abort();
@@ -2625,6 +3037,15 @@ impl ServerState {
             handle.abort();
         }
     }
+}
+
+/// Keep live writers; drop closed ones. Full queues stay subscribed but skip the frame.
+fn retain_rpc_event_subscribers(subscribers: &mut HashMap<u64, mpsc::Sender<Frame>>, frame: Frame) {
+    subscribers.retain(|_, tx| match tx.try_send(frame.clone()) {
+        Ok(()) => true,
+        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => true,
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => false,
+    });
 }
 
 fn configured_mcp_servers(config: &AppConfig) -> Vec<kkagent_mcp::McpServerConfig> {
@@ -2734,6 +3155,14 @@ fn open_transcript_with_policy(
 }
 
 async fn build_server_state(config: Arc<AppConfig>) -> Result<Arc<ServerState>> {
+    let (shutdown_tx, _) = watch::channel(false);
+    build_server_state_with_shutdown(config, shutdown_tx).await
+}
+
+async fn build_server_state_with_shutdown(
+    config: Arc<AppConfig>,
+    shutdown_tx: watch::Sender<bool>,
+) -> Result<Arc<ServerState>> {
     let startup_started = std::time::Instant::now();
     let (events, _) = tokio::sync::broadcast::channel(1024);
     let allow_in_memory = std::env::var("KKAGENT_ALLOW_IN_MEMORY_TRANSCRIPTS")
@@ -2920,6 +3349,10 @@ async fn build_server_state(config: Arc<AppConfig>) -> Result<Arc<ServerState>> 
         persistence_durable,
         persistence_error,
         started_at: std::time::Instant::now(),
+        client_count: AtomicUsize::new(0),
+        shutdown_tx,
+        rpc_event_subscribers: StdRwLock::new(HashMap::new()),
+        rpc_event_subscriber_seq: AtomicUsize::new(0),
     });
     let recovery_state = state.clone();
     let recovery_task = tokio::spawn(async move {
@@ -2959,7 +3392,26 @@ async fn run_server_handler_with_state<T: kkagent_rpc::transport::AsyncTransport
     };
 
     let server = RpcServer::new(handler);
-    server.serve(transport).await;
+    let state_start = state.clone();
+    let state_end = state.clone();
+    let sub_id = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let sub_id_start = sub_id.clone();
+    let sub_id_end = sub_id;
+    server
+        .serve_with_hooks(
+            transport,
+            move |write_tx| {
+                let id = state_start.register_rpc_event_subscriber(write_tx);
+                sub_id_start.store(id, Ordering::SeqCst);
+            },
+            move || {
+                let id = sub_id_end.load(Ordering::SeqCst);
+                if id != 0 {
+                    state_end.unregister_rpc_event_subscriber(id);
+                }
+            },
+        )
+        .await;
 }
 
 fn persist_session_messages(db: &TranscriptDb, session: &mut Session) -> anyhow::Result<()> {
@@ -3058,7 +3510,6 @@ async fn spawn_session_agent_turn(
     state: Arc<ServerState>,
     session_id: String,
     turn_permit: tokio::sync::OwnedSemaphorePermit,
-    rpc_event_tx: mpsc::Sender<Frame>,
 ) -> Result<(), (i32, String)> {
     let steer_mailbox = state
         .steer_mailboxes
@@ -3069,7 +3520,7 @@ async fn spawn_session_agent_turn(
         .ok_or_else(|| (-32602, format!("Session not found: {session_id}")))?;
     let (agent_event_tx, mut agent_event_rx) = mpsc::channel::<AgentEvent>(256);
 
-    let rpc_tx = rpc_event_tx.clone();
+    let event_state = state.clone();
     let home_dir = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
     let wire_dir = home_dir.join(".kkagent").join("sessions").join(&session_id);
     let wire = kkagent_wire::WireJournal::open(&wire_dir);
@@ -3115,14 +3566,14 @@ async fn spawn_session_agent_turn(
                     _ => {}
                 }
             }
-            let frame = Frame::Event {
+            // Fan-out to every attached TUI. Never stop draining when a client
+            // disconnects — otherwise detach/reattach leaves Thinking stuck and
+            // interrupt status updates never reach the new connection.
+            event_state.publish_rpc_event(Frame::Event {
                 event: "agent".into(),
                 scope: None,
                 data,
-            };
-            if rpc_tx.send(frame).await.is_err() {
-                break;
-            }
+            });
         }
     });
 
@@ -3173,7 +3624,6 @@ async fn spawn_session_agent_turn(
 
     let state_clone = state.clone();
     let sid = session_id.clone();
-    let rpc_progress = rpc_event_tx.clone();
     steer_mailbox.start_turn();
     tokio::spawn(async move {
         let _turn_permit = turn_permit;
@@ -3187,13 +3637,11 @@ async fn spawn_session_agent_turn(
                 })
                 .await;
             let snap = state_clone.mcp.status_snapshot().await;
-            let _ = rpc_progress
-                .send(Frame::Event {
-                    event: "mcp.status".into(),
-                    scope: None,
-                    data: mcp_status_json(&snap),
-                })
-                .await;
+            state_clone.publish_rpc_event(Frame::Event {
+                event: "mcp.status".into(),
+                scope: None,
+                data: mcp_status_json(&snap),
+            });
 
             let cancel = {
                 let flags = state_clone.interrupt_flags.lock().await;
@@ -3259,13 +3707,11 @@ async fn spawn_session_agent_turn(
             }
 
             let snap = state_clone.mcp.status_snapshot().await;
-            let _ = rpc_progress
-                .send(Frame::Event {
-                    event: "mcp.status".into(),
-                    scope: None,
-                    data: mcp_status_json(&snap),
-                })
-                .await;
+            state_clone.publish_rpc_event(Frame::Event {
+                event: "mcp.status".into(),
+                scope: None,
+                data: mcp_status_json(&snap),
+            });
         }
 
         let todos = {
@@ -3426,31 +3872,29 @@ struct BtwRetryNotice<'a> {
     initial: bool,
 }
 
-async fn send_btw_retry_notice(rpc_tx: &mpsc::Sender<Frame>, notice: BtwRetryNotice<'_>) {
+async fn send_btw_retry_notice(publish: &impl Fn(Frame), notice: BtwRetryNotice<'_>) {
     let ceil_seconds = |duration: Duration| {
         let milliseconds = duration.as_millis();
         u64::try_from(milliseconds.saturating_add(999) / 1_000).unwrap_or(u64::MAX)
     };
-    let _ = rpc_tx
-        .send(Frame::Event {
-            event: "agent".into(),
-            scope: None,
-            data: serde_json::to_value(AgentEvent::BtwRetry {
-                session_id: notice.session_id.to_string(),
-                agent_id: notice.agent_id.to_string(),
-                retry_number: notice.retry_number,
-                reason: notice.reason.to_string(),
-                wait_seconds: ceil_seconds(notice.delay),
-                remaining_seconds: ceil_seconds(notice.remaining),
-                initial: notice.initial,
-            })
-            .unwrap_or_default(),
+    publish(Frame::Event {
+        event: "agent".into(),
+        scope: None,
+        data: serde_json::to_value(AgentEvent::BtwRetry {
+            session_id: notice.session_id.to_string(),
+            agent_id: notice.agent_id.to_string(),
+            retry_number: notice.retry_number,
+            reason: notice.reason.to_string(),
+            wait_seconds: ceil_seconds(notice.delay),
+            remaining_seconds: ceil_seconds(notice.remaining),
+            initial: notice.initial,
         })
-        .await;
+        .unwrap_or_default(),
+    });
 }
 
 async fn wait_for_btw_retry(
-    rpc_tx: &mpsc::Sender<Frame>,
+    publish: &impl Fn(Frame),
     session_id: &str,
     agent_id: &str,
     retry_number: u32,
@@ -3471,7 +3915,7 @@ async fn wait_for_btw_retry(
         if initial || remaining_seconds != displayed_seconds {
             displayed_seconds = remaining_seconds;
             send_btw_retry_notice(
-                rpc_tx,
+                publish,
                 BtwRetryNotice {
                     session_id,
                     agent_id,
@@ -3609,8 +4053,30 @@ async fn handle_rpc_call(
                 "sandbox": {
                     "mode": sandbox.mode_name(),
                     "network": sandbox.network,
-                }
+                },
+                "alive": true,
+                "active_turns": state.turn_locks.active_count().await,
+                "client_count": state.client_count(),
+                "uptime_secs": state.started_at.elapsed().as_secs(),
+                "pid": std::process::id(),
             }))
+        }
+        "runtime.has_active_turns" => {
+            let sessions = state.turn_locks.active_session_ids().await;
+            Ok(serde_json::json!({
+                "active": !sessions.is_empty(),
+                "sessions": sessions,
+            }))
+        }
+        "runtime.shutdown" => {
+            if state.has_active_turns().await {
+                return Err((
+                    -32000,
+                    "server has active agent turn(s); refuse to stop".into(),
+                ));
+            }
+            state.request_shutdown();
+            Ok(serde_json::json!({"ok": true}))
         }
         "workspace.trust" => {
             let value = params.ok_or_else(|| (-32602, "Missing workspace trust".to_string()))?;
@@ -4666,7 +5132,7 @@ async fn handle_rpc_call(
                 }
             }
 
-            spawn_session_agent_turn(state, session_id, turn_permit, rpc_event_tx).await?;
+            spawn_session_agent_turn(state, session_id, turn_permit).await?;
             Ok(serde_json::json!({"ok": true}))
         }
         "session.interrupt" => {
@@ -4782,7 +5248,7 @@ async fn handle_rpc_call(
             let cancel = btw_service.cancel_flag();
             cancel.store(false, std::sync::atomic::Ordering::SeqCst);
 
-            let rpc_tx = rpc_event_tx.clone();
+            let rpc_state = state.clone();
             let config = state.config.clone();
             let sid = session_id.clone();
             let q = question.clone();
@@ -4833,13 +5299,12 @@ async fn handle_rpc_call(
                     let mut retry_after = None;
                     let mut rate_limited = false;
                     let mut emitted_output = false;
-                    let mut rpc_closed = false;
                     while let Some(evt) = stream_rx.recv().await {
                         match evt {
                             kkagent_llm::types::StreamEvent::TextDelta(text) => {
                                 emitted_output = true;
                                 answer.push_str(&text);
-                                let frame = Frame::Event {
+                                rpc_state.publish_rpc_event(Frame::Event {
                                     event: "agent".into(),
                                     scope: None,
                                     data: serde_json::to_value(AgentEvent::BtwDelta {
@@ -4848,15 +5313,11 @@ async fn handle_rpc_call(
                                         text,
                                     })
                                     .unwrap_or_default(),
-                                };
-                                if rpc_tx.send(frame).await.is_err() {
-                                    rpc_closed = true;
-                                    break;
-                                }
+                                });
                             }
                             kkagent_llm::types::StreamEvent::ThinkingDelta(text) => {
                                 emitted_output = true;
-                                let frame = Frame::Event {
+                                rpc_state.publish_rpc_event(Frame::Event {
                                     event: "agent".into(),
                                     scope: None,
                                     data: serde_json::to_value(AgentEvent::BtwThinkingDelta {
@@ -4865,11 +5326,7 @@ async fn handle_rpc_call(
                                         text,
                                     })
                                     .unwrap_or_default(),
-                                };
-                                if rpc_tx.send(frame).await.is_err() {
-                                    rpc_closed = true;
-                                    break;
-                                }
+                                });
                             }
                             kkagent_llm::types::StreamEvent::Error(message) => {
                                 attempt_error = Some(message);
@@ -4892,10 +5349,6 @@ async fn handle_rpc_call(
                             attempt_error = Some(error.to_string());
                         }
                     }
-                    if rpc_closed {
-                        break;
-                    }
-
                     let retryable = attempt_error.is_some()
                         && !emitted_output
                         && attempt < max_attempts
@@ -4903,8 +5356,9 @@ async fn handle_rpc_call(
                     if retryable {
                         let delay = btw_retry_delay(attempt, retry_after, rate_limited, retry_base);
                         let reason = attempt_error.as_deref().unwrap_or("LLM request failed");
+                        let publish = |frame: Frame| rpc_state.publish_rpc_event(frame);
                         if wait_for_btw_retry(
-                            &rpc_tx,
+                            &publish,
                             &sid,
                             &event_agent_id,
                             attempt,
@@ -4933,7 +5387,7 @@ async fn handle_rpc_call(
 
                 task_btw_service.end(&cancel);
 
-                let frame = Frame::Event {
+                rpc_state.publish_rpc_event(Frame::Event {
                     event: "agent".into(),
                     scope: None,
                     data: serde_json::to_value(AgentEvent::BtwEnd {
@@ -4942,8 +5396,7 @@ async fn handle_rpc_call(
                         error: stream_error,
                     })
                     .unwrap_or_default(),
-                };
-                let _ = rpc_tx.send(frame).await;
+                });
             });
 
             Ok(serde_json::json!({
@@ -5560,7 +6013,7 @@ async fn handle_rpc_call(
                 })
                 .await;
 
-            spawn_session_agent_turn(state, session_id, turn_permit, rpc_event_tx).await?;
+            spawn_session_agent_turn(state, session_id, turn_permit).await?;
             Ok(serde_json::json!({
                 "activated": true,
                 "skill_name": resolved_name,
@@ -6147,8 +6600,7 @@ async fn handle_rpc_call(
                     .await;
             }
             if turn_started {
-                spawn_session_agent_turn(state, session_id.clone(), turn_permit, rpc_event_tx)
-                    .await?;
+                spawn_session_agent_turn(state, session_id.clone(), turn_permit).await?;
             }
             Ok(serde_json::json!({
                 "ok": true,
@@ -6334,10 +6786,43 @@ mod http_path_tests {
     async fn session_turn_lock_reports_active_turns() {
         let locks = SessionTurnLocks::default();
         assert!(!locks.is_busy("session").await);
+        assert_eq!(locks.active_count().await, 0);
         let permit = locks.try_acquire("session").await.unwrap();
         assert!(locks.is_busy("session").await);
+        assert_eq!(locks.active_count().await, 1);
+        assert_eq!(
+            locks.active_session_ids().await,
+            vec!["session".to_string()]
+        );
         drop(permit);
         assert!(!locks.is_busy("session").await);
+        assert_eq!(locks.active_count().await, 0);
+    }
+
+    #[test]
+    fn rpc_event_fanout_keeps_live_subscribers_and_drops_closed() {
+        let mut subscribers = HashMap::new();
+        let (live_tx, mut live_rx) = mpsc::channel(4);
+        let (dead_tx, dead_rx) = mpsc::channel(4);
+        drop(dead_rx);
+        subscribers.insert(1, live_tx);
+        subscribers.insert(2, dead_tx);
+
+        retain_rpc_event_subscribers(
+            &mut subscribers,
+            Frame::Event {
+                event: "agent".into(),
+                scope: None,
+                data: serde_json::json!({"type": "heartbeat"}),
+            },
+        );
+
+        let got = live_rx
+            .try_recv()
+            .expect("live subscriber should get event");
+        assert!(matches!(got, Frame::Event { .. }));
+        assert_eq!(subscribers.len(), 1, "closed subscriber should be pruned");
+        assert!(subscribers.contains_key(&1));
     }
 
     #[test]
@@ -6362,10 +6847,13 @@ mod http_path_tests {
     async fn btw_retry_wait_publishes_countdown_event() {
         let (tx, mut rx) = mpsc::channel(2);
         let cancel = AtomicBool::new(false);
+        let publish = |frame: Frame| {
+            let _ = tx.try_send(frame);
+        };
 
         assert!(
             wait_for_btw_retry(
-                &tx,
+                &publish,
                 "session",
                 "btw-agent",
                 1,

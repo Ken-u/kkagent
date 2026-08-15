@@ -28,8 +28,26 @@ impl RpcServer {
     }
 
     pub async fn serve<T: AsyncTransport>(&self, transport: T) {
+        self.serve_with_hooks(transport, |_| {}, || {}).await;
+    }
+
+    /// Like [`serve`], but notifies when the connection's event writer is ready
+    /// and when the connection ends. Used so standalone servers can fan-out
+    /// agent events to whichever TUI clients are currently attached.
+    pub async fn serve_with_hooks<T, OnStart, OnEnd>(
+        &self,
+        transport: T,
+        on_start: OnStart,
+        on_end: OnEnd,
+    ) where
+        T: AsyncTransport,
+        OnStart: FnOnce(mpsc::Sender<Frame>),
+        OnEnd: FnOnce(),
+    {
         let (read_half, write_half) = tokio::io::split(transport);
         let (write_tx, mut write_rx) = mpsc::channel::<Frame>(256);
+
+        on_start(write_tx.clone());
 
         let handler = self.handler.clone();
 
@@ -78,5 +96,7 @@ impl RpcServer {
                 Err(_) => break,
             }
         }
+
+        on_end();
     }
 }

@@ -220,6 +220,8 @@ pub fn render_ui(f: &mut Frame, state: &mut AppState, config: &AppConfig) {
         render_list_picker(f, slash_area, state, &theme);
     } else if state.session_delete_confirm.is_some() {
         render_session_delete_confirm(f, slash_area, state, &theme);
+    } else if state.quit_dialog.is_some() {
+        render_quit_dialog(f, slash_area, state, &theme);
     }
 
     if state.tasks_panel.is_some() {
@@ -1674,6 +1676,8 @@ fn render_footer(
         activity.clone()
     } else if let Some(ref hover) = state.strip_hover_title {
         hover.clone()
+    } else if state.quit_dialog.is_some() {
+        "T terminate · B background · Esc cancel".to_string()
     } else if state.quit_confirm {
         "press ctrl-c again to quit".to_string()
     } else if state.search.active {
@@ -1698,7 +1702,7 @@ fn render_footer(
         line1_spans.push(Span::raw(" ".repeat(pad as usize)));
         line1_spans.push(Span::styled(
             tip,
-            Style::default().fg(if state.quit_confirm {
+            Style::default().fg(if state.quit_confirm || state.quit_dialog.is_some() {
                 theme.warning
             } else if state.status_bar.activity.is_some() {
                 theme.primary
@@ -2417,6 +2421,59 @@ fn render_session_delete_confirm(f: &mut Frame, area: Rect, state: &AppState, th
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         " ↑↓ select · Enter confirm · Esc cancel ",
+        Style::default().fg(theme.text_muted),
+    )));
+    f.render_widget(
+        Paragraph::new(Text::from(lines))
+            .wrap(Wrap { trim: false })
+            .block(block),
+        area,
+    );
+}
+
+fn render_quit_dialog(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    let Some(dialog) = state.quit_dialog.as_ref() else {
+        return;
+    };
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.warning))
+        .title(" A turn is still running ");
+    let options = [
+        ("[T] Terminate", "kill the turn, exit TUI"),
+        ("[B] Background", "keep it running, exit TUI"),
+        ("[Esc] Cancel", "stay in TUI"),
+    ];
+    let mut lines: Vec<Line> = vec![
+        Line::from(Span::styled(
+            " Choose how to leave while work continues on the server.",
+            Style::default().fg(theme.text),
+        )),
+        Line::from(""),
+    ];
+    for (i, (label, detail)) in options.iter().enumerate() {
+        let selected = dialog.selected == i;
+        let prefix = if selected { "> " } else { "  " };
+        let style = if selected {
+            Style::default()
+                .fg(match i {
+                    0 => theme.error,
+                    1 => theme.primary,
+                    _ => theme.text,
+                })
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.text_dim)
+        };
+        lines.push(Line::from(Span::styled(
+            format!("{prefix}{label}  — {detail}"),
+            style,
+        )));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        " ↑↓ select · Enter confirm · T / B / Esc ",
         Style::default().fg(theme.text_muted),
     )));
     f.render_widget(

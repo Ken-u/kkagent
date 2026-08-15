@@ -1,10 +1,28 @@
 use anyhow::{Context, Result};
 use std::path::Path;
+use thiserror::Error;
 
 #[cfg(windows)]
 pub use tokio::net::{TcpListener as LocalListener, TcpStream as LocalStream};
 #[cfg(unix)]
 pub use tokio::net::{UnixListener as LocalListener, UnixStream as LocalStream};
+
+/// Errors from [`try_connect_uds`], including automatic stale-endpoint cleanup.
+#[derive(Debug, Error)]
+pub enum ConnectError {
+    #[error("stale local endpoint at {path}: {source}")]
+    StaleSocket {
+        path: String,
+        #[source]
+        source: anyhow::Error,
+    },
+    #[error("local endpoint not found at {path}: {source}")]
+    NotFound {
+        path: String,
+        #[source]
+        source: anyhow::Error,
+    },
+}
 
 /// Connect to kkagent's local IPC endpoint.
 ///
@@ -27,6 +45,25 @@ pub async fn connect_uds(path: &Path) -> Result<LocalStream> {
     LocalStream::connect(address.trim())
         .await
         .with_context(|| format!("failed to connect to local endpoint {}", path.display()))
+}
+
+/// Try to connect; if the endpoint file exists but is dead, remove it and
+/// return [`ConnectError::StaleSocket`].
+pub async fn try_connect_uds(path: &Path) -> Result<LocalStream, ConnectError> {
+    match connect_uds(path).await {
+        Ok(stream) => Ok(stream),
+        Err(error) if path.exists() => {
+            let _ = remove_stale_endpoint(path);
+            Err(ConnectError::StaleSocket {
+                path: path.display().to_string(),
+                source: error,
+            })
+        }
+        Err(error) => Err(ConnectError::NotFound {
+            path: path.display().to_string(),
+            source: error,
+        }),
+    }
 }
 
 #[cfg(unix)]
@@ -148,5 +185,23 @@ mod tests {
         let error = bind_uds(&path).unwrap_err().to_string();
         assert!(error.contains("already listening"));
         remove_endpoint(&path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn try_connect_cleans_stale_socket() {
+        let path = std::env::temp_dir().join(format!("kk-stale-{}.sock", std::process::id()));
+        // A leftover endpoint file that is not an accepting listener.
+        std::fs::write(&path, b"stale").unwrap();
+        assert!(path.exists());
+        let err = try_connect_uds(&path).await.unwrap_err();
+        assert!(matches!(err, ConnectError::StaleSocket { .. }));
+        assert!(!path.exists(), "stale socket should be removed");
+    }
+
+    #[tokio::test]
+    async fn try_connect_not_found_when_missing() {
+        let path = std::env::temp_dir().join(format!("kk-miss-{}.sock", std::process::id()));
+        let err = try_connect_uds(&path).await.unwrap_err();
+        assert!(matches!(err, ConnectError::NotFound { .. }));
     }
 }

@@ -268,3 +268,95 @@ pub fn ensure_config_dir() -> Result<PathBuf> {
     }
     Ok(dir)
 }
+
+/// Default local IPC endpoint for the standalone server.
+pub fn default_server_socket_path() -> PathBuf {
+    default_config_dir().join("server.sock")
+}
+
+fn active_session_path() -> PathBuf {
+    default_config_dir().join("active-session")
+}
+
+fn write_active_session_file(path: &Path, session_id: &str) -> Result<()> {
+    let trimmed = session_id.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("active session id must not be empty");
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, trimmed).with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(())
+}
+
+fn read_active_session_file(path: &Path) -> Option<String> {
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn remove_active_session_file(path: &Path) {
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            tracing::warn!(path = %path.display(), %error, "failed to clear active-session");
+        }
+    }
+}
+
+/// Persist the session id that `kk` should auto-resume after a TUI detach.
+pub fn save_active_session(session_id: &str) -> Result<()> {
+    ensure_config_dir()?;
+    write_active_session_file(&active_session_path(), session_id)
+}
+
+/// Load the last detached session id, if any.
+pub fn load_active_session() -> Option<String> {
+    read_active_session_file(&active_session_path())
+}
+
+/// Clear a stale or intentionally discarded active-session marker.
+pub fn clear_active_session() {
+    remove_active_session_file(&active_session_path())
+}
+
+#[cfg(test)]
+mod active_session_tests {
+    use super::*;
+
+    #[test]
+    fn save_load_clear_active_session_roundtrip() {
+        let dir = std::env::temp_dir().join(format!(
+            "kkagent-active-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("active-session");
+
+        assert!(read_active_session_file(&path).is_none());
+        write_active_session_file(&path, "  sess-123  ").unwrap();
+        assert_eq!(read_active_session_file(&path).as_deref(), Some("sess-123"));
+        remove_active_session_file(&path);
+        assert!(read_active_session_file(&path).is_none());
+        remove_active_session_file(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rejects_empty_active_session_id() {
+        let path = std::env::temp_dir().join(format!(
+            "kkagent-active-empty-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        assert!(write_active_session_file(&path, "   ").is_err());
+    }
+}

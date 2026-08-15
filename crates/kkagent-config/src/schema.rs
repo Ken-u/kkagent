@@ -65,6 +65,35 @@ pub struct AppConfig {
     /// TUI / accessibility / update preferences.
     #[serde(default)]
     pub ui: UiConfig,
+    /// Standalone server lifecycle (idle exit, default detach mode).
+    #[serde(default)]
+    pub server: ServerConfig,
+}
+
+/// Standalone RPC server preferences (`[server]` in config.toml).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerConfig {
+    /// Seconds with no clients and no active turns before the standalone server
+    /// exits. `0` disables automatic exit (requires `kkagent server stop`).
+    #[serde(default = "default_idle_timeout_secs")]
+    pub idle_timeout_secs: u64,
+    /// When true, `kk` auto-spawns/connects a standalone server (Ctrl+B works).
+    /// When false, use the legacy in-process server (Ctrl+B unavailable).
+    #[serde(default = "default_true")]
+    pub standalone: bool,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            idle_timeout_secs: default_idle_timeout_secs(),
+            standalone: true,
+        }
+    }
+}
+
+fn default_idle_timeout_secs() -> u64 {
+    1800
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

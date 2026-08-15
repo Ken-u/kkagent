@@ -11,6 +11,7 @@
 | `~/.kkagent/credentials/kimi-code.json` | Kimi OAuth 凭据。 |
 | `~/.kkagent/kkagent.log` | TUI 文件日志。 |
 | `~/.kkagent/server.sock` | Unix socket，或 Windows 本地 endpoint 文件。 |
+| `~/.kkagent/active-session` | 最近一次 TUI 后台化时保存的 session id，供下次自动 resume。 |
 | `~/.kkagent/config.toml.trust.toml` | TUI 管理的 workspace、外部 Git 元数据和只读全局 Git 配置授权；自定义 `--config` 使用同目录同名 sidecar。 |
 | `~/.kkagent/skills/`、`plugins/`、`hooks.json` | 用户扩展。 |
 | `~/.kkagent/telemetry/events.jsonl` | 本地遥测事件。 |
@@ -59,6 +60,19 @@ Linux 生产主机需安装 Bubblewrap 并允许非特权 user namespace；否�
 5. 检查 `/api/v1/meta`、模型列表、MCP 和一次只读 prompt。
 
 不要让新旧版本同时写同一个 endpoint 或同一 Session。残留 `server.sock` 只应在确认没有 Server 进程持有后移除。
+
+## Standalone Server 生命周期
+
+默认 `kk` 会自动启动或连接独立 server（`~/.kkagent/server.sock`）。TUI 退出（含 `Ctrl+B` 后台化）不会停止 server；正在执行的 agent turn 继续跑，结果留在 server 内存与 transcript 中。
+
+| 命令 | 作用 |
+|---|---|
+| `kkagent server` | 前台运行独立 server（也可由 TUI 自动后台拉起）。 |
+| `kkagent server status` | 人类可读状态；退出码 0=存活，1=未运行。 |
+| `kkagent server status --json` | JSON：`alive`、`active_turns`、`client_count`、`uptime_secs`、`pid`。 |
+| `kkagent server stop` | 优雅停止；有 active turn 时拒绝。 |
+
+空闲策略见配置 `[server].idle_timeout_secs`（默认 1800 秒；`0` 表示永不自动退出）。`./upload.sh` 在本地 CI 前会检测并停止无 turn 的 server；有 turn 时会报错退出。
 
 ## 容量与清理
 

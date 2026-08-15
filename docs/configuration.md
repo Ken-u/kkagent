@@ -143,6 +143,20 @@ approval_timeout_s = 900
 
 `max_running_tasks` 控制 Agent 后台任务并发；`approval_timeout_s` 到期后按拒绝处理，范围在运行时限制为 1 秒到 24 小时。
 
+## Standalone Server
+
+```toml
+[server]
+# 无客户端且无 active turn 时，独立 server 自动退出的空闲秒数。
+# 0 = 永不自动退出，需手动 `kkagent server stop`。
+idle_timeout_secs = 1800
+# true：`kk` 默认拉起/连接独立 server（Ctrl+B 可用）。
+# false：退回进程内 server（旧行为，Ctrl+B 不可用）。
+standalone = true
+```
+
+默认 `kk`（无参数）会连接 `~/.kkagent/server.sock` 上的独立 server；不存在时自动后台启动。TUI 退出不会杀死该 server。`~/.kkagent/active-session` 记录最近后台化的 session，下次启动自动 resume。
+
 ## 系统隔离
 
 ```toml

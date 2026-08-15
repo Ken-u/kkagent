@@ -39,6 +39,8 @@ pub struct TuiApp {
     jobs: crate::async_jobs::AsyncJobHub,
     use_alt_screen: bool,
     remote_connection: bool,
+    /// Standalone / --connect mode: Ctrl+B detaches without killing the server.
+    allows_background_detach: bool,
     connection_alerted: bool,
 }
 
@@ -68,6 +70,8 @@ pub struct AppState {
     pub mode: AppMode,
     pub should_quit: bool,
     pub quit_confirm: bool,
+    /// Shown when quitting while a turn is still running (standalone mode).
+    pub quit_dialog: Option<QuitDialogState>,
     pub thinking_text: String,
     /// Assistant display message receiving deltas for the current model step.
     pub active_assistant_message: Option<usize>,
@@ -511,6 +515,13 @@ pub struct SessionDeleteConfirm {
     pub busy: bool,
 }
 
+/// Dialog when quitting while an agent turn is still running.
+#[derive(Debug, Clone)]
+pub struct QuitDialogState {
+    /// 0 = Terminate, 1 = Background, 2 = Cancel
+    pub selected: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct ResumeSwitchCtx {
     pub target: String,
@@ -891,6 +902,7 @@ impl AppState {
             },
             should_quit: false,
             quit_confirm: false,
+            quit_dialog: None,
             thinking_text: String::new(),
             active_assistant_message: None,
             scroll_up: 0,
@@ -1244,6 +1256,7 @@ impl TuiApp {
             jobs: crate::async_jobs::AsyncJobHub::new(),
             use_alt_screen: true,
             remote_connection: false,
+            allows_background_detach: false,
             connection_alerted: false,
         }
     }
@@ -1254,6 +1267,10 @@ impl TuiApp {
 
     pub fn set_remote_connection(&mut self, enabled: bool) {
         self.remote_connection = enabled;
+    }
+
+    pub fn set_allows_background_detach(&mut self, enabled: bool) {
+        self.allows_background_detach = enabled;
     }
 
     pub fn set_config_path(&mut self, path: PathBuf) {
@@ -1468,9 +1485,12 @@ impl TuiApp {
         let sid = self.state.session_id.clone();
         let empty = !session_has_retained_io(&self.state.messages);
 
-        // Interrupt any in-flight turn before tearing down the paired server.
+        // In-process mode: interrupt before aborting the paired server task.
+        // Standalone / --connect: leave turns running so Ctrl+B and Background quit work.
         if let Some(ref id) = sid {
-            let _ = self.client.interrupt(id).await;
+            if !self.allows_background_detach {
+                let _ = self.client.interrupt(id).await;
+            }
             if empty {
                 let _ = self.discard_session_record(id).await;
             }
@@ -2120,6 +2140,10 @@ impl TuiApp {
     /// Close the topmost transient UI (menus / pickers / search / shell).
     /// Returns true if something was dismissed. Does not touch the agent turn.
     fn dismiss_transient_ui(&mut self) -> bool {
+        if self.state.quit_dialog.take().is_some() {
+            self.state.quit_confirm = false;
+            return true;
+        }
         if self.state.plugin_prompt.take().is_some() {
             return true;
         }
@@ -2155,6 +2179,75 @@ impl TuiApp {
             return true;
         }
         false
+    }
+
+    fn has_transient_ui(&self) -> bool {
+        self.state.quit_dialog.is_some()
+            || self.state.plugin_prompt.is_some()
+            || self.state.session_delete_confirm.is_some()
+            || self.state.list_picker.is_some()
+            || self.state.tasks_panel.is_some()
+            || self.state.search.active
+            || self.state.file_menu.is_some()
+            || self.state.slash_menu.is_some()
+            || self.state.mode == AppMode::Shell
+    }
+
+    fn persist_active_session_marker(&self) {
+        if let Some(sid) = self.state.session_id.as_deref() {
+            if let Err(error) = kkagent_config::save_active_session(sid) {
+                tracing::warn!(%error, "failed to save active-session");
+            }
+        }
+    }
+
+    async fn has_server_active_turns(&self) -> bool {
+        if session_status_has_active_agent_loop(self.state.status) {
+            return true;
+        }
+        if self
+            .state
+            .workspace_sessions
+            .entries
+            .iter()
+            .any(|entry| session_status_has_active_agent_loop(entry.status))
+        {
+            return true;
+        }
+        match self.client.has_active_turns().await {
+            Ok(active) => active,
+            Err(error) => {
+                tracing::warn!(%error, "failed to query active turns");
+                false
+            }
+        }
+    }
+
+    async fn apply_quit_dialog(&mut self, choice: usize) -> anyhow::Result<()> {
+        self.state.quit_dialog = None;
+        match choice {
+            0 => {
+                // Terminate: interrupt then exit (server stays up).
+                if let Some(sid) = self.state.session_id.clone() {
+                    if let Err(error) = self.client.interrupt(&sid).await {
+                        self.system_message(format!("Failed to interrupt turn: {error}"));
+                    } else {
+                        self.state.status = SessionStatus::Cancelling;
+                    }
+                }
+                self.state.should_quit = true;
+            }
+            1 => {
+                // Background: keep turn, save session, exit.
+                self.persist_active_session_marker();
+                self.state.should_quit = true;
+            }
+            _ => {
+                // Cancel: stay in TUI.
+                self.state.quit_confirm = false;
+            }
+        }
+        Ok(())
     }
 
     /// Esc: return to parent picker if any, otherwise close.
@@ -2516,6 +2609,59 @@ impl TuiApp {
         }
         let key = crate::platform_keys::normalize_key_event(key);
 
+        // Quit dialog (turn still running): Terminate / Background / Cancel
+        if self.state.quit_dialog.is_some() {
+            match key.code {
+                KeyCode::Up | KeyCode::BackTab | KeyCode::Left => {
+                    if let Some(dialog) = self.state.quit_dialog.as_mut() {
+                        dialog.selected = dialog.selected.saturating_sub(1);
+                    }
+                }
+                KeyCode::Down | KeyCode::Tab | KeyCode::Right => {
+                    if let Some(dialog) = self.state.quit_dialog.as_mut() {
+                        dialog.selected = (dialog.selected + 1).min(2);
+                    }
+                }
+                KeyCode::Char('t') | KeyCode::Char('T') => {
+                    self.apply_quit_dialog(0).await?;
+                }
+                KeyCode::Char('b') | KeyCode::Char('B') => {
+                    self.apply_quit_dialog(1).await?;
+                }
+                KeyCode::Esc => {
+                    self.apply_quit_dialog(2).await?;
+                }
+                KeyCode::Enter => {
+                    let selected = self
+                        .state
+                        .quit_dialog
+                        .as_ref()
+                        .map(|dialog| dialog.selected)
+                        .unwrap_or(2);
+                    self.apply_quit_dialog(selected).await?;
+                }
+                _ => {}
+            }
+            return Ok(());
+        }
+
+        // Ctrl+B: background detach (standalone / --connect only)
+        if key.code == KeyCode::Char('b')
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && self.allows_background_detach
+        {
+            if self.state.mode != AppMode::Normal {
+                return Ok(());
+            }
+            if self.has_transient_ui() {
+                let _ = self.dismiss_transient_ui();
+                return Ok(());
+            }
+            self.persist_active_session_marker();
+            self.state.should_quit = true;
+            return Ok(());
+        }
+
         // Esc while a menu/overlay is open: only dismiss that UI — never interrupt
         // an in-flight turn. Ctrl-C still cancels the turn below.
         if matches!(key.code, KeyCode::Esc) && self.dismiss_transient_ui() {
@@ -2595,8 +2741,8 @@ impl TuiApp {
         }
 
         // A plan review is a blocking approval, but Esc should only fold its modal.
-        // Keep the server waiter alive so Enter can restore the same approval. Ctrl-C
-        // deliberately falls through to the busy-turn interrupt below.
+        // Keep the server waiter alive so Enter can restore the same approval.
+        // Ctrl+C uses the quit-confirm / dialog path below instead of interrupting here.
         let plan_review_pending = self
             .state
             .approval_pending
@@ -2630,12 +2776,11 @@ impl TuiApp {
             return Ok(());
         }
 
-        // Busy turn with no overlay: Esc / Ctrl-C interrupt the agent (always Ctrl-C
-        // even on macOS so the key to stop a running turn is consistent).
+        // Busy turn with no overlay: Esc interrupts and stays in the TUI.
+        // Ctrl+C is intentionally not handled here — it drives quit confirm / dialog.
         if !matches!(self.state.status, SessionStatus::Idle)
-            && ((matches!(key.code, KeyCode::Esc) && !plan_review_pending)
-                || (matches!(key.code, KeyCode::Char('c'))
-                    && key.modifiers.contains(KeyModifiers::CONTROL)))
+            && matches!(key.code, KeyCode::Esc)
+            && !plan_review_pending
         {
             if let Some(sid) = self.state.session_id.clone() {
                 match self.client.interrupt(&sid).await {
@@ -3124,58 +3269,49 @@ impl TuiApp {
                     Err(error) => self.system_message(format!("Image paste failed: {error}")),
                 }
             }
-            // Ctrl-C: interrupt or quit
+            // Ctrl-C: empty input uses double-tap quit. With an active turn the
+            // second press opens Terminate / Background / Cancel (no interrupt yet).
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if self.state.status != SessionStatus::Idle {
-                    if let Some(sid) = &self.state.session_id {
-                        self.state.status = SessionStatus::Cancelling;
-                        self.client.interrupt(sid).await?;
-                        self.system_message(
-                            "Cancelling… partial output kept. After idle: edit & retry, or /fork."
-                                .into(),
-                        );
-                    }
-                } else if self.state.input.is_empty() {
-                    if self.state.quit_confirm {
-                        self.state.should_quit = true;
-                    } else {
-                        let mut reasons = Vec::new();
-                        if !self.state.input.is_empty() {
-                            reasons.push("draft");
-                        }
-                        if self.state.approval_pending.is_some()
-                            || !self.state.approval_queue.is_empty()
-                        {
-                            reasons.push("approval");
-                        }
-                        if self.state.question_pending.is_some() {
-                            reasons.push("question");
-                        }
-                        if matches!(
-                            self.state.status,
-                            SessionStatus::Thinking
-                                | SessionStatus::ToolExecuting
-                                | SessionStatus::WaitingApproval
-                                | SessionStatus::WaitingQuestion
-                                | SessionStatus::Compacting
-                        ) {
-                            reasons.push("running");
-                        }
-                        if reasons.is_empty() {
-                            self.state.quit_confirm = true;
-                        } else {
-                            self.state.quit_confirm = true;
-                            self.system_message(format!(
-                                "Quit? pending: {} — Ctrl-C again quits (turn continues in background if running).",
-                                reasons.join(", ")
-                            ));
-                        }
-                    }
-                } else {
+                if !self.state.input.is_empty() {
                     self.state.input.clear();
                     self.state.slash_menu = None;
                     self.state.file_menu = None;
                     self.state.list_picker = None;
+                } else if self.state.quit_confirm {
+                    if self.has_server_active_turns().await {
+                        self.state.quit_dialog = Some(QuitDialogState { selected: 1 });
+                        self.state.quit_confirm = false;
+                    } else {
+                        self.persist_active_session_marker();
+                        self.state.should_quit = true;
+                    }
+                } else {
+                    let mut reasons = Vec::new();
+                    if self.state.approval_pending.is_some()
+                        || !self.state.approval_queue.is_empty()
+                    {
+                        reasons.push("approval");
+                    }
+                    if self.state.question_pending.is_some() {
+                        reasons.push("question");
+                    }
+                    if session_status_has_active_agent_loop(self.state.status)
+                        || self
+                            .state
+                            .workspace_sessions
+                            .entries
+                            .iter()
+                            .any(|entry| session_status_has_active_agent_loop(entry.status))
+                    {
+                        reasons.push("running");
+                    }
+                    self.state.quit_confirm = true;
+                    if !reasons.is_empty() {
+                        self.system_message(format!(
+                            "Quit? pending: {} — Ctrl-C again (Terminate / Background if a turn is running).",
+                            reasons.join(", ")
+                        ));
+                    }
                 }
             }
             // Ctrl-D in the virtual BTW workspace clears that workspace; the
@@ -3216,6 +3352,7 @@ impl TuiApp {
                         self.confirm_delete_session(true).await?;
                     }
                 } else if self.state.quit_confirm {
+                    self.persist_active_session_marker();
                     self.state.should_quit = true;
                 } else {
                     self.state.quit_confirm = true;
@@ -3405,9 +3542,6 @@ impl TuiApp {
             }
             KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.state.input.move_end();
-            }
-            KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.state.input.move_left();
             }
             KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.state.input.move_right();
@@ -8169,6 +8303,7 @@ impl TuiApp {
                 }
             }
             "exit" | "quit" | "q" => {
+                self.persist_active_session_marker();
                 self.state.should_quit = true;
             }
             "new" | "clear" => {
@@ -12891,5 +13026,107 @@ mod app_state_tests {
             p,
             DisplayPart::Tool(t) if t.id == "a" && t.output.is_none()
         )));
+    }
+
+    #[tokio::test]
+    async fn ctrl_b_quits_without_interrupting_when_detach_enabled() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use futures::FutureExt;
+        use std::sync::Arc;
+
+        let (client_transport, server_transport) =
+            kkagent_rpc::transport::memory::create_memory_pair();
+        let (event_tx, event_rx) = tokio::sync::mpsc::channel(16);
+        let rpc = kkagent_rpc::RpcClient::new(client_transport, event_tx);
+        let client = kkagent_client::KkagentClient::new(rpc, event_rx);
+        let (interrupt_tx, mut interrupt_rx) = tokio::sync::mpsc::unbounded_channel();
+        let handler: kkagent_rpc::server::RequestHandler =
+            Arc::new(move |_id, method, params, _event_tx| {
+                let interrupt_tx = interrupt_tx.clone();
+                async move {
+                    match method.as_str() {
+                        "session.interrupt" => {
+                            interrupt_tx.send(params.unwrap()).unwrap();
+                            Ok(serde_json::json!({"ok": true}))
+                        }
+                        other => panic!("unexpected RPC method: {other}"),
+                    }
+                }
+                .boxed()
+            });
+        tokio::spawn(async move {
+            kkagent_rpc::RpcServer::new(handler)
+                .serve(server_transport)
+                .await;
+        });
+
+        let mut app = TuiApp::new(AppConfig::default(), client);
+        app.set_allows_background_detach(true);
+        app.state.session_id = Some("running".into());
+        app.state.status = SessionStatus::Thinking;
+        app.state.mode = AppMode::Normal;
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+
+        assert!(app.state.should_quit);
+        assert!(
+            interrupt_rx.try_recv().is_err(),
+            "Ctrl+B must not interrupt the in-flight turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn ctrl_c_while_busy_opens_quit_confirm_without_interrupt() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use futures::FutureExt;
+        use std::sync::Arc;
+
+        let (client_transport, server_transport) =
+            kkagent_rpc::transport::memory::create_memory_pair();
+        let (event_tx, event_rx) = tokio::sync::mpsc::channel(16);
+        let rpc = kkagent_rpc::RpcClient::new(client_transport, event_tx);
+        let client = kkagent_client::KkagentClient::new(rpc, event_rx);
+        let (interrupt_tx, mut interrupt_rx) = tokio::sync::mpsc::unbounded_channel();
+        let handler: kkagent_rpc::server::RequestHandler =
+            Arc::new(move |_id, method, params, _event_tx| {
+                let interrupt_tx = interrupt_tx.clone();
+                async move {
+                    match method.as_str() {
+                        "session.interrupt" => {
+                            interrupt_tx.send(params.unwrap()).unwrap();
+                            Ok(serde_json::json!({"ok": true}))
+                        }
+                        "runtime.has_active_turns" => {
+                            Ok(serde_json::json!({"active": true, "sessions": ["running"]}))
+                        }
+                        other => panic!("unexpected RPC method: {other}"),
+                    }
+                }
+                .boxed()
+            });
+        tokio::spawn(async move {
+            kkagent_rpc::RpcServer::new(handler)
+                .serve(server_transport)
+                .await;
+        });
+
+        let mut app = TuiApp::new(AppConfig::default(), client);
+        app.set_allows_background_detach(true);
+        app.state.session_id = Some("running".into());
+        app.state.status = SessionStatus::Thinking;
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+        assert!(app.state.quit_confirm);
+        assert!(interrupt_rx.try_recv().is_err());
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+        assert!(app.state.quit_dialog.is_some());
+        assert!(interrupt_rx.try_recv().is_err());
     }
 }

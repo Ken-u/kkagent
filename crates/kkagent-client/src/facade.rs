@@ -275,6 +275,19 @@ impl KkagentClient {
         Ok(())
     }
 
+    /// Whether the connected server currently has any in-flight agent turns.
+    pub async fn has_active_turns(&self) -> anyhow::Result<bool> {
+        let result = self
+            .rpc
+            .call("runtime.has_active_turns", None)
+            .await
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        Ok(result
+            .get("active")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false))
+    }
+
     pub async fn rpc_call(
         &self,
         method: &str,
