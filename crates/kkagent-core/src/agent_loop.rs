@@ -527,6 +527,10 @@ Do not mention this reminder to the user.\n</system-reminder>"
                 max_tokens: model_config.max_output_size.map(|v| v as u32),
                 system: Some(system_prompt.clone()),
                 thinking: thinking.clone(),
+                first_token_timeout: kkagent_config::resolve_first_token_timeout(
+                    model_config,
+                    provider_config,
+                ),
             };
 
             let (stream_tx, mut stream_rx) = mpsc::channel::<StreamEvent>(256);
@@ -655,6 +659,13 @@ Do not mention this reminder to the user.\n</system-reminder>"
                                 .await;
                         }
                         StreamEvent::Error(msg) => {
+                            if msg.contains("first token timeout:") {
+                                tracing::warn!(
+                                    model = %model_config.model,
+                                    provider = %provider_config.provider_type,
+                                    "first_token_timeout"
+                                );
+                            }
                             tracing::error!("Stream error: {}", msg);
                             last_stream_error = Some(msg);
                             stream_failed = true;
@@ -3211,6 +3222,7 @@ mod retry_tests {
                 base_url: Some(base_url),
                 custom_headers: HashMap::new(),
                 oauth: None,
+                first_token_timeout_ms: None,
             },
         );
         config.models.insert(
@@ -3227,6 +3239,7 @@ mod retry_tests {
                 pricing: None,
                 experimental_adaptive_thinking: false,
                 experimental_visible_empty_retries: 0,
+                first_token_timeout_ms: None,
             },
         );
         let config = Arc::new(config);
@@ -3349,6 +3362,7 @@ mod retry_tests {
                     base_url: Some(base_url),
                     custom_headers: HashMap::new(),
                     oauth: None,
+                    first_token_timeout_ms: None,
                 },
             );
             config.models.insert(
@@ -3365,6 +3379,7 @@ mod retry_tests {
                     pricing: None,
                     experimental_adaptive_thinking: false,
                     experimental_visible_empty_retries: 0,
+                    first_token_timeout_ms: None,
                 },
             );
         }
@@ -3449,6 +3464,7 @@ mod retry_tests {
                 base_url: Some(base_url),
                 custom_headers: HashMap::new(),
                 oauth: None,
+                first_token_timeout_ms: None,
             },
         );
         for alias in ["primary", "fallback"] {
@@ -3466,6 +3482,7 @@ mod retry_tests {
                     pricing: None,
                     experimental_adaptive_thinking: false,
                     experimental_visible_empty_retries: 0,
+                    first_token_timeout_ms: None,
                 },
             );
         }
@@ -3585,6 +3602,7 @@ mod retry_tests {
                 base_url: Some(base_url),
                 custom_headers: HashMap::new(),
                 oauth: None,
+                first_token_timeout_ms: None,
             },
         );
         config.models.insert(
@@ -3601,6 +3619,7 @@ mod retry_tests {
                 pricing: None,
                 experimental_adaptive_thinking: false,
                 experimental_visible_empty_retries: 0,
+                first_token_timeout_ms: None,
             },
         );
         let (event_tx, _) = mpsc::channel(64);
@@ -3676,6 +3695,7 @@ mod retry_tests {
                 base_url: Some(base_url),
                 custom_headers: HashMap::new(),
                 oauth: None,
+                first_token_timeout_ms: None,
             },
         );
         config.models.insert(
@@ -3692,6 +3712,7 @@ mod retry_tests {
                 pricing: None,
                 experimental_adaptive_thinking: false,
                 experimental_visible_empty_retries: 0,
+                first_token_timeout_ms: None,
             },
         );
         let (event_tx, _) = mpsc::channel(512);
@@ -3773,6 +3794,7 @@ mod retry_tests {
                 base_url: Some(base_url),
                 custom_headers: HashMap::new(),
                 oauth: None,
+                first_token_timeout_ms: None,
             },
         );
         config.models.insert(
@@ -3789,6 +3811,7 @@ mod retry_tests {
                 pricing: None,
                 experimental_adaptive_thinking: false,
                 experimental_visible_empty_retries: 1,
+                first_token_timeout_ms: None,
             },
         );
         let (event_tx, _) = mpsc::channel(64);
@@ -3877,6 +3900,7 @@ mod retry_tests {
                 base_url: Some(base_url),
                 custom_headers: HashMap::new(),
                 oauth: None,
+                first_token_timeout_ms: None,
             },
         );
         config.models.insert(
@@ -3893,6 +3917,7 @@ mod retry_tests {
                 pricing: None,
                 experimental_adaptive_thinking: false,
                 experimental_visible_empty_retries: 0,
+                first_token_timeout_ms: None,
             },
         );
         let (event_tx, mut event_rx) = mpsc::channel(64);

@@ -22,6 +22,7 @@ TUI 问题同时查看 `~/.kkagent/kkagent.log`。分享日志前删除 token、
 | URL 校验失败 | `base_url` 必须是合法 `http://` 或 `https://` URL。 |
 | 401/403 | 检查 API key、OAuth 状态、自定义 Header 和上游 base URL。 |
 | 400 / max tokens | 减小 `max_output_size`，校准 context，必要时关闭 thinking。 |
+| `first token timeout` | 上游迟迟不吐首字；调大模型/Provider 的 `first_token_timeout_ms`，或设 `0` 禁用；也可配置 `fallback_model`。 |
 | 模型不调用工具 | 加入 `capabilities = ["tool_use"]`，并确认上游支持。 |
 | 上下文过长 | `/compact`，开启 `auto_compact`，或降低 `compact_keep_last`。 |
 

@@ -47,6 +47,7 @@ custom_headers = { "X-Organization" = "example" }
 | `base_url` | `http://` 或 `https://` URL；兼容端点可使用 `/v1`、`/v4` 等版本前缀，也可填写完整资源 endpoint。 |
 | `custom_headers` | 发送给上游的附加 HTTP Header。 |
 | `oauth` | 托管 OAuth 配置，通常由 `kkagent auth login` 管理。 |
+| `first_token_timeout_ms` | Provider 级流式首字超时默认值（毫秒）；模型级可覆盖；`0` 禁用。 |
 
 OAuth 子项：`storage` 默认 `file`，`key` 默认 `kimi-code`，`oauth_host` 可覆盖登录服务地址。
 
@@ -62,12 +63,15 @@ capabilities = ["tool_use", "thinking", "image_in"]
 display_name = "Coding model"
 support_efforts = ["low", "medium", "high"]
 default_effort = "medium"
+# first_token_timeout_ms = 60000  # 等首字；0 禁用；未设置继承 provider / 默认 60s
 # 以下实验选项默认关闭，只建议为需要兼容处理的模型单独开启。
 # experimental_adaptive_thinking = true
 # experimental_visible_empty_retries = 1
 ```
 
 `provider` 必须引用已有 Provider。`max_context_size` 和 `max_output_size` 参与上下文预算。`tool_use` 控制是否向模型发送工具定义；`image_in`、`video_in`、`audio_in` 声明多模态输入能力；`support_efforts` 和 `default_effort` 描述可用推理强度。
+
+`first_token_timeout_ms` 控制流式请求等待第一个有效内容 chunk（文本 / thinking / tool_use）的超时。优先级为：模型级 → Provider 级 → 默认 `60000`（60 秒）。设为 `0` 表示禁用（退化为仅受 HTTP 总超时 300s 约束）。≥ 300s 的配置会被 clamp 到 290s。超时后请求中断；若配置了 `fallback_model`，Agent loop 会按既有重试策略切换。
 
 `experimental_adaptive_thinking` 仅影响 Anthropic 请求：开启后发送 `thinking.type = "adaptive"`，并通过 `output_config.effort` 转发当前 thinking effort。`experimental_visible_empty_retries` 指定 tool result 后遇到“无正文且无新 tool call”的成功响应时最多重试几次；thinking-only 也属于这种响应。重试只重新请求模型，不会再次执行已经完成的工具。两个选项都按模型配置，未设置时保持原有行为。
 

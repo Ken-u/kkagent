@@ -675,6 +675,7 @@ async fn provision_managed_kimi_config(
                 key: "kimi-code".into(),
                 oauth_host: oauth_host.map(str::to_string),
             }),
+            first_token_timeout_ms: None,
         },
     );
     let mut first_alias = None;
@@ -749,6 +750,7 @@ async fn provision_managed_kimi_config(
                 pricing: None,
                 experimental_adaptive_thinking: false,
                 experimental_visible_empty_retries: 0,
+                first_token_timeout_ms: None,
             },
         );
     }

@@ -11193,6 +11193,7 @@ mod app_state_tests {
                     pricing: None,
                     experimental_adaptive_thinking: false,
                     experimental_visible_empty_retries: 0,
+                    first_token_timeout_ms: None,
                 },
             );
         }

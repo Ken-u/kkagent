@@ -45,6 +45,8 @@ pub struct LlmRequest {
     pub max_tokens: Option<u32>,
     pub system: Option<String>,
     pub thinking: Option<ThinkingParams>,
+    /// When set, abort the stream if no meaningful content arrives in time.
+    pub first_token_timeout: Option<std::time::Duration>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

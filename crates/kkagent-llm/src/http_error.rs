@@ -19,6 +19,20 @@ impl LlmHttpError {
     }
 }
 
+/// Streaming request did not receive a meaningful first content chunk in time.
+#[derive(Debug, thiserror::Error)]
+#[error("first token timeout: no content received within {timeout_ms}ms for model {model}")]
+pub struct FirstTokenTimeoutError {
+    pub timeout_ms: u64,
+    pub model: String,
+}
+
+impl FirstTokenTimeoutError {
+    pub fn is_retryable(&self) -> bool {
+        true
+    }
+}
+
 pub async fn response_error(response: Response) -> anyhow::Error {
     let status = response.status();
     let headers = response.headers().clone();
@@ -42,6 +56,11 @@ pub fn stream_error_event(error: &anyhow::Error) -> crate::types::StreamEvent {
         }
     }
     crate::types::StreamEvent::Error(error.to_string())
+}
+
+pub fn is_first_token_timeout(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<FirstTokenTimeoutError>().is_some()
+        || error.to_string().contains("first token timeout:")
 }
 
 fn retry_after_hint(headers: &HeaderMap, body: &str, now: SystemTime) -> Option<Duration> {
@@ -217,6 +236,24 @@ mod tests {
                 retry_after: Some(delay),
                 ..
             } if delay == Duration::from_secs(9)
+        ));
+    }
+
+    #[test]
+    fn first_token_timeout_display_and_detection() {
+        let error: anyhow::Error = FirstTokenTimeoutError {
+            timeout_ms: 1500,
+            model: "demo".into(),
+        }
+        .into();
+        assert_eq!(
+            error.to_string(),
+            "first token timeout: no content received within 1500ms for model demo"
+        );
+        assert!(is_first_token_timeout(&error));
+        assert!(matches!(
+            stream_error_event(&error),
+            crate::types::StreamEvent::Error(message) if message.contains("first token timeout")
         ));
     }
 }

@@ -3,9 +3,71 @@
 use futures_util::StreamExt;
 use reqwest::Client;
 use serde_json::json;
+use std::time::Instant;
 use tokio::sync::mpsc;
 
+use crate::http_error::FirstTokenTimeoutError;
 use crate::types::{ChatContent, LlmRequest, StreamEvent, TokenUsage};
+
+struct FirstTokenGate {
+    deadline: Option<Instant>,
+    timeout_ms: u64,
+    model: String,
+    received: bool,
+}
+
+impl FirstTokenGate {
+    fn new(timeout: Option<std::time::Duration>, model: &str) -> Self {
+        let (deadline, timeout_ms) = match timeout {
+            Some(duration) if !duration.is_zero() => {
+                (Some(Instant::now() + duration), duration.as_millis() as u64)
+            }
+            _ => (None, 0),
+        };
+        Self {
+            deadline,
+            timeout_ms,
+            model: model.to_string(),
+            received: false,
+        }
+    }
+
+    fn mark_content(&mut self) {
+        self.received = true;
+    }
+
+    async fn next_chunk<S, B>(&mut self, stream: &mut S) -> anyhow::Result<Option<B>>
+    where
+        S: futures_util::Stream<Item = Result<B, reqwest::Error>> + Unpin,
+    {
+        if self.received || self.deadline.is_none() {
+            return Ok(match stream.next().await {
+                Some(Ok(chunk)) => Some(chunk),
+                Some(Err(error)) => return Err(error.into()),
+                None => None,
+            });
+        }
+        let deadline = self.deadline.expect("checked above");
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(FirstTokenTimeoutError {
+                timeout_ms: self.timeout_ms,
+                model: self.model.clone(),
+            }
+            .into());
+        }
+        match tokio::time::timeout(remaining, stream.next()).await {
+            Ok(Some(Ok(chunk))) => Ok(Some(chunk)),
+            Ok(Some(Err(error))) => Err(error.into()),
+            Ok(None) => Ok(None),
+            Err(_) => Err(FirstTokenTimeoutError {
+                timeout_ms: self.timeout_ms,
+                model: self.model.clone(),
+            }
+            .into()),
+        }
+    }
+}
 
 pub async fn openai_responses_stream(
     client: &Client,
@@ -142,9 +204,9 @@ pub async fn openai_responses_stream(
     let mut buffer = String::new();
     let mut usage = TokenUsage::default();
     let mut active_calls = std::collections::HashMap::<String, ActiveCall>::new();
+    let mut first_token = FirstTokenGate::new(request.first_token_timeout, &request.model);
 
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk?;
+    while let Some(chunk) = first_token.next_chunk(&mut stream).await? {
         buffer.push_str(&String::from_utf8_lossy(&chunk));
         while let Some(pos) = buffer.find('\n') {
             let line = buffer[..pos].to_string();
@@ -166,6 +228,7 @@ pub async fn openai_responses_stream(
                 "response.output_text.delta" | "response.text.delta" => {
                     if let Some(delta) = event.get("delta").and_then(|v| v.as_str()) {
                         if !delta.is_empty() {
+                            first_token.mark_content();
                             let _ = event_tx
                                 .send(StreamEvent::TextDelta(delta.to_string()))
                                 .await;
@@ -174,6 +237,7 @@ pub async fn openai_responses_stream(
                 }
                 "response.reasoning_summary_text.delta" | "response.reasoning.delta" => {
                     if let Some(delta) = event.get("delta").and_then(|v| v.as_str()) {
+                        first_token.mark_content();
                         let _ = event_tx
                             .send(StreamEvent::ThinkingDelta(delta.to_string()))
                             .await;
@@ -207,6 +271,7 @@ pub async fn openai_responses_stream(
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("tool")
                                 .to_string();
+                            first_token.mark_content();
                             let _ = event_tx
                                 .send(StreamEvent::ToolUseStart {
                                     id: id.clone(),
@@ -366,6 +431,7 @@ mod tests {
             max_tokens: Some(128),
             system: None,
             thinking: None,
+            first_token_timeout: None,
         }
     }
 

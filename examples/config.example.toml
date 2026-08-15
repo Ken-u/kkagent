@@ -18,6 +18,7 @@ type = "anthropic"
 api_key = "sk-your-key-here"
 base_url = "http://127.0.0.1:3000"
 # custom_headers = { "X-Organization" = "example" }
+# first_token_timeout_ms = 30000  # provider 级首字超时；模型级可覆盖；0 禁用
 
 [models."local/default"]
 provider = "local"
@@ -26,6 +27,7 @@ max_context_size = 262144
 max_output_size = 16384
 capabilities = ["tool_use", "image_in"]
 display_name = "Default coding model"
+# first_token_timeout_ms = 60000
 # support_efforts = ["low", "medium", "high"]
 # default_effort = "medium"
 # Experimental Anthropic compatibility workarounds; disabled by default.

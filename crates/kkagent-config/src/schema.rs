@@ -160,6 +160,10 @@ pub struct ProviderConfig {
     pub custom_headers: HashMap<String, String>,
     #[serde(default)]
     pub oauth: Option<ProviderOAuthConfig>,
+    /// Provider-level default for streaming first-token timeout (milliseconds).
+    /// Model-level config wins; `0` disables. See [`resolve_first_token_timeout`].
+    #[serde(default)]
+    pub first_token_timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -205,6 +209,10 @@ pub struct ModelConfig {
     /// Experimental: retry a thinking-only/empty response immediately after tool results.
     #[serde(default)]
     pub experimental_visible_empty_retries: u32,
+    /// Wait this many milliseconds for the first meaningful stream chunk.
+    /// `0` disables; unset inherits provider / default (60s). See [`resolve_first_token_timeout`].
+    #[serde(default)]
+    pub first_token_timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -514,6 +522,40 @@ pub struct McpOAuthConfig {
     pub client_label: Option<String>,
 }
 
+const DEFAULT_FIRST_TOKEN_TIMEOUT_MS: u64 = 60_000;
+const HTTP_TOTAL_TIMEOUT_MS: u64 = 300_000;
+const FIRST_TOKEN_TIMEOUT_CLAMP_MS: u64 = 290_000;
+
+/// Resolve streaming first-token timeout.
+///
+/// Priority: model (`Some(0)` disables) → provider (`Some(0)` disables) → default 60s.
+/// Values ≥ 300s are clamped to 290s.
+pub fn resolve_first_token_timeout(
+    model: &ModelConfig,
+    provider: &ProviderConfig,
+) -> Option<std::time::Duration> {
+    let raw = match model.first_token_timeout_ms {
+        Some(0) => return None,
+        Some(ms) => ms,
+        None => match provider.first_token_timeout_ms {
+            Some(0) => return None,
+            Some(ms) => ms,
+            None => DEFAULT_FIRST_TOKEN_TIMEOUT_MS,
+        },
+    };
+    let ms = if raw >= HTTP_TOTAL_TIMEOUT_MS {
+        tracing::warn!(
+            configured_ms = raw,
+            clamped_ms = FIRST_TOKEN_TIMEOUT_CLAMP_MS,
+            "first_token_timeout_ms >= 300s; clamping to 290s"
+        );
+        FIRST_TOKEN_TIMEOUT_CLAMP_MS
+    } else {
+        raw
+    };
+    Some(std::time::Duration::from_millis(ms))
+}
+
 impl AppConfig {
     pub fn validate(&self) -> anyhow::Result<()> {
         let default_model = self
@@ -632,6 +674,17 @@ impl AppConfig {
         Some((model, provider))
     }
 
+    /// Resolve streaming first-token timeout for a model/provider pair.
+    ///
+    /// Priority: model (`Some(0)` disables) → provider (`Some(0)` disables) → default 60s.
+    /// Values ≥ 300s are clamped to 290s (below the HTTP total timeout).
+    pub fn resolve_first_token_timeout(
+        model: &ModelConfig,
+        provider: &ProviderConfig,
+    ) -> Option<std::time::Duration> {
+        resolve_first_token_timeout(model, provider)
+    }
+
     pub fn default_model_alias(&self) -> Option<&str> {
         self.default_model.as_deref()
     }
@@ -692,6 +745,7 @@ mod tests {
                 base_url: Some("https://example.test".into()),
                 custom_headers: HashMap::new(),
                 oauth: None,
+                first_token_timeout_ms: None,
             },
         );
         config.models.insert(
@@ -708,9 +762,60 @@ mod tests {
                 pricing: None,
                 experimental_adaptive_thinking: false,
                 experimental_visible_empty_retries: 0,
+                first_token_timeout_ms: None,
             },
         );
         config
+    }
+
+    #[test]
+    fn first_token_timeout_priority_and_disable() {
+        let mut model = ModelConfig {
+            provider: "test".into(),
+            model: "m".into(),
+            max_context_size: None,
+            max_output_size: None,
+            capabilities: Vec::new(),
+            display_name: None,
+            support_efforts: Vec::new(),
+            default_effort: None,
+            pricing: None,
+            experimental_adaptive_thinking: false,
+            experimental_visible_empty_retries: 0,
+            first_token_timeout_ms: None,
+        };
+        let mut provider = ProviderConfig {
+            provider_type: "openai".into(),
+            api_key: None,
+            base_url: None,
+            custom_headers: HashMap::new(),
+            oauth: None,
+            first_token_timeout_ms: Some(30_000),
+        };
+        assert_eq!(
+            resolve_first_token_timeout(&model, &provider),
+            Some(std::time::Duration::from_millis(30_000))
+        );
+        model.first_token_timeout_ms = Some(45_000);
+        assert_eq!(
+            resolve_first_token_timeout(&model, &provider),
+            Some(std::time::Duration::from_millis(45_000))
+        );
+        model.first_token_timeout_ms = Some(0);
+        assert_eq!(resolve_first_token_timeout(&model, &provider), None);
+        model.first_token_timeout_ms = None;
+        provider.first_token_timeout_ms = Some(0);
+        assert_eq!(resolve_first_token_timeout(&model, &provider), None);
+        provider.first_token_timeout_ms = None;
+        assert_eq!(
+            resolve_first_token_timeout(&model, &provider),
+            Some(std::time::Duration::from_millis(60_000))
+        );
+        model.first_token_timeout_ms = Some(300_000);
+        assert_eq!(
+            resolve_first_token_timeout(&model, &provider),
+            Some(std::time::Duration::from_millis(290_000))
+        );
     }
 
     #[test]
