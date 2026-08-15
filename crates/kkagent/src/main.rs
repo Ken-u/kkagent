@@ -394,10 +394,10 @@ async fn run(cli: Cli) -> Result<()> {
                     kkagent_config::default_config_dir().join("http-audit.jsonl")
                 })),
             };
-            run_server(config, listen, http, token, security).await
+            run_server(config, config_path, listen, http, token, security).await
         }
         Some(Commands::Acp) => {
-            let state = build_server_state(Arc::new(config)).await?;
+            let state = build_server_state(Arc::new(config), config_path).await?;
             let server = kkagent_acp::AcpServer::with_host(Arc::new(AgentAcpHost { state }));
             server.serve_stdio().await
         }
@@ -412,7 +412,7 @@ async fn run(cli: Cli) -> Result<()> {
         }
         None => {
             if let Some(prompt) = cli.prompt {
-                run_print_mode(config, prompt, permission_mode, cli.connect).await
+                run_print_mode(config, config_path, prompt, permission_mode, cli.connect).await
             } else {
                 run_tui(
                     config,
@@ -836,10 +836,10 @@ async fn run_tui(
                 maybe_auto_resume(&mut resume, false);
                 let (client_stream, server_stream) = create_memory_pair();
                 let server_config = Arc::new(config.clone());
-                let handle =
-                    tokio::spawn(
-                        async move { run_server_handler(server_stream, server_config).await },
-                    );
+                let server_config_path = config_path.clone();
+                let handle = tokio::spawn(async move {
+                    run_server_handler(server_stream, server_config, server_config_path).await
+                });
                 tokio::task::yield_now().await;
                 (RpcClient::new(client_stream, event_tx), Some(handle), false)
             }
@@ -848,8 +848,10 @@ async fn run_tui(
         maybe_auto_resume(&mut resume, false);
         let (client_stream, server_stream) = create_memory_pair();
         let server_config = Arc::new(config.clone());
-        let handle =
-            tokio::spawn(async move { run_server_handler(server_stream, server_config).await });
+        let server_config_path = config_path.clone();
+        let handle = tokio::spawn(async move {
+            run_server_handler(server_stream, server_config, server_config_path).await
+        });
         tokio::task::yield_now().await;
         (RpcClient::new(client_stream, event_tx), Some(handle), false)
     };
@@ -1123,6 +1125,7 @@ fn should_idle_shutdown(
 
 async fn run_print_mode(
     config: AppConfig,
+    config_path: PathBuf,
     prompt: String,
     permission_mode: PermissionMode,
     connect: Option<String>,
@@ -1135,8 +1138,9 @@ async fn run_print_mode(
     } else {
         let (client_stream, server_stream) = create_memory_pair();
         let config_arc = Arc::new(config.clone());
-        let handle =
-            tokio::spawn(async move { run_server_handler(server_stream, config_arc).await });
+        let handle = tokio::spawn(async move {
+            run_server_handler(server_stream, config_arc, config_path).await
+        });
         (RpcClient::new(client_stream, event_tx), Some(handle))
     };
 
@@ -1203,6 +1207,7 @@ async fn run_print_client(
 
 async fn run_server(
     config: AppConfig,
+    config_path: PathBuf,
     listen: Option<String>,
     http: Option<String>,
     http_token: Option<String>,
@@ -1225,9 +1230,10 @@ async fn run_server(
     let (state_tx, state_rx) = watch::channel(None::<Result<Arc<ServerState>, String>>);
 
     let init_config = config_arc.clone();
+    let init_config_path = config_path;
     let init_shutdown = shutdown_tx.clone();
     tokio::spawn(async move {
-        match build_server_state_with_shutdown(init_config, init_shutdown).await {
+        match build_server_state_with_shutdown(init_config, init_config_path, init_shutdown).await {
             Ok(state) => {
                 let _ = state_tx.send(Some(Ok(state)));
             }
@@ -1381,7 +1387,7 @@ struct AgentAcpHost {
 }
 
 async fn initialize_session_context(state: &ServerState, session: &mut Session) {
-    session.image_config = state.config.image.clone();
+    session.image_config = state.config().image.clone();
     session.inject_working_directory_context();
     session.inject_date_reminder();
     session.inject_workspace_instructions().await;
@@ -1421,13 +1427,13 @@ async fn ensure_session_loaded(state: &Arc<ServerState>, session_id: &str) -> Re
         (record, messages_from_records(&records))
     };
     let permission_mode = state
-        .config
+        .config()
         .effective_permission_mode()
         .parse()
         .unwrap_or_default();
     let model = if record.model.is_empty() {
         state
-            .config
+            .config()
             .default_model_alias()
             .unwrap_or("default")
             .to_string()
@@ -1541,7 +1547,7 @@ async fn recover_subagents(state: Arc<ServerState>) {
             continue;
         }
         let manager = state.subagents.clone();
-        let app_config = state.config.clone();
+        let app_config = state.config();
         let abort_manager = manager.clone();
         let abort_agent_id = agent_id.clone();
         let join = tokio::spawn(async move {
@@ -1590,13 +1596,13 @@ impl kkagent_acp::AcpHost for AgentAcpHost {
             .map_err(|e| format!("invalid ACP working directory {cwd}: {e}"))?;
         let model = self
             .state
-            .config
+            .config()
             .default_model_alias()
             .ok_or_else(|| "default_model is not configured".to_string())?
             .to_string();
         let permission_mode = self
             .state
-            .config
+            .config()
             .effective_permission_mode()
             .parse()
             .map_err(|_| "invalid default permission mode".to_string())?;
@@ -1756,7 +1762,7 @@ impl kkagent_acp::AcpHost for AgentAcpHost {
     }
 
     async fn set_model(&self, session_id: &str, model: &str) -> Result<(), String> {
-        if self.state.config.resolve_model(model).is_none() {
+        if self.state.config().resolve_model(model).is_none() {
             return Err(format!("unknown model alias: {model}"));
         }
         let aliases = self.state.model_aliases.lock().await;
@@ -1852,7 +1858,7 @@ impl kkagent_acp::AcpHost for AgentAcpHost {
     async fn list_models(&self) -> serde_json::Value {
         let models = self
             .state
-            .config
+            .config()
             .models
             .iter()
             .map(|(alias, model)| {
@@ -1943,7 +1949,7 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
         }
         let model = self
             .state
-            .config
+            .config()
             .default_model_alias()
             .ok_or_else(|| "default_model is not configured".to_string())?
             .to_string();
@@ -2226,7 +2232,7 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
     async fn list_models(&self) -> serde_json::Value {
         let mut models: Vec<_> = self
             .state
-            .config
+            .config()
             .models
             .iter()
             .map(|(alias, m)| {
@@ -2251,9 +2257,9 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
 
     async fn get_config(&self) -> serde_json::Value {
         serde_json::json!({
-            "default_model": self.state.config.default_model,
+            "default_model": self.state.config().default_model,
             "config_dir": kkagent_config::default_config_dir().display().to_string(),
-            "mcp_servers": self.state.config.mcp_servers.len(),
+            "mcp_servers": self.state.config().mcp_servers.len(),
             "sandbox": self.state.sandbox_snapshot().mode_name(),
         })
     }
@@ -2323,14 +2329,14 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
     }
 
     async fn fs_read(&self, path: &str) -> Result<String, String> {
-        let path = resolve_http_fs_path(&self.state.config, path, false)?;
+        let path = resolve_http_fs_path(self.state.config().as_ref(), path, false)?;
         tokio::fs::read_to_string(path)
             .await
             .map_err(|e| e.to_string())
     }
 
     async fn fs_write(&self, path: &str, content: &str) -> Result<(), String> {
-        let path = resolve_http_fs_path(&self.state.config, path, true)?;
+        let path = resolve_http_fs_path(self.state.config().as_ref(), path, true)?;
         if let Some(parent) = path.parent() {
             let _ = tokio::fs::create_dir_all(parent).await;
         }
@@ -2340,7 +2346,7 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
     }
 
     async fn list_files(&self, path: &str) -> Result<serde_json::Value, String> {
-        let path = resolve_http_fs_path(&self.state.config, path, false)?;
+        let path = resolve_http_fs_path(self.state.config().as_ref(), path, false)?;
         let mut directory = tokio::fs::read_dir(&path)
             .await
             .map_err(|error| error.to_string())?;
@@ -2471,7 +2477,7 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
                 "error": self.state.persistence_error,
             },
             "sessions": self.state.sessions.lock().await.len(),
-            "mcp_servers": self.state.config.mcp_servers.len(),
+            "mcp_servers": self.state.config().mcp_servers.len(),
             "sandbox": {
                 "mode": sandbox.mode_name(),
                 "network": sandbox.network,
@@ -2581,7 +2587,7 @@ async fn build_turn_tool_registry(
         todos,
     )));
     let auto_background_on_timeout = state
-        .config
+        .config()
         .background
         .as_ref()
         .and_then(|background| background.bash_auto_background_on_timeout)
@@ -2596,7 +2602,7 @@ async fn build_turn_tool_registry(
     register_mcp_tools(&mut tools, &state.mcp).await;
 
     let subagents = state.subagents.clone();
-    let config = state.config.clone();
+    let config = state.config();
     let launch: kkagent_tools::builtin::task::SubagentLaunchFn = Arc::new(move |sub_config| {
         let manager = subagents.clone();
         let app_config = config.clone();
@@ -2743,7 +2749,7 @@ async fn run_http_turn(
     let tools = build_turn_tool_registry(&state, event_tx.clone(), session.todo_items()).await;
 
     let permission_rules = state
-        .config
+        .config()
         .permission
         .as_ref()
         .map(|p| p.rules.clone())
@@ -2753,7 +2759,7 @@ async fn run_http_turn(
         permission_rules,
     )));
     let agent = AgentLoop::new(
-        state.config.clone(),
+        state.config(),
         Arc::new(tools),
         permission,
         event_tx,
@@ -2783,7 +2789,10 @@ async fn run_http_turn(
 }
 
 struct ServerState {
-    config: Arc<AppConfig>,
+    /// Hot-reloadable app config. Use [`Self::config`] / [`Self::replace_config`].
+    shared_config: StdRwLock<Arc<AppConfig>>,
+    /// Absolute path used for `/reload` / `config.reload`.
+    config_path: PathBuf,
     sandbox_policy: StdRwLock<kkagent_tools::sandbox::SandboxPolicy>,
     workspace_trust: StdRwLock<kkagent_config::WorkspaceTrustStore>,
     sessions: Mutex<HashMap<String, Session>>,
@@ -2922,6 +2931,20 @@ impl ActiveBtwSession {
 }
 
 impl ServerState {
+    fn config(&self) -> Arc<AppConfig> {
+        self.shared_config
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+
+    fn replace_config(&self, next: Arc<AppConfig>) {
+        *self
+            .shared_config
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = next;
+    }
+
     fn sandbox_snapshot(&self) -> kkagent_tools::sandbox::SandboxPolicy {
         self.sandbox_policy
             .read()
@@ -2939,7 +2962,7 @@ impl ServerState {
         {
             return true;
         }
-        kkagent_core::is_workspace_trusted(&self.config, workspace)
+        kkagent_core::is_workspace_trusted(&self.config(), workspace)
     }
 
     fn apply_workspace_trust(&self, trust: kkagent_config::WorkspaceTrust) -> anyhow::Result<()> {
@@ -3629,7 +3652,7 @@ fn configured_plugin_marketplace(config: &AppConfig, explicit: Option<&str>) -> 
 }
 
 async fn refresh_plugin_mcp(state: &ServerState) -> Result<(usize, usize)> {
-    let configs = combined_mcp_servers(&state.config, &state.plugins).await;
+    let configs = combined_mcp_servers(state.config().as_ref(), &state.plugins).await;
     let mut disabled: std::collections::HashSet<String> =
         state.mcp.disabled_names().await.into_iter().collect();
     disabled.extend(
@@ -3651,7 +3674,7 @@ async fn install_marketplace_plugin(
     id: &str,
     explicit_marketplace: Option<&str>,
 ) -> Result<kkagent_core::InstalledPluginRecord> {
-    let source = configured_plugin_marketplace(&state.config, explicit_marketplace)?;
+    let source = configured_plugin_marketplace(state.config().as_ref(), explicit_marketplace)?;
     let cwd = std::env::current_dir()?;
     let marketplace = state.plugins.marketplace(&source, &cwd).await?;
     let entry = marketplace
@@ -3691,13 +3714,17 @@ fn open_transcript_with_policy(
     }
 }
 
-async fn build_server_state(config: Arc<AppConfig>) -> Result<Arc<ServerState>> {
+async fn build_server_state(
+    config: Arc<AppConfig>,
+    config_path: PathBuf,
+) -> Result<Arc<ServerState>> {
     let (shutdown_tx, _) = watch::channel(false);
-    build_server_state_with_shutdown(config, shutdown_tx).await
+    build_server_state_with_shutdown(config, config_path, shutdown_tx).await
 }
 
 async fn build_server_state_with_shutdown(
     config: Arc<AppConfig>,
+    config_path: PathBuf,
     shutdown_tx: watch::Sender<bool>,
 ) -> Result<Arc<ServerState>> {
     let startup_started = std::time::Instant::now();
@@ -3852,7 +3879,8 @@ async fn build_server_state_with_shutdown(
     background_tasks.push(task.abort_handle());
 
     let state = Arc::new(ServerState {
-        config: config.clone(),
+        shared_config: StdRwLock::new(config.clone()),
+        config_path,
         sandbox_policy: StdRwLock::new(sandbox_policy),
         workspace_trust: StdRwLock::new(config.workspace_trust.clone()),
         sessions: Mutex::new(HashMap::new()),
@@ -3920,8 +3948,9 @@ async fn build_server_state_with_shutdown(
 async fn run_server_handler<T: kkagent_rpc::transport::AsyncTransport>(
     transport: T,
     config: Arc<AppConfig>,
+    config_path: PathBuf,
 ) -> Result<()> {
-    let state = build_server_state(config).await?;
+    let state = build_server_state(config, config_path).await?;
     run_server_handler_with_state(transport, state).await;
     Ok(())
 }
@@ -4131,15 +4160,15 @@ async fn spawn_session_agent_turn(
             .get(&session_id)
             .map(|a| a.lock().unwrap_or_else(|e| e.into_inner()).clone())
             .filter(|a| !a.is_empty())
-            .or_else(|| state.config.default_model_alias().map(|s| s.to_string()))
+            .or_else(|| state.config().default_model_alias().map(|s| s.to_string()))
             .ok_or_else(|| (-32000, "No default_model in config".into()))?
     };
-    if state.config.resolve_model(&model_alias).is_none() {
+    if state.config().resolve_model(&model_alias).is_none() {
         return Err((-32000, format!("Model '{model_alias}' not found")));
     }
 
     let permission_rules = state
-        .config
+        .config()
         .permission
         .as_ref()
         .map(|p| p.rules.clone())
@@ -4273,7 +4302,7 @@ async fn spawn_session_agent_turn(
         let permission = PermissionChain::with_shared_mode(shared_mode, permission_rules);
         let agent_loop = Arc::new(
             AgentLoop::new(
-                state_clone.config.clone(),
+                state_clone.config(),
                 Arc::new(tools),
                 Arc::new(Mutex::new(permission)),
                 agent_event_tx.clone(),
@@ -4589,6 +4618,49 @@ fn resolve_resume_working_dir(
     Ok(resolved)
 }
 
+async fn reload_server_config_from_disk(
+    state: Arc<ServerState>,
+) -> Result<serde_json::Value, (i32, String)> {
+    let path = state.config_path.clone();
+    let mut next = load_config(Some(&path)).map_err(|error| (-32000, error.to_string()))?;
+    hydrate_provider_oauth(&mut next)
+        .await
+        .map_err(|error| (-32000, error.to_string()))?;
+    let sandbox = kkagent_tools::sandbox::SandboxPolicy::from_app_config(&next)
+        .map_err(|error| (-32000, error.to_string()))?;
+    let model_count = next.models.len();
+    let mcp_server_count = next.mcp_servers.len();
+    let default_model = next.default_model.clone();
+    let disabled_skills = next.disabled_skills.clone();
+    let workspace_trust = next.workspace_trust.clone();
+    let next = Arc::new(next);
+
+    state.replace_config(next);
+    *state
+        .sandbox_policy
+        .write()
+        .unwrap_or_else(|error| error.into_inner()) = sandbox;
+    *state
+        .workspace_trust
+        .write()
+        .unwrap_or_else(|error| error.into_inner()) = workspace_trust;
+    state.skills.set_disabled(disabled_skills).await;
+
+    tracing::info!(
+        path = %path.display(),
+        models = model_count,
+        "Config reloaded from disk"
+    );
+    Ok(serde_json::json!({
+        "ok": true,
+        "path": path.display().to_string(),
+        "models": model_count,
+        "mcp_servers": mcp_server_count,
+        "default_model": default_model,
+        "mcp_hooks_restart_hint": true,
+    }))
+}
+
 async fn handle_rpc_call(
     state: Arc<ServerState>,
     method: &str,
@@ -4627,6 +4699,7 @@ async fn handle_rpc_call(
             state.request_shutdown();
             Ok(serde_json::json!({"ok": true}))
         }
+        "config.reload" => reload_server_config_from_disk(state).await,
         "workspace.trust" => {
             let value = params.ok_or_else(|| (-32602, "Missing workspace trust".to_string()))?;
             let trust: kkagent_config::WorkspaceTrust = serde_json::from_value(value)
@@ -4658,14 +4731,14 @@ async fn handle_rpc_call(
                 .and_then(|v| serde_json::from_value(v.clone()).ok())
                 .unwrap_or_else(|| {
                     state
-                        .config
+                        .config()
                         .effective_permission_mode()
                         .parse()
                         .unwrap_or_default()
                 });
 
             let model_alias = state
-                .config
+                .config()
                 .default_model_alias()
                 .unwrap_or("default")
                 .to_string();
@@ -5260,7 +5333,7 @@ async fn handle_rpc_call(
             }
 
             let configured_perm_mode = state
-                .config
+                .config()
                 .effective_permission_mode()
                 .parse()
                 .unwrap_or_default();
@@ -5280,7 +5353,7 @@ async fn handle_rpc_call(
                     .unwrap_or_else(|| {
                         if record.model.is_empty() {
                             state
-                                .config
+                                .config()
                                 .default_model_alias()
                                 .unwrap_or("default")
                                 .to_string()
@@ -5840,7 +5913,7 @@ async fn handle_rpc_call(
                             .clone()
                     })
                     .filter(|alias| !alias.is_empty())
-                    .or_else(|| state.config.default_model_alias().map(str::to_owned))
+                    .or_else(|| state.config().default_model_alias().map(str::to_owned))
                     .ok_or_else(|| (-32000, "No default_model in config".into()))?;
                 (active.service, active.agents, messages, model_alias)
             };
@@ -5872,7 +5945,7 @@ async fn handle_rpc_call(
                 .await;
 
             let rpc_state = state.clone();
-            let config = state.config.clone();
+            let config = state.config();
             let sid = session_id.clone();
             let q = question.clone();
             let event_agent_id = agent_id.clone();
@@ -6314,7 +6387,7 @@ async fn handle_rpc_call(
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| (-32602, "Missing model".into()))?
                 .to_string();
-            if state.config.resolve_model(&model).is_none() {
+            if state.config().resolve_model(&model).is_none() {
                 return Err((-32602, format!("Unknown model: {}", model)));
             }
             // Always update the shared Arc (works mid-turn while session is out of the map).
@@ -6377,7 +6450,7 @@ async fn handle_rpc_call(
                         .and_then(|v| v.as_str())
                         .filter(|model| !model.is_empty())
                         .ok_or_else(|| (-32602, "Missing fallback model".into()))?;
-                    if state.config.resolve_model(model).is_none() {
+                    if state.config().resolve_model(model).is_none() {
                         return Err((-32602, format!("Unknown fallback model: {model}")));
                     }
                     let primary = state
@@ -6784,7 +6857,7 @@ async fn handle_rpc_call(
         "plugins.marketplaces.list" => {
             let mut marketplaces = Vec::new();
             let mut sources = std::collections::HashSet::new();
-            if let Ok(source) = configured_plugin_marketplace(&state.config, None) {
+            if let Ok(source) = configured_plugin_marketplace(state.config().as_ref(), None) {
                 sources.insert(source.clone());
                 marketplaces.push(serde_json::json!({
                     "id": "default",
@@ -6849,7 +6922,7 @@ async fn handle_rpc_call(
                 .as_ref()
                 .and_then(|value| value.get("source"))
                 .and_then(|value| value.as_str());
-            let source = configured_plugin_marketplace(&state.config, explicit)
+            let source = configured_plugin_marketplace(state.config().as_ref(), explicit)
                 .map_err(|error| (-32602, error.to_string()))?;
             let cwd = std::env::current_dir().map_err(|error| (-32000, error.to_string()))?;
             let marketplace = state
@@ -7051,7 +7124,7 @@ async fn handle_rpc_call(
 
                 // LLM summary can take a while — do not hold the RPC handler.
                 let result = kkagent_core::compact_full_async(
-                    state_clone.config.clone(),
+                    state_clone.config(),
                     &mut messages,
                     instruction.as_deref(),
                 )

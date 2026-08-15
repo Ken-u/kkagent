@@ -4131,7 +4131,7 @@ impl TuiApp {
             }
             ListPickerKind::Config => match item.id.as_str() {
                 "reload" => {
-                    self.reload_config_from_disk();
+                    self.reload_config_from_disk().await;
                     self.open_config_picker();
                 }
                 id => {
@@ -4202,7 +4202,7 @@ impl TuiApp {
                     self.apply_help_command(&item.id).await?;
                 } else if item.id == "reload" {
                     self.state.list_picker_stack.push(picker);
-                    self.reload_config_from_disk();
+                    self.reload_config_from_disk().await;
                     self.pop_list_picker_level();
                 } else {
                     self.clear_list_pickers();
@@ -5666,7 +5666,7 @@ impl TuiApp {
             "skills" => self.open_skill_manager().await?,
             "swarm" => self.open_swarm_picker(),
             "plugins" | "plugin" => self.open_plugins_picker().await?,
-            "reload" => self.reload_config_from_disk(),
+            "reload" => self.reload_config_from_disk().await,
             other => {
                 let hint = find_slash_command(other)
                     .and_then(|c| c.argument_hint)
@@ -6413,15 +6413,36 @@ impl TuiApp {
         Ok(())
     }
 
-    fn reload_config_from_disk(&mut self) {
-        match kkagent_config::load_config(Some(&self.config_path)) {
-            Ok(config) => {
+    async fn reload_config_from_disk(&mut self) {
+        let local = kkagent_config::load_config(Some(&self.config_path));
+        let server = self.client.rpc_call("config.reload", None).await;
+        match (local, server) {
+            (Ok(config), Ok(result)) => {
                 self.config = config;
-                self.system_message(
-                    "Config reloaded from disk. Server-side MCP/hooks may need a restart.".into(),
-                );
+                let models = result
+                    .get("models")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(0);
+                self.system_message(format!(
+                    "Config reloaded from disk ({models} model(s)). MCP/hooks may still need a restart."
+                ));
             }
-            Err(e) => self.system_message(format!("Reload failed: {e}")),
+            (Ok(config), Err(error)) => {
+                self.config = config;
+                self.system_message(format!(
+                    "TUI config reloaded locally, but server reload failed: {error}"
+                ));
+            }
+            (Err(error), Ok(_)) => {
+                self.system_message(format!(
+                    "Server config reloaded, but local TUI reload failed: {error}"
+                ));
+            }
+            (Err(local_error), Err(server_error)) => {
+                self.system_message(format!(
+                    "Reload failed (server: {server_error}; local: {local_error})"
+                ));
+            }
         }
     }
 
@@ -9103,7 +9124,7 @@ impl TuiApp {
                 self.open_provider_picker();
             }
             "reload" => {
-                self.reload_config_from_disk();
+                self.reload_config_from_disk().await;
             }
             "web" => {
                 if args.is_empty() {

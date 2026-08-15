@@ -257,6 +257,13 @@ impl KkagentClient {
         Ok(())
     }
 
+    pub async fn reload_config(&self) -> anyhow::Result<serde_json::Value> {
+        self.rpc
+            .call("config.reload", None)
+            .await
+            .map_err(|e| anyhow::anyhow!("{}", e))
+    }
+
     pub async fn set_fallback_model(
         &self,
         session_id: &str,

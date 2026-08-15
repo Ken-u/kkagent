@@ -21,6 +21,8 @@ TUI / prompt / ACP / HTTP+WS
 
 Agent turn 事件（含 Thinking / StatusUpdate / TurnEnd）由 server 扇出到当前所有已连接的 RPC writer；TUI detach 后 turn 继续在 server 内跑，重新 attach 后新连接会立刻收到后续事件（断线窗口内的增量不补发，完整 transcript 靠 resume/history）。`AskUserQuestion` / 工具审批 / `/btw` / compact / 排队 prompt / 子 agent 摘要 / 最近 StatusUpdate 与部分 streaming 缓冲会记在 server，由 `session.resume` 带回。
 
+`/reload` 会调用 RPC `config.reload`：server 从磁盘热替换 `AppConfig`（含 models / permission / sandbox trust 等），TUI 同步刷新本地配置。MCP 连接与 hooks 进程仍可能需要重启才能吃到新定义。
+
 ## Crate 职责
 
 | crate | 职责 |
