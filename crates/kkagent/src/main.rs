@@ -2819,6 +2819,10 @@ struct ServerState {
     reconnect_ui: Mutex<HashMap<String, SessionReconnectUi>>,
     /// Live `/btw` panel state (survives TUI detach).
     pending_btw: Mutex<HashMap<String, PendingBtwUi>>,
+    /// TUI next-turn prompt queue (synced from client so reattach keeps it).
+    prompt_queues: Mutex<HashMap<String, PromptQueueSnapshot>>,
+    /// Parent-session subagent lifecycle summaries for reattach.
+    pending_subagents: Mutex<HashMap<String, Vec<PendingSubagentUi>>>,
     background_tasks: Mutex<Vec<AbortHandle>>,
     turn_locks: SessionTurnLocks,
     /// Recent session.prompt idempotency keys → first-seen time.
@@ -2865,6 +2869,31 @@ struct PendingBtwUi {
     streaming: bool,
     turns: Vec<BtwTurn>,
     retry_status: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct PromptQueueSnapshot {
+    selected: usize,
+    items: Vec<PromptQueueItem>,
+}
+
+#[derive(Debug, Clone)]
+struct PromptQueueItem {
+    id: String,
+    text: String,
+    images: Vec<(String, String)>,
+    as_steer: bool,
+}
+
+#[derive(Debug, Clone)]
+struct PendingSubagentUi {
+    subagent_id: String,
+    subagent_name: String,
+    parent_tool_call_id: String,
+    description: String,
+    status: String,
+    detail: Option<String>,
+    recent_child_events: Vec<String>,
 }
 
 impl ActiveBtwSession {
@@ -3201,6 +3230,99 @@ impl ServerState {
         }))
     }
 
+    async fn set_prompt_queue_snapshot(&self, session_id: &str, snapshot: PromptQueueSnapshot) {
+        let mut queues = self.prompt_queues.lock().await;
+        if snapshot.items.is_empty() {
+            queues.remove(session_id);
+        } else {
+            queues.insert(session_id.to_string(), snapshot);
+        }
+    }
+
+    async fn prompt_queue_for_session(&self, session_id: &str) -> Option<serde_json::Value> {
+        let queue = self.prompt_queues.lock().await.get(session_id)?.clone();
+        Some(serde_json::json!({
+            "selected": queue.selected,
+            "items": queue.items.iter().map(|item| serde_json::json!({
+                "id": item.id,
+                "text": item.text,
+                "images": item.images.iter().map(|(media_type, data)| serde_json::json!({
+                    "media_type": media_type,
+                    "data": data,
+                })).collect::<Vec<_>>(),
+                "as_steer": item.as_steer,
+            })).collect::<Vec<_>>(),
+        }))
+    }
+
+    async fn upsert_pending_subagent(&self, session_id: &str, entry: PendingSubagentUi) {
+        let mut map = self.pending_subagents.lock().await;
+        let list = map.entry(session_id.to_string()).or_default();
+        if let Some(existing) = list
+            .iter_mut()
+            .find(|item| item.subagent_id == entry.subagent_id)
+        {
+            *existing = entry;
+        } else {
+            list.push(entry);
+        }
+    }
+
+    async fn update_pending_subagent_status(
+        &self,
+        session_id: &str,
+        subagent_id: &str,
+        status: &str,
+        detail: Option<String>,
+    ) {
+        let mut map = self.pending_subagents.lock().await;
+        if let Some(list) = map.get_mut(session_id) {
+            if let Some(entry) = list.iter_mut().find(|item| item.subagent_id == subagent_id) {
+                entry.status = status.to_string();
+                if detail.is_some() {
+                    entry.detail = detail;
+                }
+            }
+        }
+    }
+
+    async fn push_pending_subagent_child(&self, session_id: &str, subagent_id: &str, line: String) {
+        let mut map = self.pending_subagents.lock().await;
+        if let Some(list) = map.get_mut(session_id) {
+            if let Some(entry) = list.iter_mut().find(|item| item.subagent_id == subagent_id) {
+                entry.recent_child_events.push(line);
+                const MAX_CHILD: usize = 12;
+                if entry.recent_child_events.len() > MAX_CHILD {
+                    let skip = entry.recent_child_events.len() - MAX_CHILD;
+                    entry.recent_child_events.drain(0..skip);
+                }
+            }
+        }
+    }
+
+    async fn clear_pending_subagents(&self, session_id: &str) {
+        self.pending_subagents.lock().await.remove(session_id);
+    }
+
+    async fn pending_subagents_for_session(&self, session_id: &str) -> Option<serde_json::Value> {
+        let list = self.pending_subagents.lock().await.get(session_id)?.clone();
+        if list.is_empty() {
+            return None;
+        }
+        Some(serde_json::json!(list
+            .into_iter()
+            .map(|item| serde_json::json!({
+                "subagent_id": item.subagent_id,
+                "subagent_name": item.subagent_name,
+                "parent_tool_call_id": item.parent_tool_call_id,
+                "description": item.description,
+                "status": item.status,
+                "detail": item.detail,
+                "recent_child_events": item.recent_child_events,
+            }))
+            .collect::<Vec<_>>()))
+    }
+
     async fn resume_status_for_session(
         &self,
         session_id: &str,
@@ -3234,6 +3356,12 @@ impl ServerState {
         }
         if let Some(btw) = self.pending_btw_for_session(session_id).await {
             extra.insert("pending_btw".into(), btw);
+        }
+        if let Some(queue) = self.prompt_queue_for_session(session_id).await {
+            extra.insert("prompt_queue".into(), queue);
+        }
+        if let Some(subagents) = self.pending_subagents_for_session(session_id).await {
+            extra.insert("pending_subagents".into(), subagents);
         }
         extra
     }
@@ -3318,6 +3446,102 @@ impl ServerState {
                 self.clear_pending_question(session_id, None).await;
                 self.clear_pending_tool_approval(session_id, None).await;
                 self.clear_reconnect_ui(session_id).await;
+                self.clear_pending_subagents(session_id).await;
+            }
+            AgentEvent::SubagentSpawned {
+                session_id,
+                subagent_id,
+                subagent_name,
+                parent_tool_call_id,
+                description,
+                ..
+            } => {
+                self.upsert_pending_subagent(
+                    session_id,
+                    PendingSubagentUi {
+                        subagent_id: subagent_id.clone(),
+                        subagent_name: subagent_name.clone(),
+                        parent_tool_call_id: parent_tool_call_id.clone(),
+                        description: description.clone().unwrap_or_default(),
+                        status: "pending".into(),
+                        detail: None,
+                        recent_child_events: Vec::new(),
+                    },
+                )
+                .await;
+            }
+            AgentEvent::SubagentStarted {
+                session_id,
+                subagent_id,
+                ..
+            } => {
+                self.update_pending_subagent_status(session_id, subagent_id, "running", None)
+                    .await;
+            }
+            AgentEvent::SubagentCompleted {
+                session_id,
+                subagent_id,
+                result_summary,
+                ..
+            } => {
+                self.update_pending_subagent_status(
+                    session_id,
+                    subagent_id,
+                    "complete",
+                    Some(result_summary.chars().take(240).collect()),
+                )
+                .await;
+            }
+            AgentEvent::SubagentFailed {
+                session_id,
+                subagent_id,
+                error,
+                ..
+            } => {
+                self.update_pending_subagent_status(
+                    session_id,
+                    subagent_id,
+                    "failed",
+                    Some(error.chars().take(240).collect()),
+                )
+                .await;
+            }
+            AgentEvent::SubagentChildEvent {
+                session_id,
+                subagent_id,
+                event,
+                ..
+            } => {
+                let line = match event.as_ref() {
+                    AgentEvent::ToolCall {
+                        tool_name, input, ..
+                    } => {
+                        let brief = serde_json::to_string(input)
+                            .unwrap_or_default()
+                            .chars()
+                            .take(80)
+                            .collect::<String>();
+                        Some(format!("tool {tool_name} {brief}"))
+                    }
+                    AgentEvent::ToolResult {
+                        tool_name,
+                        output,
+                        is_error,
+                        ..
+                    } => {
+                        let mark = if *is_error { "!" } else { "ok" };
+                        Some(format!(
+                            "{tool_name} [{mark}] {}",
+                            output.chars().take(120).collect::<String>()
+                        ))
+                    }
+                    AgentEvent::Error { message, .. } => Some(format!("error: {message}")),
+                    _ => None,
+                };
+                if let Some(line) = line {
+                    self.push_pending_subagent_child(session_id, subagent_id, line)
+                        .await;
+                }
             }
             AgentEvent::CompactCompleted { session_id, .. } => {
                 self.set_reconnect_status(session_id, SessionStatus::Idle)
@@ -3644,6 +3868,8 @@ async fn build_server_state_with_shutdown(
         pending_tool_approvals: Mutex::new(HashMap::new()),
         reconnect_ui: Mutex::new(HashMap::new()),
         pending_btw: Mutex::new(HashMap::new()),
+        prompt_queues: Mutex::new(HashMap::new()),
+        pending_subagents: Mutex::new(HashMap::new()),
         background_tasks: Mutex::new(background_tasks),
         turn_locks: SessionTurnLocks::default(),
         prompt_idempotency: Mutex::new(HashMap::new()),
@@ -5871,6 +6097,75 @@ async fn handle_rpc_call(
                 active.service.clear(&active.agents);
             }
             state.clear_pending_btw(session_id).await;
+            Ok(serde_json::json!({"ok": true}))
+        }
+        "session.set_prompt_queue" => {
+            let session_id = params
+                .as_ref()
+                .and_then(|p| p.get("session_id"))
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| (-32602, "Missing session_id".into()))?
+                .to_string();
+            let selected = params
+                .as_ref()
+                .and_then(|p| p.get("selected"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as usize;
+            let items = params
+                .as_ref()
+                .and_then(|p| p.get("items"))
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|item| {
+                            let text = item.get("text")?.as_str()?.to_string();
+                            let id = item
+                                .get("id")
+                                .and_then(|v| v.as_str())
+                                .map(str::to_string)
+                                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                            let images = item
+                                .get("images")
+                                .and_then(|v| v.as_array())
+                                .map(|imgs| {
+                                    imgs.iter()
+                                        .filter_map(|img| {
+                                            let media_type = img
+                                                .get("media_type")
+                                                .or_else(|| img.get("mime_type"))
+                                                .and_then(|v| v.as_str())?
+                                                .to_string();
+                                            let data = img
+                                                .get("data")
+                                                .and_then(|v| v.as_str())?
+                                                .to_string();
+                                            Some((media_type, data))
+                                        })
+                                        .collect::<Vec<_>>()
+                                })
+                                .unwrap_or_default();
+                            let as_steer = item
+                                .get("as_steer")
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false);
+                            Some(PromptQueueItem {
+                                id,
+                                text,
+                                images,
+                                as_steer,
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let selected = if items.is_empty() {
+                0
+            } else {
+                selected.min(items.len() - 1)
+            };
+            state
+                .set_prompt_queue_snapshot(&session_id, PromptQueueSnapshot { selected, items })
+                .await;
             Ok(serde_json::json!({"ok": true}))
         }
         "session.set_permission_mode" => {

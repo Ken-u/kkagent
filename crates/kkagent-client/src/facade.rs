@@ -275,6 +275,24 @@ impl KkagentClient {
         Ok(())
     }
 
+    pub async fn set_prompt_queue_json(
+        &self,
+        session_id: &str,
+        selected: usize,
+        items: Vec<serde_json::Value>,
+    ) -> anyhow::Result<()> {
+        let params = serde_json::json!({
+            "session_id": session_id,
+            "selected": selected,
+            "items": items,
+        });
+        self.rpc
+            .call("session.set_prompt_queue", Some(params))
+            .await
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        Ok(())
+    }
+
     /// Whether the connected server currently has any in-flight agent turns.
     pub async fn has_active_turns(&self) -> anyhow::Result<bool> {
         let result = self

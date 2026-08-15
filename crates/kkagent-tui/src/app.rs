@@ -2198,6 +2198,76 @@ impl TuiApp {
         }
     }
 
+    fn prompt_queue_items_json(&self) -> Vec<serde_json::Value> {
+        self.state
+            .prompt_queue
+            .items
+            .iter()
+            .map(|item| {
+                serde_json::json!({
+                    "id": item.id,
+                    "text": item.text,
+                    "images": item.images.iter().map(|(media_type, data)| {
+                        serde_json::json!({
+                            "media_type": media_type,
+                            "data": data,
+                        })
+                    }).collect::<Vec<_>>(),
+                    "as_steer": item.as_steer,
+                })
+            })
+            .collect()
+    }
+
+    /// Fire-and-forget sync so reconnect can restore the next-turn queue.
+    fn enqueue_prompt_queue_sync(&self) {
+        let Some(session_id) = self.state.session_id.clone() else {
+            return;
+        };
+        if !self.allows_background_detach {
+            return;
+        }
+        let items = self.prompt_queue_items_json();
+        let selected = self.state.prompt_queue.selected;
+        let requester = self.client.requester();
+        tokio::spawn(async move {
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                requester.rpc_call(
+                    "session.set_prompt_queue",
+                    Some(serde_json::json!({
+                        "session_id": session_id,
+                        "selected": selected,
+                        "items": items,
+                    })),
+                ),
+            )
+            .await;
+        });
+    }
+
+    async fn sync_prompt_queue(&self) {
+        let Some(session_id) = self.state.session_id.clone() else {
+            return;
+        };
+        if !self.allows_background_detach {
+            return;
+        }
+        let items = self.prompt_queue_items_json();
+        let selected = self.state.prompt_queue.selected;
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            self.client
+                .set_prompt_queue_json(&session_id, selected, items),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => tracing::warn!(%error, "failed to sync prompt queue"),
+            Err(_) => tracing::warn!("timed out syncing prompt queue"),
+        }
+    }
+
     async fn has_server_active_turns(&self) -> bool {
         if session_status_has_active_agent_loop(self.state.status) {
             return true;
@@ -2232,10 +2302,12 @@ impl TuiApp {
                         self.state.status = SessionStatus::Cancelling;
                     }
                 }
+                self.sync_prompt_queue().await;
                 self.state.should_quit = true;
             }
             1 => {
                 // Background: keep turn, save session, exit.
+                self.sync_prompt_queue().await;
                 self.persist_active_session_marker();
                 self.state.should_quit = true;
             }
@@ -2654,6 +2726,7 @@ impl TuiApp {
                 let _ = self.dismiss_transient_ui();
                 return Ok(());
             }
+            self.sync_prompt_queue().await;
             self.persist_active_session_marker();
             self.state.should_quit = true;
             return Ok(());
@@ -3279,6 +3352,7 @@ impl TuiApp {
                         self.state.quit_dialog = Some(QuitDialogState { selected: 1 });
                         self.state.quit_confirm = false;
                     } else {
+                        self.sync_prompt_queue().await;
                         self.persist_active_session_marker();
                         self.state.should_quit = true;
                     }
@@ -3349,6 +3423,7 @@ impl TuiApp {
                         self.confirm_delete_session(true).await?;
                     }
                 } else if self.state.quit_confirm {
+                    self.sync_prompt_queue().await;
                     self.persist_active_session_marker();
                     self.state.should_quit = true;
                 } else {
@@ -7114,6 +7189,129 @@ impl TuiApp {
                 }
             }
         }
+        if let Some(queue) = data.get("prompt_queue") {
+            let items = queue
+                .get("items")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|item| {
+                            let text = item.get("text")?.as_str()?.to_string();
+                            let id = item
+                                .get("id")
+                                .and_then(|v| v.as_str())
+                                .map(str::to_string)
+                                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                            let images = item
+                                .get("images")
+                                .and_then(|v| v.as_array())
+                                .map(|imgs| {
+                                    imgs.iter()
+                                        .filter_map(|img| {
+                                            let media_type = img
+                                                .get("media_type")
+                                                .or_else(|| img.get("mime_type"))
+                                                .and_then(|v| v.as_str())?
+                                                .to_string();
+                                            let data = img
+                                                .get("data")
+                                                .and_then(|v| v.as_str())?
+                                                .to_string();
+                                            Some((media_type, data))
+                                        })
+                                        .collect::<Vec<_>>()
+                                })
+                                .unwrap_or_default();
+                            let as_steer = item
+                                .get("as_steer")
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false);
+                            Some(crate::prompt_queue::QueuedPrompt {
+                                id,
+                                session_id: sid.clone(),
+                                text,
+                                images,
+                                as_steer,
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let selected = queue.get("selected").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            self.state.prompt_queue = crate::prompt_queue::PromptQueue {
+                selected: if items.is_empty() {
+                    0
+                } else {
+                    selected.min(items.len() - 1)
+                },
+                items: items.clone(),
+            };
+            for item in &items {
+                let already = self.state.messages.iter().any(|message| {
+                    message.role == MessageRole::User
+                        && message.delivery == crate::prompt_queue::DeliveryState::Queued
+                        && message.content == item.text
+                });
+                if !already {
+                    self.state.messages.push(DisplayMessage {
+                        role: MessageRole::User,
+                        content: item.text.clone(),
+                        thinking: None,
+                        parts: Vec::new(),
+                        tool_calls: Vec::new(),
+                        delivery: crate::prompt_queue::DeliveryState::Queued,
+                        idempotency_key: None,
+                    });
+                }
+            }
+            if !items.is_empty() {
+                self.system_message(format!(
+                    "Restored {} queued prompt(s) from before disconnect.",
+                    items.len()
+                ));
+            }
+        }
+        if let Some(subagents) = data.get("pending_subagents").and_then(|v| v.as_array()) {
+            for item in subagents {
+                let id = item
+                    .get("subagent_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?");
+                let name = item
+                    .get("subagent_name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("subagent");
+                let status = item
+                    .get("status")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                let parent = item
+                    .get("parent_tool_call_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("-");
+                let desc = item
+                    .get("description")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let detail = item.get("detail").and_then(|v| v.as_str()).unwrap_or("");
+                let mut line =
+                    format!("⊟ subagent [{name}] id={id} status={status} under {parent}");
+                if !desc.is_empty() {
+                    line.push_str(&format!(": {desc}"));
+                }
+                if !detail.is_empty() {
+                    line.push_str(&format!(" — {detail}"));
+                }
+                self.system_message(line);
+                if let Some(children) = item.get("recent_child_events").and_then(|v| v.as_array()) {
+                    for child in children.iter().rev().take(6).rev() {
+                        if let Some(text) = child.as_str() {
+                            self.system_message(format!("  ↳ [{id}] {text}"));
+                        }
+                    }
+                }
+            }
+        }
         if let Some(todos) = data.get("todos").and_then(|value| value.as_array()) {
             self.state.todos = todos
                 .iter()
@@ -7244,6 +7442,8 @@ impl TuiApp {
             self.drop_background_session_events(&sid);
         }
         self.sync_active_session_status();
+        // Turn may have finished while detached; drain restored queue immediately.
+        self.flush_prompt_queue_if_idle();
         Ok(())
     }
 
@@ -8181,6 +8381,7 @@ impl TuiApp {
             idem,
         );
         crate::draft_store::clear_draft(&session_id);
+        self.enqueue_prompt_queue_sync();
         self.system_message("Steer sent — applying at the next model step.".into());
         Ok(())
     }
@@ -8265,6 +8466,7 @@ impl TuiApp {
                 "Queued ({} waiting) — will send after current turn.",
                 self.state.prompt_queue.items.len()
             ));
+            self.enqueue_prompt_queue_sync();
             return Ok(());
         }
 
@@ -8364,6 +8566,7 @@ impl TuiApp {
         self.state.status = SessionStatus::Thinking;
         self.jobs
             .spawn_prompt(self.client.requester(), sid, item.text, item.images, idem);
+        self.enqueue_prompt_queue_sync();
     }
 
     async fn handle_slash_command(&mut self, cmd: &str) -> anyhow::Result<()> {
@@ -8440,6 +8643,7 @@ impl TuiApp {
                 }
             }
             "exit" | "quit" | "q" => {
+                self.sync_prompt_queue().await;
                 self.persist_active_session_marker();
                 self.state.should_quit = true;
             }
@@ -12260,6 +12464,57 @@ mod app_state_tests {
         assert_eq!(app.state.btw.turns.len(), 1);
     }
 
+    #[tokio::test]
+    async fn resume_restores_prompt_queue_and_subagent_summary() {
+        let mut app = test_tui_app();
+        app.apply_session_resume_data(
+            "session-queue",
+            serde_json::json!({
+                "session_id": "session-queue",
+                "messages": [],
+                "turn_active": true,
+                "status": "thinking",
+                "prompt_queue": {
+                    "selected": 0,
+                    "items": [{
+                        "id": "q1",
+                        "text": "follow up later",
+                        "images": [],
+                        "as_steer": false
+                    }]
+                },
+                "pending_subagents": [{
+                    "subagent_id": "sa-1",
+                    "subagent_name": "explore",
+                    "parent_tool_call_id": "tool-1",
+                    "description": "scan files",
+                    "status": "running",
+                    "detail": null,
+                    "recent_child_events": ["tool Read {\"path\":\"a.rs\"}"]
+                }]
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(app.state.prompt_queue.items.len(), 1);
+        assert_eq!(app.state.prompt_queue.items[0].text, "follow up later");
+        assert!(app.state.messages.iter().any(|m| {
+            m.role == MessageRole::User
+                && m.delivery == crate::prompt_queue::DeliveryState::Queued
+                && m.content == "follow up later"
+        }));
+        assert!(app.state.messages.iter().any(|m| {
+            m.role == MessageRole::System
+                && m.content.contains("sa-1")
+                && m.content.contains("running")
+        }));
+        assert!(app
+            .state
+            .messages
+            .iter()
+            .any(|m| { m.role == MessageRole::System && m.content.contains("Read") }));
+    }
+
     fn pending_plan_revision() -> (PendingApproval, ApprovalChoice) {
         let choice = ApprovalChoice {
             label: "修改意见".into(),
@@ -13271,6 +13526,7 @@ mod app_state_tests {
                             interrupt_tx.send(params.unwrap()).unwrap();
                             Ok(serde_json::json!({"ok": true}))
                         }
+                        "session.set_prompt_queue" => Ok(serde_json::json!({"ok": true})),
                         other => panic!("unexpected RPC method: {other}"),
                     }
                 }
@@ -13323,6 +13579,7 @@ mod app_state_tests {
                         "runtime.has_active_turns" => {
                             Ok(serde_json::json!({"active": true, "sessions": ["running"]}))
                         }
+                        "session.set_prompt_queue" => Ok(serde_json::json!({"ok": true})),
                         other => panic!("unexpected RPC method: {other}"),
                     }
                 }
