@@ -13,6 +13,7 @@ use crate::{Tool, ToolContext, ToolOutput};
 const MAX_OUTPUT: usize = 50_000;
 pub const DEFAULT_TIMEOUT_S: u64 = 120; // 2 minutes foreground default
 const MAX_TIMEOUT_S: u64 = 300; // 5 minutes foreground
+const MIN_TIMEOUT_S: u64 = 1; // clamp zero/undersized timeouts to 1s to avoid instant kills
 const DEFAULT_BG_TIMEOUT_S: u64 = 600;
 const MAX_BG_TIMEOUT_S: u64 = 86_400; // 24h
 const MAX_BACKGROUND_JOBS: usize = 256;
@@ -391,7 +392,7 @@ fn resolve_timeout_ms(input: &Value, run_in_background: bool, default_fg_timeout
         } else {
             MAX_TIMEOUT_S * 1000
         };
-        return ms.min(cap);
+        return ms.min(cap).max(1000);
     }
     let default_s = if run_in_background {
         DEFAULT_BG_TIMEOUT_S
@@ -407,7 +408,7 @@ fn resolve_timeout_ms(input: &Value, run_in_background: bool, default_fg_timeout
         .get("timeout")
         .and_then(|v| v.as_u64())
         .unwrap_or(default_s)
-        .min(cap_s);
+        .clamp(MIN_TIMEOUT_S, cap_s);
     secs.saturating_mul(1000)
 }
 
@@ -1258,5 +1259,29 @@ mod tests {
         .await
         .expect("background cancellation must finish promptly");
         assert!(final_output.content.contains("process tree killed"));
+    }
+
+    #[test]
+    fn resolve_timeout_ms_clamps_zero_and_undersized_values() {
+        // timeout_ms = 0 must not translate into an instant kill.
+        assert_eq!(
+            resolve_timeout_ms(&json!({"timeout_ms": 0}), false, 120),
+            1000
+        );
+        // timeout (seconds) = 0 falls back to clamping at the 1s floor too.
+        assert_eq!(resolve_timeout_ms(&json!({"timeout": 0}), false, 120), 1000);
+        // A zero default (misconfigured bash_task_timeout_s) still floors at 1s.
+        assert_eq!(resolve_timeout_ms(&json!({}), false, 0), 1000);
+        // Normal values keep flowing through untouched.
+        assert_eq!(resolve_timeout_ms(&json!({}), false, 120), 120_000);
+        assert_eq!(
+            resolve_timeout_ms(&json!({"timeout": 5}), false, 120),
+            5_000
+        );
+        // Foreground caps at MAX_TIMEOUT_S.
+        assert_eq!(
+            resolve_timeout_ms(&json!({"timeout": 9_999}), false, 120),
+            300_000
+        );
     }
 }

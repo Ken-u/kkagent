@@ -49,6 +49,15 @@ pub async fn resolve_path(store: &AcpSessionStore, params: &Value) -> Result<Pat
         }
     }
     let cwd_canon = std::fs::canonicalize(&cwd).unwrap_or(cwd.clone());
+    // Defense in depth: refuse paths that traverse a symlink component, so a
+    // pre-existing `cwd/link -> /etc` cannot be used to write outside the
+    // workspace (approximates O_NOFOLLOW for the write tools below).
+    if has_symlink_component(&cwd, &normalized) {
+        return Err(format!(
+            "path traverses a symlink and may escape the session workspace: {}",
+            candidate.display()
+        ));
+    }
     // Compare against cwd: if normalized is absolute and outside cwd_canon, reject.
     if normalized.is_absolute() {
         if let Ok(canon) = std::fs::canonicalize(&normalized) {
@@ -78,6 +87,24 @@ pub async fn resolve_path(store: &AcpSessionStore, params: &Value) -> Result<Pat
         return Ok(normalized);
     }
     Ok(normalized)
+}
+
+/// Returns true when any component of `path` below `cwd` is an existing symlink.
+fn has_symlink_component(cwd: &Path, path: &Path) -> bool {
+    let Ok(rel) = path.strip_prefix(cwd) else {
+        return false;
+    };
+    let mut cur = cwd.to_path_buf();
+    for comp in rel.components() {
+        cur.push(comp.as_os_str());
+        if std::fs::symlink_metadata(&cur)
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            return true;
+        }
+    }
+    false
 }
 
 pub async fn read_text(store: &AcpSessionStore, params: &Value) -> Result<Value, String> {

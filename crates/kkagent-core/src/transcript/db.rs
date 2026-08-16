@@ -99,17 +99,19 @@ fn fts_query_from_user(query: &str) -> String {
     query
         .split_whitespace()
         .filter(|t| !t.is_empty())
-        .map(|token| {
+        .filter_map(|token| {
             let cleaned: String = token
                 .chars()
                 .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-' || *c == '.')
                 .collect();
-            if cleaned.is_empty() {
-                return String::new();
+            // Skip tokens without at least one alphanumeric/underscore character:
+            // punctuation-only prefixes like `"."*` match nothing on modern FTS5 and
+            // raise syntax errors on older builds.
+            if !cleaned.chars().any(|c| c.is_alphanumeric() || c == '_') {
+                return None;
             }
-            format!("\"{cleaned}\"*")
+            Some(format!("\"{cleaned}\"*"))
         })
-        .filter(|t| !t.is_empty())
         .collect::<Vec<_>>()
         .join(" ")
 }
@@ -1269,5 +1271,27 @@ mod tests {
             .unwrap();
         assert_eq!(titled.len(), 1);
         assert_eq!(titled[0].session_id, "s2");
+    }
+
+    #[test]
+    fn test_fts_query_from_user_skips_punctuation_only_tokens() {
+        assert_eq!(fts_query_from_user("hello"), "\"hello\"*");
+        assert_eq!(fts_query_from_user("foo bar"), "\"foo\"* \"bar\"*");
+        // Punctuation-only tokens are dropped instead of producing `"."*`
+        // which matches nothing (and errors on older FTS5 builds).
+        assert_eq!(fts_query_from_user("."), "");
+        assert_eq!(fts_query_from_user("- -- ..."), "");
+        assert_eq!(fts_query_from_user("!!! ???"), "");
+        // Mixed tokens keep their alphanumeric core.
+        assert_eq!(fts_query_from_user("foo-bar."), "\"foo-bar.\"*");
+        // A query that is entirely punctuation yields no hits, not an error.
+        let db = test_db();
+        db.create_session("s1", "claude", ".").unwrap();
+        db.append_message("s1", "user", r#"[{"type":"text","text":"hello"}]"#, None)
+            .unwrap();
+        let hits = db
+            .search_messages("--- ... !!!", 10, None, None, None, None)
+            .unwrap();
+        assert!(hits.is_empty());
     }
 }

@@ -705,6 +705,42 @@ mod tests {
         assert!(read.error.is_some());
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fs_rejects_symlink_escape() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let server = AcpServer::new();
+        let sid = new_session(&server, dir.path().to_str().unwrap()).await;
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("link")).unwrap();
+        let write = server
+            .handle(AcpRequest {
+                jsonrpc: "2.0".into(),
+                id: Some(json!(1)),
+                method: "fs/write_text_file".into(),
+                params: json!({
+                    "sessionId": sid,
+                    "path": "link/escaped.txt",
+                    "content": "should not land outside",
+                }),
+            })
+            .await;
+        assert!(write.error.is_some(), "{write:?}");
+        assert!(!outside.path().join("escaped.txt").exists());
+        let read = server
+            .handle(AcpRequest {
+                jsonrpc: "2.0".into(),
+                id: Some(json!(2)),
+                method: "fs/read_text_file".into(),
+                params: json!({
+                    "sessionId": sid,
+                    "path": "link/escaped.txt",
+                }),
+            })
+            .await;
+        assert!(read.error.is_some(), "{read:?}");
+    }
+
     #[tokio::test]
     async fn terminal_exec_via_kaos() {
         let dir = tempfile::tempdir().unwrap();

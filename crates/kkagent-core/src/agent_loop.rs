@@ -707,7 +707,7 @@ Do not mention this reminder to the user.\n</system-reminder>"
                                 .await;
                         }
                         StreamEvent::Error(msg) => {
-                            if msg.contains("first token timeout:") {
+                            if msg.contains(kkagent_llm::FIRST_TOKEN_TIMEOUT_MARKER) {
                                 tracing::warn!(
                                     model = %model_config.model,
                                     provider = %provider_config.provider_type,

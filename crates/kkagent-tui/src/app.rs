@@ -1150,15 +1150,17 @@ impl AppState {
     pub fn compensate_scroll_anchor(&mut self, new_content_height: u16) {
         if !self.follow_bottom {
             if let Some(prev) = self.prev_content_lines {
-                let delta = new_content_height as i32 - prev as i32;
-                if delta != 0 {
-                    self.scroll_up = (self.scroll_up as i32 + delta).max(0) as u16;
+                if new_content_height > prev {
+                    // Content grew: push the anchor down by the same amount,
+                    // saturating instead of truncating through a u16 cast.
+                    self.scroll_up = self.scroll_up.saturating_add(new_content_height - prev);
+                } else if new_content_height < prev {
+                    // Content shrank: pull the anchor back, never below 0.
+                    self.scroll_up = self.scroll_up.saturating_sub(prev - new_content_height);
                 }
             }
             let max = new_content_height.saturating_sub(self.viewport_height.max(1));
-            if self.scroll_up > max {
-                self.scroll_up = max;
-            }
+            self.scroll_up = self.scroll_up.min(max);
         }
         self.prev_content_lines = Some(new_content_height);
     }
@@ -14075,6 +14077,26 @@ mod app_state_tests {
         assert_eq!(
             state.scroll_up, 0,
             "scroll_up should be clamped to 0 when content fits in viewport"
+        );
+    }
+
+    #[test]
+    fn compensate_scroll_anchor_saturates_instead_of_truncating() {
+        let mut state = AppState::new(PermissionMode::Manual, false);
+        state.viewport_height = 1;
+        // Extreme-but-legal values: scroll_up near u16::MAX with growth delta.
+        // Old i32->u16 cast would wrap 65540 -> 4; saturation must clamp.
+        state.scroll_up = u16::MAX - 5;
+        state.follow_bottom = false;
+        state.prev_content_lines = Some(u16::MAX - 10);
+
+        // Growth of 10 lines saturates at u16::MAX, then the max-scroll clamp
+        // lands at u16::MAX - 1 (content minus the 1-line viewport).
+        state.compensate_scroll_anchor(u16::MAX);
+        assert_eq!(
+            state.scroll_up,
+            u16::MAX - 1,
+            "growth near u16::MAX must saturate, not wrap to a small value"
         );
     }
 }

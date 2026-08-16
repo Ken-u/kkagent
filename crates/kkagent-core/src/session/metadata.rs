@@ -246,7 +246,9 @@ impl SessionMetadataService {
             ..Default::default()
         };
         // Freeze the first real user prompt for stable tab / picker labels.
-        if self.data.first_prompt.is_none() {
+        // Whitespace-only text must not claim the slot (accidental empty send),
+        // otherwise tabs/pickers would stick with a blank label forever.
+        if self.data.first_prompt.is_none() && !short.trim().is_empty() {
             patch.first_prompt = Some(Some(short));
         }
         self.update(patch, true)
@@ -299,6 +301,18 @@ mod tests {
         svc.set_last_prompt("second question").unwrap();
         assert_eq!(svc.read().first_prompt.as_deref(), Some("first question"));
         assert_eq!(svc.read().last_prompt.as_deref(), Some("second question"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn first_prompt_ignores_whitespace_only_prompts() {
+        let dir = std::env::temp_dir().join(format!("kkagent-meta-ws-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut svc = SessionMetadataService::create_new(&dir, "abc", Path::new("/w")).unwrap();
+        svc.set_last_prompt("   \n\t ").unwrap();
+        assert!(svc.read().first_prompt.is_none());
+        svc.set_last_prompt("real prompt").unwrap();
+        assert_eq!(svc.read().first_prompt.as_deref(), Some("real prompt"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

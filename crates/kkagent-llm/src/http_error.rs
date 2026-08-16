@@ -19,9 +19,14 @@ impl LlmHttpError {
     }
 }
 
+/// Canonical error-message marker for first-token timeouts. All matching sites
+/// (agent_loop classification, stream tests) must use this constant instead of
+/// re-typing the literal, so the Display text and detection stay in lockstep.
+pub const FIRST_TOKEN_TIMEOUT_MARKER: &str = "first token timeout:";
+
 /// Streaming request did not receive a meaningful first content chunk in time.
 #[derive(Debug, thiserror::Error)]
-#[error("first token timeout: no content received within {timeout_ms}ms for model {model}")]
+#[error("{FIRST_TOKEN_TIMEOUT_MARKER} no content received within {timeout_ms}ms for model {model}")]
 pub struct FirstTokenTimeoutError {
     pub timeout_ms: u64,
     pub model: String,
@@ -60,7 +65,7 @@ pub fn stream_error_event(error: &anyhow::Error) -> crate::types::StreamEvent {
 
 pub fn is_first_token_timeout(error: &anyhow::Error) -> bool {
     error.downcast_ref::<FirstTokenTimeoutError>().is_some()
-        || error.to_string().contains("first token timeout:")
+        || error.to_string().contains(FIRST_TOKEN_TIMEOUT_MARKER)
 }
 
 fn retry_after_hint(headers: &HeaderMap, body: &str, now: SystemTime) -> Option<Duration> {
@@ -253,7 +258,8 @@ mod tests {
         assert!(is_first_token_timeout(&error));
         assert!(matches!(
             stream_error_event(&error),
-            crate::types::StreamEvent::Error(message) if message.contains("first token timeout")
+            crate::types::StreamEvent::Error(message)
+                if message.contains(FIRST_TOKEN_TIMEOUT_MARKER)
         ));
     }
 }

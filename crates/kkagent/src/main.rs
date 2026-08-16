@@ -2838,6 +2838,8 @@ async fn build_turn_tool_registry(
     let default_timeout_s = background_config
         .as_ref()
         .and_then(|background| background.bash_task_timeout_s)
+        // `0` is not a meaningful timeout (would kill instantly); treat as unset.
+        .filter(|seconds| *seconds > 0)
         .unwrap_or(kkagent_tools::builtin::bash::DEFAULT_TIMEOUT_S);
     tools.register(Arc::new(kkagent_tools::builtin::BashTool::new(
         state.bash_shells.clone(),
@@ -4871,9 +4873,16 @@ fn resolve_session_id(db: &TranscriptDb, query: &str) -> Option<String> {
     if is_safe_session_id(query) {
         if let Ok(summary) = SessionStore::open_default().get(query) {
             let working_dir = summary.work_dir.clone();
-            let _ = db.create_session(query, "unknown", &working_dir);
-            if let Some(title) = &summary.title {
-                let _ = db.set_title(query, title);
+            // Prefer an existing title, then the first user prompt, and only
+            // fall back to the session id — never leave "unknown" behind.
+            let title = summary
+                .title
+                .or(summary.first_prompt)
+                .unwrap_or_else(|| query.to_string());
+            if let Err(error) = db.create_session(query, "unknown", &working_dir) {
+                tracing::warn!("backfill create_session({query}) failed: {error:#}");
+            } else if let Err(error) = db.set_title(query, &title) {
+                tracing::warn!("backfill set_title({query}) failed: {error:#}");
             }
             return Some(query.to_string());
         }
@@ -8444,5 +8453,23 @@ mod http_path_tests {
         assert!(!session.transcript_rewrite_required);
         assert_eq!(session.persisted_message_count, 3);
         std::fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[test]
+    fn should_idle_shutdown_decision_matrix() {
+        let timeout = Duration::from_secs(30);
+        let idle = Duration::from_secs(31);
+        let fresh = Duration::from_secs(5);
+        // Idle timeout disabled -> never shut down.
+        assert!(!should_idle_shutdown(Duration::ZERO, idle, false, false));
+        // Quiet and past the deadline -> shut down.
+        assert!(should_idle_shutdown(timeout, idle, false, false));
+        // Not yet idle -> stay up.
+        assert!(!should_idle_shutdown(timeout, fresh, false, false));
+        // Exactly at the boundary counts as still active (strictly-greater check).
+        assert!(!should_idle_shutdown(timeout, timeout, false, false));
+        // Active turns or connected clients keep the server alive.
+        assert!(!should_idle_shutdown(timeout, idle, true, false));
+        assert!(!should_idle_shutdown(timeout, idle, false, true));
     }
 }
