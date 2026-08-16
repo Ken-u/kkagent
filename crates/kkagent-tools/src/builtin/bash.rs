@@ -203,6 +203,8 @@ impl Default for BackgroundShellManager {
 pub struct BashTool {
     backgrounds: Arc<BackgroundShellManager>,
     options: BashOptions,
+    /// Live grant store for per-execution sandbox overlay refresh.
+    grants: Option<Arc<crate::toolchain::ToolchainGrantStore>>,
 }
 
 impl BashTool {
@@ -210,6 +212,27 @@ impl BashTool {
         Self {
             backgrounds,
             options,
+            grants: None,
+        }
+    }
+
+    /// Attach a live grant store so the sandbox overlay is refreshed from the
+    /// latest grants on every Bash invocation.
+    pub fn with_grant_store(mut self, grants: Arc<crate::toolchain::ToolchainGrantStore>) -> Self {
+        self.grants = Some(grants);
+        self
+    }
+
+    /// Build a sandbox policy with the latest toolchain overlay (profile +
+    /// live grants). When no grant store is attached, returns the frozen
+    /// policy from `BashOptions`.
+    fn effective_sandbox(&self) -> crate::sandbox::SandboxPolicy {
+        if let Some(grants) = &self.grants {
+            let mut policy = self.options.sandbox.clone();
+            policy.refresh_toolchain(&self.options.toolchain, &grants.snapshot());
+            policy
+        } else {
+            self.options.sandbox.clone()
         }
     }
 }
@@ -302,6 +325,10 @@ for background jobs (shell_id/stop remain as aliases)."
         }
         let safety_note = crate::shell_safety::safety_prefix(&risk).unwrap_or_default();
 
+        // Refresh the sandbox overlay from live grants so that
+        // RequestToolchainAccess grants take effect immediately.
+        let effective_sandbox = self.effective_sandbox();
+
         let description = input
             .get("description")
             .and_then(|v| v.as_str())
@@ -311,7 +338,7 @@ for background jobs (shell_id/stop remain as aliases)."
         let cwd = match resolve_cwd(
             input.get("cwd").and_then(|v| v.as_str()),
             &ctx.working_dir,
-            &self.options.sandbox,
+            &effective_sandbox,
         ) {
             Ok(cwd) => cwd,
             Err(error) => return Ok(ToolOutput::error(error.to_string())),
@@ -456,7 +483,7 @@ impl BashTool {
 
         let mgr = self.backgrounds.clone();
         let id_clone = id.clone();
-        let sandbox = self.options.sandbox.clone();
+        let sandbox = self.effective_sandbox().clone();
         let kaos = self.options.kaos.clone();
         let desc_for_kaos = description.clone();
         tokio::spawn(async move {
@@ -501,7 +528,11 @@ impl BashTool {
             )
             .await;
         });
-
+        // Once-scoped grants are consumed as soon as the sandbox is set up,
+        // even for background commands.
+        if let Some(grants) = &self.grants {
+            grants.consume_once();
+        }
         Ok(ToolOutput::success(format!(
             "Background shell started: {description} (shell_id={id}). \
 Also available as task_id={id} via TaskOutput/TaskStop."
@@ -519,6 +550,7 @@ Also available as task_id={id} via TaskOutput/TaskStop."
         timeout_ms: u64,
         interrupted: Option<Arc<std::sync::atomic::AtomicBool>>,
     ) -> anyhow::Result<ToolOutput> {
+        let effective_sandbox = self.effective_sandbox();
         if self.options.kaos.kind() == "ssh" {
             return run_via_kaos(
                 &self.options.kaos,
@@ -532,16 +564,14 @@ Also available as task_id={id} via TaskOutput/TaskStop."
             .await;
         }
         let (shell, flag) = shell_and_flag();
-        let mut cmd = match self.options.sandbox.command_for_session(
-            shell,
-            flag,
-            &command,
-            &cwd,
-            &session_root,
-        ) {
-            Ok(command) => command,
-            Err(error) => return Ok(ToolOutput::error(format!("Sandbox setup failed: {error}"))),
-        };
+        let mut cmd =
+            match effective_sandbox.command_for_session(shell, flag, &command, &cwd, &session_root)
+            {
+                Ok(command) => command,
+                Err(error) => {
+                    return Ok(ToolOutput::error(format!("Sandbox setup failed: {error}")))
+                }
+            };
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
         cmd.kill_on_drop(true);
@@ -552,7 +582,7 @@ Also available as task_id={id} via TaskOutput/TaskStop."
             Ok(c) => c,
             Err(e) => return Ok(ToolOutput::error(format!("Failed to spawn: {}", e))),
         };
-        let sandbox_guard = match self.options.sandbox.contain_child(&child) {
+        let sandbox_guard = match effective_sandbox.contain_child(&child) {
             Ok(guard) => guard,
             Err(error) => {
                 terminate_process_tree(&mut child).await;
@@ -586,6 +616,11 @@ Also available as task_id={id} via TaskOutput/TaskStop."
             }
             return Ok(ToolOutput::error(result));
         };
+        // Once-scoped grants have been baked into the sandbox; consume them
+        // before the command result is returned.
+        if let Some(grants) = &self.grants {
+            grants.consume_once();
+        }
         match wait_result {
             Ok(Ok(status)) => {
                 join_pump(pump).await;
@@ -1092,6 +1127,7 @@ mod tests {
         ToolContext {
             working_dir: std::env::current_dir().expect("current directory"),
             session_id: "bash-test".to_string(),
+            turn_id: "test-turn".into(),
             plan_file_path: None,
             image: kkagent_config::ImageConfig::default(),
             tool_call_id: None,

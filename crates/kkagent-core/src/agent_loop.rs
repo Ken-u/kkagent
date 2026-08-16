@@ -1532,6 +1532,7 @@ Do not mention this reminder to the user.\n</system-reminder>"
                     let plan_file_path = session.plan_file_path.clone();
                     let image = self.config.image.clone();
                     let tools_config = self.config.tools.clone();
+                    let msg_count = session.messages.len();
                     tasks.push(ToolCallTask {
                         accesses,
                         start: box_start(move || {
@@ -1544,12 +1545,14 @@ Do not mention this reminder to the user.\n</system-reminder>"
                             let input = input;
                             let tool_call_id = tool_call_id;
                             let tools_config = tools_config;
+                            let msg_count = msg_count;
                             async move {
                                 execute_tool_parallel(ParallelToolRequest {
                                     tools,
                                     hooks,
                                     working_dir,
-                                    session_id: sid,
+                                    session_id: sid.clone(),
+                                    turn_id: format!("{}:{}", sid, msg_count),
                                     image,
                                     enabled_tools: enabled,
                                     name,
@@ -2314,6 +2317,7 @@ Do not mention this reminder to the user.\n</system-reminder>"
             hooks: self.hooks.clone(),
             working_dir: session.working_dir.clone(),
             session_id: session.id.clone(),
+            turn_id: format!("{}:{}", session.id, session.messages.len()),
             image: self.config.image.clone(),
             enabled_tools: session.enabled_tools.clone(),
             name: name.to_string(),
@@ -2688,6 +2692,7 @@ struct ParallelToolRequest {
     hooks: Option<Arc<kkagent_mcp::HookManager>>,
     working_dir: std::path::PathBuf,
     session_id: String,
+    turn_id: String,
     image: kkagent_config::ImageConfig,
     enabled_tools: Option<std::collections::HashSet<String>>,
     name: String,
@@ -2704,6 +2709,7 @@ async fn execute_tool_parallel(request: ParallelToolRequest) -> ToolOutput {
         hooks,
         working_dir,
         session_id,
+        turn_id,
         image,
         enabled_tools,
         name,
@@ -2765,6 +2771,7 @@ async fn execute_tool_parallel(request: ParallelToolRequest) -> ToolOutput {
     let ctx = ToolContext {
         working_dir,
         session_id,
+        turn_id,
         plan_file_path: Some(plan_file_path),
         image,
         tool_call_id,

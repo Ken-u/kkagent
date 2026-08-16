@@ -63,6 +63,8 @@ pub trait Tool: Send + Sync {
 pub struct ToolContext {
     pub working_dir: std::path::PathBuf,
     pub session_id: String,
+    /// Monotonic turn identifier (e.g. `"{session_id}:{msg_count}"`).
+    pub turn_id: String,
     /// Current plan file when the host supports file-backed plan mode.
     pub plan_file_path: Option<std::path::PathBuf>,
     pub image: kkagent_config::ImageConfig,

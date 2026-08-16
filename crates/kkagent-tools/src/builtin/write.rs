@@ -134,6 +134,7 @@ mod tests {
         let context = ToolContext {
             working_dir: dir.clone(),
             session_id: "write-test".into(),
+            turn_id: "test-turn".into(),
             plan_file_path: None,
             image: kkagent_config::ImageConfig::default(),
             tool_call_id: None,

@@ -3,7 +3,7 @@ use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::toolchain::{GrantAccess, ToolchainGrant, ToolchainGrantStore};
+use crate::toolchain::{GrantAccess, GrantScope, ToolchainGrant, ToolchainGrantStore};
 use crate::{Tool, ToolContext, ToolOutput};
 
 /// Request a scoped read/read-write path grant for toolchain/sandbox use.
@@ -54,6 +54,11 @@ runtime/cache paths that are not covered by built-in toolchain profiles."
                 "profile": {
                     "type": "string",
                     "description": "Optional toolchain profile name (rust/node/python/go/java)."
+                },
+                "scope": {
+                    "type": "string",
+                    "enum": ["once", "turn", "session", "workspace"],
+                    "description": "How long the grant remains active. Default: session."
                 }
             },
             "required": ["path", "access", "reason"],
@@ -65,7 +70,7 @@ runtime/cache paths that are not covered by built-in toolchain profiles."
         false
     }
 
-    async fn execute(&self, input: Value, _ctx: &ToolContext) -> anyhow::Result<ToolOutput> {
+    async fn execute(&self, input: Value, ctx: &ToolContext) -> anyhow::Result<ToolOutput> {
         if !self.path_isolation_active {
             return Ok(ToolOutput::error(
                 "RequestToolchainAccess is only available when the effective sandbox \
@@ -92,6 +97,10 @@ Current mode does not enforce path mounts, so grants would be meaningless.",
             .get("profile")
             .and_then(|v| v.as_str())
             .map(str::to_string);
+        let scope = input
+            .get("scope")
+            .and_then(|v| v.as_str())
+            .unwrap_or("session");
 
         if path.is_empty() || reason.is_empty() {
             return Ok(ToolOutput::error("path and reason are required"));
@@ -108,6 +117,17 @@ Current mode does not enforce path mounts, so grants would be meaningless.",
                 )))
             }
         };
+        let scope = match scope {
+            "once" => GrantScope::Once,
+            "turn" => GrantScope::Turn,
+            "session" => GrantScope::Session,
+            "workspace" => GrantScope::Workspace,
+            other => {
+                return Ok(ToolOutput::error(format!(
+                    "invalid scope {other:?}; expected once, turn, session, or workspace"
+                )))
+            }
+        };
 
         let path_buf = PathBuf::from(path);
         self.grants.grant(ToolchainGrant {
@@ -115,13 +135,27 @@ Current mode does not enforce path mounts, so grants would be meaningless.",
             access,
             reason: reason.to_string(),
             profile,
+            scope,
+            turn_id: if scope == GrantScope::Turn {
+                Some(ctx.turn_id.clone())
+            } else {
+                None
+            },
         });
 
+        let scope_desc = match scope {
+            GrantScope::Once => "the next Bash invocation only",
+            GrantScope::Turn => "the current turn",
+            GrantScope::Session => "this session",
+            GrantScope::Workspace => "all sessions in this workspace",
+        };
+
         Ok(ToolOutput::success(format!(
-            "Granted {:?} access to `{}` for this session.\nReason: {reason}\n\
+            "Granted {:?} access to `{}` for {}.\nReason: {reason}\n\
 Subsequent Bash commands in workspace mode will mount this path.",
             access,
-            path_buf.display()
+            path_buf.display(),
+            scope_desc
         )))
     }
 }

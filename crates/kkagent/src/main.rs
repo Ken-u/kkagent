@@ -2841,37 +2841,33 @@ async fn build_turn_tool_registry(
         // `0` is not a meaningful timeout (would kill instantly); treat as unset.
         .filter(|seconds| *seconds > 0)
         .unwrap_or(kkagent_tools::builtin::bash::DEFAULT_TIMEOUT_S);
-    tools.register(Arc::new(kkagent_tools::builtin::BashTool::new(
-        state.bash_shells.clone(),
-        kkagent_tools::builtin::BashOptions {
-            auto_background_on_timeout,
-            sandbox: {
-                let mut sandbox = state.sandbox_snapshot();
-                sandbox.refresh_toolchain(
-                    &state.config().toolchain,
-                    &state.toolchain_grants.snapshot(),
-                );
-                sandbox
+    tools.register(Arc::new(
+        kkagent_tools::builtin::BashTool::new(
+            state.bash_shells.clone(),
+            kkagent_tools::builtin::BashOptions {
+                auto_background_on_timeout,
+                sandbox: state.sandbox_snapshot(),
+                default_timeout_s,
+                toolchain: state.config().toolchain.clone(),
+                kaos: {
+                    let cfg = state.config();
+                    let remote = kkagent_kaos::RemoteConfig {
+                        enabled: cfg.remote.enabled,
+                        host: cfg.remote.host.clone(),
+                        port: cfg.remote.port,
+                        user: cfg.remote.user.clone(),
+                        identity_file: cfg.remote.identity_file.clone(),
+                        remote_cwd: cfg.remote.remote_cwd.clone(),
+                    };
+                    kkagent_kaos::environment_from_remote(
+                        Some(&remote),
+                        std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+                    )
+                },
             },
-            default_timeout_s,
-            toolchain: state.config().toolchain.clone(),
-            kaos: {
-                let cfg = state.config();
-                let remote = kkagent_kaos::RemoteConfig {
-                    enabled: cfg.remote.enabled,
-                    host: cfg.remote.host.clone(),
-                    port: cfg.remote.port,
-                    user: cfg.remote.user.clone(),
-                    identity_file: cfg.remote.identity_file.clone(),
-                    remote_cwd: cfg.remote.remote_cwd.clone(),
-                };
-                kkagent_kaos::environment_from_remote(
-                    Some(&remote),
-                    std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-                )
-            },
-        },
-    )));
+        )
+        .with_grant_store(state.toolchain_grants.clone()),
+    ));
     let path_isolation = matches!(
         state.sandbox_snapshot().mode,
         kkagent_tools::sandbox::SandboxMode::Workspace
@@ -3055,6 +3051,10 @@ async fn run_http_turn(
     .with_hooks(state.hooks.clone())
     .with_goal_manager(state.goal_mgr.clone())
     .with_tool_result_store(state.tool_result_store.clone());
+
+    // Prune expired toolchain grants (Once/Turn scope) before the turn starts.
+    let turn_id = format!("{}:{}", session.id, session.messages.len());
+    state.toolchain_grants.prune_expired(&turn_id);
 
     let result = agent.run_turn(&mut session).await;
     let steer_result = session.close_and_apply_steers();

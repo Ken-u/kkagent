@@ -101,6 +101,7 @@ mod tests {
         ToolContext {
             working_dir: working_dir.to_path_buf(),
             session_id: "write-plan-test".into(),
+            turn_id: "test-turn".into(),
             plan_file_path: path,
             image: kkagent_config::ImageConfig::default(),
             tool_call_id: None,
