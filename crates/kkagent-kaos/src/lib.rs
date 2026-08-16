@@ -224,6 +224,9 @@ impl Environment for LocalKaos {
             c.args(["-lc", command]);
             c
         };
+        // If this future is dropped mid-run (e.g. tool timeout in run_via_kaos),
+        // tear the child down instead of leaking an orphan process.
+        cmd.kill_on_drop(true);
         cmd.current_dir(&dir);
         for (k, v) in &env {
             cmd.env(k, v);
@@ -233,22 +236,21 @@ impl Environment for LocalKaos {
             .await
             .map_err(|e| KaosError::Io(e.to_string()))?;
 
-        // Best-effort cwd tracking for simple `cd <path>` prefixes.
-        if let Some(new_cwd) = track_cd(command, &dir) {
+        // Best-effort cwd tracking for simple `cd <path>` prefixes. The exit
+        // status validates the cd actually succeeded on the execution host.
+        let new_cwd = if output.status.success() {
+            track_cd(command, &dir)
+        } else {
+            None
+        };
+        if let Some(new_cwd) = &new_cwd {
             self.set_cwd(new_cwd.clone());
-            return Ok(ExecResult {
-                status: output.status.code().unwrap_or(-1),
-                stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-                cwd: Some(new_cwd),
-            });
         }
-
         Ok(ExecResult {
             status: output.status.code().unwrap_or(-1),
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-            cwd: Some(dir),
+            cwd: Some(new_cwd.unwrap_or(dir)),
         })
     }
 
@@ -305,9 +307,26 @@ fn resolve_path(root: &Path, path: &Path) -> PathBuf {
 }
 
 fn track_cd(command: &str, base: &Path) -> Option<PathBuf> {
+    track_cd_inner(command, base, true)
+}
+
+/// Best-effort cwd tracking for a leading `cd <path>` command.
+///
+/// `verify_dir` must be false for remote (SSH) targets: the host-local
+/// `is_dir` probe would inspect the *local* filesystem and could validate a
+/// directory that does not exist remotely (or reject one that does). For
+/// remote commands the caller gates this on the remote exit status instead.
+fn track_cd_inner(command: &str, base: &Path, verify_dir: bool) -> Option<PathBuf> {
     let trimmed = command.trim();
     let rest = trimmed.strip_prefix("cd ")?.trim();
-    let target = rest.split_whitespace().next()?;
+    let mut parts = rest.split_whitespace();
+    let target = parts.next()?;
+    // Only track a *pure* `cd <dir>` command. Anything with trailing content
+    // (`cd a && cd b`, `cd a; ls`) can leave the shell somewhere else, and a
+    // stale tracked cwd is worse than no tracking at all.
+    if parts.next().is_some() {
+        return None;
+    }
     if target.is_empty() || target.contains('&') || target.contains('|') || target.contains(';') {
         return None;
     }
@@ -316,10 +335,33 @@ fn track_cd(command: &str, base: &Path) -> Option<PathBuf> {
     } else {
         base.join(target)
     };
-    if path.is_dir() {
-        Some(path)
+    // Lexically normalize `.`/`..` so `cd sub/../other` tracks correctly.
+    let normalized = lexical_normalize(&path);
+    if verify_dir && !normalized.is_dir() {
+        return None;
+    }
+    Some(normalized)
+}
+
+/// Lexically resolve `.`, `..`, and redundant separators without touching the
+/// filesystem. This mirrors the non-TOCTOU normalization used elsewhere in
+/// the sandbox and keeps cwd tracking deterministic on any host OS.
+fn lexical_normalize(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    if out.as_os_str().is_empty() {
+        PathBuf::from(".")
     } else {
-        None
+        out
     }
 }
 
@@ -381,8 +423,11 @@ impl SshKaos {
 impl Environment for SshKaos {
     async fn exec(&self, command: &str, cwd: Option<&Path>) -> Result<ExecResult, KaosError> {
         let remote = self.wrap_remote(command, cwd);
-        let output = self
-            .ssh_base()
+        let mut ssh = self.ssh_base();
+        // If this future is dropped mid-run (tool timeout), tear the local
+        // ssh client down; the remote side then sees EOF and stops.
+        ssh.kill_on_drop(true);
+        let output = ssh
             .arg(remote)
             .output()
             .await
@@ -390,20 +435,27 @@ impl Environment for SshKaos {
         let result_cwd = cwd
             .map(Path::to_path_buf)
             .or_else(|| self.cwd.read().ok().and_then(|g| g.clone()));
-        if let Some(new_cwd) = track_cd(command, result_cwd.as_deref().unwrap_or(Path::new("/"))) {
+        let status = output.status.code().unwrap_or(-1);
+        // Track a leading `cd` only when the remote command succeeded and
+        // without host-local dir validation (the local filesystem is not the
+        // remote one); lexical normalization keeps the tracked path sane.
+        let new_cwd = if status == 0 {
+            track_cd_inner(
+                command,
+                result_cwd.as_deref().unwrap_or(Path::new("/")),
+                false,
+            )
+        } else {
+            None
+        };
+        if let Some(new_cwd) = &new_cwd {
             *self.cwd.write().unwrap_or_else(|e| e.into_inner()) = Some(new_cwd.clone());
-            return Ok(ExecResult {
-                status: output.status.code().unwrap_or(-1),
-                stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-                cwd: Some(new_cwd),
-            });
         }
         Ok(ExecResult {
-            status: output.status.code().unwrap_or(-1),
+            status,
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-            cwd: result_cwd,
+            cwd: Some(new_cwd.unwrap_or_else(|| result_cwd.unwrap_or_else(|| PathBuf::from("/")))),
         })
     }
 
@@ -524,12 +576,18 @@ fn shell_quote(s: &str) -> String {
 }
 
 fn uuid_lite() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+    // Monotonic per-process counter guards against collisions when two temp
+    // files are requested within the same clock tick (Windows timer
+    // granularity is coarse enough for nanos to repeat).
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let t = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    format!("{t:x}")
+    format!("{t:x}-{n:x}-{}", std::process::id())
 }
 
 /// Build an [`Environment`] from optional SSH remote config.
@@ -678,5 +736,61 @@ mod tests {
         let env = environment_from_remote(Some(&cfg), PathBuf::from("."));
         assert_eq!(env.kind(), "local");
         assert_eq!(env.as_environment().kind(), "local");
+    }
+
+    #[test]
+    fn track_cd_lexically_normalizes_dots() {
+        let base = Path::new("/w/root");
+        assert_eq!(
+            track_cd_inner("cd sub/../other", base, false).as_deref(),
+            Some(Path::new("/w/root/other"))
+        );
+        assert_eq!(
+            track_cd_inner("cd ./x", base, false).as_deref(),
+            Some(Path::new("/w/root/x"))
+        );
+        // Command chaining is refused outright.
+        assert_eq!(track_cd_inner("cd a; rm -rf /", base, false), None);
+        assert_eq!(track_cd_inner("cd a && b", base, false), None);
+    }
+
+    #[test]
+    fn track_cd_local_still_validates_dir() {
+        let dir = std::env::temp_dir().join(format!("kkagent-tcd-{}", uuid_lite()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let base = std::env::temp_dir();
+        let joined = base.join(&dir);
+        let _ = joined;
+        assert!(track_cd_inner(&format!("cd {}", dir.display()), &base, true).is_some());
+        assert_eq!(
+            track_cd_inner("cd definitely-not-a-dir-xyz", &base, true),
+            None
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn local_cd_requires_successful_exit() {
+        // A failing command must not move the tracked cwd even when the
+        // directory happens to exist locally.
+        let dir = std::env::temp_dir().join(format!("kkagent-tcd2-{}", uuid_lite()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let k = LocalKaos::new(&dir);
+        let r = k.exec("cd / && exit 3", None).await.unwrap();
+        assert_eq!(r.status, 3);
+        assert_eq!(k.cwd(), dir);
+        // A successful cd moves it.
+        let r = k.exec("cd .", None).await.unwrap();
+        assert_eq!(r.status, 0);
+        assert_eq!(k.cwd(), lexical_normalize(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn uuid_lite_never_collides_under_rapid_calls() {
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..1000 {
+            assert!(seen.insert(uuid_lite()));
+        }
     }
 }
