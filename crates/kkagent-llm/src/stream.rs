@@ -1,85 +1,11 @@
-use futures_util::StreamExt;
 use reqwest::Client;
 use serde_json::json;
-use std::time::Instant;
 use tokio::sync::mpsc;
 
-use crate::http_error::FirstTokenTimeoutError;
+use crate::first_token_gate::FirstTokenGate;
 use crate::types::{ChatContent, LlmRequest, StreamEvent, TokenUsage};
 
 const ANTHROPIC_FALLBACK_MAX_TOKENS: u32 = 128_000;
-
-/// Tracks whether the first meaningful stream chunk has arrived under an optional deadline.
-struct FirstTokenGate {
-    deadline: Option<Instant>,
-    timeout_ms: u64,
-    model: String,
-    received: bool,
-}
-
-impl FirstTokenGate {
-    fn new(timeout: Option<std::time::Duration>, model: &str) -> Self {
-        let (deadline, timeout_ms) = match timeout {
-            Some(duration) if !duration.is_zero() => {
-                (Some(Instant::now() + duration), duration.as_millis() as u64)
-            }
-            _ => (None, 0),
-        };
-        Self {
-            deadline,
-            timeout_ms,
-            model: model.to_string(),
-            received: false,
-        }
-    }
-
-    fn mark_content(&mut self) {
-        self.received = true;
-    }
-
-    fn note_event(&mut self, event: &StreamEvent) {
-        if matches!(
-            event,
-            StreamEvent::TextDelta(_)
-                | StreamEvent::ThinkingDelta(_)
-                | StreamEvent::ToolUseStart { .. }
-        ) {
-            self.mark_content();
-        }
-    }
-
-    async fn next_chunk<S, B>(&mut self, stream: &mut S) -> anyhow::Result<Option<B>>
-    where
-        S: futures_util::Stream<Item = Result<B, reqwest::Error>> + Unpin,
-    {
-        if self.received || self.deadline.is_none() {
-            return Ok(match stream.next().await {
-                Some(Ok(chunk)) => Some(chunk),
-                Some(Err(error)) => return Err(error.into()),
-                None => None,
-            });
-        }
-        let deadline = self.deadline.expect("checked above");
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(FirstTokenTimeoutError {
-                timeout_ms: self.timeout_ms,
-                model: self.model.clone(),
-            }
-            .into());
-        }
-        match tokio::time::timeout(remaining, stream.next()).await {
-            Ok(Some(Ok(chunk))) => Ok(Some(chunk)),
-            Ok(Some(Err(error))) => Err(error.into()),
-            Ok(None) => Ok(None),
-            Err(_) => Err(FirstTokenTimeoutError {
-                timeout_ms: self.timeout_ms,
-                model: self.model.clone(),
-            }
-            .into()),
-        }
-    }
-}
 
 /// Resolve max_tokens for Anthropic with per-model ceiling.
 fn resolve_anthropic_max_tokens(model: &str, override_: Option<u32>) -> Option<u32> {
@@ -262,7 +188,6 @@ pub async fn anthropic_stream(
                 if let Some(evt) =
                     parse_sse_event(&event, &mut tool_blocks, &mut usage, &mut stop_reason)
                 {
-                    first_token.note_event(&evt);
                     completed |= matches!(evt, StreamEvent::MessageEnd { .. });
                     if event_tx.send(evt).await.is_err() {
                         return Ok(());
@@ -1225,6 +1150,77 @@ mod tests {
         let mut request = request();
         request.first_token_timeout = Some(std::time::Duration::from_secs(5));
         openai_stream(&Client::new(), &base_url, "token", request, tx)
+            .await
+            .unwrap();
+        assert!(matches!(rx.recv().await, Some(StreamEvent::TextDelta(text)) if text == "hello"));
+    }
+
+    #[tokio::test]
+    async fn anthropic_first_token_timeout_when_body_stalls() {
+        let base_url = serve_headers_then_stall("").await;
+        let (tx, _rx) = mpsc::channel(8);
+        let mut request = request();
+        request.first_token_timeout = Some(std::time::Duration::from_millis(80));
+        let error = anthropic_stream(&Client::new(), &base_url, "secret", request, tx)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("first token timeout"));
+    }
+
+    #[tokio::test]
+    async fn anthropic_first_token_timeout_ignores_ping_events() {
+        // Anthropic sends "ping" events as keep-alive; they must not reset the deadline.
+        let base_url = serve_headers_then_stall("event: ping\ndata: {}\n\n").await;
+        let (tx, _rx) = mpsc::channel(8);
+        let mut request = request();
+        request.first_token_timeout = Some(std::time::Duration::from_millis(80));
+        let error = anthropic_stream(&Client::new(), &base_url, "secret", request, tx)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("first token timeout"));
+    }
+
+    #[tokio::test]
+    async fn anthropic_first_token_arrives_before_timeout() {
+        let sse = concat!(
+            "event: message_start\ndata: {\"type\":\"message_start\"}\n\n",
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+        );
+        let (base_url, _captured) = serve_once("200 OK", "text/event-stream", sse).await;
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut request = request();
+        request.first_token_timeout = Some(std::time::Duration::from_secs(5));
+        anthropic_stream(&Client::new(), &base_url, "secret", request, tx)
+            .await
+            .unwrap();
+        assert!(matches!(rx.recv().await, Some(StreamEvent::TextDelta(text)) if text == "hello"));
+    }
+
+    #[tokio::test]
+    async fn google_first_token_timeout_when_body_stalls() {
+        let base_url = serve_headers_then_stall("").await;
+        let (tx, _rx) = mpsc::channel(8);
+        let mut request = request();
+        request.first_token_timeout = Some(std::time::Duration::from_millis(80));
+        let error = google_stream(&Client::new(), &base_url, "key", request, tx)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("first token timeout"));
+    }
+
+    #[tokio::test]
+    async fn google_first_token_arrives_before_timeout() {
+        let sse = concat!(
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hello\"}]}}]}\n",
+            "data: {\"candidates\":[{\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":5,\"candidatesTokenCount\":2}}\n"
+        );
+        let (base_url, _captured) = serve_once("200 OK", "text/event-stream", sse).await;
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut request = request();
+        request.first_token_timeout = Some(std::time::Duration::from_secs(5));
+        google_stream(&Client::new(), &base_url, "key", request, tx)
             .await
             .unwrap();
         assert!(matches!(rx.recv().await, Some(StreamEvent::TextDelta(text)) if text == "hello"));

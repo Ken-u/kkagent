@@ -1,4 +1,5 @@
 pub mod catalog;
+pub mod first_token_gate;
 pub mod http_error;
 pub mod openai_responses;
 pub mod provider;

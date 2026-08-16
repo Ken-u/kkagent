@@ -1,73 +1,11 @@
 //! OpenAI Responses API (`/v1/responses`) streaming adapter.
 
-use futures_util::StreamExt;
 use reqwest::Client;
 use serde_json::json;
-use std::time::Instant;
 use tokio::sync::mpsc;
 
-use crate::http_error::FirstTokenTimeoutError;
+use crate::first_token_gate::FirstTokenGate;
 use crate::types::{ChatContent, LlmRequest, StreamEvent, TokenUsage};
-
-struct FirstTokenGate {
-    deadline: Option<Instant>,
-    timeout_ms: u64,
-    model: String,
-    received: bool,
-}
-
-impl FirstTokenGate {
-    fn new(timeout: Option<std::time::Duration>, model: &str) -> Self {
-        let (deadline, timeout_ms) = match timeout {
-            Some(duration) if !duration.is_zero() => {
-                (Some(Instant::now() + duration), duration.as_millis() as u64)
-            }
-            _ => (None, 0),
-        };
-        Self {
-            deadline,
-            timeout_ms,
-            model: model.to_string(),
-            received: false,
-        }
-    }
-
-    fn mark_content(&mut self) {
-        self.received = true;
-    }
-
-    async fn next_chunk<S, B>(&mut self, stream: &mut S) -> anyhow::Result<Option<B>>
-    where
-        S: futures_util::Stream<Item = Result<B, reqwest::Error>> + Unpin,
-    {
-        if self.received || self.deadline.is_none() {
-            return Ok(match stream.next().await {
-                Some(Ok(chunk)) => Some(chunk),
-                Some(Err(error)) => return Err(error.into()),
-                None => None,
-            });
-        }
-        let deadline = self.deadline.expect("checked above");
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(FirstTokenTimeoutError {
-                timeout_ms: self.timeout_ms,
-                model: self.model.clone(),
-            }
-            .into());
-        }
-        match tokio::time::timeout(remaining, stream.next()).await {
-            Ok(Some(Ok(chunk))) => Ok(Some(chunk)),
-            Ok(Some(Err(error))) => Err(error.into()),
-            Ok(None) => Ok(None),
-            Err(_) => Err(FirstTokenTimeoutError {
-                timeout_ms: self.timeout_ms,
-                model: self.model.clone(),
-            }
-            .into()),
-        }
-    }
-}
 
 pub async fn openai_responses_stream(
     client: &Client,
@@ -237,10 +175,12 @@ pub async fn openai_responses_stream(
                 }
                 "response.reasoning_summary_text.delta" | "response.reasoning.delta" => {
                     if let Some(delta) = event.get("delta").and_then(|v| v.as_str()) {
-                        first_token.mark_content();
-                        let _ = event_tx
-                            .send(StreamEvent::ThinkingDelta(delta.to_string()))
-                            .await;
+                        if !delta.is_empty() {
+                            first_token.mark_content();
+                            let _ = event_tx
+                                .send(StreamEvent::ThinkingDelta(delta.to_string()))
+                                .await;
+                        }
                     }
                 }
                 "response.function_call_arguments.delta" => {
@@ -506,5 +446,81 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("connection closed"));
+    }
+
+    /// Mimic `serve_headers_then_stall` from stream.rs tests: send HTTP
+    /// headers + a body prefix, then keep the connection open without sending
+    /// more data.
+    async fn serve_headers_then_stall(body_prefix: &'static str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            loop {
+                let mut bytes = [0_u8; 4096];
+                let count = socket.read(&mut bytes).await.unwrap();
+                request.extend_from_slice(&bytes[..count]);
+                if request.windows(4).any(|part| part == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let headers =
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n";
+            socket.write_all(headers.as_bytes()).await.unwrap();
+            if !body_prefix.is_empty() {
+                let chunk = format!("{:x}\r\n{body_prefix}\r\n", body_prefix.len());
+                socket.write_all(chunk.as_bytes()).await.unwrap();
+            }
+            // Keep the connection open to simulate a stalled stream.
+            std::future::pending::<()>().await;
+        });
+        format!("http://{address}")
+    }
+
+    #[tokio::test]
+    async fn responses_first_token_timeout_when_body_stalls() {
+        let base_url = serve_headers_then_stall("").await;
+        let (tx, _rx) = mpsc::channel(8);
+        let mut request = request();
+        request.first_token_timeout = Some(std::time::Duration::from_millis(80));
+        let error = openai_responses_stream(&Client::new(), &base_url, "token", request, tx)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("first token timeout"));
+    }
+
+    /// Regression: empty `response.reasoning.delta` events (used as
+    /// keep-alive by some Responses-API servers) must NOT reset the
+    /// first-token deadline.
+    #[tokio::test]
+    async fn responses_first_token_timeout_ignores_empty_reasoning_delta() {
+        let base_url = serve_headers_then_stall(
+            "data: {\"type\":\"response.reasoning.delta\",\"delta\":\"\"}\n\n",
+        )
+        .await;
+        let (tx, _rx) = mpsc::channel(8);
+        let mut request = request();
+        request.first_token_timeout = Some(std::time::Duration::from_millis(80));
+        let error = openai_responses_stream(&Client::new(), &base_url, "token", request, tx)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("first token timeout"));
+    }
+
+    #[tokio::test]
+    async fn responses_first_token_arrives_before_timeout() {
+        let sse = concat!(
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":4,\"output_tokens\":2}}}\n"
+        );
+        let base_url = serve_sse(sse).await;
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut request = request();
+        request.first_token_timeout = Some(std::time::Duration::from_secs(5));
+        openai_responses_stream(&Client::new(), &base_url, "token", request, tx)
+            .await
+            .unwrap();
+        assert!(matches!(rx.recv().await, Some(StreamEvent::TextDelta(text)) if text == "hello"));
     }
 }
