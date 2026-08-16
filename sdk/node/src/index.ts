@@ -107,6 +107,21 @@ export class KkagentHttpClient {
     return res.json();
   }
 
+  async search(query: string): Promise<unknown> {
+    const q = new URLSearchParams({ q: query });
+    const res = await fetch(this.url(`/api/v1/search?${q}`), { headers: this.headers() });
+    if (!res.ok) throw new Error(`search ${res.status}`);
+    return res.json();
+  }
+
+  async sessionTimeline(sessionId: string): Promise<unknown> {
+    const res = await fetch(this.url(`/api/v1/sessions/${sessionId}/timeline`), {
+      headers: this.headers(),
+    });
+    if (!res.ok) throw new Error(`timeline ${res.status}`);
+    return res.json();
+  }
+
   async modelCatalog(): Promise<unknown> {
     const res = await fetch(this.url("/api/v1/modelCatalog"), { headers: this.headers() });
     if (!res.ok) throw new Error(`modelCatalog ${res.status}`);

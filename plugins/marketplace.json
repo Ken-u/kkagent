@@ -1,0 +1,25 @@
+{
+  "version": "1",
+  "plugins": [
+    {
+      "id": "kk-weather",
+      "type": "plugin",
+      "tier": "official",
+      "displayName": "KK Weather",
+      "version": "1.0.0",
+      "description": "Official example datasource plugin (weather lookup via public API).",
+      "keywords": ["data", "weather", "example"],
+      "source": "./official/kk-weather"
+    },
+    {
+      "id": "kk-browser",
+      "type": "plugin",
+      "tier": "official",
+      "displayName": "KK Browser",
+      "version": "1.0.0",
+      "description": "Official example browser-control plugin (headless Chromium via MCP).",
+      "keywords": ["browser", "automation", "cdp", "example"],
+      "source": "./official/kk-browser"
+    }
+  ]
+}

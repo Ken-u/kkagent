@@ -1,8 +1,8 @@
 {
   "name": "kkagent",
   "displayName": "kkagent",
-  "description": "kkagent IDE bridge (ACP) — minimal VS Code extension",
-  "version": "0.1.0",
+  "description": "kkagent IDE bridge — sessions, slash prompts, and ACP",
+  "version": "0.2.0",
   "publisher": "kkagent",
   "engines": {
     "vscode": "^1.90.0"
@@ -10,20 +10,40 @@
   "categories": ["AI", "Other"],
   "activationEvents": [
     "onCommand:kkagent.start",
-    "onCommand:kkagent.prompt"
+    "onCommand:kkagent.prompt",
+    "onCommand:kkagent.commit",
+    "onCommand:kkagent.explain",
+    "onCommand:kkagent.fix",
+    "onView:kkagent.sessions"
   ],
   "main": "./extension.js",
   "contributes": {
     "commands": [
-      {
-        "command": "kkagent.start",
-        "title": "kkagent: Start ACP bridge"
-      },
-      {
-        "command": "kkagent.prompt",
-        "title": "kkagent: Send prompt"
-      }
+      { "command": "kkagent.start", "title": "kkagent: Start ACP bridge" },
+      { "command": "kkagent.prompt", "title": "kkagent: Send prompt" },
+      { "command": "kkagent.commit", "title": "kkagent: /commit" },
+      { "command": "kkagent.explain", "title": "kkagent: /explain" },
+      { "command": "kkagent.fix", "title": "kkagent: /fix" },
+      { "command": "kkagent.refreshSessions", "title": "kkagent: Refresh sessions" },
+      { "command": "kkagent.showDiff", "title": "kkagent: Show diff preview" }
     ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "kkagent",
+          "title": "kkagent",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "kkagent": [
+        {
+          "id": "kkagent.sessions",
+          "name": "Sessions"
+        }
+      ]
+    },
     "configuration": {
       "title": "kkagent",
       "properties": {
@@ -39,5 +59,8 @@
         }
       }
     }
+  },
+  "scripts": {
+    "package": "npx --yes @vscode/vsce package --allow-missing-repository"
   }
 }

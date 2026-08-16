@@ -162,6 +162,21 @@ enum Commands {
         #[arg(long)]
         bundle: bool,
     },
+    /// Import legacy kimi-code / `.kimi` sessions into kkagent
+    Migrate {
+        /// Legacy data root (e.g. ~/.kimi)
+        #[arg(long)]
+        from: PathBuf,
+        /// Preview without writing to the transcript DB
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        dry_run: bool,
+        /// Actually write imported sessions (disables dry-run)
+        #[arg(long)]
+        apply: bool,
+        /// Emit machine-readable JSON report
+        #[arg(long)]
+        json: bool,
+    },
     /// Generate shell completion scripts
     Completions {
         /// bash | zsh | fish | powershell
@@ -262,6 +277,7 @@ fn runtime_mode(cli: &Cli) -> &'static str {
         (Some(Commands::Init { .. }), _) => "init",
         (Some(Commands::Config { .. }), _) => "config",
         (Some(Commands::Doctor { .. }), _) => "doctor",
+        (Some(Commands::Migrate { .. }), _) => "migrate",
         (Some(Commands::Completions { .. }), _) => "completions",
         (None, Some(_)) => "print",
         (None, None) => "tui",
@@ -299,6 +315,34 @@ async fn run(cli: Cli) -> Result<()> {
                 return print_doctor_bundle(cli.config.as_deref());
             }
             return run_doctor(cli.config.as_deref(), *json, *live).await;
+        }
+        Some(Commands::Migrate {
+            from,
+            dry_run,
+            apply,
+            json,
+        }) => {
+            let effective_dry_run = if *apply { false } else { *dry_run };
+            let report = kkagent_core::migrate_legacy_home(from, effective_dry_run)?;
+            if *json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!("migrate from {} (dry_run={})", report.from, report.dry_run);
+                println!(
+                    "scanned={} imported_sessions={} imported_messages={}",
+                    report.scanned_sessions, report.imported_sessions, report.imported_messages
+                );
+                for skip in &report.skipped {
+                    println!("skip: {skip}");
+                }
+                for err in &report.errors {
+                    eprintln!("error: {err}");
+                }
+            }
+            if !report.errors.is_empty() {
+                anyhow::bail!("migration finished with {} error(s)", report.errors.len());
+            }
+            return Ok(());
         }
         Some(Commands::Completions { shell }) => {
             return print_completions(shell);
@@ -406,6 +450,7 @@ async fn run(cli: Cli) -> Result<()> {
             Commands::Init { .. }
             | Commands::Config { .. }
             | Commands::Doctor { .. }
+            | Commands::Migrate { .. }
             | Commands::Completions { .. },
         ) => {
             unreachable!("setup commands handled before runtime startup")
@@ -2535,36 +2580,47 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
     }
 
     async fn search(&self, query: &str) -> serde_json::Value {
-        let needle = query.to_lowercase();
-        let sessions = self.state.sessions.lock().await;
-        let mut hits = Vec::new();
-        for session in sessions.values() {
-            for (index, message) in session.messages.iter().enumerate() {
-                for part in &message.content {
-                    let text = match part {
-                        ChatContent::Text { text } | ChatContent::Thinking { thinking: text } => {
-                            text
-                        }
-                        ChatContent::ToolResult { content, .. } => content,
-                        ChatContent::ToolUse { .. }
-                        | ChatContent::Image { .. }
-                        | ChatContent::Video { .. } => continue,
-                    };
-                    if text.to_lowercase().contains(&needle) {
-                        hits.push(serde_json::json!({
-                            "session_id": session.id,
-                            "message_index": index,
-                            "role": message.role,
-                            "preview": text.chars().take(240).collect::<String>(),
-                        }));
-                        if hits.len() == 100 {
-                            break;
+        let db = self.state.transcript.lock().await;
+        match db.search_messages(query, 100, None, None, None, None) {
+            Ok(hits) => serde_json::json!({
+                "query": query,
+                "hits": hits,
+                "source": "fts",
+            }),
+            Err(error) => {
+                tracing::warn!("FTS search failed, falling back to memory: {error}");
+                drop(db);
+                let needle = query.to_lowercase();
+                let sessions = self.state.sessions.lock().await;
+                let mut hits = Vec::new();
+                for session in sessions.values() {
+                    for (index, message) in session.messages.iter().enumerate() {
+                        for part in &message.content {
+                            let text = match part {
+                                ChatContent::Text { text }
+                                | ChatContent::Thinking { thinking: text } => text,
+                                ChatContent::ToolResult { content, .. } => content,
+                                ChatContent::ToolUse { .. }
+                                | ChatContent::Image { .. }
+                                | ChatContent::Video { .. } => continue,
+                            };
+                            if text.to_lowercase().contains(&needle) {
+                                hits.push(serde_json::json!({
+                                    "session_id": session.id,
+                                    "message_index": index,
+                                    "role": message.role,
+                                    "preview": text.chars().take(240).collect::<String>(),
+                                }));
+                                if hits.len() == 100 {
+                                    break;
+                                }
+                            }
                         }
                     }
                 }
+                serde_json::json!({"query": query, "hits": hits, "source": "memory"})
             }
         }
-        serde_json::json!({"query": query, "hits": hits})
     }
 
     async fn workspace_info(&self) -> serde_json::Value {
@@ -5039,6 +5095,80 @@ async fn handle_rpc_call(
                 "session_id": session_id,
                 "session_dir": session_dir,
                 "model": model_alias,
+            }))
+        }
+        "sessions.search" => {
+            let query = params
+                .as_ref()
+                .and_then(|p| p.get("query").or_else(|| p.get("q")))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let limit = params
+                .as_ref()
+                .and_then(|p| p.get("limit"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(50) as usize;
+            let title = params
+                .as_ref()
+                .and_then(|p| p.get("title"))
+                .and_then(|v| v.as_str());
+            let tool_name = params
+                .as_ref()
+                .and_then(|p| p.get("tool_name").or_else(|| p.get("tool")))
+                .and_then(|v| v.as_str());
+            let since = params
+                .as_ref()
+                .and_then(|p| p.get("since"))
+                .and_then(|v| v.as_str());
+            let until = params
+                .as_ref()
+                .and_then(|p| p.get("until"))
+                .and_then(|v| v.as_str());
+            let db = state.transcript.lock().await;
+            let hits = db
+                .search_messages(&query, limit, title, tool_name, since, until)
+                .map_err(|e| (-32000, e.to_string()))?;
+            Ok(serde_json::json!({"query": query, "hits": hits, "source": "fts"}))
+        }
+        "sessions.timeline" => {
+            let session_id = params
+                .as_ref()
+                .and_then(|p| p.get("session_id"))
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| (-32602, "Missing session_id".into()))?;
+            let db = state.transcript.lock().await;
+            let session = db
+                .get_session(session_id)
+                .map_err(|e| (-32000, e.to_string()))?
+                .ok_or_else(|| (-32000, format!("session not found: {session_id}")))?;
+            let messages = db
+                .load_messages(session_id)
+                .map_err(|e| (-32000, e.to_string()))?;
+            let events: Vec<serde_json::Value> = messages
+                .into_iter()
+                .map(|m| {
+                    serde_json::json!({
+                        "id": m.id,
+                        "role": m.role,
+                        "created_at": m.created_at,
+                        "token_count": m.token_count,
+                        "preview": m.content_json.chars().take(200).collect::<String>(),
+                    })
+                })
+                .collect();
+            Ok(serde_json::json!({
+                "session": {
+                    "session_id": session.session_id,
+                    "title": session.title,
+                    "model": session.model,
+                    "working_dir": session.working_dir,
+                    "created_at": session.created_at,
+                    "updated_at": session.updated_at,
+                    "message_count": session.message_count,
+                },
+                "events": events,
+                "format": "timeline/v1",
             }))
         }
         "sessions.list" => {

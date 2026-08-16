@@ -2963,7 +2963,7 @@ impl TuiApp {
 
         // Transcript search overlay (Ctrl-F)
         if self.state.search.active {
-            return self.handle_search_key(key);
+            return self.handle_search_key(key).await;
         }
 
         // Handle approval panel first (plan review / permission approval).
@@ -9418,8 +9418,7 @@ impl TuiApp {
                 self.state.search.open();
                 if !args.is_empty() {
                     self.state.search.query = args.to_string();
-                    let msgs = self.state.messages.clone();
-                    self.state.search.recompute(&msgs);
+                    self.refresh_search_hits().await;
                 }
                 self.state.slash_menu = None;
                 self.state.list_picker = None;
@@ -9622,7 +9621,7 @@ impl TuiApp {
         });
     }
 
-    fn handle_search_key(&mut self, key: KeyEvent) -> anyhow::Result<()> {
+    async fn handle_search_key(&mut self, key: KeyEvent) -> anyhow::Result<()> {
         match key.code {
             KeyCode::Esc => {
                 self.state.search.close();
@@ -9630,44 +9629,127 @@ impl TuiApp {
             }
             KeyCode::Enter => {
                 if let Some(hit) = self.state.search.current().cloned() {
-                    self.state.highlight_message = Some(hit.message_index);
-                    self.state.follow_bottom = false;
-                    // Jump roughly toward the selected message.
-                    let n = self.state.messages.len().max(1);
-                    let from_end = n.saturating_sub(hit.message_index + 1);
-                    let approx_lines = (from_end as u16).saturating_mul(6);
-                    self.state.scroll_up = approx_lines.min(self.state.max_scroll_up());
-                    self.state.search.close();
+                    if let Some(session_id) = hit.session_id.clone() {
+                        self.state.search.close();
+                        self.state.highlight_message = None;
+                        self.resume_session(&session_id).await?;
+                        self.system_message(format!(
+                            "Opened session from search · {}",
+                            hit.title.as_deref().unwrap_or(session_id.as_str())
+                        ));
+                    } else {
+                        self.state.highlight_message = Some(hit.message_index);
+                        self.state.follow_bottom = false;
+                        // Jump roughly toward the selected message.
+                        let n = self.state.messages.len().max(1);
+                        let from_end = n.saturating_sub(hit.message_index + 1);
+                        let approx_lines = (from_end as u16).saturating_mul(6);
+                        self.state.scroll_up = approx_lines.min(self.state.max_scroll_up());
+                        self.state.search.close();
+                    }
                 }
+            }
+            KeyCode::Tab if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.state.search.toggle_scope();
+                self.refresh_search_hits().await;
             }
             KeyCode::Up | KeyCode::BackTab => {
                 self.state.search.prev();
                 if let Some(hit) = self.state.search.current() {
-                    self.state.highlight_message = Some(hit.message_index);
+                    if hit.session_id.is_none() {
+                        self.state.highlight_message = Some(hit.message_index);
+                    }
                 }
             }
             KeyCode::Down | KeyCode::Tab => {
                 self.state.search.next();
                 if let Some(hit) = self.state.search.current() {
-                    self.state.highlight_message = Some(hit.message_index);
+                    if hit.session_id.is_none() {
+                        self.state.highlight_message = Some(hit.message_index);
+                    }
                 }
             }
             KeyCode::Backspace => {
                 self.state.search.query.pop();
-                let msgs = self.state.messages.clone();
-                self.state.search.recompute(&msgs);
+                self.refresh_search_hits().await;
             }
             KeyCode::Char(c)
                 if !key.modifiers.contains(KeyModifiers::CONTROL)
                     && !key.modifiers.contains(KeyModifiers::ALT) =>
             {
                 self.state.search.query.push(c);
-                let msgs = self.state.messages.clone();
-                self.state.search.recompute(&msgs);
+                self.refresh_search_hits().await;
             }
             _ => {}
         }
         Ok(())
+    }
+
+    async fn refresh_search_hits(&mut self) {
+        use crate::search::{parse_search_query, SearchHit, SearchScope};
+        match self.state.search.scope {
+            SearchScope::Local => {
+                let msgs = self.state.messages.clone();
+                self.state.search.recompute(&msgs);
+            }
+            SearchScope::Global => {
+                let (needle, title, tool) = parse_search_query(&self.state.search.query);
+                if needle.is_empty() && title.is_none() && tool.is_none() {
+                    self.state.search.hits.clear();
+                    self.state.search.selected = 0;
+                    return;
+                }
+                let mut params = serde_json::json!({
+                    "query": needle,
+                    "limit": 40,
+                });
+                if let Some(title) = title {
+                    params["title"] = serde_json::Value::String(title);
+                }
+                if let Some(tool) = tool {
+                    params["tool_name"] = serde_json::Value::String(tool);
+                }
+                match self.client.rpc_call("sessions.search", Some(params)).await {
+                    Ok(value) => {
+                        let hits = value
+                            .get("hits")
+                            .and_then(|v| v.as_array())
+                            .into_iter()
+                            .flatten()
+                            .enumerate()
+                            .map(|(i, hit)| SearchHit {
+                                message_index: i,
+                                preview: hit
+                                    .get("preview")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string(),
+                                role: hit
+                                    .get("role")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("?")
+                                    .to_string(),
+                                session_id: hit
+                                    .get("session_id")
+                                    .and_then(|v| v.as_str())
+                                    .map(str::to_string),
+                                title: hit
+                                    .get("title")
+                                    .and_then(|v| v.as_str())
+                                    .filter(|s| !s.is_empty())
+                                    .map(str::to_string),
+                            })
+                            .collect();
+                        self.state.search.apply_global_hits(hits);
+                    }
+                    Err(error) => {
+                        self.state.search.hits.clear();
+                        self.state.search.selected = 0;
+                        self.system_message(format!("Search failed: {error}"));
+                    }
+                }
+            }
+        }
     }
 
     fn system_message(&mut self, content: String) {

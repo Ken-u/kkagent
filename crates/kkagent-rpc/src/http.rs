@@ -1765,6 +1765,79 @@ async fn export_session(
     Ok(Json(json!({"export": sess, "format": "json"})))
 }
 
+async fn session_timeline(
+    State(state): State<HttpState>,
+    Path(id): Path<String>,
+    Query(q): Query<AuthQuery>,
+) -> Result<Json<Value>, StatusCode> {
+    check_auth(&state, &q)?;
+    let sess = state
+        .backend
+        .get_session(&id)
+        .await
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let messages = sess
+        .get("messages")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let events: Vec<Value> = messages
+        .into_iter()
+        .enumerate()
+        .map(|(i, m)| {
+            json!({
+                "index": i,
+                "role": m.get("role"),
+                "preview": m.get("content").cloned().unwrap_or(Value::Null).to_string().chars().take(200).collect::<String>(),
+            })
+        })
+        .collect();
+    Ok(Json(json!({
+        "session_id": id,
+        "events": events,
+        "format": "timeline/v1",
+    })))
+}
+
+async fn web_ui_index() -> impl IntoResponse {
+    (
+        [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        WEB_UI_HTML,
+    )
+}
+
+async fn web_ui_app_js() -> impl IntoResponse {
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )],
+        WEB_UI_JS,
+    )
+}
+
+async fn debug_panel(State(state): State<HttpState>) -> impl IntoResponse {
+    let sessions = state.backend.list_sessions().await;
+    let health = state.backend.health().await;
+    let body = format!(
+        r#"<!DOCTYPE html><html><head><meta charset="utf-8"><title>kkagent debug</title>
+<style>body{{font:13px/1.4 ui-monospace,monospace;background:#111;color:#ddd;padding:16px}}
+pre{{background:#1b1b1b;padding:12px;overflow:auto;border-radius:8px}}</style></head>
+<body><h1>kkagent debug</h1><h2>health</h2><pre>{health}</pre>
+<h2>sessions</h2><pre>{sessions}</pre>
+<p><a href="/ui/" style="color:#8cf">Open Web UI</a></p></body></html>"#,
+        health = serde_json::to_string_pretty(&health).unwrap_or_default(),
+        sessions = serde_json::to_string_pretty(&sessions).unwrap_or_default()
+    );
+    (
+        [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        body,
+    )
+}
+
+const WEB_UI_HTML: &str = include_str!("../../../apps/web-ui/index.html");
+const WEB_UI_JS: &str = include_str!("../../../apps/web-ui/app.js");
+
 async fn delete_session(
     State(state): State<HttpState>,
     Path(id): Path<String>,
@@ -1939,6 +2012,12 @@ pub fn router(state: HttpState) -> Router {
         )
         .route("/api/v1/connections", get(connections))
         .route("/api/v1/ws", get(ws_handler))
+        .route("/", get(web_ui_index))
+        .route("/ui", get(web_ui_index))
+        .route("/ui/", get(web_ui_index))
+        .route("/ui/app.js", get(web_ui_app_js))
+        .route("/debug", get(debug_panel))
+        .route("/api/v1/sessions/{id}/timeline", get(session_timeline))
         // A 100 MiB source image expands by roughly 4/3 when base64 encoded.
         .layer(DefaultBodyLimit::max(140 * 1024 * 1024))
         .route_layer(middleware::from_fn_with_state(

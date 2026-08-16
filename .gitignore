@@ -17,10 +17,9 @@
 # Reference / local scratch
 /ref/
 /tmp/
-/plugins/
-/upload.sh
 *.log
 /specs/
+/upload.sh
 
 # Node build artifacts
 **/node_modules/

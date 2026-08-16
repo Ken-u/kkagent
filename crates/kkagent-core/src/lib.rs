@@ -9,6 +9,7 @@ pub mod event_bus;
 pub mod file_conflict;
 pub mod full_compaction;
 pub mod git_context;
+pub mod legacy_migrate;
 pub mod media_pipeline;
 pub mod model_capability;
 pub mod permission;
@@ -52,6 +53,7 @@ pub use full_compaction::{
     DEFAULT_TRIGGER_RATIO, MAX_OVERFLOW_COMPACTION_ATTEMPTS,
 };
 pub use git_context::{collect_git_context, collect_git_context_with_trust, is_workspace_trusted};
+pub use legacy_migrate::{migrate_legacy_home, MigrateReport};
 pub use media_pipeline::{extract_at_paths, resolve_media, MediaLimits, MediaRef};
 pub use model_capability::ModelCapability;
 pub use permission::*;

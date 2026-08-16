@@ -34,6 +34,86 @@ pub struct MessageRecord {
     pub created_at: String,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SearchHit {
+    pub session_id: String,
+    pub role: String,
+    pub preview: String,
+    pub created_at: String,
+    pub title: String,
+    pub tool_name: String,
+}
+
+fn searchable_body(content_json: &str) -> String {
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(content_json) {
+        let mut parts = Vec::new();
+        collect_text(&value, &mut parts);
+        if !parts.is_empty() {
+            return parts.join("\n");
+        }
+    }
+    content_json.to_string()
+}
+
+fn collect_text(value: &serde_json::Value, out: &mut Vec<String>) {
+    match value {
+        serde_json::Value::String(s) => out.push(s.clone()),
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_text(item, out);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for (key, item) in map {
+                if matches!(
+                    key.as_str(),
+                    "text" | "content" | "thinking" | "name" | "path" | "command" | "query"
+                ) {
+                    collect_text(item, out);
+                } else if key == "type" {
+                    continue;
+                } else {
+                    collect_text(item, out);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn extract_tool_name(content_json: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(content_json).ok()?;
+    if let Some(arr) = value.as_array() {
+        for item in arr {
+            if item.get("type").and_then(|v| v.as_str()) == Some("tool_use") {
+                if let Some(name) = item.get("name").and_then(|v| v.as_str()) {
+                    return Some(name.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn fts_query_from_user(query: &str) -> String {
+    query
+        .split_whitespace()
+        .filter(|t| !t.is_empty())
+        .map(|token| {
+            let cleaned: String = token
+                .chars()
+                .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-' || *c == '.')
+                .collect();
+            if cleaned.is_empty() {
+                return String::new();
+            }
+            format!("\"{cleaned}\"*")
+        })
+        .filter(|t| !t.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Open `transcripts.db` once; callers can share the Arc across stores.
 pub fn open_shared_sqlite(db_path: &Path) -> anyhow::Result<SharedSqlite> {
     // Skip for in-memory / empty parents (Path(":memory:").parent() == Some(""))
@@ -134,6 +214,16 @@ impl TranscriptDb {
 
             CREATE INDEX IF NOT EXISTS idx_tool_results_tool_call_id
                 ON tool_results(tool_call_id);
+
+            CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+                session_id UNINDEXED,
+                role UNINDEXED,
+                body,
+                tool_name UNINDEXED,
+                created_at UNINDEXED,
+                title UNINDEXED,
+                tokenize = 'unicode61'
+            );
             ",
         )?;
         let has_fallback_model: bool = conn.query_row(
@@ -146,7 +236,158 @@ impl TranscriptDb {
         if !has_fallback_model {
             conn.execute("ALTER TABLE sessions ADD COLUMN fallback_model TEXT", [])?;
         }
+        drop(conn);
+        self.ensure_fts_populated()?;
         Ok(())
+    }
+
+    fn ensure_fts_populated(&self) -> anyhow::Result<()> {
+        let conn = self.lock()?;
+        let fts_count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM messages_fts", [], |row| row.get(0))?;
+        if fts_count > 0 {
+            return Ok(());
+        }
+        let msg_count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))?;
+        if msg_count == 0 {
+            return Ok(());
+        }
+        drop(conn);
+        self.rebuild_fts()?;
+        Ok(())
+    }
+
+    /// Rebuild the full-text index from `messages` (blocking; call off agent hot path).
+    pub fn rebuild_fts(&self) -> anyhow::Result<()> {
+        let conn = self.lock()?;
+        let tx = conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM messages_fts", [])?;
+        {
+            let mut stmt = tx.prepare(
+                "SELECT m.session_id, m.role, m.content_json, m.created_at,
+                        COALESCE(s.title, '')
+                 FROM messages m
+                 LEFT JOIN sessions s ON s.session_id = m.session_id
+                 ORDER BY m.id",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })?;
+            let mut insert = tx.prepare(
+                "INSERT INTO messages_fts(session_id, role, body, tool_name, created_at, title)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            )?;
+            for row in rows {
+                let (session_id, role, content_json, created_at, title) = row?;
+                let body = searchable_body(&content_json);
+                let tool_name = extract_tool_name(&content_json).unwrap_or_default();
+                insert.execute(params![
+                    session_id, role, body, tool_name, created_at, title
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn index_message_locked(
+        conn: &rusqlite::Connection,
+        session_id: &str,
+        role: &str,
+        content_json: &str,
+        created_at: &str,
+    ) -> anyhow::Result<()> {
+        let title: String = conn
+            .query_row(
+                "SELECT COALESCE(title, '') FROM sessions WHERE session_id = ?1",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .unwrap_or_default();
+        let tool_name = extract_tool_name(content_json).unwrap_or_default();
+        let body = searchable_body(content_json);
+        conn.execute(
+            "INSERT INTO messages_fts(session_id, role, body, tool_name, created_at, title)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![session_id, role, body, tool_name, created_at, title],
+        )?;
+        Ok(())
+    }
+
+    /// Cross-session full-text search with optional filters.
+    pub fn search_messages(
+        &self,
+        query: &str,
+        limit: usize,
+        title_contains: Option<&str>,
+        tool_name: Option<&str>,
+        since: Option<&str>,
+        until: Option<&str>,
+    ) -> anyhow::Result<Vec<SearchHit>> {
+        let q = query.trim();
+        if q.is_empty() {
+            return Ok(Vec::new());
+        }
+        let fts_query = fts_query_from_user(q);
+        if fts_query.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT f.session_id, f.role, snippet(messages_fts, 2, '«', '»', '…', 32),
+                    f.created_at, f.title, f.tool_name
+             FROM messages_fts f
+             WHERE messages_fts MATCH ?1
+             ORDER BY rank
+             LIMIT ?2",
+        )?;
+        let fetch_limit = (limit.clamp(1, 200) * 4) as i64;
+        let rows = stmt.query_map(params![fts_query, fetch_limit], |row| {
+            Ok(SearchHit {
+                session_id: row.get(0)?,
+                role: row.get(1)?,
+                preview: row.get(2)?,
+                created_at: row.get(3)?,
+                title: row.get(4)?,
+                tool_name: row.get(5)?,
+            })
+        })?;
+        let mut hits = Vec::new();
+        for row in rows {
+            let hit = row?;
+            if let Some(title) = title_contains.filter(|s| !s.is_empty()) {
+                if !hit.title.to_lowercase().contains(&title.to_lowercase()) {
+                    continue;
+                }
+            }
+            if let Some(tool) = tool_name.filter(|s| !s.is_empty()) {
+                if !hit.tool_name.eq_ignore_ascii_case(tool) {
+                    continue;
+                }
+            }
+            if let Some(since) = since.filter(|s| !s.is_empty()) {
+                if hit.created_at.as_str() < since {
+                    continue;
+                }
+            }
+            if let Some(until) = until.filter(|s| !s.is_empty()) {
+                if hit.created_at.as_str() > until {
+                    continue;
+                }
+            }
+            hits.push(hit);
+            if hits.len() >= limit.clamp(1, 200) {
+                break;
+            }
+        }
+        Ok(hits)
     }
 
     pub fn create_session(
@@ -216,6 +457,7 @@ impl TranscriptDb {
             params![session_id, role, content_json, token_count, now],
         )?;
         let id = conn.last_insert_rowid();
+        let _ = Self::index_message_locked(&conn, session_id, role, content_json, &now);
 
         conn.execute(
             "UPDATE sessions SET message_count = message_count + 1, updated_at = ?1
@@ -244,6 +486,8 @@ impl TranscriptDb {
             )?;
             for (role, content_json) in messages {
                 statement.execute(params![session_id, role, content_json, now])?;
+                let _ =
+                    Self::index_message_locked(&transaction, session_id, role, content_json, &now);
             }
         }
         transaction.execute(
@@ -268,6 +512,10 @@ impl TranscriptDb {
             "DELETE FROM messages WHERE session_id = ?1",
             params![session_id],
         )?;
+        let _ = transaction.execute(
+            "DELETE FROM messages_fts WHERE session_id = ?1",
+            params![session_id],
+        );
         let now = Utc::now().to_rfc3339();
         {
             let mut statement = transaction.prepare(
@@ -276,6 +524,8 @@ impl TranscriptDb {
             )?;
             for (role, content_json) in messages {
                 statement.execute(params![session_id, role, content_json, now])?;
+                let _ =
+                    Self::index_message_locked(&transaction, session_id, role, content_json, &now);
             }
         }
         transaction.execute(
@@ -986,5 +1236,38 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_fts_search_across_sessions() {
+        let db = test_db();
+        db.create_session("s1", "claude", ".").unwrap();
+        db.set_title("s1", "alpha project").unwrap();
+        db.create_session("s2", "gpt", ".").unwrap();
+        db.set_title("s2", "beta project").unwrap();
+        db.append_message(
+            "s1",
+            "user",
+            r#"[{"type":"text","text":"unique-fts-apple-token"}]"#,
+            None,
+        )
+        .unwrap();
+        db.append_message(
+            "s2",
+            "assistant",
+            r#"[{"type":"text","text":"unique-fts-orange-token"}]"#,
+            None,
+        )
+        .unwrap();
+        let hits = db
+            .search_messages("unique-fts-apple", 10, None, None, None, None)
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].session_id, "s1");
+        let titled = db
+            .search_messages("unique-fts-orange", 10, Some("beta"), None, None, None)
+            .unwrap();
+        assert_eq!(titled.len(), 1);
+        assert_eq!(titled[0].session_id, "s2");
     }
 }

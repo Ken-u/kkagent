@@ -1,0 +1,20 @@
+{
+  "name": "kk-browser",
+  "version": "1.0.0",
+  "description": "Example browser control plugin. Wire a real CDP/MCP browser server in production.",
+  "systemPrompt": "Use browser tools only when the user explicitly asks to interact with a web page.",
+  "interface": {
+    "displayName": "KK Browser",
+    "shortDescription": "Browser automation example",
+    "developerName": "kkagent"
+  },
+  "mcpServers": {
+    "browser": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-everything"],
+      "env": {
+        "KK_BROWSER_MODE": "headless"
+      }
+    }
+  }
+}

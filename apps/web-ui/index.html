@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>kkagent Web UI</title>
+  <style>
+    :root { --bg:#0f1419; --panel:#1a2332; --text:#e7ecf3; --muted:#8b9bb4; --accent:#3d8bfd; --border:#2a3548; }
+    * { box-sizing: border-box; }
+    body { margin:0; font:14px/1.45 ui-sans-serif, system-ui, sans-serif; background:var(--bg); color:var(--text); height:100vh; display:grid; grid-template-columns:260px 1fr; }
+    aside { background:var(--panel); border-right:1px solid var(--border); padding:12px; overflow:auto; }
+    main { display:flex; flex-direction:column; min-width:0; }
+    h1 { font-size:16px; margin:0 0 12px; }
+    .session { padding:8px; border-radius:8px; cursor:pointer; color:var(--muted); }
+    .session.active, .session:hover { background:#243044; color:var(--text); }
+    #log { flex:1; overflow:auto; padding:16px; white-space:pre-wrap; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:12px; }
+    .msg { margin:0 0 12px; padding:10px 12px; border-radius:10px; background:var(--panel); border:1px solid var(--border); }
+    .msg.user { border-color:#35507a; }
+    .msg.assistant { border-color:#2f5d45; }
+    .msg .role { color:var(--muted); font-size:11px; margin-bottom:4px; }
+    form { display:flex; gap:8px; padding:12px; border-top:1px solid var(--border); background:var(--panel); }
+    input, button { font:inherit; }
+    input { flex:1; background:#0f1419; color:var(--text); border:1px solid var(--border); border-radius:8px; padding:10px 12px; }
+    button { background:var(--accent); color:white; border:0; border-radius:8px; padding:10px 14px; cursor:pointer; }
+    #status { color:var(--muted); font-size:12px; margin-bottom:8px; }
+    pre.diff { background:#111820; padding:8px; overflow:auto; border-radius:6px; }
+    code { color:#9cdcfe; }
+  </style>
+</head>
+<body>
+  <aside>
+    <h1>kkagent</h1>
+    <div id="status">connecting…</div>
+    <button id="newSession" style="width:100%;margin-bottom:8px;">New session</button>
+    <button id="timelineBtn" style="width:100%;margin-bottom:8px;background:#35507a;">Timeline</button>
+    <input id="searchBox" placeholder="Search sessions…" style="width:100%;margin-bottom:12px;background:#0f1419;color:var(--text);border:1px solid var(--border);border-radius:8px;padding:8px;" />
+    <div id="sessions"></div>
+  </aside>
+  <main>
+    <div id="log"></div>
+    <form id="composer">
+      <input id="prompt" placeholder="Message kkagent… (/commit /explain /fix)" autocomplete="off" />
+      <button type="submit">Send</button>
+    </form>
+  </main>
+  <script src="/ui/app.js"></script>
+</body>
+</html>

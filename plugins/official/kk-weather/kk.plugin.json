@@ -1,0 +1,18 @@
+{
+  "name": "kk-weather",
+  "version": "1.0.0",
+  "description": "Example datasource: fetch weather for a city via Open-Meteo.",
+  "systemPrompt": "When the user asks about weather, prefer the weather MCP tools from the kk-weather plugin.",
+  "interface": {
+    "displayName": "KK Weather",
+    "shortDescription": "Weather datasource example",
+    "developerName": "kkagent"
+  },
+  "mcpServers": {
+    "weather": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-everything"],
+      "env": {}
+    }
+  }
+}

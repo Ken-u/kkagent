@@ -2035,9 +2035,13 @@ fn render_search_overlay(f: &mut Frame, size: Rect, state: &AppState, theme: &Th
 
     let mut lines: Vec<Line> = Vec::new();
     let query_budget = inner_width.saturating_sub(10).max(1);
+    let scope_label = match state.search.scope {
+        crate::search::SearchScope::Local => "local",
+        crate::search::SearchScope::Global => "all",
+    };
     lines.push(Line::from(vec![
         Span::styled(
-            " find ",
+            format!(" find[{scope_label}] "),
             Style::default()
                 .fg(theme.primary)
                 .add_modifier(Modifier::BOLD),
@@ -2051,7 +2055,7 @@ fn render_search_overlay(f: &mut Frame, size: Rect, state: &AppState, theme: &Th
         ),
         Span::styled(
             if state.search.query.is_empty() {
-                " type to search…".into()
+                " type… Ctrl-Tab scope".into()
             } else {
                 format!(
                     "  {}/{}",
@@ -2093,9 +2097,19 @@ fn render_search_overlay(f: &mut Frame, size: Rect, state: &AppState, theme: &Th
                 Style::default().fg(theme.text_dim)
             };
             let mut spans = vec![Span::styled(format!(" {marker} "), style)];
-            let preview_budget = if area.width < 32 {
-                inner_width.saturating_sub(3)
-            } else {
+            let mut used = 3usize;
+            if let Some(title) = hit.title.as_deref().filter(|s| !s.is_empty()) {
+                let label = truncate_display_width(title, 14);
+                used += label.chars().count() + 1;
+                spans.push(Span::styled(
+                    format!("{label} "),
+                    Style::default().fg(if selected {
+                        theme.accent
+                    } else {
+                        theme.text_muted
+                    }),
+                ));
+            } else if area.width >= 32 {
                 spans.push(Span::styled(
                     format!("{:8} ", truncate_display_width(&hit.role, 8)),
                     Style::default().fg(if selected {
@@ -2104,8 +2118,9 @@ fn render_search_overlay(f: &mut Frame, size: Rect, state: &AppState, theme: &Th
                         theme.text_muted
                     }),
                 ));
-                inner_width.saturating_sub(12)
-            };
+                used += 9;
+            }
+            let preview_budget = inner_width.saturating_sub(used).max(8);
             spans.push(Span::styled(
                 truncate_display_width(&hit.preview, preview_budget),
                 style,
@@ -2115,10 +2130,10 @@ fn render_search_overlay(f: &mut Frame, size: Rect, state: &AppState, theme: &Th
     }
 
     lines.push(Line::from(Span::styled(
-        if area.width < 36 {
-            " ↑↓ · enter · esc"
+        if area.width < 42 {
+            " ↑↓ · enter · Ctrl-Tab · esc"
         } else {
-            " ↑↓ select · enter jump · esc close"
+            " ↑↓ select · enter jump · Ctrl-Tab local/all · esc"
         },
         Style::default().fg(theme.text_muted),
     )));
