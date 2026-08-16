@@ -407,7 +407,7 @@ async fn run(cli: Cli) -> Result<()> {
         }) => {
             let mut token = http_token.or_else(|| std::env::var("KKAGENT_HTTP_TOKEN").ok());
             if http.is_some() && token.as_deref().is_none_or(str::is_empty) {
-                let generated = format!("{}{}", uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+                let generated = generate_http_token();
                 tracing::warn!(
                     "No HTTP token was supplied. Generated one for this server process: {generated}"
                 );
@@ -1464,8 +1464,16 @@ async fn run_server(
     let init_config = config_arc.clone();
     let init_config_path = config_path;
     let init_shutdown = shutdown_tx.clone();
+    let init_http_security = http_security;
     tokio::spawn(async move {
-        match build_server_state_with_shutdown(init_config, init_config_path, init_shutdown).await {
+        match build_server_state_with_shutdown(
+            init_config,
+            init_config_path,
+            init_shutdown,
+            init_http_security,
+        )
+        .await
+        {
             Ok(state) => {
                 let _ = state_tx.send(Some(Ok(state)));
             }
@@ -1481,44 +1489,27 @@ async fn run_server(
         let state = wait_for_server_state(&mut state_wait)
             .await
             .map_err(|error| anyhow::anyhow!("{error}"))?;
-        let http_handle = if let Some(addr) = http {
-            let concrete_backend = Arc::new(AgentHttpBackend {
+        if let Some(addr) = http {
+            let backend = Arc::new(AgentHttpBackend {
                 state: state.clone(),
             });
-            let recovery_backend = concrete_backend.clone();
-            let backend: Arc<dyn kkagent_rpc::HttpBackend> = concrete_backend;
-            let token = http_token;
-            let durable_http = state.durable_http.clone();
-            let http_listener = kkagent_rpc::bind_http(&addr, token.as_deref()).await?;
-            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-            let handle = tokio::spawn(async move {
-                if let Err(e) =
-                    kkagent_rpc::serve_http_listener_with_backend_security_and_persistence(
-                        http_listener,
-                        backend,
-                        token,
-                        http_security,
-                        durable_http,
-                        Some(ready_tx),
-                    )
-                    .await
-                {
-                    tracing::error!("HTTP server error: {e}");
+            match state.http_runtime.start(backend, &addr, http_token).await {
+                Ok(Some(_)) => {
+                    recover_durable_turns(Arc::new(AgentHttpBackend {
+                        state: state.clone(),
+                    }))
+                    .await;
                 }
-            });
-            ready_rx
-                .await
-                .map_err(|_| anyhow::anyhow!("HTTP server stopped before initialization"))?;
-            recover_durable_turns(recovery_backend).await;
-            Some(handle)
-        } else {
-            None
-        };
-        Ok::<_, anyhow::Error>((state, http_handle))
+                Ok(None) => {
+                    tracing::warn!("HTTP server already running; ignoring --http {addr}");
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok::<_, anyhow::Error>(state)
     };
 
     // Race: serve accepts immediately while HTTP setup (and state init) continue.
-    let mut http_handle = None;
     let mut shared_state: Option<Arc<ServerState>> = None;
     let mut last_activity = Instant::now();
     let mut http_setup = std::pin::pin!(http_setup);
@@ -1545,9 +1536,8 @@ async fn run_server(
             }
             setup = &mut http_setup, if !http_setup_done => {
                 http_setup_done = true;
-                let (state, handle) = setup?;
+                let state = setup?;
                 shared_state = Some(state);
-                http_handle = handle;
                 last_activity = Instant::now();
             }
             changed = shutdown_rx.changed() => {
@@ -1585,10 +1575,6 @@ async fn run_server(
         }
     }
 
-    if let Some(handle) = http_handle {
-        handle.abort();
-        let _ = handle.await;
-    }
     if let Some(state) = shared_state {
         state.shutdown().await;
     } else if let Some(Ok(state)) = state_rx.borrow().clone() {
@@ -1612,6 +1598,132 @@ async fn wait_for_server_state(
 
 struct AgentHttpBackend {
     state: Arc<ServerState>,
+}
+
+/// Running HTTP server spawned by `--http` startup or `runtime.http.start`.
+struct HttpServerHandle {
+    task: tokio::task::JoinHandle<()>,
+    /// Actual bound address (the requested port may be 0 for ephemeral).
+    address: String,
+    token: Option<String>,
+}
+
+/// Address + token snapshot returned after starting the HTTP server.
+#[derive(Debug, Clone)]
+struct HttpServerInfo {
+    address: String,
+    token: Option<String>,
+}
+
+/// Owns the lifecycle of the runtime HTTP / Web UI server.
+///
+/// Shared by `--http` startup and the `runtime.http.start` RPC so both paths
+/// apply the same security policy and never run two servers at once.
+struct HttpServerManager {
+    security: kkagent_rpc::HttpSecurityOptions,
+    durable: kkagent_rpc::DurableHttpStore,
+    current: Mutex<Option<HttpServerHandle>>,
+}
+
+impl HttpServerManager {
+    fn new(
+        security: kkagent_rpc::HttpSecurityOptions,
+        durable: kkagent_rpc::DurableHttpStore,
+    ) -> Self {
+        Self {
+            security,
+            durable,
+            current: Mutex::new(None),
+        }
+    }
+
+    /// Spawn the HTTP server if none is running. Returns `None` when one is.
+    async fn start(
+        &self,
+        backend: Arc<dyn kkagent_rpc::HttpBackend>,
+        addr: &str,
+        token: Option<String>,
+    ) -> Result<Option<HttpServerInfo>, anyhow::Error> {
+        let mut guard = self.current.lock().await;
+        if guard.is_some() {
+            return Ok(None);
+        }
+        let token = token.filter(|value| !value.trim().is_empty());
+        // bind_http enforces the spec rule: non-loopback addresses require a token.
+        let listener = kkagent_rpc::bind_http(addr, token.as_deref()).await?;
+        let address = listener
+            .local_addr()
+            .map(|addr| addr.to_string())
+            .unwrap_or_else(|_| addr.to_string());
+        let durable_http = self.durable.clone();
+        let security = self.security.clone();
+        let serve_token = token.clone();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            if let Err(error) =
+                kkagent_rpc::serve_http_listener_with_backend_security_and_persistence(
+                    listener,
+                    backend,
+                    serve_token,
+                    security,
+                    durable_http,
+                    Some(ready_tx),
+                )
+                .await
+            {
+                tracing::error!("HTTP server error: {error}");
+            }
+        });
+        if ready_rx.await.is_err() {
+            task.abort();
+            let _ = task.await;
+            anyhow::bail!("HTTP server stopped before initialization");
+        }
+        tracing::info!("HTTP server listening on http://{address}");
+        *guard = Some(HttpServerHandle {
+            task,
+            address: address.clone(),
+            token: token.clone(),
+        });
+        Ok(Some(HttpServerInfo { address, token }))
+    }
+
+    /// Abort the running HTTP server, if any. Returns its address.
+    async fn stop(&self) -> Result<String, String> {
+        let handle = self
+            .current
+            .lock()
+            .await
+            .take()
+            .ok_or_else(|| "HTTP server is not running".to_string())?;
+        handle.task.abort();
+        let _ = handle.task.await;
+        tracing::info!("HTTP server on {} stopped", handle.address);
+        Ok(handle.address)
+    }
+
+    /// Abort without reporting — used during server shutdown.
+    async fn abort(&self) {
+        if let Some(handle) = self.current.lock().await.take() {
+            handle.task.abort();
+        }
+    }
+
+    /// Snapshot for `runtime.http.status`.
+    async fn status(&self) -> serde_json::Value {
+        match self.current.lock().await.as_ref() {
+            Some(handle) => serde_json::json!({
+                "running": true,
+                "address": handle.address,
+                "token_set": handle.token.is_some(),
+            }),
+            None => serde_json::json!({
+                "running": false,
+                "address": serde_json::Value::Null,
+                "token_set": false,
+            }),
+        }
+    }
 }
 
 struct AgentAcpHost {
@@ -1763,6 +1875,11 @@ async fn recover_durable_turns(backend: Arc<AgentHttpBackend>) {
                 .finish_turn(&turn.task_id, "failed", Some(&error));
         }
     }
+}
+
+/// High-entropy token generated when no HTTP token is supplied.
+fn generate_http_token() -> String {
+    format!("{}{}", uuid::Uuid::new_v4(), uuid::Uuid::new_v4())
 }
 
 async fn recover_subagents(state: Arc<ServerState>) {
@@ -3107,6 +3224,9 @@ struct ServerState {
     /// DB rows so trash archival can map files back to sessions.
     tool_result_store: Arc<kkagent_core::agent_loop::ToolResultStore>,
     durable_http: kkagent_rpc::DurableHttpStore,
+    /// Lifecycle of the HTTP / Web UI server, shared by `--http` startup and
+    /// `runtime.http.start` so both paths stay equivalent.
+    http_runtime: HttpServerManager,
     subagents: Arc<SubagentManager>,
     /// Connected MCP servers; tools registered per turn from this manager.
     mcp: Arc<McpManager>,
@@ -3878,6 +3998,7 @@ impl ServerState {
     }
 
     async fn shutdown(&self) {
+        self.http_runtime.abort().await;
         for (_, handle) in self.abort_registry.lock().await.drain() {
             handle.abort();
         }
@@ -4007,13 +4128,20 @@ async fn build_server_state(
     config_path: PathBuf,
 ) -> Result<Arc<ServerState>> {
     let (shutdown_tx, _) = watch::channel(false);
-    build_server_state_with_shutdown(config, config_path, shutdown_tx).await
+    build_server_state_with_shutdown(
+        config,
+        config_path,
+        shutdown_tx,
+        kkagent_rpc::HttpSecurityOptions::default(),
+    )
+    .await
 }
 
 async fn build_server_state_with_shutdown(
     config: Arc<AppConfig>,
     config_path: PathBuf,
     shutdown_tx: watch::Sender<bool>,
+    http_security: kkagent_rpc::HttpSecurityOptions,
 ) -> Result<Arc<ServerState>> {
     let startup_started = std::time::Instant::now();
     let (events, _) = tokio::sync::broadcast::channel(1024);
@@ -4205,7 +4333,8 @@ async fn build_server_state_with_shutdown(
             kkagent_config::default_config_dir(),
             Some(db_for_tool_results),
         )),
-        durable_http,
+        durable_http: durable_http.clone(),
+        http_runtime: HttpServerManager::new(http_security, durable_http),
         subagents,
         mcp,
         bash_shells: Arc::new(kkagent_tools::builtin::BackgroundShellManager::new()),
@@ -5003,6 +5132,67 @@ async fn handle_rpc_call(
                 "pid": std::process::id(),
             }))
         }
+        "runtime.http.start" => {
+            let value =
+                params.ok_or_else(|| (-32602, "Missing runtime.http.start params".to_string()))?;
+            let addr = value
+                .get("addr")
+                .and_then(serde_json::Value::as_str)
+                .filter(|addr| !addr.trim().is_empty())
+                .ok_or_else(|| (-32602, "Missing or empty 'addr'".to_string()))?
+                .to_string();
+            let provided_token = value
+                .get("token")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+                .or_else(|| std::env::var("KKAGENT_HTTP_TOKEN").ok())
+                .filter(|token| !token.trim().is_empty());
+            if provided_token.is_none() {
+                let resolved = tokio::net::lookup_host(&addr).await;
+                let needs_token = match resolved {
+                    Ok(sockets) => sockets.into_iter().any(|socket| !socket.ip().is_loopback()),
+                    Err(_) => {
+                        // Unresolvable addresses are rejected by bind_http anyway;
+                        // require a token to stay conservative.
+                        true
+                    }
+                };
+                if needs_token {
+                    return Err((
+                        -32000,
+                        "non-loopback HTTP listen address requires a token".into(),
+                    ));
+                }
+            }
+            // Spec: no token provided → generate a high-entropy one and return it.
+            let token = provided_token.or_else(|| Some(generate_http_token()));
+            let backend = Arc::new(AgentHttpBackend {
+                state: state.clone(),
+            });
+            let info = match state.http_runtime.start(backend, &addr, token).await {
+                Ok(Some(info)) => info,
+                Ok(None) => {
+                    return Err((-32000, "HTTP server is already running".into()));
+                }
+                Err(error) => {
+                    return Err((-32000, format!("failed to start HTTP server: {error}")))
+                }
+            };
+            // Same recovery semantics as `--http` startup.
+            recover_durable_turns(Arc::new(AgentHttpBackend {
+                state: state.clone(),
+            }))
+            .await;
+            Ok(serde_json::json!({
+                "address": info.address,
+                "token": info.token.unwrap_or_default(),
+            }))
+        }
+        "runtime.http.stop" => match state.http_runtime.stop().await {
+            Ok(address) => Ok(serde_json::json!({ "stopped": true, "address": address })),
+            Err(message) => Err((-32000, message)),
+        },
+        "runtime.http.status" => Ok(state.http_runtime.status().await),
         "runtime.has_active_turns" => {
             let sessions = state.turn_locks.active_session_ids().await;
             Ok(serde_json::json!({
@@ -8489,5 +8679,326 @@ mod http_path_tests {
         // Active turns or connected clients keep the server alive.
         assert!(!should_idle_shutdown(timeout, idle, true, false));
         assert!(!should_idle_shutdown(timeout, idle, false, true));
+    }
+}
+
+#[cfg(test)]
+mod runtime_http_tests {
+    use super::*;
+
+    fn manager() -> HttpServerManager {
+        HttpServerManager::new(
+            kkagent_rpc::HttpSecurityOptions::default(),
+            kkagent_rpc::DurableHttpStore::open_in_memory().unwrap(),
+        )
+    }
+
+    fn manager_with_token(scoped_tokens: &[(&str, &[&str])]) -> HttpServerManager {
+        let mut security = kkagent_rpc::HttpSecurityOptions::default();
+        for (token, scopes) in scoped_tokens {
+            security.scoped_tokens.insert(
+                (*token).to_string(),
+                scopes.iter().map(|s| s.to_string()).collect(),
+            );
+        }
+        HttpServerManager::new(
+            security,
+            kkagent_rpc::DurableHttpStore::open_in_memory().unwrap(),
+        )
+    }
+
+    fn memory_backend() -> Arc<dyn kkagent_rpc::HttpBackend> {
+        Arc::new(kkagent_rpc::MemoryBackend::default())
+    }
+
+    #[tokio::test]
+    async fn status_reports_not_running_initially() {
+        let manager = manager();
+        let status = manager.status().await;
+        assert_eq!(status["running"], serde_json::json!(false));
+        assert_eq!(status["address"], serde_json::Value::Null);
+        assert_eq!(status["token_set"], serde_json::json!(false));
+    }
+
+    #[tokio::test]
+    async fn stop_without_running_server_errors() {
+        let manager = manager();
+        let error = manager.stop().await.expect_err("stop should fail");
+        assert_eq!(error, "HTTP server is not running");
+    }
+
+    #[tokio::test]
+    async fn start_returns_bound_address_and_token() {
+        let manager = manager();
+        let info = manager
+            .start(
+                memory_backend(),
+                "127.0.0.1:0",
+                Some("an-explicit-token".into()),
+            )
+            .await
+            .unwrap()
+            .expect("first start should succeed");
+        assert!(info.address.contains(':'), "actual bound address returned");
+        assert_eq!(info.token.as_deref(), Some("an-explicit-token"));
+        let status = manager.status().await;
+        assert_eq!(status["running"], serde_json::json!(true));
+        assert_eq!(status["address"], serde_json::json!(info.address));
+        assert_eq!(status["token_set"], serde_json::json!(true));
+
+        let address = manager.stop().await.unwrap();
+        assert_eq!(address, info.address);
+        let status = manager.status().await;
+        assert_eq!(status["running"], serde_json::json!(false));
+    }
+
+    #[tokio::test]
+    async fn second_start_is_rejected_while_running() {
+        let manager = manager();
+        manager
+            .start(memory_backend(), "127.0.0.1:0", None)
+            .await
+            .unwrap()
+            .expect("first start succeeds");
+        let second = manager
+            .start(memory_backend(), "127.0.0.1:0", Some("t2".into()))
+            .await
+            .unwrap();
+        assert!(second.is_none(), "second start returns None while running");
+    }
+
+    #[tokio::test]
+    async fn non_loopback_without_token_is_rejected() {
+        let manager = manager();
+        let error = manager
+            .start(memory_backend(), "0.0.0.0:0", None)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("token"),
+            "bind must reject non-loopback without token: {error}"
+        );
+        // Still not running after failed start.
+        assert_eq!(manager.status().await["running"], serde_json::json!(false));
+    }
+
+    #[tokio::test]
+    async fn non_loopback_with_token_is_allowed() {
+        let manager = manager();
+        let info = manager
+            .start(memory_backend(), "0.0.0.0:0", Some("secret-token".into()))
+            .await
+            .unwrap()
+            .expect("non-loopback with token should start");
+        assert_eq!(info.token.as_deref(), Some("secret-token"));
+        manager.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn released_port_is_rebindable_after_stop() {
+        let manager = manager();
+        let first = manager
+            .start(memory_backend(), "127.0.0.1:0", None)
+            .await
+            .unwrap()
+            .unwrap();
+        manager.stop().await.unwrap();
+        // The port freed by stop must be immediately reusable.
+        let second = manager
+            .start(memory_backend(), &first.address, Some("tok".into()))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.address, first.address);
+        manager.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stopped_server_rejects_connections() {
+        let manager = manager();
+        let info = manager
+            .start(memory_backend(), "127.0.0.1:0", Some("tok".into()))
+            .await
+            .unwrap()
+            .unwrap();
+        let token = info.token.clone().unwrap();
+        let client = reqwest::Client::new();
+        let url = format!("http://{}/api/v1/health", info.address);
+        // While running the endpoint answers (any status; auth may 401).
+        let _ = client.get(&url).send().await.unwrap();
+        // The token is accepted.
+        let response = client
+            .get(&url)
+            .query(&[("token", token)])
+            .send()
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+        manager.stop().await.unwrap();
+        // After stop the port is closed.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let result = client.get(&url).send().await;
+        assert!(
+            result.is_err(),
+            "connection to {} must fail after stop",
+            info.address
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_http_start_requires_token_for_non_loopback() {
+        let state = test_server_state().await;
+        let error = handle_rpc_call(
+            state.clone(),
+            "runtime.http.start",
+            Some(serde_json::json!({ "addr": "0.0.0.0:0" })),
+            rpc_event_sink(),
+        )
+        .await
+        .expect_err("non-loopback without token must fail");
+        assert_eq!(error.0, -32000);
+        assert!(error.1.contains("token"));
+    }
+
+    #[tokio::test]
+    async fn runtime_http_lifecycle_through_rpc() {
+        let state = test_server_state().await;
+
+        // status: not running
+        let status = handle_rpc_call(state.clone(), "runtime.http.status", None, rpc_event_sink())
+            .await
+            .unwrap();
+        assert_eq!(status["running"], serde_json::json!(false));
+
+        // start on an ephemeral loopback port
+        let started = handle_rpc_call(
+            state.clone(),
+            "runtime.http.start",
+            Some(serde_json::json!({ "addr": "127.0.0.1:0" })),
+            rpc_event_sink(),
+        )
+        .await
+        .unwrap();
+        let address = started["address"].as_str().unwrap().to_string();
+        let token = started["token"].as_str().unwrap().to_string();
+        assert!(address.contains(':'));
+        assert!(token.len() >= 32, "generated token is returned");
+
+        // duplicate start is rejected
+        let error = handle_rpc_call(
+            state.clone(),
+            "runtime.http.start",
+            Some(serde_json::json!({ "addr": "127.0.0.1:0" })),
+            rpc_event_sink(),
+        )
+        .await
+        .expect_err("duplicate start must fail");
+        assert_eq!(error.0, -32000);
+        assert!(error.1.contains("already running"));
+
+        // status reports the running server
+        let status = handle_rpc_call(state.clone(), "runtime.http.status", None, rpc_event_sink())
+            .await
+            .unwrap();
+        assert_eq!(status["running"], serde_json::json!(true));
+        assert_eq!(status["address"], serde_json::json!(address));
+        assert_eq!(status["token_set"], serde_json::json!(true));
+
+        // the UI endpoint is reachable with the token
+        let client = reqwest::Client::new();
+        let response = client
+            .get(format!("http://{address}/ui"))
+            .query(&[("token", token)])
+            .send()
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+        let body = response.text().await.unwrap();
+        assert!(
+            body.trim_start().starts_with("<!DOCTYPE html>"),
+            "web UI index should be served, got: {}",
+            &body[..body.len().min(80)]
+        );
+
+        // stop
+        let stopped = handle_rpc_call(state.clone(), "runtime.http.stop", None, rpc_event_sink())
+            .await
+            .unwrap();
+        assert_eq!(stopped["stopped"], serde_json::json!(true));
+
+        // stop again errors
+        let error = handle_rpc_call(state.clone(), "runtime.http.stop", None, rpc_event_sink())
+            .await
+            .expect_err("second stop must fail");
+        assert_eq!(error.0, -32000);
+
+        // status back to not running
+        let status = handle_rpc_call(state.clone(), "runtime.http.status", None, rpc_event_sink())
+            .await
+            .unwrap();
+        assert_eq!(status["running"], serde_json::json!(false));
+
+        state.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn runtime_http_start_missing_addr_is_invalid_params() {
+        let state = test_server_state().await;
+        let error = handle_rpc_call(
+            state.clone(),
+            "runtime.http.start",
+            Some(serde_json::json!({})),
+            rpc_event_sink(),
+        )
+        .await
+        .expect_err("missing addr must fail");
+        assert_eq!(error.0, -32602);
+    }
+
+    /// Minimal ServerState for RPC-level tests: default config, no plugins/MCP.
+    async fn test_server_state() -> Arc<ServerState> {
+        let config = Arc::new(AppConfig::default());
+        let (shutdown_tx, _) = watch::channel(false);
+        let state = build_server_state_with_shutdown(
+            config,
+            PathBuf::from("/tmp/kkagent-test-config.toml"),
+            shutdown_tx,
+            kkagent_rpc::HttpSecurityOptions::default(),
+        )
+        .await
+        .unwrap();
+        state
+    }
+
+    fn rpc_event_sink() -> mpsc::Sender<Frame> {
+        let (tx, _rx) = mpsc::channel(16);
+        tx
+    }
+
+    #[tokio::test]
+    async fn scoped_tokens_authorize_requests() {
+        let manager = manager_with_token(&[("read-only", &["read"])]);
+        let info = manager
+            .start(memory_backend(), "127.0.0.1:0", Some("admin-token".into()))
+            .await
+            .unwrap()
+            .unwrap();
+        let client = reqwest::Client::new();
+        // Missing token -> 401
+        let response = client
+            .get(format!("http://{}/api/v1/sessions", info.address))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+        // Scoped token with read access -> 200
+        let response = client
+            .get(format!("http://{}/api/v1/sessions", info.address))
+            .header("authorization", "Bearer read-only")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        manager.stop().await.unwrap();
     }
 }

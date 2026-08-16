@@ -401,9 +401,15 @@ mod tests {
         store.prune_expired("session:6");
         let snap = store.snapshot();
         assert_eq!(snap.len(), 2);
-        assert!(snap.iter().any(|g| g.path == std::path::Path::new("/tmp/current-turn")));
-        assert!(snap.iter().any(|g| g.path == std::path::Path::new("/tmp/session")));
-        assert!(!snap.iter().any(|g| g.path == std::path::Path::new("/tmp/old-turn")));
+        assert!(snap
+            .iter()
+            .any(|g| g.path == std::path::Path::new("/tmp/current-turn")));
+        assert!(snap
+            .iter()
+            .any(|g| g.path == std::path::Path::new("/tmp/session")));
+        assert!(!snap
+            .iter()
+            .any(|g| g.path == std::path::Path::new("/tmp/old-turn")));
     }
 
     #[test]
