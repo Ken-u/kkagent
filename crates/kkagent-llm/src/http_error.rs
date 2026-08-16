@@ -63,11 +63,6 @@ pub fn stream_error_event(error: &anyhow::Error) -> crate::types::StreamEvent {
     crate::types::StreamEvent::Error(error.to_string())
 }
 
-pub fn is_first_token_timeout(error: &anyhow::Error) -> bool {
-    error.downcast_ref::<FirstTokenTimeoutError>().is_some()
-        || error.to_string().contains(FIRST_TOKEN_TIMEOUT_MARKER)
-}
-
 fn retry_after_hint(headers: &HeaderMap, body: &str, now: SystemTime) -> Option<Duration> {
     let header_delay = headers
         .get(reqwest::header::RETRY_AFTER)
@@ -255,7 +250,6 @@ mod tests {
             error.to_string(),
             "first token timeout: no content received within 1500ms for model demo"
         );
-        assert!(is_first_token_timeout(&error));
         assert!(matches!(
             stream_error_event(&error),
             crate::types::StreamEvent::Error(message)
