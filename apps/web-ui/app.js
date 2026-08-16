@@ -1,12 +1,26 @@
 const params = new URLSearchParams(location.search);
-const token = params.get("token") || localStorage.getItem("kkagent_token") || "";
 const base = params.get("base") || "";
+
+let token = params.get("token") || localStorage.getItem("kkagent_token") || "";
+// Persist a token that arrived in the URL, then strip it from the address bar
+// so it does not leak through copying/sharing the link.
+if (params.get("token")) {
+  localStorage.setItem("kkagent_token", token);
+  params.delete("token");
+  const rest = params.toString();
+  history.replaceState(null, "", location.pathname + (rest ? `?${rest}` : ""));
+}
 
 async function api(path, opts = {}) {
   const headers = { ...(opts.headers || {}) };
   if (token) headers.Authorization = `Bearer ${token}`;
   if (opts.body && !headers["content-type"]) headers["content-type"] = "application/json";
   const res = await fetch(base + path, { ...opts, headers });
+  if (res.status === 401) {
+    const error = new Error(`${path} 401`);
+    error.unauthorized = true;
+    throw error;
+  }
   if (!res.ok) throw new Error(`${path} ${res.status}`);
   return res.json();
 }
@@ -15,6 +29,24 @@ const state = { sessionId: null, sessions: [] };
 const logEl = document.getElementById("log");
 const sessionsEl = document.getElementById("sessions");
 const statusEl = document.getElementById("status");
+
+function showTokenPrompt(message) {
+  document.getElementById("tokenGate").style.display = "flex";
+  const form = document.getElementById("tokenForm");
+  const input = document.getElementById("tokenInput");
+  const hint = document.getElementById("tokenHint");
+  hint.textContent = message || "";
+  input.focus();
+  form.onsubmit = (e) => {
+    e.preventDefault();
+    const value = input.value.trim();
+    if (!value) return;
+    token = value;
+    localStorage.setItem("kkagent_token", token);
+    document.getElementById("tokenGate").style.display = "none";
+    boot();
+  };
+}
 
 function renderSessions() {
   sessionsEl.innerHTML = "";
@@ -132,13 +164,25 @@ document.getElementById("composer").onsubmit = async (e) => {
   }
 };
 
-(async function boot() {
+async function boot() {
   try {
     const meta = await api("/api/v1/meta");
     statusEl.textContent = `connected · ${meta.name || "kkagent"}`;
     await refreshSessions();
     if (state.sessions[0]) await selectSession(state.sessions[0].session_id || state.sessions[0].id);
   } catch (err) {
+    if (err.unauthorized) {
+      // Wrong or expired token: forget it and ask again.
+      localStorage.removeItem("kkagent_token");
+      showTokenPrompt("token 无效或已过期，请重新输入");
+      return;
+    }
     statusEl.textContent = `offline: ${err}`;
   }
-})();
+}
+
+if (!token) {
+  showTokenPrompt();
+} else {
+  boot();
+}

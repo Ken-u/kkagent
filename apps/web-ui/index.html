@@ -25,9 +25,25 @@
     #status { color:var(--muted); font-size:12px; margin-bottom:8px; }
     pre.diff { background:#111820; padding:8px; overflow:auto; border-radius:6px; }
     code { color:#9cdcfe; }
+    #tokenGate { display:none; position:fixed; inset:0; background:var(--bg); z-index:10; align-items:center; justify-content:center; }
+    #tokenGate .card { background:var(--panel); border:1px solid var(--border); border-radius:12px; padding:24px; width:min(420px, 90vw); }
+    #tokenGate h2 { margin:0 0 8px; font-size:16px; }
+    #tokenGate p { margin:0 0 16px; color:var(--muted); font-size:13px; }
+    #tokenHint { color:#e3745f; font-size:12px; min-height:16px; margin-top:8px; }
   </style>
 </head>
 <body>
+  <div id="tokenGate">
+    <div class="card">
+      <h2>kkagent 需要访问令牌</h2>
+      <p>该服务已启用鉴权。请输入启动 server 时打印的 HTTP token，也可以在 URL 中带上 <code>?token=…</code>。</p>
+      <form id="tokenForm">
+        <input id="tokenInput" placeholder="粘贴 token…" autocomplete="off" />
+        <button type="submit">连接</button>
+      </form>
+      <div id="tokenHint"></div>
+    </div>
+  </div>
   <aside>
     <h1>kkagent</h1>
     <div id="status">connecting…</div>

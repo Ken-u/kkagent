@@ -1437,6 +1437,39 @@ async fn run_print_goal(client: &mut KkagentClient, session_id: &str, args: &str
     Ok(exit_codes::ERROR)
 }
 
+/// A server is already listening on the socket: start HTTP on that server via
+/// the `runtime.http.start` RPC and report the result, then exit without
+/// touching the running server's sessions.
+async fn attach_http_to_running_server(
+    stream: kkagent_rpc::transport::uds::LocalStream,
+    addr: &str,
+    token: Option<String>,
+) -> Result<()> {
+    let (event_tx, _event_rx) = mpsc::channel::<Frame>(1);
+    let client = RpcClient::new(stream, event_tx);
+    let params = serde_json::json!({
+        "addr": addr,
+        "token": token,
+    });
+    let result = client
+        .call("runtime.http.start", Some(params))
+        .await
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    let address = result
+        .get("address")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(addr);
+    let returned_token = result
+        .get("token")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    println!("kkagent server is already running; HTTP attached to it: http://{address}/ui");
+    if !returned_token.is_empty() {
+        println!("HTTP token: {returned_token}");
+    }
+    Ok(())
+}
+
 async fn run_server(
     config: AppConfig,
     config_path: PathBuf,
@@ -1453,6 +1486,16 @@ async fn run_server(
 
     tracing::info!("Starting server on {}", socket_path);
     let endpoint_path = std::path::PathBuf::from(&socket_path);
+
+    // If a server is already running, attach the HTTP service to it via RPC
+    // instead of failing — the running server's sessions stay uninterrupted.
+    if http.is_some() {
+        if let Ok(stream) = kkagent_rpc::transport::uds::try_connect_uds(&endpoint_path).await {
+            let addr = http.clone().expect("checked is_some above");
+            return attach_http_to_running_server(stream, &addr, http_token).await;
+        }
+    }
+
     let listener = kkagent_rpc::transport::uds::bind_uds(&endpoint_path)?;
     let _endpoint_guard = LocalEndpointGuard(endpoint_path.clone());
 
@@ -8953,6 +8996,51 @@ mod runtime_http_tests {
         .await
         .expect_err("missing addr must fail");
         assert_eq!(error.0, -32602);
+    }
+
+    #[tokio::test]
+    async fn kk_server_http_attaches_to_already_running_server() {
+        // A real server listening on a temp UDS socket (short path: macOS
+        // rejects socket paths longer than SUN_LEN).
+        let socket_dir = std::env::temp_dir().join(format!(
+            "kk-att-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..8]
+        ));
+        std::fs::create_dir_all(&socket_dir).unwrap();
+        let socket_path = socket_dir.join("s.sock");
+        let listener = kkagent_rpc::transport::uds::bind_uds(&socket_path).unwrap();
+
+        let state = test_server_state().await;
+        let accept_state = state.clone();
+        let server_task = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let state = accept_state.clone();
+                tokio::spawn(async move {
+                    run_server_handler_with_state(stream, state).await;
+                });
+            }
+        });
+
+        // ...then `kk server --http` must attach via RPC instead of failing.
+        let stream = kkagent_rpc::transport::uds::try_connect_uds(&socket_path)
+            .await
+            .unwrap();
+        attach_http_to_running_server(stream, "127.0.0.1:0", None)
+            .await
+            .unwrap();
+
+        // The HTTP server really runs on the already-running server now.
+        let status = handle_rpc_call(state.clone(), "runtime.http.status", None, rpc_event_sink())
+            .await
+            .unwrap();
+        assert_eq!(status["running"], serde_json::json!(true));
+        handle_rpc_call(state.clone(), "runtime.http.stop", None, rpc_event_sink())
+            .await
+            .unwrap();
+
+        server_task.abort();
+        state.shutdown().await;
+        let _ = std::fs::remove_dir_all(&socket_dir);
     }
 
     /// Minimal ServerState for RPC-level tests: default config, no plugins/MCP.

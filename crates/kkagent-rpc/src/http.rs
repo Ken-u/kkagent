@@ -879,6 +879,13 @@ fn authorize_request(state: &HttpState, request: &mut Request) -> Result<String,
     if state.token_scopes.is_empty() {
         return Ok("anonymous".into());
     }
+    let path = request.uri().path();
+    // The Web UI shell is public: without a token the page itself renders a
+    // token prompt instead of a raw 401, so users can paste a token in the
+    // browser. All /api requests behind it still require the token.
+    if matches!(path, "/" | "/ui" | "/ui/" | "/ui/app.js") {
+        return Ok("anonymous".into());
+    }
     let query_token = url::Url::parse(&format!("http://localhost{}", request.uri()))
         .ok()
         .and_then(|url| {
@@ -2313,6 +2320,30 @@ mod security_tests {
         let state = HttpState::new(Some("secret".into()));
         let mut request = Request::builder()
             .uri("/api/v1/sessions")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert_eq!(
+            authorize_request(&state, &mut request),
+            Err(StatusCode::UNAUTHORIZED)
+        );
+    }
+
+    #[test]
+    fn web_ui_shell_is_public_while_api_requires_token() {
+        let state = HttpState::new(Some("secret".into()));
+        for path in ["/", "/ui", "/ui/", "/ui/app.js"] {
+            let mut request = Request::builder()
+                .uri(path)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            assert!(
+                authorize_request(&state, &mut request).is_ok(),
+                "{path} must stay reachable without a token so the browser can show a token prompt"
+            );
+        }
+        // The API surface behind the shell is still protected.
+        let mut request = Request::builder()
+            .uri("/api/v1/meta")
             .body(axum::body::Body::empty())
             .unwrap();
         assert_eq!(
