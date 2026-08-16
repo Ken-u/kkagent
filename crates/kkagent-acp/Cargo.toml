@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 kkagent-protocol = { workspace = true }
 kkagent-config = { workspace = true }
+kkagent-kaos = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -13,3 +14,8 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 async-trait = { workspace = true }
 uuid = { workspace = true }
+walkdir = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
