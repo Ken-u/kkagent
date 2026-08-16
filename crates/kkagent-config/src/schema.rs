@@ -386,6 +386,11 @@ pub struct SandboxConfig {
     /// Default `false` — opening those paths defeats workspace isolation.
     #[serde(default)]
     pub allow_sensitive_extra_paths: bool,
+    /// Extra read-only bind roots for the Linux workspace sandbox (bwrap),
+    /// e.g. `/nix/store` on NixOS or a custom toolchain prefix. Paths that do
+    /// not exist are skipped. The default system roots are always bound.
+    #[serde(default)]
+    pub system_read_paths: Vec<String>,
 }
 
 impl Default for SandboxConfig {
@@ -399,6 +404,7 @@ impl Default for SandboxConfig {
             extra_read_paths: Vec::new(),
             extra_write_paths: Vec::new(),
             allow_sensitive_extra_paths: false,
+            system_read_paths: Vec::new(),
         }
     }
 }

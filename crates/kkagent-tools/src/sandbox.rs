@@ -69,6 +69,9 @@ pub struct SandboxPolicy {
     pub extra_read_paths: Vec<PathBuf>,
     pub extra_write_paths: Vec<PathBuf>,
     pub allow_sensitive_extra_paths: bool,
+    /// Additional read-only bind roots for the Linux bwrap sandbox
+    /// (`sandbox.system_read_paths`, `~` expanded).
+    pub system_read_paths: Vec<PathBuf>,
     /// Set when `auto` fell back because workspace tooling was missing.
     pub auto_fallback_warning: Option<String>,
     /// Toolchain-derived mounts/env applied in workspace mode.
@@ -88,6 +91,7 @@ impl Default for SandboxPolicy {
             extra_read_paths: Vec::new(),
             extra_write_paths: Vec::new(),
             allow_sensitive_extra_paths: false,
+            system_read_paths: Vec::new(),
             auto_fallback_warning: None,
             toolchain_overlay: crate::toolchain::ToolchainSandboxOverlay::default(),
             workspace_trust: Vec::new(),
@@ -138,6 +142,11 @@ impl SandboxPolicy {
                 .map(|raw| kkagent_config::expand_user_path(raw))
                 .collect(),
             allow_sensitive_extra_paths: config.allow_sensitive_extra_paths,
+            system_read_paths: config
+                .system_read_paths
+                .iter()
+                .map(|raw| kkagent_config::expand_user_path(raw))
+                .collect(),
             auto_fallback_warning,
             toolchain_overlay: crate::toolchain::ToolchainSandboxOverlay::default(),
             workspace_trust: Vec::new(),
@@ -436,9 +445,29 @@ fn workspace_command(
     if policy.network {
         command.arg("--share-net");
     }
-    for path in ["/bin", "/sbin", "/usr", "/lib", "/lib64", "/etc", "/opt"] {
-        if Path::new(path).exists() {
-            command.args(["--ro-bind", path, path]);
+    let mut ro_roots: Vec<PathBuf> = ["/bin", "/sbin", "/usr", "/lib", "/lib64", "/etc", "/opt"]
+        .iter()
+        .map(PathBuf::from)
+        .collect();
+    // Interpreter location: if the shell lives outside the default roots
+    // (NixOS `/nix/store`, homebrew `/opt/homebrew` covered by /opt, custom
+    // toolchains), bind the *parent directory* of its realpath so the sandbox
+    // can still exec it.
+    if let Ok(real_shell) = std::fs::canonicalize(shell) {
+        let covered = ro_roots.iter().any(|root| real_shell.starts_with(root));
+        if !covered {
+            if let Some(parent) = real_shell.parent() {
+                ro_roots.push(parent.to_path_buf());
+            }
+        }
+    }
+    for path in ro_roots.iter().chain(policy.system_read_paths.iter()) {
+        if path.is_dir() {
+            command.args([
+                "--ro-bind",
+                &path.to_string_lossy(),
+                &path.to_string_lossy(),
+            ]);
         }
     }
     command.args(["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"]);
@@ -553,6 +582,30 @@ fn macos_profile(
     cwd: &Path,
     writable_root: &Path,
 ) -> anyhow::Result<String> {
+    macos_profile_with_home(
+        policy,
+        trust,
+        cwd,
+        writable_root,
+        dirs::home_dir().as_deref(),
+    )
+}
+
+/// Credential directories that stay read-denied even if a broad allow rule
+/// is ever introduced for HOME. Kept aligned with `path_policy`'s cloud/SSH
+/// list. SBPL resolves equal-specificity conflicts by last-match-wins, so the
+/// explicit `extra_read_paths` opt-in allows below still override these denies.
+#[cfg(target_os = "macos")]
+const DENIED_CREDENTIAL_SUBDIRS: &[&str] = &[".ssh", ".aws", ".gcp", ".kube", ".docker", ".gnupg"];
+
+#[cfg(target_os = "macos")]
+fn macos_profile_with_home(
+    policy: &SandboxPolicy,
+    trust: Option<&kkagent_config::WorkspaceTrust>,
+    cwd: &Path,
+    writable_root: &Path,
+    home: Option<&Path>,
+) -> anyhow::Result<String> {
     fn literal(path: &Path) -> anyhow::Result<String> {
         let value = path_text(path)?;
         Ok(format!(
@@ -566,8 +619,21 @@ fn macos_profile(
          (global-name \"com.apple.securityd\"))\n\
          (allow file-write* (subpath \"/private/tmp\") (subpath \"/tmp\") (subpath \"/dev\"))\n",
     );
-    if let Some(home) = dirs::home_dir() {
-        let home = literal(&std::fs::canonicalize(home)?)?;
+    if let Some(home) = home {
+        let home_canon = std::fs::canonicalize(home)?;
+        let home_path = home_canon.as_path();
+        let home = literal(home_path)?;
+        // Defense in depth: explicitly deny reads of credential directories
+        // before any allow rules. The HOME exclusion below already blocks
+        // them in practice; these denies keep that true even if rule ordering
+        // or the HOME exclusion is ever relaxed. No existence probe — the
+        // deny must also cover files created later.
+        for dir in DENIED_CREDENTIAL_SUBDIRS {
+            let dir_lit = literal(&home_canon.join(dir))?;
+            profile.push_str(&format!(
+                "(deny file-read* file-write* (subpath {dir_lit}))\n"
+            ));
+        }
         // A broad deny for HOME cannot be overridden by the later workspace
         // allow when the workspace itself lives under HOME. Exclude HOME from
         // the general read permission, then add narrow workspace/extra paths.
@@ -580,12 +646,15 @@ fn macos_profile(
     } else {
         profile.push_str("(allow file-read*)\n");
     }
-    let root = literal(writable_root)?;
+    let root = literal(
+        &std::fs::canonicalize(writable_root).unwrap_or_else(|_| writable_root.to_path_buf()),
+    )?;
     profile.push_str(&format!(
         "(allow file-read* file-write* (subpath {root}))\n"
     ));
     if cwd != writable_root {
-        let cwd_lit = literal(cwd)?;
+        let cwd_canon = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+        let cwd_lit = literal(&cwd_canon)?;
         profile.push_str(&format!(
             "(allow file-read* file-write* (subpath {cwd_lit}))\n"
         ));
@@ -903,6 +972,7 @@ mod tests {
             max_processes: 8,
             extra_read_paths: vec!["~/kkagent-sandbox-extra-read".into()],
             extra_write_paths: vec!["~/kkagent-sandbox-extra-write".into()],
+            system_read_paths: vec!["/nix/store".into(), "~/nix-extra".into()],
             ..Default::default()
         };
         let policy = SandboxPolicy::from_config(&config).unwrap();
@@ -913,6 +983,10 @@ mod tests {
         assert_eq!(
             policy.extra_write_paths,
             vec![home.join("kkagent-sandbox-extra-write")]
+        );
+        assert_eq!(
+            policy.system_read_paths,
+            vec![PathBuf::from("/nix/store"), home.join("nix-extra")]
         );
     }
 
@@ -1149,6 +1223,60 @@ mod tests {
             "child-process-ran"
         );
         std::fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn mac_workspace_denies_credential_reads_under_fake_home() {
+        // The credential denies must hold even when the "HOME" is a fake
+        // directory: profile uses macos_profile_with_home so the test does
+        // not depend on the real user home layout.
+        let base = std::env::temp_dir().join(format!("kkagent-cred-{}", uuid::Uuid::new_v4()));
+        let home = base.join("home");
+        let workspace = home.join("ws");
+        let ssh = home.join(".ssh");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&ssh).unwrap();
+        std::fs::write(ssh.join("id_rsa"), "SECRET").unwrap();
+
+        let policy = SandboxPolicy {
+            mode: SandboxMode::Workspace,
+            ..Default::default()
+        };
+        let profile =
+            macos_profile_with_home(&policy, None, &workspace, &workspace, Some(&home)).unwrap();
+        if std::env::var("KKAGENT_DUMP_PROFILE").is_ok() {
+            eprintln!("---PROFILE---\n{profile}\n---END---");
+        }
+        // Sanity: the profile actually contains the deny + workspace allow.
+        assert!(profile.contains("(deny file-read* file-write*"));
+        assert!(profile.contains(".ssh"));
+
+        let mut command = Command::new("/usr/bin/sandbox-exec");
+        command
+            .arg("-p")
+            .arg(&profile)
+            .arg("/bin/bash")
+            .arg("-c")
+            .arg(format!("cat {}", ssh.join("id_rsa").display()));
+        let output = command.output().await.unwrap();
+        assert!(
+            !output.status.success(),
+            "credential read under sandbox must fail"
+        );
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("SECRET"));
+        // And the workspace itself stays readable.
+        std::fs::write(workspace.join("ok.txt"), "OK").unwrap();
+        let mut command = Command::new("/usr/bin/sandbox-exec");
+        command
+            .arg("-p")
+            .arg(&profile)
+            .arg("/bin/bash")
+            .arg("-c")
+            .arg(format!("cat {}", workspace.join("ok.txt").display()));
+        let output = command.output().await.unwrap();
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "OK");
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     #[cfg(target_os = "macos")]
