@@ -49,12 +49,13 @@ pub async fn resolve_path(store: &AcpSessionStore, params: &Value) -> Result<Pat
         }
     }
     let cwd_canon = std::fs::canonicalize(&cwd).unwrap_or(cwd.clone());
-    // Defense in depth: refuse paths that traverse a symlink component, so a
-    // pre-existing `cwd/link -> /etc` cannot be used to write outside the
-    // workspace (approximates O_NOFOLLOW for the write tools below).
-    if has_symlink_component(&cwd, &normalized) {
+    // Defense in depth: refuse paths that resolve outside the workspace via
+    // symlink hops, so a pre-existing `cwd/link -> /etc` cannot be used to
+    // write outside the session root. Symlinks that stay inside the workspace
+    // remain usable (pnpm-style linked dirs, internal aliases).
+    if symlink_escapes_root(&cwd_canon, &cwd, &normalized) {
         return Err(format!(
-            "path traverses a symlink and may escape the session workspace: {}",
+            "path traverses a symlink that escapes the session workspace: {}",
             candidate.display()
         ));
     }
@@ -89,19 +90,26 @@ pub async fn resolve_path(store: &AcpSessionStore, params: &Value) -> Result<Pat
     Ok(normalized)
 }
 
-/// Returns true when any component of `path` below `cwd` is an existing symlink.
-fn has_symlink_component(cwd: &Path, path: &Path) -> bool {
+/// Returns true when resolving `path` below `cwd` would land outside the
+/// canonical session root via one or more symlink hops. Each component is
+/// canonicalized incrementally so multi-hop escapes are caught at the first
+/// hop that leaves the workspace; failures to resolve (not-yet-existing
+/// components) are left to the later existence checks.
+fn symlink_escapes_root(cwd_canon: &Path, cwd: &Path, path: &Path) -> bool {
     let Ok(rel) = path.strip_prefix(cwd) else {
         return false;
     };
-    let mut cur = cwd.to_path_buf();
+    let mut cur = cwd_canon.to_path_buf();
     for comp in rel.components() {
         cur.push(comp.as_os_str());
-        if std::fs::symlink_metadata(&cur)
-            .map(|m| m.file_type().is_symlink())
-            .unwrap_or(false)
-        {
-            return true;
+        match std::fs::canonicalize(&cur) {
+            Ok(resolved) => {
+                if !resolved.starts_with(cwd_canon) {
+                    return true;
+                }
+                cur = resolved;
+            }
+            Err(_) => break,
         }
     }
     false

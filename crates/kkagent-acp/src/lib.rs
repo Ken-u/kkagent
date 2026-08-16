@@ -741,6 +741,52 @@ mod tests {
         assert!(read.error.is_some(), "{read:?}");
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fs_allows_symlinks_that_stay_inside_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = AcpServer::new();
+        let sid = new_session(&server, dir.path().to_str().unwrap()).await;
+        // Internal alias: real/sub -> ../../real style links must keep working
+        // (pnpm-style layouts), only escapes are rejected.
+        std::fs::create_dir_all(dir.path().join("real")).unwrap();
+        std::fs::write(dir.path().join("real/file.txt"), "inside").unwrap();
+        std::os::unix::fs::symlink("real", dir.path().join("alias")).unwrap();
+
+        let read = server
+            .handle(AcpRequest {
+                jsonrpc: "2.0".into(),
+                id: Some(json!(1)),
+                method: "fs/read_text_file".into(),
+                params: json!({
+                    "sessionId": sid,
+                    "path": "alias/file.txt",
+                }),
+            })
+            .await;
+        assert!(read.result.is_some(), "{read:?}");
+        assert!(read.error.is_none(), "{read:?}");
+        assert!(read.result.unwrap()["content"].as_str().unwrap() == "inside");
+
+        let write = server
+            .handle(AcpRequest {
+                jsonrpc: "2.0".into(),
+                id: Some(json!(2)),
+                method: "fs/write_text_file".into(),
+                params: json!({
+                    "sessionId": sid,
+                    "path": "alias/written.txt",
+                    "content": "still inside",
+                }),
+            })
+            .await;
+        assert!(write.error.is_none(), "{write:?}");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("real/written.txt")).unwrap(),
+            "still inside"
+        );
+    }
+
     #[tokio::test]
     async fn terminal_exec_via_kaos() {
         let dir = tempfile::tempdir().unwrap();
