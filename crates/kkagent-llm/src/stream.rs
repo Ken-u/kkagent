@@ -810,10 +810,12 @@ pub async fn google_stream(
             };
             for part in parts {
                 if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
-                    first_token.mark_content();
-                    let _ = event_tx
-                        .send(StreamEvent::TextDelta(text.to_string()))
-                        .await;
+                    if !text.is_empty() {
+                        first_token.mark_content();
+                        let _ = event_tx
+                            .send(StreamEvent::TextDelta(text.to_string()))
+                            .await;
+                    }
                 }
                 if let Some(fc) = part.get("functionCall") {
                     let name = fc.get("name").and_then(|v| v.as_str()).unwrap_or("tool");
@@ -1224,6 +1226,23 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(rx.recv().await, Some(StreamEvent::TextDelta(text)) if text == "hello"));
+    }
+
+    /// Regression: Google may send `{"text": ""}` parts during thinking;
+    /// these must NOT reset the first-token deadline.
+    #[tokio::test]
+    async fn google_first_token_timeout_ignores_empty_text() {
+        let base_url = serve_headers_then_stall(
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"\"}]}}]}\n\n",
+        )
+        .await;
+        let (tx, _rx) = mpsc::channel(8);
+        let mut request = request();
+        request.first_token_timeout = Some(std::time::Duration::from_millis(80));
+        let error = google_stream(&Client::new(), &base_url, "key", request, tx)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("first token timeout"));
     }
 
     #[test]
