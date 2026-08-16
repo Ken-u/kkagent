@@ -1166,13 +1166,28 @@ Do not mention this reminder to the user.\n</system-reminder>"
 
                 let decision = {
                     let perm = self.permission.lock().await;
-                    perm.evaluate(
+                    let (verdict, source) = perm.evaluate_sourced(
                         &tc.name,
                         &tc.input,
                         &session.working_dir,
                         session.plan_mode,
                         Some(&session.plan_file_path),
-                    )
+                    );
+                    let verdict_str = match &verdict {
+                        PermissionDecision::Approve => "approve",
+                        PermissionDecision::Ask => "ask",
+                        PermissionDecision::Deny(_) => "deny",
+                    };
+                    crate::audit::record(&crate::audit::AuditEvent::PermissionVerdict {
+                        at: &crate::audit::now_rfc3339(),
+                        session_id: &session.id,
+                        tool: &tc.name,
+                        verdict: verdict_str,
+                        source,
+                        detail: "",
+                        permission_mode: &format!("{:?}", perm.current_mode()),
+                    });
+                    verdict
                 };
                 tracing::info!("Permission for {}: {:?}", tc.name, decision);
 
@@ -1263,6 +1278,22 @@ Do not mention this reminder to the user.\n</system-reminder>"
                             };
                             match response.decision {
                                 kkagent_protocol::ApprovalDecision::Approved => {
+                                    crate::audit::record(
+                                        &crate::audit::AuditEvent::ApprovalResponse {
+                                            at: &crate::audit::now_rfc3339(),
+                                            session_id: &session.id,
+                                            tool: &tc.name,
+                                            response: "approved",
+                                            scope: &format!(
+                                                "{:?}",
+                                                response
+                                                    .scope
+                                                    .as_ref()
+                                                    .map(|s| format!("{s:?}"))
+                                                    .unwrap_or_else(|| "once".into())
+                                            ),
+                                        },
+                                    );
                                     match response.scope {
                                         Some(kkagent_protocol::ApprovalScope::Session) => {
                                             let mut perm = self.permission.lock().await;
@@ -1331,9 +1362,20 @@ Do not mention this reminder to the user.\n</system-reminder>"
                                     self.finish_interrupted(session).await?;
                                     return Ok(TurnStep::Done);
                                 }
-                                _ => Prepared::Done(ToolOutput::error(
-                                    "Tool call was rejected by user",
-                                )),
+                                other => {
+                                    crate::audit::record(
+                                        &crate::audit::AuditEvent::ApprovalResponse {
+                                            at: &crate::audit::now_rfc3339(),
+                                            session_id: &session.id,
+                                            tool: &tc.name,
+                                            response: &format!("{other:?}").to_lowercase(),
+                                            scope: "once",
+                                        },
+                                    );
+                                    Prepared::Done(ToolOutput::error(
+                                        "Tool call was rejected by user",
+                                    ))
+                                }
                             }
                         } // end else non-ExitPlanMode Ask
                     }

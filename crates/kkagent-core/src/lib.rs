@@ -1,5 +1,6 @@
 pub mod activity_view;
 pub mod agent_loop;
+pub mod audit;
 pub mod blob_store;
 pub mod context_breakdown;
 pub mod context_memory;

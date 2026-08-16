@@ -4029,6 +4029,14 @@ async fn build_server_state_with_shutdown(
     let durable_http = kkagent_rpc::DurableHttpStore::from_shared(shared_sqlite.clone())?;
     let subagents = Arc::new(SubagentManager::from_shared(4, shared_sqlite)?);
     let sandbox_policy = kkagent_tools::sandbox::SandboxPolicy::from_app_config(&config)?;
+    if let Some(reason) = sandbox_policy.auto_fallback_warning.as_ref() {
+        kkagent_core::audit::record(&kkagent_core::audit::AuditEvent::SandboxFallback {
+            at: &kkagent_core::audit::now_rfc3339(),
+            configured: "auto",
+            effective: sandbox_policy.mode_name(),
+            reason,
+        });
+    }
 
     let plugins_dir = kkagent_config::default_config_dir().join("plugins");
     let plugins = kkagent_core::PluginManager::discover(&plugins_dir).await;

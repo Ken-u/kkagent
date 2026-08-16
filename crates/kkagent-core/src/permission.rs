@@ -14,6 +14,10 @@ pub struct PermissionChain {
     /// Live mode handle — shared with the session so `/permission` takes effect mid-turn.
     pub mode: Arc<Mutex<PermissionMode>>,
     pub rules: Vec<PermissionRule>,
+    /// Whether `record_always_approval` writes through to the sidecar file.
+    /// Disabled in unit tests and headless one-shots to avoid mutating the
+    /// developer's real `~/.kkagent/permissions.toml`.
+    pub persist: bool,
     pub session_approved: Vec<String>,
     /// Approvals that expire at the end of the current turn.
     pub turn_approved: Vec<String>,
@@ -65,12 +69,26 @@ impl PermissionChain {
     }
 
     pub fn with_shared_mode(mode: Arc<Mutex<PermissionMode>>, rules: Vec<PermissionRule>) -> Self {
-        Self {
+        // `cargo test` must stay hermetic: neither load from nor write to the
+        // developer's real ~/.kkagent/permissions.toml.
+        let in_tests = cfg!(test);
+        let mut chain = Self {
             mode,
             rules,
+            persist: !in_tests,
             session_approved: Vec::new(),
             turn_approved: Vec::new(),
+        };
+        if !in_tests {
+            chain.load_persisted_approvals();
         }
+        chain
+    }
+
+    /// Tests / one-shot runs: never touch the sidecar file.
+    pub fn without_persistence(mut self) -> Self {
+        self.persist = false;
+        self
     }
 
     pub fn current_mode(&self) -> PermissionMode {
@@ -86,16 +104,33 @@ impl PermissionChain {
         plan_mode: bool,
         plan_file: Option<&Path>,
     ) -> PermissionDecision {
+        self.evaluate_sourced(tool_name, input, working_dir, plan_mode, plan_file)
+            .0
+    }
+
+    /// Same as [`Self::evaluate`] but reports which chain step decided, for
+    /// the audit trail.
+    pub fn evaluate_sourced(
+        &self,
+        tool_name: &str,
+        input: &serde_json::Value,
+        working_dir: &Path,
+        plan_mode: bool,
+        plan_file: Option<&Path>,
+    ) -> (PermissionDecision, &'static str) {
         let mode = self.current_mode();
 
         // WritePlan is a host-scoped plan primitive: it never accepts a path
         // and is available without approval only while plan mode is active.
         if tool_name == "WritePlan" {
             return if plan_mode && plan_file.is_some() {
-                PermissionDecision::Approve
+                (PermissionDecision::Approve, "write-plan-plan-mode")
             } else {
-                PermissionDecision::Deny(
-                    "WritePlan is only available while plan mode is active.".into(),
+                (
+                    PermissionDecision::Deny(
+                        "WritePlan is only available while plan mode is active.".into(),
+                    ),
+                    "write-plan-plan-mode",
                 )
             };
         }
@@ -103,37 +138,44 @@ impl PermissionChain {
         // 0. plan-mode-guard-deny (must run before auto/yolo approve)
         if plan_mode {
             if let Some(deny) = plan_mode_guard(tool_name, input, working_dir, plan_file) {
-                return deny;
+                return (deny, "plan-mode-guard");
             }
         }
 
         // 1. auto-mode-ask-user-question-deny
         if mode == PermissionMode::Auto && tool_name == "AskUserQuestion" {
-            return PermissionDecision::Deny(
-                "AskUserQuestion is disabled in auto mode. Make a decision and continue.".into(),
+            return (
+                PermissionDecision::Deny(
+                    "AskUserQuestion is disabled in auto mode. Make a decision and continue."
+                        .into(),
+                ),
+                "auto-ask-user-deny",
             );
         }
 
         // AskUserQuestion is the user interaction itself — never gate behind another approval.
         if tool_name == "AskUserQuestion" {
-            return PermissionDecision::Approve;
+            return (PermissionDecision::Approve, "ask-user-question");
         }
 
         // 2. user-configured-deny
         for rule in &self.rules {
             if rule.decision == "deny" && matches_pattern(&rule.pattern, tool_name, input) {
-                return PermissionDecision::Deny(format!("Denied by rule: {}", rule.pattern));
+                return (
+                    PermissionDecision::Deny(format!("Denied by rule: {}", rule.pattern)),
+                    "user-deny-rule",
+                );
             }
         }
 
         // 3. auto-mode-approve
         if mode == PermissionMode::Auto {
-            return PermissionDecision::Approve;
+            return (PermissionDecision::Approve, "auto-mode-approve");
         }
 
         // 3b. exit-plan-mode-review-ask (kimi): always ask in manual/yolo
         if tool_name == "ExitPlanMode" {
-            return PermissionDecision::Ask;
+            return (PermissionDecision::Ask, "exit-plan-mode-review");
         }
 
         // 4. session-approval-history (session + turn scoped)
@@ -141,44 +183,44 @@ impl PermissionChain {
         if self.session_approved.contains(&approval_key)
             || self.turn_approved.contains(&approval_key)
         {
-            return PermissionDecision::Approve;
+            return (PermissionDecision::Approve, "session-approval-history");
         }
 
         // 5. user-configured-ask / user-configured-allow
         for rule in &self.rules {
             if rule.decision == "allow" && matches_pattern(&rule.pattern, tool_name, input) {
-                return PermissionDecision::Approve;
+                return (PermissionDecision::Approve, "user-allow-rule");
             }
             if rule.decision == "ask" && matches_pattern(&rule.pattern, tool_name, input) {
-                return PermissionDecision::Ask;
+                return (PermissionDecision::Ask, "user-ask-rule");
             }
         }
 
         // 6. sensitive-file-access-ask
         if has_sensitive_file_access(tool_name, input) {
-            return PermissionDecision::Ask;
+            return (PermissionDecision::Ask, "sensitive-file-access");
         }
 
         // 7. git-control-path-access-ask
         if accesses_git_control_path(tool_name, input) {
-            return PermissionDecision::Ask;
+            return (PermissionDecision::Ask, "git-control-path");
         }
 
         // 8. yolo-mode-approve
         if mode == PermissionMode::Yolo {
-            return PermissionDecision::Approve;
+            return (PermissionDecision::Approve, "yolo-mode-approve");
         }
 
         // 9. default-tool-approve (read-only tools)
         if READ_ONLY_TOOLS.contains(&tool_name) {
-            return PermissionDecision::Approve;
+            return (PermissionDecision::Approve, "read-only-tool");
         }
 
         // 10. git-cwd-write-approve
         // (simplified: approve writes within git working dir)
 
         // 11. fallback-ask
-        PermissionDecision::Ask
+        (PermissionDecision::Ask, "fallback-ask")
     }
 
     pub fn record_session_approval(&mut self, tool_name: &str, input: &serde_json::Value) {
@@ -200,20 +242,53 @@ impl PermissionChain {
     }
 
     /// Persist an allow rule for matching tool patterns (Always scope).
+    ///
+    /// The rule is applied to the in-memory chain immediately and — unless the
+    /// chain was constructed with `without_persistence` — written to the
+    /// `permissions.toml` sidecar so it survives restarts. Failures to persist
+    /// are logged but do not undo the in-memory approval: the user already
+    /// approved this action for the current session.
     pub fn record_always_approval(&mut self, tool_name: &str, input: &serde_json::Value) {
         let pattern = format!("{}:{}", tool_name, approval_pattern(tool_name, input));
+        let rule = PermissionRule {
+            decision: "allow".into(),
+            pattern: pattern.clone(),
+            scope: Some("always".into()),
+        };
         if !self
             .rules
             .iter()
             .any(|r| r.decision == "allow" && r.pattern == pattern)
         {
-            self.rules.push(PermissionRule {
-                decision: "allow".into(),
-                pattern,
-                scope: Some("always".into()),
-            });
+            self.rules.push(rule.clone());
+        }
+        if self.persist {
+            let mut persisted = kkagent_config::PersistedApprovals::load().unwrap_or_default();
+            persisted.upsert(rule);
+            if let Err(error) = persisted.save() {
+                tracing::warn!("could not persist always-approval: {error:#}");
+            }
         }
         self.record_session_approval(tool_name, input);
+    }
+
+    /// Merge durable "always allow" rules from the permissions sidecar.
+    pub fn load_persisted_approvals(&mut self) {
+        match kkagent_config::PersistedApprovals::load() {
+            Ok(persisted) => {
+                for rule in persisted.rules {
+                    if rule.decision == "allow"
+                        && !self
+                            .rules
+                            .iter()
+                            .any(|r| r.decision == rule.decision && r.pattern == rule.pattern)
+                    {
+                        self.rules.push(rule);
+                    }
+                }
+            }
+            Err(error) => tracing::warn!("could not load persisted approvals: {error:#}"),
+        }
     }
 
     pub fn set_mode(&self, mode: PermissionMode) {

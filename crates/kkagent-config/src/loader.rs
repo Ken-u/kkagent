@@ -19,6 +19,78 @@ pub fn disabled_state_path() -> PathBuf {
     default_config_dir().join("disabled.toml")
 }
 
+/// Sidecar for durable "always allow" approval decisions. Rewriting the main
+/// config.toml from the agent would destroy user comments/formatting, so — like
+/// `disabled.toml` — persisted approvals live in a managed file and are merged
+/// into the permission chain at session start.
+pub fn permission_sidecar_path() -> PathBuf {
+    default_config_dir().join("permissions.toml")
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PersistedApprovals {
+    /// Durable "always allow" rules written by `record_always_approval`.
+    #[serde(default)]
+    pub rules: Vec<crate::PermissionRule>,
+}
+
+impl PersistedApprovals {
+    pub fn load() -> Result<Self> {
+        let path = permission_sidecar_path();
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+        let content = std::fs::read_to_string(&path)
+            .with_context(|| format!("Failed to read persisted approvals: {path:?}"))?;
+        toml::from_str(&content)
+            .with_context(|| format!("Failed to parse persisted approvals: {path:?}"))
+    }
+
+    pub fn save(&self) -> Result<()> {
+        ensure_config_dir()?;
+        let path = permission_sidecar_path();
+        let body = toml::to_string_pretty(self)
+            .with_context(|| format!("Failed to serialize persisted approvals: {path:?}"))?;
+        let header =
+            "# Managed by kkagent \"always allow\" approval choices.\n# Safe to delete; approvals then revert to asking.\n";
+        std::fs::write(&path, format!("{header}{body}"))
+            .with_context(|| format!("Failed to write persisted approvals: {path:?}"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn load_from(path: &Path) -> Result<Self> {
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+        let content = std::fs::read_to_string(path)?;
+        Ok(toml::from_str(&content)?)
+    }
+
+    #[cfg(test)]
+    fn save_to(&self, path: &Path) -> Result<()> {
+        let body = toml::to_string_pretty(self)?;
+        std::fs::write(path, body)?;
+        Ok(())
+    }
+
+    /// Append an allow rule, deduplicating identical patterns.
+    pub fn upsert(&mut self, rule: crate::PermissionRule) {
+        if !self
+            .rules
+            .iter()
+            .any(|r| r.decision == rule.decision && r.pattern == rule.pattern)
+        {
+            self.rules.push(rule);
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DisabledState {
     #[serde(default)]
@@ -358,5 +430,35 @@ mod active_session_tests {
                 .unwrap_or(0)
         ));
         assert!(write_active_session_file(&path, "   ").is_err());
+    }
+}
+
+#[cfg(test)]
+mod persisted_approval_tests {
+    use super::*;
+
+    #[test]
+    fn upsert_dedupes_and_roundtrips() {
+        let dir =
+            std::env::temp_dir().join(format!("kkagent-perm-{:?}", std::time::SystemTime::now()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("permissions.toml");
+
+        let mut a = PersistedApprovals::default();
+        let rule = crate::PermissionRule {
+            decision: "allow".into(),
+            pattern: "Bash:git push".into(),
+            scope: Some("always".into()),
+        };
+        a.upsert(rule.clone());
+        a.upsert(rule.clone()); // duplicate ignored
+        assert_eq!(a.rules.len(), 1);
+        a.save_to(&path).unwrap();
+
+        let b = PersistedApprovals::load_from(&path).unwrap();
+        assert_eq!(b.rules.len(), 1);
+        assert_eq!(b.rules[0].pattern, "Bash:git push");
+        assert_eq!(b.rules[0].decision, "allow");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
