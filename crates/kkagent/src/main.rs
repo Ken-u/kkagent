@@ -962,16 +962,39 @@ fn maybe_auto_resume(resume: &mut Option<Option<String>>, server_alive: bool) {
         return;
     };
     if server_alive {
+        if !session_exists(&session_id) {
+            tracing::warn!(%session_id, "Active-session marker references a non-existent session; clearing it");
+            kkagent_config::clear_active_session();
+            return;
+        }
         tracing::info!(%session_id, "Auto-resuming session from active-session");
         *resume = Some(Some(session_id));
         return;
     }
     // Stale marker after a dead server: clear it, but still resume history from DB.
     kkagent_config::clear_active_session();
+    if !session_exists(&session_id) {
+        tracing::warn!(%session_id, "Active-session marker references a non-existent session; starting fresh");
+        return;
+    }
     eprintln!(
         "Previous standalone server is gone; in-flight tasks were lost. Restoring conversation history for session {session_id}."
     );
     *resume = Some(Some(session_id));
+}
+
+/// Check whether a session still has a retrievable record (DB or disk store).
+fn session_exists(session_id: &str) -> bool {
+    if is_safe_session_id(session_id) {
+        if let Ok(Some(_)) = TranscriptDb::open_default().and_then(|db| db.get_session(session_id))
+        {
+            return true;
+        }
+        if SessionStore::open_default().get(session_id).is_ok() {
+            return true;
+        }
+    }
+    false
 }
 
 fn resolve_listen_path(listen: Option<String>) -> PathBuf {

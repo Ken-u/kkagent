@@ -1659,7 +1659,7 @@ impl TuiApp {
                 }
             }
 
-            redraw |= self.drain_job_results();
+            redraw |= self.drain_job_results().await;
             let current_activity = self.jobs.active_notice_text();
             if self.state.status_bar.activity != current_activity {
                 self.state.status_bar.activity = current_activity;
@@ -1813,7 +1813,7 @@ impl TuiApp {
         );
     }
 
-    fn drain_job_results(&mut self) -> bool {
+    async fn drain_job_results(&mut self) -> bool {
         let mut received = false;
         while let Some(outcome) = self.jobs.try_recv() {
             received = true;
@@ -1870,13 +1870,50 @@ impl TuiApp {
                         }
                         Err(err) => {
                             self.clear_failed_resume(&query);
-                            self.jobs.push_error(
-                                Some(channel),
-                                Some(generation),
-                                format!("Resume failed: {err}"),
-                                true,
-                                0,
-                            );
+                            // If this was a startup resume and no session is
+                            // active yet, create a fresh session so the user
+                            // isn't left stranded with an empty TUI.
+                            let needs_fallback = self.state.session_id.is_none();
+                            if needs_fallback {
+                                match self
+                                    .client
+                                    .create_session(
+                                        Some(&self.state.working_dir.to_string_lossy()),
+                                        Some(self.state.permission_mode),
+                                    )
+                                    .await
+                                {
+                                    Ok(session_id) => {
+                                        self.state.tab_strip.ensure_active(&session_id, "main");
+                                        self.state.status_bar.session_id = Some(session_id.clone());
+                                        self.state.session_id = Some(session_id);
+                                        self.bind_config_default_model();
+                                        // Clear the stale marker so the next
+                                        // launch doesn't repeat this failure.
+                                        kkagent_config::clear_active_session();
+                                        self.system_message(format!(
+                                            "Previous session could not be resumed ({err}). Started a new session."
+                                        ));
+                                    }
+                                    Err(create_err) => {
+                                        self.jobs.push_error(
+                                            Some(channel),
+                                            Some(generation),
+                                            format!("Resume failed: {err}; new session also failed: {create_err}"),
+                                            true,
+                                            0,
+                                        );
+                                    }
+                                }
+                            } else {
+                                self.jobs.push_error(
+                                    Some(channel),
+                                    Some(generation),
+                                    format!("Resume failed: {err}"),
+                                    true,
+                                    0,
+                                );
+                            }
                         }
                     }
                 }
@@ -8357,6 +8394,9 @@ impl TuiApp {
                         self.state.tab_strip.ensure_active(&session_id, "main");
                         self.bind_config_default_model();
                     }
+                    // The active-session marker may still point at the deleted
+                    // session; refresh it to the new current session (or clear it).
+                    self.persist_active_session_marker();
                 }
                 if reopen_picker {
                     self.open_session_picker().await?;
