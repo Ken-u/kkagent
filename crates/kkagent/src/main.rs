@@ -4037,6 +4037,16 @@ async fn build_server_state_with_shutdown(
             reason,
         });
     }
+    // Windows never gets filesystem isolation: surface the posture in the
+    // audit trail instead of failing silently (task 8 short-term).
+    if cfg!(windows) && sandbox_policy.mode == kkagent_tools::sandbox::SandboxMode::Process {
+        kkagent_core::audit::record(&kkagent_core::audit::AuditEvent::SandboxFallback {
+            at: &kkagent_core::audit::now_rfc3339(),
+            configured: &sandbox_policy.configured_mode,
+            effective: "process",
+            reason: "filesystem sandbox unsupported on Windows; only resource limits apply",
+        });
+    }
 
     let plugins_dir = kkagent_config::default_config_dir().join("plugins");
     let plugins = kkagent_core::PluginManager::discover(&plugins_dir).await;

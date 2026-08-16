@@ -249,7 +249,9 @@ impl PermissionChain {
     /// are logged but do not undo the in-memory approval: the user already
     /// approved this action for the current session.
     pub fn record_always_approval(&mut self, tool_name: &str, input: &serde_json::Value) {
-        let pattern = format!("{}:{}", tool_name, approval_pattern(tool_name, input));
+        // Patterns match the tool name (see matches_pattern); the historical
+        // `"{tool}:{tool}"` form never matched anything after a restart.
+        let pattern = approval_pattern(tool_name, input);
         let rule = PermissionRule {
             decision: "allow".into(),
             pattern: pattern.clone(),
@@ -421,7 +423,9 @@ fn approval_pattern(tool_name: &str, _input: &serde_json::Value) -> String {
 }
 
 fn has_sensitive_file_access(tool_name: &str, input: &serde_json::Value) -> bool {
-    let file_tools = ["Read", "Write", "Edit", "Bash"];
+    // ReadMediaFile reads file contents just like Read — same sensitive-path
+    // gate applies.
+    let file_tools = ["Read", "ReadMediaFile", "Write", "Edit", "Bash"];
     if !file_tools.contains(&tool_name) {
         return false;
     }
@@ -712,6 +716,155 @@ mod tests {
             Path::new("/tmp/ws"),
             true,
             Some(Path::new("/tmp/ws/.kkagent/plans/x.md")),
+        );
+        assert_eq!(decision, PermissionDecision::Approve);
+    }
+
+    /// Cross-semantic decision matrix: mode × risk shape. Locks the kimi-v2
+    /// chain ordering (user-deny > auto-approve > sensitive-ask > yolo-approve
+    /// > read-only-approve > fallback-ask) against accidental reordering.
+    #[test]
+    fn permission_mode_risk_matrix() {
+        fn verdict(mode: PermissionMode, tool: &str, input: serde_json::Value) -> &'static str {
+            let chain = PermissionChain::new(mode, vec![]);
+            match chain.evaluate(tool, &input, Path::new("/tmp/ws"), false, None) {
+                PermissionDecision::Approve => "approve",
+                PermissionDecision::Ask => "ask",
+                PermissionDecision::Deny(_) => "deny",
+            }
+        }
+        let normal = serde_json::json!({"path": "src/main.rs"});
+        let sensitive = serde_json::json!({"path": "/Users/x/.ssh/id_rsa"});
+        let git_control = serde_json::json!({"path": "/tmp/ws/.git/config"});
+
+        // Write: normal file
+        assert_eq!(
+            verdict(PermissionMode::Manual, "Write", normal.clone()),
+            "ask"
+        );
+        assert_eq!(
+            verdict(PermissionMode::Yolo, "Write", normal.clone()),
+            "approve"
+        );
+        assert_eq!(
+            verdict(PermissionMode::Auto, "Write", normal.clone()),
+            "approve"
+        );
+
+        // Write: sensitive file — yolo still asks (deliberate kimi ordering)
+        assert_eq!(
+            verdict(PermissionMode::Manual, "Write", sensitive.clone()),
+            "ask"
+        );
+        assert_eq!(
+            verdict(PermissionMode::Yolo, "Write", sensitive.clone()),
+            "ask"
+        );
+        assert_eq!(
+            verdict(PermissionMode::Auto, "Write", sensitive.clone()),
+            "approve"
+        );
+
+        // Write: git control path — yolo still asks
+        assert_eq!(
+            verdict(PermissionMode::Manual, "Write", git_control.clone()),
+            "ask"
+        );
+        assert_eq!(
+            verdict(PermissionMode::Yolo, "Write", git_control.clone()),
+            "ask"
+        );
+        assert_eq!(
+            verdict(PermissionMode::Auto, "Write", git_control.clone()),
+            "approve"
+        );
+
+        // Read: sensitive file hits the sensitive gate before read-only approve
+        assert_eq!(
+            verdict(PermissionMode::Manual, "Read", sensitive.clone()),
+            "ask"
+        );
+        assert_eq!(
+            verdict(PermissionMode::Yolo, "Read", sensitive.clone()),
+            "ask"
+        );
+        assert_eq!(
+            verdict(PermissionMode::Auto, "Read", sensitive.clone()),
+            "approve"
+        );
+
+        // ReadMediaFile shares the Read gate
+        assert_eq!(
+            verdict(PermissionMode::Manual, "ReadMediaFile", sensitive.clone()),
+            "ask"
+        );
+
+        // Read: normal file is always approved (read-only list)
+        assert_eq!(
+            verdict(PermissionMode::Manual, "Read", normal.clone()),
+            "approve"
+        );
+        assert_eq!(
+            verdict(PermissionMode::Yolo, "Read", normal.clone()),
+            "approve"
+        );
+
+        // AskUserQuestion: denied in auto, allowed elsewhere
+        let ask_q = serde_json::json!({"question": "q"});
+        assert_eq!(
+            verdict(PermissionMode::Auto, "AskUserQuestion", ask_q.clone()),
+            "deny"
+        );
+        assert_eq!(
+            verdict(PermissionMode::Manual, "AskUserQuestion", ask_q.clone()),
+            "approve"
+        );
+        assert_eq!(
+            verdict(PermissionMode::Yolo, "AskUserQuestion", ask_q.clone()),
+            "approve"
+        );
+    }
+
+    /// User deny rules outrank auto approve — the one hard backstop inside
+    /// autonomous mode (kimi-v2 order: user-deny before auto-approve).
+    #[test]
+    fn user_rules_outrank_auto_approve() {
+        let deny_rule = PermissionRule {
+            decision: "deny".into(),
+            pattern: "Bash".into(),
+            scope: None,
+        };
+        let chain = PermissionChain::new(PermissionMode::Auto, vec![deny_rule]);
+        match chain.evaluate(
+            "Bash",
+            &serde_json::json!({"command": "git push --force"}),
+            Path::new("/tmp/ws"),
+            false,
+            None,
+        ) {
+            PermissionDecision::Deny(_) => {}
+            other => panic!("auto must not override explicit user deny: {other:?}"),
+        }
+    }
+
+    /// Regression: always-approval rules must match after a restart. The old
+    /// `"{tool}:{tool}"` pattern never matched, silently reverting "always
+    /// allow" to "ask" on every restart.
+    #[test]
+    fn always_approval_rule_matches_after_reload() {
+        let mut chain = PermissionChain::new(PermissionMode::Manual, vec![]);
+        chain.persist = false;
+        chain.record_always_approval("Write", &serde_json::json!({"path": "a.rs"}));
+
+        // Simulate a restart: rules round-trip through a fresh chain.
+        let reloaded_rules = chain.rules.clone();
+        let fresh = PermissionChain::new(PermissionMode::Manual, reloaded_rules);
+        let decision = fresh.evaluate(
+            "Write",
+            &serde_json::json!({"path": "b.rs"}),
+            Path::new("/tmp/ws"),
+            false,
+            None,
         );
         assert_eq!(decision, PermissionDecision::Approve);
     }

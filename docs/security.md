@@ -15,6 +15,15 @@ kkagent 能读取和修改文件、运行 Shell、访问网络和调用第三方
 
 `manual`、`yolo`、`auto` 决定工具是否需要交互批准；路径策略和危险命令检测阻止一部分常见误操作。Bash 默认再启用 `[sandbox] mode = "auto"`：Linux/macOS 在探测到 bubblewrap / `sandbox-exec` 后使用工作区级 OS sandbox，否则回退 `process`（Job Object / rlimit）；Windows 使用 Job Object 进程隔离。该层只覆盖 Bash 工具进程，不自动包裹 MCP、Hook 或显式开启的 HTTP terminal；合法编译器和脚本仍可能利用允许的工作区或网络能力。处理多租户或恶意代码时仍应叠加低权限账户、容器或 VM。
 
+### 权限模式语义（与 kimi-code v2 链路对齐）
+
+裁决链固定顺序：用户 deny 规则 → `auto` 全批 → 敏感文件/`git` 控制路径 Ask → `yolo` 全批 → 只读工具白名单 → 兜底 Ask。由此产生的关键行为：
+
+- `auto` 是无人值守档：除 AskUserQuestion（直接 Deny）外批准一切，包括敏感文件访问；它的硬底线是**用户显式 deny 规则**与 shell 危险命令检测，不是交互确认。
+- `yolo` 在敏感文件（`~/.ssh`、`.env` 等）和 `.git` 控制路径上**仍然会 Ask**——比 `auto` 更晚的全批，使这两类风险保留人工确认。
+- `Read` / `ReadMediaFile` 读敏感路径在 manual/yolo 下同样触发 Ask（敏感检查先于只读白名单）。
+- `permission_mode = "auto"` 与 `sandbox` `disabled` 组合会在启动时输出告警并记入审计日志：该组合只在受控容器/VM 内合理。
+
 `--disable-sandbox` 只覆盖当前 kkagent 进程，会完整关闭 Bash 的 OS 文件/网络隔离、Git 环境隔离和资源/进程限制。它不会关闭工具审批或危险命令检测，也不能覆盖通过 `--connect` 使用的远端 Server。只应在外层已有可信容器或 VM 隔离时使用。
 
 ### 沙箱模式差异
@@ -30,6 +39,12 @@ kkagent 能读取和修改文件、运行 Shell、访问网络和调用第三方
 workspace 模式不限制进程能力（macOS profile 含 `(allow process*)`，shell 需要自由 exec）。`extra_read_paths` / `extra_write_paths` 默认拒绝 HOME 与凭据目录（`.ssh` / `.aws` / `.kube` 等）；确需开放时设置 `sandbox.allow_sensitive_extra_paths = true`。
 
 应用层路径策略（`tools.path_guard_mode`、敏感文件检测）是第二道防线，在 disabled/process 模式下尤为重要，但不能替代 OS 沙盒。Bash 命令中的敏感路径扫描是 best-effort，不是可靠隔离。
+
+### 审计与持久化审批
+
+安全相关决策写入 `~/.kkagent/audit.jsonl`（追加式，权限 0600）：权限裁决（含命中的链路步骤）、用户批准/拒绝响应、沙箱降级（如 auto 无 bwrap 回退 process、Windows 无文件系统隔离）。审计写入失败只告警不阻断操作。
+
+"Always allow" 审批持久化在 `~/.kkagent/permissions.toml`（sidecar，不重写主 config.toml）。删除该文件即恢复对所有操作询问。
 
 ## Server 暴露
 

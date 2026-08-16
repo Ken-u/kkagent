@@ -731,6 +731,22 @@ impl AppConfig {
                 self.effective_permission_mode()
             );
         }
+        // Deliberately a warning, not an error: auto + disabled is legitimate
+        // inside a controlled container/VM, but outside one it removes every
+        // OS-level backstop under an unattended agent.
+        if self.effective_permission_mode() == "auto" {
+            let sandbox_off = matches!(
+                self.sandbox.mode.trim().to_ascii_lowercase().as_str(),
+                "disabled" | "off" | "none"
+            );
+            if sandbox_off {
+                tracing::warn!(
+                    "permission_mode=auto with sandbox disabled: autonomous mode without \
+                     OS-level containment; set sandbox.mode to auto/workspace/process unless \
+                     running inside a controlled container"
+                );
+            }
+        }
         if self
             .plugin_marketplace
             .as_deref()
