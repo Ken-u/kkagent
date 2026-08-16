@@ -456,7 +456,11 @@ set sandbox.allow_sensitive_extra_paths = true to override (unsafe)",
     }
 }
 
-fn expand_user_path(raw: &str) -> std::path::PathBuf {
+/// Expand a leading `~` / `~/` to the user's home directory, leaving other
+/// paths untouched. Public so sibling crates (e.g. the sandbox runtime) apply
+/// the exact same expansion the config validator uses — otherwise a path like
+/// `~/sdk` passes validation expanded but is bound literally at runtime.
+pub fn expand_user_path(raw: &str) -> std::path::PathBuf {
     let path = std::path::PathBuf::from(raw);
     if let Some(stripped) = raw.strip_prefix("~/") {
         if let Some(home) = dirs::home_dir() {

@@ -127,8 +127,16 @@ impl SandboxPolicy {
             memory_mb: config.memory_mb,
             cpu_seconds: config.cpu_seconds,
             max_processes: config.max_processes,
-            extra_read_paths: config.extra_read_paths.iter().map(PathBuf::from).collect(),
-            extra_write_paths: config.extra_write_paths.iter().map(PathBuf::from).collect(),
+            extra_read_paths: config
+                .extra_read_paths
+                .iter()
+                .map(|raw| kkagent_config::expand_user_path(raw))
+                .collect(),
+            extra_write_paths: config
+                .extra_write_paths
+                .iter()
+                .map(|raw| kkagent_config::expand_user_path(raw))
+                .collect(),
             allow_sensitive_extra_paths: config.allow_sensitive_extra_paths,
             auto_fallback_warning,
             toolchain_overlay: crate::toolchain::ToolchainSandboxOverlay::default(),
@@ -879,6 +887,32 @@ mod tests {
             err.to_string().contains("sensitive path")
                 || err.to_string().contains("allow_sensitive_extra_paths"),
             "{err}"
+        );
+    }
+
+    #[test]
+    fn from_config_expands_tilde_in_extra_paths() {
+        // Validation expands `~` before its sensitivity check, so the runtime
+        // policy must expand too — otherwise `~/sdk` passes validation but is
+        // bound as a literal `~` directory at sandbox setup time.
+        let home = dirs::home_dir().expect("home");
+        let config = kkagent_config::SandboxConfig {
+            mode: "process".into(),
+            memory_mb: 128,
+            cpu_seconds: 10,
+            max_processes: 8,
+            extra_read_paths: vec!["~/kkagent-sandbox-extra-read".into()],
+            extra_write_paths: vec!["~/kkagent-sandbox-extra-write".into()],
+            ..Default::default()
+        };
+        let policy = SandboxPolicy::from_config(&config).unwrap();
+        assert_eq!(
+            policy.extra_read_paths,
+            vec![home.join("kkagent-sandbox-extra-read")]
+        );
+        assert_eq!(
+            policy.extra_write_paths,
+            vec![home.join("kkagent-sandbox-extra-write")]
         );
     }
 
