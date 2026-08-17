@@ -2110,6 +2110,55 @@ impl kkagent_acp::AcpHost for AgentAcpHost {
         }))
     }
 
+    async fn load_session(&self, session_id: &str, cwd: &str) -> Result<(), String> {
+        ensure_session_loaded(&self.state, session_id).await?;
+        if let Err(error) = std::fs::canonicalize(cwd) {
+            tracing::warn!("ACP session/load cwd invalid: {error}");
+        }
+        Ok(())
+    }
+
+    fn supports_load_session(&self) -> bool {
+        true
+    }
+
+    async fn session_history(&self, session_id: &str) -> Result<Vec<serde_json::Value>, String> {
+        let records = {
+            let database = self.state.transcript.lock().await;
+            database
+                .load_messages(session_id)
+                .map_err(|e| e.to_string())?
+        };
+        let mut history = Vec::with_capacity(records.len());
+        for record in records {
+            let Ok(blocks) =
+                serde_json::from_str::<Vec<kkagent_llm::ChatContent>>(&record.content_json)
+            else {
+                continue;
+            };
+            let mapped: Vec<serde_json::Value> = blocks
+                .iter()
+                .map(|block| match block {
+                    kkagent_llm::ChatContent::Text { text } => serde_json::json!({
+                        "type": "text", "text": text,
+                    }),
+                    kkagent_llm::ChatContent::Image { media_type, data } => serde_json::json!({
+                        "type": "image", "data": data, "mimeType": media_type,
+                    }),
+                    _ => serde_json::json!({"type": "text", "text": "[non-text content]"}),
+                })
+                .collect();
+            if mapped.is_empty() {
+                continue;
+            }
+            history.push(serde_json::json!({
+                "role": if record.role == "assistant" { "assistant" } else { "user" },
+                "blocks": mapped,
+            }));
+        }
+        Ok(history)
+    }
+
     async fn cancel(&self, session_id: &str) -> Result<(), String> {
         let flag = self
             .state
@@ -2182,19 +2231,43 @@ impl kkagent_acp::AcpHost for AgentAcpHost {
             .or_else(|| params.get("approval_id"))
             .and_then(|value| value.as_str())
             .ok_or_else(|| "missing approvalId".to_string())?;
-        let decision = match params
-            .get("decision")
+        // Official ACP flow sends {"approve": bool} from the
+        // session/request_permission outcome; legacy flow sends a decision
+        // string. Support both.
+        let decision = if let Some(approve) = params.get("approve").and_then(|v| v.as_bool()) {
+            if approve {
+                kkagent_protocol::ApprovalDecision::Approved
+            } else {
+                kkagent_protocol::ApprovalDecision::Rejected
+            }
+        } else {
+            match params
+                .get("decision")
+                .and_then(|value| value.as_str())
+                .unwrap_or("cancelled")
+            {
+                "approved" | "approve" | "allow" => kkagent_protocol::ApprovalDecision::Approved,
+                "rejected" | "reject" | "deny" => kkagent_protocol::ApprovalDecision::Rejected,
+                _ => kkagent_protocol::ApprovalDecision::Cancelled,
+            }
+        };
+        let scope = match params
+            .get("scope")
+            .or_else(|| params.get("optionId"))
+            .or_else(|| params.get("option_id"))
             .and_then(|value| value.as_str())
-            .unwrap_or("cancelled")
         {
-            "approved" | "approve" | "allow" => kkagent_protocol::ApprovalDecision::Approved,
-            "rejected" | "reject" | "deny" => kkagent_protocol::ApprovalDecision::Rejected,
-            _ => kkagent_protocol::ApprovalDecision::Cancelled,
+            Some("allow_always") | Some("always") | Some("session") => {
+                Some(kkagent_protocol::ApprovalScope::Always)
+            }
+            Some("turn") => Some(kkagent_protocol::ApprovalScope::Turn),
+            Some("once") => Some(kkagent_protocol::ApprovalScope::Once),
+            _ => None,
         };
         let response = kkagent_protocol::ApprovalResponse {
             approval_id: id.to_string(),
             decision,
-            scope: None,
+            scope,
             feedback: params
                 .get("feedback")
                 .and_then(|value| value.as_str())
@@ -2205,9 +2278,26 @@ impl kkagent_acp::AcpHost for AgentAcpHost {
                 .and_then(|value| value.as_str())
                 .map(str::to_string),
         };
+        // Deliver only to the session that owns the approval: broadcasting
+        // to every session would cross-wire concurrent turns.
+        let sid = params
+            .get("session_id")
+            .or_else(|| params.get("sessionId"))
+            .and_then(|value| value.as_str());
         let senders = self.state.approval_txs.lock().await;
-        for sender in senders.values() {
-            let _ = sender.try_send(response.clone());
+        match sid {
+            Some(sid) if !sid.is_empty() => {
+                if let Some(sender) = senders.get(sid) {
+                    let _ = sender.try_send(response);
+                } else {
+                    return Err(format!("session not found: {sid}"));
+                }
+            }
+            _ => {
+                for sender in senders.values() {
+                    let _ = sender.try_send(response.clone());
+                }
+            }
         }
         Ok(())
     }
@@ -2234,16 +2324,34 @@ impl kkagent_acp::AcpHost for AgentAcpHost {
             free_text: params
                 .get("freeText")
                 .or_else(|| params.get("free_text"))
+                .or_else(|| params.get("answer"))
                 .and_then(|value| value.as_str())
                 .map(str::to_string),
             cancelled: params
                 .get("cancelled")
+                .or_else(|| params.get("canceled"))
                 .and_then(|value| value.as_bool())
                 .unwrap_or(false),
         };
+        // Same targeting rule as approvals.
+        let sid = params
+            .get("session_id")
+            .or_else(|| params.get("sessionId"))
+            .and_then(|value| value.as_str());
         let senders = self.state.question_txs.lock().await;
-        for sender in senders.values() {
-            let _ = sender.try_send(response.clone());
+        match sid {
+            Some(sid) if !sid.is_empty() => {
+                if let Some(sender) = senders.get(sid) {
+                    let _ = sender.try_send(response);
+                } else {
+                    return Err(format!("session not found: {sid}"));
+                }
+            }
+            _ => {
+                for sender in senders.values() {
+                    let _ = sender.try_send(response.clone());
+                }
+            }
         }
         Ok(())
     }

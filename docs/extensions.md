@@ -2,15 +2,23 @@
 
 ## ACP
 
-`kkagent acp` 在 stdin/stdout 上运行 newline-delimited JSON-RPC，供编辑器和 IDE 启动为子进程：
+`kkagent acp` 在 stdin/stdout 上运行 newline-delimited JSON-RPC（Agent Client Protocol v1），供编辑器和 IDE 启动为子进程：
 
 ```bash
 kkagent --config ~/.kkagent/config.toml acp
 ```
 
-客户端应先调用 `initialize`，再创建会话和发送 prompt。实现暴露会话、模型目录、模式、工具、批准、用户问题、文件系统、终端、MCP 和 slash command 等 capability，并把 Agent 状态映射成 `session/update`、`session/request_permission`、`session/request_input` 等通知。
+客户端先调用 `initialize`，返回官方 `agentCapabilities`（`loadSession`、`promptCapabilities.tools`）与 `authMethods`。随后：
 
-ACP 进程的 stdout 是协议通道，不能混入普通日志；诊断信息应读取 stderr。当前 [VS Code 扩展](../apps/vscode/README.md) 是最小 ACP 客户端示例。
+- `session/new`（支持 `cwd` 与可选 `initialMessage`）返回 `sessionId` 与 `modes`；
+- `session/load` 按 transcript sessionId 恢复历史会话，并把历史按 `user_message_chunk` / `agent_message_chunk` 回放；
+- `session/prompt` 接受官方 content block 数组（text/image 等），turn 期间通过 `session/update` 通知流式推送 `agent_message_chunk`、`agent_thought_chunk`、`tool_call`、`tool_call_update` 等官方变体，turn 结束返回 `{stopReason}`（`end_turn` / `cancelled` / `max_tokens` …）；
+- 工具批准映射为 agent→client 请求 `session/request_permission`（options：`allow_once` / `allow_always` / `reject_once` / `reject_always`，kind 为 `edit` / `command` / `fetch`），客户端以 `{outcomeKind: "selected", optionId}` 或 `{outcomeKind: "cancelled"}` 响应；
+- 用户提问映射为 `session/request_input`（text 或 select，多选遵循 `multiSelect`），响应为 `{content: [...]}` 或 `{canceled: true}`。
+
+`model/list`、`session/set_mode`、`session/set_model`、`session/cancel`、`fs/*`、`terminal/*`、`mcp/list`、`commands/list` 与 slash commands 保持可用；旧 `approval/*` 接口保留为兼容层。
+
+ACP 进程的 stdout 是协议通道，不能混入普通日志；诊断信息应读取 stderr。当前 [VS Code 扩展](../apps/vscode/README.md) 是一个实现了流式更新与权限/输入请求的 ACP 客户端示例。
 
 ## MCP Client
 
