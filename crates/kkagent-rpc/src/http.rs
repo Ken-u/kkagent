@@ -489,6 +489,20 @@ pub trait HttpBackend: Send + Sync {
         images: &[HttpImageInput],
         task_id: Option<&str>,
     ) -> Result<Value, String>;
+    async fn fork_session(
+        &self,
+        _id: &str,
+        _title: Option<String>,
+        _message_limit: Option<usize>,
+    ) -> Result<Value, String> {
+        Err("session fork is not supported by this backend".into())
+    }
+    async fn start_btw(&self, _id: &str, _question: &str) -> Result<Value, String> {
+        Err("btw is not supported by this backend".into())
+    }
+    async fn cancel_btw(&self, _id: &str) -> Result<Value, String> {
+        Err("btw is not supported by this backend".into())
+    }
     async fn list_tools(&self) -> Value;
     async fn list_tasks(&self) -> Value;
     async fn list_skills(&self) -> Value;
@@ -571,6 +585,69 @@ impl HttpBackend for MemoryBackend {
         Ok(
             json!({"ok": true, "message": msg, "note": "memory backend — wire HttpBackend for AgentLoop"}),
         )
+    }
+    async fn fork_session(
+        &self,
+        id: &str,
+        title: Option<String>,
+        message_limit: Option<usize>,
+    ) -> Result<Value, String> {
+        let mut map = self.sessions.lock().await;
+        let source = map
+            .get(id)
+            .cloned()
+            .ok_or_else(|| "not found".to_string())?;
+        let new_id = uuid::Uuid::new_v4().to_string();
+        let mut forked = source;
+        let messages = forked
+            .get("messages")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let kept = match message_limit {
+            Some(limit) => messages.into_iter().take(limit).collect::<Vec<_>>(),
+            None => messages,
+        };
+        if let Some(object) = forked.as_object_mut() {
+            object.insert("session_id".into(), json!(new_id));
+            object.insert("forked_from".into(), json!(id));
+            object.insert("parent_id".into(), json!(id));
+            object.insert("messages".into(), json!(kept));
+            object.insert("created_at".into(), json!(chrono::Utc::now().to_rfc3339()));
+            let title = title.unwrap_or_else(|| {
+                object
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .map(|value| format!("Fork: {value}"))
+                    .unwrap_or_else(|| "Fork".into())
+            });
+            object.insert("title".into(), json!(title));
+        }
+        map.insert(new_id, forked.clone());
+        Ok(forked)
+    }
+    async fn start_btw(&self, id: &str, question: &str) -> Result<Value, String> {
+        let _ = self
+            .get_session(id)
+            .await
+            .ok_or_else(|| "not found".to_string())?;
+        if question.trim().is_empty() {
+            return Err("BTW question must not be empty".into());
+        }
+        Ok(json!({
+            "ok": true,
+            "agent_id": uuid::Uuid::new_v4().to_string(),
+            "question": question,
+            "answer": format!("关于「{}」的补充说明（memory backend）。", question.chars().take(40).collect::<String>()),
+        }))
+    }
+    async fn cancel_btw(&self, id: &str) -> Result<Value, String> {
+        let _ = self
+            .get_session(id)
+            .await
+            .ok_or_else(|| "not found".to_string())?;
+        Ok(json!({"ok": true}))
     }
     async fn list_tools(&self) -> Value {
         json!({"tools": [
@@ -708,7 +785,8 @@ impl HttpState {
                     "sessions","messages","approvals","ws","tools","tasks","skills",
                     "files","fs","workspaces","config","modelCatalog","search",
                     "terminals","questions","prompts","snapshot","eventReplay","turnStatus",
-                    "health","readiness","metrics","durableEvents","durableTasks","idempotency"
+                    "health","readiness","metrics","durableEvents","durableTasks","idempotency",
+                    "fork","btw","timeline"
                 ],
             }),
             events,
@@ -1385,6 +1463,95 @@ async fn post_message(
     }
 }
 
+#[derive(Deserialize, Default)]
+struct ForkSessionBody {
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    message_limit: Option<usize>,
+}
+
+async fn fork_session(
+    State(state): State<HttpState>,
+    Path(id): Path<String>,
+    Query(q): Query<AuthQuery>,
+    Json(body): Json<ForkSessionBody>,
+) -> Result<Json<Value>, StatusCode> {
+    check_auth(&state, &q)?;
+    let sess = state
+        .backend
+        .fork_session(&id, body.title, body.message_limit)
+        .await
+        .map_err(|error| {
+            if error.contains("not found") {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::BAD_REQUEST
+            }
+        })?;
+    if let Some(forked_id) = sess.get("session_id").and_then(|v| v.as_str()) {
+        state.publish(json!({
+            "type": "session.forked",
+            "session_id": forked_id,
+            "forked_from": id,
+        }));
+    }
+    Ok(Json(sess))
+}
+
+#[derive(Deserialize, Default)]
+struct BtwBody {
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    question: Option<String>,
+}
+
+async fn start_btw(
+    State(state): State<HttpState>,
+    Path(id): Path<String>,
+    Query(q): Query<AuthQuery>,
+    Json(body): Json<BtwBody>,
+) -> Result<Json<Value>, StatusCode> {
+    check_auth(&state, &q)?;
+    let question = body.text.or(body.question).unwrap_or_default();
+    let result = state
+        .backend
+        .start_btw(&id, &question)
+        .await
+        .map_err(|error| {
+            if error.contains("not found") {
+                StatusCode::NOT_FOUND
+            } else if error.contains("Wait for") {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::BAD_REQUEST
+            }
+        })?;
+    state.publish(json!({
+        "type": "btw_start",
+        "session_id": id,
+        "question": question,
+        "agent_id": result.get("agent_id").cloned().unwrap_or(Value::Null),
+    }));
+    Ok(Json(result))
+}
+
+async fn cancel_btw(
+    State(state): State<HttpState>,
+    Path(id): Path<String>,
+    Query(q): Query<AuthQuery>,
+) -> Result<Json<Value>, StatusCode> {
+    check_auth(&state, &q)?;
+    let result = state
+        .backend
+        .cancel_btw(&id)
+        .await
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+    state.publish(json!({"type": "btw_cancel", "session_id": id}));
+    Ok(Json(result))
+}
+
 #[derive(Deserialize)]
 struct ApprovalBody {
     decision: String,
@@ -1783,27 +1950,132 @@ async fn session_timeline(
         .get_session(&id)
         .await
         .ok_or(StatusCode::NOT_FOUND)?;
+    Ok(Json(build_session_timeline(&id, &sess)))
+}
+
+fn message_text(message: &Value) -> String {
+    if let Some(text) = message.get("text").and_then(Value::as_str) {
+        if !text.is_empty() {
+            return text.to_string();
+        }
+    }
+    match message.get("content") {
+        Some(Value::String(text)) => text.clone(),
+        Some(Value::Array(parts)) => parts
+            .iter()
+            .filter_map(|part| part.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        other => other
+            .cloned()
+            .unwrap_or(Value::Null)
+            .to_string()
+            .trim_matches('"')
+            .to_string(),
+    }
+}
+
+fn message_tool_calls(message: &Value) -> Vec<Value> {
+    let mut tools = Vec::new();
+    if let Some(calls) = message.get("tool_calls").and_then(Value::as_array) {
+        tools.extend(calls.iter().cloned());
+    }
+    if let Some(parts) = message.get("content").and_then(Value::as_array) {
+        for part in parts {
+            if part.get("type").and_then(Value::as_str) != Some("tool_use") {
+                continue;
+            }
+            tools.push(json!({
+                "id": part.get("id"),
+                "name": part.get("name"),
+                "input": part.get("input"),
+            }));
+        }
+    }
+    tools
+}
+
+fn build_session_timeline(id: &str, sess: &Value) -> Value {
     let messages = sess
         .get("messages")
-        .and_then(|v| v.as_array())
+        .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    let events: Vec<Value> = messages
-        .into_iter()
-        .enumerate()
-        .map(|(i, m)| {
-            json!({
-                "index": i,
-                "role": m.get("role"),
-                "preview": m.get("content").cloned().unwrap_or(Value::Null).to_string().chars().take(200).collect::<String>(),
-            })
-        })
-        .collect();
-    Ok(Json(json!({
+    let mut events = Vec::new();
+    if let Some(parent) = sess
+        .get("forked_from")
+        .or_else(|| sess.get("parent_id"))
+        .and_then(Value::as_str)
+    {
+        events.push(json!({
+            "kind": "fork",
+            "title": "Fork 会话",
+            "desc": parent,
+            "time": sess.get("created_at"),
+        }));
+    }
+    for (index, message) in messages.iter().enumerate() {
+        let role = message.get("role").and_then(Value::as_str).unwrap_or("");
+        let time = message
+            .get("created_at")
+            .cloned()
+            .or_else(|| message.get("at").cloned())
+            .unwrap_or(Value::Null);
+        let tools = message_tool_calls(message);
+        if !tools.is_empty() {
+            let changes: Vec<Value> = tools
+                .iter()
+                .map(|tool| {
+                    let name = tool.get("name").and_then(Value::as_str).unwrap_or("tool");
+                    let input = tool.get("input").cloned().unwrap_or(Value::Null);
+                    let path = input
+                        .get("path")
+                        .or_else(|| input.get("command"))
+                        .or_else(|| input.get("pattern"))
+                        .cloned()
+                        .unwrap_or(Value::Null);
+                    json!({
+                        "type": name,
+                        "path": path,
+                        "diff": tool.get("diff"),
+                        "input": input,
+                    })
+                })
+                .collect();
+            events.push(json!({
+                "kind": "tool",
+                "index": index,
+                "time": time,
+                "title": "工具调用",
+                "desc": tools
+                    .iter()
+                    .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                "changes": changes,
+            }));
+            continue;
+        }
+        let preview: String = message_text(message).chars().take(200).collect();
+        if preview.trim().is_empty() {
+            continue;
+        }
+        let kind = if role == "user" { "user" } else { "assistant" };
+        events.push(json!({
+            "kind": kind,
+            "index": index,
+            "role": role,
+            "time": time,
+            "title": if role == "user" { "用户" } else { "kkagent" },
+            "desc": preview,
+            "preview": preview,
+        }));
+    }
+    json!({
         "session_id": id,
         "events": events,
         "format": "timeline/v1",
-    })))
+    })
 }
 
 async fn web_ui_index() -> impl IntoResponse {
@@ -1992,6 +2264,9 @@ pub fn router(state: HttpState) -> Router {
             get(get_session).delete(delete_session),
         )
         .route("/api/v1/sessions/{id}/messages", post(post_message))
+        .route("/api/v1/sessions/{id}/fork", post(fork_session))
+        .route("/api/v1/sessions/{id}/btw", post(start_btw))
+        .route("/api/v1/sessions/{id}/btw/cancel", post(cancel_btw))
         .route("/api/v1/sessions/{id}/export", get(export_session))
         .route("/api/v1/approvals/{id}", post(post_approval))
         .route("/api/v1/tools", get(tools))
@@ -2459,5 +2734,85 @@ mod security_tests {
         write.await.unwrap();
         assert!(output.len() <= MAX_TERMINAL_OUTPUT_BYTES + 40);
         assert!(output.ends_with(b"... terminal output truncated ...\n"));
+    }
+
+    #[tokio::test]
+    async fn fork_endpoint_copies_history_and_records_parent() {
+        let backend = Arc::new(MemoryBackend::default());
+        let created = backend
+            .create_session(Some(".".into()), Some("source".into()))
+            .await
+            .unwrap();
+        let session_id = created["session_id"].as_str().unwrap().to_string();
+        backend
+            .post_message(&session_id, "hello", &[], None)
+            .await
+            .unwrap();
+        let state = HttpState::with_backend(backend, None);
+        let Json(forked) = fork_session(
+            State(state),
+            Path(session_id.clone()),
+            Query(AuthQuery::default()),
+            Json(ForkSessionBody {
+                title: Some("branched".into()),
+                message_limit: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_ne!(forked["session_id"], session_id);
+        assert_eq!(forked["forked_from"], session_id);
+        assert_eq!(forked["title"], "branched");
+        assert_eq!(forked["messages"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn btw_endpoint_returns_side_answer_for_memory_backend() {
+        let backend = Arc::new(MemoryBackend::default());
+        let created = backend.create_session(None, None).await.unwrap();
+        let session_id = created["session_id"].as_str().unwrap().to_string();
+        let state = HttpState::with_backend(backend, None);
+        let Json(result) = start_btw(
+            State(state),
+            Path(session_id),
+            Query(AuthQuery::default()),
+            Json(BtwBody {
+                text: Some("还有别的方案吗".into()),
+                question: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result["ok"], true);
+        assert!(result["agent_id"].as_str().is_some());
+        assert!(result["answer"]
+            .as_str()
+            .unwrap()
+            .contains("还有别的方案吗"));
+    }
+
+    #[test]
+    fn timeline_extracts_user_turns_and_tool_calls() {
+        let sess = json!({
+            "forked_from": "parent",
+            "created_at": "2026-08-17T10:00:00Z",
+            "messages": [
+                {"role": "user", "text": "fix the renderer", "created_at": "2026-08-17T10:00:01Z"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "text", "text": "looking"},
+                        {"type": "tool_use", "id": "t1", "name": "edit", "input": {"path": "app.js"}}
+                    ],
+                    "created_at": "2026-08-17T10:00:02Z"
+                }
+            ]
+        });
+        let timeline = build_session_timeline("child", &sess);
+        let events = timeline["events"].as_array().unwrap();
+        assert_eq!(events[0]["kind"], "fork");
+        assert_eq!(events[1]["kind"], "user");
+        assert_eq!(events[2]["kind"], "tool");
+        assert_eq!(events[2]["changes"][0]["path"], "app.js");
     }
 }

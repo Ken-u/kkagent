@@ -2292,20 +2292,42 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
     }
 
     async fn list_sessions(&self) -> serde_json::Value {
-        let sessions = self.state.sessions.lock().await;
-        let list: Vec<_> = sessions
-            .values()
-            .map(|s| {
-                serde_json::json!({
-                    "session_id": s.id,
-                    "title": s.title,
-                    "workspace": s.working_dir.display().to_string(),
-                    "messages": s.messages.len(),
-                    "permission_mode": format!("{:?}", s.get_permission_mode()),
+        let store = SessionStore::open_default();
+        if let Ok(summaries) = store.list(false, 200) {
+            if !summaries.is_empty() {
+                let db = self.state.transcript.lock().await;
+                let list: Vec<_> = summaries
+                    .into_iter()
+                    .map(|summary| http_session_list_item(&db, summary))
+                    .collect();
+                return serde_json::json!({"sessions": list});
+            }
+        }
+        let list: Vec<_> = {
+            let sessions = self.state.sessions.lock().await;
+            sessions
+                .values()
+                .map(|s| {
+                    let meta = s.services.metadata.read();
+                    let preview = meta
+                        .last_prompt
+                        .clone()
+                        .or_else(|| meta.first_prompt.clone())
+                        .unwrap_or_default();
+                    serde_json::json!({
+                        "session_id": s.id,
+                        "title": s.title,
+                        "workspace": s.working_dir.display().to_string(),
+                        "working_dir": s.working_dir.display().to_string(),
+                        "preview": preview,
+                        "forked_from": meta.forked_from.clone(),
+                        "parent_id": meta.forked_from,
+                        "messages": s.messages.len(),
+                        "permission_mode": format!("{:?}", s.get_permission_mode()),
+                    })
                 })
-            })
-            .collect();
-        // Also include transcript DB sessions
+                .collect()
+        };
         let db = self.state.transcript.lock().await;
         let archived = db.list_sessions(50).unwrap_or_default();
         let archived_json: Vec<_> = archived
@@ -2314,6 +2336,7 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
                 serde_json::json!({
                     "session_id": r.session_id,
                     "title": r.title,
+                    "workspace": r.working_dir,
                     "working_dir": r.working_dir,
                     "updated_at": r.updated_at,
                 })
@@ -2426,21 +2449,47 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
     }
 
     async fn get_session(&self, id: &str) -> Option<serde_json::Value> {
-        let sessions = self.state.sessions.lock().await;
-        sessions.get(id).map(|s| {
-            serde_json::json!({
-                "session_id": s.id,
-                "title": s.title,
-                "workspace": s.working_dir.display().to_string(),
-                "messages": s.messages,
-                "usage": {
-                    "input_tokens": s.usage.snapshot().input_tokens,
-                    "output_tokens": s.usage.snapshot().output_tokens,
-                    "steps": s.usage.snapshot().steps,
-                    "turns": s.usage.snapshot().turns,
-                },
-            })
-        })
+        {
+            let sessions = self.state.sessions.lock().await;
+            if let Some(s) = sessions.get(id) {
+                let meta = s.services.metadata.read();
+                return Some(serde_json::json!({
+                    "session_id": s.id,
+                    "title": s.title,
+                    "workspace": s.working_dir.display().to_string(),
+                    "working_dir": s.working_dir.display().to_string(),
+                    "forked_from": meta.forked_from.clone(),
+                    "parent_id": meta.forked_from,
+                    "messages": s.messages,
+                    "usage": {
+                        "input_tokens": s.usage.snapshot().input_tokens,
+                        "output_tokens": s.usage.snapshot().output_tokens,
+                        "steps": s.usage.snapshot().steps,
+                        "turns": s.usage.snapshot().turns,
+                    },
+                }));
+            }
+        }
+        let (record, messages) = {
+            let db = self.state.transcript.lock().await;
+            let record = db.get_session(id).ok()??;
+            let records = db.load_messages(id).ok()?;
+            (record, http_messages_from_records(&records))
+        };
+        let forked_from = SessionStore::open_default()
+            .get(id)
+            .ok()
+            .and_then(|summary| summary.forked_from);
+        Some(serde_json::json!({
+            "session_id": record.session_id,
+            "title": record.title,
+            "workspace": record.working_dir,
+            "working_dir": record.working_dir,
+            "updated_at": record.updated_at,
+            "forked_from": forked_from.clone(),
+            "parent_id": forked_from,
+            "messages": messages,
+        }))
     }
 
     async fn delete_session(&self, id: &str) -> Result<(), String> {
@@ -2561,6 +2610,41 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
             }
         });
         Ok(serde_json::json!({"ok": true, "queued": true, "message_count": n}))
+    }
+
+    async fn fork_session(
+        &self,
+        id: &str,
+        title: Option<String>,
+        message_limit: Option<usize>,
+    ) -> Result<serde_json::Value, String> {
+        let mut params = serde_json::json!({"session_id": id});
+        if let Some(title) = title {
+            params["title"] = serde_json::json!(title);
+        }
+        if let Some(limit) = message_limit {
+            params["message_limit"] = serde_json::json!(limit);
+        }
+        http_rpc(&self.state, "sessions.fork", params).await
+    }
+
+    async fn start_btw(&self, id: &str, question: &str) -> Result<serde_json::Value, String> {
+        ensure_session_loaded(&self.state, id).await?;
+        http_rpc(
+            &self.state,
+            "session.btw",
+            serde_json::json!({"session_id": id, "text": question}),
+        )
+        .await
+    }
+
+    async fn cancel_btw(&self, id: &str) -> Result<serde_json::Value, String> {
+        http_rpc(
+            &self.state,
+            "session.btw_cancel",
+            serde_json::json!({"session_id": id}),
+        )
+        .await
     }
 
     async fn list_tools(&self) -> serde_json::Value {
@@ -3661,7 +3745,12 @@ impl ServerState {
 
     /// Fan-out an event frame to every attached RPC client.
     /// Slow/full clients skip a frame; closed clients are pruned.
+    /// Agent events are also mirrored onto the HTTP WebSocket bus so the Web UI
+    /// can stream the same turn / BTW updates.
     fn publish_rpc_event(&self, frame: Frame) {
+        if let Frame::Event { data, .. } = &frame {
+            let _ = self.events.send(data.clone());
+        }
         let mut subscribers = self
             .rpc_event_subscribers
             .write()
@@ -4633,6 +4722,65 @@ fn messages_from_records(records: &[kkagent_core::transcript::MessageRecord]) ->
             })
         })
         .collect()
+}
+
+fn http_session_list_item(
+    db: &TranscriptDb,
+    summary: kkagent_core::session::store::SessionSummary,
+) -> serde_json::Value {
+    let record = db.get_session(&summary.id).ok().flatten();
+    let message_count = record.as_ref().map(|item| item.message_count).unwrap_or(0);
+    let preview = summary
+        .last_prompt
+        .as_deref()
+        .or(summary.first_prompt.as_deref())
+        .unwrap_or("")
+        .chars()
+        .take(80)
+        .collect::<String>();
+    let updated_at = chrono::DateTime::from_timestamp_millis(summary.updated_at)
+        .map(|time| time.to_rfc3339())
+        .or_else(|| record.as_ref().map(|item| item.updated_at.clone()));
+    serde_json::json!({
+        "session_id": summary.id,
+        "title": summary.title,
+        "workspace": summary.work_dir,
+        "working_dir": summary.work_dir,
+        "updated_at": updated_at,
+        "preview": preview,
+        "forked_from": summary.forked_from.clone(),
+        "parent_id": summary.forked_from,
+        "message_count": message_count,
+        "empty": message_count == 0,
+    })
+}
+
+fn http_messages_from_records(
+    records: &[kkagent_core::transcript::MessageRecord],
+) -> Vec<serde_json::Value> {
+    records
+        .iter()
+        .map(|record| {
+            let content: serde_json::Value =
+                serde_json::from_str(&record.content_json).unwrap_or(serde_json::Value::Null);
+            serde_json::json!({
+                "role": record.role,
+                "content": content,
+                "created_at": record.created_at,
+            })
+        })
+        .collect()
+}
+
+async fn http_rpc(
+    state: &Arc<ServerState>,
+    method: &str,
+    params: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let (tx, _rx) = mpsc::channel(16);
+    handle_rpc_call(state.clone(), method, Some(params), tx)
+        .await
+        .map_err(|(_, message)| message)
 }
 
 async fn persist_disabled_extensions(state: &ServerState) -> Result<(), String> {
