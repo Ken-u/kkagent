@@ -17,6 +17,7 @@ const state = {
   scope: "workspace",
   cwd: "",
   live: null,
+  views: {},
   btwLive: null,
   followBottom: true,
   suppressScroll: false,
@@ -69,6 +70,11 @@ const confirmBody = document.getElementById("confirmBody");
 const confirmOk = document.getElementById("confirmOk");
 const confirmCancel = document.getElementById("confirmCancel");
 const modelSelect = document.getElementById("modelSelect");
+const promptModal = document.getElementById("promptModal");
+const promptTitle = document.getElementById("promptTitle");
+const promptBody = document.getElementById("promptBody");
+const promptExtra = document.getElementById("promptExtra");
+const promptActions = document.getElementById("promptActions");
 
 const ICONS = {
   copy: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>',
@@ -463,12 +469,23 @@ function bindMessageActions(div, role, content, toolCalls, messageIndex) {
   }
 }
 
+function renderThinking(thinking, { done = true } = {}) {
+  if (!thinking) return "";
+  const open = done ? "" : " open";
+  const label = done ? "思考过程" : "思考中…";
+  return `<details class="thinking${done ? "" : " is-live"}"${open}>
+      <summary><span class="thinking-label">${label}</span></summary>
+      <div class="thinking-body">${escapeHtml(thinking)}</div>
+    </details>`;
+}
+
 function renderMessage(role, content, timestamp, toolCalls = [], extras = {}) {
   const div = document.createElement("div");
   div.className = `message ${role}`;
   const roleLabel = role === "assistant" ? "kkagent" : role === "user" ? "你" : "system";
   const roleIcon = role === "assistant" ? "K" : role === "user" ? "U" : "!";
   const toolsHtml = renderToolGroup(toolCalls);
+  const thinkingHtml = role === "assistant" ? renderThinking(extras.thinking, { done: extras.thinkingDone !== false }) : "";
   div.innerHTML = `
     <div class="avatar ${role}">${roleIcon}</div>
     <div class="message-body">
@@ -476,6 +493,7 @@ function renderMessage(role, content, timestamp, toolCalls = [], extras = {}) {
         <span class="role-name">${roleLabel}</span>
         <span class="timestamp">${formatTime(timestamp)}</span>
       </div>
+      ${thinkingHtml}
       <div class="bubble">${content ? markdownToHtml(content) : ""}${toolsHtml}</div>
       <span class="msg-actions">
         <button class="copy-btn msg-copy" title="复制消息">${ICONS.copy}</button>
@@ -682,11 +700,12 @@ function parseTranscript(messages) {
       });
     } else if (role === "assistant") {
       let text = "";
+      let thinking = "";
       const tools = [];
       if (parts) {
         for (const part of parts) {
           if (part.type === "text") text += part.text || "";
-          else if (part.type === "thinking") continue;
+          else if (part.type === "thinking") thinking += part.thinking || part.text || "";
           else if (part.type === "tool_use") {
             const tool = {
               _id: part.id,
@@ -700,12 +719,15 @@ function parseTranscript(messages) {
         }
       } else {
         text = raw.text || (typeof raw.content === "string" ? raw.content : "");
+        thinking = raw.thinking || "";
         for (const tool of raw.tool_calls || []) tools.push(tool);
       }
-      if (!text.trim() && tools.length === 0) continue;
+      if (!text.trim() && tools.length === 0 && !thinking.trim()) continue;
       out.push({
         role: "assistant",
         content: text,
+        thinking,
+        thinkingDone: true,
         created_at: raw.created_at || raw.at,
         tool_calls: tools,
       });
@@ -717,23 +739,30 @@ function parseTranscript(messages) {
   return out;
 }
 
-function renderLog(messages, { jump = true } = {}) {
-  const parsed = parseTranscript(messages);
+function renderLog(messages, { jump = true, parsed = false } = {}) {
+  const items = parsed ? messages || [] : parseTranscript(messages);
+  if (!parsed && state.sessionId) {
+    const view = viewOf(state.sessionId);
+    if (!view.live && !view.running) view.messages = items;
+  }
   state.suppressScroll = true;
   logEl.classList.add("is-history");
   logEl.innerHTML = "";
-  if (!parsed.length) {
+  if (!items.length) {
     logEl.classList.remove("is-history");
     state.suppressScroll = false;
-    showWelcome();
+    const view = state.sessionId ? viewOf(state.sessionId) : null;
+    if (!view || (!view.running && !view.live)) showWelcome();
     if (jump) jumpToLatest();
     else updateJumpButton();
     return;
   }
-  parsed.forEach((message, index) => {
+  items.forEach((message, index) => {
     appendMessage(message.role, message.content, message.created_at, message.tool_calls || [], {
       images: message.images,
       messageIndex: message.sourceIndex ?? index,
+      thinking: message.thinking,
+      thinkingDone: message.thinkingDone !== false,
     });
   });
   logEl.classList.remove("is-history");
@@ -752,6 +781,180 @@ function renderLog(messages, { jump = true } = {}) {
 
 function sessionIdOf(session) {
   return session.session_id || session.id;
+}
+
+function emptySessionView() {
+  return {
+    messages: [],
+    live: null,
+    running: false,
+    pendingApproval: null,
+    pendingQuestion: null,
+  };
+}
+
+function viewOf(id) {
+  if (!id) return emptySessionView();
+  if (!state.views[id]) state.views[id] = emptySessionView();
+  return state.views[id];
+}
+
+function cloneLive(live) {
+  if (!live) return null;
+  return {
+    text: live.text || "",
+    tools: (live.tools || []).map((tool) => ({ ...tool })),
+    time: live.time || new Date().toISOString(),
+    thinking: live.thinking || "",
+    thinkingDone: Boolean(live.thinkingDone),
+    el: null,
+  };
+}
+
+function ensureViewLive(view) {
+  if (!view.live) {
+    view.live = {
+      text: "",
+      tools: [],
+      time: new Date().toISOString(),
+      thinking: "",
+      thinkingDone: false,
+      el: null,
+    };
+  }
+  return view.live;
+}
+
+function mergeServerSession(id, sess) {
+  const view = viewOf(id);
+  const fetched = parseTranscript(sess.messages || []);
+  if (view.messages.length === 0 || fetched.length >= view.messages.length) {
+    view.messages = fetched;
+  }
+  const liveUi = sess.live_ui || {};
+  if (!view.live && (liveUi.thinking_text || liveUi.assistant_text)) {
+    view.live = {
+      text: liveUi.assistant_text || "",
+      tools: [],
+      time: new Date().toISOString(),
+      thinking: liveUi.thinking_text || "",
+      thinkingDone: Boolean(liveUi.assistant_text),
+      el: null,
+    };
+    view.running = true;
+  }
+  if (sess.pending_approval) view.pendingApproval = sess.pending_approval;
+  if (sess.pending_question) view.pendingQuestion = sess.pending_question;
+}
+
+function paintSessionView(id, { jump = true } = {}) {
+  const view = viewOf(id);
+  renderLog(view.messages, { jump: false, parsed: true });
+  state.live = cloneLive(view.live);
+  if (state.live && (state.live.text || state.live.thinking || state.live.tools.length)) {
+    replaceLiveMessage();
+    setRunning(true);
+  } else {
+    setRunning(Boolean(view.running || view.live || view.pendingApproval || view.pendingQuestion));
+    if (view.running && !view.pendingApproval && !view.pendingQuestion) showTyping();
+  }
+  if (view.pendingApproval) showApprovalModal(view.pendingApproval);
+  else if (view.pendingQuestion) showQuestionModal(view.pendingQuestion);
+  else hidePromptModal();
+  if (jump) jumpToLatest();
+  else updateJumpButton();
+}
+
+function applyEventToView(sessionId, event) {
+  if (!sessionId) return;
+  const view = viewOf(sessionId);
+  const type = event.type;
+  if (type === "turn_start") {
+    view.running = true;
+    view.live = {
+      text: "",
+      tools: [],
+      time: new Date().toISOString(),
+      thinking: "",
+      thinkingDone: false,
+      el: null,
+    };
+    return;
+  }
+  if (type === "thinking_delta" && event.text) {
+    ensureViewLive(view);
+    view.live.thinking += event.text;
+    view.live.thinkingDone = false;
+    view.running = true;
+    return;
+  }
+  if (type === "message_delta" && event.text) {
+    ensureViewLive(view);
+    view.live.text += event.text;
+    if (view.live.thinking) view.live.thinkingDone = true;
+    view.running = true;
+    return;
+  }
+  if (type === "tool_call") {
+    const live = ensureViewLive(view);
+    if (live.thinking) live.thinkingDone = true;
+    live.tools.push({
+      _id: event.tool_call_id,
+      name: event.tool_name,
+      input: event.input || {},
+      status: "running",
+    });
+    view.running = true;
+    return;
+  }
+  if (type === "tool_result" && view.live) {
+    const tool = view.live.tools.find((item) => item._id === event.tool_call_id);
+    if (tool) {
+      tool.output = event.output;
+      tool.status = event.is_error ? "error" : "success";
+      if (event.is_error) tool.error = event.output;
+    }
+    return;
+  }
+  if (type === "turn_end") {
+    if (view.live && (view.live.text || view.live.thinking || view.live.tools.length)) {
+      view.messages.push({
+        role: "assistant",
+        content: view.live.text,
+        thinking: view.live.thinking,
+        thinkingDone: true,
+        created_at: view.live.time,
+        tool_calls: view.live.tools,
+      });
+    }
+    view.live = null;
+    view.running = false;
+    view.pendingApproval = null;
+    view.pendingQuestion = null;
+    return;
+  }
+  if (type === "error") {
+    view.running = false;
+    return;
+  }
+  if (type === "status_update") {
+    if (event.status === "idle") view.running = false;
+    else if (event.status) view.running = true;
+    return;
+  }
+  if (type === "compact_completed" && event.messages) {
+    view.messages = parseTranscript(event.messages);
+    view.live = null;
+    view.running = false;
+    return;
+  }
+  if (type === "approval_requested") {
+    view.pendingApproval = event.request || {};
+    return;
+  }
+  if (type === "question_asked") {
+    view.pendingQuestion = event.question || {};
+  }
 }
 
 function buildSessionTree() {
@@ -843,12 +1046,16 @@ async function refreshSessions() {
 }
 
 async function selectSession(id, { jump = true } = {}) {
+  hidePromptModal();
   state.sessionId = id;
-  state.live = null;
-  setRunning(false);
   if (jump) state.followBottom = true;
   renderSessions();
-  logEl.innerHTML = "";
+  const cached = viewOf(id);
+  if (cached.messages.length || cached.live || cached.running) {
+    paintSessionView(id, { jump });
+  } else {
+    logEl.innerHTML = "";
+  }
   const sess = await api(`/api/v1/sessions/${id}`);
   if (state.sessionId !== id) return;
   const current = state.sessions.find((s) => sessionIdOf(s) === id);
@@ -859,8 +1066,9 @@ async function selectSession(id, { jump = true } = {}) {
     }
     if (sess.title) current.title = sess.title;
   }
+  mergeServerSession(id, sess);
   applySessionMeta(sess);
-  renderLog(sess.messages || [], { jump });
+  paintSessionView(id, { jump });
 }
 
 async function ensureSession() {
@@ -1010,7 +1218,12 @@ async function undoCurrent(count) {
       method: "POST",
       body: JSON.stringify({ count: count || 1 }),
     });
-    if (result.messages) renderLog(result.messages, { jump: state.followBottom });
+    if (result.messages) {
+      viewOf(state.sessionId).messages = parseTranscript(result.messages);
+      viewOf(state.sessionId).live = null;
+      viewOf(state.sessionId).running = false;
+      renderLog(result.messages, { jump: state.followBottom });
+    }
     else await selectSession(state.sessionId, { jump: state.followBottom });
     appendMessage("system", `已撤销 ${result.undone || count || 1} 轮。`, new Date().toISOString());
   } catch (err) {
@@ -1161,6 +1374,106 @@ function showNotice(text, actions = []) {
     noticeActions.appendChild(btn);
   }
   noticeBar.classList.add("active");
+}
+
+function hidePromptModal() {
+  if (!promptModal) return;
+  promptModal.classList.remove("active");
+  if (promptActions) promptActions.innerHTML = "";
+  if (promptExtra) promptExtra.innerHTML = "";
+  if (promptBody) promptBody.innerHTML = "";
+}
+
+function setPromptActions(actions = []) {
+  promptActions.innerHTML = "";
+  for (const action of actions) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = action.danger ? "btn-danger" : action.primary ? "btn-primary" : "btn-secondary";
+    btn.textContent = action.label;
+    btn.onclick = action.onclick;
+    promptActions.appendChild(btn);
+  }
+}
+
+function showApprovalModal(request = {}) {
+  if (!promptModal) return;
+  const tool = request.tool_name || "tool";
+  const action = request.action ? ` · ${request.action}` : "";
+  promptTitle.textContent = "需要批准工具";
+  const input = request.tool_input_display ?? request.input;
+  const inputHtml = input
+    ? `<pre>${escapeHtml(typeof input === "string" ? input : JSON.stringify(input, null, 2))}</pre>`
+    : "";
+  promptBody.innerHTML = `<div class="prompt-kicker">${escapeHtml(tool)}${escapeHtml(action)}</div>
+    <div>Agent 想要调用该工具，请确认是否允许。</div>${inputHtml}`;
+  promptExtra.innerHTML = "";
+  const id = request.approval_id;
+  setPromptActions([
+    {
+      label: "拒绝",
+      danger: true,
+      onclick: async () => {
+        await api(`/api/v1/approvals/${id}`, { method: "POST", body: JSON.stringify({ decision: "rejected" }) });
+        const view = viewOf(state.sessionId);
+        view.pendingApproval = null;
+        hidePromptModal();
+      },
+    },
+    {
+      label: "批准",
+      primary: true,
+      onclick: async () => {
+        await api(`/api/v1/approvals/${id}`, { method: "POST", body: JSON.stringify({ decision: "approved" }) });
+        const view = viewOf(state.sessionId);
+        view.pendingApproval = null;
+        hidePromptModal();
+      },
+    },
+  ]);
+  promptModal.classList.add("active");
+}
+
+function showQuestionModal(question = {}) {
+  if (!promptModal) return;
+  const qid = question.question_id;
+  promptTitle.textContent = "需要你的回答";
+  promptBody.innerHTML = `<div>${escapeHtml(question.text || question.prompt || question.header || "请选择或输入回答")}</div>`;
+  const options = question.options || [];
+  const extra = [];
+  if (options.length) {
+    extra.push('<div class="option-list">');
+    for (const option of options) {
+      const inputType = question.allow_multiple ? "checkbox" : "radio";
+      extra.push(`<label><input type="${inputType}" name="prompt-option" value="${escapeHtml(option.id)}"> ${escapeHtml(option.label)}</label>`);
+    }
+    extra.push("</div>");
+  }
+  if (question.allow_free_text) {
+    extra.push('<textarea id="promptFreeText" placeholder="补充说明…"></textarea>');
+  }
+  promptExtra.innerHTML = extra.join("");
+  const submit = async (cancelled = false) => {
+    const selected = [...promptExtra.querySelectorAll("input[name='prompt-option']:checked")].map((el) => el.value);
+    const freeText = document.getElementById("promptFreeText")?.value?.trim() || "";
+    await api(`/api/v1/questions/${qid}`, {
+      method: "POST",
+      body: JSON.stringify({
+        selected_option_ids: selected,
+        free_text: freeText || null,
+        cancelled,
+      }),
+    });
+    const view = viewOf(state.sessionId);
+    view.pendingQuestion = null;
+    hidePromptModal();
+  };
+  const actions = [
+    { label: "跳过", onclick: () => submit(true) },
+    { label: "提交", primary: true, onclick: () => submit(false) },
+  ];
+  setPromptActions(actions);
+  promptModal.classList.add("active");
 }
 
 function adjustPromptHeight() {
@@ -1443,7 +1756,7 @@ if (timelineClose) timelineClose.onclick = () => document.body.classList.remove(
 document.addEventListener("click", (e) => {
   if (!document.body.classList.contains("timeline-open")) return;
   if (e.target.closest("#timelinePanel") || e.target.id === "timelineBtn") return;
-  if (e.target.closest("#confirmModal") || e.target.closest("#sessionMenu")) return;
+  if (e.target.closest("#confirmModal") || e.target.closest("#promptModal") || e.target.closest("#sessionMenu")) return;
   document.body.classList.remove("timeline-open");
 });
 
@@ -1718,8 +2031,17 @@ document.getElementById("composer").onsubmit = async (e) => {
   }
   const payloadText = [text, ...extraTexts].filter(Boolean).join("\n\n");
   const sid = await ensureSession();
+  const imagesForLog = images.map((img) => ({ media_type: img.media_type, data: img.data }));
+  viewOf(sid).messages.push({
+    role: "user",
+    content: payloadText || " ",
+    created_at: new Date().toISOString(),
+    images: imagesForLog,
+    tool_calls: [],
+  });
+  viewOf(sid).running = true;
   appendMessage("user", payloadText || " ", new Date().toISOString(), [], {
-    images: images.map((img) => ({ media_type: img.media_type, data: img.data })),
+    images: imagesForLog,
   });
   showTyping();
   setRunning(true);
@@ -1737,19 +2059,17 @@ document.getElementById("composer").onsubmit = async (e) => {
 
 function replaceLiveMessage() {
   if (!state.live) return;
-  const fresh = renderMessage("assistant", state.live.text, state.live.time, state.live.tools);
+  removeTyping();
+  const fresh = renderMessage("assistant", state.live.text, state.live.time, state.live.tools, {
+    thinking: state.live.thinking,
+    thinkingDone: Boolean(state.live.thinkingDone),
+  });
   if (state.live.el && state.live.el.parentNode) state.live.el.replaceWith(fresh);
   else logEl.appendChild(fresh);
   state.live.el = fresh;
+  const view = state.sessionId ? viewOf(state.sessionId) : null;
+  if (view) view.live = state.live;
   maybeScrollLog();
-}
-
-function ensureLive() {
-  if (state.live) return state.live;
-  removeTyping();
-  state.live = { text: "", tools: [], time: new Date().toISOString(), el: null };
-  replaceLiveMessage();
-  return state.live;
 }
 
 function handleAgentEvent(event) {
@@ -1761,14 +2081,17 @@ function handleAgentEvent(event) {
   }
   if (type === "session.deleted") {
     refreshSessions().catch(() => {});
+    if (event.session_id) delete state.views[event.session_id];
     if (event.session_id && event.session_id === state.sessionId) {
       state.sessionId = null;
+      state.live = null;
       applySessionMeta({});
       showWelcome();
       updateJumpButton();
     }
     return;
   }
+  if (sessionId) applyEventToView(sessionId, event);
   if (sessionId && state.sessionId && sessionId !== state.sessionId && type !== "btw_delta" && type !== "btw_end") {
     return;
   }
@@ -1778,40 +2101,15 @@ function handleAgentEvent(event) {
       if (welcome) welcome.remove();
       showTyping();
       setRunning(true);
-      state.live = null;
+      state.live = viewOf(sessionId).live;
     }
     return;
   }
-  if (type === "message_delta" && event.text) {
+  if (type === "thinking_delta" || type === "message_delta" || type === "tool_call" || type === "tool_result") {
     if (sessionId === state.sessionId) {
-      const live = ensureLive();
-      live.text += event.text;
-      replaceLiveMessage();
-    }
-    return;
-  }
-  if (type === "tool_call") {
-    if (sessionId === state.sessionId) {
-      const live = ensureLive();
-      live.tools.push({
-        _id: event.tool_call_id,
-        name: event.tool_name,
-        input: event.input || {},
-        status: "running",
-      });
-      replaceLiveMessage();
-    }
-    return;
-  }
-  if (type === "tool_result") {
-    if (sessionId === state.sessionId && state.live) {
-      const tool = state.live.tools.find((t) => t._id === event.tool_call_id);
-      if (tool) {
-        tool.output = event.output;
-        tool.status = event.is_error ? "error" : "success";
-        if (event.is_error) tool.error = event.output;
-        replaceLiveMessage();
-      }
+      state.live = viewOf(sessionId).live;
+      if (state.live) replaceLiveMessage();
+      setRunning(true);
     }
     return;
   }
@@ -1864,35 +2162,11 @@ function handleAgentEvent(event) {
     return;
   }
   if (type === "approval_requested") {
-    const request = event.request || {};
-    const id = request.approval_id;
-    showNotice(`需要批准工具：${request.tool_name || "tool"}`, [
-      {
-        label: "批准",
-        primary: true,
-        onclick: async () => {
-          await api(`/api/v1/approvals/${id}`, { method: "POST", body: JSON.stringify({ decision: "approved" }) });
-          hideNotice();
-        },
-      },
-      {
-        label: "拒绝",
-        onclick: async () => {
-          await api(`/api/v1/approvals/${id}`, { method: "POST", body: JSON.stringify({ decision: "rejected" }) });
-          hideNotice();
-        },
-      },
-    ]);
+    if (sessionId === state.sessionId) showApprovalModal(event.request || {});
     return;
   }
   if (type === "question_asked") {
-    const question = event.question || {};
-    showNotice(question.prompt || question.header || "需要你的回答", [
-      {
-        label: "关闭",
-        onclick: () => hideNotice(),
-      },
-    ]);
+    if (sessionId === state.sessionId) showQuestionModal(event.question || {});
     return;
   }
   if (type === "btw_delta" && event.text) {
@@ -2020,6 +2294,7 @@ document.addEventListener("click", (e) => {
 
 document.addEventListener("keydown", (e) => {
   if (e.key !== "Escape") return;
+  if (promptModal?.classList.contains("active")) return;
   if (confirmModal?.classList.contains("active")) {
     confirmCancel?.click();
     return;

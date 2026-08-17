@@ -2285,6 +2285,34 @@ impl kkagent_acp::AcpHost for AgentAcpHost {
     }
 }
 
+impl AgentHttpBackend {
+    async fn attach_session_live_fields(
+        &self,
+        session_id: &str,
+        mut body: serde_json::Value,
+    ) -> serde_json::Value {
+        let extra = self.state.resume_reconnect_fields(session_id).await;
+        if let Some(object) = body.as_object_mut() {
+            for (key, value) in extra {
+                object.insert(key, value);
+            }
+            if let Some(approval) = self
+                .state
+                .pending_tool_approval_for_session(session_id)
+                .await
+            {
+                if let Ok(value) = serde_json::to_value(approval) {
+                    object.insert("pending_approval".into(), value);
+                }
+            }
+            if let Some(question) = self.state.pending_question_for_session(session_id).await {
+                object.insert("pending_question".into(), question);
+            }
+        }
+        body
+    }
+}
+
 #[async_trait::async_trait]
 impl kkagent_rpc::HttpBackend for AgentHttpBackend {
     fn event_sender(&self) -> Option<tokio::sync::broadcast::Sender<serde_json::Value>> {
@@ -2449,30 +2477,19 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
     }
 
     async fn get_session(&self, id: &str) -> Option<serde_json::Value> {
-        {
+        let body = {
             let sessions = self.state.sessions.lock().await;
-            if let Some(s) = sessions.get(id) {
-                let meta = s.services.metadata.read();
-                let usage = s.usage.snapshot();
-                return Some(serde_json::json!({
-                    "session_id": s.id,
-                    "title": s.title,
-                    "workspace": s.working_dir.display().to_string(),
-                    "working_dir": s.working_dir.display().to_string(),
-                    "forked_from": meta.forked_from.clone(),
-                    "parent_id": meta.forked_from,
-                    "permission_mode": s.get_permission_mode().to_string(),
-                    "plan_mode": s.plan_mode,
-                    "model": s.get_model_alias(),
-                    "messages": s.messages,
-                    "usage": {
-                        "input_tokens": usage.input_tokens,
-                        "output_tokens": usage.output_tokens,
-                        "steps": usage.steps,
-                        "turns": usage.turns,
-                    },
-                }));
+            sessions.get(id).map(http_session_json)
+        };
+        let body = match body {
+            Some(body) => Some(body),
+            None => {
+                let views = self.state.in_flight_views.lock().await;
+                views.get(id).cloned()
             }
+        };
+        if let Some(body) = body {
+            return Some(self.attach_session_live_fields(id, body).await);
         }
         let (record, messages) = {
             let db = self.state.transcript.lock().await;
@@ -2484,19 +2501,25 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
             .get(id)
             .ok()
             .and_then(|summary| summary.forked_from);
-        Some(serde_json::json!({
-            "session_id": record.session_id,
-            "title": record.title,
-            "workspace": record.working_dir,
-            "working_dir": record.working_dir,
-            "updated_at": record.updated_at,
-            "forked_from": forked_from.clone(),
-            "parent_id": forked_from,
-            "permission_mode": "manual",
-            "plan_mode": false,
-            "model": record.model,
-            "messages": messages,
-        }))
+        Some(
+            self.attach_session_live_fields(
+                id,
+                serde_json::json!({
+                    "session_id": record.session_id,
+                    "title": record.title,
+                    "workspace": record.working_dir,
+                    "working_dir": record.working_dir,
+                    "updated_at": record.updated_at,
+                    "forked_from": forked_from.clone(),
+                    "parent_id": forked_from,
+                    "permission_mode": "manual",
+                    "plan_mode": false,
+                    "model": record.model,
+                    "messages": messages,
+                }),
+            )
+            .await,
+        )
     }
 
     async fn delete_session(&self, id: &str) -> Result<(), String> {
@@ -3362,18 +3385,17 @@ async fn run_http_turn(
                     }),
                 );
             }
-            if let Ok(value) = serde_json::to_value(event) {
+            event_state.note_agent_event_for_resume(&event).await;
+            if let Ok(value) = serde_json::to_value(&event) {
                 let _ = live_events.send(value);
             }
         }
     });
 
-    let mut session = {
-        let mut sessions = state.sessions.lock().await;
-        sessions
-            .remove(session_id)
-            .ok_or_else(|| anyhow::anyhow!("session gone"))?
-    };
+    let mut session = state
+        .checkout_session(session_id)
+        .await
+        .ok_or_else(|| anyhow::anyhow!("session gone"))?;
     session.begin_turn();
 
     let tools = build_turn_tool_registry(
@@ -3419,9 +3441,8 @@ async fn run_http_turn(
         // Keep reinsertion and the final request sync under the same lock. This
         // closes the gap where an RPC could otherwise update the shared flag
         // after the last sync but before the Session becomes visible again.
-        let mut sessions = state.sessions.lock().await;
         session.sync_requested_plan_mode()?;
-        sessions.insert(session_id.to_string(), session);
+        state.checkin_session(session_id, session).await;
     }
     result?;
     steer_result?;
@@ -3488,6 +3509,8 @@ struct ServerState {
     pending_tool_approvals: Mutex<HashMap<String, kkagent_protocol::ApprovalRequest>>,
     /// Last status / partial stream buffers so reattach can catch up without replaying wire.
     reconnect_ui: Mutex<HashMap<String, SessionReconnectUi>>,
+    /// Session JSON snapshot while a turn owns the Session (HTTP get_session).
+    in_flight_views: Mutex<HashMap<String, serde_json::Value>>,
     /// Live `/btw` panel state (survives TUI detach).
     pending_btw: Mutex<HashMap<String, PendingBtwUi>>,
     /// TUI next-turn prompt queue (synced from client so reattach keeps it).
@@ -3622,6 +3645,21 @@ impl ServerState {
             .write()
             .unwrap_or_else(|error| error.into_inner())
             .upsert_workspace_trust(trust)
+    }
+
+    async fn checkout_session(&self, session_id: &str) -> Option<Session> {
+        let mut sessions = self.sessions.lock().await;
+        let mut views = self.in_flight_views.lock().await;
+        let session = sessions.remove(session_id)?;
+        views.insert(session_id.to_string(), http_session_json(&session));
+        Some(session)
+    }
+
+    async fn checkin_session(&self, session_id: &str, session: Session) {
+        let mut sessions = self.sessions.lock().await;
+        let mut views = self.in_flight_views.lock().await;
+        views.remove(session_id);
+        sessions.insert(session_id.to_string(), session);
     }
 }
 
@@ -4685,6 +4723,7 @@ async fn build_server_state_with_shutdown(
         pending_questions: Mutex::new(HashMap::new()),
         pending_tool_approvals: Mutex::new(HashMap::new()),
         reconnect_ui: Mutex::new(HashMap::new()),
+        in_flight_views: Mutex::new(HashMap::new()),
         pending_btw: Mutex::new(HashMap::new()),
         prompt_queues: Mutex::new(HashMap::new()),
         pending_subagents: Mutex::new(HashMap::new()),
@@ -4758,6 +4797,29 @@ async fn run_server_handler_with_state<T: kkagent_rpc::transport::AsyncTransport
             },
         )
         .await;
+}
+
+fn http_session_json(session: &Session) -> serde_json::Value {
+    let meta = session.services.metadata.read();
+    let usage = session.usage.snapshot();
+    serde_json::json!({
+        "session_id": session.id,
+        "title": session.title,
+        "workspace": session.working_dir.display().to_string(),
+        "working_dir": session.working_dir.display().to_string(),
+        "forked_from": meta.forked_from.clone(),
+        "parent_id": meta.forked_from,
+        "permission_mode": session.get_permission_mode().to_string(),
+        "plan_mode": session.plan_mode,
+        "model": session.get_model_alias(),
+        "messages": session.messages,
+        "usage": {
+            "input_tokens": usage.input_tokens,
+            "output_tokens": usage.output_tokens,
+            "steps": usage.steps,
+            "turns": usage.turns,
+        },
+    })
 }
 
 fn persist_session_messages(db: &TranscriptDb, session: &mut Session) -> anyhow::Result<()> {
@@ -5138,21 +5200,18 @@ async fn spawn_session_agent_turn(
             .with_tool_result_store(state_clone.tool_result_store.clone()),
         );
 
-        let mut session = {
-            let mut sessions = state_clone.sessions.lock().await;
-            match sessions.remove(&sid) {
-                Some(s) => s,
-                None => {
-                    tracing::error!("Session {} disappeared before turn", sid);
-                    let dropped = steer_mailbox.close_and_drain().len();
-                    if dropped > 0 {
-                        tracing::error!(
-                            "Could not preserve {dropped} steer message(s): session {sid} disappeared"
-                        );
-                    }
-                    state_clone.active_btw_sessions.lock().await.remove(&sid);
-                    return;
+        let mut session = match state_clone.checkout_session(&sid).await {
+            Some(s) => s,
+            None => {
+                tracing::error!("Session {} disappeared before turn", sid);
+                let dropped = steer_mailbox.close_and_drain().len();
+                if dropped > 0 {
+                    tracing::error!(
+                        "Could not preserve {dropped} steer message(s): session {sid} disappeared"
+                    );
                 }
+                state_clone.active_btw_sessions.lock().await.remove(&sid);
+                return;
             }
         };
         if session.is_interrupted() {
@@ -5182,12 +5241,10 @@ async fn spawn_session_agent_turn(
                     tracing::error!("Failed to persist interrupted turn: {error}");
                 }
             }
-            let mut sessions = state_clone.sessions.lock().await;
             if let Err(error) = session.sync_requested_plan_mode() {
                 tracing::error!("Failed to persist requested plan mode: {error}");
             }
-            sessions.insert(sid.clone(), session);
-            drop(sessions);
+            state_clone.checkin_session(&sid, session).await;
             state_clone.active_btw_sessions.lock().await.remove(&sid);
             return;
         }
@@ -5216,7 +5273,6 @@ async fn spawn_session_agent_turn(
             }
         }
 
-        let mut sessions = state_clone.sessions.lock().await;
         if let Err(error) = session.sync_requested_plan_mode() {
             tracing::error!("Failed to persist requested plan mode: {error}");
             let _ = agent_event_tx.try_send(AgentEvent::Error {
@@ -5224,8 +5280,7 @@ async fn spawn_session_agent_turn(
                 message: format!("plan mode persistence failed: {error}"),
             });
         }
-        sessions.insert(sid.clone(), session);
-        drop(sessions);
+        state_clone.checkin_session(&sid, session).await;
         state_clone.active_btw_sessions.lock().await.remove(&sid);
     });
 
@@ -9184,6 +9239,7 @@ mod http_path_tests {
 #[cfg(test)]
 mod runtime_http_tests {
     use super::*;
+    use kkagent_rpc::HttpBackend;
 
     fn manager() -> HttpServerManager {
         HttpServerManager::new(
@@ -9544,5 +9600,86 @@ mod runtime_http_tests {
             .unwrap();
         assert_eq!(response.status(), reqwest::StatusCode::OK);
         manager.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn get_session_keeps_history_while_turn_owns_session() {
+        let state = test_server_state().await;
+        let workspace =
+            std::env::temp_dir().join(format!("kkagent-inflight-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let mut session = Session::new(
+            "inflight-session".into(),
+            workspace.clone(),
+            PermissionMode::Manual,
+            "model".into(),
+        );
+        session.add_user_message("keep the earlier turns".into());
+        session.messages.push(ChatMessage {
+            role: "assistant".into(),
+            content: vec![
+                ChatContent::Thinking {
+                    thinking: "old thought".into(),
+                },
+                ChatContent::Text {
+                    text: "done".into(),
+                },
+            ],
+        });
+        session.add_user_message("current prompt".into());
+        state
+            .sessions
+            .lock()
+            .await
+            .insert(session.id.clone(), session);
+
+        let taken = state
+            .checkout_session("inflight-session")
+            .await
+            .expect("session should check out");
+        assert!(state
+            .sessions
+            .lock()
+            .await
+            .get("inflight-session")
+            .is_none());
+
+        let backend = AgentHttpBackend {
+            state: state.clone(),
+        };
+        let got = backend
+            .get_session("inflight-session")
+            .await
+            .expect("in-flight session should remain readable");
+        let messages = got["messages"].as_array().expect("messages array");
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0]["content"][0]["text"], "keep the earlier turns");
+        assert_eq!(messages[1]["content"][0]["thinking"], "old thought");
+        assert_eq!(messages[2]["content"][0]["text"], "current prompt");
+
+        state.reconnect_ui.lock().await.insert(
+            "inflight-session".into(),
+            SessionReconnectUi {
+                status: Some(SessionStatus::Thinking),
+                thinking_text: "live thought".into(),
+                assistant_text: "partial answer".into(),
+                llm_retry: None,
+            },
+        );
+        let live = backend
+            .get_session("inflight-session")
+            .await
+            .expect("live ui should attach");
+        assert_eq!(live["live_ui"]["thinking_text"], "live thought");
+        assert_eq!(live["live_ui"]["assistant_text"], "partial answer");
+
+        state.checkin_session("inflight-session", taken).await;
+        assert!(state
+            .sessions
+            .lock()
+            .await
+            .get("inflight-session")
+            .is_some());
+        std::fs::remove_dir_all(workspace).unwrap();
     }
 }
