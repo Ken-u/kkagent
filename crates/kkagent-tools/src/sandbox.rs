@@ -1030,7 +1030,7 @@ mod tests {
         // sandboxed shell), so compare against the parent's soft limit.
         unsafe {
             let mut lim: libc::rlimit = std::mem::zeroed();
-            assert_eq!(libc::getrlimit(resource, &mut lim), 0);
+            assert_eq!(libc::getrlimit(resource as _, &mut lim), 0);
             if lim.rlim_cur == libc::RLIM_INFINITY {
                 "unlimited".to_string()
             } else {
