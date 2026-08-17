@@ -3503,6 +3503,12 @@ fn canonicalize_workspace_trust(
     Ok(trust)
 }
 
+/// How long `session.prompt` waits for a finishing turn to release its permit
+/// before reporting the session as busy. Turns publish idle events to clients
+/// before persistence completes, so queued prompts routinely arrive a few
+/// milliseconds early.
+const TURN_PERMIT_GRACE: Duration = Duration::from_secs(2);
+
 #[derive(Default)]
 struct SessionTurnLocks {
     entries: Mutex<HashMap<String, Arc<tokio::sync::Semaphore>>>,
@@ -3523,6 +3529,33 @@ impl SessionTurnLocks {
         semaphore
             .try_acquire_owned()
             .map_err(|_| format!("session {session_id} is busy with another turn"))
+    }
+
+    /// Like [`SessionTurnLocks::try_acquire`], but tolerates a short teardown
+    /// window: a finished turn publishes idle events to clients before it
+    /// finishes persisting state and releasing its permit, so a queued prompt
+    /// that arrives right after "idle" can still observe the session as busy.
+    /// Wait up to `grace` for the permit to free up instead of failing fast.
+    async fn try_acquire_with_grace(
+        &self,
+        session_id: &str,
+        grace: Duration,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit, String> {
+        if let Ok(permit) = self.try_acquire(session_id).await {
+            return Ok(permit);
+        }
+        let busy = format!("session {session_id} is busy with another turn");
+        let semaphore = {
+            let mut entries = self.entries.lock().await;
+            entries
+                .entry(session_id.to_string())
+                .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(1)))
+                .clone()
+        };
+        match tokio::time::timeout(grace, semaphore.acquire_owned()).await {
+            Ok(Ok(permit)) => Ok(permit),
+            _ => Err(busy),
+        }
     }
 
     async fn remove(&self, session_id: &str) {
@@ -6436,7 +6469,7 @@ async fn handle_rpc_call(
             }
             let turn_permit = state
                 .turn_locks
-                .try_acquire(&session_id)
+                .try_acquire_with_grace(&session_id, TURN_PERMIT_GRACE)
                 .await
                 .map_err(|message| (-32001, message))?;
 
@@ -8751,6 +8784,40 @@ mod http_path_tests {
         drop(first);
         assert!(locks.try_acquire("session-a").await.is_ok());
         drop(other);
+    }
+
+    #[tokio::test]
+    async fn grace_acquire_waits_for_permit_release() {
+        let locks = SessionTurnLocks::default();
+        let permit = locks.try_acquire("session-a").await.unwrap();
+        assert!(
+            locks
+                .try_acquire_with_grace("session-a", Duration::from_millis(10))
+                .await
+                .is_err(),
+            "grace acquire must still fail while another turn holds the permit"
+        );
+        drop(permit);
+        assert!(locks.try_acquire("session-a").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn grace_acquire_acquires_shortly_after_idle_event() {
+        let locks = SessionTurnLocks::default();
+        let permit = locks.try_acquire("session-a").await.unwrap();
+        // Simulate a turn that publishes idle, then releases its permit shortly
+        // after (teardown/persistence window).
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            drop(permit);
+        });
+        let acquired = locks
+            .try_acquire_with_grace("session-a", Duration::from_secs(2))
+            .await;
+        assert!(
+            acquired.is_ok(),
+            "grace acquire should succeed once the permit is released within the grace window"
+        );
     }
 
     #[test]
