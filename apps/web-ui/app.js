@@ -25,6 +25,7 @@ const state = {
   permissionMode: "manual",
   planMode: false,
   model: "",
+  models: [],
   usage: null,
 };
 
@@ -67,6 +68,7 @@ const confirmTitle = document.getElementById("confirmTitle");
 const confirmBody = document.getElementById("confirmBody");
 const confirmOk = document.getElementById("confirmOk");
 const confirmCancel = document.getElementById("confirmCancel");
+const modelSelect = document.getElementById("modelSelect");
 
 const ICONS = {
   copy: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>',
@@ -536,9 +538,10 @@ function applySessionMeta(sess = {}) {
     : "manual";
   if (planBtn) planBtn.classList.toggle("active", state.planMode);
   if (sessionMeta) {
-    const bits = [state.model, state.permissionMode, state.planMode ? "plan" : ""].filter(Boolean);
+    const bits = [state.permissionMode, state.planMode ? "plan" : ""].filter(Boolean);
     sessionMeta.textContent = bits.join(" · ");
   }
+  renderModelSelect();
 }
 
 function confirmAction({ title, body, ok = "确定", danger = false }) {
@@ -1073,13 +1076,48 @@ async function togglePlanMode(enabled) {
   }
 }
 
-async function setModel(model) {
+async function setModel(model, { quiet = false } = {}) {
+  const next = String(model || "").trim();
+  if (!next || next === state.model) {
+    renderModelSelect();
+    return;
+  }
   try {
-    await patchCurrentSession({ model });
-    appendMessage("system", `模型：${model}`, new Date().toISOString());
+    await patchCurrentSession({ model: next });
+    if (!quiet) appendMessage("system", `模型：${next}`, new Date().toISOString());
   } catch (err) {
+    renderModelSelect();
     appendMessage("system", `切换模型失败: ${err.message || err}`, new Date().toISOString());
   }
+}
+
+function modelId(item) {
+  return item.alias || item.id || item.model || "";
+}
+
+function renderModelSelect() {
+  if (!modelSelect) return;
+  const names = [];
+  for (const item of state.models) {
+    const id = typeof item === "string" ? item : modelId(item);
+    if (id && !names.includes(id)) names.push(id);
+  }
+  if (state.model && !names.includes(state.model)) names.unshift(state.model);
+  const current = modelSelect.value;
+  modelSelect.innerHTML = names.length
+    ? names.map((name) => `<option value="${escapeHtml(name)}">${escapeHtml(name)}</option>`).join("")
+    : '<option value="">模型</option>';
+  modelSelect.value = state.model || current || names[0] || "";
+}
+
+async function loadModels() {
+  try {
+    const body = await api("/api/v1/models");
+    state.models = body.models || [];
+  } catch {
+    state.models = [];
+  }
+  renderModelSelect();
 }
 
 function formatUsage(usage) {
@@ -1324,29 +1362,66 @@ async function openTimelinePanel() {
     const tl = await api(`/api/v1/sessions/${state.sessionId}/timeline`);
     const events = tl.events || [];
     if (!events.length) {
-      timelineList.innerHTML = '<div class="timeline-empty">当前会话没有事件记录。</div>';
+      timelineList.innerHTML = '<div class="timeline-empty">当前会话还没有可回看的改动。</div>';
       return;
     }
     for (const item of events) {
       const el = document.createElement("div");
-      el.className = "timeline-item " + (item.kind || item.role || "");
+      el.className = "timeline-item " + (item.kind || "");
       const changes = (item.changes || []).map((c) => {
+        const add = c.additions != null ? `<span class="change-add">+${c.additions}</span>` : "";
+        const del = c.deletions != null ? `<span class="change-del">−${c.deletions}</span>` : "";
         const diff = c.diff ? renderDiffHtml(String(c.diff)) : "";
-        return `<div class="timeline-change-row"><div class="timeline-file">${escapeHtml(String(c.path || c.type || ""))}</div>${diff}</div>`;
+        return `<div class="timeline-change-row"><div class="timeline-file">${escapeHtml(String(c.path || ""))} ${add} ${del}</div>${diff}</div>`;
       }).join("");
+      const stats = item.kind === "turn"
+        ? `<div class="timeline-stats"><span class="change-add">+${item.additions || 0}</span> <span class="change-del">−${item.deletions || 0}</span></div>`
+        : "";
+      const restore = item.can_restore
+        ? `<button type="button" class="btn-secondary timeline-restore" data-turn="${item.turn_index}">恢复到此状态</button>`
+        : (item.kind === "turn" ? `<div class="timeline-desc">当前状态</div>` : "");
       el.innerHTML = `
         <div class="timeline-dot"></div>
         <div class="timeline-body">
           <div class="timeline-time">${escapeHtml(formatTime(item.time))}</div>
           <div class="timeline-title">${escapeHtml(item.title || item.kind || "")}</div>
           ${item.desc ? `<div class="timeline-desc">${escapeHtml(item.desc)}</div>` : ""}
-          ${changes ? `<div class="timeline-changes">${changes}</div>` : ""}
+          ${stats}
+          ${changes ? `<div class="timeline-changes">${changes}</div>` : (item.kind === "turn" ? `<div class="timeline-desc">这一轮没有文件改动。</div>` : "")}
+          ${restore}
         </div>
       `;
+      const restoreBtn = el.querySelector(".timeline-restore");
+      if (restoreBtn) {
+        restoreBtn.onclick = () => restoreTurn(Number(restoreBtn.dataset.turn), item.title || `第 ${Number(restoreBtn.dataset.turn) + 1} 轮`);
+      }
       timelineList.appendChild(el);
     }
   } catch (err) {
     timelineList.innerHTML = `<div class="timeline-empty">${escapeHtml(String(err.message || err))}</div>`;
+  }
+}
+
+async function restoreTurn(turnIndex, label) {
+  if (!state.sessionId || !Number.isFinite(turnIndex)) return;
+  const ok = await confirmAction({
+    title: "恢复代码状态",
+    body: `撤销「${label}」之后的对话和文件改动，恢复到该轮结束时的代码？`,
+    ok: "恢复",
+    danger: true,
+  });
+  if (!ok) return;
+  try {
+    const result = await api(`/api/v1/sessions/${state.sessionId}/restore`, {
+      method: "POST",
+      body: JSON.stringify({ turn_index: turnIndex }),
+    });
+    if (result.messages) renderLog(result.messages, { jump: true });
+    else await selectSession(state.sessionId);
+    await openTimelinePanel();
+    appendMessage("system", result.restored === false ? "已经是这一轮的状态。" : `已恢复到 ${label} 结束时的代码。`, new Date().toISOString());
+  } catch (err) {
+    appendMessage("system", `恢复失败: ${err.message || err}`, new Date().toISOString());
   }
 }
 
@@ -1368,6 +1443,7 @@ if (timelineClose) timelineClose.onclick = () => document.body.classList.remove(
 document.addEventListener("click", (e) => {
   if (!document.body.classList.contains("timeline-open")) return;
   if (e.target.closest("#timelinePanel") || e.target.id === "timelineBtn") return;
+  if (e.target.closest("#confirmModal") || e.target.closest("#sessionMenu")) return;
   document.body.classList.remove("timeline-open");
 });
 
@@ -1679,7 +1755,7 @@ function ensureLive() {
 function handleAgentEvent(event) {
   const type = event.type;
   const sessionId = event.session_id;
-  if (type === "session.created" || type === "session.forked" || type === "session.updated" || type === "session.archived") {
+  if (type === "session.created" || type === "session.forked" || type === "session.updated" || type === "session.archived" || type === "session.restored") {
     refreshSessions().catch(() => {});
     return;
   }
@@ -1921,6 +1997,12 @@ if (permissionModeEl) {
     if (mode && mode !== state.permissionMode) await setPermissionMode(mode);
   };
 }
+if (modelSelect) {
+  modelSelect.onchange = async () => {
+    const model = modelSelect.value;
+    if (model) await setModel(model, { quiet: true });
+  };
+}
 if (planBtn) planBtn.onclick = () => togglePlanMode();
 if (stopBtn) stopBtn.onclick = () => interruptCurrent();
 
@@ -1962,6 +2044,7 @@ async function boot() {
     statusEl.textContent = `已连接 · ${meta.name || "kkagent"}`;
     statusEl.className = "online";
     connectWs();
+    await loadModels();
     await refreshSessions();
     const first = filterSessions()[0] || state.sessions[0];
     if (first) await selectSession(sessionIdOf(first));

@@ -686,22 +686,40 @@ impl Session {
             .ok_or_else(|| anyhow::anyhow!("Nothing to undo"))?;
 
         for change in cp.file_changes.into_iter().rev() {
-            match change.previous {
-                Some(bytes) => {
-                    if let Some(parent) = change.path.parent() {
-                        let _ = std::fs::create_dir_all(parent);
-                    }
-                    std::fs::write(&change.path, bytes)?;
-                }
-                None => {
-                    let _ = std::fs::remove_file(&change.path);
-                }
-            }
+            restore_file_change(&change)?;
         }
 
         self.messages.truncate(cp.message_start_index);
         self.persisted_message_count = self.persisted_message_count.min(self.messages.len());
         Ok(self.messages.len())
+    }
+
+    /// Restore workspace + transcript to the end of the user turn that starts
+    /// at `user_message_index`, undoing every later turn.
+    pub fn restore_keeping_user_message(
+        &mut self,
+        user_message_index: usize,
+    ) -> anyhow::Result<(usize, usize)> {
+        let mut undone = 0usize;
+        while self
+            .undo_stack
+            .last()
+            .is_some_and(|checkpoint| checkpoint.message_start_index > user_message_index)
+        {
+            self.undo_last_turn()?;
+            undone += 1;
+        }
+        let end = next_user_turn_start(&self.messages, user_message_index);
+        if self.messages.len() > end {
+            reverse_mutating_tools(&self.messages[end..], &self.working_dir);
+            self.messages.truncate(end);
+            self.persisted_message_count = self.persisted_message_count.min(self.messages.len());
+        }
+        Ok((undone, self.messages.len()))
+    }
+
+    pub fn user_turn_starts(&self) -> Vec<usize> {
+        user_turn_starts(&self.messages)
     }
 
     pub fn clear_interrupt(&self) {
@@ -1150,6 +1168,117 @@ impl Session {
             .push_str(&crate::workspace_registry::write_concurrent_reminder(
                 &peers,
             ));
+    }
+}
+
+fn restore_file_change(change: &FileChange) -> anyhow::Result<()> {
+    match &change.previous {
+        Some(bytes) => {
+            if let Some(parent) = change.path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            std::fs::write(&change.path, bytes)?;
+        }
+        None => {
+            let _ = std::fs::remove_file(&change.path);
+        }
+    }
+    Ok(())
+}
+
+fn is_user_prompt(message: &ChatMessage) -> bool {
+    if message.role != "user" {
+        return false;
+    }
+    message.content.iter().any(|part| match part {
+        ChatContent::Text { text } => {
+            !text.trim().is_empty() && !kkagent_protocol::is_harness_only_user_text(text)
+        }
+        ChatContent::Image { .. } => true,
+        _ => false,
+    })
+}
+
+fn user_turn_starts(messages: &[ChatMessage]) -> Vec<usize> {
+    messages
+        .iter()
+        .enumerate()
+        .filter(|(_, message)| is_user_prompt(message))
+        .map(|(index, _)| index)
+        .collect()
+}
+
+fn next_user_turn_start(messages: &[ChatMessage], user_message_index: usize) -> usize {
+    messages
+        .iter()
+        .enumerate()
+        .skip(user_message_index.saturating_add(1))
+        .find(|(_, message)| is_user_prompt(message))
+        .map(|(index, _)| index)
+        .unwrap_or(messages.len())
+}
+
+fn is_mutating_tool_name(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "edit"
+            | "write"
+            | "replace"
+            | "str_replace"
+            | "strreplace"
+            | "apply_patch"
+            | "applypatch"
+            | "write_file"
+            | "edit_file"
+    )
+}
+
+fn resolve_tool_path(working_dir: &std::path::Path, path: &str) -> PathBuf {
+    let candidate = PathBuf::from(path);
+    if candidate.is_absolute() {
+        candidate
+    } else {
+        working_dir.join(candidate)
+    }
+}
+
+fn reverse_mutating_tools(messages: &[ChatMessage], working_dir: &std::path::Path) {
+    for message in messages.iter().rev() {
+        for part in message.content.iter().rev() {
+            let ChatContent::ToolUse { name, input, .. } = part else {
+                continue;
+            };
+            if !is_mutating_tool_name(name) {
+                continue;
+            }
+            let Some(path) = input.get("path").and_then(|value| value.as_str()) else {
+                continue;
+            };
+            let path = resolve_tool_path(working_dir, path);
+            let lower = name.to_ascii_lowercase();
+            if lower == "write" || lower == "write_file" {
+                continue;
+            }
+            let Some(old) = input.get("old_string").and_then(|value| value.as_str()) else {
+                continue;
+            };
+            let Some(new) = input.get("new_string").and_then(|value| value.as_str()) else {
+                continue;
+            };
+            let Ok(content) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let replace_all = input
+                .get("replace_all")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false);
+            let restored = if replace_all {
+                content.replace(new, old)
+            } else {
+                content.replacen(new, old, 1)
+            };
+            let _ = std::fs::write(&path, restored);
+        }
     }
 }
 
@@ -1732,6 +1861,66 @@ mod working_directory_tests {
         session.trim_undo_stack();
         assert_eq!(session.undo_stack.len(), MAX_UNDO_TURNS);
         assert_eq!(session.undo_stack[0].message_start_index, 8);
+    }
+
+    #[test]
+    fn restore_keeping_user_message_rewinds_later_file_changes() {
+        let root = std::env::temp_dir().join(format!("kkagent-restore-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let file = root.join("note.txt");
+        std::fs::write(&file, "v0\n").unwrap();
+        let mut session = Session::new(
+            "restore-turn".into(),
+            root.clone(),
+            PermissionMode::Manual,
+            "test-model".into(),
+        );
+        session.messages.push(ChatMessage {
+            role: "user".into(),
+            content: vec![ChatContent::Text {
+                text: "first".into(),
+            }],
+        });
+        session.begin_turn();
+        session.current_turn_changes.push(FileChange {
+            path: file.clone(),
+            previous: Some(b"v0\n".to_vec()),
+        });
+        std::fs::write(&file, "v1\n").unwrap();
+        session.messages.push(ChatMessage {
+            role: "assistant".into(),
+            content: vec![ChatContent::Text {
+                text: "wrote v1".into(),
+            }],
+        });
+        session.commit_turn();
+
+        session.messages.push(ChatMessage {
+            role: "user".into(),
+            content: vec![ChatContent::Text {
+                text: "second".into(),
+            }],
+        });
+        session.begin_turn();
+        session.current_turn_changes.push(FileChange {
+            path: file.clone(),
+            previous: Some(b"v1\n".to_vec()),
+        });
+        std::fs::write(&file, "v2\n").unwrap();
+        session.messages.push(ChatMessage {
+            role: "assistant".into(),
+            content: vec![ChatContent::Text {
+                text: "wrote v2".into(),
+            }],
+        });
+        session.commit_turn();
+
+        let (undone, kept) = session.restore_keeping_user_message(0).unwrap();
+        assert_eq!(undone, 1);
+        assert_eq!(kept, 2);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "v1\n");
+        assert_eq!(session.messages.len(), 2);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

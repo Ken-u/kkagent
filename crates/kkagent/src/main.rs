@@ -2725,6 +2725,20 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
         .await
     }
 
+    async fn restore_session(
+        &self,
+        id: &str,
+        turn_index: usize,
+    ) -> Result<serde_json::Value, String> {
+        ensure_session_loaded(&self.state, id).await?;
+        http_rpc(
+            &self.state,
+            "session.restore",
+            serde_json::json!({"session_id": id, "turn_index": turn_index}),
+        )
+        .await
+    }
+
     async fn archive_session(&self, id: &str, archived: bool) -> Result<serde_json::Value, String> {
         http_rpc(
             &self.state,
@@ -7775,6 +7789,66 @@ async fn handle_rpc_call(
             Ok(serde_json::json!({
                 "ok": true,
                 "undone": undone,
+                "message_count": keep,
+                "messages": messages,
+            }))
+        }
+        "session.restore" => {
+            let session_id = params
+                .as_ref()
+                .and_then(|p| p.get("session_id"))
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| (-32602, "Missing session_id".into()))?
+                .to_string();
+            let turn_index = params
+                .as_ref()
+                .and_then(|p| p.get("turn_index"))
+                .and_then(|v| v.as_u64())
+                .ok_or_else(|| (-32602, "Missing turn_index".into()))?
+                as usize;
+            ensure_session_loaded(&state, &session_id)
+                .await
+                .map_err(|error| {
+                    if error == "session not found" {
+                        (-32602, format!("Session not found: {session_id}"))
+                    } else {
+                        (-32000, error)
+                    }
+                })?;
+            let (undone, keep, already_current) = {
+                let mut sessions = state.sessions.lock().await;
+                let session = sessions
+                    .get_mut(&session_id)
+                    .ok_or_else(|| (-32602, format!("Session not found: {}", session_id)))?;
+                let starts = session.user_turn_starts();
+                let keep_index = *starts
+                    .get(turn_index)
+                    .ok_or_else(|| (-32602, format!("Turn not found: {turn_index}")))?;
+                if turn_index + 1 >= starts.len() {
+                    (0usize, session.messages.len(), true)
+                } else {
+                    let (undone, keep) = session
+                        .restore_keeping_user_message(keep_index)
+                        .map_err(|error| (-32000, error.to_string()))?;
+                    (undone, keep, false)
+                }
+            };
+            {
+                let db = state.transcript.lock().await;
+                let _ = db.truncate_messages(&session_id, keep);
+            }
+            let messages = {
+                let sessions = state.sessions.lock().await;
+                sessions
+                    .get(&session_id)
+                    .map(|s| s.messages.clone())
+                    .unwrap_or_default()
+            };
+            Ok(serde_json::json!({
+                "ok": true,
+                "restored": !already_current,
+                "undone": undone,
+                "turn_index": turn_index,
                 "message_count": keep,
                 "messages": messages,
             }))

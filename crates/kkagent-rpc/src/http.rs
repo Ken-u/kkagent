@@ -507,6 +507,9 @@ pub trait HttpBackend: Send + Sync {
     async fn undo_session(&self, _id: &str, _count: usize) -> Result<Value, String> {
         Err("undo is not supported by this backend".into())
     }
+    async fn restore_session(&self, _id: &str, _turn_index: usize) -> Result<Value, String> {
+        Err("timeline restore is not supported by this backend".into())
+    }
     async fn archive_session(&self, _id: &str, _archived: bool) -> Result<Value, String> {
         Err("archive is not supported by this backend".into())
     }
@@ -678,6 +681,32 @@ impl HttpBackend for MemoryBackend {
             "ok": true,
             "undone": undone,
             "messages": sess.get("messages").cloned().unwrap_or_else(|| json!([])),
+        }))
+    }
+    async fn restore_session(&self, id: &str, turn_index: usize) -> Result<Value, String> {
+        let mut map = self.sessions.lock().await;
+        let sess = map.get_mut(id).ok_or_else(|| "not found".to_string())?;
+        let messages = sess
+            .get("messages")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let original_len = messages.len();
+        let starts = visible_user_indices(&messages);
+        let keep_start = *starts
+            .get(turn_index)
+            .ok_or_else(|| "turn not found".to_string())?;
+        let end = starts.get(turn_index + 1).copied().unwrap_or(original_len);
+        let kept: Vec<Value> = messages.into_iter().take(end).collect();
+        if let Some(object) = sess.as_object_mut() {
+            object.insert("messages".into(), json!(kept.clone()));
+        }
+        Ok(json!({
+            "ok": true,
+            "restored": original_len > end,
+            "turn_index": turn_index,
+            "message_index": keep_start,
+            "messages": kept,
         }))
     }
     async fn archive_session(&self, id: &str, archived: bool) -> Result<Value, String> {
@@ -1678,6 +1707,33 @@ async fn undo_session(
 }
 
 #[derive(Deserialize, Default)]
+struct RestoreBody {
+    #[serde(default)]
+    turn_index: Option<usize>,
+}
+
+async fn restore_session(
+    State(state): State<HttpState>,
+    Path(id): Path<String>,
+    Query(q): Query<AuthQuery>,
+    Json(body): Json<RestoreBody>,
+) -> Result<Json<Value>, StatusCode> {
+    check_auth(&state, &q)?;
+    let turn_index = body.turn_index.ok_or(StatusCode::BAD_REQUEST)?;
+    let result = state
+        .backend
+        .restore_session(&id, turn_index)
+        .await
+        .map_err(backend_error_status)?;
+    state.publish(json!({
+        "type": "session.restored",
+        "session_id": id,
+        "turn_index": turn_index,
+    }));
+    Ok(Json(result))
+}
+
+#[derive(Deserialize, Default)]
 struct ArchiveBody {
     #[serde(default)]
     archived: Option<bool>,
@@ -2309,6 +2365,140 @@ fn message_tool_calls(message: &Value) -> Vec<Value> {
     tools
 }
 
+fn is_visible_user_message(message: &Value) -> bool {
+    if message.get("role").and_then(Value::as_str) != Some("user") {
+        return false;
+    }
+    let preview = message_text(message);
+    if preview.trim().is_empty() {
+        let has_image = message
+            .get("content")
+            .and_then(Value::as_array)
+            .is_some_and(|parts| {
+                parts
+                    .iter()
+                    .any(|part| part.get("type").and_then(Value::as_str) == Some("image"))
+            });
+        return has_image;
+    }
+    !kkagent_protocol::is_harness_only_user_text(&preview)
+}
+
+fn visible_user_indices(messages: &[Value]) -> Vec<usize> {
+    messages
+        .iter()
+        .enumerate()
+        .filter(|(_, message)| is_visible_user_message(message))
+        .map(|(index, _)| index)
+        .collect()
+}
+
+fn is_mutating_tool_name(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "edit"
+            | "write"
+            | "replace"
+            | "str_replace"
+            | "strreplace"
+            | "apply_patch"
+            | "applypatch"
+            | "write_file"
+            | "edit_file"
+    )
+}
+
+fn unified_replace_diff(path: &str, old: &str, new: &str) -> String {
+    const MAX_LINES: usize = 80;
+    let old_lines: Vec<&str> = old.lines().collect();
+    let new_lines: Vec<&str> = new.lines().collect();
+    let old_shown = old_lines.len().min(MAX_LINES);
+    let new_shown = new_lines.len().min(MAX_LINES);
+    let mut out = format!("--- a/{path}\n+++ b/{path}\n@@ -1,{old_shown} +1,{new_shown} @@\n");
+    for line in old_lines.iter().take(MAX_LINES) {
+        out.push('-');
+        out.push_str(line);
+        out.push('\n');
+    }
+    if old_lines.len() > MAX_LINES {
+        out.push_str(&format!(
+            "... {} more deleted lines\n",
+            old_lines.len() - MAX_LINES
+        ));
+    }
+    for line in new_lines.iter().take(MAX_LINES) {
+        out.push('+');
+        out.push_str(line);
+        out.push('\n');
+    }
+    if new_lines.len() > MAX_LINES {
+        out.push_str(&format!(
+            "... {} more added lines\n",
+            new_lines.len() - MAX_LINES
+        ));
+    }
+    out
+}
+
+fn diff_stats(diff: &str) -> (usize, usize) {
+    let mut additions = 0usize;
+    let mut deletions = 0usize;
+    for line in diff.lines() {
+        if line.starts_with("+++") || line.starts_with("---") || line.starts_with("@@") {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix('+') {
+            if !rest.starts_with("++") {
+                additions += 1;
+            }
+        } else if let Some(rest) = line.strip_prefix('-') {
+            if !rest.starts_with("--") {
+                deletions += 1;
+            }
+        }
+    }
+    (additions, deletions)
+}
+
+fn file_diff_from_tool(tool: &Value) -> Option<Value> {
+    let name = tool.get("name").and_then(Value::as_str).unwrap_or_default();
+    if !is_mutating_tool_name(name) {
+        return None;
+    }
+    let input = tool.get("input").cloned().unwrap_or(Value::Null);
+    let path = input
+        .get("path")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())?;
+    let lower = name.to_ascii_lowercase();
+    let (action, diff) = if lower == "write" || lower == "write_file" {
+        let content = input
+            .get("content")
+            .or_else(|| input.get("contents"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        ("write", unified_replace_diff(path, "", content))
+    } else {
+        let old = input
+            .get("old_string")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let new = input
+            .get("new_string")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        ("edit", unified_replace_diff(path, old, new))
+    };
+    let (additions, deletions) = diff_stats(&diff);
+    Some(json!({
+        "type": action,
+        "path": path,
+        "additions": additions,
+        "deletions": deletions,
+        "diff": diff,
+    }))
+}
+
 fn build_session_timeline(id: &str, sess: &Value) -> Value {
     let messages = sess
         .get("messages")
@@ -2328,61 +2518,50 @@ fn build_session_timeline(id: &str, sess: &Value) -> Value {
             "time": sess.get("created_at"),
         }));
     }
-    for (index, message) in messages.iter().enumerate() {
-        let role = message.get("role").and_then(Value::as_str).unwrap_or("");
-        let time = message
+    let starts = visible_user_indices(&messages);
+    for (turn_index, &start) in starts.iter().enumerate() {
+        let end = starts
+            .get(turn_index + 1)
+            .copied()
+            .unwrap_or(messages.len());
+        let user = &messages[start];
+        let time = user
             .get("created_at")
             .cloned()
-            .or_else(|| message.get("at").cloned())
+            .or_else(|| user.get("at").cloned())
             .unwrap_or(Value::Null);
-        let tools = message_tool_calls(message);
-        if !tools.is_empty() {
-            let changes: Vec<Value> = tools
-                .iter()
-                .map(|tool| {
-                    let name = tool.get("name").and_then(Value::as_str).unwrap_or("tool");
-                    let input = tool.get("input").cloned().unwrap_or(Value::Null);
-                    let path = input
-                        .get("path")
-                        .or_else(|| input.get("command"))
-                        .or_else(|| input.get("pattern"))
-                        .cloned()
-                        .unwrap_or(Value::Null);
-                    json!({
-                        "type": name,
-                        "path": path,
-                        "diff": tool.get("diff"),
-                        "input": input,
-                    })
-                })
-                .collect();
-            events.push(json!({
-                "kind": "tool",
-                "index": index,
-                "time": time,
-                "title": "工具调用",
-                "desc": tools
-                    .iter()
-                    .filter_map(|tool| tool.get("name").and_then(Value::as_str))
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                "changes": changes,
-            }));
-            continue;
+        let preview: String = message_text(user).chars().take(200).collect();
+        let mut changes = Vec::new();
+        for message in &messages[start + 1..end] {
+            for tool in message_tool_calls(message) {
+                if let Some(change) = file_diff_from_tool(&tool) {
+                    changes.push(change);
+                }
+            }
         }
-        let preview: String = message_text(message).chars().take(200).collect();
-        if preview.trim().is_empty() {
-            continue;
-        }
-        let kind = if role == "user" { "user" } else { "assistant" };
+        let additions: usize = changes
+            .iter()
+            .filter_map(|change| change.get("additions").and_then(Value::as_u64))
+            .map(|value| value as usize)
+            .sum();
+        let deletions: usize = changes
+            .iter()
+            .filter_map(|change| change.get("deletions").and_then(Value::as_u64))
+            .map(|value| value as usize)
+            .sum();
         events.push(json!({
-            "kind": kind,
-            "index": index,
-            "role": role,
+            "kind": "turn",
+            "turn_index": turn_index,
+            "index": start,
+            "message_index": start,
             "time": time,
-            "title": if role == "user" { "用户" } else { "kkagent" },
+            "title": format!("第 {} 轮", turn_index + 1),
             "desc": preview,
             "preview": preview,
+            "changes": changes,
+            "additions": additions,
+            "deletions": deletions,
+            "can_restore": turn_index + 1 < starts.len(),
         }));
     }
     json!({
@@ -2584,6 +2763,7 @@ pub fn router(state: HttpState) -> Router {
         .route("/api/v1/sessions/{id}/interrupt", post(interrupt_session))
         .route("/api/v1/sessions/{id}/compact", post(compact_session))
         .route("/api/v1/sessions/{id}/undo", post(undo_session))
+        .route("/api/v1/sessions/{id}/restore", post(restore_session))
         .route("/api/v1/sessions/{id}/archive", post(archive_session))
         .route("/api/v1/sessions/{id}/export", get(export_session))
         .route("/api/v1/approvals/{id}", post(post_approval))
@@ -3190,7 +3370,7 @@ mod security_tests {
     }
 
     #[test]
-    fn timeline_extracts_user_turns_and_tool_calls() {
+    fn timeline_groups_file_diffs_by_user_turn() {
         let sess = json!({
             "forked_from": "parent",
             "created_at": "2026-08-17T10:00:00Z",
@@ -3200,17 +3380,74 @@ mod security_tests {
                     "role": "assistant",
                     "content": [
                         {"type": "text", "text": "looking"},
-                        {"type": "tool_use", "id": "t1", "name": "edit", "input": {"path": "app.js"}}
+                        {"type": "tool_use", "id": "t1", "name": "bash", "input": {"command": "ls"}},
+                        {"type": "tool_use", "id": "t2", "name": "Edit", "input": {
+                            "path": "app.js",
+                            "old_string": "foo",
+                            "new_string": "bar"
+                        }}
                     ],
                     "created_at": "2026-08-17T10:00:02Z"
+                },
+                {"role": "user", "text": "also tweak css", "created_at": "2026-08-17T10:00:03Z"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "tool_use", "id": "t3", "name": "Write", "input": {
+                            "path": "app.css",
+                            "content": "body { color: red; }"
+                        }}
+                    ]
                 }
             ]
         });
         let timeline = build_session_timeline("child", &sess);
         let events = timeline["events"].as_array().unwrap();
         assert_eq!(events[0]["kind"], "fork");
-        assert_eq!(events[1]["kind"], "user");
-        assert_eq!(events[2]["kind"], "tool");
-        assert_eq!(events[2]["changes"][0]["path"], "app.js");
+        assert_eq!(events[1]["kind"], "turn");
+        assert_eq!(events[1]["turn_index"], 0);
+        assert_eq!(events[1]["can_restore"], true);
+        assert_eq!(events[1]["changes"].as_array().unwrap().len(), 1);
+        assert_eq!(events[1]["changes"][0]["path"], "app.js");
+        assert!(events[1]["changes"][0]["diff"]
+            .as_str()
+            .unwrap()
+            .contains("-foo"));
+        assert!(events[1]["changes"][0]["diff"]
+            .as_str()
+            .unwrap()
+            .contains("+bar"));
+        assert_eq!(events[2]["kind"], "turn");
+        assert_eq!(events[2]["can_restore"], false);
+        assert_eq!(events[2]["changes"][0]["path"], "app.css");
+    }
+
+    #[tokio::test]
+    async fn restore_endpoint_truncates_later_turns() {
+        let backend = Arc::new(MemoryBackend::default());
+        let created = backend.create_session(None, None).await.unwrap();
+        let session_id = created["session_id"].as_str().unwrap().to_string();
+        backend
+            .post_message(&session_id, "first", &[], None)
+            .await
+            .unwrap();
+        backend
+            .post_message(&session_id, "second", &[], None)
+            .await
+            .unwrap();
+        let state = HttpState::with_backend(backend.clone(), None);
+        let Json(result) = restore_session(
+            State(state),
+            Path(session_id.clone()),
+            Query(AuthQuery::default()),
+            Json(RestoreBody {
+                turn_index: Some(0),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["restored"], true);
+        assert_eq!(result["messages"].as_array().unwrap().len(), 1);
     }
 }

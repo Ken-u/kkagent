@@ -174,7 +174,7 @@
     .session-bar-meta {
       font-size: 11px; color: var(--text-secondary);
       white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-      max-width: 220px;
+      max-width: 180px;
     }
     .session-bar-actions { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
     #permissionMode {
@@ -698,17 +698,18 @@
     .image-lightbox img { max-width: 90vw; max-height: 90vh; object-fit: contain; border-radius: 8px; }
 
     #timelinePanel {
-      position: fixed; top: 0; right: 0; bottom: 0; width: 380px;
+      position: fixed; top: 0; right: 0; bottom: 0; width: min(460px, 100vw);
       background: var(--surface); border-left: 1px solid var(--border);
       display: none; flex-direction: column;
       z-index: 25; box-shadow: var(--shadow);
     }
     body.timeline-open #timelinePanel { display: flex; }
     .timeline-header {
-      display: flex; align-items: center; justify-content: space-between;
+      display: flex; align-items: flex-start; justify-content: space-between; gap: 12px;
       padding: 14px 16px; border-bottom: 1px solid var(--border); flex-shrink: 0;
     }
     .timeline-header h2 { font-size: 14px; margin: 0; }
+    .timeline-header p { margin: 4px 0 0; font-size: 12px; color: var(--text-secondary); line-height: 1.4; }
     #timelineList { flex: 1; overflow: auto; padding: 16px; min-height: 0; }
     .timeline-empty { color: var(--text-secondary); font-size: 13px; text-align: center; margin-top: 40px; }
     .timeline-item { display: flex; gap: 12px; margin-bottom: 18px; }
@@ -716,13 +717,13 @@
       width: 9px; height: 9px; border-radius: 50%; margin-top: 5px; flex-shrink: 0;
       background: var(--text-secondary); box-shadow: 0 0 0 3px rgba(125,133,144,0.15);
     }
-    .timeline-item.user .timeline-dot { background: var(--accent); box-shadow: 0 0 0 3px rgba(47,129,247,0.15); }
-    .timeline-item.tool .timeline-dot { background: var(--warning); box-shadow: 0 0 0 3px rgba(210,153,34,0.15); }
+    .timeline-item.turn .timeline-dot { background: var(--accent); box-shadow: 0 0 0 3px rgba(47,129,247,0.15); }
     .timeline-item.fork .timeline-dot { background: var(--success); box-shadow: 0 0 0 3px rgba(63,185,80,0.15); }
     .timeline-body { flex: 1; min-width: 0; }
     .timeline-time { font-size: 11px; color: var(--text-secondary); margin-bottom: 2px; }
     .timeline-title { font-size: 13px; font-weight: 500; color: var(--text); margin-bottom: 4px; }
     .timeline-desc { font-size: 12px; color: var(--text-secondary); line-height: 1.45; }
+    .timeline-stats { font-size: 11px; font-family: var(--mono); margin: 6px 0; }
     .timeline-changes { margin-top: 8px; }
     .timeline-change {
       display: flex; align-items: center; gap: 6px;
@@ -735,6 +736,12 @@
     .timeline-file {
       font-family: var(--mono); font-size: 11px; color: var(--text);
       margin-bottom: 4px; padding-left: 2px;
+      display: flex; align-items: center; gap: 8px;
+    }
+    .timeline-restore {
+      margin-top: 10px;
+      font-size: 12px;
+      padding: 6px 10px;
     }
     .change-add { color: var(--success); }
     .change-del { color: var(--danger); }
@@ -756,7 +763,15 @@
     .diff-del { color: var(--danger); background: rgba(248,81,73,0.08); }
     .diff-hunk { color: var(--accent); }
     .diff-meta { color: var(--text-secondary); }
-    .composer-actions { display: flex; align-items: flex-end; gap: 8px; flex-shrink: 0; }
+    .composer-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+    #modelSelect {
+      max-width: 168px;
+      height: 34px;
+      background: var(--bg); color: var(--text);
+      border: 1px solid var(--border); border-radius: 8px;
+      font: inherit; font-size: 12px; padding: 0 8px; outline: none;
+    }
+    #modelSelect:hover, #modelSelect:focus { border-color: var(--border-strong); }
     .composer-action {
       width: 34px; height: 34px; border-radius: 8px;
       background: var(--bg); border: 1px solid var(--border); color: var(--text-secondary);
@@ -962,6 +977,9 @@
         </div>
         <div id="cmdPalette"></div>
         <div class="composer-actions">
+          <select id="modelSelect" title="切换模型" aria-label="切换模型">
+            <option value="">模型</option>
+          </select>
           <input type="file" id="fileInput" accept="image/*,.txt,.md,.rs,.js,.json,.toml,.yaml,.yml,.py" multiple />
           <button type="button" id="attachBtn" class="composer-action" title="添加附件 / 截图 (Ctrl+V)" aria-label="添加附件">
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"></path></svg>
@@ -977,7 +995,10 @@
 
   <aside id="timelinePanel">
     <div class="timeline-header">
-      <h2>Timeline</h2>
+      <div>
+        <h2>Timeline</h2>
+        <p>每一轮的文件 diff，可恢复到该轮结束时的代码。</p>
+      </div>
       <button id="timelineClose" class="btn-secondary">×</button>
     </div>
     <div id="timelineList"></div>
