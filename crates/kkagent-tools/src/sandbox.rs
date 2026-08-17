@@ -1039,6 +1039,32 @@ mod tests {
         }
     }
 
+    fn proc_self_soft_limit(limits: &str, name: &str) -> String {
+        for line in limits.lines() {
+            if let Some(rest) = line.strip_prefix(name) {
+                if let Some(soft) = rest.split_whitespace().next() {
+                    return soft.to_string();
+                }
+            }
+        }
+        panic!("missing {name} in /proc/self/limits:\n{limits}");
+    }
+
+    #[test]
+    fn proc_self_soft_limit_parses_kernel_table() {
+        let sample = "\
+Max cpu time              unlimited            unlimited            seconds
+Max address space         268435456            unlimited            bytes
+Max processes             127588               127588               processes
+";
+        assert_eq!(proc_self_soft_limit(sample, "Max cpu time"), "unlimited");
+        assert_eq!(
+            proc_self_soft_limit(sample, "Max address space"),
+            "268435456"
+        );
+        assert_eq!(proc_self_soft_limit(sample, "Max processes"), "127588");
+    }
+
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn disabled_mode_skips_all_resource_limits() {
@@ -1049,30 +1075,34 @@ mod tests {
             max_processes: 1,
             ..Default::default()
         };
+        // Read kernel rlimits via /proc so this does not depend on dash/bash
+        // `ulimit` option support (dash can exit non-zero for unlimited -v/-t).
         let mut command = policy
-            .command(
-                "/bin/sh",
-                "-c",
-                "ulimit -v; ulimit -t; ulimit -u",
-                Path::new("/tmp"),
-            )
+            .command("/bin/sh", "-c", "cat /proc/self/limits", Path::new("/tmp"))
             .unwrap();
         let output = command.output().await.unwrap();
-        assert!(output.status.success());
-        let limits: Vec<String> = String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .map(|l| l.trim().to_string())
-            .collect();
+        assert!(
+            output.status.success(),
+            "disabled sandbox command failed: status={:?} stdout={:?} stderr={:?}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        let limits = String::from_utf8_lossy(&output.stdout);
         // `disabled` must not clamp virtual memory, CPU time or process
         // count, even when non-zero values are configured: the child keeps
         // exactly the limits the parent inherited.
         assert_eq!(
-            limits,
-            vec![
-                current_soft_ulimit(libc::RLIMIT_AS as libc::c_int),
-                current_soft_ulimit(libc::RLIMIT_CPU as libc::c_int),
-                current_soft_ulimit(libc::RLIMIT_NPROC as libc::c_int),
-            ]
+            proc_self_soft_limit(&limits, "Max address space"),
+            current_soft_ulimit(libc::RLIMIT_AS as libc::c_int)
+        );
+        assert_eq!(
+            proc_self_soft_limit(&limits, "Max cpu time"),
+            current_soft_ulimit(libc::RLIMIT_CPU as libc::c_int)
+        );
+        assert_eq!(
+            proc_self_soft_limit(&limits, "Max processes"),
+            current_soft_ulimit(libc::RLIMIT_NPROC as libc::c_int)
         );
     }
 

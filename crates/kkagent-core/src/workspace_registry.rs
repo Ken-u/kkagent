@@ -90,9 +90,9 @@ pub fn process_alive(pid: u32) -> bool {
     }
     #[cfg(windows)]
     {
-        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
         use windows_sys::Win32::System::Threading::{
-            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, STILL_ACTIVE,
+            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
         };
         unsafe {
             let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
@@ -102,7 +102,7 @@ pub fn process_alive(pid: u32) -> bool {
             let mut code = 0u32;
             let ok = GetExitCodeProcess(handle, &mut code) != 0;
             CloseHandle(handle);
-            ok && code == STILL_ACTIVE
+            ok && code == STILL_ACTIVE as u32
         }
     }
     #[cfg(not(any(unix, windows)))]
