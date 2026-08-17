@@ -396,7 +396,7 @@ pub fn session_display_title(
             .collect::<Vec<_>>()
             .join(" ")
     };
-    let usable = |raw: &str| -> Option<String> {
+    let usable_prompt = |raw: &str| -> Option<String> {
         let trimmed = raw.trim();
         if trimmed.is_empty() {
             return None;
@@ -415,23 +415,35 @@ pub fn session_display_title(
         }
         Some(clean(pick))
     };
-    if is_custom_title {
-        if let Some(t) = title.and_then(usable) {
-            return t;
+    let short_id = |s: &str| -> String {
+        if s.len() > 8 {
+            s[..8].to_string()
+        } else {
+            s.to_string()
         }
+    };
+    // Custom titles are authoritative: once the user has run `/title`, always
+    // show that title (only whitespace-normalized). Never fall back to the
+    // first prompt, otherwise the bottom indicator appears to "change back"
+    // after the user has explicitly named the session.
+    if is_custom_title {
+        if let Some(t) = title {
+            let trimmed = t.trim();
+            if !trimmed.is_empty() {
+                return clean(trimmed);
+            }
+        }
+        // A custom-title session with an empty title is an inconsistent state;
+        // show the short id rather than a stale first prompt.
+        return short_id(session_id);
     }
-    if let Some(p) = first_prompt.and_then(usable) {
+    if let Some(p) = first_prompt.and_then(usable_prompt) {
         return p;
     }
-    if let Some(t) = title.and_then(usable) {
+    if let Some(t) = title.and_then(usable_prompt) {
         return t;
     }
-    let short = if session_id.len() > 8 {
-        &session_id[..8]
-    } else {
-        session_id
-    };
-    short.to_string()
+    short_id(session_id)
 }
 
 /// Collect the fork family for `current_id` (root + all descendants).
@@ -742,6 +754,28 @@ mod tests {
         assert_eq!(t, "My Name");
         let t = session_display_title(Some("auto"), false, Some("first prompt here"), "abcdef12");
         assert_eq!(t, "first prompt here");
+    }
+
+    #[test]
+    fn display_title_custom_is_authoritative() {
+        let rem = "<system-reminder>\nToday's date is 2026-08-10.\n</system-reminder>";
+        // A custom title is displayed as-is (only whitespace-normalized); we do
+        // not strip harness blocks, otherwise `/title` labels could be silently
+        // rewritten.
+        let t = session_display_title(Some(rem), true, Some("real question"), "abcdef12");
+        assert_eq!(
+            t,
+            "<system-reminder> Today's date is 2026-08-10. </system-reminder>"
+        );
+        // And it must win over a first_prompt.
+        let t = session_display_title(Some("My Name"), true, Some("first prompt here"), "abcdef12");
+        assert_eq!(t, "My Name");
+        // If the custom title is missing/empty, fall back to the short id — never
+        // to the first prompt, otherwise the indicator appears to revert.
+        let t = session_display_title(None, true, Some("first prompt here"), "abcdef123456");
+        assert_eq!(t, "abcdef12");
+        let t = session_display_title(Some("   "), true, Some("first prompt here"), "abcdef12");
+        assert_eq!(t, "abcdef12");
     }
 
     #[test]

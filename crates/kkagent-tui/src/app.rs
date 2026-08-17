@@ -7582,14 +7582,27 @@ impl TuiApp {
         }
 
         self.state.status_bar.session_id = Some(sid.clone());
-        // Use the first_prompt from the resume response for a stable tab title
-        // that matches the session picker label.
-        let tab_title = data
-            .get("first_prompt")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.trim().is_empty())
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| "session".to_string());
+        // Prefer a title we already know (e.g. from a previous `/title`), so
+        // resuming a session does not temporarily revert the indicator to the
+        // first prompt. The workspace-sessions refresh will reconcile with the
+        // authoritative server state.
+        let existing_title = self
+            .state
+            .tab_strip
+            .tabs
+            .iter()
+            .find(|t| t.id == sid)
+            .map(|t| t.title.clone())
+            .filter(|t| !t.is_empty() && t != "main" && t != "session");
+        let tab_title = if let Some(t) = existing_title {
+            t
+        } else {
+            data.get("first_prompt")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "session".to_string())
+        };
         self.state.tab_strip.ensure_active(&sid, &tab_title);
         self.state.list_picker = None;
         self.state.session_picker_preview = None;
@@ -7787,32 +7800,46 @@ impl TuiApp {
 
         // Ensure current session is in the graph even if list is momentarily stale.
         if !rows.iter().any(|(id, _)| id == &current_id) {
-            let first_prompt = self.state.messages.iter().find_map(|m| {
-                if m.role != MessageRole::User {
-                    return None;
-                }
-                if kkagent_protocol::is_harness_only_user_text(&m.content) {
-                    return None;
-                }
-                let visible = kkagent_protocol::visible_user_text(&m.content);
-                let pick = if visible.is_empty() {
-                    m.content.trim()
-                } else {
-                    visible.as_str()
-                };
-                let snippet: String = pick.chars().take(40).collect();
-                if snippet.trim().is_empty() {
-                    None
-                } else {
-                    Some(snippet)
-                }
-            });
-            let title = crate::chrome::session_display_title(
-                None,
-                false,
-                first_prompt.as_deref(),
-                &current_id,
-            );
+            // Prefer the tab title we already know (e.g. a `/title` set earlier),
+            // so a transient missing-row does not revert to the first prompt.
+            let existing_title = self
+                .state
+                .tab_strip
+                .tabs
+                .iter()
+                .find(|t| t.id == current_id)
+                .map(|t| t.title.clone())
+                .filter(|t| !t.is_empty() && t != "main" && t != "session");
+            let title = if let Some(t) = existing_title {
+                t
+            } else {
+                let first_prompt = self.state.messages.iter().find_map(|m| {
+                    if m.role != MessageRole::User {
+                        return None;
+                    }
+                    if kkagent_protocol::is_harness_only_user_text(&m.content) {
+                        return None;
+                    }
+                    let visible = kkagent_protocol::visible_user_text(&m.content);
+                    let pick = if visible.is_empty() {
+                        m.content.trim()
+                    } else {
+                        visible.as_str()
+                    };
+                    let snippet: String = pick.chars().take(40).collect();
+                    if snippet.trim().is_empty() {
+                        None
+                    } else {
+                        Some(snippet)
+                    }
+                });
+                crate::chrome::session_display_title(
+                    None,
+                    false,
+                    first_prompt.as_deref(),
+                    &current_id,
+                )
+            };
             rows.push((current_id.clone(), title));
         }
 
