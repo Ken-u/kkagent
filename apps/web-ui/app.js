@@ -24,10 +24,13 @@ const state = {
   running: false,
   title: "",
   permissionMode: "manual",
+  defaultPermissionMode: "manual",
   planMode: false,
   model: "",
   models: [],
   usage: null,
+  mdRaf: 0,
+  pendingMd: null,
 };
 
 const logEl = document.getElementById("log");
@@ -286,32 +289,132 @@ function highlightCode(code) {
 }
 
 function markdownToHtml(text) {
-  let html = escapeHtml(text || "").replace(/\n/g, "<br>");
-  html = html.replace(/```(\w*)\n?([\s\S]*?)```/g, (_, lang, code) => {
-    const clean = code.replace(/<br>/g, "\n").replace(/\n$/, "");
-    const escaped = escapeHtml(clean);
-    return `<div class="code-block"><button class="copy-btn code-copy" data-code="${escaped.replace(/"/g, "&quot;")}" title="复制代码">${ICONS.copy}</button><pre><code class="lang-${lang || "text"}">${highlightCode(escaped)}</code></pre></div>`;
+  if (!text) return "";
+  const lines = String(text).replace(/\r\n/g, "\n").split("\n");
+  const out = [];
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+    if (!line.trim()) {
+      i += 1;
+      continue;
+    }
+    if (/^```/.test(line)) {
+      const lang = line.replace(/^```/, "").trim();
+      const body = [];
+      i += 1;
+      while (i < lines.length && !/^```/.test(lines[i])) {
+        body.push(lines[i]);
+        i += 1;
+      }
+      if (i < lines.length) i += 1;
+      const code = body.join("\n");
+      const escaped = escapeHtml(code);
+      out.push(`<div class="code-block"><button class="copy-btn code-copy" data-code="${escaped.replace(/"/g, "&quot;")}" title="复制代码">${ICONS.copy}</button><pre><code class="lang-${escapeHtml(lang || "text")}">${highlightCode(escaped)}</code></pre></div>`);
+      continue;
+    }
+    if (isTableStart(lines, i)) {
+      const header = splitTableRow(lines[i]);
+      i += 2;
+      const rows = [];
+      while (i < lines.length && lines[i].includes("|") && !isTableSep(lines[i]) && lines[i].trim()) {
+        rows.push(splitTableRow(lines[i]));
+        i += 1;
+      }
+      const head = header.map((cell) => `<th>${inlineMd(cell)}</th>`).join("");
+      const body = rows.map((row) => `<tr>${row.map((cell) => `<td>${inlineMd(cell)}</td>`).join("")}</tr>`).join("");
+      out.push(`<div class="md-table-wrap"><table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>`);
+      continue;
+    }
+    const heading = line.match(/^(#{1,6})\s+(.+)$/);
+    if (heading) {
+      const level = heading[1].length;
+      out.push(`<h${level}>${inlineMd(heading[2])}</h${level}>`);
+      i += 1;
+      continue;
+    }
+    if (/^(\*\s*){3,}$|^(-{3,})$|^(_\s*){3,}$/.test(line.trim())) {
+      out.push("<hr>");
+      i += 1;
+      continue;
+    }
+    if (/^>\s?/.test(line)) {
+      const quote = [];
+      while (i < lines.length && /^>\s?/.test(lines[i])) {
+        quote.push(lines[i].replace(/^>\s?/, ""));
+        i += 1;
+      }
+      out.push(`<blockquote>${inlineMd(quote.join("\n")).replace(/\n/g, "<br>")}</blockquote>`);
+      continue;
+    }
+    if (/^\s*[-*+]\s+/.test(line)) {
+      const items = [];
+      while (i < lines.length && /^\s*[-*+]\s+/.test(lines[i])) {
+        items.push(`<li>${inlineMd(lines[i].replace(/^\s*[-*+]\s+/, ""))}</li>`);
+        i += 1;
+      }
+      out.push(`<ul>${items.join("")}</ul>`);
+      continue;
+    }
+    if (/^\s*\d+\.\s+/.test(line)) {
+      const items = [];
+      while (i < lines.length && /^\s*\d+\.\s+/.test(lines[i])) {
+        items.push(`<li>${inlineMd(lines[i].replace(/^\s*\d+\.\s+/, ""))}</li>`);
+        i += 1;
+      }
+      out.push(`<ol>${items.join("")}</ol>`);
+      continue;
+    }
+    const para = [];
+    while (i < lines.length && lines[i].trim() && !isBlockStart(lines, i)) {
+      para.push(lines[i]);
+      i += 1;
+    }
+    out.push(`<p>${inlineMd(para.join("\n")).replace(/\n/g, "<br>")}</p>`);
+  }
+  return out.join("");
+}
+
+function isTableSep(line) {
+  const cells = splitTableRow(line);
+  return cells.length > 0 && cells.every((cell) => /^:?-{3,}:?$/.test(cell.replace(/\s/g, "")));
+}
+
+function isTableStart(lines, i) {
+  return lines[i].includes("|") && i + 1 < lines.length && isTableSep(lines[i + 1]);
+}
+
+function splitTableRow(line) {
+  let value = line.trim();
+  if (value.startsWith("|")) value = value.slice(1);
+  if (value.endsWith("|")) value = value.slice(0, -1);
+  return value.split("|").map((cell) => cell.trim());
+}
+
+function isBlockStart(lines, i) {
+  const line = lines[i] || "";
+  return /^```/.test(line)
+    || isTableStart(lines, i)
+    || /^#{1,6}\s+/.test(line)
+    || /^(\*\s*){3,}$|^(-{3,})$|^(_\s*){3,}$/.test(line.trim())
+    || /^>\s?/.test(line)
+    || /^\s*[-*+]\s+/.test(line)
+    || /^\s*\d+\.\s+/.test(line);
+}
+
+function inlineMd(text) {
+  const codes = [];
+  let html = String(text || "").replace(/`([^`]+)`/g, (_, code) => {
+    codes.push(`<code>${escapeHtml(code)}</code>`);
+    return `\0C${codes.length - 1}\0`;
   });
-  html = html.replace(/`([^`]+)`/g, "<code>$1</code>");
-  html = html.replace(/^######\s+(.+)$/gm, "<h6>$1</h6>");
-  html = html.replace(/^#####\s+(.+)$/gm, "<h5>$1</h5>");
-  html = html.replace(/^####\s+(.+)$/gm, "<h4>$1</h4>");
-  html = html.replace(/^###\s+(.+)$/gm, "<h3>$1</h3>");
-  html = html.replace(/^##\s+(.+)$/gm, "<h2>$1</h2>");
-  html = html.replace(/^#\s+(.+)$/gm, "<h1>$1</h1>");
+  html = escapeHtml(html);
+  html = html.replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
   html = html.replace(/\*\*\*(.+?)\*\*\*/g, "<strong><em>$1</em></strong>");
   html = html.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
   html = html.replace(/\*(.+?)\*/g, "<em>$1</em>");
-  html = html.replace(/^>\s+(.+)$/gm, "<blockquote>$1</blockquote>");
-  html = html.replace(/^((?:\s*[-*]\s+.+?<br>)+)/gm, (_, list) => {
-    const items = list.replace(/\s*[-*]\s+(.+?)(?:<br>|$)/g, "<li>$1</li>");
-    return `<ul>${items}</ul>`;
-  });
-  html = html.replace(/^((?:\s*\d+\.\s+.+?<br>)+)/gm, (_, list) => {
-    const items = list.replace(/\s*\d+\.\s+(.+?)(?:<br>|$)/g, "<li>$1</li>");
-    return `<ol>${items}</ol>`;
-  });
-  html = html.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+  html = html.replace(/~~(.+?)~~/g, "<del>$1</del>");
+  html = html.replace(/\0C(\d+)\0/g, (_, index) => codes[Number(index)] || "");
   return html;
 }
 
@@ -412,6 +515,41 @@ function renderToolGroup(toolCalls) {
   `;
 }
 
+function bindCodeCopies(root) {
+  for (const btn of root.querySelectorAll(".code-copy")) {
+    btn.onclick = () => copyText(btn.dataset.code || "").then(() => flashBtn(btn, "copy"));
+  }
+}
+
+function bindToolToggles(div, toolCalls) {
+  for (const tc of div.querySelectorAll(".tool-call")) {
+    const row = tc.querySelector(".tool-row");
+    if (!row) continue;
+    const toggle = () => {
+      tc.classList.toggle("open");
+      row.setAttribute("aria-expanded", tc.classList.contains("open") ? "true" : "false");
+    };
+    row.onclick = toggle;
+    row.onkeydown = (e) => {
+      if (e.key === "Enter" || e.key === " ") {
+        e.preventDefault();
+        toggle();
+      }
+    };
+    const tool = toolCalls.find((item) => item._id === tc.dataset.id);
+    for (const btn of tc.querySelectorAll(".tool-copy")) {
+      btn.onclick = (e) => {
+        e.stopPropagation();
+        const kind = btn.dataset.kind;
+        const text = kind === "input"
+          ? JSON.stringify((tool && tool.input) || {}, null, 2)
+          : String((tool && tool.output) || "");
+        copyText(text).then(() => flashBtn(btn, "copy"));
+      };
+    }
+  }
+}
+
 function bindMessageActions(div, role, content, toolCalls, messageIndex) {
   const msgCopy = div.querySelector(".msg-copy");
   if (msgCopy) msgCopy.onclick = () => copyText(content).then(() => flashBtn(msgCopy, "copy"));
@@ -439,34 +577,8 @@ function bindMessageActions(div, role, content, toolCalls, messageIndex) {
   if (msgFork) msgFork.onclick = () => forkCurrentSession();
   const msgFollow = div.querySelector(".msg-follow");
   if (msgFollow) msgFollow.onclick = () => openBtwPanel(content);
-  for (const btn of div.querySelectorAll(".code-copy")) {
-    btn.onclick = () => copyText(btn.dataset.code || "").then(() => flashBtn(btn, "copy"));
-  }
-  for (const tc of div.querySelectorAll(".tool-call")) {
-    const row = tc.querySelector(".tool-row");
-    const toggle = () => {
-      tc.classList.toggle("open");
-      row.setAttribute("aria-expanded", tc.classList.contains("open") ? "true" : "false");
-    };
-    row.onclick = toggle;
-    row.onkeydown = (e) => {
-      if (e.key === "Enter" || e.key === " ") {
-        e.preventDefault();
-        toggle();
-      }
-    };
-    const tool = toolCalls.find((t) => t._id === tc.dataset.id);
-    for (const btn of tc.querySelectorAll(".tool-copy")) {
-      btn.onclick = (e) => {
-        e.stopPropagation();
-        const kind = btn.dataset.kind;
-        const text = kind === "input"
-          ? JSON.stringify((tool && tool.input) || {}, null, 2)
-          : String((tool && tool.output) || "");
-        copyText(text).then(() => flashBtn(btn, "copy"));
-      };
-    }
-  }
+  bindCodeCopies(div);
+  bindToolToggles(div, toolCalls);
 }
 
 function renderThinking(thinking, { done = true } = {}) {
@@ -481,7 +593,7 @@ function renderThinking(thinking, { done = true } = {}) {
 
 function renderMessage(role, content, timestamp, toolCalls = [], extras = {}) {
   const div = document.createElement("div");
-  div.className = `message ${role}`;
+  div.className = `message ${role}${extras.live ? " is-live" : ""}`;
   const roleLabel = role === "assistant" ? "kkagent" : role === "user" ? "你" : "system";
   const roleIcon = role === "assistant" ? "K" : role === "user" ? "U" : "!";
   const toolsHtml = renderToolGroup(toolCalls);
@@ -494,7 +606,10 @@ function renderMessage(role, content, timestamp, toolCalls = [], extras = {}) {
         <span class="timestamp">${formatTime(timestamp)}</span>
       </div>
       ${thinkingHtml}
-      <div class="bubble">${content ? markdownToHtml(content) : ""}${toolsHtml}</div>
+      <div class="bubble">
+        <div class="bubble-md">${content ? markdownToHtml(content) : ""}</div>
+        ${toolsHtml}
+      </div>
       <span class="msg-actions">
         <button class="copy-btn msg-copy" title="复制消息">${ICONS.copy}</button>
         ${role === "user" ? '<button class="copy-btn msg-edit" title="编辑消息">' + ICONS.edit + "</button>" : ""}
@@ -542,7 +657,8 @@ function setRunning(running) {
 
 function applySessionMeta(sess = {}) {
   state.title = sess.title || "";
-  state.permissionMode = String(sess.permission_mode || "manual").toLowerCase();
+  const mode = String(sess.permission_mode || state.defaultPermissionMode || "manual").toLowerCase();
+  state.permissionMode = ["manual", "yolo", "auto"].includes(mode) ? mode : state.defaultPermissionMode || "manual";
   state.planMode = Boolean(sess.plan_mode);
   state.model = sess.model || sess.model_alias || "";
   state.usage = sess.usage || null;
@@ -1078,6 +1194,7 @@ async function ensureSession() {
     body: JSON.stringify({ workspace: state.cwd || "." }),
   });
   state.sessionId = created.session_id;
+  applySessionMeta(created);
   await refreshSessions();
   return state.sessionId;
 }
@@ -1763,10 +1880,9 @@ document.addEventListener("click", (e) => {
 document.getElementById("newSession").onclick = async () => {
   try {
     state.sessionId = null;
+    state.live = null;
     const id = await ensureSession();
-    const created = state.sessions.find((s) => sessionIdOf(s) === id) || { session_id: id };
-    applySessionMeta(created);
-    showWelcome();
+    await selectSession(id);
     appendMessage("system", "新会话已创建。", new Date().toISOString());
   } catch (err) {
     appendMessage("system", `创建会话失败: ${err.message || err}`, new Date().toISOString());
@@ -2057,19 +2173,127 @@ document.getElementById("composer").onsubmit = async (e) => {
   }
 };
 
+function toolsKey(tools) {
+  return (tools || []).map((tool) => `${tool._id || ""}:${tool.status || ""}:${tool.output ? "1" : "0"}`).join("|");
+}
+
+function syncThinking(el, thinking, done) {
+  const header = el.querySelector(".message-header");
+  let details = el.querySelector("details.thinking");
+  if (!thinking) {
+    if (details) details.remove();
+    return;
+  }
+  if (!details) {
+    const wrap = document.createElement("div");
+    wrap.innerHTML = renderThinking(thinking, { done });
+    details = wrap.firstElementChild;
+    header.after(details);
+  }
+  const body = details.querySelector(".thinking-body");
+  if (body && body.textContent !== thinking) body.textContent = thinking;
+  const label = details.querySelector(".thinking-label");
+  if (label) label.textContent = done ? "思考过程" : "思考中…";
+  const wasLive = details.classList.contains("is-live");
+  details.classList.toggle("is-live", !done);
+  if (!done && !wasLive) details.setAttribute("open", "");
+  if (done && wasLive) details.removeAttribute("open");
+}
+
+function syncLiveMarkdown(el, text) {
+  const md = el.querySelector(".bubble-md");
+  if (!md) return;
+  if (md.dataset.text === text) return;
+  md.dataset.text = text;
+  md.innerHTML = text ? markdownToHtml(text) : "";
+  bindCodeCopies(md);
+}
+
+function scheduleLiveMarkdown(el, text) {
+  state.pendingMd = { el, text };
+  if (state.mdRaf) return;
+  state.mdRaf = requestAnimationFrame(() => {
+    state.mdRaf = 0;
+    const job = state.pendingMd;
+    state.pendingMd = null;
+    if (job && job.el && job.el.parentNode) syncLiveMarkdown(job.el, job.text);
+  });
+}
+
+function flushLiveMarkdown() {
+  if (state.mdRaf) {
+    cancelAnimationFrame(state.mdRaf);
+    state.mdRaf = 0;
+  }
+  const job = state.pendingMd;
+  state.pendingMd = null;
+  if (job && job.el && job.el.parentNode) syncLiveMarkdown(job.el, job.text);
+}
+
+function syncLiveTools(el, tools) {
+  const bubble = el.querySelector(".bubble");
+  if (!bubble) return;
+  const key = toolsKey(tools);
+  if (bubble.dataset.toolsKey === key) return;
+  const openIds = new Set([...bubble.querySelectorAll(".tool-call.open")].map((node) => node.dataset.id));
+  const group = bubble.querySelector(".tool-group");
+  const html = renderToolGroup(tools);
+  if (!html) {
+    if (group) group.remove();
+    bubble.dataset.toolsKey = key;
+    return;
+  }
+  const wrap = document.createElement("div");
+  wrap.innerHTML = html;
+  const next = wrap.firstElementChild;
+  if (group) group.replaceWith(next);
+  else bubble.appendChild(next);
+  for (const id of openIds) {
+    if (!id) continue;
+    const safe = window.CSS && CSS.escape ? CSS.escape(id) : id;
+    const tc = bubble.querySelector(`.tool-call[data-id="${safe}"]`);
+    if (tc) {
+      tc.classList.add("open");
+      const row = tc.querySelector(".tool-row");
+      if (row) row.setAttribute("aria-expanded", "true");
+    }
+  }
+  bindToolToggles(el, tools);
+  bubble.dataset.toolsKey = key;
+}
+
 function replaceLiveMessage() {
   if (!state.live) return;
   removeTyping();
-  const fresh = renderMessage("assistant", state.live.text, state.live.time, state.live.tools, {
-    thinking: state.live.thinking,
-    thinkingDone: Boolean(state.live.thinkingDone),
-  });
-  if (state.live.el && state.live.el.parentNode) state.live.el.replaceWith(fresh);
-  else logEl.appendChild(fresh);
-  state.live.el = fresh;
+  const live = state.live;
+  if (!live.el || !live.el.parentNode) {
+    live.el = renderMessage("assistant", live.text, live.time, live.tools, {
+      thinking: live.thinking,
+      thinkingDone: Boolean(live.thinkingDone),
+      live: true,
+    });
+    logEl.appendChild(live.el);
+  } else {
+    live.el.classList.add("is-live");
+    syncThinking(live.el, live.thinking, Boolean(live.thinkingDone));
+    scheduleLiveMarkdown(live.el, live.text);
+    syncLiveTools(live.el, live.tools);
+    const bubble = live.el.querySelector(".bubble");
+    if (bubble) bubble.style.display = (live.text || live.tools.length) ? "" : "none";
+  }
   const view = state.sessionId ? viewOf(state.sessionId) : null;
-  if (view) view.live = state.live;
+  if (view) view.live = live;
   maybeScrollLog();
+}
+
+function finalizeLiveMessage() {
+  if (!state.live) return;
+  flushLiveMarkdown();
+  if (state.live.el) {
+    state.live.el.classList.remove("is-live");
+    syncLiveMarkdown(state.live.el, state.live.text);
+    syncThinking(state.live.el, state.live.thinking, true);
+  }
 }
 
 function handleAgentEvent(event) {
@@ -2116,11 +2340,14 @@ function handleAgentEvent(event) {
   if (type === "turn_end") {
     setRunning(false);
     if (sessionId === state.sessionId) {
-      const sid = state.sessionId;
-      const jump = state.followBottom;
+      finalizeLiveMessage();
       state.live = null;
-      selectSession(sid, { jump }).catch(() => {});
       refreshSessions().catch(() => {});
+      api(`/api/v1/sessions/${sessionId}`).then((sess) => {
+        if (state.sessionId !== sessionId) return;
+        applySessionMeta(sess);
+        mergeServerSession(sessionId, sess);
+      }).catch(() => {});
     }
     return;
   }
@@ -2209,6 +2436,16 @@ function connectWs() {
 function openSidebar() { sidebar.classList.add("open"); }
 function closeSidebar() { sidebar.classList.remove("open"); }
 menuToggle.onclick = () => sidebar.classList.toggle("open");
+
+function setSidebarCollapsed(collapsed) {
+  document.body.classList.toggle("sidebar-collapsed", collapsed);
+  localStorage.setItem("kkagent_sidebar_collapsed", collapsed ? "1" : "0");
+}
+const sidebarCollapse = document.getElementById("sidebarCollapse");
+const sidebarExpand = document.getElementById("sidebarExpand");
+if (sidebarCollapse) sidebarCollapse.onclick = () => setSidebarCollapsed(true);
+if (sidebarExpand) sidebarExpand.onclick = () => setSidebarCollapsed(false);
+if (localStorage.getItem("kkagent_sidebar_collapsed") === "1") setSidebarCollapsed(true);
 document.addEventListener("click", (e) => {
   if (window.innerWidth > 760) return;
   if (!sidebar.contains(e.target) && e.target !== menuToggle && sidebar.classList.contains("open")) closeSidebar();
@@ -2319,6 +2556,10 @@ async function boot() {
     statusEl.textContent = `已连接 · ${meta.name || "kkagent"}`;
     statusEl.className = "online";
     connectWs();
+    const cfg = await api("/api/v1/config").catch(() => ({}));
+    const defaultMode = String(cfg.default_permission_mode || "manual").toLowerCase();
+    state.defaultPermissionMode = ["manual", "yolo", "auto"].includes(defaultMode) ? defaultMode : "manual";
+    if (!state.sessionId) state.permissionMode = state.defaultPermissionMode;
     await loadModels();
     await refreshSessions();
     const first = filterSessions()[0] || state.sessions[0];

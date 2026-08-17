@@ -811,7 +811,7 @@ impl HttpBackend for MemoryBackend {
         json!({"models": kkagent_llm_catalog_stub()})
     }
     async fn get_config(&self) -> Value {
-        json!({"config_dir": dirs_home(), "api": "v1"})
+        json!({"config_dir": dirs_home(), "api": "v1", "default_permission_mode": "manual"})
     }
     async fn approve(
         &self,

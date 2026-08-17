@@ -2400,7 +2400,7 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
         let mut session = Session::new(
             id.clone(),
             cwd.clone(),
-            PermissionMode::Manual,
+            permission_mode_from_config(&self.state.config()),
             model.clone(),
         );
         initialize_session_context(&self.state, &mut session).await;
@@ -2466,12 +2466,18 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
             .await
             .insert(id.clone(), session.steer_mailbox.clone());
         let session_dir = session.session_dir().display().to_string();
+        let permission_mode = session.get_permission_mode().to_string();
+        let plan_mode = session.plan_mode;
+        let model_alias = session.get_model_alias();
         self.state.sessions.lock().await.insert(id.clone(), session);
         Ok(serde_json::json!({
             "session_id": id,
             "workspace": cwd.display().to_string(),
             "title": title,
             "session_dir": session_dir,
+            "permission_mode": permission_mode,
+            "plan_mode": plan_mode,
+            "model": model_alias,
             "created_at": chrono::Utc::now().to_rfc3339(),
         }))
     }
@@ -2501,6 +2507,17 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
             .get(id)
             .ok()
             .and_then(|summary| summary.forked_from);
+        let permission_mode = {
+            let modes = self.state.permission_modes.lock().await;
+            modes
+                .get(id)
+                .map(|mode| {
+                    mode.lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .to_string()
+                })
+                .unwrap_or_else(|| self.state.config().effective_permission_mode().to_string())
+        };
         Some(
             self.attach_session_live_fields(
                 id,
@@ -2512,7 +2529,7 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
                     "updated_at": record.updated_at,
                     "forked_from": forked_from.clone(),
                     "parent_id": forked_from,
-                    "permission_mode": "manual",
+                    "permission_mode": permission_mode,
                     "plan_mode": false,
                     "model": record.model,
                     "messages": messages,
@@ -2859,6 +2876,7 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
     async fn get_config(&self) -> serde_json::Value {
         serde_json::json!({
             "default_model": self.state.config().default_model,
+            "default_permission_mode": self.state.config().effective_permission_mode(),
             "config_dir": kkagent_config::default_config_dir().display().to_string(),
             "mcp_servers": self.state.config().mcp_servers.len(),
             "sandbox": self.state.sandbox_snapshot().mode_name(),
@@ -4797,6 +4815,13 @@ async fn run_server_handler_with_state<T: kkagent_rpc::transport::AsyncTransport
             },
         )
         .await;
+}
+
+fn permission_mode_from_config(config: &AppConfig) -> PermissionMode {
+    config
+        .effective_permission_mode()
+        .parse()
+        .unwrap_or(PermissionMode::Manual)
 }
 
 fn http_session_json(session: &Session) -> serde_json::Value {
@@ -8829,6 +8854,18 @@ mod http_path_tests {
             .contains("agents/main/plans"));
     }
 
+    #[test]
+    fn http_new_session_uses_configured_permission_mode() {
+        let mut config = AppConfig::default();
+        assert_eq!(permission_mode_from_config(&config), PermissionMode::Manual);
+        config.default_permission_mode = Some("yolo".into());
+        assert_eq!(permission_mode_from_config(&config), PermissionMode::Yolo);
+        config.default_permission_mode = Some("auto".into());
+        assert_eq!(permission_mode_from_config(&config), PermissionMode::Auto);
+        config.default_permission_mode = Some("not-a-mode".into());
+        assert_eq!(permission_mode_from_config(&config), PermissionMode::Manual);
+    }
+
     fn text_message(role: &str, text: &str) -> ChatMessage {
         ChatMessage {
             role: role.into(),
@@ -9681,5 +9718,18 @@ mod runtime_http_tests {
             .get("inflight-session")
             .is_some());
         std::fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[tokio::test]
+    async fn http_config_exposes_default_permission_mode() {
+        let state = test_server_state().await;
+        let mut config = (*state.config()).clone();
+        config.default_permission_mode = Some("yolo".into());
+        state.replace_config(Arc::new(config));
+        let backend = AgentHttpBackend {
+            state: state.clone(),
+        };
+        let value = backend.get_config().await;
+        assert_eq!(value["default_permission_mode"], "yolo");
     }
 }
