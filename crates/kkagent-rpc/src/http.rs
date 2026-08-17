@@ -482,6 +482,34 @@ pub trait HttpBackend: Send + Sync {
     async fn delete_session(&self, _id: &str) -> Result<(), String> {
         Err("session deletion is not supported by this backend".into())
     }
+    async fn rename_session(&self, _id: &str, _title: &str) -> Result<Value, String> {
+        Err("session rename is not supported by this backend".into())
+    }
+    async fn interrupt_session(&self, _id: &str) -> Result<Value, String> {
+        Err("session interrupt is not supported by this backend".into())
+    }
+    async fn set_permission_mode(&self, _id: &str, _mode: &str) -> Result<Value, String> {
+        Err("permission mode is not supported by this backend".into())
+    }
+    async fn set_plan_mode(&self, _id: &str, _enabled: bool) -> Result<Value, String> {
+        Err("plan mode is not supported by this backend".into())
+    }
+    async fn set_model(&self, _id: &str, _model: &str) -> Result<Value, String> {
+        Err("set model is not supported by this backend".into())
+    }
+    async fn compact_session(
+        &self,
+        _id: &str,
+        _instruction: Option<&str>,
+    ) -> Result<Value, String> {
+        Err("compact is not supported by this backend".into())
+    }
+    async fn undo_session(&self, _id: &str, _count: usize) -> Result<Value, String> {
+        Err("undo is not supported by this backend".into())
+    }
+    async fn archive_session(&self, _id: &str, _archived: bool) -> Result<Value, String> {
+        Err("archive is not supported by this backend".into())
+    }
     async fn post_message(
         &self,
         id: &str,
@@ -560,6 +588,8 @@ impl HttpBackend for MemoryBackend {
             "session_id": id,
             "workspace": workspace.unwrap_or_else(|| ".".into()),
             "title": title,
+            "permission_mode": "manual",
+            "plan_mode": false,
             "created_at": chrono::Utc::now().to_rfc3339(),
             "messages": [],
         });
@@ -568,6 +598,93 @@ impl HttpBackend for MemoryBackend {
     }
     async fn get_session(&self, id: &str) -> Option<Value> {
         self.sessions.lock().await.get(id).cloned()
+    }
+    async fn delete_session(&self, id: &str) -> Result<(), String> {
+        self.sessions
+            .lock()
+            .await
+            .remove(id)
+            .map(|_| ())
+            .ok_or_else(|| "not found".into())
+    }
+    async fn rename_session(&self, id: &str, title: &str) -> Result<Value, String> {
+        memory_update_session(&self.sessions, id, |sess| {
+            sess.insert("title".into(), json!(title));
+        })
+        .await
+    }
+    async fn interrupt_session(&self, id: &str) -> Result<Value, String> {
+        let _ = self
+            .get_session(id)
+            .await
+            .ok_or_else(|| "not found".to_string())?;
+        Ok(json!({"ok": true, "session_id": id}))
+    }
+    async fn set_permission_mode(&self, id: &str, mode: &str) -> Result<Value, String> {
+        let mode = normalize_permission_mode(mode)?;
+        memory_update_session(&self.sessions, id, |sess| {
+            sess.insert("permission_mode".into(), json!(mode));
+        })
+        .await
+    }
+    async fn set_plan_mode(&self, id: &str, enabled: bool) -> Result<Value, String> {
+        memory_update_session(&self.sessions, id, |sess| {
+            sess.insert("plan_mode".into(), json!(enabled));
+        })
+        .await
+    }
+    async fn set_model(&self, id: &str, model: &str) -> Result<Value, String> {
+        if model.trim().is_empty() {
+            return Err("model must not be empty".into());
+        }
+        memory_update_session(&self.sessions, id, |sess| {
+            sess.insert("model".into(), json!(model));
+        })
+        .await
+    }
+    async fn compact_session(&self, id: &str, _instruction: Option<&str>) -> Result<Value, String> {
+        let _ = self
+            .get_session(id)
+            .await
+            .ok_or_else(|| "not found".to_string())?;
+        Ok(json!({"ok": true, "started": false, "session_id": id}))
+    }
+    async fn undo_session(&self, id: &str, count: usize) -> Result<Value, String> {
+        let mut map = self.sessions.lock().await;
+        let sess = map.get_mut(id).ok_or_else(|| "not found".to_string())?;
+        let mut remaining = count.max(1);
+        let mut undone = 0usize;
+        {
+            let Some(messages) = sess.get_mut("messages").and_then(Value::as_array_mut) else {
+                return Err("not found".into());
+            };
+            while remaining > 0 && !messages.is_empty() {
+                let is_user = messages
+                    .last()
+                    .and_then(|message| message.get("role"))
+                    .and_then(Value::as_str)
+                    == Some("user");
+                messages.pop();
+                if is_user {
+                    remaining -= 1;
+                    undone += 1;
+                }
+            }
+        }
+        if undone == 0 {
+            return Err("Nothing to undo".into());
+        }
+        Ok(json!({
+            "ok": true,
+            "undone": undone,
+            "messages": sess.get("messages").cloned().unwrap_or_else(|| json!([])),
+        }))
+    }
+    async fn archive_session(&self, id: &str, archived: bool) -> Result<Value, String> {
+        memory_update_session(&self.sessions, id, |sess| {
+            sess.insert("archived".into(), json!(archived));
+        })
+        .await
     }
     async fn post_message(
         &self,
@@ -692,6 +809,46 @@ impl HttpBackend for MemoryBackend {
             "cwd": std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_else(|_| ".".into()),
             "trusted": true,
         })
+    }
+}
+
+async fn memory_update_session<F>(
+    sessions: &Mutex<HashMap<String, Value>>,
+    id: &str,
+    update: F,
+) -> Result<Value, String>
+where
+    F: FnOnce(&mut serde_json::Map<String, Value>),
+{
+    let mut map = sessions.lock().await;
+    let sess = map.get_mut(id).ok_or_else(|| "not found".to_string())?;
+    if let Some(object) = sess.as_object_mut() {
+        update(object);
+    }
+    Ok(sess.clone())
+}
+
+fn normalize_permission_mode(mode: &str) -> Result<&'static str, String> {
+    match mode.trim().to_ascii_lowercase().as_str() {
+        "manual" => Ok("manual"),
+        "yolo" => Ok("yolo"),
+        "auto" => Ok("auto"),
+        other => Err(format!("invalid permission mode: {other}")),
+    }
+}
+
+fn backend_error_status(error: String) -> StatusCode {
+    let lower = error.to_ascii_lowercase();
+    if lower.contains("not found") {
+        StatusCode::NOT_FOUND
+    } else if lower.contains("cannot compact")
+        || lower.contains("wait for")
+        || lower.contains("turn is active")
+        || lower.contains("busy")
+    {
+        StatusCode::CONFLICT
+    } else {
+        StatusCode::BAD_REQUEST
     }
 }
 
@@ -1388,6 +1545,163 @@ async fn get_session(
         .await
         .map(Json)
         .ok_or(StatusCode::NOT_FOUND)
+}
+
+#[derive(Deserialize, Default)]
+struct PatchSessionBody {
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    permission_mode: Option<String>,
+    #[serde(default)]
+    plan_mode: Option<bool>,
+    #[serde(default)]
+    model: Option<String>,
+}
+
+async fn patch_session(
+    State(state): State<HttpState>,
+    Path(id): Path<String>,
+    Query(q): Query<AuthQuery>,
+    Json(body): Json<PatchSessionBody>,
+) -> Result<Json<Value>, StatusCode> {
+    check_auth(&state, &q)?;
+    if body.title.is_none()
+        && body.permission_mode.is_none()
+        && body.plan_mode.is_none()
+        && body.model.is_none()
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    if let Some(title) = body.title.as_deref() {
+        if title.trim().is_empty() {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        state
+            .backend
+            .rename_session(&id, title.trim())
+            .await
+            .map_err(backend_error_status)?;
+    }
+    if let Some(mode) = body.permission_mode.as_deref() {
+        state
+            .backend
+            .set_permission_mode(&id, mode)
+            .await
+            .map_err(backend_error_status)?;
+    }
+    if let Some(enabled) = body.plan_mode {
+        state
+            .backend
+            .set_plan_mode(&id, enabled)
+            .await
+            .map_err(backend_error_status)?;
+    }
+    if let Some(model) = body.model.as_deref() {
+        state
+            .backend
+            .set_model(&id, model)
+            .await
+            .map_err(backend_error_status)?;
+    }
+    let sess = state
+        .backend
+        .get_session(&id)
+        .await
+        .ok_or(StatusCode::NOT_FOUND)?;
+    state.publish(json!({
+        "type": "session.updated",
+        "session_id": id,
+        "title": sess.get("title").cloned().unwrap_or(Value::Null),
+        "permission_mode": sess.get("permission_mode").cloned().unwrap_or(Value::Null),
+        "plan_mode": sess.get("plan_mode").cloned().unwrap_or(Value::Null),
+        "model": sess.get("model").cloned().unwrap_or(Value::Null),
+    }));
+    Ok(Json(sess))
+}
+
+async fn interrupt_session(
+    State(state): State<HttpState>,
+    Path(id): Path<String>,
+    Query(q): Query<AuthQuery>,
+) -> Result<Json<Value>, StatusCode> {
+    check_auth(&state, &q)?;
+    let result = state
+        .backend
+        .interrupt_session(&id)
+        .await
+        .map_err(backend_error_status)?;
+    state.publish(json!({"type": "session.interrupted", "session_id": id}));
+    Ok(Json(result))
+}
+
+#[derive(Deserialize, Default)]
+struct CompactBody {
+    #[serde(default)]
+    instruction: Option<String>,
+}
+
+async fn compact_session(
+    State(state): State<HttpState>,
+    Path(id): Path<String>,
+    Query(q): Query<AuthQuery>,
+    Json(body): Json<CompactBody>,
+) -> Result<Json<Value>, StatusCode> {
+    check_auth(&state, &q)?;
+    let result = state
+        .backend
+        .compact_session(&id, body.instruction.as_deref())
+        .await
+        .map_err(backend_error_status)?;
+    Ok(Json(result))
+}
+
+#[derive(Deserialize, Default)]
+struct UndoBody {
+    #[serde(default)]
+    count: Option<usize>,
+}
+
+async fn undo_session(
+    State(state): State<HttpState>,
+    Path(id): Path<String>,
+    Query(q): Query<AuthQuery>,
+    Json(body): Json<UndoBody>,
+) -> Result<Json<Value>, StatusCode> {
+    check_auth(&state, &q)?;
+    let result = state
+        .backend
+        .undo_session(&id, body.count.unwrap_or(1))
+        .await
+        .map_err(backend_error_status)?;
+    Ok(Json(result))
+}
+
+#[derive(Deserialize, Default)]
+struct ArchiveBody {
+    #[serde(default)]
+    archived: Option<bool>,
+}
+
+async fn archive_session(
+    State(state): State<HttpState>,
+    Path(id): Path<String>,
+    Query(q): Query<AuthQuery>,
+    Json(body): Json<ArchiveBody>,
+) -> Result<Json<Value>, StatusCode> {
+    check_auth(&state, &q)?;
+    let archived = body.archived.unwrap_or(true);
+    let result = state
+        .backend
+        .archive_session(&id, archived)
+        .await
+        .map_err(backend_error_status)?;
+    state.publish(json!({
+        "type": "session.archived",
+        "session_id": id,
+        "archived": archived,
+    }));
+    Ok(Json(result))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2261,12 +2575,16 @@ pub fn router(state: HttpState) -> Router {
         .route("/api/v1/sessions", get(list_sessions).post(create_session))
         .route(
             "/api/v1/sessions/{id}",
-            get(get_session).delete(delete_session),
+            get(get_session).patch(patch_session).delete(delete_session),
         )
         .route("/api/v1/sessions/{id}/messages", post(post_message))
         .route("/api/v1/sessions/{id}/fork", post(fork_session))
         .route("/api/v1/sessions/{id}/btw", post(start_btw))
         .route("/api/v1/sessions/{id}/btw/cancel", post(cancel_btw))
+        .route("/api/v1/sessions/{id}/interrupt", post(interrupt_session))
+        .route("/api/v1/sessions/{id}/compact", post(compact_session))
+        .route("/api/v1/sessions/{id}/undo", post(undo_session))
+        .route("/api/v1/sessions/{id}/archive", post(archive_session))
         .route("/api/v1/sessions/{id}/export", get(export_session))
         .route("/api/v1/approvals/{id}", post(post_approval))
         .route("/api/v1/tools", get(tools))
@@ -2764,6 +3082,86 @@ mod security_tests {
         assert_eq!(forked["forked_from"], session_id);
         assert_eq!(forked["title"], "branched");
         assert_eq!(forked["messages"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn rename_endpoint_updates_title() {
+        let backend = Arc::new(MemoryBackend::default());
+        let created = backend
+            .create_session(None, Some("old".into()))
+            .await
+            .unwrap();
+        let session_id = created["session_id"].as_str().unwrap().to_string();
+        let state = HttpState::with_backend(backend.clone(), None);
+        let Json(updated) = patch_session(
+            State(state),
+            Path(session_id.clone()),
+            Query(AuthQuery::default()),
+            Json(PatchSessionBody {
+                title: Some("new title".into()),
+                ..PatchSessionBody::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(updated["title"], "new title");
+        assert_eq!(
+            backend.get_session(&session_id).await.unwrap()["title"],
+            "new title"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_endpoint_removes_session() {
+        let backend = Arc::new(MemoryBackend::default());
+        let created = backend.create_session(None, None).await.unwrap();
+        let session_id = created["session_id"].as_str().unwrap().to_string();
+        let state = HttpState::with_backend(backend.clone(), None);
+        let Json(result) = delete_session(
+            State(state),
+            Path(session_id.clone()),
+            Query(AuthQuery::default()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result["ok"], true);
+        assert!(backend.get_session(&session_id).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn permission_and_undo_endpoints_update_memory_session() {
+        let backend = Arc::new(MemoryBackend::default());
+        let created = backend.create_session(None, None).await.unwrap();
+        let session_id = created["session_id"].as_str().unwrap().to_string();
+        backend
+            .post_message(&session_id, "hello", &[], None)
+            .await
+            .unwrap();
+        let state = HttpState::with_backend(backend.clone(), None);
+        let Json(patched) = patch_session(
+            State(state.clone()),
+            Path(session_id.clone()),
+            Query(AuthQuery::default()),
+            Json(PatchSessionBody {
+                permission_mode: Some("yolo".into()),
+                plan_mode: Some(true),
+                ..PatchSessionBody::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(patched["permission_mode"], "yolo");
+        assert_eq!(patched["plan_mode"], true);
+        let Json(undone) = undo_session(
+            State(state),
+            Path(session_id.clone()),
+            Query(AuthQuery::default()),
+            Json(UndoBody { count: Some(1) }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(undone["undone"], 1);
+        assert!(undone["messages"].as_array().unwrap().is_empty());
     }
 
     #[tokio::test]

@@ -127,12 +127,109 @@
     }
     .session:hover { background: var(--surface-hover); color: var(--text); }
     .session.active { background: var(--elevated); color: var(--text); box-shadow: inset 0 0 0 1px var(--border-strong); }
-    .session-title { font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; display: flex; align-items: center; gap: 4px; }
+    .session-title { font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; display: flex; align-items: center; gap: 4px; min-width: 0; flex: 1; }
     .session-path { font-size: 10px; color: var(--text-secondary); padding-left: 18px; margin-top: -2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .session-meta { font-size: 11px; color: var(--text-secondary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; padding-left: 18px; }
+    .session-row { display: flex; align-items: center; gap: 6px; min-width: 0; }
+    .session-item-actions {
+      display: none; align-items: center; gap: 2px; flex-shrink: 0; margin-left: auto;
+    }
+    .session:hover .session-item-actions, .session.active .session-item-actions { display: flex; }
+    .session-icon-btn {
+      width: 22px; height: 22px; padding: 0; border-radius: 6px;
+      background: transparent; color: var(--text-secondary);
+      display: grid; place-items: center;
+    }
+    .session-icon-btn:hover { background: var(--elevated); color: var(--text); }
+    .session-icon-btn.danger:hover { color: var(--danger); background: rgba(248,81,73,0.12); }
+    .session-rename-input {
+      flex: 1; min-width: 0;
+      background: var(--bg); color: var(--text);
+      border: 1px solid var(--accent); border-radius: 6px;
+      padding: 2px 6px; font: inherit; font-size: 13px; outline: none;
+    }
 
     main { display: flex; flex-direction: column; min-width: 0; background: var(--bg); height: 100vh; overflow: hidden; }
-    #log { flex: 1; overflow: auto; padding: 24px 24px 8px; scroll-behavior: smooth; min-height: 0; }
+    #sessionBar {
+      display: none;
+      align-items: center; gap: 10px;
+      padding: 10px 18px;
+      border-bottom: 1px solid var(--border);
+      background: var(--surface);
+      flex-shrink: 0;
+      position: relative;
+      min-height: 48px;
+    }
+    #sessionBar.active { display: flex; }
+    .session-bar-title { flex: 1; min-width: 0; }
+    #sessionTitle {
+      width: 100%;
+      background: transparent; color: var(--text);
+      border: 1px solid transparent; border-radius: 8px;
+      padding: 6px 8px; font: inherit; font-weight: 600; font-size: 14px;
+      outline: none;
+    }
+    #sessionTitle:hover { border-color: var(--border); }
+    #sessionTitle:focus { border-color: var(--accent); background: var(--bg); }
+    .session-bar-meta {
+      font-size: 11px; color: var(--text-secondary);
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+      max-width: 220px;
+    }
+    .session-bar-actions { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
+    #permissionMode {
+      background: var(--bg); color: var(--text);
+      border: 1px solid var(--border); border-radius: 8px;
+      padding: 5px 8px; font: inherit; font-size: 12px; outline: none;
+    }
+    #planBtn.active {
+      background: rgba(47,129,247,0.16);
+      border-color: var(--accent);
+      color: var(--text);
+    }
+    #stopBtn {
+      background: rgba(248,81,73,0.14);
+      color: var(--danger);
+      border: 1px solid rgba(248,81,73,0.35);
+      font-size: 12px;
+      padding: 6px 10px;
+    }
+    #stopBtn:hover { background: rgba(248,81,73,0.22); }
+    #sessionMenu {
+      display: none;
+      position: absolute; top: calc(100% - 6px); right: 12px;
+      background: var(--elevated);
+      border: 1px solid var(--border-strong);
+      border-radius: var(--radius-sm);
+      box-shadow: var(--shadow);
+      min-width: 160px;
+      z-index: 20;
+      overflow: hidden;
+    }
+    #sessionMenu.active { display: flex; flex-direction: column; padding: 4px; }
+    #sessionMenu button {
+      background: transparent; color: var(--text);
+      text-align: left; border-radius: 6px; font-size: 13px; padding: 8px 10px;
+    }
+    #sessionMenu button:hover { background: var(--surface-hover); }
+    #sessionMenu button.danger { color: var(--danger); }
+    #logWrap { flex: 1; min-height: 0; position: relative; display: flex; flex-direction: column; }
+    #log { flex: 1; overflow: auto; padding: 24px 24px 8px; min-height: 0; }
+    #log.is-history .message { animation: none; }
+    #jumpBottom {
+      display: none;
+      position: absolute; right: 24px; bottom: 16px;
+      align-items: center; gap: 6px;
+      background: var(--elevated); color: var(--text);
+      border: 1px solid var(--border-strong);
+      border-radius: 999px;
+      padding: 7px 12px;
+      font-size: 12px;
+      box-shadow: var(--shadow);
+      z-index: 4;
+    }
+    #jumpBottom.visible { display: inline-flex; }
+    #jumpBottom:hover { border-color: var(--accent); }
     .welcome {
       max-width: 560px; margin: 10vh auto;
       text-align: center; color: var(--text-secondary);
@@ -559,7 +656,7 @@
       font-size: 14px; color: var(--text);
     }
     .cmd-item:hover, .cmd-item.selected { background: var(--surface-hover); }
-    .cmd-item .cmd-name { font-weight: 600; color: var(--accent); width: 80px; flex-shrink: 0; }
+    .cmd-item .cmd-name { font-weight: 600; color: var(--accent); width: 112px; flex-shrink: 0; }
     .cmd-item .cmd-desc { color: var(--text-secondary); font-size: 13px; }
 
     .composer-wrap { padding: 14px 24px 24px; background: var(--bg); flex-shrink: 0; }
@@ -735,6 +832,30 @@
     }
     #noticeBar.active { display: flex; align-items: center; gap: 10px; }
     #noticeBar .notice-actions { margin-left: auto; display: flex; gap: 8px; }
+    .composer-hint { margin-top: 8px; font-size: 12px; color: var(--text-secondary); }
+
+    #confirmModal {
+      display: none;
+      position: fixed; inset: 0;
+      background: rgba(0,0,0,0.55);
+      z-index: 50;
+      align-items: center; justify-content: center;
+      padding: 20px;
+    }
+    #confirmModal.active { display: flex; }
+    #confirmModal .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 22px;
+      width: min(420px, 100%);
+      box-shadow: var(--shadow);
+    }
+    #confirmModal h2 { margin: 0 0 8px; font-size: 16px; }
+    #confirmModal p { margin: 0 0 18px; color: var(--text-secondary); font-size: 13px; line-height: 1.5; }
+    #confirmModal .confirm-actions { display: flex; justify-content: flex-end; gap: 8px; }
+    .btn-danger { background: var(--danger); color: #fff; }
+    .btn-danger:hover { filter: brightness(1.08); }
 
     @media (max-width: 760px) {
       body { grid-template-columns: 1fr; }
@@ -749,6 +870,8 @@
       }
       .brand { padding-left: 50px; }
       #log { padding: 18px 16px 6px; }
+      #sessionBar { padding: 10px 16px 10px 52px; }
+      #jumpBottom { right: 16px; }
       .composer-wrap { padding: 12px 16px 16px; }
       .kv-row { grid-template-columns: 72px minmax(0, 1fr); gap: 8px; }
       .tool-meta { display: none; }
@@ -798,11 +921,39 @@
   </aside>
 
   <main>
+    <header id="sessionBar">
+      <div class="session-bar-title">
+        <input id="sessionTitle" maxlength="80" placeholder="会话标题" />
+      </div>
+      <div class="session-bar-meta" id="sessionMeta"></div>
+      <div class="session-bar-actions">
+        <select id="permissionMode" title="权限模式">
+          <option value="manual">manual</option>
+          <option value="yolo">yolo</option>
+          <option value="auto">auto</option>
+        </select>
+        <button type="button" id="planBtn" class="btn-secondary" title="Plan 模式">Plan</button>
+        <button type="button" id="stopBtn" hidden>停止</button>
+        <button type="button" id="moreBtn" class="composer-action" title="更多" aria-label="更多">⋯</button>
+      </div>
+      <div id="sessionMenu">
+        <button type="button" data-action="rename">重命名</button>
+        <button type="button" data-action="fork">Fork</button>
+        <button type="button" data-action="compact">Compact</button>
+        <button type="button" data-action="undo">Undo</button>
+        <button type="button" data-action="export">导出</button>
+        <button type="button" data-action="archive">归档</button>
+        <button type="button" data-action="delete" class="danger">删除</button>
+      </div>
+    </header>
     <div id="noticeBar">
       <span id="noticeText"></span>
       <div class="notice-actions" id="noticeActions"></div>
     </div>
-    <div id="log"></div>
+    <div id="logWrap">
+      <div id="log"></div>
+      <button type="button" id="jumpBottom">↓ 最新</button>
+    </div>
     <div class="composer-wrap">
       <form id="composer">
         <div class="composer-left">
@@ -820,7 +971,7 @@
           </button>
         </div>
       </form>
-      <div class="composer-hint">Enter 发送 · Shift + Enter 换行 · Ctrl+V 粘贴截图或文件</div>
+      <div class="composer-hint">Enter 发送 · Shift+Enter 换行 · / 命令 · Esc 停止</div>
     </div>
   </main>
 
@@ -855,6 +1006,17 @@
       </form>
     </div>
   </aside>
+
+  <div id="confirmModal">
+    <div class="card">
+      <h2 id="confirmTitle">确认</h2>
+      <p id="confirmBody"></p>
+      <div class="confirm-actions">
+        <button type="button" id="confirmCancel" class="btn-secondary">取消</button>
+        <button type="button" id="confirmOk" class="btn-danger">删除</button>
+      </div>
+    </div>
+  </div>
 
   <script src="/ui/app.js"></script>
 </body>

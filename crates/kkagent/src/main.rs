@@ -2323,7 +2323,7 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
                         "forked_from": meta.forked_from.clone(),
                         "parent_id": meta.forked_from,
                         "messages": s.messages.len(),
-                        "permission_mode": format!("{:?}", s.get_permission_mode()),
+                        "permission_mode": s.get_permission_mode().to_string(),
                     })
                 })
                 .collect()
@@ -2453,6 +2453,7 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
             let sessions = self.state.sessions.lock().await;
             if let Some(s) = sessions.get(id) {
                 let meta = s.services.metadata.read();
+                let usage = s.usage.snapshot();
                 return Some(serde_json::json!({
                     "session_id": s.id,
                     "title": s.title,
@@ -2460,12 +2461,15 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
                     "working_dir": s.working_dir.display().to_string(),
                     "forked_from": meta.forked_from.clone(),
                     "parent_id": meta.forked_from,
+                    "permission_mode": s.get_permission_mode().to_string(),
+                    "plan_mode": s.plan_mode,
+                    "model": s.get_model_alias(),
                     "messages": s.messages,
                     "usage": {
-                        "input_tokens": s.usage.snapshot().input_tokens,
-                        "output_tokens": s.usage.snapshot().output_tokens,
-                        "steps": s.usage.snapshot().steps,
-                        "turns": s.usage.snapshot().turns,
+                        "input_tokens": usage.input_tokens,
+                        "output_tokens": usage.output_tokens,
+                        "steps": usage.steps,
+                        "turns": usage.turns,
                     },
                 }));
             }
@@ -2488,6 +2492,9 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
             "updated_at": record.updated_at,
             "forked_from": forked_from.clone(),
             "parent_id": forked_from,
+            "permission_mode": "manual",
+            "plan_mode": false,
+            "model": record.model,
             "messages": messages,
         }))
     }
@@ -2643,6 +2650,86 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
             &self.state,
             "session.btw_cancel",
             serde_json::json!({"session_id": id}),
+        )
+        .await
+    }
+
+    async fn rename_session(&self, id: &str, title: &str) -> Result<serde_json::Value, String> {
+        http_rpc(
+            &self.state,
+            "session.set_title",
+            serde_json::json!({"session_id": id, "title": title}),
+        )
+        .await
+    }
+
+    async fn interrupt_session(&self, id: &str) -> Result<serde_json::Value, String> {
+        http_rpc(
+            &self.state,
+            "session.interrupt",
+            serde_json::json!({"session_id": id}),
+        )
+        .await
+    }
+
+    async fn set_permission_mode(&self, id: &str, mode: &str) -> Result<serde_json::Value, String> {
+        ensure_session_loaded(&self.state, id).await?;
+        http_rpc(
+            &self.state,
+            "session.set_permission_mode",
+            serde_json::json!({"session_id": id, "mode": mode}),
+        )
+        .await
+    }
+
+    async fn set_plan_mode(&self, id: &str, enabled: bool) -> Result<serde_json::Value, String> {
+        ensure_session_loaded(&self.state, id).await?;
+        http_rpc(
+            &self.state,
+            "session.set_plan_mode",
+            serde_json::json!({"session_id": id, "enabled": enabled}),
+        )
+        .await
+    }
+
+    async fn set_model(&self, id: &str, model: &str) -> Result<serde_json::Value, String> {
+        ensure_session_loaded(&self.state, id).await?;
+        http_rpc(
+            &self.state,
+            "session.set_model",
+            serde_json::json!({"session_id": id, "model": model}),
+        )
+        .await
+    }
+
+    async fn compact_session(
+        &self,
+        id: &str,
+        instruction: Option<&str>,
+    ) -> Result<serde_json::Value, String> {
+        ensure_session_loaded(&self.state, id).await?;
+        let mut params = serde_json::json!({"session_id": id});
+        if let Some(instruction) = instruction.filter(|value| !value.trim().is_empty()) {
+            params["instruction"] = serde_json::json!(instruction);
+        }
+        http_rpc(&self.state, "session.compact", params).await
+    }
+
+    async fn undo_session(&self, id: &str, count: usize) -> Result<serde_json::Value, String> {
+        ensure_session_loaded(&self.state, id).await?;
+        http_rpc(
+            &self.state,
+            "session.undo",
+            serde_json::json!({"session_id": id, "count": count}),
+        )
+        .await
+    }
+
+    async fn archive_session(&self, id: &str, archived: bool) -> Result<serde_json::Value, String> {
+        http_rpc(
+            &self.state,
+            "sessions.archive",
+            serde_json::json!({"session_id": id, "archived": archived}),
         )
         .await
     }

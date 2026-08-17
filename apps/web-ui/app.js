@@ -18,6 +18,14 @@ const state = {
   cwd: "",
   live: null,
   btwLive: null,
+  followBottom: true,
+  suppressScroll: false,
+  running: false,
+  title: "",
+  permissionMode: "manual",
+  planMode: false,
+  model: "",
+  usage: null,
 };
 
 const logEl = document.getElementById("log");
@@ -45,6 +53,20 @@ const timelineClose = document.getElementById("timelineClose");
 const noticeBar = document.getElementById("noticeBar");
 const noticeText = document.getElementById("noticeText");
 const noticeActions = document.getElementById("noticeActions");
+const sessionBar = document.getElementById("sessionBar");
+const sessionTitle = document.getElementById("sessionTitle");
+const sessionMeta = document.getElementById("sessionMeta");
+const permissionModeEl = document.getElementById("permissionMode");
+const planBtn = document.getElementById("planBtn");
+const stopBtn = document.getElementById("stopBtn");
+const moreBtn = document.getElementById("moreBtn");
+const sessionMenu = document.getElementById("sessionMenu");
+const jumpBottom = document.getElementById("jumpBottom");
+const confirmModal = document.getElementById("confirmModal");
+const confirmTitle = document.getElementById("confirmTitle");
+const confirmBody = document.getElementById("confirmBody");
+const confirmOk = document.getElementById("confirmOk");
+const confirmCancel = document.getElementById("confirmCancel");
 
 const ICONS = {
   copy: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>',
@@ -55,6 +77,7 @@ const ICONS = {
   chevron: '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"></polyline></svg>',
   spinner: '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M21 12a9 9 0 1 1-6.219-8.56"></path></svg>',
   x: '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>',
+  trash: '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"></path><path d="M10 11v6"></path><path d="M14 11v6"></path><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"></path></svg>',
 };
 
 const TOOL_KINDS = {
@@ -80,13 +103,27 @@ const TOOL_KINDS = {
 };
 
 const COMMANDS = [
+  { name: "/new", desc: "新建会话", example: "/new" },
+  { name: "/fork", desc: "Fork 当前会话", example: "/fork" },
+  { name: "/title", desc: "设置会话标题", example: "/title " },
+  { name: "/rename", desc: "重命名会话", example: "/rename " },
+  { name: "/delete", desc: "删除当前会话", example: "/delete" },
+  { name: "/yolo", desc: "切换 YOLO 自动批准", example: "/yolo" },
+  { name: "/auto", desc: "切换 Auto 全自动", example: "/auto" },
+  { name: "/permission", desc: "设置权限模式", example: "/permission manual" },
+  { name: "/plan", desc: "切换 Plan 模式", example: "/plan" },
+  { name: "/compact", desc: "压缩上下文", example: "/compact" },
+  { name: "/undo", desc: "撤销上一轮", example: "/undo" },
+  { name: "/interrupt", desc: "中断当前 turn", example: "/interrupt" },
+  { name: "/model", desc: "切换模型", example: "/model " },
+  { name: "/status", desc: "会话状态", example: "/status" },
+  { name: "/usage", desc: "上下文用量", example: "/usage" },
+  { name: "/export", desc: "导出会话 JSON", example: "/export" },
+  { name: "/btw", desc: "在侧边窗口追问", example: "/btw " },
+  { name: "/timeline", desc: "打开 Timeline", example: "/timeline" },
   { name: "/explain", desc: "解释选中代码或上下文", example: "/explain 这段代码的作用" },
   { name: "/fix", desc: "修复当前问题", example: "/fix 修复当前问题" },
   { name: "/commit", desc: "提交当前变更", example: "/commit 提交修复" },
-  { name: "/fork", desc: "Fork 当前会话", example: "/fork" },
-  { name: "/btw", desc: "在侧边窗口追问", example: "/btw 还有别的方案吗" },
-  { name: "/timeline", desc: "打开 Timeline", example: "/timeline" },
-  { name: "/new", desc: "新建会话", example: "/new" },
   { name: "/test", desc: "运行相关测试", example: "/test" },
 ];
 
@@ -452,6 +489,76 @@ function renderMessage(role, content, timestamp, toolCalls = [], extras = {}) {
   return div;
 }
 
+function isNearBottom() {
+  return logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight < 80;
+}
+
+function updateJumpButton() {
+  if (!jumpBottom) return;
+  jumpBottom.classList.toggle("visible", Boolean(state.sessionId) && !state.followBottom);
+}
+
+function maybeScrollLog() {
+  if (state.suppressScroll) return;
+  if (!state.followBottom) {
+    updateJumpButton();
+    return;
+  }
+  logEl.scrollTop = logEl.scrollHeight;
+  updateJumpButton();
+}
+
+function jumpToLatest() {
+  state.followBottom = true;
+  logEl.scrollTop = logEl.scrollHeight;
+  updateJumpButton();
+}
+
+function setRunning(running) {
+  state.running = running;
+  sendBtn.disabled = running;
+  if (stopBtn) stopBtn.hidden = !running;
+}
+
+function applySessionMeta(sess = {}) {
+  state.title = sess.title || "";
+  state.permissionMode = String(sess.permission_mode || "manual").toLowerCase();
+  state.planMode = Boolean(sess.plan_mode);
+  state.model = sess.model || sess.model_alias || "";
+  state.usage = sess.usage || null;
+  if (sessionBar) sessionBar.classList.toggle("active", Boolean(state.sessionId));
+  if (sessionTitle && document.activeElement !== sessionTitle) {
+    sessionTitle.value = state.title;
+    sessionTitle.placeholder = state.sessionId ? state.sessionId.slice(0, 8) : "会话标题";
+  }
+  if (permissionModeEl) permissionModeEl.value = ["manual", "yolo", "auto"].includes(state.permissionMode)
+    ? state.permissionMode
+    : "manual";
+  if (planBtn) planBtn.classList.toggle("active", state.planMode);
+  if (sessionMeta) {
+    const bits = [state.model, state.permissionMode, state.planMode ? "plan" : ""].filter(Boolean);
+    sessionMeta.textContent = bits.join(" · ");
+  }
+}
+
+function confirmAction({ title, body, ok = "确定", danger = false }) {
+  return new Promise((resolve) => {
+    confirmTitle.textContent = title;
+    confirmBody.textContent = body;
+    confirmOk.textContent = ok;
+    confirmOk.className = danger ? "btn-danger" : "btn-primary";
+    confirmModal.classList.add("active");
+    const finish = (value) => {
+      confirmModal.classList.remove("active");
+      confirmOk.onclick = null;
+      confirmCancel.onclick = null;
+      resolve(value);
+    };
+    confirmOk.onclick = () => finish(true);
+    confirmCancel.onclick = () => finish(false);
+  });
+}
+
 function showTyping() {
   const div = document.createElement("div");
   div.className = "message assistant typing-msg";
@@ -463,7 +570,7 @@ function showTyping() {
     </div>
   `;
   logEl.appendChild(div);
-  logEl.scrollTop = logEl.scrollHeight;
+  maybeScrollLog();
   return div;
 }
 
@@ -483,7 +590,7 @@ function appendMessage(role, content, timestamp, toolCalls = [], extras = {}) {
     body.appendChild(row);
   }
   logEl.appendChild(el);
-  logEl.scrollTop = logEl.scrollHeight;
+  maybeScrollLog();
   return el;
 }
 
@@ -607,11 +714,17 @@ function parseTranscript(messages) {
   return out;
 }
 
-function renderLog(messages) {
+function renderLog(messages, { jump = true } = {}) {
   const parsed = parseTranscript(messages);
+  state.suppressScroll = true;
+  logEl.classList.add("is-history");
   logEl.innerHTML = "";
   if (!parsed.length) {
+    logEl.classList.remove("is-history");
+    state.suppressScroll = false;
     showWelcome();
+    if (jump) jumpToLatest();
+    else updateJumpButton();
     return;
   }
   parsed.forEach((message, index) => {
@@ -620,6 +733,18 @@ function renderLog(messages) {
       messageIndex: message.sourceIndex ?? index,
     });
   });
+  logEl.classList.remove("is-history");
+  state.suppressScroll = false;
+  if (jump) {
+    state.followBottom = true;
+    logEl.scrollTop = logEl.scrollHeight;
+    requestAnimationFrame(() => {
+      logEl.scrollTop = logEl.scrollHeight;
+      updateJumpButton();
+    });
+  } else {
+    updateJumpButton();
+  }
 }
 
 function sessionIdOf(session) {
@@ -666,8 +791,14 @@ function renderSessions() {
     const path = escapeHtml(s.workspace || s.working_dir || s.path || "");
     const preview = s.preview || "";
     div.innerHTML = `
-      <div class="session-title">
-        ${expander}${(s.depth || 0) > 0 ? '<span class="session-fork-icon">↳</span>' : ""}${escapeHtml(title)}
+      <div class="session-row">
+        <div class="session-title">
+          ${expander}${(s.depth || 0) > 0 ? '<span class="session-fork-icon">↳</span>' : ""}${escapeHtml(title)}
+        </div>
+        <div class="session-item-actions">
+          <button type="button" class="session-icon-btn" data-act="rename" title="重命名">${ICONS.edit}</button>
+          <button type="button" class="session-icon-btn danger" data-act="delete" title="删除">${ICONS.trash}</button>
+        </div>
       </div>
       ${path ? `<div class="session-path">${path}</div>` : ""}
       <div class="session-meta">${escapeHtml(preview)}</div>
@@ -683,6 +814,18 @@ function renderSessions() {
         selectSession(id);
       }
     };
+    const titleEl = div.querySelector(".session-title");
+    titleEl.ondblclick = (e) => {
+      e.stopPropagation();
+      startInlineRename(id, title, titleEl);
+    };
+    div.querySelectorAll(".session-item-actions button").forEach((btn) => {
+      btn.onclick = (e) => {
+        e.stopPropagation();
+        if (btn.dataset.act === "rename") startInlineRename(id, title, titleEl);
+        else if (btn.dataset.act === "delete") deleteSession(id, title);
+      };
+    });
     sessionsEl.appendChild(div);
   }
 }
@@ -696,19 +839,25 @@ async function refreshSessions() {
   renderSessions();
 }
 
-async function selectSession(id) {
+async function selectSession(id, { jump = true } = {}) {
   state.sessionId = id;
   state.live = null;
+  setRunning(false);
+  if (jump) state.followBottom = true;
   renderSessions();
   logEl.innerHTML = "";
   const sess = await api(`/api/v1/sessions/${id}`);
+  if (state.sessionId !== id) return;
   const current = state.sessions.find((s) => sessionIdOf(s) === id);
-  if (current && sess.forked_from) {
-    current.forked_from = sess.forked_from;
-    current.parent_id = sess.forked_from;
+  if (current) {
+    if (sess.forked_from) {
+      current.forked_from = sess.forked_from;
+      current.parent_id = sess.forked_from;
+    }
+    if (sess.title) current.title = sess.title;
   }
-  const messages = sess.messages || [];
-  renderLog(messages);
+  applySessionMeta(sess);
+  renderLog(sess.messages || [], { jump });
 }
 
 async function ensureSession() {
@@ -735,6 +884,209 @@ async function forkCurrentSession(title) {
   } catch (err) {
     appendMessage("system", `fork 失败: ${err.message || err}`, new Date().toISOString());
   }
+}
+
+function startInlineRename(id, current, titleEl) {
+  const input = document.createElement("input");
+  input.className = "session-rename-input";
+  input.value = current;
+  titleEl.replaceWith(input);
+  input.focus();
+  input.select();
+  let done = false;
+  const finish = async (commit) => {
+    if (done) return;
+    done = true;
+    const next = input.value.trim();
+    if (commit && next && next !== current) {
+      await renameSession(id, next);
+    } else {
+      renderSessions();
+    }
+  };
+  input.onkeydown = (e) => {
+    e.stopPropagation();
+    if (e.key === "Enter") {
+      e.preventDefault();
+      finish(true);
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      finish(false);
+    }
+  };
+  input.onblur = () => finish(true);
+  input.onclick = (e) => e.stopPropagation();
+}
+
+async function renameSession(id, title) {
+  const next = String(title || "").trim();
+  if (!id || !next) return;
+  try {
+    const sess = await api(`/api/v1/sessions/${id}`, {
+      method: "PATCH",
+      body: JSON.stringify({ title: next }),
+    });
+    const current = state.sessions.find((s) => sessionIdOf(s) === id);
+    if (current) current.title = sess.title || next;
+    if (id === state.sessionId) applySessionMeta({ ...sess, title: sess.title || next });
+    renderSessions();
+  } catch (err) {
+    appendMessage("system", `改名失败: ${err.message || err}`, new Date().toISOString());
+  }
+}
+
+async function deleteSession(id, title) {
+  if (!id) return;
+  const ok = await confirmAction({
+    title: "删除会话",
+    body: `永久删除「${title || id.slice(0, 8)}」及其历史？此操作不可撤销。`,
+    ok: "删除",
+    danger: true,
+  });
+  if (!ok) return;
+  try {
+    await api(`/api/v1/sessions/${id}`, { method: "DELETE" });
+    state.sessions = state.sessions.filter((s) => sessionIdOf(s) !== id);
+    if (state.sessionId === id) {
+      state.sessionId = null;
+      applySessionMeta({});
+      const next = filterSessions()[0] || state.sessions[0];
+      if (next) await selectSession(sessionIdOf(next));
+      else {
+        showWelcome();
+        updateJumpButton();
+      }
+    }
+    await refreshSessions();
+  } catch (err) {
+    appendMessage("system", `删除失败: ${err.message || err}`, new Date().toISOString());
+  }
+}
+
+async function patchCurrentSession(body) {
+  if (!state.sessionId) return null;
+  const sess = await api(`/api/v1/sessions/${state.sessionId}`, {
+    method: "PATCH",
+    body: JSON.stringify(body),
+  });
+  applySessionMeta(sess);
+  const current = state.sessions.find((s) => sessionIdOf(s) === state.sessionId);
+  if (current && sess.title) current.title = sess.title;
+  renderSessions();
+  return sess;
+}
+
+async function interruptCurrent() {
+  if (!state.sessionId) return;
+  try {
+    await api(`/api/v1/sessions/${state.sessionId}/interrupt`, { method: "POST", body: "{}" });
+    setRunning(false);
+    appendMessage("system", "已请求中断当前 turn。", new Date().toISOString());
+  } catch (err) {
+    appendMessage("system", `中断失败: ${err.message || err}`, new Date().toISOString());
+  }
+}
+
+async function compactCurrent(instruction) {
+  if (!state.sessionId) return;
+  try {
+    await api(`/api/v1/sessions/${state.sessionId}/compact`, {
+      method: "POST",
+      body: JSON.stringify({ instruction: instruction || undefined }),
+    });
+    appendMessage("system", "正在压缩上下文…", new Date().toISOString());
+  } catch (err) {
+    appendMessage("system", `Compact 失败: ${err.message || err}`, new Date().toISOString());
+  }
+}
+
+async function undoCurrent(count) {
+  if (!state.sessionId) return;
+  try {
+    const result = await api(`/api/v1/sessions/${state.sessionId}/undo`, {
+      method: "POST",
+      body: JSON.stringify({ count: count || 1 }),
+    });
+    if (result.messages) renderLog(result.messages, { jump: state.followBottom });
+    else await selectSession(state.sessionId, { jump: state.followBottom });
+    appendMessage("system", `已撤销 ${result.undone || count || 1} 轮。`, new Date().toISOString());
+  } catch (err) {
+    appendMessage("system", `Undo 失败: ${err.message || err}`, new Date().toISOString());
+  }
+}
+
+async function archiveCurrent() {
+  if (!state.sessionId) return;
+  const id = state.sessionId;
+  try {
+    await api(`/api/v1/sessions/${id}/archive`, {
+      method: "POST",
+      body: JSON.stringify({ archived: true }),
+    });
+    state.sessions = state.sessions.filter((s) => sessionIdOf(s) !== id);
+    state.sessionId = null;
+    applySessionMeta({});
+    await refreshSessions();
+    const next = filterSessions()[0] || state.sessions[0];
+    if (next) await selectSession(sessionIdOf(next));
+    else {
+      showWelcome();
+      updateJumpButton();
+    }
+  } catch (err) {
+    appendMessage("system", `归档失败: ${err.message || err}`, new Date().toISOString());
+  }
+}
+
+async function exportCurrent() {
+  if (!state.sessionId) return;
+  try {
+    const body = await api(`/api/v1/sessions/${state.sessionId}/export`);
+    const blob = new Blob([JSON.stringify(body, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${state.title || state.sessionId}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  } catch (err) {
+    appendMessage("system", `导出失败: ${err.message || err}`, new Date().toISOString());
+  }
+}
+
+async function setPermissionMode(mode) {
+  try {
+    await patchCurrentSession({ permission_mode: mode });
+    appendMessage("system", `权限模式：${mode}`, new Date().toISOString());
+  } catch (err) {
+    appendMessage("system", `切换权限失败: ${err.message || err}`, new Date().toISOString());
+  }
+}
+
+async function togglePlanMode(enabled) {
+  const next = typeof enabled === "boolean" ? enabled : !state.planMode;
+  try {
+    await patchCurrentSession({ plan_mode: next });
+    appendMessage("system", next ? "已进入 Plan 模式。" : "已退出 Plan 模式。", new Date().toISOString());
+  } catch (err) {
+    appendMessage("system", `Plan 模式失败: ${err.message || err}`, new Date().toISOString());
+  }
+}
+
+async function setModel(model) {
+  try {
+    await patchCurrentSession({ model });
+    appendMessage("system", `模型：${model}`, new Date().toISOString());
+  } catch (err) {
+    appendMessage("system", `切换模型失败: ${err.message || err}`, new Date().toISOString());
+  }
+}
+
+function formatUsage(usage) {
+  if (!usage) return "暂无用量";
+  const inTok = usage.input_tokens ?? usage.input ?? 0;
+  const outTok = usage.output_tokens ?? usage.output ?? 0;
+  return `input ${inTok} · output ${outTok} · steps ${usage.steps ?? 0} · turns ${usage.turns ?? 0}`;
 }
 
 function showTokenPrompt(message) {
@@ -1022,7 +1374,9 @@ document.addEventListener("click", (e) => {
 document.getElementById("newSession").onclick = async () => {
   try {
     state.sessionId = null;
-    await ensureSession();
+    const id = await ensureSession();
+    const created = state.sessions.find((s) => sessionIdOf(s) === id) || { session_id: id };
+    applySessionMeta(created);
     showWelcome();
     appendMessage("system", "新会话已创建。", new Date().toISOString());
   } catch (err) {
@@ -1148,7 +1502,7 @@ async function handleSlash(text) {
   if (!match) return false;
   const name = match[1].toLowerCase();
   const args = (match[2] || "").trim();
-  if (name === "new") {
+  if (name === "new" || name === "clear") {
     document.getElementById("newSession").click();
     return true;
   }
@@ -1161,8 +1515,99 @@ async function handleSlash(text) {
     if (args) await sendBtwMessage(args);
     return true;
   }
-  if (name === "timeline") {
+  if (name === "timeline" || name === "tl") {
     await openTimelinePanel();
+    return true;
+  }
+  if (name === "title" || name === "rename") {
+    if (!args) {
+      appendMessage("system", `当前标题：${state.title || "(未设置)"}。用法：/title <name>`, new Date().toISOString());
+      return true;
+    }
+    await renameSession(state.sessionId || await ensureSession(), args);
+    return true;
+  }
+  if (name === "delete") {
+    const id = state.sessionId;
+    if (id) await deleteSession(id, state.title);
+    return true;
+  }
+  if (name === "yolo" || name === "yes") {
+    await setPermissionMode(state.permissionMode === "yolo" ? "manual" : "yolo");
+    return true;
+  }
+  if (name === "auto") {
+    await setPermissionMode(state.permissionMode === "auto" ? "manual" : "auto");
+    return true;
+  }
+  if (name === "permission") {
+    const mode = args.toLowerCase();
+    if (!["manual", "yolo", "auto"].includes(mode)) {
+      appendMessage("system", `当前权限：${state.permissionMode}。用法：/permission manual|yolo|auto`, new Date().toISOString());
+      return true;
+    }
+    await setPermissionMode(mode);
+    return true;
+  }
+  if (name === "plan") {
+    if (args === "clear") await togglePlanMode(false);
+    else await togglePlanMode();
+    return true;
+  }
+  if (name === "compact") {
+    await compactCurrent(args);
+    return true;
+  }
+  if (name === "undo") {
+    const count = args ? Number.parseInt(args, 10) : 1;
+    await undoCurrent(Number.isFinite(count) && count > 0 ? count : 1);
+    return true;
+  }
+  if (name === "interrupt" || name === "stop") {
+    await interruptCurrent();
+    return true;
+  }
+  if (name === "model") {
+    if (!args) {
+      try {
+        const body = await api("/api/v1/models");
+        const names = (body.models || [])
+          .map((item) => item.alias || item.id || item.model)
+          .filter(Boolean);
+        appendMessage(
+          "system",
+          `当前模型：${state.model || "(默认)"}\n可选：${names.slice(0, 20).join(", ") || "(无)"}`,
+          new Date().toISOString(),
+        );
+      } catch (err) {
+        appendMessage("system", `当前模型：${state.model || "(默认)"}。${err.message || err}`, new Date().toISOString());
+      }
+      return true;
+    }
+    await setModel(args);
+    return true;
+  }
+  if (name === "status" || name === "info") {
+    appendMessage(
+      "system",
+      [
+        `session: ${state.sessionId || "(无)"}`,
+        `title: ${state.title || "(未设置)"}`,
+        `model: ${state.model || "(默认)"}`,
+        `permission: ${state.permissionMode}`,
+        `plan: ${state.planMode ? "on" : "off"}`,
+        formatUsage(state.usage),
+      ].join("\n"),
+      new Date().toISOString(),
+    );
+    return true;
+  }
+  if (name === "usage") {
+    appendMessage("system", formatUsage(state.usage), new Date().toISOString());
+    return true;
+  }
+  if (name === "export") {
+    await exportCurrent();
     return true;
   }
   return false;
@@ -1201,7 +1646,7 @@ document.getElementById("composer").onsubmit = async (e) => {
     images: images.map((img) => ({ media_type: img.media_type, data: img.data })),
   });
   showTyping();
-  sendBtn.disabled = true;
+  setRunning(true);
   try {
     await api(`/api/v1/sessions/${sid}/messages`, {
       method: "POST",
@@ -1209,7 +1654,7 @@ document.getElementById("composer").onsubmit = async (e) => {
     });
   } catch (err) {
     removeTyping();
-    sendBtn.disabled = false;
+    setRunning(false);
     appendMessage("system", String(err.message || err), new Date().toISOString());
   }
 };
@@ -1220,7 +1665,7 @@ function replaceLiveMessage() {
   if (state.live.el && state.live.el.parentNode) state.live.el.replaceWith(fresh);
   else logEl.appendChild(fresh);
   state.live.el = fresh;
-  logEl.scrollTop = logEl.scrollHeight;
+  maybeScrollLog();
 }
 
 function ensureLive() {
@@ -1234,8 +1679,18 @@ function ensureLive() {
 function handleAgentEvent(event) {
   const type = event.type;
   const sessionId = event.session_id;
-  if (type === "session.created" || type === "session.forked" || type === "session.deleted") {
+  if (type === "session.created" || type === "session.forked" || type === "session.updated" || type === "session.archived") {
     refreshSessions().catch(() => {});
+    return;
+  }
+  if (type === "session.deleted") {
+    refreshSessions().catch(() => {});
+    if (event.session_id && event.session_id === state.sessionId) {
+      state.sessionId = null;
+      applySessionMeta({});
+      showWelcome();
+      updateJumpButton();
+    }
     return;
   }
   if (sessionId && state.sessionId && sessionId !== state.sessionId && type !== "btw_delta" && type !== "btw_end") {
@@ -1246,7 +1701,7 @@ function handleAgentEvent(event) {
       const welcome = logEl.querySelector(".welcome");
       if (welcome) welcome.remove();
       showTyping();
-      sendBtn.disabled = true;
+      setRunning(true);
       state.live = null;
     }
     return;
@@ -1285,19 +1740,51 @@ function handleAgentEvent(event) {
     return;
   }
   if (type === "turn_end") {
-    sendBtn.disabled = false;
+    setRunning(false);
     if (sessionId === state.sessionId) {
       const sid = state.sessionId;
+      const jump = state.followBottom;
       state.live = null;
-      selectSession(sid).catch(() => {});
+      selectSession(sid, { jump }).catch(() => {});
       refreshSessions().catch(() => {});
     }
     return;
   }
   if (type === "error") {
-    sendBtn.disabled = false;
+    setRunning(false);
     removeTyping();
     appendMessage("system", event.message || "turn error", new Date().toISOString());
+    return;
+  }
+  if (type === "status_update") {
+    if (sessionId === state.sessionId) {
+      const status = event.status;
+      if (status === "idle") setRunning(false);
+      else if (status) setRunning(true);
+    }
+    return;
+  }
+  if (type === "session_config_changed") {
+    if (sessionId === state.sessionId) {
+      applySessionMeta({
+        title: state.title,
+        permission_mode: event.permission_mode || state.permissionMode,
+        plan_mode: typeof event.plan_mode === "boolean" ? event.plan_mode : state.planMode,
+        model: event.model || state.model,
+        usage: state.usage,
+      });
+    }
+    return;
+  }
+  if (type === "compact_completed") {
+    if (sessionId === state.sessionId) {
+      setRunning(false);
+      if (event.error) appendMessage("system", `Compact 失败: ${event.error}`, new Date().toISOString());
+      else if (event.messages) {
+        renderLog(event.messages, { jump: state.followBottom });
+        appendMessage("system", `上下文已压缩，保留 ${event.kept_user_message_count || 0} 条用户消息。`, new Date().toISOString());
+      }
+    }
     return;
   }
   if (type === "approval_requested") {
@@ -1375,6 +1862,96 @@ menuToggle.onclick = () => sidebar.classList.toggle("open");
 document.addEventListener("click", (e) => {
   if (window.innerWidth > 760) return;
   if (!sidebar.contains(e.target) && e.target !== menuToggle && sidebar.classList.contains("open")) closeSidebar();
+});
+
+logEl.addEventListener("scroll", () => {
+  if (state.suppressScroll) return;
+  state.followBottom = isNearBottom();
+  updateJumpButton();
+});
+if (jumpBottom) jumpBottom.onclick = () => jumpToLatest();
+
+function closeSessionMenu() {
+  sessionMenu?.classList.remove("active");
+}
+
+if (moreBtn && sessionMenu) {
+  moreBtn.onclick = (e) => {
+    e.stopPropagation();
+    sessionMenu.classList.toggle("active");
+  };
+  sessionMenu.onclick = async (e) => {
+    const btn = e.target.closest("button");
+    if (!btn) return;
+    closeSessionMenu();
+    const action = btn.dataset.action;
+    if (action === "rename") {
+      sessionTitle?.focus();
+      sessionTitle?.select();
+    } else if (action === "fork") await forkCurrentSession();
+    else if (action === "compact") await compactCurrent();
+    else if (action === "undo") await undoCurrent(1);
+    else if (action === "export") await exportCurrent();
+    else if (action === "archive") await archiveCurrent();
+    else if (action === "delete" && state.sessionId) await deleteSession(state.sessionId, state.title);
+  };
+}
+
+if (sessionTitle) {
+  sessionTitle.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      sessionTitle.blur();
+    } else if (e.key === "Escape") {
+      sessionTitle.value = state.title;
+      sessionTitle.blur();
+    }
+  });
+  sessionTitle.addEventListener("blur", async () => {
+    const next = sessionTitle.value.trim();
+    if (!state.sessionId) return;
+    if (next && next !== state.title) await renameSession(state.sessionId, next);
+    else sessionTitle.value = state.title;
+  });
+}
+
+if (permissionModeEl) {
+  permissionModeEl.onchange = async () => {
+    const mode = permissionModeEl.value;
+    if (mode && mode !== state.permissionMode) await setPermissionMode(mode);
+  };
+}
+if (planBtn) planBtn.onclick = () => togglePlanMode();
+if (stopBtn) stopBtn.onclick = () => interruptCurrent();
+
+if (confirmModal) {
+  confirmModal.addEventListener("click", (e) => {
+    if (e.target === confirmModal) confirmCancel?.click();
+  });
+}
+
+document.addEventListener("click", (e) => {
+  if (!sessionMenu?.classList.contains("active")) return;
+  if (e.target.closest("#sessionMenu") || e.target.closest("#moreBtn")) return;
+  closeSessionMenu();
+});
+
+document.addEventListener("keydown", (e) => {
+  if (e.key !== "Escape") return;
+  if (confirmModal?.classList.contains("active")) {
+    confirmCancel?.click();
+    return;
+  }
+  if (sessionMenu?.classList.contains("active")) {
+    closeSessionMenu();
+    return;
+  }
+  if (cmdPalette.classList.contains("active")) return;
+  if (state.running && document.activeElement !== promptEl) {
+    interruptCurrent();
+  } else if (state.running && promptEl.value.trim() === "") {
+    interruptCurrent();
+  }
 });
 
 async function boot() {
