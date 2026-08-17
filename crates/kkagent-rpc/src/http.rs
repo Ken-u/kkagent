@@ -2326,23 +2326,44 @@ async fn session_timeline(
 fn message_text(message: &Value) -> String {
     if let Some(text) = message.get("text").and_then(Value::as_str) {
         if !text.is_empty() {
-            return text.to_string();
+            return kkagent_protocol::visible_user_text(text);
         }
     }
     match message.get("content") {
-        Some(Value::String(text)) => text.clone(),
-        Some(Value::Array(parts)) => parts
-            .iter()
-            .filter_map(|part| part.get("text").and_then(Value::as_str))
-            .collect::<Vec<_>>()
-            .join("\n"),
-        other => other
-            .cloned()
-            .unwrap_or(Value::Null)
-            .to_string()
-            .trim_matches('"')
-            .to_string(),
+        Some(Value::String(text)) => kkagent_protocol::visible_user_text(text),
+        Some(Value::Array(parts)) => {
+            let joined = parts
+                .iter()
+                .filter(|part| part.get("type").and_then(Value::as_str) != Some("tool_result"))
+                .filter_map(|part| part.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n");
+            kkagent_protocol::visible_user_text(&joined)
+        }
+        _ => String::new(),
     }
+}
+
+fn message_has_tool_result(message: &Value) -> bool {
+    message
+        .get("content")
+        .and_then(Value::as_array)
+        .is_some_and(|parts| {
+            parts
+                .iter()
+                .any(|part| part.get("type").and_then(Value::as_str) == Some("tool_result"))
+        })
+}
+
+fn message_has_user_image(message: &Value) -> bool {
+    message
+        .get("content")
+        .and_then(Value::as_array)
+        .is_some_and(|parts| {
+            parts
+                .iter()
+                .any(|part| part.get("type").and_then(Value::as_str) == Some("image"))
+        })
 }
 
 fn message_tool_calls(message: &Value) -> Vec<Value> {
@@ -2369,19 +2390,10 @@ fn is_visible_user_message(message: &Value) -> bool {
     if message.get("role").and_then(Value::as_str) != Some("user") {
         return false;
     }
-    let preview = message_text(message);
-    if preview.trim().is_empty() {
-        let has_image = message
-            .get("content")
-            .and_then(Value::as_array)
-            .is_some_and(|parts| {
-                parts
-                    .iter()
-                    .any(|part| part.get("type").and_then(Value::as_str) == Some("image"))
-            });
-        return has_image;
+    if message_has_tool_result(message) {
+        return false;
     }
-    !kkagent_protocol::is_harness_only_user_text(&preview)
+    !message_text(message).is_empty() || message_has_user_image(message)
 }
 
 fn visible_user_indices(messages: &[Value]) -> Vec<usize> {
@@ -2555,7 +2567,12 @@ fn build_session_timeline(id: &str, sess: &Value) -> Value {
             "index": start,
             "message_index": start,
             "time": time,
-            "title": format!("第 {} 轮", turn_index + 1),
+            "title": if preview.is_empty() {
+                format!("第 {} 轮", turn_index + 1)
+            } else {
+                preview.clone()
+            },
+            "label": format!("第 {} 轮", turn_index + 1),
             "desc": preview,
             "preview": preview,
             "changes": changes,
@@ -3389,11 +3406,35 @@ mod security_tests {
                     ],
                     "created_at": "2026-08-17T10:00:02Z"
                 },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "tool_result", "tool_use_id": "t1", "content": "ok"},
+                        {"type": "tool_result", "tool_use_id": "t2", "content": "updated app.js"}
+                    ]
+                },
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "tool_use", "id": "t3", "name": "Edit", "input": {
+                            "path": "main.rs",
+                            "old_string": "a",
+                            "new_string": "b"
+                        }}
+                    ]
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "tool_result", "tool_use_id": "t3", "content": "updated main.rs"}
+                    ]
+                },
+                {"role": "assistant", "content": [{"type": "text", "text": "done"}]},
                 {"role": "user", "text": "also tweak css", "created_at": "2026-08-17T10:00:03Z"},
                 {
                     "role": "assistant",
                     "content": [
-                        {"type": "tool_use", "id": "t3", "name": "Write", "input": {
+                        {"type": "tool_use", "id": "t4", "name": "Write", "input": {
                             "path": "app.css",
                             "content": "body { color: red; }"
                         }}
@@ -3406,18 +3447,16 @@ mod security_tests {
         assert_eq!(events[0]["kind"], "fork");
         assert_eq!(events[1]["kind"], "turn");
         assert_eq!(events[1]["turn_index"], 0);
+        assert_eq!(events[1]["title"], "fix the renderer");
         assert_eq!(events[1]["can_restore"], true);
-        assert_eq!(events[1]["changes"].as_array().unwrap().len(), 1);
-        assert_eq!(events[1]["changes"][0]["path"], "app.js");
-        assert!(events[1]["changes"][0]["diff"]
-            .as_str()
-            .unwrap()
-            .contains("-foo"));
-        assert!(events[1]["changes"][0]["diff"]
-            .as_str()
-            .unwrap()
-            .contains("+bar"));
+        let first_changes = events[1]["changes"].as_array().unwrap();
+        assert_eq!(first_changes.len(), 2);
+        assert_eq!(first_changes[0]["path"], "app.js");
+        assert_eq!(first_changes[1]["path"], "main.rs");
+        assert!(first_changes[0]["diff"].as_str().unwrap().contains("-foo"));
+        assert!(first_changes[0]["diff"].as_str().unwrap().contains("+bar"));
         assert_eq!(events[2]["kind"], "turn");
+        assert_eq!(events[2]["title"], "also tweak css");
         assert_eq!(events[2]["can_restore"], false);
         assert_eq!(events[2]["changes"][0]["path"], "app.css");
     }

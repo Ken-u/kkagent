@@ -1380,12 +1380,12 @@ async function openTimelinePanel() {
       const restore = item.can_restore
         ? `<button type="button" class="btn-secondary timeline-restore" data-turn="${item.turn_index}">恢复到此状态</button>`
         : (item.kind === "turn" ? `<div class="timeline-desc">当前状态</div>` : "");
+      const label = item.label || (item.kind === "turn" ? `第 ${(item.turn_index ?? 0) + 1} 轮` : "");
       el.innerHTML = `
         <div class="timeline-dot"></div>
         <div class="timeline-body">
-          <div class="timeline-time">${escapeHtml(formatTime(item.time))}</div>
+          <div class="timeline-time">${escapeHtml([formatTime(item.time), label].filter(Boolean).join(" · "))}</div>
           <div class="timeline-title">${escapeHtml(item.title || item.kind || "")}</div>
-          ${item.desc ? `<div class="timeline-desc">${escapeHtml(item.desc)}</div>` : ""}
           ${stats}
           ${changes ? `<div class="timeline-changes">${changes}</div>` : (item.kind === "turn" ? `<div class="timeline-desc">这一轮没有文件改动。</div>` : "")}
           ${restore}
@@ -1393,7 +1393,7 @@ async function openTimelinePanel() {
       `;
       const restoreBtn = el.querySelector(".timeline-restore");
       if (restoreBtn) {
-        restoreBtn.onclick = () => restoreTurn(Number(restoreBtn.dataset.turn), item.title || `第 ${Number(restoreBtn.dataset.turn) + 1} 轮`);
+        restoreBtn.onclick = () => restoreTurn(Number(restoreBtn.dataset.turn), label || item.title || `第 ${Number(restoreBtn.dataset.turn) + 1} 轮`);
       }
       timelineList.appendChild(el);
     }

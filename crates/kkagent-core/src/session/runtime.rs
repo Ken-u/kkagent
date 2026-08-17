@@ -1190,10 +1190,15 @@ fn is_user_prompt(message: &ChatMessage) -> bool {
     if message.role != "user" {
         return false;
     }
+    if message
+        .content
+        .iter()
+        .any(|part| matches!(part, ChatContent::ToolResult { .. }))
+    {
+        return false;
+    }
     message.content.iter().any(|part| match part {
-        ChatContent::Text { text } => {
-            !text.trim().is_empty() && !kkagent_protocol::is_harness_only_user_text(text)
-        }
+        ChatContent::Text { text } => !kkagent_protocol::visible_user_text(text).is_empty(),
         ChatContent::Image { .. } => true,
         _ => false,
     })
@@ -1921,6 +1926,53 @@ mod working_directory_tests {
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "v1\n");
         assert_eq!(session.messages.len(), 2);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn user_turn_starts_skip_tool_result_messages() {
+        let mut session = Session::new(
+            "turns".into(),
+            std::env::temp_dir(),
+            PermissionMode::Manual,
+            "test-model".into(),
+        );
+        session.messages.extend([
+            ChatMessage {
+                role: "user".into(),
+                content: vec![ChatContent::Text {
+                    text: "please edit".into(),
+                }],
+            },
+            ChatMessage {
+                role: "assistant".into(),
+                content: vec![ChatContent::ToolUse {
+                    id: "t1".into(),
+                    name: "Edit".into(),
+                    input: serde_json::json!({"path": "a.rs"}),
+                }],
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: vec![ChatContent::ToolResult {
+                    tool_use_id: "t1".into(),
+                    content: "updated".into(),
+                    is_error: false,
+                }],
+            },
+            ChatMessage {
+                role: "assistant".into(),
+                content: vec![ChatContent::Text {
+                    text: "done".into(),
+                }],
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: vec![ChatContent::Text {
+                    text: "next please".into(),
+                }],
+            },
+        ]);
+        assert_eq!(session.user_turn_starts(), vec![0, 4]);
     }
 
     #[test]
