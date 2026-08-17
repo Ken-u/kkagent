@@ -179,6 +179,47 @@ impl SessionStore {
         Ok(())
     }
 
+    /// Sweep legacy `sub-*` index entries left behind by old builds that
+    /// persisted subagent runs as real sessions (shell with no transcript
+    /// content). Each candidate is only removed when its metadata confirms it
+    /// is content-less, so a user-created session whose id merely starts with
+    /// `sub-` is never touched. Returns the swept session ids.
+    pub fn sweep_orphan_subagent_sessions(&self) -> anyhow::Result<Vec<String>> {
+        let index = read_session_index(&self.home_dir, &self.sessions_dir)?;
+        let mut swept = Vec::new();
+        for (id, entry) in index {
+            if !id.starts_with("sub-") {
+                continue;
+            }
+            let dir = PathBuf::from(&entry.session_dir);
+            // Safety guard: only delete when the session dir holds no
+            // meaningful content (no messages.jsonl rows and no recorded
+            // tool-result files). Missing dir entries are just unindexed.
+            let messages_path = dir.join("messages.jsonl");
+            let has_messages = messages_path.is_file()
+                && std::fs::read_to_string(&messages_path)
+                    .map(|text| text.lines().any(|line| !line.trim().is_empty()))
+                    .unwrap_or(true);
+            if has_messages {
+                continue;
+            }
+            let tool_results_dir = dir.join("tool_results");
+            let has_tool_results = tool_results_dir
+                .read_dir()
+                .map(|entries| entries.filter_map(Result::ok).count() > 0)
+                .unwrap_or(false);
+            if has_tool_results {
+                continue;
+            }
+            if dir.is_dir() {
+                std::fs::remove_dir_all(&dir)?;
+            }
+            append_session_index_deletion(&self.home_dir, &id)?;
+            swept.push(id);
+        }
+        Ok(swept)
+    }
+
     pub fn fork(
         &self,
         source_id: &str,
@@ -446,6 +487,46 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn sweep_orphan_subagent_sessions_removes_only_empty_sub_entries() {
+        let home = std::env::temp_dir().join(format!("kkagent-store-{}", uuid::Uuid::new_v4()));
+        let store = SessionStore::new(&home);
+        let work = home.join("proj");
+        std::fs::create_dir_all(&work).unwrap();
+
+        // 1. Empty subagent shell (legacy junk) — should be swept.
+        let empty_sub = store.create("sub-abc123", &work).unwrap();
+        // 2. Sub entry WITH messages — must be preserved.
+        let content_sub = store.create("sub-keepme", &work).unwrap();
+        std::fs::write(
+            Path::new(&content_sub.session_dir).join("messages.jsonl"),
+            "{\"role\":\"user\"}\n",
+        )
+        .unwrap();
+        // 3. Regular session — must be preserved.
+        store.create("normal-session", &work).unwrap();
+        // 4. Sub entry with tool results — must be preserved.
+        let tool_sub = store.create("sub-tools", &work).unwrap();
+        let tool_dir = Path::new(&tool_sub.session_dir).join("tool_results");
+        std::fs::create_dir_all(&tool_dir).unwrap();
+        std::fs::write(tool_dir.join("r1.json"), "{}").unwrap();
+
+        let swept = store.sweep_orphan_subagent_sessions().unwrap();
+        assert_eq!(swept, vec!["sub-abc123".to_string()]);
+        assert!(!Path::new(&empty_sub.session_dir).exists());
+        assert!(Path::new(&content_sub.session_dir).exists());
+        assert!(Path::new(&tool_sub.session_dir).exists());
+        assert!(store.get("normal-session").is_ok());
+        assert!(store.get("sub-keepme").is_ok());
+        assert!(store.get("sub-tools").is_ok());
+
+        // Idempotent: second sweep finds nothing.
+        let swept_again = store.sweep_orphan_subagent_sessions().unwrap();
+        assert!(swept_again.is_empty());
+
         let _ = std::fs::remove_dir_all(&home);
     }
 }

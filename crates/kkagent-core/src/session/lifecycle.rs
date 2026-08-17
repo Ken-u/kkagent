@@ -8,6 +8,10 @@ pub enum SessionCreateSource {
     Startup,
     Resume,
     Fork,
+    /// In-memory subagent run: no session-store index entry, no disk session
+    /// dir under `~/.kkagent/sessions` (scratch dir under the OS temp dir
+    /// instead, cleaned up when the run finishes).
+    Subagent,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

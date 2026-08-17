@@ -134,6 +134,7 @@ impl SessionServices {
                         SessionCreateSource::Startup => "startup",
                         SessionCreateSource::Resume => "resume",
                         SessionCreateSource::Fork => "fork",
+                        SessionCreateSource::Subagent => "subagent",
                     },
                 ),
             )

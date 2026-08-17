@@ -64,7 +64,7 @@ fn run_subagent_mirrored_boxed(
             .unwrap_or("general")
             .to_lowercase();
 
-        let mut session = Session::new(
+        let mut session = Session::for_subagent(
             format!("sub-{}", sub_cfg.agent_id),
             PathBuf::from(&sub_cfg.working_dir),
             permission_mode,
@@ -216,6 +216,9 @@ fn run_subagent_mirrored_boxed(
         }
 
         let run_result = agent.run_turn(&mut session).await;
+        // Ephemeral subagent scratch dir (SessionCreateSource::Subagent) —
+        // remove it on every exit path so temp storage never accumulates.
+        let _ = std::fs::remove_dir_all(session.session_dir());
         match run_result {
             Ok(()) => {
                 let result = extract_final_assistant_text(&session);

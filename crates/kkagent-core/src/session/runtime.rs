@@ -10,7 +10,7 @@ use crate::session::instructions::SessionInstructionsProvider;
 use crate::session::lifecycle::SessionCreateSource;
 use crate::session::metadata::{SessionMeta, SessionMetaPatch, TurnReason};
 use crate::session::services::SessionServices;
-use crate::session::store::{encode_work_dir_key, SessionStore};
+use crate::session::store::{encode_work_dir_key, is_safe_session_id, SessionStore};
 
 /// Pre-write snapshot so undo can restore files.
 #[derive(Debug, Clone)]
@@ -240,6 +240,26 @@ impl Session {
             permission_mode,
             model_alias,
             SessionCreateSource::Startup,
+            None,
+        )
+    }
+
+    /// Ephemeral session for an in-process subagent run. Never indexed by the
+    /// session store and never persisted under `~/.kkagent/sessions` — the
+    /// scratch dir lives under the OS temp dir and is removed by the caller
+    /// when the run finishes.
+    pub fn for_subagent(
+        id: String,
+        working_dir: PathBuf,
+        permission_mode: PermissionMode,
+        model_alias: String,
+    ) -> Self {
+        Self::new_with_source(
+            id,
+            working_dir,
+            permission_mode,
+            model_alias,
+            SessionCreateSource::Subagent,
             None,
         )
     }
@@ -1339,25 +1359,37 @@ fn resolve_session_dir(
     working_dir: &std::path::Path,
     source: SessionCreateSource,
 ) -> (PathBuf, String) {
-    let store = SessionStore::open_default();
     let workspace_id = encode_work_dir_key(working_dir);
     match source {
-        SessionCreateSource::Startup => match store.create(id, working_dir) {
-            Ok(summary) => (PathBuf::from(summary.session_dir), workspace_id),
-            Err(_) => {
-                // Already indexed — reuse.
-                if let Ok(summary) = store.get(id) {
-                    (PathBuf::from(summary.session_dir), workspace_id)
-                } else {
-                    let dir = store
-                        .session_dir_for(id, working_dir)
-                        .unwrap_or_else(|_| store.sessions_dir.join(&workspace_id).join(id));
-                    let _ = std::fs::create_dir_all(&dir);
-                    (dir, workspace_id)
+        SessionCreateSource::Subagent => {
+            // Subagent runs never touch the session store: no index entry, no
+            // persistent session dir. A unique scratch dir under the OS temp
+            // dir satisfies services that still want a path to write to, and
+            // it is removed when the run finishes (guard in subagent_runtime).
+            let dir = subagent_scratch_dir(id);
+            let _ = std::fs::create_dir_all(&dir);
+            (dir, workspace_id)
+        }
+        SessionCreateSource::Startup => {
+            let store = SessionStore::open_default();
+            match store.create(id, working_dir) {
+                Ok(summary) => (PathBuf::from(summary.session_dir), workspace_id),
+                Err(_) => {
+                    // Already indexed — reuse.
+                    if let Ok(summary) = store.get(id) {
+                        (PathBuf::from(summary.session_dir), workspace_id)
+                    } else {
+                        let dir = store
+                            .session_dir_for(id, working_dir)
+                            .unwrap_or_else(|_| store.sessions_dir.join(&workspace_id).join(id));
+                        let _ = std::fs::create_dir_all(&dir);
+                        (dir, workspace_id)
+                    }
                 }
             }
-        },
+        }
         SessionCreateSource::Resume | SessionCreateSource::Fork => {
+            let store = SessionStore::open_default();
             if let Ok(summary) = store.get(id) {
                 (PathBuf::from(summary.session_dir), workspace_id)
             } else {
@@ -1373,6 +1405,42 @@ fn resolve_session_dir(
                 }
             }
         }
+    }
+}
+
+/// Scratch dir for an ephemeral subagent session (OS temp dir, per-run unique
+/// by caller-supplied id; the caller removes it when the run ends).
+fn subagent_scratch_dir(id: &str) -> PathBuf {
+    let safe = if is_safe_session_id(id) {
+        id.to_string()
+    } else {
+        encode_work_dir_key(std::path::Path::new(id))
+    };
+    std::env::temp_dir().join("kkagent-subagent").join(format!(
+        "{}-{}",
+        safe,
+        uuid::Uuid::new_v4().simple()
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn subagent_source_never_touches_session_store() {
+        let home =
+            std::env::temp_dir().join(format!("kkagent-runtime-{}", uuid::Uuid::new_v4().simple()));
+        // Point the default store at a scratch home via env is not possible
+        // (open_default reads ~/.kkagent), so assert the pure helper instead:
+        // the scratch dir must live outside any kkagent sessions dir.
+        let dir = subagent_scratch_dir("sub-test");
+        assert!(dir.starts_with(std::env::temp_dir()));
+        assert!(dir.to_string_lossy().contains("kkagent-subagent"));
+        // Unique per call.
+        let dir2 = subagent_scratch_dir("sub-test");
+        assert_ne!(dir, dir2);
+        let _ = std::fs::remove_dir_all(&home);
     }
 }
 

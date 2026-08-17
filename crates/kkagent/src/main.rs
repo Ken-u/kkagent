@@ -4255,6 +4255,16 @@ async fn build_server_state_with_shutdown(
     let db_for_tool_results = TranscriptDb::from_shared(shared_sqlite.clone())?;
     let durable_http = kkagent_rpc::DurableHttpStore::from_shared(shared_sqlite.clone())?;
     let subagents = Arc::new(SubagentManager::from_shared(4, shared_sqlite)?);
+    // Legacy cleanup: old builds persisted subagent runs as real sessions,
+    // leaving empty `sub-*` entries in /sessions. Sweep them once at startup;
+    // subagent sessions are ephemeral since SessionCreateSource::Subagent.
+    match SessionStore::open_default().sweep_orphan_subagent_sessions() {
+        Ok(swept) if !swept.is_empty() => {
+            tracing::info!("swept {} orphan subagent session(s)", swept.len())
+        }
+        Ok(_) => {}
+        Err(error) => tracing::warn!("orphan subagent session sweep failed: {error}"),
+    }
     let sandbox_policy = kkagent_tools::sandbox::SandboxPolicy::from_app_config(&config)?;
     if let Some(reason) = sandbox_policy.auto_fallback_warning.as_ref() {
         kkagent_core::audit::record(&kkagent_core::audit::AuditEvent::SandboxFallback {
