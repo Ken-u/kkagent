@@ -5,60 +5,394 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>kkagent Web UI</title>
   <style>
-    :root { --bg:#0f1419; --panel:#1a2332; --text:#e7ecf3; --muted:#8b9bb4; --accent:#3d8bfd; --border:#2a3548; }
+    :root {
+      --bg: #0d1117;
+      --surface: #151b23;
+      --surface-hover: #1c242e;
+      --elevated: #212830;
+      --border: #30363d;
+      --border-strong: #3d444d;
+      --text: #e6edf3;
+      --text-secondary: #7d8590;
+      --accent: #2f81f7;
+      --accent-hover: #388bfd;
+      --danger: #f85149;
+      --success: #3fb950;
+      --warning: #f0883e;
+      --user-msg: rgba(47, 129, 247, 0.12);
+      --assistant-msg: transparent;
+      --system-msg: rgba(240, 136, 62, 0.10);
+      --shadow: 0 8px 24px rgba(0,0,0,0.35);
+      --radius: 12px;
+      --radius-sm: 8px;
+    }
     * { box-sizing: border-box; }
-    body { margin:0; font:14px/1.45 ui-sans-serif, system-ui, sans-serif; background:var(--bg); color:var(--text); height:100vh; display:grid; grid-template-columns:260px 1fr; }
-    aside { background:var(--panel); border-right:1px solid var(--border); padding:12px; overflow:auto; }
-    main { display:flex; flex-direction:column; min-width:0; }
-    h1 { font-size:16px; margin:0 0 12px; }
-    .session { padding:8px; border-radius:8px; cursor:pointer; color:var(--muted); }
-    .session.active, .session:hover { background:#243044; color:var(--text); }
-    #log { flex:1; overflow:auto; padding:16px; white-space:pre-wrap; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:12px; }
-    .msg { margin:0 0 12px; padding:10px 12px; border-radius:10px; background:var(--panel); border:1px solid var(--border); }
-    .msg.user { border-color:#35507a; }
-    .msg.assistant { border-color:#2f5d45; }
-    .msg .role { color:var(--muted); font-size:11px; margin-bottom:4px; }
-    form { display:flex; gap:8px; padding:12px; border-top:1px solid var(--border); background:var(--panel); }
-    input, button { font:inherit; }
-    input { flex:1; background:#0f1419; color:var(--text); border:1px solid var(--border); border-radius:8px; padding:10px 12px; }
-    button { background:var(--accent); color:white; border:0; border-radius:8px; padding:10px 14px; cursor:pointer; }
-    #status { color:var(--muted); font-size:12px; margin-bottom:8px; }
-    pre.diff { background:#111820; padding:8px; overflow:auto; border-radius:6px; }
-    code { color:#9cdcfe; }
-    #tokenGate { display:none; position:fixed; inset:0; background:var(--bg); z-index:10; align-items:center; justify-content:center; }
-    #tokenGate .card { background:var(--panel); border:1px solid var(--border); border-radius:12px; padding:24px; width:min(420px, 90vw); }
-    #tokenGate h2 { margin:0 0 8px; font-size:16px; }
-    #tokenGate p { margin:0 0 16px; color:var(--muted); font-size:13px; }
-    #tokenHint { color:#e3745f; font-size:12px; min-height:16px; margin-top:8px; }
+    html, body { height: 100%; }
+    body {
+      margin: 0;
+      font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Noto Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      display: grid;
+      grid-template-columns: 280px 1fr;
+    }
+
+    /* Sidebar */
+    aside {
+      background: var(--surface);
+      border-right: 1px solid var(--border);
+      display: flex;
+      flex-direction: column;
+      min-width: 0;
+    }
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 14px 16px;
+      border-bottom: 1px solid var(--border);
+    }
+    .brand-icon {
+      width: 28px; height: 28px;
+      border-radius: 8px;
+      background: linear-gradient(135deg, var(--accent), #a371f7);
+      display: grid; place-items: center;
+      font-weight: 800; font-size: 13px; color: #fff;
+    }
+    .brand h1 { font-size: 15px; margin: 0; font-weight: 600; }
+    .brand .version { font-size: 11px; color: var(--text-secondary); margin-top: 2px; }
+    #status {
+      padding: 8px 16px;
+      font-size: 12px;
+      color: var(--text-secondary);
+      border-bottom: 1px solid var(--border);
+    }
+    #status.online { color: var(--success); }
+    #status.offline { color: var(--danger); }
+    .sidebar-actions {
+      display: flex; flex-direction: column; gap: 8px;
+      padding: 12px 14px;
+    }
+    button {
+      font: inherit;
+      border: 0; border-radius: var(--radius-sm);
+      padding: 9px 12px;
+      cursor: pointer;
+      transition: background .15s, transform .05s;
+    }
+    button:active { transform: translateY(1px); }
+    .btn-primary { background: var(--accent); color: #fff; }
+    .btn-primary:hover { background: var(--accent-hover); }
+    .btn-secondary { background: var(--elevated); color: var(--text); border: 1px solid var(--border); }
+    .btn-secondary:hover { background: var(--surface-hover); border-color: var(--border-strong); }
+    #searchBox {
+      margin: 0 14px 10px;
+      background: var(--bg);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      padding: 9px 12px;
+      font: inherit;
+      outline: none;
+    }
+    #searchBox:focus { border-color: var(--accent); }
+    #sessions {
+      flex: 1;
+      overflow: auto;
+      padding: 0 8px 12px;
+    }
+    .session {
+      padding: 10px 12px;
+      border-radius: var(--radius-sm);
+      cursor: pointer;
+      color: var(--text-secondary);
+      font-size: 13px;
+      display: flex;
+      flex-direction: column;
+      gap: 3px;
+      transition: background .15s, color .15s;
+      margin-bottom: 4px;
+    }
+    .session:hover { background: var(--surface-hover); color: var(--text); }
+    .session.active { background: var(--elevated); color: var(--text); box-shadow: inset 0 0 0 1px var(--border-strong); }
+    .session-title { font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .session-meta { font-size: 11px; color: var(--text-secondary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+    /* Main */
+    main { display: flex; flex-direction: column; min-width: 0; background: var(--bg); }
+    #log {
+      flex: 1;
+      overflow: auto;
+      padding: 24px 24px 8px;
+      scroll-behavior: smooth;
+    }
+    .welcome {
+      max-width: 560px;
+      margin: 10vh auto;
+      text-align: center;
+      color: var(--text-secondary);
+    }
+    .welcome h2 { color: var(--text); font-size: 26px; margin-bottom: 12px; font-weight: 600; }
+    .welcome p { margin: 0 0 24px; line-height: 1.6; }
+    .samples { display: flex; flex-wrap: wrap; gap: 10px; justify-content: center; }
+    .sample {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 12px 16px;
+      font-size: 13px;
+      color: var(--text-secondary);
+      cursor: pointer;
+      transition: border-color .15s, color .15s;
+    }
+    .sample:hover { border-color: var(--accent); color: var(--text); }
+
+    .message {
+      display: flex;
+      gap: 14px;
+      margin-bottom: 18px;
+      animation: fadeIn .25s ease;
+    }
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
+    .avatar {
+      width: 32px; height: 32px;
+      border-radius: 50%;
+      flex-shrink: 0;
+      display: grid; place-items: center;
+      font-size: 14px; font-weight: 700; color: #fff;
+    }
+    .avatar.user { background: linear-gradient(135deg, var(--accent), #5cadff); }
+    .avatar.assistant { background: linear-gradient(135deg, #7d3cff, #a371f7); }
+    .avatar.system { background: var(--warning); }
+    .message-body { min-width: 0; flex: 1; padding-top: 3px; }
+    .message-header {
+      display: flex; align-items: baseline; gap: 8px;
+      margin-bottom: 4px;
+      font-size: 13px;
+    }
+    .role-name { font-weight: 600; color: var(--text); }
+    .timestamp { color: var(--text-secondary); font-size: 11px; }
+    .bubble {
+      background: var(--assistant-msg);
+      border: 1px solid transparent;
+      border-radius: var(--radius);
+      padding: 2px 0;
+      color: var(--text);
+      word-break: break-word;
+    }
+    .message.user .bubble { background: var(--user-msg); border-color: rgba(47,129,247,0.25); padding: 12px 16px; }
+    .message.system .bubble { background: var(--system-msg); border-color: rgba(240,136,62,0.25); padding: 10px 14px; }
+    .bubble p { margin: 0 0 10px; }
+    .bubble p:last-child { margin-bottom: 0; }
+    .bubble pre {
+      background: #0a0c10;
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      padding: 12px 14px;
+      overflow: auto;
+      font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+      font-size: 13px;
+      line-height: 1.5;
+      margin: 10px 0;
+    }
+    .bubble pre code { color: inherit; background: transparent; padding: 0; }
+    .bubble code {
+      font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+      font-size: 13px;
+      background: rgba(255,255,255,0.08);
+      padding: 2px 5px;
+      border-radius: 5px;
+      color: #ff7b72;
+    }
+    .bubble ul, .bubble ol { margin: 8px 0; padding-left: 22px; }
+    .bubble li { margin: 4px 0; }
+    .bubble blockquote {
+      border-left: 3px solid var(--accent);
+      margin: 10px 0; padding: 4px 14px;
+      color: var(--text-secondary);
+    }
+    .bubble table { border-collapse: collapse; margin: 10px 0; font-size: 13px; }
+    .bubble th, .bubble td { border: 1px solid var(--border); padding: 6px 10px; }
+    .bubble th { background: var(--surface); }
+    .bubble a { color: var(--accent); text-decoration: none; }
+    .bubble a:hover { text-decoration: underline; }
+
+    /* Composer */
+    .composer-wrap {
+      padding: 14px 24px 24px;
+      background: linear-gradient(to top, var(--bg) 80%, transparent);
+    }
+    #composer {
+      display: flex; align-items: flex-end; gap: 10px;
+      background: var(--surface);
+      border: 1px solid var(--border-strong);
+      border-radius: var(--radius);
+      padding: 10px 12px;
+      box-shadow: var(--shadow);
+      transition: border-color .15s;
+    }
+    #composer:focus-within { border-color: var(--accent); }
+    #prompt {
+      flex: 1;
+      min-height: 22px;
+      max-height: 180px;
+      background: transparent;
+      color: var(--text);
+      border: 0;
+      outline: none;
+      font: inherit;
+      line-height: 1.5;
+      resize: none;
+      padding: 4px 2px;
+    }
+    #prompt::placeholder { color: var(--text-secondary); }
+    #sendBtn {
+      background: var(--accent);
+      color: #fff;
+      width: 34px; height: 34px;
+      border-radius: 8px;
+      display: grid; place-items: center;
+      padding: 0;
+      flex-shrink: 0;
+    }
+    #sendBtn:hover { background: var(--accent-hover); }
+    #sendBtn:disabled { background: var(--border-strong); cursor: not-allowed; }
+    .composer-hint {
+      text-align: center;
+      font-size: 11px;
+      color: var(--text-secondary);
+      margin-top: 8px;
+    }
+
+    /* Typing indicator */
+    .typing {
+      display: inline-flex; gap: 4px;
+      padding: 10px 12px;
+      align-items: center;
+    }
+    .typing span {
+      width: 7px; height: 7px;
+      background: var(--text-secondary);
+      border-radius: 50%;
+      animation: bounce 1.4s infinite ease-in-out both;
+    }
+    .typing span:nth-child(1) { animation-delay: -0.32s; }
+    .typing span:nth-child(2) { animation-delay: -0.16s; }
+    @keyframes bounce {
+      0%, 80%, 100% { transform: scale(0); }
+      40% { transform: scale(1); }
+    }
+
+    /* Token gate */
+    #tokenGate {
+      display: none;
+      position: fixed; inset: 0;
+      background: var(--bg);
+      z-index: 20;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+    }
+    #tokenGate .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 28px;
+      width: min(420px, 100%);
+      box-shadow: var(--shadow);
+    }
+    #tokenGate h2 { margin: 0 0 6px; font-size: 18px; }
+    #tokenGate p { margin: 0 0 18px; color: var(--text-secondary); font-size: 14px; line-height: 1.5; }
+    #tokenForm { display: flex; gap: 10px; }
+    #tokenInput {
+      flex: 1;
+      background: var(--bg);
+      color: var(--text);
+      border: 1px solid var(--border-strong);
+      border-radius: var(--radius-sm);
+      padding: 10px 12px;
+      font: inherit;
+      outline: none;
+    }
+    #tokenInput:focus { border-color: var(--accent); }
+    #tokenHint { color: var(--danger); font-size: 12px; min-height: 16px; margin-top: 10px; }
+
+    /* Mobile */
+    @media (max-width: 760px) {
+      body { grid-template-columns: 1fr; }
+      aside { position: fixed; inset: 0; z-index: 10; transform: translateX(-100%); transition: transform .2s; }
+      aside.open { transform: translateX(0); }
+      .menu-toggle {
+        display: grid; place-items: center;
+        width: 34px; height: 34px;
+        background: var(--elevated);
+        border: 1px solid var(--border);
+        border-radius: var(--radius-sm);
+        color: var(--text);
+        position: fixed;
+        top: 10px; left: 10px;
+        z-index: 11;
+      }
+      .brand { padding-left: 50px; }
+      #log { padding: 18px 16px 6px; }
+      .composer-wrap { padding: 12px 16px 16px; }
+    }
+    @media (min-width: 761px) {
+      .menu-toggle { display: none; }
+    }
+
+    /* Scrollbar */
+    ::-webkit-scrollbar { width: 8px; height: 8px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+    ::-webkit-scrollbar-thumb:hover { background: var(--border-strong); }
   </style>
 </head>
 <body>
   <div id="tokenGate">
     <div class="card">
-      <h2>kkagent 需要访问令牌</h2>
-      <p>该服务已启用鉴权。请输入启动 server 时打印的 HTTP token，也可以在 URL 中带上 <code>?token=…</code>。</p>
+      <h2>需要访问令牌</h2>
+      <p>该服务已启用鉴权。请输入启动 server 时打印的 HTTP token，或在 URL 中带上 <code>?token=…</code>。</p>
       <form id="tokenForm">
         <input id="tokenInput" placeholder="粘贴 token…" autocomplete="off" />
-        <button type="submit">连接</button>
+        <button type="submit" class="btn-primary">连接</button>
       </form>
       <div id="tokenHint"></div>
     </div>
   </div>
-  <aside>
-    <h1>kkagent</h1>
+
+  <button class="menu-toggle" id="menuToggle" aria-label="Open sidebar">☰</button>
+
+  <aside id="sidebar">
+    <div class="brand">
+      <div class="brand-icon">K</div>
+      <div>
+        <h1>kkagent</h1>
+        <div class="version">Web UI</div>
+      </div>
+    </div>
     <div id="status">connecting…</div>
-    <button id="newSession" style="width:100%;margin-bottom:8px;">New session</button>
-    <button id="timelineBtn" style="width:100%;margin-bottom:8px;background:#35507a;">Timeline</button>
-    <input id="searchBox" placeholder="Search sessions…" style="width:100%;margin-bottom:12px;background:#0f1419;color:var(--text);border:1px solid var(--border);border-radius:8px;padding:8px;" />
+    <div class="sidebar-actions">
+      <button id="newSession" class="btn-primary">+ 新会话</button>
+      <button id="timelineBtn" class="btn-secondary">查看 Timeline</button>
+    </div>
+    <input id="searchBox" placeholder="搜索会话…" />
     <div id="sessions"></div>
   </aside>
+
   <main>
     <div id="log"></div>
-    <form id="composer">
-      <input id="prompt" placeholder="Message kkagent… (/commit /explain /fix)" autocomplete="off" />
-      <button type="submit">Send</button>
-    </form>
+    <div class="composer-wrap">
+      <form id="composer">
+        <textarea id="prompt" rows="1" placeholder="给 kkagent 发送消息…（/commit /explain /fix）"></textarea>
+        <button type="submit" id="sendBtn" aria-label="Send">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"></line><polygon points="22 2 15 22 11 13 2 9 22 2"></polygon></svg>
+        </button>
+      </form>
+      <div class="composer-hint">Enter 发送 · Shift + Enter 换行</div>
+    </div>
   </main>
+
   <script src="/ui/app.js"></script>
 </body>
 </html>
