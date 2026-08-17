@@ -225,6 +225,7 @@ impl SessionStore {
         copy_dir_recursive(&source_dir, &target_dir)?;
         // Drop non-forkable files
         let _ = std::fs::remove_file(target_dir.join("upcoming-goals.json"));
+        let _ = std::fs::remove_file(target_dir.join("goal.json"));
 
         let mut meta = SessionMetadataService::load_or_create(&target_dir, target_id, &work)?;
         meta.update(

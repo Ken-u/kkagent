@@ -2981,6 +2981,7 @@ async fn build_turn_tool_registry(
     state: &Arc<ServerState>,
     event_tx: mpsc::Sender<AgentEvent>,
     todos: Vec<kkagent_protocol::TodoItemEvent>,
+    session_id: &str,
 ) -> ToolRegistry {
     // MCP discovery starts in the background so the TUI can paint immediately.
     // Synchronize only when a turn actually needs its final tool registry.
@@ -3107,17 +3108,18 @@ async fn build_turn_tool_registry(
             state.bash_shells.clone(),
         ),
     ));
+    let goal_mgr = state.goal_for(session_id).await;
     tools.register(Arc::new(kkagent_tools::builtin::CreateGoalTool::new(
-        state.goal_mgr.clone(),
+        goal_mgr.clone(),
     )));
     tools.register(Arc::new(kkagent_tools::builtin::GetGoalTool::new(
-        state.goal_mgr.clone(),
+        goal_mgr.clone(),
     )));
     tools.register(Arc::new(kkagent_tools::builtin::UpdateGoalTool::new(
-        state.goal_mgr.clone(),
+        goal_mgr.clone(),
     )));
     tools.register(Arc::new(kkagent_tools::builtin::SetGoalBudgetTool::new(
-        state.goal_mgr.clone(),
+        goal_mgr,
     )));
     tools.register(Arc::new(kkagent_tools::builtin::SkillTool::new(
         state.skills.clone(),
@@ -3189,7 +3191,13 @@ async fn run_http_turn(
     };
     session.begin_turn();
 
-    let tools = build_turn_tool_registry(&state, event_tx.clone(), session.todo_items()).await;
+    let tools = build_turn_tool_registry(
+        &state,
+        event_tx.clone(),
+        session.todo_items(),
+        session.id.as_str(),
+    )
+    .await;
 
     let permission_rules = state
         .config()
@@ -3209,7 +3217,7 @@ async fn run_http_turn(
         state.abort_registry.clone(),
     )
     .with_hooks(state.hooks.clone())
-    .with_goal_manager(state.goal_mgr.clone())
+    .with_goal_manager(state.goal_for(session.id.as_str()).await)
     .with_tool_result_store(state.tool_result_store.clone());
 
     // Prune expired toolchain grants (Once/Turn scope) before the turn starts.
@@ -3240,6 +3248,8 @@ struct ServerState {
     shared_config: StdRwLock<Arc<AppConfig>>,
     /// Absolute path used for `/reload` / `config.reload`.
     config_path: PathBuf,
+    /// User home directory; session wire dirs (incl. goal snapshots) live under it.
+    home_dir: PathBuf,
     sandbox_policy: StdRwLock<kkagent_tools::sandbox::SandboxPolicy>,
     workspace_trust: StdRwLock<kkagent_config::WorkspaceTrustStore>,
     sessions: Mutex<HashMap<String, Session>>,
@@ -3277,9 +3287,10 @@ struct ServerState {
     bash_shells: Arc<kkagent_tools::builtin::BackgroundShellManager>,
     toolchain_grants: Arc<kkagent_tools::toolchain::ToolchainGrantStore>,
     cron: Arc<kkagent_tools::CronManager>,
+    /// Per-session goal state (isolated; each persisted under the session's wire dir).
+    goal_managers: Mutex<HashMap<String, Arc<kkagent_protocol::goal::GoalManager>>>,
     /// Pending cron-fire XML injections for the next turn.
     cron_fires: Arc<Mutex<Vec<String>>>,
-    goal_mgr: Arc<kkagent_protocol::goal::GoalManager>,
     hooks: Arc<kkagent_mcp::HookManager>,
     skills: Arc<kkagent_tools::SkillCatalog>,
     web: Arc<kkagent_tools::WebServicesConfig>,
@@ -3544,6 +3555,51 @@ impl SessionTurnLocks {
 impl ServerState {
     fn client_count(&self) -> usize {
         self.client_count.load(Ordering::SeqCst)
+    }
+
+    /// Per-session goal state, lazily created and restored from the session's store dir.
+    fn goal_file(&self, session_id: &str) -> PathBuf {
+        if !is_safe_session_id(session_id) {
+            // Path traversal guard: fall back to a sanitized placeholder.
+            return self.home_dir.join(".kkagent").join("goal-invalid.json");
+        }
+        let dir = kkagent_core::session::store::SessionStore::open_default()
+            .get(session_id)
+            .ok()
+            .map(|summary| PathBuf::from(summary.session_dir));
+        dir.unwrap_or_else(|| {
+            self.home_dir
+                .join(".kkagent")
+                .join("sessions")
+                .join(session_id)
+        })
+        .join("goal.json")
+    }
+
+    pub async fn goal_for(&self, session_id: &str) -> Arc<kkagent_protocol::goal::GoalManager> {
+        let mut managers = self.goal_managers.lock().await;
+        if let Some(mgr) = managers.get(session_id) {
+            return mgr.clone();
+        }
+        let mgr = Arc::new(
+            kkagent_protocol::goal::GoalManager::with_persist(self.goal_file(session_id)).await,
+        );
+        managers.insert(session_id.to_string(), mgr.clone());
+        mgr
+    }
+
+    /// Drop a session's goal manager and delete its persisted snapshot.
+    pub async fn drop_goal(&self, session_id: &str) {
+        let mgr = self.goal_managers.lock().await.remove(session_id);
+        if let Some(mgr) = mgr {
+            mgr.clear_goal().await;
+        }
+        let path = self.goal_file(session_id);
+        if let Err(error) = tokio::fs::remove_file(&path).await {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!("goal cleanup {}: {error}", path.display());
+            }
+        }
     }
 
     async fn has_active_turns(&self) -> bool {
@@ -4285,7 +4341,8 @@ async fn build_server_state_with_shutdown(
     let skills = Arc::new(skills);
     skills.set_disabled(config.disabled_skills.clone()).await;
     let cron = Arc::new(cron);
-    let goal_mgr = Arc::new(kkagent_protocol::goal::GoalManager::new());
+    let goal_managers: Mutex<HashMap<String, Arc<kkagent_protocol::goal::GoalManager>>> =
+        Mutex::new(HashMap::new());
     let web = Arc::new(kkagent_tools::WebServicesConfig::from_app(&config));
 
     let cron_fires: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
@@ -4358,6 +4415,7 @@ async fn build_server_state_with_shutdown(
     let state = Arc::new(ServerState {
         shared_config: StdRwLock::new(config.clone()),
         config_path,
+        home_dir: home.clone(),
         sandbox_policy: StdRwLock::new(sandbox_policy),
         workspace_trust: StdRwLock::new(config.workspace_trust.clone()),
         sessions: Mutex::new(HashMap::new()),
@@ -4384,7 +4442,7 @@ async fn build_server_state_with_shutdown(
         toolchain_grants: Arc::new(kkagent_tools::toolchain::ToolchainGrantStore::new()),
         cron,
         cron_fires,
-        goal_mgr,
+        goal_managers,
         hooks,
         skills,
         web,
@@ -4772,7 +4830,8 @@ async fn spawn_session_agent_turn(
                 .map(Session::todo_items)
                 .unwrap_or_default()
         };
-        let tools = build_turn_tool_registry(&state_clone, agent_event_tx.clone(), todos).await;
+        let tools =
+            build_turn_tool_registry(&state_clone, agent_event_tx.clone(), todos, &sid).await;
         let permission = PermissionChain::with_shared_mode(shared_mode, permission_rules);
         let agent_loop = Arc::new(
             AgentLoop::new(
@@ -4783,7 +4842,7 @@ async fn spawn_session_agent_turn(
                 state_clone.abort_registry.clone(),
             )
             .with_hooks(state_clone.hooks.clone())
-            .with_goal_manager(state_clone.goal_mgr.clone())
+            .with_goal_manager(state_clone.goal_for(&sid).await)
             .with_tool_result_store(state_clone.tool_result_store.clone()),
         );
 
@@ -5676,6 +5735,7 @@ async fn handle_rpc_call(
             state.question_txs.lock().await.remove(&session_id);
             state.steer_mailboxes.lock().await.remove(&session_id);
             state.active_btw_sessions.lock().await.remove(&session_id);
+            state.drop_goal(&session_id).await;
             if let Some(session) = removed {
                 session.services.on_close(SessionCloseReason::Exit).await;
             }
@@ -6522,18 +6582,19 @@ async fn handle_rpc_call(
                 });
             };
 
+            let goal_mgr = state.goal_for(&session_id).await;
             match action {
-                "status" | "get" => Ok(goal_snapshot(&state.goal_mgr).await),
+                "status" | "get" => Ok(goal_snapshot(&goal_mgr).await),
                 "pause" => {
-                    state.goal_mgr.pause_goal().await;
-                    let body = goal_snapshot(&state.goal_mgr).await;
+                    goal_mgr.pause_goal().await;
+                    let body = goal_snapshot(&goal_mgr).await;
                     publish_goal(session_id, &body, "paused");
                     Ok(body)
                 }
                 "resume" => {
-                    state.goal_mgr.resume_goal().await;
-                    let body = goal_snapshot(&state.goal_mgr).await;
-                    let should_prompt = state.goal_mgr.should_continue().await;
+                    goal_mgr.resume_goal().await;
+                    let body = goal_snapshot(&goal_mgr).await;
+                    let should_prompt = goal_mgr.should_continue().await;
                     publish_goal(session_id.clone(), &body, "resumed");
                     if should_prompt {
                         let prompt = format!(
@@ -6561,8 +6622,8 @@ async fn handle_rpc_call(
                     Ok(body)
                 }
                 "cancel" => {
-                    let _ = state.goal_mgr.cancel_goal().await;
-                    let body = goal_snapshot(&state.goal_mgr).await;
+                    let _ = goal_mgr.cancel_goal().await;
+                    let body = goal_snapshot(&goal_mgr).await;
                     publish_goal(session_id.clone(), &body, "cancelled");
                     {
                         let mut sessions = state.sessions.lock().await;
@@ -6585,7 +6646,7 @@ async fn handle_rpc_call(
                             .and_then(|p| p.get("replace"))
                             .and_then(|v| v.as_bool())
                             .unwrap_or(false);
-                    if let Some(existing) = state.goal_mgr.get_goal().await {
+                    if let Some(existing) = goal_mgr.get_goal().await {
                         if !existing.is_terminal() && !replace && action != "replace" {
                             return Err((
                                 -32000,
@@ -6597,17 +6658,15 @@ async fn handle_rpc_call(
                         }
                     }
                     let goal = if replace || action == "replace" {
-                        state
-                            .goal_mgr
+                        goal_mgr
                             .replace_goal(&objective, kkagent_protocol::goal::GoalBudget::default())
                             .await
                     } else {
-                        state
-                            .goal_mgr
+                        goal_mgr
                             .create_goal(&objective, kkagent_protocol::goal::GoalBudget::default())
                             .await
                     };
-                    let body = goal_snapshot(&state.goal_mgr).await;
+                    let body = goal_snapshot(&goal_mgr).await;
                     publish_goal(session_id.clone(), &body, "created");
                     let prompt = format!(
                         "Pursue this goal until complete or blocked.\n\n{}\n\n{}",

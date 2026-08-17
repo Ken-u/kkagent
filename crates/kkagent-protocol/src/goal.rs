@@ -1,5 +1,6 @@
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -241,8 +242,18 @@ struct GoalInner {
     journal: Vec<GoalOp>,
 }
 
+/// On-disk snapshot of a session goal (atomic tmp+rename writes).
+#[derive(Serialize, Deserialize)]
+struct GoalFile {
+    version: u32,
+    goal: Option<Goal>,
+}
+
+const GOAL_FILE_VERSION: u32 = 1;
+
 pub struct GoalManager {
     inner: Arc<Mutex<GoalInner>>,
+    persist_path: Option<PathBuf>,
 }
 
 impl GoalManager {
@@ -253,6 +264,46 @@ impl GoalManager {
                 active_since: None,
                 journal: Vec::new(),
             })),
+            persist_path: None,
+        }
+    }
+
+    /// Load from `path` if present; subsequent mutations persist there atomically.
+    pub async fn with_persist(path: PathBuf) -> Self {
+        let mgr = Self {
+            inner: Arc::new(Mutex::new(GoalInner {
+                current: None,
+                active_since: None,
+                journal: Vec::new(),
+            })),
+            persist_path: Some(path.clone()),
+        };
+        match tokio::fs::read(&path).await {
+            Ok(raw) => match serde_json::from_slice::<GoalFile>(&raw) {
+                Ok(file) => {
+                    if let Some(goal) = file.goal {
+                        mgr.load_snapshot(goal).await;
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!("goal snapshot {}: parse error: {error}", path.display())
+                }
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                tracing::warn!("goal snapshot {}: read error: {error}", path.display())
+            }
+        }
+        mgr
+    }
+
+    /// Best-effort persist while holding the state lock (callers must hold the guard).
+    async fn persist(&self, guard: &GoalInner) {
+        let Some(path) = &self.persist_path else {
+            return;
+        };
+        if let Err(error) = write_goal_file(path, guard.current.as_ref()).await {
+            tracing::warn!("goal persist {}: {error}", path.display());
         }
     }
 
@@ -299,6 +350,7 @@ impl GoalManager {
         });
         guard.current = Some(goal.clone());
         guard.active_since = Some(std::time::Instant::now());
+        self.persist(&guard).await;
         goal
     }
 
@@ -340,6 +392,7 @@ impl GoalManager {
             time: goal.updated_at.clone(),
         };
         guard.journal.push(op);
+        self.persist(&guard).await;
     }
 
     pub async fn should_continue(&self) -> bool {
@@ -371,6 +424,7 @@ impl GoalManager {
             time: Utc::now().to_rfc3339(),
         });
         guard.active_since = None;
+        self.persist(&guard).await;
         Some(goal)
     }
 
@@ -396,6 +450,7 @@ impl GoalManager {
         };
         guard.journal.push(op);
         guard.current = Some(goal);
+        self.persist(&guard).await;
     }
 
     /// Legacy alias: map former Failed semantics onto Blocked.
@@ -408,6 +463,7 @@ impl GoalManager {
         if let Some(goal) = guard.current.as_mut() {
             goal.completion_criterion = Some(criterion.to_string());
             goal.updated_at = Utc::now().to_rfc3339();
+            self.persist(&guard).await;
         }
     }
 
@@ -435,6 +491,7 @@ impl GoalManager {
         };
         guard.journal.push(op);
         guard.current = Some(goal);
+        self.persist(&guard).await;
     }
 
     pub async fn resume_goal(&self) {
@@ -460,6 +517,7 @@ impl GoalManager {
             guard.journal.push(op);
         }
         guard.current = Some(goal);
+        self.persist(&guard).await;
     }
 
     pub async fn cancel_goal(&self) -> Option<Goal> {
@@ -473,6 +531,7 @@ impl GoalManager {
             time: goal.updated_at.clone(),
         });
         guard.active_since = None;
+        self.persist(&guard).await;
         Some(goal)
     }
 
@@ -483,6 +542,7 @@ impl GoalManager {
         guard.journal.push(GoalOp::Clear {
             time: Utc::now().to_rfc3339(),
         });
+        self.persist(&guard).await;
     }
 
     pub async fn update_budget(&self, budget: GoalBudget) {
@@ -504,6 +564,7 @@ impl GoalManager {
         };
         guard.journal.push(op);
         guard.current = Some(goal);
+        self.persist(&guard).await;
     }
 
     /// On session restore / fork recovery: active → paused (wall-clock stops).
@@ -529,6 +590,7 @@ impl GoalManager {
             guard.journal.push(op);
         }
         guard.current = Some(goal);
+        self.persist(&guard).await;
     }
 
     /// Replace in-memory goal from a persisted snapshot (then [`on_restore`]).
@@ -560,6 +622,30 @@ impl GoalManager {
 impl Default for GoalManager {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Atomic goal snapshot write: tmp file + rename; `None` removes the file.
+async fn write_goal_file(path: &Path, goal: Option<&Goal>) -> std::io::Result<()> {
+    match goal {
+        Some(goal) => {
+            let file = GoalFile {
+                version: GOAL_FILE_VERSION,
+                goal: Some(goal.clone()),
+            };
+            let bytes = serde_json::to_vec_pretty(&file).map_err(std::io::Error::other)?;
+            if let Some(parent) = path.parent() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+            let tmp = path.with_extension("tmp");
+            tokio::fs::write(&tmp, &bytes).await?;
+            tokio::fs::rename(&tmp, path).await
+        }
+        None => match tokio::fs::remove_file(path).await {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        },
     }
 }
 
@@ -660,5 +746,80 @@ mod tests {
         mgr.resume_goal().await;
         assert_eq!(mgr.get_goal().await.unwrap().status, GoalStatus::Active);
         assert!(mgr.should_continue().await);
+    }
+
+    fn temp_goal_path(tag: &str) -> std::path::PathBuf {
+        let mut path = std::env::temp_dir();
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let pid = std::process::id();
+        path.push(format!("kkagent-goal-{tag}-{pid}-{nonce}.json"));
+        path
+    }
+
+    #[tokio::test]
+    async fn persists_and_restores_across_managers() {
+        let path = temp_goal_path("roundtrip");
+        let mgr = GoalManager::with_persist(path.clone()).await;
+        mgr.create_goal(
+            "persisted goal",
+            GoalBudget {
+                turn_budget: Some(3),
+                token_budget: Some(42),
+                wall_clock_budget_ms: None,
+            },
+        )
+        .await;
+        mgr.record_turn(7).await;
+        assert!(path.is_file());
+
+        // New manager instance restores the same goal (paused on restore semantics).
+        let restored = GoalManager::with_persist(path.clone()).await;
+        let goal = restored.get_goal().await.expect("goal restored");
+        assert_eq!(goal.description, "persisted goal");
+        assert_eq!(goal.budget.token_budget, Some(42));
+        assert_eq!(goal.turns_used, 1);
+        assert_eq!(goal.tokens_used, 7);
+        // Restored active goals are paused so wall-clock does not tick unseen.
+        assert_eq!(goal.status, GoalStatus::Paused);
+
+        // Cancellation removes the snapshot entirely.
+        restored.cancel_goal().await;
+        assert!(!path.exists());
+        drop(mgr);
+    }
+
+    #[tokio::test]
+    async fn cancel_persists_removal() {
+        let path = temp_goal_path("cancel");
+        let mgr = GoalManager::with_persist(path.clone()).await;
+        mgr.create_goal("gone soon", GoalBudget::default()).await;
+        assert!(path.is_file());
+        mgr.cancel_goal().await;
+        assert!(!path.exists());
+        // Clearing on an already-empty manager must not error.
+        mgr.clear_goal().await;
+    }
+
+    #[tokio::test]
+    async fn two_managers_do_not_share_state() {
+        // Two managers (per-session) are fully isolated even with the same objective.
+        let a = GoalManager::with_persist(temp_goal_path("iso-a")).await;
+        let b = GoalManager::with_persist(temp_goal_path("iso-b")).await;
+        a.create_goal("session A goal", GoalBudget::default()).await;
+        b.create_goal("session B goal", GoalBudget::default()).await;
+        b.record_turn(99).await;
+
+        let goal_a = a.get_goal().await.unwrap();
+        let goal_b = b.get_goal().await.unwrap();
+        assert_eq!(goal_a.description, "session A goal");
+        assert_eq!(goal_b.description, "session B goal");
+        assert_eq!(goal_a.tokens_used, 0);
+        assert_eq!(goal_b.tokens_used, 99);
+        // Pausing B must not affect A.
+        b.pause_goal().await;
+        assert_eq!(a.get_goal().await.unwrap().status, GoalStatus::Active);
     }
 }
