@@ -7538,7 +7538,6 @@ impl TuiApp {
                 .get("output_tokens")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0);
-            self.state.approx_tokens = input.saturating_add(output);
             self.state.usage_session = SessionUsageTotals {
                 input_tokens: input,
                 output_tokens: output,
@@ -7551,6 +7550,21 @@ impl TuiApp {
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0),
             };
+            // `approx_tokens` reflects the *current context size* (most recent
+            // single LLM call), NOT the session-running total. Prefer the
+            // dedicated `last_step_usage` field; fall back to `usage` only for
+            // older servers that don't send it.
+            let ctx_input = data
+                .get("last_step_usage")
+                .and_then(|u| u.get("input_tokens"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(input);
+            let ctx_output = data
+                .get("last_step_usage")
+                .and_then(|u| u.get("output_tokens"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(output);
+            self.state.approx_tokens = ctx_input.saturating_add(ctx_output);
         }
         if let Some(plan) = data.get("plan_mode").and_then(|v| v.as_bool()) {
             self.state.on_plan_mode_changed(plan);

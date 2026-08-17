@@ -3802,6 +3802,10 @@ mod render_smoke {
         let backend = TestBackend::new(90, 20);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut state = AppState::new(PermissionMode::Manual, false);
+        // Pin a short cwd so the footer layout assertion isn't perturbed by the
+        // real working directory (e.g. a long worktree path can squeeze the
+        // `btw` label off the 90-col line).
+        state.working_dir = std::path::PathBuf::from("/repo");
         state.mode = AppMode::Btw;
         state.btw.open = true;
         state.btw.turns.push(crate::panes::BtwTurnView {

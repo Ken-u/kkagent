@@ -5982,6 +5982,7 @@ async fn handle_rpc_call(
                     (
                         existing.messages.clone(),
                         existing.usage.snapshot(),
+                        existing.usage.last_step.clone(),
                         plan_state_json(existing.plan_state()),
                         existing.pending_plan_review(),
                         existing.todo_items(),
@@ -5995,6 +5996,7 @@ async fn handle_rpc_call(
             if let Some((
                 messages,
                 usage,
+                last_step_usage,
                 plan,
                 plan_pending_approval,
                 todos,
@@ -6041,6 +6043,15 @@ async fn handle_rpc_call(
                         "output_tokens": usage.output_tokens,
                         "cache_creation_tokens": usage.cache_creation_input_tokens,
                         "cache_read_tokens": usage.cache_read_input_tokens,
+                    },
+                    // Most-recent single LLM call usage (not cumulative). Used by the
+                    // TUI to show "current context size" — distinct from `usage`
+                    // above which is the session-running total.
+                    "last_step_usage": {
+                        "input_tokens": last_step_usage.input_tokens,
+                        "output_tokens": last_step_usage.output_tokens,
+                        "cache_creation_tokens": last_step_usage.cache_creation_input_tokens,
+                        "cache_read_tokens": last_step_usage.cache_read_input_tokens,
                     },
                     "history": {
                         "total": total,
