@@ -248,8 +248,10 @@ async function selectSession(id) {
   for (const m of messages) {
     const text = Array.isArray(m.content)
       ? m.content.map((c) => c.text || "").join("\n")
-      : m.content || m.text || JSON.stringify(m);
-    appendMessage(m.role || "assistant", text, m.created_at);
+      : m.content || m.text || "";
+    const trimmed = text.trim();
+    if (!trimmed && m.role !== "system") continue;
+    appendMessage(m.role || "assistant", trimmed || text, m.created_at);
   }
 }
 
