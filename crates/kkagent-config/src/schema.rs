@@ -241,6 +241,9 @@ pub struct ModelConfig {
     /// Experimental: retry a thinking-only/empty response immediately after tool results.
     #[serde(default)]
     pub experimental_visible_empty_retries: u32,
+    /// Experimental: auto-retry after rolling back a malformed tool call (non-JSON arguments).
+    #[serde(default)]
+    pub experimental_bad_toolcall_auto_retries: u32,
     /// Wait this many milliseconds for the first meaningful stream chunk.
     /// `0` disables; unset inherits provider / default (60s). See [`resolve_first_token_timeout`].
     #[serde(default)]
@@ -941,6 +944,7 @@ mod tests {
                 pricing: None,
                 experimental_adaptive_thinking: false,
                 experimental_visible_empty_retries: 0,
+                experimental_bad_toolcall_auto_retries: 0,
                 first_token_timeout_ms: None,
             },
         );
@@ -961,6 +965,7 @@ mod tests {
             pricing: None,
             experimental_adaptive_thinking: false,
             experimental_visible_empty_retries: 0,
+            experimental_bad_toolcall_auto_retries: 0,
             first_token_timeout_ms: None,
         };
         let mut provider = ProviderConfig {
@@ -1036,11 +1041,13 @@ provider = "local"
 model = "claude-opus-4-8"
 experimental_adaptive_thinking = true
 experimental_visible_empty_retries = 1
+experimental_bad_toolcall_auto_retries = 2
 "#,
         )
         .unwrap();
         assert!(model.experimental_adaptive_thinking);
         assert_eq!(model.experimental_visible_empty_retries, 1);
+        assert_eq!(model.experimental_bad_toolcall_auto_retries, 2);
     }
 
     #[test]

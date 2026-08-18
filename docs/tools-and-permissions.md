@@ -96,10 +96,15 @@ Content-Type: application/json
 
 ## Tool call 参数异常恢复
 
-部分兼容模型服务会在历史 assistant tool call 的 `arguments` 不是 JSON object 时返回 HTTP 400。kkagent 识别 `Assistant tool call <id>.arguments must be a JSON object` 后不会重试或猜测修复参数，而是：
+部分兼容模型服务会在历史 assistant tool call 的 `arguments` 不是 JSON object 时返回 HTTP 400。kkagent 识别 `Assistant tool call <id>.arguments must be a JSON object` 后不会猜测修复参数，而是：
 
 1. 定位报错 ID；服务隐藏 ID 时回退定位最近一个非 object 参数的 tool call。
 2. 将消息历史截断到包含该 tool call 的 assistant 小步骤之前，同时丢弃其后的 tool result。
-3. 将转录标记为原子重写，发布错误、Idle 和 TurnEnd 事件，按 Esc 中断语义结束当前执行。
+3. 将转录标记为原子重写。
 
-这个恢复只撤销一条 Agent 小步骤，不撤销整条用户回合，也不会反向恢复工具已经产生的文件或外部副作用。用户可以检查现场后发送“继续”。其他 HTTP 400 仍沿用正常错误和重试策略。
+此后分两种行为：
+
+- 若该模型配置了 `experimental_bad_toolcall_auto_retries > 0`，则在重试次数未耗尽时刷新消息投影、发布一条 LlmRetry 通知并重新请求模型，不再停下来等待用户输入。
+- 否则（未配置或次数已耗尽），发布错误、Idle 和 TurnEnd 事件，按 Esc 中断语义结束当前执行，用户可以检查现场后发送“继续”。
+
+这个恢复只撤销一条 Agent 小步骤，不撤销整条用户回合，也不会反向恢复工具已经产生的文件或外部副作用。其他 HTTP 400 仍沿用正常错误和重试策略。
