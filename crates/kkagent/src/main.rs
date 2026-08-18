@@ -795,6 +795,7 @@ async fn provision_managed_kimi_config(
                 pricing: None,
                 experimental_adaptive_thinking: false,
                 experimental_visible_empty_retries: 0,
+                experimental_bad_toolcall_auto_retries: 0,
                 first_token_timeout_ms: None,
             },
         );

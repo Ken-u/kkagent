@@ -514,6 +514,9 @@ Do not mention this reminder to the user.\n</system-reminder>"
         let mut using_fallback = false;
         let mut visible_empty_retry_limit = primary_model_config.experimental_visible_empty_retries;
         let mut visible_empty_retries = 0_u32;
+        let mut bad_toolcall_retry_limit =
+            primary_model_config.experimental_bad_toolcall_auto_retries;
+        let mut bad_toolcall_retries = 0_u32;
         let mut failure_retries = 0_u32;
         let mut retry_notice_count = 0_u32;
 
@@ -789,6 +792,32 @@ Do not mention this reminder to the user.\n</system-reminder>"
                             removed_blocks = rollback.removed_blocks,
                             "Rolled back provider-rejected assistant tool call"
                         );
+
+                        // Experimental: auto-retry after rollback instead of stopping.
+                        if bad_toolcall_retries < bad_toolcall_retry_limit {
+                            bad_toolcall_retries += 1;
+                            retry_notice_count += 1;
+                            messages = self.prepare_messages(session, &tool_defs, &system_prompt);
+                            send_llm_retry_notice(
+                                &self.event_tx,
+                                &session_id,
+                                retry_notice_count,
+                                format!(
+                                    "Model returned a malformed tool call (`{}`); rolled back that micro-step and retrying ({}/{})",
+                                    rollback.tool_call_id,
+                                    bad_toolcall_retries,
+                                    bad_toolcall_retry_limit
+                                ),
+                                Duration::ZERO,
+                                Duration::ZERO,
+                                true,
+                            )
+                            .await;
+                            continue;
+                        }
+
+                        // Retry budget exhausted (or feature disabled): stop and
+                        // wait for the user to send `continue`, as before.
                         rejected_tool_call_recovery = Some(rollback);
                         break;
                     }
@@ -948,6 +977,12 @@ Do not mention this reminder to the user.\n</system-reminder>"
                         .resolve_model(fallback_alias)
                         .map(|(model, _)| model.experimental_visible_empty_retries)
                         .unwrap_or(0);
+                    bad_toolcall_retries = 0;
+                    bad_toolcall_retry_limit = self
+                        .config
+                        .resolve_model(fallback_alias)
+                        .map(|(model, _)| model.experimental_bad_toolcall_auto_retries)
+                        .unwrap_or(0);
                     continue;
                 }
             }
@@ -994,8 +1029,17 @@ Do not mention this reminder to the user.\n</system-reminder>"
 
         if let Some(rollback) = rejected_tool_call_recovery {
             let message = format!(
-                "Model rejected malformed tool call `{}`; discarded that micro-step and stopped. Send `continue` to resume. ({})",
+                "Model rejected malformed tool call `{}`; discarded that micro-step and stopped{}. Send `continue` to resume. ({})",
                 rollback.tool_call_id,
+                if bad_toolcall_retry_limit > 0 {
+                    format!(
+                        " after {} auto-retr{}",
+                        bad_toolcall_retry_limit,
+                        if bad_toolcall_retry_limit == 1 { "y" } else { "ies" }
+                    )
+                } else {
+                    String::new()
+                },
                 truncate_chars_for_event(&rollback.provider_error, 300)
             );
             self.finish_interrupted_with_message(session, message)
@@ -3402,6 +3446,7 @@ mod retry_tests {
                 pricing: None,
                 experimental_adaptive_thinking: false,
                 experimental_visible_empty_retries: 0,
+                experimental_bad_toolcall_auto_retries: 0,
                 first_token_timeout_ms: None,
             },
         );
@@ -3451,6 +3496,160 @@ mod retry_tests {
                 .iter()
                 .any(|content| matches!(content, ChatContent::Text { text } if text == "recovered"))
         }));
+        std::fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[tokio::test]
+    async fn auto_retries_bad_toolcall_then_recovers_when_feature_enabled() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let bad_id = "functions.BadTool:0".to_string();
+        let error_body = format!(
+            "HTTP 400 Bad Request: status_code=400, Assistant tool call {bad_id}.arguments must be a JSON object."
+        );
+        tokio::spawn(async move {
+            for attempt in 1..=2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0_u8; 8192];
+                let _ = socket.read(&mut request).await.unwrap();
+                let (status, content_type, body) = if attempt == 1 {
+                    ("400 Bad Request", "application/json", error_body.clone())
+                } else {
+                    (
+                        "200 OK",
+                        "text/event-stream",
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"recovered\"}}]}\n\
+                         data: [DONE]\n"
+                            .to_string(),
+                    )
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+
+        let mut config = AppConfig {
+            default_model: Some("test/model".into()),
+            loop_control: Some(LoopControlConfig {
+                max_attempts_per_step: 3,
+                rate_limit_retry_base_seconds: 0,
+                reserved_context_size: 1_000,
+                max_steps_per_turn: 4,
+                auto_compact: true,
+                compact_keep_last: 4,
+                token_counting: "estimated".into(),
+                ..Default::default()
+            }),
+            ..AppConfig::default()
+        };
+        config.providers.insert(
+            "test".into(),
+            ProviderConfig {
+                provider_type: "openai-chat".into(),
+                api_key: Some("token".into()),
+                base_url: Some(base_url),
+                custom_headers: HashMap::new(),
+                oauth: None,
+                first_token_timeout_ms: None,
+            },
+        );
+        config.models.insert(
+            "test/model".into(),
+            ModelConfig {
+                provider: "test".into(),
+                model: "test-model".into(),
+                max_context_size: Some(16_000),
+                max_output_size: Some(1_000),
+                capabilities: Vec::new(),
+                display_name: None,
+                support_efforts: Vec::new(),
+                default_effort: None,
+                pricing: None,
+                experimental_adaptive_thinking: false,
+                experimental_visible_empty_retries: 0,
+                experimental_bad_toolcall_auto_retries: 1,
+                first_token_timeout_ms: None,
+            },
+        );
+        let config = Arc::new(config);
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let loop_ = AgentLoop::new(
+            config,
+            Arc::new(ToolRegistry::new()),
+            Arc::new(Mutex::new(PermissionChain::new(
+                PermissionMode::Auto,
+                Vec::new(),
+            ))),
+            event_tx,
+            Arc::new(Mutex::new(HashMap::new())),
+        );
+        let workspace =
+            std::env::temp_dir().join(format!("kkagent-badtoolcall-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let mut session = Session::new(
+            "badtoolcall-test".into(),
+            workspace.clone(),
+            PermissionMode::Auto,
+            "test/model".into(),
+        );
+        // Pre-populate the transcript with a malformed tool call so the rollback
+        // path has something to roll back when the provider rejects it.
+        session.messages = vec![
+            ChatMessage {
+                role: "user".into(),
+                content: vec![ChatContent::Text {
+                    text: "work".into(),
+                }],
+            },
+            ChatMessage {
+                role: "assistant".into(),
+                content: vec![
+                    ChatContent::Text {
+                        text: "checking".into(),
+                    },
+                    ChatContent::ToolUse {
+                        id: bad_id.clone(),
+                        name: "BadTool".into(),
+                        input: serde_json::Value::Null,
+                    },
+                ],
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: vec![ChatContent::ToolResult {
+                    tool_use_id: bad_id.clone(),
+                    content: "invalid arguments".into(),
+                    is_error: true,
+                }],
+            },
+        ];
+
+        loop_.run_turn(&mut session).await.unwrap();
+
+        let mut saw_retry_notice = false;
+        let mut saw_error = false;
+        let mut saw_text = false;
+        while let Ok(event) = event_rx.try_recv() {
+            match event {
+                AgentEvent::LlmRetry { reason, .. } if reason.contains("malformed tool call") => {
+                    saw_retry_notice = true;
+                }
+                AgentEvent::Error { .. } => saw_error = true,
+                AgentEvent::MessageDelta { text, .. } if text.contains("recovered") => {
+                    saw_text = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            saw_retry_notice,
+            "expected a retry notice for the bad tool call"
+        );
+        assert!(!saw_error, "turn should not end in error after auto-retry");
+        assert!(saw_text, "expected the recovered text after retry");
         std::fs::remove_dir_all(workspace).unwrap();
     }
 
@@ -3542,6 +3741,7 @@ mod retry_tests {
                     pricing: None,
                     experimental_adaptive_thinking: false,
                     experimental_visible_empty_retries: 0,
+                    experimental_bad_toolcall_auto_retries: 0,
                     first_token_timeout_ms: None,
                 },
             );
@@ -3645,6 +3845,7 @@ mod retry_tests {
                     pricing: None,
                     experimental_adaptive_thinking: false,
                     experimental_visible_empty_retries: 0,
+                    experimental_bad_toolcall_auto_retries: 0,
                     first_token_timeout_ms: None,
                 },
             );
@@ -3782,6 +3983,7 @@ mod retry_tests {
                 pricing: None,
                 experimental_adaptive_thinking: false,
                 experimental_visible_empty_retries: 0,
+                experimental_bad_toolcall_auto_retries: 0,
                 first_token_timeout_ms: None,
             },
         );
@@ -3875,6 +4077,7 @@ mod retry_tests {
                 pricing: None,
                 experimental_adaptive_thinking: false,
                 experimental_visible_empty_retries: 0,
+                experimental_bad_toolcall_auto_retries: 0,
                 first_token_timeout_ms: None,
             },
         );
@@ -3974,6 +4177,7 @@ mod retry_tests {
                 pricing: None,
                 experimental_adaptive_thinking: false,
                 experimental_visible_empty_retries: 1,
+                experimental_bad_toolcall_auto_retries: 0,
                 first_token_timeout_ms: None,
             },
         );
@@ -4080,6 +4284,7 @@ mod retry_tests {
                 pricing: None,
                 experimental_adaptive_thinking: false,
                 experimental_visible_empty_retries: 0,
+                experimental_bad_toolcall_auto_retries: 0,
                 first_token_timeout_ms: None,
             },
         );

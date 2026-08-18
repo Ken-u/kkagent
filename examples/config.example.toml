@@ -33,6 +33,7 @@ display_name = "Default coding model"
 # Experimental Anthropic compatibility workarounds; disabled by default.
 # experimental_adaptive_thinking = true
 # experimental_visible_empty_retries = 1
+# experimental_bad_toolcall_auto_retries = 2
 
 # OpenAI Responses 示例
 # [providers.openai]
