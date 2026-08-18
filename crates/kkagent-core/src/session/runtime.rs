@@ -12,24 +12,37 @@ use crate::session::metadata::{SessionMeta, SessionMetaPatch, TurnReason};
 use crate::session::services::SessionServices;
 use crate::session::store::{encode_work_dir_key, is_safe_session_id, SessionStore};
 
+/// Where a file's pre-change content lives for undo.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Previous {
+    /// File did not exist before the write.
+    Absent,
+    /// Content persisted as a content-addressed checkpoint blob.
+    Blob(String),
+}
+
 /// Pre-write snapshot so undo can restore files.
 #[derive(Debug, Clone)]
 pub struct FileChange {
     pub path: PathBuf,
-    /// `None` means the file did not exist before the write.
-    pub previous: Option<Vec<u8>>,
+    pub previous: Previous,
+    /// Original size in bytes (for undo previews).
+    pub bytes: u64,
 }
 
 #[derive(Debug, Clone)]
 pub struct TurnCheckpoint {
     /// Index of the user message that started this turn.
-    pub message_start_index: usize,
+    ///
+    /// `None` after a compaction rewrote the transcript: the file snapshot
+    /// stays restorable, but message truncation no longer applies.
+    pub message_start_index: Option<usize>,
     pub file_changes: Vec<FileChange>,
 }
 
+/// Turn-history cap for undo. Content lives on disk (checkpoint blobs), so
+/// there is no byte budget anymore — only this many turns back can be undone.
 const MAX_UNDO_TURNS: usize = 32;
-const MAX_UNDO_BYTES: usize = 64 * 1024 * 1024;
-const MAX_UNDO_FILE_BYTES: u64 = 16 * 1024 * 1024;
 
 /// User input injected into an already-running agent turn.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -270,14 +283,23 @@ impl Session {
         permission_mode: PermissionMode,
         model_alias: String,
     ) -> Self {
-        Self::new_with_source(
+        let mut session = Self::new_with_source(
             id,
             working_dir,
             permission_mode,
             model_alias,
             SessionCreateSource::Resume,
             None,
-        )
+        );
+        session.reload_undo_journal();
+        session
+    }
+
+    /// Rebuild the undo stack from the on-disk journal so checkpoints
+    /// survive restarts and compactions.
+    fn reload_undo_journal(&mut self) {
+        let store = self.checkpoint_store();
+        self.undo_stack = store.load().iter().map(entry_to_checkpoint).collect();
     }
 
     pub fn new_with_source(
@@ -594,103 +616,120 @@ impl Session {
     }
 
     pub fn begin_turn(&mut self) {
-        self.turn_message_start = Some(self.messages.len().saturating_sub(1));
-        self.current_turn_changes.clear();
+        if self.turn_message_start.is_none() {
+            self.turn_message_start = Some(self.messages.len().saturating_sub(1));
+        }
+        // `run_turn_step` re-enters every LLM round within the same turn;
+        // keep file snapshots taken in earlier rounds so commit captures all.
     }
 
     pub fn commit_turn(&mut self) {
         if let Some(start) = self.turn_message_start.take() {
-            self.undo_stack.push(TurnCheckpoint {
-                message_start_index: start,
+            let checkpoint = TurnCheckpoint {
+                message_start_index: Some(start),
                 file_changes: std::mem::take(&mut self.current_turn_changes),
-            });
+            };
+            // Persist before pushing so a crash cannot lose the snapshot map.
+            let store = self.checkpoint_store();
+            if let Err(error) = store.append(&checkpoint_to_entry(&checkpoint)) {
+                tracing::warn!(%error, "cannot append undo journal");
+            }
+            self.undo_stack.push(checkpoint);
             self.trim_undo_stack();
         }
     }
 
     /// Snapshot file contents before Write/Edit (once per path per turn).
+    /// Contents go to the session's checkpoint blob store on disk: there is
+    /// no in-memory byte budget and oversized files are no longer skipped.
     pub async fn record_pre_change(&mut self, path: PathBuf) {
         if self.current_turn_changes.iter().any(|c| c.path == path) {
             return;
         }
-        let previous = match tokio::fs::metadata(&path).await {
-            Ok(metadata) if metadata.len() > MAX_UNDO_FILE_BYTES => {
-                tracing::warn!(
-                    path = %path.display(),
-                    bytes = metadata.len(),
-                    limit = MAX_UNDO_FILE_BYTES,
-                    "skipping oversized in-memory undo snapshot"
-                );
-                return;
-            }
-            Ok(metadata) => {
-                if !self.make_undo_room(metadata.len() as usize) {
-                    tracing::warn!(
-                        path = %path.display(),
-                        bytes = metadata.len(),
-                        limit = MAX_UNDO_BYTES,
-                        "skipping undo snapshot because the current turn reached its byte budget"
-                    );
-                    return;
-                }
-                match tokio::fs::read(&path).await {
-                    Ok(previous) => Some(previous),
+        let (previous, bytes) = match tokio::fs::read(&path).await {
+            Ok(contents) => {
+                let bytes = contents.len() as u64;
+                match self.write_checkpoint_blob(&contents) {
+                    Ok(hash) => (Previous::Blob(hash), bytes),
                     Err(error) => {
-                        tracing::warn!(path = %path.display(), %error, "cannot capture undo snapshot");
+                        tracing::warn!(
+                            path = %path.display(),
+                            %error,
+                            "cannot persist undo snapshot"
+                        );
                         return;
                     }
                 }
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (Previous::Absent, 0),
             Err(error) => {
                 tracing::warn!(path = %path.display(), %error, "cannot inspect file for undo snapshot");
                 return;
             }
         };
-        self.current_turn_changes
-            .push(FileChange { path, previous });
+        self.current_turn_changes.push(FileChange {
+            path,
+            previous,
+            bytes,
+        });
+    }
+
+    /// Store bytes in the checkpoint blob store (best effort; scratch dirs
+    /// may be unwritable in constrained sandboxes).
+    fn write_checkpoint_blob(&self, contents: &[u8]) -> anyhow::Result<String> {
+        let store = self.checkpoint_store();
+        store.write_blob(contents)
+    }
+
+    fn checkpoint_store(&self) -> crate::checkpoint_store::CheckpointStore {
+        crate::checkpoint_store::CheckpointStore::open(&self.services.context.session_dir)
     }
 
     fn trim_undo_stack(&mut self) {
-        while self.undo_stack.len() > MAX_UNDO_TURNS
-            || undo_snapshot_bytes(&self.undo_stack) > MAX_UNDO_BYTES
-        {
-            self.undo_stack.remove(0);
+        let trimmed = self.undo_stack.len().saturating_sub(MAX_UNDO_TURNS);
+        if trimmed > 0 {
+            self.undo_stack.drain(0..trimmed);
+            self.persist_undo_journal();
         }
     }
 
-    fn make_undo_room(&mut self, additional: usize) -> bool {
-        let current = file_change_bytes(&self.current_turn_changes);
-        if current.saturating_add(additional) > MAX_UNDO_BYTES {
-            return false;
+    /// Persist the in-memory undo stack to the journal (rewrite).
+    fn persist_undo_journal(&self) {
+        let store = self.checkpoint_store();
+        let entries: Vec<_> = self.undo_stack.iter().map(checkpoint_to_entry).collect();
+        if let Err(error) = store.truncate_to(&entries) {
+            tracing::warn!(%error, "cannot persist undo journal");
         }
-        while undo_snapshot_bytes(&self.undo_stack)
-            .saturating_add(current)
-            .saturating_add(additional)
-            > MAX_UNDO_BYTES
-        {
-            if self.undo_stack.is_empty() {
-                return false;
-            }
-            self.undo_stack.remove(0);
-        }
-        true
     }
 
-    /// Undo the last completed turn: restore files + truncate messages.
+    /// Mark every checkpoint as pre-compaction: file snapshots remain
+    /// restorable, but transcript truncation no longer applies.
+    pub fn invalidate_undo_message_indices(&mut self) {
+        for checkpoint in &mut self.undo_stack {
+            checkpoint.message_start_index = None;
+        }
+        self.persist_undo_journal();
+    }
+
+    /// Undo the last completed turn: restore files + truncate messages
+    /// (when the checkpoint predates a compaction, only files restore).
     /// Returns the new message count.
     pub fn undo_last_turn(&mut self) -> anyhow::Result<usize> {
         let cp = self
             .undo_stack
             .pop()
             .ok_or_else(|| anyhow::anyhow!("Nothing to undo"))?;
+        self.persist_undo_journal();
 
+        let store = self.checkpoint_store();
         for change in cp.file_changes.into_iter().rev() {
-            restore_file_change(&change)?;
+            restore_file_change(&store, &change)?;
         }
 
-        self.messages.truncate(cp.message_start_index);
-        self.persisted_message_count = self.persisted_message_count.min(self.messages.len());
+        if let Some(index) = cp.message_start_index {
+            self.messages.truncate(index);
+            self.persisted_message_count = self.persisted_message_count.min(self.messages.len());
+        }
         Ok(self.messages.len())
     }
 
@@ -701,11 +740,11 @@ impl Session {
         user_message_index: usize,
     ) -> anyhow::Result<(usize, usize)> {
         let mut undone = 0usize;
-        while self
-            .undo_stack
-            .last()
-            .is_some_and(|checkpoint| checkpoint.message_start_index > user_message_index)
-        {
+        while self.undo_stack.last().is_some_and(|checkpoint| {
+            checkpoint
+                .message_start_index
+                .is_some_and(|i| i > user_message_index)
+        }) {
             self.undo_last_turn()?;
             undone += 1;
         }
@@ -1171,19 +1210,61 @@ impl Session {
     }
 }
 
-fn restore_file_change(change: &FileChange) -> anyhow::Result<()> {
+fn restore_file_change(
+    store: &crate::checkpoint_store::CheckpointStore,
+    change: &FileChange,
+) -> anyhow::Result<()> {
     match &change.previous {
-        Some(bytes) => {
+        Previous::Blob(hash) => {
+            let contents = store.read_blob(hash)?;
             if let Some(parent) = change.path.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
-            std::fs::write(&change.path, bytes)?;
+            std::fs::write(&change.path, contents)?;
         }
-        None => {
+        Previous::Absent => {
             let _ = std::fs::remove_file(&change.path);
         }
     }
     Ok(())
+}
+
+/// In-memory checkpoint -> journal line.
+fn checkpoint_to_entry(cp: &TurnCheckpoint) -> crate::checkpoint_store::CheckpointEntry {
+    crate::checkpoint_store::CheckpointEntry {
+        message_start_index: cp.message_start_index,
+        changes: cp
+            .file_changes
+            .iter()
+            .map(|c| crate::checkpoint_store::ChangeEntry {
+                path: c.path.clone(),
+                blob: match &c.previous {
+                    Previous::Absent => None,
+                    Previous::Blob(hash) => Some(hash.clone()),
+                },
+                bytes: c.bytes,
+            })
+            .collect(),
+    }
+}
+
+/// Journal line -> in-memory checkpoint.
+fn entry_to_checkpoint(entry: &crate::checkpoint_store::CheckpointEntry) -> TurnCheckpoint {
+    TurnCheckpoint {
+        message_start_index: entry.message_start_index,
+        file_changes: entry
+            .changes
+            .iter()
+            .map(|c| FileChange {
+                path: c.path.clone(),
+                previous: match &c.blob {
+                    None => Previous::Absent,
+                    Some(hash) => Previous::Blob(hash.clone()),
+                },
+                bytes: c.bytes,
+            })
+            .collect(),
+    }
 }
 
 fn is_user_prompt(message: &ChatMessage) -> bool {
@@ -1285,21 +1366,6 @@ fn reverse_mutating_tools(messages: &[ChatMessage], working_dir: &std::path::Pat
             let _ = std::fs::write(&path, restored);
         }
     }
-}
-
-fn undo_snapshot_bytes(stack: &[TurnCheckpoint]) -> usize {
-    stack
-        .iter()
-        .flat_map(|checkpoint| &checkpoint.file_changes)
-        .filter_map(|change| change.previous.as_ref())
-        .fold(0usize, |total, bytes| total.saturating_add(bytes.len()))
-}
-
-fn file_change_bytes(changes: &[FileChange]) -> usize {
-    changes
-        .iter()
-        .filter_map(|change| change.previous.as_ref())
-        .fold(0usize, |total, bytes| total.saturating_add(bytes.len()))
 }
 
 fn working_directory_context(working_dir: &std::path::Path) -> String {
@@ -1856,16 +1922,17 @@ mod working_directory_tests {
         );
         for index in 0..MAX_UNDO_TURNS + 8 {
             session.undo_stack.push(TurnCheckpoint {
-                message_start_index: index,
+                message_start_index: Some(index),
                 file_changes: vec![FileChange {
                     path: PathBuf::from(format!("file-{index}")),
-                    previous: Some(vec![index as u8]),
+                    previous: Previous::Absent,
+                    bytes: 0,
                 }],
             });
         }
         session.trim_undo_stack();
         assert_eq!(session.undo_stack.len(), MAX_UNDO_TURNS);
-        assert_eq!(session.undo_stack[0].message_start_index, 8);
+        assert_eq!(session.undo_stack[0].message_start_index, Some(8));
     }
 
     #[test]
@@ -1889,7 +1956,8 @@ mod working_directory_tests {
         session.begin_turn();
         session.current_turn_changes.push(FileChange {
             path: file.clone(),
-            previous: Some(b"v0\n".to_vec()),
+            previous: Previous::Blob(session.checkpoint_store().write_blob(b"v0\n").unwrap()),
+            bytes: 3,
         });
         std::fs::write(&file, "v1\n").unwrap();
         session.messages.push(ChatMessage {
@@ -1909,7 +1977,8 @@ mod working_directory_tests {
         session.begin_turn();
         session.current_turn_changes.push(FileChange {
             path: file.clone(),
-            previous: Some(b"v1\n".to_vec()),
+            previous: Previous::Blob(session.checkpoint_store().write_blob(b"v1\n").unwrap()),
+            bytes: 3,
         });
         std::fs::write(&file, "v2\n").unwrap();
         session.messages.push(ChatMessage {
@@ -1925,6 +1994,90 @@ mod working_directory_tests {
         assert_eq!(kept, 2);
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "v1\n");
         assert_eq!(session.messages.len(), 2);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn undo_survives_restart_and_compaction() {
+        let root =
+            std::env::temp_dir().join(format!("kkagent-cp-restart-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let file = root.join("doc.txt");
+        std::fs::write(&file, "v0\n").unwrap();
+
+        // Turn 1 in the "first process": snapshot via the public API.
+        let mut session = Session::new(
+            "cp-restart".into(),
+            root.clone(),
+            PermissionMode::Manual,
+            "test-model".into(),
+        );
+        session.messages.push(ChatMessage {
+            role: "user".into(),
+            content: vec![ChatContent::Text {
+                text: "edit it".into(),
+            }],
+        });
+        session.begin_turn();
+        session.record_pre_change(file.clone()).await;
+        std::fs::write(&file, "v1\n").unwrap();
+        session.messages.push(ChatMessage {
+            role: "assistant".into(),
+            content: vec![ChatContent::Text {
+                text: "wrote v1".into(),
+            }],
+        });
+        session.commit_turn();
+        let session_dir = session.services.context.session_dir.clone();
+        drop(session);
+
+        // "Restart": a fresh Session::resume rebuilds the undo stack from disk.
+        let mut resumed = Session::resume(
+            "cp-restart".into(),
+            root.clone(),
+            PermissionMode::Manual,
+            "test-model".into(),
+        );
+        // Same session dir means the journal is found.
+        assert_eq!(resumed.services.context.session_dir, session_dir);
+        assert_eq!(resumed.undo_stack.len(), 1);
+
+        // Simulate compaction: transcript rewrote, indices dropped.
+        resumed.invalidate_undo_message_indices();
+
+        // Undo still restores the file content after restart + compaction.
+        resumed.undo_last_turn().unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "v0\n");
+        assert!(resumed.undo_stack.is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn oversized_file_is_not_skipped() {
+        let root = std::env::temp_dir().join(format!("kkagent-cp-big-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let file = root.join("big.bin");
+        // 5 MB — far beyond the old 16 MB in-memory budget per *turn*? No:
+        // this is beyond what the old per-file cap would keep for many turns.
+        let payload = vec![7u8; 5 * 1024 * 1024];
+        std::fs::write(&file, &payload).unwrap();
+
+        let mut session = Session::new(
+            "cp-big".into(),
+            root.clone(),
+            PermissionMode::Manual,
+            "test-model".into(),
+        );
+        session.begin_turn();
+        session.record_pre_change(file.clone()).await;
+        assert_eq!(session.current_turn_changes.len(), 1);
+        assert_eq!(session.current_turn_changes[0].bytes, payload.len() as u64);
+
+        // Multiple big files: no cumulative byte budget drops them either.
+        let other = root.join("big2.bin");
+        std::fs::write(&other, &payload).unwrap();
+        session.record_pre_change(other.clone()).await;
+        assert_eq!(session.current_turn_changes.len(), 2);
         std::fs::remove_dir_all(root).unwrap();
     }
 

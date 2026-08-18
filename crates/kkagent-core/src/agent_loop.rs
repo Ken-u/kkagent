@@ -2041,7 +2041,9 @@ Do not mention this reminder to the user.\n</system-reminder>"
 
         let result = compact_full_async(self.config.clone(), &mut session.messages, None).await;
         session.transcript_rewrite_required = true;
-        session.undo_stack.clear();
+        // Checkpoints survive compaction: file snapshots stay restorable,
+        // transcript truncation for pre-compaction turns no longer applies.
+        session.invalidate_undo_message_indices();
         let after = session
             .token_counter
             .request_size(system, tools, &session.build_messages());
@@ -2130,7 +2132,8 @@ Do not mention this reminder to the user.\n</system-reminder>"
                 CompactionStrategy::KeepUsers,
             );
             session.transcript_rewrite_required = true;
-            session.undo_stack.clear();
+            // See full compaction: keep file snapshots, drop stale indices.
+            session.invalidate_undo_message_indices();
             let after =
                 session
                     .token_counter

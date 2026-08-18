@@ -8592,7 +8592,7 @@ async fn handle_rpc_call(
                             session.messages = messages.clone();
                             session.persisted_message_count = session.messages.len();
                             session.transcript_rewrite_required = false;
-                            session.undo_stack.clear();
+                            session.invalidate_undo_message_indices();
                             let after =
                                 kkagent_core::TokenCounter::estimate_messages(&session.messages);
                             session.last_compacted_tokens = Some(after);
