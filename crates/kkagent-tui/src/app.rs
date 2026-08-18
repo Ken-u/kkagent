@@ -6867,6 +6867,31 @@ impl TuiApp {
         leaving_id
     }
 
+    fn take_cached_session_runtime(
+        &mut self,
+        query: &str,
+    ) -> Option<(String, SessionRuntimeState)> {
+        if let Some(cached) = self.state.session_runtime_states.remove(query) {
+            return Some((query.to_string(), cached));
+        }
+        let matches: Vec<String> = self
+            .state
+            .session_runtime_states
+            .keys()
+            .filter(|id| *id == query || id.starts_with(query))
+            .cloned()
+            .collect();
+        if matches.len() == 1 {
+            let id = matches.into_iter().next()?;
+            return self
+                .state
+                .session_runtime_states
+                .remove(&id)
+                .map(|cached| (id, cached));
+        }
+        None
+    }
+
     fn clear_session_composer_draft(&mut self, session_id: &str) {
         if self.state.session_id.as_deref() == Some(session_id) {
             self.state.input.clear();
@@ -7067,8 +7092,8 @@ impl TuiApp {
         }
         let started_at = std::time::Instant::now();
         let leaving_id = self.cache_active_session_state(query);
-        if let Some(cached) = self.state.session_runtime_states.remove(query) {
-            self.activate_cached_session(query, cached, started_at);
+        if let Some((cached_id, cached)) = self.take_cached_session_runtime(query) {
+            self.activate_cached_session(&cached_id, cached, started_at);
             return Ok(());
         }
 

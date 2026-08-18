@@ -2591,6 +2591,7 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
     }
 
     async fn get_session(&self, id: &str) -> Option<serde_json::Value> {
+        let turn_active = self.state.turn_locks.is_busy(id).await;
         let body = {
             let sessions = self.state.sessions.lock().await;
             sessions.get(id).map(http_session_json)
@@ -2602,7 +2603,20 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
                 views.get(id).cloned()
             }
         };
-        if let Some(body) = body {
+        if let Some(mut body) = body {
+            if turn_active {
+                if let Some(messages) = body.get("messages").cloned() {
+                    let base =
+                        serde_json::from_value::<Vec<ChatMessage>>(messages).unwrap_or_default();
+                    let merged = self.state.resume_messages_for_active_turn(id, base).await;
+                    if let Some(object) = body.as_object_mut() {
+                        object.insert(
+                            "messages".into(),
+                            serde_json::to_value(merged).unwrap_or_default(),
+                        );
+                    }
+                }
+            }
             return Some(self.attach_session_live_fields(id, body).await);
         }
         let (record, messages) = {
@@ -3671,6 +3685,8 @@ struct SessionReconnectUi {
     thinking_text: String,
     assistant_text: String,
     llm_retry: Option<LlmRetryUi>,
+    /// In-flight transcript tail for checked-out sessions (not yet persisted).
+    partial_messages: Vec<ChatMessage>,
 }
 
 #[derive(Debug, Clone)]
@@ -4138,6 +4154,34 @@ impl ServerState {
         }))
     }
 
+    async fn resume_messages_for_active_turn(
+        &self,
+        session_id: &str,
+        db_messages: Vec<ChatMessage>,
+    ) -> Vec<ChatMessage> {
+        let base = {
+            let views = self.in_flight_views.lock().await;
+            views
+                .get(session_id)
+                .and_then(|view| {
+                    view.get("messages").and_then(|value| {
+                        serde_json::from_value::<Vec<ChatMessage>>(value.clone()).ok()
+                    })
+                })
+                .unwrap_or(db_messages)
+        };
+        let partial = self
+            .reconnect_ui
+            .lock()
+            .await
+            .get(session_id)
+            .map(|ui| ui.partial_messages.clone())
+            .unwrap_or_default();
+        let mut merged = base;
+        merged.extend(partial);
+        merged
+    }
+
     async fn remember_pending_btw(&self, session_id: &str, snapshot: PendingBtwUi) {
         self.pending_btw
             .lock()
@@ -4341,13 +4385,39 @@ impl ServerState {
                 let entry = map.entry(session_id.clone()).or_default();
                 entry.assistant_text.push_str(text);
             }
-            AgentEvent::ToolCall { session_id, .. } => {
-                // Tool boundary closes the current assistant stream buffer; fresh
-                // deltas after tools start a new bubble on the TUI.
+            AgentEvent::ToolCall {
+                session_id,
+                tool_call_id,
+                tool_name,
+                input,
+                ..
+            } => {
                 let mut map = self.reconnect_ui.lock().await;
-                if let Some(ui) = map.get_mut(session_id) {
-                    ui.assistant_text.clear();
-                    ui.thinking_text.clear();
+                let entry = map.entry(session_id.clone()).or_default();
+                reconnect_append_tool_call(
+                    entry,
+                    tool_call_id.clone(),
+                    tool_name.clone(),
+                    input.clone(),
+                );
+            }
+            AgentEvent::ToolResult {
+                session_id,
+                tool_call_id,
+                output,
+                is_error,
+                ..
+            } => {
+                let mut map = self.reconnect_ui.lock().await;
+                if let Some(entry) = map.get_mut(session_id) {
+                    entry.partial_messages.push(ChatMessage {
+                        role: "user".into(),
+                        content: vec![ChatContent::ToolResult {
+                            tool_use_id: tool_call_id.clone(),
+                            content: output.clone(),
+                            is_error: *is_error,
+                        }],
+                    });
                 }
             }
             AgentEvent::LlmRetry {
@@ -4372,6 +4442,7 @@ impl ServerState {
                 entry.thinking_text.clear();
                 entry.assistant_text.clear();
                 entry.llm_retry = None;
+                entry.partial_messages.clear();
                 entry.status = Some(SessionStatus::Thinking);
             }
             AgentEvent::TurnEnd { session_id, .. } => {
@@ -5566,6 +5637,72 @@ fn slice_recent_messages(
     (messages[start..].to_vec(), start, true)
 }
 
+fn reconnect_open_assistant_step(messages: &[ChatMessage]) -> bool {
+    messages.last().is_some_and(|message| {
+        message.role == "assistant"
+            && message
+                .content
+                .last()
+                .is_some_and(|block| matches!(block, ChatContent::ToolUse { .. }))
+    })
+}
+
+fn reconnect_append_tool_call(
+    entry: &mut SessionReconnectUi,
+    tool_call_id: String,
+    tool_name: String,
+    input: serde_json::Value,
+) {
+    let thinking = std::mem::take(&mut entry.thinking_text);
+    let text = std::mem::take(&mut entry.assistant_text);
+
+    if reconnect_open_assistant_step(&entry.partial_messages) {
+        if let Some(last) = entry.partial_messages.last_mut() {
+            if !thinking.is_empty()
+                && !last
+                    .content
+                    .iter()
+                    .any(|block| matches!(block, ChatContent::Thinking { .. }))
+            {
+                last.content.insert(0, ChatContent::Thinking { thinking });
+            }
+            if !text.is_empty() {
+                match last
+                    .content
+                    .iter_mut()
+                    .find(|block| matches!(block, ChatContent::Text { .. }))
+                {
+                    Some(ChatContent::Text { text: existing }) => existing.push_str(&text),
+                    _ => last.content.push(ChatContent::Text { text }),
+                }
+            }
+            last.content.push(ChatContent::ToolUse {
+                id: tool_call_id,
+                name: tool_name,
+                input,
+            });
+            return;
+        }
+    }
+
+    let mut content = Vec::new();
+    if !thinking.is_empty() {
+        content.push(ChatContent::Thinking { thinking });
+    }
+    if !text.is_empty() {
+        content.push(ChatContent::Text { text });
+    }
+    content.push(ChatContent::ToolUse {
+        id: tool_call_id,
+        name: tool_name,
+        input,
+    });
+    entry.partial_messages.push(ChatMessage {
+        role: "assistant".into(),
+        content,
+    });
+}
+
 fn plan_state_json(plan: kkagent_core::SessionPlanState) -> serde_json::Value {
     serde_json::json!({
         "id": plan.id,
@@ -6596,9 +6733,12 @@ async fn handle_rpc_call(
                         pending_question.is_some(),
                     )
                     .await;
-                let total = messages.len();
+                let merged_messages = state
+                    .resume_messages_for_active_turn(&session_id, messages.clone())
+                    .await;
+                let total = merged_messages.len();
                 let (display, oldest_index, older_available) =
-                    slice_recent_messages(&messages, display_limit);
+                    slice_recent_messages(&merged_messages, display_limit);
                 let mut payload = serde_json::json!({
                     "session_id": session_id,
                     "messages": display,
@@ -9809,6 +9949,7 @@ mod runtime_http_tests {
                 thinking_text: "live thought".into(),
                 assistant_text: "partial answer".into(),
                 llm_retry: None,
+                partial_messages: Vec::new(),
             },
         );
         let live = backend

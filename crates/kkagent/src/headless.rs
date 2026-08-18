@@ -172,9 +172,37 @@ impl From<ApprovalInputScope> for ApprovalScope {
     }
 }
 
+/// Output sink for the headless driver (stdout/stderr in production,
+/// in-memory buffers in tests).
+struct HeadlessIo {
+    out: Box<dyn std::io::Write + Send>,
+    err: Box<dyn std::io::Write + Send>,
+}
+
+impl HeadlessIo {
+    fn stdio() -> Self {
+        Self {
+            out: Box::new(std::io::stdout()),
+            err: Box::new(std::io::stderr()),
+        }
+    }
+}
+
 /// Run one headless conversation and return the process exit code.
 pub async fn run(client: &mut KkagentClient, opts: HeadlessOptions) -> i32 {
-    match Driver::new(client, opts).drive().await {
+    let (tx, rx) = mpsc::channel::<std::result::Result<InputMessage, String>>(64);
+    tokio::spawn(read_stdin_lines(tx));
+    run_with_io(client, opts, HeadlessIo::stdio(), rx).await
+}
+
+/// Same as [`run`] but with injectable IO and input stream (tests).
+async fn run_with_io(
+    client: &mut KkagentClient,
+    opts: HeadlessOptions,
+    io: HeadlessIo,
+    input_rx: mpsc::Receiver<std::result::Result<InputMessage, String>>,
+) -> i32 {
+    match Driver::new(client, opts, io, input_rx).drive().await {
         Ok(code) => code,
         Err(err) => {
             eprintln!("Error: {err:#}");
@@ -256,6 +284,8 @@ struct Driver<'a> {
     client: &'a mut KkagentClient,
     requester: kkagent_client::KkagentRequester,
     opts: HeadlessOptions,
+    io: HeadlessIo,
+    input_rx: Option<mpsc::Receiver<std::result::Result<InputMessage, String>>>,
     session_id: String,
     resumed: bool,
     started: Instant,
@@ -280,12 +310,19 @@ struct Driver<'a> {
 }
 
 impl<'a> Driver<'a> {
-    fn new(client: &'a mut KkagentClient, opts: HeadlessOptions) -> Self {
+    fn new(
+        client: &'a mut KkagentClient,
+        opts: HeadlessOptions,
+        io: HeadlessIo,
+        input_rx: mpsc::Receiver<std::result::Result<InputMessage, String>>,
+    ) -> Self {
         let requester = client.requester();
         Self {
             client,
             requester,
             opts,
+            io,
+            input_rx: Some(input_rx),
             session_id: String::new(),
             resumed: false,
             started: Instant::now(),
@@ -314,10 +351,14 @@ impl<'a> Driver<'a> {
         self.opts.output_format == OutputFormat::StreamJson
     }
 
-    fn emit(&self, value: serde_json::Value) {
+    fn emit(&mut self, value: serde_json::Value) {
         if self.stream() {
-            println!("{value}");
+            let _ = writeln!(self.io.out, "{value}");
         }
+    }
+
+    fn write_err_line(&mut self, line: &str) {
+        let _ = writeln!(self.io.err, "{line}");
     }
 
     async fn drive(&mut self) -> Result<i32> {
@@ -336,7 +377,7 @@ impl<'a> Driver<'a> {
                     "message": format!("{err:#}"),
                 }));
             }
-            eprintln!("Error: {err:#}");
+            self.write_err_line(&format!("Error: {err:#}"));
             return Ok(exit_codes::ERROR);
         }
 
@@ -465,8 +506,10 @@ impl<'a> Driver<'a> {
 
     /// `--input-format stream-json`: select over agent events and stdin lines.
     async fn run_stream_input(&mut self) -> Result<Outcome> {
-        let (tx, mut rx) = mpsc::channel::<std::result::Result<InputMessage, String>>(64);
-        tokio::spawn(read_stdin_lines(tx));
+        let mut rx = self
+            .input_rx
+            .take()
+            .expect("stream-json input requires an input channel");
 
         loop {
             let sel = tokio::select! {
@@ -528,7 +571,7 @@ impl<'a> Driver<'a> {
                     }
                     InputMessage::Quit => return Ok(AfterTurn::Finish),
                     InputMessage::Interrupt => {
-                        eprintln!("kkagent: interrupt ignored between turns");
+                        self.write_err_line("kkagent: interrupt ignored between turns");
                     }
                     InputMessage::Approval {
                         decision,
@@ -561,7 +604,7 @@ impl<'a> Driver<'a> {
                     }
                 },
                 Some(Err(line)) => {
-                    eprintln!("Error: invalid stream-json input: {line}");
+                    self.write_err_line(&format!("Error: invalid stream-json input: {line}"));
                     return Ok(AfterTurn::Finish);
                 }
                 None => return Ok(AfterTurn::Finish),
@@ -582,7 +625,7 @@ impl<'a> Driver<'a> {
                 if self.turn_active {
                     self.interrupt().await;
                 } else {
-                    eprintln!("kkagent: interrupt ignored between turns");
+                    self.write_err_line("kkagent: interrupt ignored between turns");
                 }
             }
             InputMessage::Quit => {
@@ -684,7 +727,7 @@ impl<'a> Driver<'a> {
             }
             AgentEvent::MessageDelta { text, .. } => {
                 if self.opts.output_format == OutputFormat::Text {
-                    print!("{text}");
+                    let _ = write!(self.io.out, "{text}");
                 } else {
                     self.pending_message.push_str(&text);
                 }
@@ -794,7 +837,7 @@ impl<'a> Driver<'a> {
                     return Ok(EventOutcome::Continue);
                 }
                 if self.opts.output_format == OutputFormat::Text {
-                    eprintln!("Error: Agent turn failed: {message}");
+                    self.write_err_line(&format!("Error: Agent turn failed: {message}"));
                 } else {
                     self.emit(serde_json::json!({
                         "type": "error",
@@ -816,10 +859,10 @@ impl<'a> Driver<'a> {
                     } else {
                         format!("in {remaining_seconds}s")
                     };
-                    eprint!("\rLLM retry #{retry_number} {when}: {reason}");
-                    let _ = std::io::Write::flush(&mut std::io::stderr());
+                    let _ = write!(self.io.err, "\rLLM retry #{retry_number} {when}: {reason}");
+                    let _ = self.io.err.flush();
                     if remaining_seconds == 0 {
-                        eprintln!();
+                        let _ = writeln!(self.io.err);
                     }
                 }
                 OutputFormat::StreamJson => {
@@ -837,7 +880,7 @@ impl<'a> Driver<'a> {
                 self.turn_active = false;
                 self.turn_ends += 1;
                 if self.opts.output_format == OutputFormat::Text {
-                    println!();
+                    let _ = writeln!(self.io.out);
                 } else {
                     self.flush_message();
                     self.emit(serde_json::json!({

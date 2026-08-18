@@ -442,6 +442,81 @@
 - [ ] 覆盖 rustup/nvm/Volta/pyenv/mise/asdf、绝对路径 runtime、自定义 HOME、路径变化、缓存损坏、私有 registry 和工具链缺失场景；拒绝授权后核心对话和非相关工具仍可使用。
 - [ ] 覆盖工具目录条件注册矩阵：macOS/Linux `workspace` 与有效 `auto` 可见，`process` / `disabled` 不可见，当前 Windows 不可见；同时验证 Once 单次消费、Turn/Session 清理、Workspace 持久化、拒绝去重、软链接竞态和重启后 mode 变化。
 
+## 十五、成熟 Coding Agent 能力差距（待办）
+
+> 分析日期：2026-08-17。对标 Claude Code / Codex CLI / Cline / Aider 等成熟 coding agent。
+> 已确认达标：工具契约层、权限四模式 + always-allow 持久化、系统级沙箱、自动 compaction、
+> MCP/Skills/Hooks（8 事件）、子代理 + worktree 隔离、SQLite 持久化 + resume/fork、ACP、
+> turn 级内存 checkpoint、`/usage` 成本计价、测试输出解析摘要��Markdown 导出、CI 全平台矩阵。
+> 差距核心不在工具数量，而在可靠性闭环、持久化深度和自动化生态位。
+
+### P0：验证闭环（编辑后自动验证，最大差距）【已暂缓 2026-08-18】
+
+> 暂缓原因：turn 末强制验证的触发粒度与构建成本不划算（本仓库 workspace clippy + 全量 test 每个 turn 固定增加数分钟）；AGENTS.md 手动约束对当前模型已够用，框架兜底的边际价值小。以下保留备忘，未来若接 LSP diagnostics 毫秒级轻量层再评估。
+
+- [ ] 项目感知的验证命令探测：识别 Cargo.toml / package.json / pyproject.toml / go.mod 等 manifest，推导 `cargo check/clippy/test`、`lint/typecheck/test` 等命令；可被项目配置（AGENTS.md 或 `[verification]` 段）覆盖，探测失败不静默猜测。
+- [ ] Write/Edit 批量修改完成后（turn 末或按配置）自动执行探测到的验证命令，把编译错误 / 失败用例作为 tool note 回灌当前 turn，驱动模型在同 turn 内修复，而不是依赖模型"想起来"手动跑测试。
+- [ ] 验证策略可配置：`auto / off / manual`；默认尊重现有 permission / approval 规则与沙箱；带超时和单 turn 最多重试次数，避免无限 fix 循环；TUI 完成态摘要（`3 files changed · 24 tests passed`）复用验证结果而非事后解析。
+- [ ] 评估接入 LSP diagnostics 作为轻量验证层（编辑后无需编译即可拿到错误），作为可选增强。
+
+### P0：Checkpoint 持久化与多 turn 回退
+
+- [x] 现状是 `TurnCheckpoint` 内存态 + 字节上限 + 重启即失；将文件快照持久化到磁盘（按 session 存储，可复用 `blob_store.rs` 内容寻址或 shadow git 方案），进程崩溃 / 重启后 undo 仍可用。（`checkpoint_store.rs`：内容寻址 blobs + `undo.jsonl` journal，`Session::resume` 重建 undo 栈）
+- [x] 超大文件编辑不再静默跳过快照（当前 `skipping oversized in-memory undo snapshot` 降级为不保护）：落盘快照不受内存预算限制，受磁盘配额 + LRU 清理约束。（内存字节上限全部移除；`CheckpointStore::gc` 清理无引用 blob）
+- [x] 支持多 turn 连续回退与"恢复到指定 turn"：undo 前预览将恢复的消息和文件（预览 UI 已有，需扩展跨 turn 范围），compact 之后仍能恢复 compact 之前的文件状态（跨重启 + 跨 compact）。（compact 时 `invalidate_undo_message_indices`：快照保留可恢复，消息索引失效不再截断）
+
+### P0：Headless / CI 输出格式
+
+- [x] `-p` 增加 `--output-format text|json|stream-json`：结构化输出 message / tool_call / tool_result / usage / final result 事件流，供 CI 流水线和上层编排消费；文本模式保持现状。
+- [x] 增加 `--input-format stream-json`（可选）：程序化多轮对话输入，配合现有 RPC server 不重复造轮子。
+- [x] 结构化退出码：区分成功 / 达到 `--max-turns` 上限 / 验证失败 / 权限拒绝 / provider 错误；输出 session id 便于脚本 resume；`--continue` / `--resume <id>` 的 headless 语义与 TUI 一致。
+
+### P1：代码库索引与符号检索
+
+- [ ] 基于 tree-sitter 的本地符号索引（定义 / 引用），支持主流语言；文件变更时增量重建，索引仅本地使用、按需进入模型上下文。
+- [ ] 大仓库 repo map / 依赖图摘要（Aider 风格）：按 import / 依赖关系挑选相关文件进上下文，提高 Grep/Glob 文本匹配在大型代码库的命中率。
+- [ ] 评估在索引之上提供 CodeSearch 内置工具（def/symbol 检索），Grep/Glob 保留为无索引 fallback；无索引或语言不支持时行为完全不变。
+
+### P1：持久记忆系统
+
+- [ ] 跨会话自动记忆：session 结束或按需将用户偏好、项目惯例沉淀为项目级记忆文件（MEMORY.md 风格），下次启动冷启动成本降低。
+- [ ] 记忆加载纳入现有 instructions 链（AGENTS.md → skills → memory），顺序和覆盖关系在 `/context` 中可见、可编辑、可清空。
+- [ ] 提供 `/memory` 查看 / 编辑 / 精简入口；记忆写入沿用现有敏感值检测，未确认不落盘。
+
+### P1：Prompt Caching 主动控制
+
+- [ ] 现状仅解析响应中的 `cached_tokens`；为 Anthropic 风格 provider 增加主动 cache 断点放置（按 provider 配置策略），Kimi 自动缓存保持默认零配置。
+- [ ] `/usage` 增加 cache 命中率展示，长会话下验证断点策略确实降低成本（对照 provider 账单字段）。
+
+### P1：模型路由与预算
+
+- [ ] 按阶段 / 工具的路由策略：子代理、简单检索轮次可路由到快模型，主循环保持强模型；配置 schema 声明规则，路由目标缺少能力（tool use / 图片 / context window）时经 `model_capability.rs` 预检降级回主模型，不得 turn 中途失败。
+- [ ] session 级成本预算护栏：`/usage` 已有计价，增加预算阈值告警与超限行为（提示 / 停止）。
+
+### P2：VSCode 扩展做实
+
+- [ ] 现有 extension.js 仅 203 行占位；基于 ACP 适配器实现真实扩展：内联 diff 审阅、共享选中代码上下文、感知当前打开文件；核心操作与 TUI 能力对齐，不另起一套状态。
+
+### P2：E2E 评估体系
+
+- [ ] Agent 级回归 eval harness：在 fixture 仓库上跑脚本化任务，断言文件结果 + 工具轨迹；接入 CI（如 nightly）防止 prompt / loop 改动引入退化。
+- [ ] 关键场景（编辑、验证循环、compaction、权限）建立 golden 工具调用序列断言；跑法复用本节 P0 的 stream-json headless 模式。
+
+### P2：Hooks 与编辑原语补全
+
+- [ ] Hook 事件补 `PreCompact` / `UserPromptSubmit` / `SubagentStop`；受控允许 hook stdout 作为 system-reminder 注入上下文（沿用现有注入通道与脱敏）。
+- [ ] 增加 MultiEdit 批量编辑工具：一次调用多个 old/new 对，原子应用、按 hunk 报告失败位置，减少大范围重构的往返轮次。
+
+### 验收与回归测试
+
+- [ ] 验证闭环：fixture 项目（Rust / Node / Python）注入编译错误后自动验证捕获并在同 turn 修复；`off` 模式不执行任何命令；无 manifest 项目明确提示不猜测。
+- [ ] Checkpoint：崩��� / 重启后 undo 仍恢复文件；超大文件编辑不静默失去保护；compact 后仍可恢复 compact 前文件状态。
+- [ ] Headless：`json` / `stream-json` 输出 golden 测试；各退出码路径、`--max-turns`、脚本化 resume 覆盖。
+- [ ] 索引：fixture 仓库符号 def / reference 命中率；编辑后增量重建正确性；无索引行为不变。
+- [ ] 记忆：敏感值未确认不落盘；`/context` 可见记忆来源与顺序。
+- [ ] Caching / 路由：断点放置与命中对照 provider 响应；路由目标能力不足时回退而不是失败。
+- [ ] E2E：eval harness 以 headless 模式跑通全部 fixture 任务，CI 报告退化。
+
 ## 文末：暂缓 / 手动项
 
 - archive / undo session：**评估暂缓**
