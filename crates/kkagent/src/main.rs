@@ -2686,6 +2686,7 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
         self.state.question_txs.lock().await.remove(id);
         self.state.steer_mailboxes.lock().await.remove(id);
         self.state.active_btw_sessions.lock().await.remove(id);
+        self.state.reconnect_ui.lock().await.remove(id);
         self.state.turn_locks.remove(id).await;
         {
             let db = self.state.transcript.lock().await;
@@ -3802,6 +3803,13 @@ impl ServerState {
         let mut views = self.in_flight_views.lock().await;
         views.remove(session_id);
         sessions.insert(session_id.to_string(), session);
+        // The persisted history (including everything this turn produced) is
+        // back in `sessions`, so the reconnect transcript tail is now redundant.
+        // Clearing it here — after checkin — closes the window where TurnEnd
+        // used to wipe the tail while the runner was still persisting.
+        drop(views);
+        drop(sessions);
+        self.reconnect_ui.lock().await.remove(session_id);
     }
 }
 
@@ -4126,8 +4134,12 @@ impl ServerState {
         }
     }
 
-    async fn clear_reconnect_ui(&self, session_id: &str) {
-        self.reconnect_ui.lock().await.remove(session_id);
+    /// True while a background turn owns this session (between checkout and
+    /// checkin). Transcript-bearing events that arrive after checkin must not
+    /// recreate reconnect state, or `get_session` would append a stale copy of
+    /// already-persisted messages.
+    async fn session_is_checked_out(&self, session_id: &str) -> bool {
+        self.in_flight_views.lock().await.contains_key(session_id)
     }
 
     async fn reconnect_status_for_session(&self, session_id: &str) -> Option<SessionStatus> {
@@ -4170,15 +4182,47 @@ impl ServerState {
                 })
                 .unwrap_or(db_messages)
         };
-        let partial = self
+        let mut partial = self
             .reconnect_ui
             .lock()
             .await
             .get(session_id)
-            .map(|ui| ui.partial_messages.clone())
+            .map(|ui| {
+                let mut msgs = ui.partial_messages.clone();
+                // Flush any accumulated thinking/text deltas that haven't been
+                // committed to partial_messages yet (they are only flushed when a
+                // ToolCall arrives).  Without this, reconnecting during a pure
+                // thinking/text phase — or between two tool calls — silently drops
+                // the in-flight assistant content.
+                let thinking = ui.thinking_text.clone();
+                let text = ui.assistant_text.clone();
+                if !thinking.is_empty() || !text.is_empty() {
+                    let mut content = Vec::new();
+                    if !thinking.is_empty() {
+                        content.push(ChatContent::Thinking {
+                            thinking: thinking.clone(),
+                        });
+                    }
+                    if !text.is_empty() {
+                        content.push(ChatContent::Text { text: text.clone() });
+                    }
+                    if reconnect_open_assistant_step(&msgs) {
+                        // Append to the last open assistant message.
+                        if let Some(last) = msgs.last_mut() {
+                            last.content.extend(content);
+                        }
+                    } else {
+                        msgs.push(ChatMessage {
+                            role: "assistant".into(),
+                            content,
+                        });
+                    }
+                }
+                msgs
+            })
             .unwrap_or_default();
         let mut merged = base;
-        merged.extend(partial);
+        merged.append(&mut partial);
         merged
     }
 
@@ -4374,6 +4418,9 @@ impl ServerState {
             AgentEvent::ThinkingDelta {
                 session_id, text, ..
             } => {
+                if !self.session_is_checked_out(session_id).await {
+                    return;
+                }
                 let mut map = self.reconnect_ui.lock().await;
                 let entry = map.entry(session_id.clone()).or_default();
                 entry.thinking_text.push_str(text);
@@ -4381,6 +4428,9 @@ impl ServerState {
             AgentEvent::MessageDelta {
                 session_id, text, ..
             } => {
+                if !self.session_is_checked_out(session_id).await {
+                    return;
+                }
                 let mut map = self.reconnect_ui.lock().await;
                 let entry = map.entry(session_id.clone()).or_default();
                 entry.assistant_text.push_str(text);
@@ -4392,6 +4442,9 @@ impl ServerState {
                 input,
                 ..
             } => {
+                if !self.session_is_checked_out(session_id).await {
+                    return;
+                }
                 let mut map = self.reconnect_ui.lock().await;
                 let entry = map.entry(session_id.clone()).or_default();
                 reconnect_append_tool_call(
@@ -4408,17 +4461,19 @@ impl ServerState {
                 is_error,
                 ..
             } => {
-                let mut map = self.reconnect_ui.lock().await;
-                if let Some(entry) = map.get_mut(session_id) {
-                    entry.partial_messages.push(ChatMessage {
-                        role: "user".into(),
-                        content: vec![ChatContent::ToolResult {
-                            tool_use_id: tool_call_id.clone(),
-                            content: output.clone(),
-                            is_error: *is_error,
-                        }],
-                    });
+                if !self.session_is_checked_out(session_id).await {
+                    return;
                 }
+                let mut map = self.reconnect_ui.lock().await;
+                let entry = map.entry(session_id.clone()).or_default();
+                entry.partial_messages.push(ChatMessage {
+                    role: "user".into(),
+                    content: vec![ChatContent::ToolResult {
+                        tool_use_id: tool_call_id.clone(),
+                        content: output.clone(),
+                        is_error: *is_error,
+                    }],
+                });
             }
             AgentEvent::LlmRetry {
                 session_id,
@@ -4437,6 +4492,9 @@ impl ServerState {
                 entry.status = Some(SessionStatus::Thinking);
             }
             AgentEvent::TurnStart { session_id, .. } => {
+                if !self.session_is_checked_out(session_id).await {
+                    return;
+                }
                 let mut map = self.reconnect_ui.lock().await;
                 let entry = map.entry(session_id.clone()).or_default();
                 entry.thinking_text.clear();
@@ -4448,8 +4506,20 @@ impl ServerState {
             AgentEvent::TurnEnd { session_id, .. } => {
                 self.clear_pending_question(session_id, None).await;
                 self.clear_pending_tool_approval(session_id, None).await;
-                self.clear_reconnect_ui(session_id).await;
                 self.clear_pending_subagents(session_id).await;
+                // Do NOT drop the transcript tail here. TurnEnd is observed by
+                // the event forwarding task, which races ahead of the turn
+                // runner's persist + checkin. Clearing partial state in this
+                // window made `get_session` return a stale pre-turn view and
+                // silently dropped the whole turn's thinking/tool history on
+                // reconnect. The entry is fully cleared by `checkin_session`
+                // once the persisted history is back in place; only the
+                // transient status fields are reset here.
+                let mut map = self.reconnect_ui.lock().await;
+                if let Some(entry) = map.get_mut(session_id) {
+                    entry.status = None;
+                    entry.llm_retry = None;
+                }
             }
             AgentEvent::SubagentSpawned {
                 session_id,
@@ -5356,11 +5426,9 @@ async fn spawn_session_agent_turn(
                             tracing::error!("Failed to persist interrupted turn: {error}");
                         }
                     }
-                    state_clone
-                        .sessions
-                        .lock()
-                        .await
-                        .insert(sid.clone(), session);
+                    // Route through checkin so in_flight_views and the
+                    // reconnect tail are cleaned up consistently.
+                    state_clone.checkin_session(&sid, session).await;
                 } else {
                     let dropped = steer_mailbox.close_and_drain().len();
                     if dropped > 0 {
@@ -9966,6 +10034,228 @@ mod runtime_http_tests {
             .await
             .get("inflight-session")
             .is_some());
+        std::fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[tokio::test]
+    async fn get_session_flushes_pending_deltas_during_active_turn() {
+        let state = test_server_state().await;
+        let workspace =
+            std::env::temp_dir().join(format!("kkagent-resume-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let mut session = Session::new(
+            "resume-session".into(),
+            workspace.clone(),
+            PermissionMode::Manual,
+            "model".into(),
+        );
+        session.add_user_message("current prompt".into());
+        state
+            .sessions
+            .lock()
+            .await
+            .insert(session.id.clone(), session);
+
+        let taken = state
+            .checkout_session("resume-session")
+            .await
+            .expect("session should check out");
+
+        // Hold the turn lock so get_session treats the session as mid-turn.
+        let _permit = state
+            .turn_locks
+            .try_acquire("resume-session")
+            .await
+            .expect("turn lock should be free");
+
+        // Live streaming phase: thinking/text deltas arrived, but no ToolCall
+        // yet, so nothing was committed to partial_messages.
+        state.reconnect_ui.lock().await.insert(
+            "resume-session".into(),
+            SessionReconnectUi {
+                status: Some(SessionStatus::Thinking),
+                thinking_text: "in-flight thought".into(),
+                assistant_text: "partial answer".into(),
+                llm_retry: None,
+                partial_messages: Vec::new(),
+            },
+        );
+
+        let backend = AgentHttpBackend {
+            state: state.clone(),
+        };
+        let got = backend
+            .get_session("resume-session")
+            .await
+            .expect("in-flight session should remain readable");
+        let messages = got["messages"].as_array().expect("messages array");
+        // The flushed assistant message must survive the reconnect merge.
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["content"][0]["text"], "current prompt");
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[1]["content"][0]["thinking"], "in-flight thought");
+        assert_eq!(messages[1]["content"][1]["text"], "partial answer");
+
+        state.checkin_session("resume-session", taken).await;
+        std::fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[tokio::test]
+    async fn get_session_keeps_tool_steps_between_calls_during_active_turn() {
+        let state = test_server_state().await;
+        let workspace =
+            std::env::temp_dir().join(format!("kkagent-resume2-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let mut session = Session::new(
+            "resume-tools".into(),
+            workspace.clone(),
+            PermissionMode::Manual,
+            "model".into(),
+        );
+        session.add_user_message("run tools".into());
+        state
+            .sessions
+            .lock()
+            .await
+            .insert(session.id.clone(), session);
+
+        let taken = state
+            .checkout_session("resume-tools")
+            .await
+            .expect("session should check out");
+        let _permit = state
+            .turn_locks
+            .try_acquire("resume-tools")
+            .await
+            .expect("turn lock should be free");
+
+        // The session was checked out mid-turn and no reconnect_ui entry exists
+        // yet (fresh server restart or TurnEnd cleanup raced with late tool
+        // events). Tool events must create the entry instead of being dropped.
+        state.reconnect_ui.lock().await.remove("resume-tools");
+        let event_state = state.clone();
+        event_state
+            .note_agent_event_for_resume(&AgentEvent::ToolCall {
+                session_id: "resume-tools".into(),
+                tool_call_id: "call-1".into(),
+                tool_name: "bash".into(),
+                input: serde_json::json!({"command": "ls"}),
+            })
+            .await;
+        event_state
+            .note_agent_event_for_resume(&AgentEvent::ToolResult {
+                session_id: "resume-tools".into(),
+                tool_call_id: "call-1".into(),
+                tool_name: "bash".into(),
+                output: "file list".into(),
+                is_error: false,
+            })
+            .await;
+
+        let backend = AgentHttpBackend {
+            state: state.clone(),
+        };
+        let got = backend
+            .get_session("resume-tools")
+            .await
+            .expect("in-flight session should remain readable");
+        let messages = got["messages"].as_array().expect("messages array");
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0]["content"][0]["text"], "run tools");
+        assert_eq!(messages[1]["content"][0]["type"], "tool_use");
+        assert_eq!(messages[1]["content"][0]["id"], "call-1");
+        assert_eq!(
+            messages[2]["content"][0]["type"], "tool_result",
+            "tool result must survive after its reconnect_ui entry was recreated"
+        );
+        assert_eq!(messages[2]["content"][0]["tool_use_id"], "call-1");
+
+        state.checkin_session("resume-tools", taken).await;
+        std::fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[tokio::test]
+    async fn turn_end_keeps_transcript_until_checkin() {
+        let state = test_server_state().await;
+        let workspace =
+            std::env::temp_dir().join(format!("kkagent-resume3-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let mut session = Session::new(
+            "resume-race".into(),
+            workspace.clone(),
+            PermissionMode::Manual,
+            "model".into(),
+        );
+        session.add_user_message("race prompt".into());
+        state
+            .sessions
+            .lock()
+            .await
+            .insert(session.id.clone(), session);
+
+        let taken = state
+            .checkout_session("resume-race")
+            .await
+            .expect("session should check out");
+        let _permit = state
+            .turn_locks
+            .try_acquire("resume-race")
+            .await
+            .expect("turn lock should be free");
+
+        state
+            .note_agent_event_for_resume(&AgentEvent::ThinkingDelta {
+                session_id: "resume-race".into(),
+                text: "deep thought".into(),
+            })
+            .await;
+        state
+            .note_agent_event_for_resume(&AgentEvent::ToolCall {
+                session_id: "resume-race".into(),
+                tool_call_id: "call-9".into(),
+                tool_name: "read".into(),
+                input: serde_json::json!({"path": "x"}),
+            })
+            .await;
+        state
+            .note_agent_event_for_resume(&AgentEvent::ToolResult {
+                session_id: "resume-race".into(),
+                tool_call_id: "call-9".into(),
+                tool_name: "read".into(),
+                output: "data".into(),
+                is_error: false,
+            })
+            .await;
+
+        // The forwarding task observes TurnEnd before the runner finishes
+        // persisting and checking the session back in. This is the exact
+        // window where the whole turn used to vanish from `get_session`.
+        state
+            .note_agent_event_for_resume(&AgentEvent::TurnEnd {
+                session_id: "resume-race".into(),
+            })
+            .await;
+
+        let backend = AgentHttpBackend {
+            state: state.clone(),
+        };
+        let got = backend
+            .get_session("resume-race")
+            .await
+            .expect("session should remain readable mid-checkin");
+        let messages = got["messages"].as_array().expect("messages array");
+        assert_eq!(
+            messages.len(),
+            3,
+            "turn output must survive the TurnEnd -> checkin window"
+        );
+        assert_eq!(messages[1]["content"][0]["thinking"], "deep thought");
+        assert_eq!(messages[1]["content"][1]["type"], "tool_use");
+        assert_eq!(messages[2]["content"][0]["type"], "tool_result");
+
+        // Once checkin restores the persisted history, the tail is dropped.
+        state.checkin_session("resume-race", taken).await;
+        assert!(state.reconnect_ui.lock().await.get("resume-race").is_none());
         std::fs::remove_dir_all(workspace).unwrap();
     }
 
