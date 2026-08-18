@@ -49,6 +49,10 @@ pub struct AgentLoop {
     /// (truncated with a notice) — used by subagent loops that share the
     /// parent's store instead of owning one.
     tool_result_store: Option<Arc<ToolResultStore>>,
+    /// When attached, every complete message pushed during a turn is appended
+    /// to the transcript DB at once (never per stream chunk). Cuts the crash
+    /// window from a whole turn down to the currently streaming/executing step.
+    transcript_db: Option<TranscriptDb>,
 }
 
 /// Spills oversized tool results to `<config_dir>/tool-results/` and, when a
@@ -222,6 +226,29 @@ impl AgentLoop {
         self
     }
 
+    /// Attach a transcript DB for per-message persistence within a turn.
+    /// Without it, messages only reach disk when the turn ends (old behavior).
+    pub fn with_transcript_db(mut self, db: TranscriptDb) -> Self {
+        self.transcript_db = Some(db);
+        self
+    }
+
+    /// Persist any not-yet-written messages at a complete-message boundary.
+    /// Failures are logged but never abort the turn — same policy as the
+    /// turn-end persistence path.
+    fn persist_step(&self, session: &mut Session) {
+        let Some(db) = &self.transcript_db else {
+            return;
+        };
+        if let Err(error) = crate::transcript::persist_session_delta(db, session) {
+            tracing::error!(
+                session = %session.id,
+                error = %error,
+                "per-message transcript persist failed (non-fatal)"
+            );
+        }
+    }
+
     pub fn with_max_rounds(
         config: Arc<AppConfig>,
         tools: Arc<ToolRegistry>,
@@ -240,6 +267,7 @@ impl AgentLoop {
             hooks: None,
             goal_mgr: None,
             tool_result_store: None,
+            transcript_db: None,
         }
     }
 
@@ -1022,6 +1050,7 @@ Do not mention this reminder to the user.\n</system-reminder>"
                     role: "assistant".into(),
                     content,
                 });
+                self.persist_step(session);
             }
             self.finish_interrupted(session).await?;
             return Ok(TurnStep::Done);
@@ -1081,6 +1110,7 @@ Do not mention this reminder to the user.\n</system-reminder>"
                 role: "assistant".into(),
                 content,
             });
+            self.persist_step(session);
         }
 
         if !tool_calls.is_empty() {
@@ -1096,6 +1126,7 @@ Do not mention this reminder to the user.\n</system-reminder>"
                             is_error: true,
                         }],
                     });
+                    self.persist_step(session);
                     let _ = self
                         .event_tx
                         .send(AgentEvent::ToolResult {
@@ -1864,10 +1895,14 @@ Do not mention this reminder to the user.\n</system-reminder>"
                 role: "user".into(),
                 content: result_content,
             });
+            self.persist_step(session);
 
             // Steer / delivery messages land after tool results (next model turn).
             for msg in deliveries {
                 session.add_user_message(msg);
+            }
+            if !session.transcript_rewrite_required {
+                self.persist_step(session);
             }
 
             if session.is_interrupted() {
@@ -4358,6 +4393,234 @@ mod retry_tests {
         assert!(recovery_errors[0].contains("discarded that micro-step"));
         assert!(saw_idle);
         assert!(saw_turn_end);
+        std::fs::remove_dir_all(workspace).unwrap();
+    }
+
+    struct ProbingTool {
+        probe: std::sync::Arc<dyn Fn() + Send + Sync>,
+    }
+
+    #[async_trait::async_trait]
+    impl kkagent_tools::Tool for ProbingTool {
+        fn name(&self) -> &str {
+            "Probe"
+        }
+        fn description(&self) -> &str {
+            "records a probe observation"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {},
+            })
+        }
+        fn read_only(&self) -> bool {
+            true
+        }
+        async fn execute(
+            &self,
+            _input: serde_json::Value,
+            _ctx: &kkagent_tools::ToolContext,
+        ) -> anyhow::Result<kkagent_tools::ToolOutput> {
+            (self.probe)();
+            Ok(kkagent_tools::ToolOutput::success("probed"))
+        }
+    }
+
+    fn sse(body: &str) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    /// Per-message persistence: within a running turn, every complete message
+    /// (assistant step, tool result) must already be in the transcript DB at
+    /// the moment the next step executes — the crash-recovery contract.
+    #[tokio::test]
+    async fn per_message_transcript_persistence_within_turn() {
+        // Round 1: text + tool_use (chunked stream).
+        let round1 = sse(&[
+            "data: {\"choices\":[{\"delta\":{\"content\":\"running probe\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-1\",\"type\":\"function\",\"function\":{\"name\":\"Probe\",\"arguments\":\"{}\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n",
+        ].concat());
+        // Round 2: final text.
+        let round2 = sse(&[
+            "data: {\"choices\":[{\"delta\":{\"content\":\"all done\"}}]}\n\n",
+            "data: [DONE]\n\n",
+        ]
+        .concat());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut round = 0;
+            while let Ok((mut socket, _)) = listener.accept().await {
+                round += 1;
+                let mut buf = vec![0u8; 8192];
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                    use tokio::io::AsyncReadExt;
+                    let _ = socket.read(&mut buf).await;
+                })
+                .await;
+                let response = if round == 1 {
+                    round1.clone()
+                } else {
+                    round2.clone()
+                };
+                use tokio::io::AsyncWriteExt;
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+
+        let mut config = AppConfig {
+            default_model: Some("test/model".into()),
+            loop_control: Some(kkagent_config::LoopControlConfig {
+                max_attempts_per_step: 3,
+                max_steps_per_turn: 10,
+                auto_compact: false,
+                ..Default::default()
+            }),
+            ..AppConfig::default()
+        };
+        config.providers.insert(
+            "test".into(),
+            ProviderConfig {
+                provider_type: "openai-chat".into(),
+                api_key: Some("token".into()),
+                base_url: Some(format!("http://{addr}")),
+                custom_headers: HashMap::new(),
+                oauth: None,
+                first_token_timeout_ms: None,
+            },
+        );
+        config.models.insert(
+            "test/model".into(),
+            ModelConfig {
+                provider: "test".into(),
+                model: "test-model".into(),
+                max_context_size: Some(16_000),
+                max_output_size: Some(1_000),
+                capabilities: vec!["tool_use".into()],
+                display_name: None,
+                support_efforts: Vec::new(),
+                default_effort: None,
+                pricing: None,
+                experimental_adaptive_thinking: false,
+                experimental_visible_empty_retries: 0,
+                experimental_bad_toolcall_auto_retries: 0,
+                first_token_timeout_ms: None,
+            },
+        );
+        let config = Arc::new(config);
+
+        let db = crate::transcript::TranscriptDb::open_in_memory().unwrap();
+
+        // Probe runs inside the tool-execution step: assert the DB already
+        // contains the user prompt + the complete assistant step (with
+        // thinking, text and tool_use) — chunk-level data never lands, but
+        // complete messages do.
+        let seen_in_db = Arc::new(std::sync::Mutex::new(Vec::<(String, usize)>::new()));
+        let seen_clone = seen_in_db.clone();
+        let db_for_probe = db.clone();
+        let probe = Arc::new(move || {
+            let records = db_for_probe
+                .load_messages("persist-step-test")
+                .expect("db read in probe");
+            let summary: Vec<(String, usize)> = records
+                .iter()
+                .map(|r| (r.role.clone(), r.content_json.len()))
+                .collect();
+            *seen_clone.lock().unwrap() = summary;
+        });
+
+        let mut registry = kkagent_tools::ToolRegistry::new();
+        registry.register(Arc::new(ProbingTool { probe }));
+
+        let (event_tx, mut event_rx) = mpsc::channel(256);
+        let loop_ = AgentLoop::new(
+            config,
+            Arc::new(registry),
+            Arc::new(Mutex::new(PermissionChain::new(
+                PermissionMode::Auto,
+                Vec::new(),
+            ))),
+            event_tx,
+            Arc::new(Mutex::new(HashMap::new())),
+        )
+        .with_transcript_db(db.clone());
+
+        let workspace =
+            std::env::temp_dir().join(format!("kkagent-persist-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace).unwrap();
+        db.create_session(
+            "persist-step-test",
+            "test/model",
+            workspace.to_str().unwrap(),
+        )
+        .unwrap();
+        let mut session = Session::new(
+            "persist-step-test".into(),
+            workspace.clone(),
+            PermissionMode::Auto,
+            "test/model".into(),
+        );
+        session.add_user_message("go".into());
+
+        loop_.run_turn(&mut session).await.unwrap();
+        server.abort();
+
+        // Diagnostic: if the mid-turn probe never fired, dump the event log.
+        let mut events: Vec<String> = Vec::new();
+        while let Ok(event) = event_rx.try_recv() {
+            let discriminant = match event {
+                AgentEvent::ThinkingDelta { .. } => "ThinkingDelta",
+                AgentEvent::MessageDelta { .. } => "MessageDelta",
+                AgentEvent::ToolCall { ref tool_name, .. } => {
+                    events.push(format!("ToolCall:{tool_name}"));
+                    continue;
+                }
+                AgentEvent::ToolResult { .. } => "ToolResult",
+                AgentEvent::TurnEnd { .. } => "TurnEnd",
+                AgentEvent::Error { ref message, .. } => {
+                    events.push(format!("Error:{message}"));
+                    continue;
+                }
+                AgentEvent::StatusUpdate { .. } => "StatusUpdate",
+                _ => "Other",
+            };
+            events.push(discriminant.into());
+        }
+        assert!(
+            events.iter().any(|e| e.starts_with("ToolCall")),
+            "probe tool was never called; events: {events:?}"
+        );
+
+        // During the tool step the DB held user + assistant(tool_use).
+        let mid_turn = seen_in_db.lock().unwrap().clone();
+        assert!(
+            mid_turn.len() >= 2,
+            "assistant step must be persisted before tool executes, got {mid_turn:?}"
+        );
+        assert_eq!(mid_turn[0].0, "user");
+        assert_eq!(mid_turn[1].0, "assistant");
+        assert!(
+            mid_turn[1].1 > 50,
+            "assistant step must contain full content, got len {}",
+            mid_turn[1].1
+        );
+
+        // After the turn, DB also holds the tool result and final assistant.
+        let final_records = db.load_messages("persist-step-test").unwrap();
+        let roles: Vec<&str> = final_records.iter().map(|r| r.role.as_str()).collect();
+        assert_eq!(roles, vec!["user", "assistant", "user", "assistant"]);
+        assert!(final_records[1].content_json.contains("running probe"));
+        assert!(final_records[1].content_json.contains("call-1"));
+        assert!(final_records[1].content_json.contains("Probe"));
+        assert!(final_records[2].content_json.contains("call-1"));
+        assert!(final_records[3].content_json.contains("all done"));
         std::fs::remove_dir_all(workspace).unwrap();
     }
 }

@@ -6,6 +6,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 /// Shared SQLite handle used by transcript / durable HTTP / subagent stores.
 pub type SharedSqlite = Arc<Mutex<Connection>>;
 
+/// Cheap to clone: the SQLite connection is behind an `Arc`.
+#[derive(Clone)]
 pub struct TranscriptDb {
     conn: SharedSqlite,
 }

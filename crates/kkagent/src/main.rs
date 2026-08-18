@@ -3566,7 +3566,8 @@ async fn run_http_turn(
     )
     .with_hooks(state.hooks.clone())
     .with_goal_manager(state.goal_for(session.id.as_str()).await)
-    .with_tool_result_store(state.tool_result_store.clone());
+    .with_tool_result_store(state.tool_result_store.clone())
+    .with_transcript_db(state.transcript.lock().await.clone());
 
     // Prune expired toolchain grants (Once/Turn scope) before the turn starts.
     let turn_id = format!("{}:{}", session.id, session.messages.len());
@@ -5149,7 +5150,7 @@ fn serialize_transcript_messages(
 }
 
 fn messages_from_records(records: &[kkagent_core::transcript::MessageRecord]) -> Vec<ChatMessage> {
-    records
+    let mut messages: Vec<ChatMessage> = records
         .iter()
         .filter_map(|r| {
             let content: Vec<ChatContent> = serde_json::from_str(&r.content_json).ok()?;
@@ -5158,7 +5159,81 @@ fn messages_from_records(records: &[kkagent_core::transcript::MessageRecord]) ->
                 content,
             })
         })
-        .collect()
+        .collect();
+    repair_orphan_tool_uses(&mut messages);
+    messages
+}
+
+/// Synthesize error tool_results for tool_use blocks left unanswered by a
+/// crash between per-message persistence points. Providers reject a
+/// tool_use without its matching tool_result, so loading a crashed turn's
+/// transcript must repair the tail before it can be replayed.
+fn repair_orphan_tool_uses(messages: &mut Vec<ChatMessage>) {
+    let Some(last) = messages.last() else {
+        return;
+    };
+    if last.role != "assistant" {
+        return;
+    }
+    // Only an unanswered trailing tool_use needs repair.
+    if !last
+        .content
+        .iter()
+        .any(|block| matches!(block, ChatContent::ToolUse { .. }))
+    {
+        return;
+    }
+
+    // Walk back over trailing tool_result messages collecting answered ids.
+    let mut answered: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for message in messages[..messages.len() - 1].iter().rev() {
+        if message.role != "user" {
+            break;
+        }
+        let only_results = message
+            .content
+            .iter()
+            .all(|block| matches!(block, ChatContent::ToolResult { .. }));
+        if !only_results {
+            break;
+        }
+        for block in &message.content {
+            if let ChatContent::ToolResult { tool_use_id, .. } = block {
+                answered.insert(tool_use_id.as_str());
+            }
+        }
+    }
+
+    let missing: Vec<(String, String)> = last
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            ChatContent::ToolUse { id, name, .. } if !answered.contains(id.as_str()) => {
+                Some((id.clone(), name.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    if missing.is_empty() {
+        return;
+    }
+    tracing::warn!(
+        count = missing.len(),
+        "repairing orphan tool_use blocks from an interrupted turn"
+    );
+    messages.push(ChatMessage {
+        role: "user".into(),
+        content: missing
+            .into_iter()
+            .map(|(id, name)| ChatContent::ToolResult {
+                tool_use_id: id,
+                content: format!(
+                    "Tool `{name}` was interrupted by a server restart; no result was recorded."
+                ),
+                is_error: true,
+            })
+            .collect(),
+    });
 }
 
 fn http_session_list_item(
@@ -5195,6 +5270,9 @@ fn http_session_list_item(
 fn http_messages_from_records(
     records: &[kkagent_core::transcript::MessageRecord],
 ) -> Vec<serde_json::Value> {
+    // Deliberately raw (no orphan repair): the HTTP view mirrors the on-disk
+    // transcript exactly, timestamps included. LLM-context correctness is
+    // handled by `messages_from_records`, which repairs orphan tool_use.
     records
         .iter()
         .map(|record| {
@@ -5469,7 +5547,8 @@ async fn spawn_session_agent_turn(
             )
             .with_hooks(state_clone.hooks.clone())
             .with_goal_manager(state_clone.goal_for(&sid).await)
-            .with_tool_result_store(state_clone.tool_result_store.clone()),
+            .with_tool_result_store(state_clone.tool_result_store.clone())
+            .with_transcript_db(state_clone.transcript.lock().await.clone()),
         );
 
         let mut session = match state_clone.checkout_session(&sid).await {
@@ -10270,5 +10349,77 @@ mod runtime_http_tests {
         };
         let value = backend.get_config().await;
         assert_eq!(value["default_permission_mode"], "yolo");
+    }
+
+    fn msg_record(role: &str, content_json: &str) -> kkagent_core::transcript::MessageRecord {
+        kkagent_core::transcript::MessageRecord {
+            id: 0,
+            session_id: String::new(),
+            role: role.into(),
+            content_json: content_json.into(),
+            token_count: None,
+            created_at: "2026-01-01T00:00:00Z".into(),
+        }
+    }
+
+    #[test]
+    fn repair_orphan_tool_uses_adds_error_result() {
+        let records = vec![
+            msg_record("user", r#"[{"type":"text","text":"go"}]"#),
+            msg_record(
+                "assistant",
+                r#"[{"type":"text","text":"calling tool"},{"type":"tool_use","id":"call-1","name":"bash","input":{}}]"#,
+            ),
+        ];
+        let messages = messages_from_records(&records);
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[2].role, "user");
+        let result = &messages[2].content[0];
+        match result {
+            ChatContent::ToolResult {
+                tool_use_id,
+                is_error,
+                ..
+            } => {
+                assert_eq!(tool_use_id, "call-1");
+                assert!(*is_error);
+            }
+            other => panic!("expected ToolResult, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn repair_orphan_tool_uses_skips_complete_transcript() {
+        let records = vec![
+            msg_record("user", r#"[{"type":"text","text":"go"}]"#),
+            msg_record("assistant", r#"[{"type":"text","text":"done"}]"#),
+        ];
+        let messages = messages_from_records(&records);
+        assert_eq!(
+            messages.len(),
+            2,
+            "no repair needed for complete transcript"
+        );
+    }
+
+    #[test]
+    fn repair_orphan_tool_uses_skips_answered_tool_use() {
+        let records = vec![
+            msg_record(
+                "assistant",
+                r#"[{"type":"tool_use","id":"call-1","name":"bash","input":{}}]"#,
+            ),
+            msg_record(
+                "user",
+                r#"[{"type":"tool_result","tool_use_id":"call-1","content":"ok","is_error":false}]"#,
+            ),
+            msg_record("assistant", r#"[{"type":"text","text":"finalized"}]"#),
+        ];
+        let messages = messages_from_records(&records);
+        assert_eq!(
+            messages.len(),
+            3,
+            "no repair when tool_use already answered"
+        );
     }
 }
