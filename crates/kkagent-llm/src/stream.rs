@@ -139,6 +139,7 @@ pub async fn anthropic_stream(
 
     let mut stream = resp.bytes_stream();
     let mut buffer = String::new();
+    let mut byte_buf: Vec<u8> = Vec::new();
     let mut chunk_count = 0u64;
     let mut tool_blocks = std::collections::HashMap::<u64, String>::new();
     let mut usage = TokenUsage::default();
@@ -151,7 +152,7 @@ pub async fn anthropic_stream(
         if chunk_count <= 3 {
             tracing::debug!("SSE chunk #{}: {} bytes", chunk_count, chunk.len());
         }
-        buffer.push_str(&String::from_utf8_lossy(&chunk));
+        buffer.push_str(&drain_utf8(&mut byte_buf, &chunk));
 
         while let Some(pos) = buffer.find('\n') {
             let line = buffer[..pos].to_string();
@@ -201,6 +202,42 @@ pub async fn anthropic_stream(
         Ok(())
     } else {
         anyhow::bail!("Anthropic stream connection closed before message_stop")
+    }
+}
+
+/// Append a raw byte chunk to the accumulator and return as much valid UTF-8
+/// as possible. Incomplete multi-byte sequences at the tail are retained in
+/// `byte_buf` so they can be completed by the next chunk — this prevents the
+/// lossy replacement (`U+FFFD`) that [`String::from_utf8_lossy`] produces when
+/// a network chunk boundary splits a character.
+fn drain_utf8(byte_buf: &mut Vec<u8>, chunk: &[u8]) -> String {
+    byte_buf.extend_from_slice(chunk);
+    let mut out = String::new();
+    loop {
+        match std::str::from_utf8(byte_buf) {
+            Ok(s) => {
+                out.push_str(s);
+                byte_buf.clear();
+                return out;
+            }
+            Err(e) => {
+                let valid_up_to = e.valid_up_to();
+                // SAFETY: `from_utf8` confirmed `byte_buf[..valid_up_to]` is valid UTF-8.
+                out.push_str(std::str::from_utf8(&byte_buf[..valid_up_to]).unwrap());
+                match e.error_len() {
+                    Some(error_len) => {
+                        // Truly invalid byte(s) — replace and skip, like lossy.
+                        out.push('\u{FFFD}');
+                        byte_buf.drain(..valid_up_to + error_len);
+                    }
+                    None => {
+                        // Incomplete multi-byte sequence at tail — keep for next chunk.
+                        byte_buf.drain(..valid_up_to);
+                        return out;
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -487,6 +524,7 @@ async fn chat_completions_stream(
 
     let mut stream = resp.bytes_stream();
     let mut buffer = String::new();
+    let mut byte_buf: Vec<u8> = Vec::new();
     // Track partial tool call argument deltas by index
     let mut tool_ids: std::collections::HashMap<usize, (String, String)> =
         std::collections::HashMap::new();
@@ -496,7 +534,7 @@ async fn chat_completions_stream(
     let mut first_token = FirstTokenGate::new(request.first_token_timeout, &request.model);
 
     while let Some(chunk) = first_token.next_chunk(&mut stream).await? {
-        buffer.push_str(&String::from_utf8_lossy(&chunk));
+        buffer.push_str(&drain_utf8(&mut byte_buf, &chunk));
         while let Some(pos) = buffer.find('\n') {
             let line = buffer[..pos].to_string();
             buffer = buffer[pos + 1..].to_string();
@@ -753,11 +791,12 @@ pub async fn google_stream(
 
     let mut stream = resp.bytes_stream();
     let mut buffer = String::new();
+    let mut byte_buf: Vec<u8> = Vec::new();
     let mut usage = TokenUsage::default();
     let mut completed = false;
     let mut first_token = FirstTokenGate::new(request.first_token_timeout, &request.model);
     while let Some(chunk) = first_token.next_chunk(&mut stream).await? {
-        buffer.push_str(&String::from_utf8_lossy(&chunk));
+        buffer.push_str(&drain_utf8(&mut byte_buf, &chunk));
         while let Some(pos) = buffer.find('\n') {
             let line = buffer[..pos].to_string();
             buffer = buffer[pos + 1..].to_string();
@@ -977,7 +1016,7 @@ async fn upload_kimi_video(
 #[cfg(test)]
 mod tests {
     use super::{
-        anthropic_stream, api_endpoint, google_stream, kimi_stream, openai_stream,
+        anthropic_stream, api_endpoint, drain_utf8, google_stream, kimi_stream, openai_stream,
         push_strict_provider_message,
     };
     use crate::types::{ChatContent, ChatMessage, LlmRequest, StreamEvent, ThinkingParams};
@@ -1014,6 +1053,46 @@ mod tests {
             ),
             "https://example.test/custom/chat/completions"
         );
+    }
+
+    #[test]
+    fn drain_utf8_reassembles_split_multibyte_across_chunks() {
+        // "会话": 会=E4 BC 9A, 话=E8 AF 9D — split each char's bytes across chunks
+        let mut buf = Vec::new();
+
+        // chunk 1: first two bytes of "会"
+        assert_eq!(drain_utf8(&mut buf, &[0xE4, 0xBC]), "");
+        assert_eq!(buf, vec![0xE4, 0xBC]);
+
+        // chunk 2: last byte of "会" + first byte of "话"
+        assert_eq!(drain_utf8(&mut buf, &[0x9A, 0xE8]), "会");
+        assert_eq!(buf, vec![0xE8]);
+
+        // chunk 3: remaining bytes of "话"
+        assert_eq!(drain_utf8(&mut buf, &[0xAF, 0x9D]), "话");
+        assert!(buf.is_empty(), "buffer should be drained: {buf:?}");
+    }
+
+    #[test]
+    fn drain_utf8_handles_pure_ascii_in_one_chunk() {
+        let mut buf = Vec::new();
+        assert_eq!(drain_utf8(&mut buf, b"data: hello\n"), "data: hello\n");
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn drain_utf8_replaces_truly_invalid_bytes() {
+        // 0xFF is never a valid UTF-8 leading byte
+        let mut buf = Vec::new();
+        assert_eq!(drain_utf8(&mut buf, &[0xFF, b'a']), "\u{FFFD}a");
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn drain_utf8_handles_empty_chunk() {
+        let mut buf = Vec::new();
+        assert_eq!(drain_utf8(&mut buf, &[]), "");
+        assert!(buf.is_empty());
     }
 
     async fn capture_request(socket: &mut tokio::net::TcpStream) -> CapturedRequest {
