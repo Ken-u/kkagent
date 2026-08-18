@@ -7043,6 +7043,21 @@ impl TuiApp {
         } else if self.state.question_pending.is_some() {
             self.state.status = SessionStatus::WaitingQuestion;
         }
+        // Don't force the plan-document overlay when switching to a cached
+        // session — show the normal transcript instead.  The plan content is
+        // preserved as a MessageRole::Plan entry in `messages`, and the next
+        // PlanFileUpdated event (replayed below or received live) restores the
+        // focus view.  Exception: when the agent submitted a plan for review
+        // and is waiting for the user to approve, the plan document must stay
+        // visible.
+        let needs_plan_review = self
+            .state
+            .approval_pending
+            .as_ref()
+            .is_some_and(|a| a.is_plan_review);
+        if self.state.plan_mode && !needs_plan_review {
+            self.state.dismiss_plan_focus();
+        }
         self.state.status_bar.session_id = Some(session_id.to_string());
         self.state.tab_strip.ensure_active(session_id, "session");
         self.state.list_picker = None;
@@ -7614,6 +7629,18 @@ impl TuiApp {
                     self.state.follow_bottom = false;
                 }
             }
+        }
+        // Resuming a session should land on the normal transcript, not the
+        // plan-document overlay — unless the agent submitted a plan for
+        // review (ExitPlanMode approval) and is waiting for the user to
+        // decide, in which case the plan document must stay visible.
+        let needs_plan_review = self
+            .state
+            .approval_pending
+            .as_ref()
+            .is_some_and(|a| a.is_plan_review);
+        if self.state.plan_mode && !needs_plan_review {
+            self.state.dismiss_plan_focus();
         }
 
         if !self.state.open_session_group.iter().any(|id| id == &sid) {
