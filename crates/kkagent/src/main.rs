@@ -6866,6 +6866,12 @@ async fn handle_rpc_call(
                 let total = merged_messages.len();
                 let (display, oldest_index, older_available) =
                     slice_recent_messages(&merged_messages, display_limit);
+                // Usage is not persisted, so a DB-resumed session starts with
+                // empty totals. Estimate the current context from the full
+                // transcript (not the display slice) so the TUI context
+                // indicator is meaningful right after the switch.
+                let est_tokens =
+                    kkagent_core::token_counting::TokenCounter::estimate_messages(&merged_messages);
                 let mut payload = serde_json::json!({
                     "session_id": session_id,
                     "messages": display,
@@ -6881,6 +6887,18 @@ async fn handle_rpc_call(
                     "pending_question": pending_question,
                     "todos": todos,
                     "first_prompt": first_prompt,
+                    "usage": {
+                        "input_tokens": est_tokens,
+                        "output_tokens": 0,
+                        "cache_creation_tokens": 0,
+                        "cache_read_tokens": 0,
+                        "steps": 0,
+                        "turns": 0,
+                    },
+                    "last_step_usage": {
+                        "input_tokens": est_tokens,
+                        "output_tokens": 0,
+                    },
                     "history": {
                         "total": total,
                         "oldest_index": oldest_index,
@@ -6973,6 +6991,10 @@ async fn handle_rpc_call(
             let total = messages.len();
             let (display, oldest_index, older_available) =
                 slice_recent_messages(&messages, display_limit);
+            // Usage is not persisted; estimate current context from the full
+            // transcript so the TUI indicator reflects reality after resume.
+            let est_tokens =
+                kkagent_core::token_counting::TokenCounter::estimate_messages(&messages);
             let mut payload = serde_json::json!({
                 "session_id": session_id,
                 "messages": display,
@@ -6988,6 +7010,18 @@ async fn handle_rpc_call(
                 "pending_question": pending_question,
                 "todos": todos,
                 "first_prompt": first_prompt,
+                "usage": {
+                    "input_tokens": est_tokens,
+                    "output_tokens": 0,
+                    "cache_creation_tokens": 0,
+                    "cache_read_tokens": 0,
+                    "steps": 0,
+                    "turns": 0,
+                },
+                "last_step_usage": {
+                    "input_tokens": est_tokens,
+                    "output_tokens": 0,
+                },
                 "history": {
                     "total": total,
                     "oldest_index": oldest_index,

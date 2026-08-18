@@ -7429,6 +7429,7 @@ impl TuiApp {
         self.state.turn_started_at = None;
         self.state.tokens_at_turn_start = 0;
         self.state.approx_tokens = 0;
+        self.state.status_bar.cache_hit = None;
         self.state.approval_queue.clear();
         self.state.prompt_queue = crate::prompt_queue::PromptQueue::default();
         self.state.usage_session = SessionUsageTotals::default();
@@ -7803,18 +7804,23 @@ impl TuiApp {
             // `approx_tokens` reflects the *current context size* (most recent
             // single LLM call), NOT the session-running total. Prefer the
             // dedicated `last_step_usage` field; fall back to `usage` only for
-            // older servers that don't send it.
-            let ctx_input = data
-                .get("last_step_usage")
-                .and_then(|u| u.get("input_tokens"))
-                .and_then(|v| v.as_u64())
-                .unwrap_or(input);
-            let ctx_output = data
-                .get("last_step_usage")
-                .and_then(|u| u.get("output_tokens"))
-                .and_then(|v| v.as_u64())
-                .unwrap_or(output);
-            self.state.approx_tokens = ctx_input.saturating_add(ctx_output);
+            // older servers that don't send it. Cache tokens are folded in via
+            // the provider-aware helper so long cached sessions show their real
+            // context size (Anthropic excludes cache from `input_tokens`).
+            let step = data.get("last_step_usage");
+            let step_field = |name: &str, fallback: u64| {
+                step.and_then(|u| u.get(name))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(fallback)
+            };
+            let step_usage = kkagent_protocol::TokenUsage {
+                input_tokens: step_field("input_tokens", input),
+                output_tokens: step_field("output_tokens", output),
+                cache_creation_input_tokens: step_field("cache_creation_tokens", 0),
+                cache_read_input_tokens: step_field("cache_read_tokens", 0),
+            };
+            self.state.approx_tokens = step_usage.context_size();
+            self.state.status_bar.cache_hit = step_usage.cache_hit_ratio();
         }
         if let Some(plan) = data.get("plan_mode").and_then(|v| v.as_bool()) {
             self.state.on_plan_mode_changed(plan);
@@ -10754,8 +10760,9 @@ impl TuiApp {
                     } => {
                         // `usage` is per-call; session totals accumulate across
                         // calls so cost/usage reflects the whole session.
-                        self.state.approx_tokens =
-                            usage.input_tokens.saturating_add(usage.output_tokens);
+                        // Context indicator = full prompt actually sent (cache
+                        // tokens included via provider-aware helper) + output.
+                        self.state.approx_tokens = usage.context_size();
                         let s = &mut self.state.usage_session;
                         s.input_tokens = s.input_tokens.saturating_add(usage.input_tokens);
                         s.output_tokens = s.output_tokens.saturating_add(usage.output_tokens);

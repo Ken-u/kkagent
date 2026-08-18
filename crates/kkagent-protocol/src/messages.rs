@@ -58,6 +58,28 @@ pub struct TokenUsage {
 }
 
 impl TokenUsage {
+    /// Total input (prompt) tokens across provider semantics:
+    /// - Anthropic: `input_tokens` excludes cache, so add both cache buckets.
+    /// - OpenAI: `input_tokens` already includes cached tokens (and
+    ///   `cache_read_input_tokens` is a subset of it), so use it alone.
+    ///
+    /// This is the right numerator for "current context size" indicators.
+    pub fn total_input_tokens(&self) -> u64 {
+        if self.cache_creation_input_tokens > 0 {
+            self.input_tokens
+                .saturating_add(self.cache_creation_input_tokens)
+                .saturating_add(self.cache_read_input_tokens)
+        } else {
+            self.input_tokens
+        }
+    }
+
+    /// Approximate context size after this call: the prompt actually sent plus
+    /// the generated output (which becomes input for the next call).
+    pub fn context_size(&self) -> u64 {
+        self.total_input_tokens().saturating_add(self.output_tokens)
+    }
+
     /// Compute cache hit ratio adaptively across provider semantics:
     /// - `cache_creation > 0` (Anthropic style): `input_tokens` excludes cache,
     ///   so the total input is `input + cache_creation + cache_read`.
@@ -112,5 +134,37 @@ impl ContextBreakdownInfo {
             .saturating_add(self.conversation)
             .saturating_add(self.tools)
             .saturating_add(self.media)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn total_input_tokens_anthropic_style() {
+        // input excludes cache: total = 2k + 3k + 95k = 100k.
+        let u = TokenUsage {
+            input_tokens: 2_000,
+            output_tokens: 1_000,
+            cache_creation_input_tokens: 3_000,
+            cache_read_input_tokens: 95_000,
+        };
+        assert_eq!(u.total_input_tokens(), 100_000);
+        assert_eq!(u.context_size(), 101_000);
+    }
+
+    #[test]
+    fn total_input_tokens_openai_style() {
+        // prompt_tokens includes cached: 100k total, 95k of it cached.
+        // cache_read is a subset of input — must NOT be added again.
+        let u = TokenUsage {
+            input_tokens: 100_000,
+            output_tokens: 1_000,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 95_000,
+        };
+        assert_eq!(u.total_input_tokens(), 100_000);
+        assert_eq!(u.context_size(), 101_000);
     }
 }

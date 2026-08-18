@@ -74,7 +74,7 @@ impl SessionEventRouter {
                 // Single-call context size — NOT a running total. (Mirrors the
                 // `approx_tokens` assignment in app.rs; the value is re-synced
                 // from `approx_tokens` every render frame via components.rs.)
-                status.tokens = usage.input_tokens.saturating_add(usage.output_tokens);
+                status.tokens = usage.context_size();
                 status.cache_hit = kkagent_protocol::cache_hit_ratio(
                     usage.input_tokens,
                     usage.cache_creation_input_tokens,
