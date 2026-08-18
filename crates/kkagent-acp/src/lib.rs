@@ -1611,6 +1611,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn fs_write_rejects_symlink_escape() {
         let dir = tempfile::tempdir().unwrap();
