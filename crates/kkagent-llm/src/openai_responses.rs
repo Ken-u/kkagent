@@ -5,6 +5,7 @@ use serde_json::json;
 use tokio::sync::mpsc;
 
 use crate::first_token_gate::FirstTokenGate;
+use crate::stream::drain_utf8;
 use crate::types::{ChatContent, LlmRequest, StreamEvent, TokenUsage};
 
 pub async fn openai_responses_stream(
@@ -140,12 +141,13 @@ pub async fn openai_responses_stream(
 
     let mut stream = resp.bytes_stream();
     let mut buffer = String::new();
+    let mut byte_buf: Vec<u8> = Vec::new();
     let mut usage = TokenUsage::default();
     let mut active_calls = std::collections::HashMap::<String, ActiveCall>::new();
     let mut first_token = FirstTokenGate::new(request.first_token_timeout, &request.model);
 
     while let Some(chunk) = first_token.next_chunk(&mut stream).await? {
-        buffer.push_str(&String::from_utf8_lossy(&chunk));
+        buffer.push_str(&drain_utf8(&mut byte_buf, &chunk));
         while let Some(pos) = buffer.find('\n') {
             let line = buffer[..pos].to_string();
             buffer = buffer[pos + 1..].to_string();

@@ -210,7 +210,7 @@ pub async fn anthropic_stream(
 /// `byte_buf` so they can be completed by the next chunk — this prevents the
 /// lossy replacement (`U+FFFD`) that [`String::from_utf8_lossy`] produces when
 /// a network chunk boundary splits a character.
-fn drain_utf8(byte_buf: &mut Vec<u8>, chunk: &[u8]) -> String {
+pub(crate) fn drain_utf8(byte_buf: &mut Vec<u8>, chunk: &[u8]) -> String {
     byte_buf.extend_from_slice(chunk);
     let mut out = String::new();
     loop {
