@@ -187,6 +187,10 @@ pub struct AppState {
     pub status_bar: StatusBarModel,
     /// Workspace sessions for footer strip + empty-input Tab cycling.
     pub workspace_sessions: crate::chrome::WorkspaceSessionStrip,
+    /// Sessions whose tab was closed in this window (Ctrl-D). Guards against
+    /// stale `sessions.list` responses (raced with the follow-up session
+    /// switch) resurrecting the closed indicator in the footer strip.
+    pub closed_tab_ids: std::collections::HashSet<String>,
     /// Ephemeral Tab group for this TUI window (`/new` siblings). Not persisted.
     pub open_session_group: Vec<String>,
     /// Preview pane while `/sessions` list is open.
@@ -980,6 +984,7 @@ impl AppState {
                 ..Default::default()
             },
             workspace_sessions: crate::chrome::WorkspaceSessionStrip::default(),
+            closed_tab_ids: std::collections::HashSet::new(),
             open_session_group: Vec::new(),
             session_picker_preview: None,
             session_picker_entries: Vec::new(),
@@ -7059,6 +7064,9 @@ impl TuiApp {
             self.state.dismiss_plan_focus();
         }
         self.state.status_bar.session_id = Some(session_id.to_string());
+        // Reopening a session clears its closed-tab tombstone so the footer
+        // strip (and future refreshes) may show it again.
+        self.state.closed_tab_ids.remove(session_id);
         self.state.tab_strip.ensure_active(session_id, "session");
         self.state.list_picker = None;
         self.state.session_picker_preview = None;
@@ -7212,6 +7220,9 @@ impl TuiApp {
             }
         }
         self.state.session_id = Some(sid.clone());
+        // Resuming a session re-opens its tab: clear any closed-tab tombstone
+        // so subsequent refreshes show the indicator again.
+        self.state.closed_tab_ids.remove(&sid);
         if let Some(working_dir) = data.get("working_dir").and_then(|v| v.as_str()) {
             self.state.working_dir = std::fs::canonicalize(working_dir)
                 .unwrap_or_else(|_| std::path::PathBuf::from(working_dir));
@@ -7852,6 +7863,11 @@ impl TuiApp {
                 if empty && id != current_id && !is_open {
                     continue;
                 }
+                // Tabs closed in this window (Ctrl-D) stay closed: drop rows for
+                // them so a stale refresh cannot resurrect the indicator.
+                if self.state.closed_tab_ids.contains(&id) {
+                    continue;
+                }
                 let title = crate::chrome::session_display_title(
                     s.get("title").and_then(|v| v.as_str()),
                     s.get("is_custom_title")
@@ -7865,7 +7881,10 @@ impl TuiApp {
         }
 
         // Ensure current session is in the graph even if list is momentarily stale.
-        if !rows.iter().any(|(id, _)| id == &current_id) {
+        // Skip when the current id was just closed (Ctrl-D) and the follow-up
+        // session switch has not landed yet — it must not re-enter the strip.
+        let current_open = !self.state.closed_tab_ids.contains(&current_id);
+        if current_open && !rows.iter().any(|(id, _)| id == &current_id) {
             // Prefer the tab title we already know (e.g. a `/title` set earlier),
             // so a transient missing-row does not revert to the first prompt.
             let existing_title = self
@@ -7917,8 +7936,9 @@ impl TuiApp {
             .tabs
             .iter()
             .map(|tab| tab.id.clone())
+            .filter(|id| !self.state.closed_tab_ids.contains(id))
             .collect::<Vec<_>>();
-        if !ids.contains(&current_id) {
+        if current_open && !ids.contains(&current_id) {
             ids.insert(0, current_id.clone());
         }
 
@@ -7968,27 +7988,34 @@ impl TuiApp {
             })
             .collect();
 
-        self.state
-            .workspace_sessions
-            .set_entries_stable(entries, Some(current_id.as_str()));
+        self.state.workspace_sessions.set_entries_stable(
+            entries,
+            if current_open {
+                Some(current_id.as_str())
+            } else {
+                None
+            },
+        );
 
         for e in self.state.workspace_sessions.entries.iter() {
             self.state.tab_strip.ensure_tab(&e.id, e.title.clone());
         }
-        let title = self
-            .state
-            .workspace_sessions
-            .entries
-            .iter()
-            .find(|e| e.id == current_id)
-            .map(|e| e.title.clone())
-            .or_else(|| {
-                rows.iter()
-                    .find(|(id, _)| id == &current_id)
-                    .map(|(_, title)| title.clone())
-            })
-            .unwrap_or_else(|| "main".into());
-        self.state.tab_strip.ensure_active(&current_id, title);
+        if current_open {
+            let title = self
+                .state
+                .workspace_sessions
+                .entries
+                .iter()
+                .find(|e| e.id == current_id)
+                .map(|e| e.title.clone())
+                .or_else(|| {
+                    rows.iter()
+                        .find(|(id, _)| id == &current_id)
+                        .map(|(_, title)| title.clone())
+                })
+                .unwrap_or_else(|| "main".into());
+            self.state.tab_strip.ensure_active(&current_id, title);
+        }
     }
 
     fn link_open_sessions(&mut self, a: &str, b: &str) {
@@ -8349,6 +8376,10 @@ impl TuiApp {
                 .workspace_sessions
                 .entries
                 .retain(|entry| entry.id != deleted_id);
+            // Tombstone the closed tab so an in-flight/stale `sessions.list`
+            // response cannot resurrect it (state.session_id still points at
+            // it until the follow-up switch lands).
+            self.state.closed_tab_ids.insert(deleted_id.clone());
             if self.state.workspace_sessions.active >= self.state.workspace_sessions.entries.len() {
                 self.state.workspace_sessions.active = self
                     .state
@@ -8446,6 +8477,9 @@ impl TuiApp {
             Ok(_) => {
                 self.state.open_session_group.retain(|id| id != &deleted_id);
                 self.state.tab_strip.tabs.retain(|t| t.id != deleted_id);
+                // Tombstone the deleted tab against stale `sessions.list`
+                // responses racing the follow-up switch.
+                self.state.closed_tab_ids.insert(deleted_id.clone());
                 self.state.parked_approvals.remove(&deleted_id);
                 self.state.parked_questions.remove(&deleted_id);
                 self.state.session_views.remove(&deleted_id);
@@ -12271,6 +12305,68 @@ mod app_state_tests {
         assert!(visible_ids.contains(&"current"));
         assert!(visible_ids.contains(&"running"));
         assert!(visible_ids.contains(&"idle"));
+    }
+
+    #[tokio::test]
+    async fn stale_sessions_list_cannot_resurrect_a_closed_tab() {
+        // Ctrl-D closed "current" (tombstoned) and the follow-up switch to
+        // another session has not landed yet: state.session_id is still the
+        // closed id. A stale sessions.list response must neither re-add the
+        // row nor re-open the tab in tab_strip.
+        let mut app = test_tui_app();
+        app.state.session_id = Some("closed".into());
+        app.state.tab_strip.ensure_active("closed", "closed");
+        app.state.tab_strip.ensure_tab("other", "other");
+        // Mirror confirm_delete_session's non-permanent branch: tab removed
+        // from the strip, tombstone recorded, session switch still pending.
+        app.state.tab_strip.tabs.retain(|t| t.id != "closed");
+        app.state.closed_tab_ids.insert("closed".into());
+
+        app.apply_workspace_sessions_list(Some(serde_json::json!({
+            "sessions": [
+                {"session_id": "closed", "title": "closed", "empty": false},
+                {"session_id": "other", "title": "other", "empty": false}
+            ]
+        })));
+
+        let visible_ids = app
+            .state
+            .workspace_sessions
+            .entries
+            .iter()
+            .map(|entry| entry.id.as_str())
+            .collect::<Vec<_>>();
+        assert!(!visible_ids.contains(&"closed"));
+        assert!(visible_ids.contains(&"other"));
+        assert!(!app
+            .state
+            .tab_strip
+            .tabs
+            .iter()
+            .any(|tab| tab.id == "closed"));
+    }
+
+    #[tokio::test]
+    async fn resuming_a_session_clears_its_closed_tab_tombstone() {
+        let mut app = test_tui_app();
+        app.state.session_id = Some("current".into());
+        app.state.tab_strip.ensure_active("current", "current");
+        app.state.closed_tab_ids.insert("reopened".into());
+
+        // Cached-switch path clears the tombstone when the session lands.
+        app.activate_cached_session(
+            "reopened",
+            SessionRuntimeState::capture(&app.state),
+            std::time::Instant::now(),
+        );
+
+        assert!(!app.state.closed_tab_ids.contains("reopened"));
+        assert!(app
+            .state
+            .tab_strip
+            .tabs
+            .iter()
+            .any(|tab| tab.id == "reopened"));
     }
 
     #[tokio::test]
