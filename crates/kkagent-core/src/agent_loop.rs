@@ -1901,9 +1901,7 @@ Do not mention this reminder to the user.\n</system-reminder>"
             for msg in deliveries {
                 session.add_user_message(msg);
             }
-            if !session.transcript_rewrite_required {
-                self.persist_step(session);
-            }
+            self.persist_step(session);
 
             if session.is_interrupted() {
                 self.finish_interrupted(session).await?;

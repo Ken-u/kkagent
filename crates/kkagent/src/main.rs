@@ -4483,6 +4483,9 @@ impl ServerState {
                 remaining_seconds,
                 ..
             } => {
+                if !self.session_is_checked_out(session_id).await {
+                    return;
+                }
                 let mut map = self.reconnect_ui.lock().await;
                 let entry = map.entry(session_id.clone()).or_default();
                 entry.llm_retry = Some(LlmRetryUi {
@@ -5098,41 +5101,10 @@ fn http_session_json(session: &Session) -> serde_json::Value {
 }
 
 fn persist_session_messages(db: &TranscriptDb, session: &mut Session) -> anyhow::Result<()> {
-    if session.transcript_rewrite_required {
-        let replacement = serialize_transcript_messages(&session.messages)?;
-        db.replace_messages(&session.id, &replacement, None)?;
-        session.persisted_message_count = session.messages.len();
-        session.transcript_rewrite_required = false;
-    }
-
-    if session.persisted_message_count < session.messages.len() {
-        let pending = &session.messages[session.persisted_message_count..];
-        let serialized = serialize_transcript_messages(pending)?;
-        db.append_messages(&session.id, &serialized)?;
-        session.persisted_message_count = session.messages.len();
-    }
-
-    // Auto-title from first real user text (skip harness-only injections).
-    // Use the same 200-char truncation as `first_prompt` so the DB title stays
-    // consistent with the disk-store label shown in the session picker.
-    if session.title.is_none() {
-        if let Some(text) =
-            kkagent_protocol::first_real_user_text(session.messages.iter().filter_map(|m| {
-                if m.role != "user" {
-                    return None;
-                }
-                m.content.iter().find_map(|c| match c {
-                    ChatContent::Text { text } => Some(text.as_str()),
-                    _ => None,
-                })
-            }))
-        {
-            let title: String = text.chars().take(200).collect();
-            db.set_title(&session.id, &title)?;
-            session.title = Some(title);
-        }
-    }
-    Ok(())
+    // Delegate to the shared core implementation so per-step (persist_step)
+    // and turn-end persistence stay in lockstep — no duplicated
+    // rewrite/append/auto-title logic to drift apart.
+    kkagent_core::transcript::persist_session_delta(db, session)
 }
 
 fn serialize_transcript_messages(
