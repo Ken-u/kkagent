@@ -254,6 +254,9 @@ pub struct AppState {
     pub usage_session: SessionUsageTotals,
     /// Recent per-turn usage samples for `/usage`.
     pub usage_turns: Vec<TurnUsageSample>,
+    /// Server-authoritative per-part context breakdown (system/tools/…) for
+    /// the active session.
+    pub context_breakdown: Option<kkagent_protocol::ContextBreakdownInfo>,
     /// Transient copy feedback shown for 1.5s after a successful copy.
     pub copy_toast: Option<CopyToast>,
 }
@@ -277,6 +280,8 @@ pub struct SessionUsageTotals {
     pub output_tokens: u64,
     pub cache_creation_tokens: u64,
     pub cache_read_tokens: u64,
+    pub steps: u64,
+    pub turns: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -314,6 +319,7 @@ pub struct SessionRuntimeState {
     pub prompt_queue: crate::prompt_queue::PromptQueue,
     pub usage_session: SessionUsageTotals,
     pub usage_turns: Vec<TurnUsageSample>,
+    pub context_breakdown: Option<kkagent_protocol::ContextBreakdownInfo>,
     pub copy_toast: Option<CopyToast>,
     pub click_history: Vec<ClickRecord>,
 }
@@ -352,6 +358,7 @@ impl SessionRuntimeState {
             prompt_queue: state.prompt_queue.clone(),
             usage_session: state.usage_session.clone(),
             usage_turns: state.usage_turns.clone(),
+            context_breakdown: state.context_breakdown.clone(),
             copy_toast: state.copy_toast.clone(),
             click_history: state.click_history.clone(),
         }
@@ -382,6 +389,7 @@ impl SessionRuntimeState {
         state.prompt_queue = self.prompt_queue;
         state.usage_session = self.usage_session;
         state.usage_turns = self.usage_turns;
+        state.context_breakdown = self.context_breakdown;
         state.copy_toast = self.copy_toast;
         state.click_history = self.click_history;
         state.stream_cursor = crate::streaming::StreamingCursor::default();
@@ -467,6 +475,10 @@ pub enum ListPickerKind {
     Effort,
     /// Browse-only key/value rows (status / auth / flags / plugins / info).
     Browse,
+    /// Session usage panel (`/usage`); `__turns__` row drills into per-turn detail.
+    Usage,
+    /// Per-turn usage detail (submenu of `/usage`).
+    UsageTurns,
     /// Slash command catalogue (`/help`).
     Help,
     /// Prompt templates (`/prompts`).
@@ -1016,6 +1028,7 @@ impl AppState {
             last_switch_metrics: None,
             usage_session: SessionUsageTotals::default(),
             usage_turns: Vec::new(),
+            context_breakdown: None,
             copy_toast: None,
         }
     }
@@ -3010,15 +3023,40 @@ impl TuiApp {
             return self.handle_search_key(key).await;
         }
 
+        // Ctrl+G (BTW toggle) punches through a visible approval / plan-review
+        // modal. BTW is an independent side question that does not touch the
+        // pending approval on the server, so entering it while the modal is up
+        // is safe — the modal stays pending and remains interactable after BTW
+        // exits (and is simply not drawn while BTW owns the surface).
+        if key.code == KeyCode::Char('g')
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && self
+                .state
+                .approval_pending
+                .as_ref()
+                .is_some_and(|a| !a.hidden)
+        {
+            if self.state.mode == AppMode::Btw {
+                self.exit_btw_view();
+            } else {
+                self.enter_btw_view();
+            }
+            return Ok(());
+        }
+
         // Handle approval panel first (plan review / permission approval).
         // The agent loop ensures AskUserQuestion and ExitPlanMode never run in
         // the same step, so in practice only one is pending. If both somehow
         // exist (e.g. across turns), the approval modal takes precedence.
+        // While BTW owns the surface the modal is suspended: it is neither
+        // drawn nor allowed to swallow keystrokes, so the user can type into
+        // the BTW composer. The modal is restored on BTW exit.
         if self
             .state
             .approval_pending
             .as_ref()
             .is_some_and(|approval| !approval.hidden)
+            && self.state.mode != AppMode::Btw
         {
             let approval = self
                 .state
@@ -4334,6 +4372,20 @@ impl TuiApp {
                     self.state.list_picker = Some(prev);
                 }
             }
+            ListPickerKind::Usage => {
+                if item.id == "__turns__" {
+                    self.state.list_picker_stack.push(picker);
+                    self.open_usage_turns_picker();
+                } else if let Some(prev) = self.state.list_picker_stack.pop() {
+                    self.state.list_picker = Some(prev);
+                }
+            }
+            ListPickerKind::UsageTurns => {
+                // Enter = same as Esc: back to the /usage panel.
+                if let Some(prev) = self.state.list_picker_stack.pop() {
+                    self.state.list_picker = Some(prev);
+                }
+            }
             ListPickerKind::Help => {
                 let nested = matches!(
                     item.id.as_str(),
@@ -5510,6 +5562,11 @@ impl TuiApp {
         let (in_price, out_price, cache_c, cache_r, generic) =
             model_pricing(&self.config, model.as_str());
         let cost = estimate_usd(u, in_price, out_price, cache_c, cache_r);
+        let hit = kkagent_protocol::cache_hit_ratio(
+            u.input_tokens,
+            u.cache_creation_tokens,
+            u.cache_read_tokens,
+        );
         let mut items = vec![
             ListPickerItem {
                 id: "model".into(),
@@ -5517,24 +5574,41 @@ impl TuiApp {
                 detail: model,
             },
             ListPickerItem {
+                id: "sep_totals".into(),
+                label: "── Session Totals ──".into(),
+                detail: String::new(),
+            },
+            ListPickerItem {
                 id: "input".into(),
                 label: "Input tokens".into(),
-                detail: u.input_tokens.to_string(),
+                detail: fmt_thousands(u.input_tokens),
             },
             ListPickerItem {
                 id: "output".into(),
                 label: "Output tokens".into(),
-                detail: u.output_tokens.to_string(),
+                detail: fmt_thousands(u.output_tokens),
+            },
+            ListPickerItem {
+                id: "total".into(),
+                label: "Total tokens".into(),
+                detail: fmt_thousands(u.input_tokens.saturating_add(u.output_tokens)),
             },
             ListPickerItem {
                 id: "cache_c".into(),
                 label: "Cache creation".into(),
-                detail: u.cache_creation_tokens.to_string(),
+                detail: fmt_thousands(u.cache_creation_tokens),
             },
             ListPickerItem {
                 id: "cache_r".into(),
                 label: "Cache read".into(),
-                detail: u.cache_read_tokens.to_string(),
+                detail: fmt_thousands(u.cache_read_tokens),
+            },
+            ListPickerItem {
+                id: "hit".into(),
+                label: "Cache hit ratio".into(),
+                detail: hit
+                    .map(|h| format!("{:.1}%", h * 100.0))
+                    .unwrap_or_else(|| "n/a".into()),
             },
             ListPickerItem {
                 id: "cost".into(),
@@ -5545,20 +5619,135 @@ impl TuiApp {
                 },
                 detail: format!("${cost:.4}"),
             },
+            ListPickerItem {
+                id: "steps".into(),
+                label: "Steps".into(),
+                detail: u.steps.to_string(),
+            },
+            ListPickerItem {
+                id: "turns".into(),
+                label: "Turns".into(),
+                detail: u.turns.to_string(),
+            },
         ];
-        for (i, turn) in self.state.usage_turns.iter().rev().take(8).enumerate() {
+
+        // Context breakdown with progress bars (server-authoritative when
+        // available; falls back to a local estimate otherwise).
+        let max_ctx = self
+            .state
+            .model_alias
+            .as_deref()
+            .or_else(|| self.config.default_model_alias())
+            .and_then(|a| self.config.resolve_model(a))
+            .and_then(|(m, _)| m.max_context_size)
+            .unwrap_or(200_000);
+        let (ctx_system, ctx_conv, ctx_tools, ctx_media, ctx_reserved, ctx_est) =
+            if let Some(c) = self.state.context_breakdown.as_ref() {
+                (
+                    c.system,
+                    c.conversation,
+                    c.tools,
+                    c.media,
+                    c.reserved_output,
+                    c.estimated,
+                )
+            } else {
+                (0, 0, 0, 0, 8_192, true)
+            };
+        let ctx_used = ctx_system
+            .saturating_add(ctx_conv)
+            .saturating_add(ctx_tools)
+            .saturating_add(ctx_media);
+        let free = max_ctx.saturating_sub(ctx_used.saturating_add(ctx_reserved));
+        items.push(ListPickerItem {
+            id: "sep_ctx".into(),
+            label: format!(
+                "── Context Breakdown ({} / {}) ──",
+                fmt_thousands(ctx_used),
+                fmt_thousands(max_ctx)
+            ),
+            detail: String::new(),
+        });
+        let rows = [
+            ("system", "System prompt", ctx_system),
+            ("conversation", "Conversation", ctx_conv),
+            ("tools", "Tools", ctx_tools),
+            ("media", "Media", ctx_media),
+            ("reserved", "Reserved output", ctx_reserved),
+            ("free", "Free", free),
+        ];
+        for (id, name, tokens) in rows {
+            let pct = if max_ctx == 0 {
+                0.0
+            } else {
+                tokens as f64 / max_ctx as f64 * 100.0
+            };
+            items.push(ListPickerItem {
+                id: format!("ctx-{id}"),
+                label: name.into(),
+                detail: format!(
+                    "{} {:>10} ({:4.1}%){}",
+                    progress_bar(tokens, max_ctx, 24),
+                    fmt_thousands(tokens),
+                    pct,
+                    if ctx_est { " ≈" } else { "" }
+                ),
+            });
+        }
+
+        items.push(ListPickerItem {
+            id: "sep_more".into(),
+            label: "── More ──".into(),
+            detail: String::new(),
+        });
+        items.push(ListPickerItem {
+            id: "__turns__".into(),
+            label: "Recent Turns →".into(),
+            detail: "(Enter to view)".into(),
+        });
+        self.replace_list_picker(ListPickerState {
+            kind: ListPickerKind::Usage,
+            title: " /usage ".into(),
+            items,
+            selected: 0,
+            filter: String::new(),
+            all_items: Vec::new(),
+        });
+    }
+
+    fn open_usage_turns_picker(&mut self) {
+        let mut items = Vec::new();
+        for (i, turn) in self.state.usage_turns.iter().rev().take(20).enumerate() {
+            let hit = kkagent_protocol::cache_hit_ratio(
+                turn.input_tokens,
+                turn.cache_creation_tokens,
+                turn.cache_read_tokens,
+            );
             items.push(ListPickerItem {
                 id: format!("turn{i}"),
                 label: format!("Turn −{}", i + 1),
                 detail: format!(
-                    "in={} out={} · {}ms",
-                    turn.input_tokens, turn.output_tokens, turn.duration_ms
+                    "in={:>8} out={:>7} · cc={:>7} cr={:>8} · hit={:>5} · {:>6}ms",
+                    fmt_thousands(turn.input_tokens),
+                    fmt_thousands(turn.output_tokens),
+                    fmt_thousands(turn.cache_creation_tokens),
+                    fmt_thousands(turn.cache_read_tokens),
+                    hit.map(|h| format!("{:.0}%", h * 100.0))
+                        .unwrap_or_else(|| "n/a".into()),
+                    fmt_thousands(turn.duration_ms),
                 ),
             });
         }
+        if items.is_empty() {
+            items.push(ListPickerItem {
+                id: "empty".into(),
+                label: "No turn samples yet".into(),
+                detail: String::new(),
+            });
+        }
         self.replace_list_picker(ListPickerState {
-            kind: ListPickerKind::Browse,
-            title: " /usage ".into(),
+            kind: ListPickerKind::UsageTurns,
+            title: " /usage · Recent Turns ".into(),
             items,
             selected: 0,
             filter: String::new(),
@@ -7244,6 +7433,7 @@ impl TuiApp {
         self.state.prompt_queue = crate::prompt_queue::PromptQueue::default();
         self.state.usage_session = SessionUsageTotals::default();
         self.state.usage_turns.clear();
+        self.state.context_breakdown = None;
         self.state.scroll_up = 0;
         self.state.follow_bottom = true;
         self.state.render_cache.invalidate_all();
@@ -7600,7 +7790,16 @@ impl TuiApp {
                     .get("cache_read_tokens")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0),
+                steps: usage.get("steps").and_then(|v| v.as_u64()).unwrap_or(0),
+                turns: usage.get("turns").and_then(|v| v.as_u64()).unwrap_or(0),
             };
+            if let Some(ctx) = usage.get("context") {
+                if let Ok(info) =
+                    serde_json::from_value::<kkagent_protocol::ContextBreakdownInfo>(ctx.clone())
+                {
+                    self.state.context_breakdown = Some(info);
+                }
+            }
             // `approx_tokens` reflects the *current context size* (most recent
             // single LLM call), NOT the session-running total. Prefer the
             // dedicated `last_step_usage` field; fall back to `usage` only for
@@ -10546,29 +10745,31 @@ impl TuiApp {
                         self.state.question_pending = Some(pending);
                         self.state.status = SessionStatus::WaitingQuestion;
                     }
-                    AgentEvent::UsageUpdate { usage, .. } => {
+                    AgentEvent::UsageUpdate {
+                        usage,
+                        context,
+                        steps,
+                        turns,
+                        ..
+                    } => {
+                        // `usage` is per-call; session totals accumulate across
+                        // calls so cost/usage reflects the whole session.
                         self.state.approx_tokens =
                             usage.input_tokens.saturating_add(usage.output_tokens);
-                        self.state.usage_session.input_tokens = self
-                            .state
-                            .usage_session
-                            .input_tokens
-                            .max(usage.input_tokens);
-                        self.state.usage_session.output_tokens = self
-                            .state
-                            .usage_session
-                            .output_tokens
-                            .max(usage.output_tokens);
-                        self.state.usage_session.cache_creation_tokens = self
-                            .state
-                            .usage_session
+                        let s = &mut self.state.usage_session;
+                        s.input_tokens = s.input_tokens.saturating_add(usage.input_tokens);
+                        s.output_tokens = s.output_tokens.saturating_add(usage.output_tokens);
+                        s.cache_creation_tokens = s
                             .cache_creation_tokens
-                            .max(usage.cache_creation_input_tokens);
-                        self.state.usage_session.cache_read_tokens = self
-                            .state
-                            .usage_session
+                            .saturating_add(usage.cache_creation_input_tokens);
+                        s.cache_read_tokens = s
                             .cache_read_tokens
-                            .max(usage.cache_read_input_tokens);
+                            .saturating_add(usage.cache_read_input_tokens);
+                        s.steps = steps;
+                        s.turns = turns;
+                        if let Some(ctx) = context {
+                            self.state.context_breakdown = Some(ctx);
+                        }
                         self.state.usage_turns.push(TurnUsageSample {
                             model: self.state.model_alias.clone(),
                             input_tokens: usage.input_tokens,
@@ -10932,6 +11133,38 @@ fn estimate_usd(
         + (u.output_tokens as f64) * out_price / 1_000_000.0
         + (u.cache_creation_tokens as f64) * cache_c / 1_000_000.0
         + (u.cache_read_tokens as f64) * cache_r / 1_000_000.0
+}
+
+/// `1234567` → `"1,234,567"` for readable token counts.
+fn fmt_thousands(n: u64) -> String {
+    let s = n.to_string();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    let bytes = s.as_bytes();
+    for (i, b) in bytes.iter().enumerate() {
+        if i > 0 && (bytes.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(*b as char);
+    }
+    out
+}
+
+/// Fixed-width Unicode progress bar: `████░░░` (`width` cells total).
+fn progress_bar(used: u64, max: u64, width: usize) -> String {
+    if max == 0 || width == 0 {
+        return "░".repeat(width);
+    }
+    let ratio = (used.min(max) as f64 / max as f64).clamp(0.0, 1.0);
+    let filled = (ratio * width as f64).round() as usize;
+    let filled = filled.min(width);
+    let mut out = String::with_capacity(width * 3);
+    for _ in 0..filled {
+        out.push('█');
+    }
+    for _ in filled..width {
+        out.push('░');
+    }
+    out
 }
 
 fn summarize_tool_input(input: &serde_json::Value) -> String {

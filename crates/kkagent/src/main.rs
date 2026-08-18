@@ -5094,8 +5094,11 @@ fn http_session_json(session: &Session) -> serde_json::Value {
         "usage": {
             "input_tokens": usage.input_tokens,
             "output_tokens": usage.output_tokens,
+            "cache_creation_tokens": usage.cache_creation_input_tokens,
+            "cache_read_tokens": usage.cache_read_input_tokens,
             "steps": usage.steps,
             "turns": usage.turns,
+            "context": session.usage.last_context,
         },
     })
 }
@@ -6719,6 +6722,7 @@ async fn handle_rpc_call(
                         existing.messages.clone(),
                         existing.usage.snapshot(),
                         existing.usage.last_step.clone(),
+                        existing.usage.last_context.clone(),
                         plan_state_json(existing.plan_state()),
                         existing.pending_plan_review(),
                         existing.todo_items(),
@@ -6733,6 +6737,7 @@ async fn handle_rpc_call(
                 messages,
                 usage,
                 last_step_usage,
+                usage_ctx,
                 plan,
                 plan_pending_approval,
                 todos,
@@ -6779,6 +6784,9 @@ async fn handle_rpc_call(
                         "output_tokens": usage.output_tokens,
                         "cache_creation_tokens": usage.cache_creation_input_tokens,
                         "cache_read_tokens": usage.cache_read_input_tokens,
+                        "steps": usage.steps,
+                        "turns": usage.turns,
+                        "context": usage_ctx,
                     },
                     // Most-recent single LLM call usage (not cumulative). Used by the
                     // TUI to show "current context size" — distinct from `usage`

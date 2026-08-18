@@ -59,6 +59,15 @@ pub enum AgentEvent {
     UsageUpdate {
         session_id: String,
         usage: super::TokenUsage,
+        /// Estimated per-part token breakdown of the request just sent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        context: Option<super::ContextBreakdownInfo>,
+        /// Cumulative step count after this request (session totals).
+        #[serde(default)]
+        steps: u64,
+        /// Cumulative turn count after this request (session totals).
+        #[serde(default)]
+        turns: u64,
     },
     ApprovalRequested {
         session_id: String,

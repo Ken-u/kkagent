@@ -1064,6 +1064,23 @@ function applyEventToView(sessionId, event) {
     view.running = false;
     return;
   }
+  if (type === "usage_update") {
+    if (event.session_id && event.session_id !== state.sessionId) return;
+    // Per-call usage accumulates into session totals; steps/turns/context are
+    // server-authoritative snapshots that overwrite.
+    const u = event.usage || {};
+    if (!state.usage) state.usage = {};
+    state.usage.input_tokens = (state.usage.input_tokens || 0) + (u.input_tokens || 0);
+    state.usage.output_tokens = (state.usage.output_tokens || 0) + (u.output_tokens || 0);
+    state.usage.cache_creation_tokens =
+      (state.usage.cache_creation_tokens || 0) + (u.cache_creation_input_tokens || 0);
+    state.usage.cache_read_tokens =
+      (state.usage.cache_read_tokens || 0) + (u.cache_read_input_tokens || 0);
+    if (event.steps !== undefined) state.usage.steps = event.steps;
+    if (event.turns !== undefined) state.usage.turns = event.turns;
+    if (event.context) state.usage.context = event.context;
+    return;
+  }
   if (type === "approval_requested") {
     view.pendingApproval = event.request || {};
     return;
@@ -1450,11 +1467,56 @@ async function loadModels() {
   renderModelSelect();
 }
 
+function progressBar(used, max, width = 24) {
+  if (!max || max <= 0) return "░".repeat(width);
+  const filled = Math.min(width, Math.round((used / max) * width));
+  return "█".repeat(filled) + "░".repeat(width - filled);
+}
+
+function cacheHitRatio(inTok, cacheC, cacheR) {
+  if (!cacheR) return null;
+  const total = cacheC > 0 ? inTok + cacheC + cacheR : inTok;
+  if (!total) return null;
+  return cacheR / total;
+}
+
 function formatUsage(usage) {
   if (!usage) return "暂无用量";
   const inTok = usage.input_tokens ?? usage.input ?? 0;
   const outTok = usage.output_tokens ?? usage.output ?? 0;
-  return `input ${inTok} · output ${outTok} · steps ${usage.steps ?? 0} · turns ${usage.turns ?? 0}`;
+  const cacheC = usage.cache_creation_tokens ?? 0;
+  const cacheR = usage.cache_read_tokens ?? 0;
+  const steps = usage.steps ?? 0;
+  const turns = usage.turns ?? 0;
+  const total = inTok + outTok;
+  const hit = cacheHitRatio(inTok, cacheC, cacheR);
+
+  const lines = [
+    `input ${inTok.toLocaleString()} · output ${outTok.toLocaleString()} · total ${total.toLocaleString()}`,
+    `cache create ${cacheC.toLocaleString()} · cache read ${cacheR.toLocaleString()}${hit !== null ? ` · 命中 ${(hit * 100).toFixed(1)}%` : ""}`,
+    `steps ${steps} · turns ${turns}`,
+  ];
+
+  const c = usage.context;
+  if (c) {
+    const used = (c.system ?? 0) + (c.conversation ?? 0) + (c.tools ?? 0) + (c.media ?? 0);
+    const reserved = c.reserved_output ?? 0;
+    // Without a server-provided window, scale bars against the used total so
+    // relative proportions stay meaningful.
+    const max = Math.max(used, reserved, 1);
+    const rows = [
+      ["System", c.system ?? 0],
+      ["Conversation", c.conversation ?? 0],
+      ["Tools", c.tools ?? 0],
+      ["Media", c.media ?? 0],
+      ["Reserved", reserved],
+    ];
+    lines.push("", `── 上下文分解 (${used.toLocaleString()} tokens${c.estimated ? ", 估算" : ""}) ──`);
+    for (const [name, tokens] of rows) {
+      lines.push(`${name.padEnd(14, " ")} ${progressBar(tokens, max)} ${tokens.toLocaleString()}`);
+    }
+  }
+  return lines.join("\n");
 }
 
 function showTokenPrompt(message) {
@@ -2386,6 +2448,23 @@ function handleAgentEvent(event) {
         appendMessage("system", `上下文已压缩，保留 ${event.kept_user_message_count || 0} 条用户消息。`, new Date().toISOString());
       }
     }
+    return;
+  }
+  if (type === "usage_update") {
+    if (event.session_id && event.session_id !== state.sessionId) return;
+    // Per-call usage accumulates into session totals; steps/turns/context are
+    // server-authoritative snapshots that overwrite.
+    const u = event.usage || {};
+    if (!state.usage) state.usage = {};
+    state.usage.input_tokens = (state.usage.input_tokens || 0) + (u.input_tokens || 0);
+    state.usage.output_tokens = (state.usage.output_tokens || 0) + (u.output_tokens || 0);
+    state.usage.cache_creation_tokens =
+      (state.usage.cache_creation_tokens || 0) + (u.cache_creation_input_tokens || 0);
+    state.usage.cache_read_tokens =
+      (state.usage.cache_read_tokens || 0) + (u.cache_read_input_tokens || 0);
+    if (event.steps !== undefined) state.usage.steps = event.steps;
+    if (event.turns !== undefined) state.usage.turns = event.turns;
+    if (event.context) state.usage.context = event.context;
     return;
   }
   if (type === "approval_requested") {

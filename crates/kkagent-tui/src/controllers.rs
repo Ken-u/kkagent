@@ -75,10 +75,11 @@ impl SessionEventRouter {
                 // `approx_tokens` assignment in app.rs; the value is re-synced
                 // from `approx_tokens` every render frame via components.rs.)
                 status.tokens = usage.input_tokens.saturating_add(usage.output_tokens);
-                if usage.cache_read_input_tokens > 0 {
-                    let total = usage.input_tokens.max(1);
-                    status.cache_hit = Some(usage.cache_read_input_tokens as f32 / total as f32);
-                }
+                status.cache_hit = kkagent_protocol::cache_hit_ratio(
+                    usage.input_tokens,
+                    usage.cache_creation_input_tokens,
+                    usage.cache_read_input_tokens,
+                );
             }
             _ => {}
         }

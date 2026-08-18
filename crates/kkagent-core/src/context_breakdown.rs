@@ -1,6 +1,6 @@
 //! Rough context token breakdown for `/context` transparency.
 
-use kkagent_llm::{ChatContent, ChatMessage};
+use kkagent_llm::{ChatContent, ChatMessage, ToolDef};
 
 #[derive(Debug, Clone, Default)]
 pub struct ContextBreakdown {
@@ -25,9 +25,18 @@ impl ContextBreakdown {
     }
 
     /// Character-based estimate (~4 chars/token). Marks unknown as estimated.
-    pub fn estimate(system_prompt: &str, messages: &[ChatMessage], reserved_output: u64) -> Self {
+    ///
+    /// `tools` covers tool *definitions* (schema text) while tool call/result
+    /// blocks inside `messages` are folded into the same bucket for display.
+    pub fn estimate(
+        system_prompt: &str,
+        tools: &[ToolDef],
+        messages: &[ChatMessage],
+        reserved_output: u64,
+    ) -> Self {
         let mut out = Self {
             system: estimate_tokens(system_prompt),
+            tools: crate::token_counting::TokenCounter::estimate_tools(tools),
             reserved_output,
             estimated: true,
             ..Default::default()
@@ -57,6 +66,19 @@ impl ContextBreakdown {
     }
 }
 
+impl From<ContextBreakdown> for kkagent_protocol::ContextBreakdownInfo {
+    fn from(b: ContextBreakdown) -> Self {
+        Self {
+            system: b.system,
+            conversation: b.conversation,
+            tools: b.tools,
+            media: b.media,
+            reserved_output: b.reserved_output,
+            estimated: b.estimated,
+        }
+    }
+}
+
 fn estimate_tokens(text: &str) -> u64 {
     (text.chars().count() as u64).div_ceil(4)
 }
@@ -67,9 +89,27 @@ mod tests {
 
     #[test]
     fn estimates_system_and_text() {
-        let b = ContextBreakdown::estimate("hello world", &[], 1024);
+        let b = ContextBreakdown::estimate("hello world", &[], &[], 1024);
         assert!(b.system > 0);
         assert_eq!(b.reserved_output, 1024);
         assert!(b.estimated);
+    }
+
+    #[test]
+    fn counts_tool_definitions() {
+        let tools = vec![ToolDef {
+            name: "read_file".into(),
+            description: "Read a file from disk and return its contents.".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Absolute file path" }
+                },
+                "required": ["path"]
+            }),
+        }];
+        let b = ContextBreakdown::estimate("sys", &tools, &[], 0);
+        assert!(b.tools > 0, "tool defs should contribute tokens");
+        assert!(b.total_used() >= b.tools);
     }
 }

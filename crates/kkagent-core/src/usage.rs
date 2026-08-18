@@ -2,6 +2,8 @@
 
 use kkagent_protocol::TokenUsage;
 
+pub use kkagent_protocol::cache_hit_ratio;
+
 #[derive(Debug, Clone, Default)]
 pub struct UsageSnapshot {
     pub input_tokens: u64,
@@ -18,10 +20,11 @@ impl UsageSnapshot {
     }
 
     pub fn cache_hit_ratio(&self) -> Option<f32> {
-        if self.input_tokens == 0 {
-            return None;
-        }
-        Some(self.cache_read_input_tokens as f32 / self.input_tokens as f32)
+        cache_hit_ratio(
+            self.input_tokens,
+            self.cache_creation_input_tokens,
+            self.cache_read_input_tokens,
+        )
     }
 }
 
@@ -29,6 +32,8 @@ impl UsageSnapshot {
 pub struct UsageService {
     pub session: UsageSnapshot,
     pub last_step: UsageSnapshot,
+    /// Last estimated context breakdown attached by the agent loop.
+    pub last_context: Option<kkagent_protocol::ContextBreakdownInfo>,
 }
 
 impl UsageService {
@@ -65,6 +70,10 @@ impl UsageService {
         self.session.turns = self.session.turns.saturating_add(1);
     }
 
+    pub fn set_context(&mut self, ctx: kkagent_protocol::ContextBreakdownInfo) {
+        self.last_context = Some(ctx);
+    }
+
     pub fn snapshot(&self) -> UsageSnapshot {
         self.session.clone()
     }
@@ -85,5 +94,34 @@ mod tests {
         });
         assert_eq!(u.session.total_tokens(), 15);
         assert!((u.session.cache_hit_ratio().unwrap() - 0.4).abs() < 0.01);
+    }
+
+    #[test]
+    fn cache_hit_ratio_openai_style() {
+        // OpenAI: input_tokens already includes cached tokens.
+        // 400 cached out of 1000 total input → 40%.
+        let r = cache_hit_ratio(1000, 0, 400).unwrap();
+        assert!((r - 0.4).abs() < 0.01);
+    }
+
+    #[test]
+    fn cache_hit_ratio_anthropic_style() {
+        // Anthropic: input excludes cache; total = 100 + 400 + 500 = 1000,
+        // cache_read = 500 → 50%.
+        let r = cache_hit_ratio(100, 400, 500).unwrap();
+        assert!((r - 0.5).abs() < 0.01);
+
+        // Steady-state hit: mostly cache reads.
+        // total = 200 + 100 + 2700 = 3000, read = 2700 → 90%.
+        let r = cache_hit_ratio(200, 100, 2_700).unwrap();
+        assert!((r - 0.9).abs() < 0.01);
+    }
+
+    #[test]
+    fn cache_hit_ratio_none_when_no_read() {
+        assert!(cache_hit_ratio(1000, 500, 0).is_none());
+        assert!(cache_hit_ratio(0, 0, 0).is_none());
+        // Read > 0 but total 0 (creation-only edge) → None to avoid div by zero.
+        assert!(cache_hit_ratio(0, 0, 10).is_none());
     }
 }

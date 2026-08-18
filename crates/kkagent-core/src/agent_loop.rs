@@ -515,6 +515,24 @@ Do not mention this reminder to the user.\n</system-reminder>"
         let mut messages = self.prepare_messages(session, &tool_defs, &system_prompt);
         tracing::debug!("Conversation has {} messages (projected)", messages.len());
 
+        // Track per-part context size for `/usage` transparency. Recomputed on
+        // every step so compact / tool-result growth is reflected promptly.
+        {
+            let reserved = self
+                .config
+                .loop_control
+                .as_ref()
+                .map(|l| l.reserved_context_size)
+                .unwrap_or(8_192);
+            let breakdown = crate::context_breakdown::ContextBreakdown::estimate(
+                &system_prompt,
+                &tool_defs,
+                &messages,
+                reserved,
+            );
+            session.usage.set_context(breakdown.into());
+        }
+
         let max_attempts = self
             .config
             .loop_control
@@ -729,11 +747,15 @@ Do not mention this reminder to the user.\n</system-reminder>"
                                 cache_read_input_tokens: usage.cache_read_input_tokens,
                             };
                             session.usage.record(&tu);
+                            let snap = session.usage.snapshot();
                             let _ = self
                                 .event_tx
                                 .send(AgentEvent::UsageUpdate {
                                     session_id: session_id.clone(),
                                     usage: tu,
+                                    context: session.usage.last_context.clone(),
+                                    steps: snap.steps,
+                                    turns: snap.turns,
                                 })
                                 .await;
                         }
