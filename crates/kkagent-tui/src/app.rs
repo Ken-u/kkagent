@@ -123,6 +123,9 @@ pub struct AppState {
     pub click_history: Vec<ClickRecord>,
     pub approx_tokens: u64,
     pub approval_pending: Option<PendingApproval>,
+    /// True while BTW hid a visible approval modal on entry so it can be
+    /// restored on exit. Distinguishes a BTW-driven hide from a user Esc fold.
+    pub btw_hid_approval: bool,
     /// Additional approvals waiting behind the active one (FIFO).
     pub approval_queue: std::collections::VecDeque<PendingApproval>,
     /// Approvals for sessions that are open in this window but not currently focused.
@@ -960,6 +963,7 @@ impl AppState {
             click_history: Vec::new(),
             approx_tokens: 0,
             approval_pending: None,
+            btw_hid_approval: false,
             approval_queue: std::collections::VecDeque::new(),
             parked_approvals: std::collections::HashMap::new(),
             question_pending: None,
@@ -3026,8 +3030,8 @@ impl TuiApp {
         // Ctrl+G (BTW toggle) punches through a visible approval / plan-review
         // modal. BTW is an independent side question that does not touch the
         // pending approval on the server, so entering it while the modal is up
-        // is safe — the modal stays pending and remains interactable after BTW
-        // exits (and is simply not drawn while BTW owns the surface).
+        // is safe — `enter_btw_view` hides the modal (stack-like), and
+        // `exit_btw_view` restores it so the user can resume the approval.
         if key.code == KeyCode::Char('g')
             && key.modifiers.contains(KeyModifiers::CONTROL)
             && self
@@ -3048,15 +3052,14 @@ impl TuiApp {
         // The agent loop ensures AskUserQuestion and ExitPlanMode never run in
         // the same step, so in practice only one is pending. If both somehow
         // exist (e.g. across turns), the approval modal takes precedence.
-        // While BTW owns the surface the modal is suspended: it is neither
-        // drawn nor allowed to swallow keystrokes, so the user can type into
-        // the BTW composer. The modal is restored on BTW exit.
+        // When BTW owns the surface `enter_btw_view` has already set
+        // `approval.hidden = true`, so this branch is skipped and keystrokes
+        // reach the BTW composer instead.
         if self
             .state
             .approval_pending
             .as_ref()
             .is_some_and(|approval| !approval.hidden)
-            && self.state.mode != AppMode::Btw
         {
             let approval = self
                 .state
@@ -8310,6 +8313,16 @@ impl TuiApp {
     }
 
     fn enter_btw_view(&mut self) {
+        // Stack a visible approval/plan-review modal: hide it while BTW owns
+        // the surface so it is neither drawn nor swallowing keystrokes. We
+        // remember that *we* hid it so `exit_btw_view` can restore it — a
+        // modal the user already folded with Esc stays folded.
+        if let Some(approval) = self.state.approval_pending.as_mut() {
+            if !approval.hidden {
+                approval.hidden = true;
+                self.state.btw_hid_approval = true;
+            }
+        }
         self.state.mode = AppMode::Btw;
         self.state.btw.open = true;
         self.state.btw.scroll_offset = 0;
@@ -8317,6 +8330,14 @@ impl TuiApp {
     }
 
     fn exit_btw_view(&mut self) {
+        // Restore an approval modal that BTW hid on entry (but not one the
+        // user folded themselves with Esc).
+        if self.state.btw_hid_approval {
+            if let Some(approval) = self.state.approval_pending.as_mut() {
+                approval.hidden = false;
+            }
+            self.state.btw_hid_approval = false;
+        }
         self.state.mode = if self.state.plan_mode {
             AppMode::Plan
         } else {
