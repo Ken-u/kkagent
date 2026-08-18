@@ -32,6 +32,7 @@ use kkagent_tools::ToolRegistry;
 use kkagent_tui::TuiApp;
 
 mod diagnostics;
+mod headless;
 mod onboarding;
 use diagnostics::RunDiagnostics;
 use onboarding::{run_config, run_doctor, run_init};
@@ -68,6 +69,22 @@ struct Cli {
     /// Non-interactive prompt mode
     #[arg(short = 'p', long)]
     prompt: Option<String>,
+
+    /// Output format for -p mode (text | json | stream-json)
+    #[arg(long, requires = "prompt")]
+    output_format: Option<headless::OutputFormat>,
+
+    /// Input format for -p mode (text | stream-json); stream-json reads NDJSON from stdin
+    #[arg(long, requires = "prompt")]
+    input_format: Option<headless::InputFormat>,
+
+    /// Max agent rounds (LLM steps) per headless turn; exceeding exits with code 3
+    #[arg(long, requires = "prompt")]
+    max_turns: Option<u32>,
+
+    /// Continue the most recent session (headless: with -p)
+    #[arg(long = "continue", requires = "prompt")]
+    continue_: bool,
 
     /// Resume an existing session by id (or prefix); with no id, show the session picker
     #[arg(long, short = 'r')]
@@ -456,8 +473,22 @@ async fn run(cli: Cli) -> Result<()> {
             unreachable!("setup commands handled before runtime startup")
         }
         None => {
-            if let Some(prompt) = cli.prompt {
-                run_print_mode(config, config_path, prompt, permission_mode, cli.connect).await
+            if let Some(prompt) = cli.prompt.clone() {
+                let resume = match (cli.resume, cli.continue_) {
+                    (Some(Some(id)), _) => headless::Resume::Id(id),
+                    (Some(None), _) => headless::Resume::Latest,
+                    (None, true) => headless::Resume::Latest,
+                    (None, false) => headless::Resume::New,
+                };
+                let print_opts = headless::PrintModeOptions {
+                    prompt,
+                    permission_mode: Some(permission_mode),
+                    output_format: cli.output_format,
+                    input_format: cli.input_format,
+                    max_turns: cli.max_turns,
+                    resume: Some(resume),
+                };
+                run_print_mode(config, config_path, cli.connect, print_opts).await
             } else {
                 run_tui(
                     config,
@@ -1196,9 +1227,8 @@ fn should_idle_shutdown(
 async fn run_print_mode(
     config: AppConfig,
     config_path: PathBuf,
-    prompt: String,
-    permission_mode: PermissionMode,
     connect: Option<String>,
+    print_opts: headless::PrintModeOptions,
 ) -> Result<()> {
     let (event_tx, event_rx) = mpsc::channel::<Frame>(256);
     let (rpc_client, server_handle) = if let Some(endpoint) = connect {
@@ -1215,7 +1245,7 @@ async fn run_print_mode(
     };
 
     let mut client = KkagentClient::new(rpc_client, event_rx);
-    let result = run_print_client(&mut client, prompt, permission_mode).await;
+    let result = run_print_client(&mut client, print_opts).await;
     if let Some(server_handle) = server_handle {
         server_handle.abort();
         let _ = server_handle.await;
@@ -1225,62 +1255,31 @@ async fn run_print_mode(
 
 async fn run_print_client(
     client: &mut KkagentClient,
-    prompt: String,
-    permission_mode: PermissionMode,
+    opts: headless::PrintModeOptions,
 ) -> Result<()> {
-    let cwd = std::env::current_dir()?.to_string_lossy().to_string();
-    let session_id = client
-        .create_session(Some(&cwd), Some(permission_mode))
-        .await?;
-
-    let trimmed = prompt.trim();
-    let goal_mode = trimmed.strip_prefix("/goal").map(str::trim);
-    if let Some(goal_args) = goal_mode {
+    // `/goal ...` keeps its dedicated headless driver (goal RPC + exit codes).
+    if opts.prompt.trim().starts_with("/goal") {
+        let permission_mode = opts.permission_mode.unwrap_or(PermissionMode::Manual);
+        let cwd = std::env::current_dir()?.to_string_lossy().to_string();
+        let session_id = client
+            .create_session(Some(&cwd), Some(permission_mode))
+            .await?;
+        let goal_args = opts
+            .prompt
+            .trim()
+            .strip_prefix("/goal")
+            .unwrap_or("")
+            .trim();
         let exit = run_print_goal(client, &session_id, goal_args).await?;
         std::process::exit(exit);
     }
 
-    client.send_prompt(&session_id, &prompt).await?;
-
-    while let Some(frame) = client.event_rx.recv().await {
-        if let Frame::Event { data, .. } = frame {
-            if let Ok(evt) = serde_json::from_value::<AgentEvent>(data) {
-                match evt {
-                    AgentEvent::MessageDelta { text, .. } => {
-                        print!("{}", text);
-                    }
-                    AgentEvent::TurnEnd { .. } => {
-                        println!();
-                        return Ok(());
-                    }
-                    AgentEvent::Error { message, .. } => {
-                        return Err(anyhow::anyhow!("Agent turn failed: {message}"));
-                    }
-                    AgentEvent::LlmRetry {
-                        retry_number,
-                        remaining_seconds,
-                        reason,
-                        ..
-                    } => {
-                        let when = if remaining_seconds == 0 {
-                            "now".to_string()
-                        } else {
-                            format!("in {remaining_seconds}s")
-                        };
-                        eprint!("\rLLM retry #{retry_number} {when}: {reason}");
-                        let _ = std::io::Write::flush(&mut io::stderr());
-                        if remaining_seconds == 0 {
-                            eprintln!();
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
+    let headless_opts = opts.resolve();
+    let exit = headless::run(client, headless_opts).await;
+    if exit != 0 {
+        std::process::exit(exit);
     }
-    Err(anyhow::anyhow!(
-        "Agent event stream closed before the turn completed"
-    ))
+    Ok(())
 }
 
 async fn session_goal_rpc(
