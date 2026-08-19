@@ -237,3 +237,16 @@ pub fn create_provider(
     };
     Ok(provider)
 }
+
+/// Whether a provider's wire format natively supports message-level tool
+/// declarations (`messages[].tools`).
+///
+/// Only such dialects can host progressive tool disclosure without rewriting
+/// the top-level `tools[]` prefix — and thereby busting the provider prompt
+/// cache — on every `SelectTools` load. The Kimi chat-completions dialect
+/// supports it; OpenAI / Anthropic / Google wire formats do not and fold
+/// loaded schemas into the top-level `tools[]` instead
+/// (`merge_message_level_tools`).
+pub fn supports_message_level_tools(provider_type: &str) -> bool {
+    matches!(provider_type, "kimi")
+}

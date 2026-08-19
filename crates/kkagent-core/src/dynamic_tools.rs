@@ -148,6 +148,24 @@ pub fn deferred_names(all_defs: &[ToolDefinition]) -> Vec<String> {
         .collect()
 }
 
+/// Whether progressive tool disclosure should run for the active model.
+///
+/// `SelectTools`-loaded schemas only stay cache-friendly on wire dialects that
+/// natively support `messages[].tools`; elsewhere every load rewrites the
+/// top-level `tools[]` prefix and busts the provider prompt cache. So the
+/// feature needs BOTH:
+///   - the config toggle (`tools.dynamically_loaded_tools`, default on), and
+///   - support, declared via model `capabilities` (`dynamically_loaded_tools`)
+///     or detected from the provider type (Kimi dialect).
+pub fn dynamic_tools_enabled(
+    config_toggle: bool,
+    capability_declared: bool,
+    provider_type: &str,
+) -> bool {
+    config_toggle
+        && (capability_declared || kkagent_llm::supports_message_level_tools(provider_type))
+}
+
 pub fn unloaded_deferred_names(
     all_defs: &[ToolDefinition],
     loaded: &HashSet<String>,
@@ -689,5 +707,23 @@ mod tests {
             "should suggest the correct tool name: {}",
             applied.content
         );
+    }
+
+    #[test]
+    fn dynamic_tools_gating_requires_toggle_and_support() {
+        // Config toggle alone is not enough: unsupported dialects would bust
+        // the prompt cache on every SelectTools load.
+        assert!(!dynamic_tools_enabled(true, false, "openai-chat"));
+        assert!(!dynamic_tools_enabled(true, false, "anthropic"));
+        assert!(!dynamic_tools_enabled(true, false, "google"));
+
+        // Kimi dialect natively supports `messages[].tools`.
+        assert!(dynamic_tools_enabled(true, false, "kimi"));
+
+        // Explicit capability declaration wins for any provider.
+        assert!(dynamic_tools_enabled(true, true, "openai-chat"));
+
+        // Toggle off always disables.
+        assert!(!dynamic_tools_enabled(false, true, "kimi"));
     }
 }

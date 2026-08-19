@@ -393,7 +393,7 @@ impl AgentLoop {
                 alias
             }
         };
-        let (primary_model_config, _) = self
+        let (primary_model_config, primary_provider_config) = self
             .config
             .resolve_model(&model_alias)
             .ok_or_else(|| anyhow::anyhow!("Model '{}' not found", model_alias))?;
@@ -457,7 +457,13 @@ impl AgentLoop {
             .cloned()
             .collect();
 
-        let dynamic_tools_enabled = self.config.tools.dynamically_loaded_tools;
+        // Progressive disclosure only where the wire format natively supports
+        // message-level `tools` (see `dynamic_tools_enabled`).
+        let dynamic_tools_enabled = crate::dynamic_tools::dynamic_tools_enabled(
+            self.config.tools.dynamically_loaded_tools,
+            capability.supports("dynamically_loaded_tools"),
+            &primary_provider_config.provider_type,
+        );
 
         // Turn-boundary incremental announcement. System prompt stays byte-stable;
         // loaded deferred schemas live on history messages (Phase 2).

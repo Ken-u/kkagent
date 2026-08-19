@@ -542,8 +542,11 @@ pub struct ToolsConfig {
     #[serde(default)]
     pub additional_dirs: Vec<std::path::PathBuf>,
     /// When `true` (default), deferred tools are loaded progressively via
-    /// `SelectTools`. When `false`, all tool schemas are sent to the LLM
-    /// in a single batch — simpler but uses more context.
+    /// `SelectTools` — but only for models whose wire dialect natively
+    /// supports `messages[].tools` (declared via model `capabilities`, or the
+    /// Kimi provider). Elsewhere every load would rewrite the top-level
+    /// `tools[]` prefix and bust the provider prompt cache, so all tool
+    /// schemas are sent in a single batch instead.
     #[serde(default = "default_true")]
     pub dynamically_loaded_tools: bool,
 }

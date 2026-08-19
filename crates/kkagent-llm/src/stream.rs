@@ -3,7 +3,9 @@ use serde_json::json;
 use tokio::sync::mpsc;
 
 use crate::first_token_gate::FirstTokenGate;
-use crate::types::{merge_message_level_tools, ChatContent, LlmRequest, StreamEvent, TokenUsage};
+use crate::types::{
+    merge_message_level_tools, ChatContent, LlmRequest, StreamEvent, TokenUsage, ToolDef,
+};
 
 const ANTHROPIC_FALLBACK_MAX_TOKENS: u32 = 128_000;
 
@@ -374,6 +376,18 @@ pub async fn kimi_stream(
     chat_completions_stream(client, base_url, api_key, request, event_tx, true).await
 }
 
+/// Serialize a tool definition as an OpenAI-style `function` tool param.
+fn function_tool_param(t: &ToolDef) -> serde_json::Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": &t.name,
+            "description": &t.description,
+            "parameters": &t.input_schema,
+        }
+    })
+}
+
 async fn chat_completions_stream(
     client: &Client,
     base_url: &str,
@@ -390,6 +404,25 @@ async fn chat_completions_stream(
     }
     for m in &request.messages {
         if m.is_schema_only() {
+            // The Kimi dialect natively supports message-level tool
+            // declarations (`messages[].tools`): keep schema-only messages in
+            // place so a `SelectTools` load never rewrites the top-level
+            // `tools[]` prefix (prompt-cache friendly). Other dialects have no
+            // such field — their schemas are merged into the top-level array
+            // below and the message itself is dropped.
+            if kimi {
+                let message_tools: Vec<serde_json::Value> = m
+                    .tools
+                    .as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .map(function_tool_param)
+                    .collect();
+                messages.push(json!({
+                    "role": &m.role,
+                    "tools": message_tools,
+                }));
+            }
             continue;
         }
         // Flatten content blocks into OpenAI-ish messages.
@@ -478,19 +511,16 @@ async fn chat_completions_stream(
         }
     }
 
-    let tools: Vec<serde_json::Value> = merge_message_level_tools(&request)
-        .iter()
-        .map(|t| {
-            json!({
-                "type": "function",
-                "function": {
-                    "name": &t.name,
-                    "description": &t.description,
-                    "parameters": &t.input_schema,
-                }
-            })
-        })
-        .collect();
+    // Kimi keeps loaded schemas on their history messages; every other
+    // dialect folds them into the top-level array (see above).
+    let tools: Vec<serde_json::Value> = if kimi {
+        request.tools.iter().map(function_tool_param).collect()
+    } else {
+        merge_message_level_tools(&request)
+            .iter()
+            .map(function_tool_param)
+            .collect()
+    };
 
     let mut body = json!({
         "model": &request.model,
@@ -1684,6 +1714,94 @@ mod tests {
         assert!(body.get("max_tokens").is_none());
         assert_eq!(body["thinking"]["type"], "enabled");
         assert_eq!(body["stream_options"]["include_usage"], true);
+    }
+
+    #[tokio::test]
+    async fn kimi_keeps_schema_only_messages_and_top_level_tools_stable() {
+        let (base_url, captured) =
+            serve_once("200 OK", "text/event-stream", "data: [DONE]\n").await;
+        let mut request = request();
+        request.tools = vec![tool_def("core_tool")];
+        request
+            .messages
+            .push(ChatMessage::schema(vec![tool_def("loaded_tool")]));
+        let (tx, _rx) = mpsc::channel(8);
+        kimi_stream(
+            &Client::new(),
+            &format!("{base_url}/v1"),
+            "kimi-token",
+            request,
+            tx,
+        )
+        .await
+        .unwrap();
+        let captured = captured.await.unwrap();
+        let body: serde_json::Value = serde_json::from_str(&captured.body).unwrap();
+
+        // Top-level `tools[]` stays the immutable core set — no merge, so the
+        // serialized prefix is byte-stable across SelectTools loads.
+        let wire_tools = body["tools"].as_array().unwrap();
+        assert_eq!(wire_tools.len(), 1);
+        assert_eq!(wire_tools[0]["function"]["name"], "core_tool");
+
+        // The schema-only message survives in place with its own `tools`.
+        let schema_msg = body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m.get("tools").is_some())
+            .expect("schema-only message should be serialized for kimi");
+        assert_eq!(schema_msg["role"], "system");
+        assert!(schema_msg.get("content").is_none());
+        let msg_tools = schema_msg["tools"].as_array().unwrap();
+        assert_eq!(msg_tools.len(), 1);
+        assert_eq!(msg_tools[0]["function"]["name"], "loaded_tool");
+    }
+
+    #[tokio::test]
+    async fn openai_chat_merges_schema_messages_into_top_level_tools() {
+        let (base_url, captured) =
+            serve_once("200 OK", "text/event-stream", "data: [DONE]\n").await;
+        let mut request = request();
+        request.tools = vec![tool_def("core_tool")];
+        request
+            .messages
+            .push(ChatMessage::schema(vec![tool_def("loaded_tool")]));
+        let (tx, _rx) = mpsc::channel(8);
+        openai_stream(
+            &Client::new(),
+            &format!("{base_url}/v1"),
+            "key",
+            request,
+            tx,
+        )
+        .await
+        .unwrap();
+        let captured = captured.await.unwrap();
+        let body: serde_json::Value = serde_json::from_str(&captured.body).unwrap();
+
+        // Non-Kimi dialects fold loaded schemas into the top-level array…
+        let names: Vec<&str> = body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["core_tool", "loaded_tool"]);
+        // …and drop the schema-only message entirely.
+        assert!(!body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m.get("tools").is_some()));
+    }
+
+    fn tool_def(name: &str) -> ToolDef {
+        ToolDef {
+            name: name.into(),
+            description: format!("description for {name}"),
+            input_schema: serde_json::json!({"type": "object", "properties": {}}),
+        }
     }
 
     #[tokio::test]
