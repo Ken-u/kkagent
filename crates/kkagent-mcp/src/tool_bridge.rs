@@ -79,6 +79,10 @@ impl Tool for McpProxyTool {
         self.input_schema.clone()
     }
 
+    fn disclosure(&self) -> kkagent_tools::ToolDisclosure {
+        kkagent_tools::ToolDisclosure::Deferred
+    }
+
     async fn execute(&self, input: Value, ctx: &ToolContext) -> anyhow::Result<ToolOutput> {
         match self
             .manager
@@ -180,5 +184,32 @@ mod tests {
     #[test]
     fn sanitize_special_chars() {
         assert_eq!(sanitize_mcp_name_part("my server!"), "my_server_");
+    }
+
+    #[test]
+    fn disclosure_defaults_to_inline_for_generic_tools() {
+        // A trivial inline tool should report Inline disclosure.
+        struct DummyTool;
+        #[async_trait]
+        impl Tool for DummyTool {
+            fn name(&self) -> &str {
+                "Dummy"
+            }
+            fn description(&self) -> &str {
+                "test"
+            }
+            fn parameters_schema(&self) -> Value {
+                serde_json::json!({})
+            }
+            async fn execute(
+                &self,
+                _input: Value,
+                _ctx: &ToolContext,
+            ) -> anyhow::Result<ToolOutput> {
+                Ok(ToolOutput::success("ok"))
+            }
+        }
+        let t = DummyTool;
+        assert_eq!(t.disclosure(), kkagent_tools::ToolDisclosure::Inline);
     }
 }

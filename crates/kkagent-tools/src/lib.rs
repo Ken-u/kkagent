@@ -28,6 +28,8 @@ pub use toolchain::{
 };
 pub use web_providers::WebServicesConfig;
 
+pub use kkagent_protocol::tools::ToolDisclosure;
+
 use async_trait::async_trait;
 use serde_json::Value;
 use std::path::Path;
@@ -39,6 +41,11 @@ pub trait Tool: Send + Sync {
     fn parameters_schema(&self) -> Value;
     fn read_only(&self) -> bool {
         false
+    }
+    /// Whether this tool's schema is sent inline (default) or deferred until
+    /// loaded via `SelectTools`. MCP tools override this to return `Deferred`.
+    fn disclosure(&self) -> ToolDisclosure {
+        ToolDisclosure::Inline
     }
     /// Per-call resource accesses (defaults to static inference).
     fn accesses(&self, input: &Value, working_dir: &Path) -> ToolAccesses {

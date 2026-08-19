@@ -445,12 +445,38 @@ impl AgentLoop {
         session.services.mark_turn_started();
         session.begin_turn();
 
-        let mut tool_defs: Vec<ToolDef> = self
-            .tools
-            .tool_definitions()
+        let all_defs = self.tools.tool_definitions();
+
+        // Build the deferred-tools announcement: list name + description for
+        // deferred tools that haven't been loaded via SelectTools yet.
+        let mut deferred_announcement = String::new();
+        let unloaded_deferred: Vec<_> = all_defs
+            .iter()
+            .filter(|td| {
+                td.disclosure == kkagent_protocol::tools::ToolDisclosure::Deferred
+                    && !session.loaded_deferred_tools.contains(&td.name)
+            })
+            .collect();
+        if !unloaded_deferred.is_empty() {
+            deferred_announcement.push_str(
+                "\n\n# Deferred Tools\n\n\
+                 The following tools are available but not loaded by default to conserve context. \
+                 Call `SelectTools` with their exact names to load their definitions before use:\n",
+            );
+            for td in &unloaded_deferred {
+                deferred_announcement.push_str(&format!("- `{}`: {}\n", td.name, td.description));
+            }
+        }
+
+        let mut tool_defs: Vec<ToolDef> = all_defs
             .iter()
             .filter(|td| {
                 tool_allowed(session, &td.name) && (td.name != "ReadMediaFile" || capability.vision)
+            })
+            .filter(|td| {
+                // Omit unloaded deferred tools — only send their schema once loaded.
+                td.disclosure != kkagent_protocol::tools::ToolDisclosure::Deferred
+                    || session.loaded_deferred_tools.contains(&td.name)
             })
             .map(|td| ToolDef {
                 name: td.name.clone(),
@@ -505,6 +531,11 @@ Do not mention this reminder to the user.\n</system-reminder>"
         }
 
         let system_prompt = session.effective_system_prompt();
+        let system_prompt = if deferred_announcement.is_empty() {
+            system_prompt
+        } else {
+            format!("{system_prompt}{deferred_announcement}")
+        };
         // Early-trigger / blocking auto-compact (LLM summary + user retention).
         self.ensure_context_budget(session, &tool_defs, &system_prompt, false)
             .await?;
@@ -1621,7 +1652,6 @@ Do not mention this reminder to the user.\n</system-reminder>"
                     let hooks = self.hooks.clone();
                     let working_dir = session.working_dir.clone();
                     let sid = session.id.clone();
-                    let enabled = session.enabled_tools.clone();
                     let name = name.clone();
                     let input = input.clone();
                     let tool_call_id = tool_call_id.clone();
@@ -1637,7 +1667,6 @@ Do not mention this reminder to the user.\n</system-reminder>"
                             let hooks = hooks;
                             let working_dir = working_dir;
                             let sid = sid;
-                            let enabled = enabled;
                             let name = name;
                             let input = input;
                             let tool_call_id = tool_call_id;
@@ -1651,7 +1680,6 @@ Do not mention this reminder to the user.\n</system-reminder>"
                                     session_id: sid.clone(),
                                     turn_id: format!("{}:{}", sid, msg_count),
                                     image,
-                                    enabled_tools: enabled,
                                     name,
                                     input,
                                     tool_call_id: Some(tool_call_id),
@@ -1724,17 +1752,12 @@ Do not mention this reminder to the user.\n</system-reminder>"
                 }
                 if name == "SelectTools" && !output.is_error {
                     if let Some(data) = &output.data {
-                        if data.get("tools").map(|v| v.is_null()).unwrap_or(false) {
-                            session.enabled_tools = None;
-                            session.tool_policy.layers_mut().profile.tools = None;
-                        } else if let Some(arr) = data.get("tools").and_then(|v| v.as_array()) {
-                            let set: std::collections::HashSet<String> = arr
-                                .iter()
-                                .filter_map(|v| v.as_str().map(String::from))
-                                .collect();
-                            session.tool_policy.layers_mut().profile.tools =
-                                Some(set.iter().cloned().collect());
-                            session.enabled_tools = Some(set);
+                        if let Some(arr) = data.get("tools").and_then(|v| v.as_array()) {
+                            for v in arr {
+                                if let Some(tool_name) = v.as_str() {
+                                    session.loaded_deferred_tools.insert(tool_name.to_string());
+                                }
+                            }
                         }
                     }
                 }
@@ -2143,6 +2166,9 @@ Do not mention this reminder to the user.\n</system-reminder>"
         // Checkpoints survive compaction: file snapshots stay restorable,
         // transcript truncation for pre-compaction turns no longer applies.
         session.invalidate_undo_message_indices();
+        // Reset deferred tools: compaction rewrites history so previously
+        // loaded schemas are gone. The model must reload via SelectTools.
+        session.loaded_deferred_tools.clear();
         let after = session
             .token_counter
             .request_size(system, tools, &session.build_messages());
@@ -2233,6 +2259,7 @@ Do not mention this reminder to the user.\n</system-reminder>"
             session.transcript_rewrite_required = true;
             // See full compaction: keep file snapshots, drop stale indices.
             session.invalidate_undo_message_indices();
+            session.loaded_deferred_tools.clear();
             let after =
                 session
                     .token_counter
@@ -2421,7 +2448,6 @@ Do not mention this reminder to the user.\n</system-reminder>"
             session_id: session.id.clone(),
             turn_id: format!("{}:{}", session.id, session.messages.len()),
             image: self.config.image.clone(),
-            enabled_tools: session.enabled_tools.clone(),
             name: name.to_string(),
             input: input.clone(),
             tool_call_id: None,
@@ -2771,22 +2797,7 @@ fn tool_allowed(session: &Session, name: &str) -> bool {
             return false;
         }
     }
-    tool_allowed_set(session.enabled_tools.as_ref(), name)
-}
-
-fn tool_allowed_set(enabled: Option<&std::collections::HashSet<String>>, name: &str) -> bool {
-    match enabled {
-        None => true,
-        Some(set) => {
-            set.contains(name)
-                || name == "SelectTools"
-                || name == "AskUserQuestion"
-                || name == "TodoList"
-                || name == "ExitPlanMode"
-                || name == "EnterPlanMode"
-                || name == "WritePlan"
-        }
-    }
+    true
 }
 
 struct ParallelToolRequest {
@@ -2796,7 +2807,6 @@ struct ParallelToolRequest {
     session_id: String,
     turn_id: String,
     image: kkagent_config::ImageConfig,
-    enabled_tools: Option<std::collections::HashSet<String>>,
     name: String,
     input: serde_json::Value,
     tool_call_id: Option<String>,
@@ -2813,7 +2823,6 @@ async fn execute_tool_parallel(request: ParallelToolRequest) -> ToolOutput {
         session_id,
         turn_id,
         image,
-        enabled_tools,
         name,
         input,
         tool_call_id,
@@ -2821,11 +2830,6 @@ async fn execute_tool_parallel(request: ParallelToolRequest) -> ToolOutput {
         plan_file_path,
         tools_config,
     } = request;
-    if !tool_allowed_set(enabled_tools.as_ref(), &name) {
-        return ToolOutput::error(format!(
-            "Tool `{name}` is not in the current SelectTools allowlist"
-        ));
-    }
 
     let mut input = input;
     if let Some(hooks) = &hooks {

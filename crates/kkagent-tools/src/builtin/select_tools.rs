@@ -1,24 +1,19 @@
 use async_trait::async_trait;
 use serde_json::{json, Value};
-use std::collections::HashSet;
-use std::sync::Mutex;
 
 use crate::{Tool, ToolContext, ToolOutput};
 
-/// Progressive tool disclosure — restrict which tools the model may call next.
-pub struct SelectToolsTool {
-    enabled: Mutex<Option<HashSet<String>>>,
-}
+/// Progressive tool disclosure — load deferred tool definitions by name.
+///
+/// Some tools (e.g. MCP tools) are `Deferred` by default: their full JSON
+/// schema is omitted from LLM requests to conserve context. This tool lets
+/// the model load those definitions on demand. The loaded names are tracked
+/// in `Session.loaded_deferred_tools` by the agent loop.
+pub struct SelectToolsTool;
 
 impl SelectToolsTool {
     pub fn new() -> Self {
-        Self {
-            enabled: Mutex::new(None),
-        }
-    }
-
-    pub fn current_filter(&self) -> Option<HashSet<String>> {
-        self.enabled.lock().unwrap().clone()
+        Self
     }
 }
 
@@ -35,8 +30,9 @@ impl Tool for SelectToolsTool {
     }
 
     fn description(&self) -> &str {
-        "Progressively disclose tools. Pass `tools` (array of tool names) to enable only those \
-(plus always-available control tools). Pass empty array or omit to restore full tool set."
+        "Load deferred tool definitions by name. Some tools (e.g. MCP tools) are not loaded by \
+         default to conserve context. Call this with their exact names to load their full \
+         definitions before use."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -46,7 +42,7 @@ impl Tool for SelectToolsTool {
                 "tools": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Tool names to enable. Empty/omit restores all tools."
+                    "description": "Deferred tool names to load. Call with exact names listed in the Deferred Tools section of the system prompt."
                 }
             }
         })
@@ -57,37 +53,92 @@ impl Tool for SelectToolsTool {
     }
 
     async fn execute(&self, input: Value, _ctx: &ToolContext) -> anyhow::Result<ToolOutput> {
-        let mut guard = self.enabled.lock().unwrap();
-        match input.get("tools").and_then(|v| v.as_array()) {
-            None => {
-                *guard = None;
-                Ok(ToolOutput::success_with_data(
-                    "Tool filter cleared — all tools available.",
-                    json!({ "tools": Value::Null }),
-                ))
-            }
-            Some(arr) if arr.is_empty() => {
-                *guard = None;
-                Ok(ToolOutput::success_with_data(
-                    "Tool filter cleared — all tools available.",
-                    json!({ "tools": Value::Null }),
-                ))
-            }
-            Some(arr) => {
-                let set: HashSet<String> = arr
-                    .iter()
+        let tools: Vec<String> = input
+            .get("tools")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
                     .filter_map(|v| v.as_str().map(String::from))
-                    .collect();
-                // Always keep SelectTools itself available.
-                let mut with_self = set.clone();
-                with_self.insert("SelectTools".into());
-                let list: Vec<String> = with_self.iter().cloned().collect();
-                *guard = Some(with_self);
-                Ok(ToolOutput::success_with_data(
-                    format!("Enabled tools: {}", list.join(", ")),
-                    json!({ "tools": list }),
-                ))
-            }
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        if tools.is_empty() {
+            return Ok(ToolOutput::success_with_data(
+                "No tools requested.",
+                json!({ "tools": [] }),
+            ));
         }
+
+        Ok(ToolOutput::success_with_data(
+            format!("Loaded tools: {}", tools.join(", ")),
+            json!({ "tools": tools }),
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn context() -> ToolContext {
+        ToolContext {
+            working_dir: std::env::temp_dir(),
+            session_id: "select-tools-test".into(),
+            turn_id: "test-turn".into(),
+            plan_file_path: None,
+            image: kkagent_config::ImageConfig::default(),
+            tool_call_id: None,
+            interrupted: None,
+            tools_config: kkagent_config::ToolsConfig::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn returns_requested_tool_names() {
+        let tool = SelectToolsTool::new();
+        let input = json!({
+            "tools": ["mcp__server__tool_a", "mcp__server__tool_b"]
+        });
+        let output = tool.execute(input, &context()).await.unwrap();
+        assert!(!output.is_error);
+        let tools: Vec<String> = output
+            .data
+            .as_ref()
+            .unwrap()
+            .get("tools")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(tools, vec!["mcp__server__tool_a", "mcp__server__tool_b"]);
+    }
+
+    #[tokio::test]
+    async fn empty_tools_returns_empty_list() {
+        let tool = SelectToolsTool::new();
+        let input = json!({"tools": []});
+        let output = tool.execute(input, &context()).await.unwrap();
+        assert!(!output.is_error);
+        assert_eq!(
+            output
+                .data
+                .as_ref()
+                .unwrap()
+                .get("tools")
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+    }
+
+    #[test]
+    fn description_mentions_deferred_loading() {
+        let tool = SelectToolsTool::new();
+        assert!(tool.description().contains("deferred"));
     }
 }

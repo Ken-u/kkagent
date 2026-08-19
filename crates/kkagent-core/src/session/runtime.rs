@@ -208,8 +208,8 @@ pub struct Session {
     pub current_turn_changes: Vec<FileChange>,
     /// Completed turns available for undo (most recent last).
     pub undo_stack: Vec<TurnCheckpoint>,
-    /// Progressive tool disclosure filter (None = all tools).
-    pub enabled_tools: Option<std::collections::HashSet<String>>,
+    /// Names of deferred tools the model has loaded via `SelectTools`.
+    pub loaded_deferred_tools: std::collections::HashSet<String>,
     /// Turns since last TodoList write (for reminder).
     pub turns_since_todo: u32,
     /// Cross-turn tool dedupe tracker.
@@ -399,7 +399,7 @@ impl Session {
             turn_message_start: None,
             current_turn_changes: Vec::new(),
             undo_stack: Vec::new(),
-            enabled_tools: None,
+            loaded_deferred_tools: std::collections::HashSet::new(),
             turns_since_todo: 0,
             tool_dedupe: crate::tool_dedupe::ToolDedupeTracker::new(),
             token_counter: crate::token_counting::TokenCounter::new(

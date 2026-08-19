@@ -39,6 +39,7 @@ impl ToolRegistry {
                 description: t.description().to_string(),
                 parameters: t.parameters_schema(),
                 read_only: t.read_only(),
+                disclosure: t.disclosure(),
             })
             .collect()
     }
