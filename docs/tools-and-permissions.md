@@ -23,10 +23,10 @@
 为节省上下文，内置工具按使用频率分三层（基于 196 个会话、14,447 次调用的统计）：
 
 - **Inline 常驻**：`Read`、`Write`、`Edit`、`Grep`、`Glob`、`Bash`、`TaskOutput`、`TodoList`、`Skill`、`AskUserQuestion`、`SelectTools` 及 `WritePlan`/`ExitPlanMode`（仅 Plan 模式激活时）。完整 schema 始终随请求发送。
-- **Deferred 按需加载**：`Agent`、`EnterPlanMode`、`Web`、`ReadMediaFile`、`Goal`、`Cron` 及全部 MCP 工具。仅在请求中以名字公告，模型调用 `SelectTools` 按名加载 schema 后使用。
+- **Deferred 按需加载**：`Agent`、`EnterPlanMode`、`Web`、`ReadMediaFile`、`Goal`、`Cron`、`RequestToolchainAccess`、`ToolchainDoctor` 及全部 MCP 工具。仅在请求中以名字公告，模型调用 `SelectTools` 按名加载 schema 后使用。
 - **条件可见**：`WritePlan`/`ExitPlanMode` 仅在 Plan 模式激活时出现在工具列表；执行层（permission guard）独立兜底，隐藏不影响安全性。
 
-基线约 4.5k token 的工具 schema 降至常规请求约 2.3k token（约 -49%）。随后通过合并语义重叠的冷门工具（Task/Agent/AgentSwarm → Agent；TaskList/TaskStop → TaskOutput action；Goal 四件套 → Goal；Cron 三件套 → Cron；WebSearch/FetchURL → Web），工具总数从 29 降至 19，公告名从 15 降至 6。
+基线约 4.5k token 的工具 schema 降至常规请求约 2.3k token（约 -49%）。随后通过合并语义重叠的冷门工具（Task/Agent/AgentSwarm → Agent；TaskList/TaskStop → TaskOutput action；Goal 四件套 → Goal；Cron 三件套 → Cron；WebSearch/FetchURL → Web），并把零调用的沙箱元工具（RequestToolchainAccess、ToolchainDoctor）转为 Deferred，工具总数从 29 降至 19，公告名从 15 降至 8，inline schema 降至 12 个。
 
 ## 图片输入
 

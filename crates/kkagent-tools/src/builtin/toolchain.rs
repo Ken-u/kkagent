@@ -34,6 +34,10 @@ impl Tool for RequestToolchainAccessTool {
 runtime/cache paths that are not covered by built-in toolchain profiles."
     }
 
+    fn disclosure(&self) -> crate::ToolDisclosure {
+        crate::ToolDisclosure::Deferred
+    }
+
     fn parameters_schema(&self) -> Value {
         json!({
             "type": "object",
@@ -221,6 +225,10 @@ impl Tool for ToolchainDoctorTool {
     fn description(&self) -> &str {
         "Diagnose toolchain sandbox profiles: availability, cache sizes, env injection, \
 and current session grants. Does not print secrets."
+    }
+
+    fn disclosure(&self) -> crate::ToolDisclosure {
+        crate::ToolDisclosure::Deferred
     }
 
     fn parameters_schema(&self) -> Value {

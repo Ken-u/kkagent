@@ -42,6 +42,15 @@ fn main() {
     let cron = Arc::new(builtin::cron::CronManager::default());
     r.register(Arc::new(builtin::CronTool::new(cron)));
 
+    r.register(Arc::new(builtin::RequestToolchainAccessTool::new(
+        Arc::new(kkagent_tools::toolchain::ToolchainGrantStore::default()),
+        true,
+    )));
+    r.register(Arc::new(builtin::ToolchainDoctorTool::new(
+        kkagent_config::ToolchainConfig::default(),
+        Arc::new(kkagent_tools::toolchain::ToolchainGrantStore::default()),
+    )));
+
     // --- report ---
     let defs = r.tool_definitions();
     println!("registered tools: {}", defs.len());
