@@ -426,3 +426,95 @@ mod profile_tool_tests {
         assert!(!names.contains(&"Task"));
     }
 }
+
+#[cfg(test)]
+mod disclosure_tests {
+    use super::*;
+    use kkagent_protocol::tools::ToolDisclosure;
+    use std::sync::Arc;
+
+    fn full_registry() -> ToolRegistry {
+        let mut registry = ToolRegistry::new();
+        register_core_tools(&mut registry);
+        let mgr = Arc::new(kkagent_protocol::subagent::SubagentManager::new(4));
+        let launch: builtin::task::SubagentLaunchFn = Arc::new(|_cfg| {});
+        register_subagent_tools(&mut registry, mgr, launch, None);
+        let goal = Arc::new(kkagent_protocol::goal::GoalManager::new());
+        registry.register(Arc::new(builtin::CreateGoalTool::new(goal.clone())));
+        registry.register(Arc::new(builtin::GetGoalTool::new(goal.clone())));
+        registry.register(Arc::new(builtin::UpdateGoalTool::new(goal.clone())));
+        registry.register(Arc::new(builtin::SetGoalBudgetTool::new(goal)));
+        registry.register(Arc::new(builtin::SkillTool::new(Arc::new(
+            builtin::skill::SkillCatalog::new(),
+        ))));
+        registry.register(Arc::new(builtin::FetchUrlTool::new(Arc::new(
+            web_providers::WebServicesConfig {
+                search: None,
+                fetch: web_providers::WebFetchServiceConfig::default(),
+                migration_hint: None,
+            },
+        ))));
+        let cron = Arc::new(builtin::cron::CronManager::default());
+        registry.register(Arc::new(builtin::CronCreateTool::new(cron.clone())));
+        registry.register(Arc::new(builtin::CronListTool::new(cron.clone())));
+        registry.register(Arc::new(builtin::CronDeleteTool::new(cron)));
+        registry
+    }
+
+    /// Usage-tiered disclosure: hot tools stay Inline; cold tools are name-only
+    /// until loaded via SelectTools. Guard against accidental regressions.
+    #[test]
+    fn cold_builtins_are_deferred_and_hot_tools_stay_inline() {
+        let mut deferred: Vec<String> = full_registry()
+            .tool_definitions()
+            .into_iter()
+            .filter(|td| td.disclosure == ToolDisclosure::Deferred)
+            .map(|td| td.name)
+            .collect();
+        deferred.sort();
+
+        // WebSearch is registered only when [services.web_search] is configured;
+        // it is deferred too (asserted in its own impl).
+        let mut expected = [
+            "Agent",
+            "AgentSwarm",
+            "TaskList",
+            "TaskStop",
+            "EnterPlanMode",
+            "FetchURL",
+            "ReadMediaFile",
+            "CreateGoal",
+            "GetGoal",
+            "UpdateGoal",
+            "SetGoalBudget",
+            "CronCreate",
+            "CronList",
+            "CronDelete",
+        ]
+        .to_vec();
+        expected.sort_unstable();
+        assert_eq!(deferred, expected, "deferred set changed");
+
+        for hot in [
+            "Read",
+            "Write",
+            "Edit",
+            "Grep",
+            "Glob",
+            "Bash",
+            "Task",
+            "TaskOutput",
+        ] {
+            let td = full_registry()
+                .tool_definitions()
+                .into_iter()
+                .find(|td| td.name == hot)
+                .unwrap_or_else(|| panic!("{hot} missing"));
+            assert_eq!(
+                td.disclosure,
+                ToolDisclosure::Inline,
+                "{hot} must stay inline"
+            );
+        }
+    }
+}

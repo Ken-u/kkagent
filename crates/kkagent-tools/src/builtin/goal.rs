@@ -24,6 +24,9 @@ impl Tool for CreateGoalTool {
         "Create a new multi-turn goal that will drive autonomous execution across many turns. \
 Use SetGoalBudget afterwards to attach hard limits."
     }
+    fn disclosure(&self) -> crate::ToolDisclosure {
+        crate::ToolDisclosure::Deferred
+    }
     fn parameters_schema(&self) -> Value {
         serde_json::json!({
             "type": "object",
@@ -129,6 +132,9 @@ impl Tool for GetGoalTool {
     fn description(&self) -> &str {
         "Get the current goal status, budget usage, and progress."
     }
+    fn disclosure(&self) -> crate::ToolDisclosure {
+        crate::ToolDisclosure::Deferred
+    }
     fn parameters_schema(&self) -> Value {
         serde_json::json!({
             "type": "object",
@@ -170,6 +176,9 @@ impl Tool for UpdateGoalTool {
     }
     fn description(&self) -> &str {
         "Update the goal status: active, complete, or blocked (kimi-aligned)."
+    }
+    fn disclosure(&self) -> crate::ToolDisclosure {
+        crate::ToolDisclosure::Deferred
     }
     fn parameters_schema(&self) -> Value {
         serde_json::json!({
@@ -249,6 +258,9 @@ impl Tool for SetGoalBudgetTool {
     fn description(&self) -> &str {
         "Set one hard budget limit for the active goal (unit + value). \
 Legacy multi-field token_budget/turn_budget/wall_clock_budget_ms still accepted."
+    }
+    fn disclosure(&self) -> crate::ToolDisclosure {
+        crate::ToolDisclosure::Deferred
     }
     fn parameters_schema(&self) -> Value {
         serde_json::json!({

@@ -282,6 +282,9 @@ impl Tool for CronCreateTool {
         "Schedule a prompt to run later. Use delay like `in 5m` / `30s`, or a 5-field cron \
 expression with recurring=true (default) / false for one-shot."
     }
+    fn disclosure(&self) -> crate::ToolDisclosure {
+        crate::ToolDisclosure::Deferred
+    }
     fn parameters_schema(&self) -> Value {
         json!({
             "type": "object",
@@ -338,6 +341,9 @@ impl Tool for CronListTool {
     fn description(&self) -> &str {
         "List scheduled cron jobs."
     }
+    fn disclosure(&self) -> crate::ToolDisclosure {
+        crate::ToolDisclosure::Deferred
+    }
     fn read_only(&self) -> bool {
         true
     }
@@ -372,6 +378,9 @@ impl Tool for CronDeleteTool {
     }
     fn description(&self) -> &str {
         "Delete a cron job by id."
+    }
+    fn disclosure(&self) -> crate::ToolDisclosure {
+        crate::ToolDisclosure::Deferred
     }
     fn parameters_schema(&self) -> Value {
         json!({

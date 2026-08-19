@@ -28,6 +28,9 @@ impl Tool for WebSearchTool {
     fn description(&self) -> &str {
         "Search the web for up-to-date information. Requires [services.web_search] in config."
     }
+    fn disclosure(&self) -> crate::ToolDisclosure {
+        crate::ToolDisclosure::Deferred
+    }
     fn read_only(&self) -> bool {
         true
     }
@@ -143,6 +146,9 @@ impl Tool for FetchUrlTool {
     }
     fn description(&self) -> &str {
         "Fetch a URL and return extracted text content. Works with direct HTTP GET; optional [services.web_fetch] proxy."
+    }
+    fn disclosure(&self) -> crate::ToolDisclosure {
+        crate::ToolDisclosure::Deferred
     }
     fn read_only(&self) -> bool {
         true

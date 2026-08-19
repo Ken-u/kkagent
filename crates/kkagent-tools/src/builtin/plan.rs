@@ -120,6 +120,10 @@ impl Tool for EnterPlanModeTool {
          through WritePlan, then call ExitPlanMode for approval."
     }
 
+    fn disclosure(&self) -> crate::ToolDisclosure {
+        crate::ToolDisclosure::Deferred
+    }
+
     fn parameters_schema(&self) -> Value {
         json!({
             "type": "object",

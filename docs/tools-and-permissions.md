@@ -18,6 +18,16 @@
 
 实际可用集合受模型 capability、配置、当前模式和 MCP 连接状态影响。`GET /api/v1/tools` 或 TUI 状态可查看当前工具。
 
+## 渐进式工具披露（Progressive Tool Disclosure）
+
+为节省上下文，内置工具按使用频率分三层（基于 196 个会话、14,447 次调用的统计）：
+
+- **Inline 常驻**：`Read`、`Write`、`Edit`、`Grep`、`Glob`、`Bash`、`Task`、`TaskOutput`、`TodoList`、`Skill`、`AskUserQuestion`、`SelectTools` 及 `WritePlan`/`ExitPlanMode`（仅 Plan 模式激活时）。完整 schema 始终随请求发送。
+- **Deferred 按需加载**：`Agent`、`AgentSwarm`、`TaskList`、`TaskStop`、`EnterPlanMode`、`WebSearch`、`FetchURL`、`ReadMediaFile`、`CreateGoal`、`GetGoal`、`UpdateGoal`、`SetGoalBudget`、`CronCreate`、`CronList`、`CronDelete` 及全部 MCP 工具。仅在请求中以名字公告，模型调用 `SelectTools` 按名加载 schema 后使用。
+- **条件可见**：`WritePlan`/`ExitPlanMode` 仅在 Plan 模式激活时出现在工具列表；执行层（permission guard）独立兜底，隐藏不影响安全性。
+
+基线约 4.5k token 的工具 schema 降至常规请求约 2.3k token（约 -49%）。
+
 ## 图片输入
 
 模型配置含 `image_in`（也兼容 `vision`、`image`、`multimodal`）时启用完整图片输入：

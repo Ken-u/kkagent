@@ -23,6 +23,10 @@ fine detail in original-image coordinates, or full_resolution=true to avoid ordi
 Audio and video currently return metadata only. Files are never modified."
     }
 
+    fn disclosure(&self) -> crate::ToolDisclosure {
+        crate::ToolDisclosure::Deferred
+    }
+
     fn read_only(&self) -> bool {
         true
     }

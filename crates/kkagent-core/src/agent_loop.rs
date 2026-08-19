@@ -448,19 +448,26 @@ impl AgentLoop {
 
         let all_defs = self.tools.tool_definitions();
 
+        // Visibility-filtered defs drive both the announcement ledger and the
+        // SelectTools loadable set, so plan-gated or session-disabled tools
+        // are never announced by name either.
+        let visible_defs: Vec<_> = all_defs
+            .iter()
+            .filter(|td| tool_allowed(session, &td.name))
+            .cloned()
+            .collect();
+
         // Turn-boundary incremental announcement. System prompt stays byte-stable;
         // loaded deferred schemas live on history messages (Phase 2).
         if is_turn_boundary {
-            crate::dynamic_tools::inject_deferred_tools_diff(session, &all_defs);
+            crate::dynamic_tools::inject_deferred_tools_diff(session, &visible_defs);
         }
 
         // Top-level tools[] is the immutable core set (Inline only). Deferred
         // schemas are injected as message-level tools after SelectTools.
-        let mut tool_defs: Vec<ToolDef> = all_defs
+        let mut tool_defs: Vec<ToolDef> = visible_defs
             .iter()
-            .filter(|td| {
-                tool_allowed(session, &td.name) && (td.name != "ReadMediaFile" || capability.vision)
-            })
+            .filter(|td| td.name != "ReadMediaFile" || capability.vision)
             .filter(|td| td.disclosure != kkagent_protocol::tools::ToolDisclosure::Deferred)
             .map(crate::dynamic_tools::to_llm_tool_def)
             .collect();
@@ -1743,7 +1750,12 @@ Do not mention this reminder to the user.\n</system-reminder>"
                         .unwrap_or_default();
                     let applied = crate::dynamic_tools::apply_select_tools(
                         session,
-                        &self.tools.tool_definitions(),
+                        &self
+                            .tools
+                            .tool_definitions()
+                            .into_iter()
+                            .filter(|td| tool_allowed(session, &td.name))
+                            .collect::<Vec<_>>(),
                         &requested,
                     );
                     output.content = applied.content;
@@ -2782,6 +2794,13 @@ fn tool_allowed(session: &Session, name: &str) -> bool {
         .session_policy
         .is_disabled(name)
     {
+        return false;
+    }
+    // Plan-mode tools are only visible while plan mode is active. Their
+    // execution layer already guards against misuse (permission.rs
+    // `plan_mode_guard`, plan.rs `plan_file_path` check); this gate only
+    // removes ~590 tokens of schema from ordinary (non-plan) requests.
+    if matches!(name, "WritePlan" | "ExitPlanMode") && !session.plan_mode {
         return false;
     }
     if !session.tool_policy.is_active(name) {
@@ -4659,6 +4678,38 @@ mod retry_tests {
         assert!(final_records[1].content_json.contains("Probe"));
         assert!(final_records[2].content_json.contains("call-1"));
         assert!(final_records[3].content_json.contains("all done"));
+        std::fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[test]
+    fn plan_tools_are_gated_on_plan_mode() {
+        use super::*;
+
+        let workspace =
+            std::env::temp_dir().join(format!("kkagent-plan-gate-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace).unwrap();
+        // Unique id: Session::new registers into the real session store, and a
+        // fixed id would reuse metadata (plan_mode=true) left by a prior run.
+        let mut session = Session::new(
+            format!("plan-gate-{}", uuid::Uuid::new_v4()),
+            workspace.clone(),
+            PermissionMode::Auto,
+            "missing/model".into(),
+        );
+
+        // Ordinary (non-plan) session: WritePlan / ExitPlanMode are hidden.
+        assert!(!tool_allowed(&session, "WritePlan"));
+        assert!(!tool_allowed(&session, "ExitPlanMode"));
+        // Primitives and cold tools stay visible.
+        assert!(tool_allowed(&session, "Read"));
+        assert!(tool_allowed(&session, "SelectTools"));
+        assert!(tool_allowed(&session, "EnterPlanMode"));
+
+        // Entering plan mode makes the plan trio visible.
+        session.set_plan_mode_persisted(true).unwrap();
+        assert!(tool_allowed(&session, "WritePlan"));
+        assert!(tool_allowed(&session, "ExitPlanMode"));
+
         std::fs::remove_dir_all(workspace).unwrap();
     }
 }

@@ -306,6 +306,9 @@ impl Tool for TaskListTool {
     fn description(&self) -> &str {
         "List all Task/Agent subagents and background Bash jobs with their statuses."
     }
+    fn disclosure(&self) -> crate::ToolDisclosure {
+        crate::ToolDisclosure::Deferred
+    }
     fn parameters_schema(&self) -> Value {
         serde_json::json!({
             "type": "object",
@@ -386,6 +389,9 @@ impl Tool for AgentTool {
     }
     fn description(&self) -> &str {
         &self.description
+    }
+    fn disclosure(&self) -> crate::ToolDisclosure {
+        crate::ToolDisclosure::Deferred
     }
     fn parameters_schema(&self) -> Value {
         serde_json::json!({
@@ -535,6 +541,9 @@ impl Tool for AgentSwarmTool {
     }
     fn description(&self) -> &str {
         &self.description
+    }
+    fn disclosure(&self) -> crate::ToolDisclosure {
+        crate::ToolDisclosure::Deferred
     }
     fn parameters_schema(&self) -> Value {
         serde_json::json!({
@@ -813,6 +822,9 @@ impl Tool for TaskStopTool {
     }
     fn description(&self) -> &str {
         "Stop a running Task/Agent subagent or background Bash job by id."
+    }
+    fn disclosure(&self) -> crate::ToolDisclosure {
+        crate::ToolDisclosure::Deferred
     }
     fn parameters_schema(&self) -> Value {
         serde_json::json!({
