@@ -257,6 +257,9 @@ pub struct AppState {
     pub usage_session: SessionUsageTotals,
     /// Recent per-turn usage samples for `/usage`.
     pub usage_turns: Vec<TurnUsageSample>,
+    /// Most recent single LLM call's usage (context-size anchor + cache stats
+    /// for the "Latest request" section in `/usage`).
+    pub last_step_usage: Option<kkagent_protocol::TokenUsage>,
     /// Server-authoritative per-part context breakdown (system/tools/…) for
     /// the active session.
     pub context_breakdown: Option<kkagent_protocol::ContextBreakdownInfo>,
@@ -298,6 +301,8 @@ pub struct TurnUsageSample {
     pub output_tokens: u64,
     pub cache_creation_tokens: u64,
     pub cache_read_tokens: u64,
+    /// Provider semantics of `input_tokens` for this turn's provider.
+    pub input_includes_cache: Option<bool>,
     pub duration_ms: u64,
 }
 
@@ -326,6 +331,9 @@ pub struct SessionRuntimeState {
     pub prompt_queue: crate::prompt_queue::PromptQueue,
     pub usage_session: SessionUsageTotals,
     pub usage_turns: Vec<TurnUsageSample>,
+    /// Most recent single LLM call's usage (server-authoritative snapshot
+    /// `last_step_usage`); powers the "Latest request" section in `/usage`.
+    pub last_step_usage: Option<kkagent_protocol::TokenUsage>,
     pub context_breakdown: Option<kkagent_protocol::ContextBreakdownInfo>,
     pub copy_toast: Option<CopyToast>,
     pub click_history: Vec<ClickRecord>,
@@ -365,6 +373,7 @@ impl SessionRuntimeState {
             prompt_queue: state.prompt_queue.clone(),
             usage_session: state.usage_session.clone(),
             usage_turns: state.usage_turns.clone(),
+            last_step_usage: state.last_step_usage.clone(),
             context_breakdown: state.context_breakdown.clone(),
             copy_toast: state.copy_toast.clone(),
             click_history: state.click_history.clone(),
@@ -1036,6 +1045,7 @@ impl AppState {
             last_switch_metrics: None,
             usage_session: SessionUsageTotals::default(),
             usage_turns: Vec::new(),
+            last_step_usage: None,
             context_breakdown: None,
             copy_toast: None,
         }
@@ -5569,10 +5579,11 @@ impl TuiApp {
         let (in_price, out_price, cache_c, cache_r, generic) =
             model_pricing(&self.config, model.as_str());
         let cost = estimate_usd(u, in_price, out_price, cache_c, cache_r);
-        let hit = kkagent_protocol::cache_hit_ratio(
+        let hit = kkagent_protocol::cache_hit_ratio_ex(
             u.input_tokens,
             u.cache_creation_tokens,
             u.cache_read_tokens,
+            u.input_includes_cache,
         );
         let mut items = vec![
             ListPickerItem {
@@ -5625,6 +5636,32 @@ impl TuiApp {
                     "Est. cost".into()
                 },
                 detail: format!("${cost:.4}"),
+            },
+            ListPickerItem {
+                id: "sep_latest".into(),
+                label: "── Latest Request ──".into(),
+                detail: String::new(),
+            },
+            ListPickerItem {
+                id: "latest_ctx".into(),
+                label: "Context size".into(),
+                detail: self
+                    .state
+                    .last_step_usage
+                    .as_ref()
+                    .map(|s| fmt_thousands(s.context_size()))
+                    .unwrap_or_else(|| "n/a".into()),
+            },
+            ListPickerItem {
+                id: "latest_hit".into(),
+                label: "Cache hit ratio".into(),
+                detail: self
+                    .state
+                    .last_step_usage
+                    .as_ref()
+                    .and_then(|s| s.cache_hit_ratio())
+                    .map(|h| format!("{:.1}%", h * 100.0))
+                    .unwrap_or_else(|| "n/a".into()),
             },
             ListPickerItem {
                 id: "steps".into(),
@@ -5725,10 +5762,11 @@ impl TuiApp {
     fn open_usage_turns_picker(&mut self) {
         let mut items = Vec::new();
         for (i, turn) in self.state.usage_turns.iter().rev().take(20).enumerate() {
-            let hit = kkagent_protocol::cache_hit_ratio(
+            let hit = kkagent_protocol::cache_hit_ratio_ex(
                 turn.input_tokens,
                 turn.cache_creation_tokens,
                 turn.cache_read_tokens,
+                turn.input_includes_cache,
             );
             items.push(ListPickerItem {
                 id: format!("turn{i}"),
@@ -7834,6 +7872,7 @@ impl TuiApp {
             };
             self.state.approx_tokens = step_usage.context_size();
             self.state.status_bar.cache_hit = step_usage.cache_hit_ratio();
+            self.state.last_step_usage = Some(step_usage);
         }
         if let Some(plan) = data.get("plan_mode").and_then(|v| v.as_bool()) {
             self.state.on_plan_mode_changed(plan);
@@ -10814,6 +10853,7 @@ impl TuiApp {
                             output_tokens: usage.output_tokens,
                             cache_creation_tokens: usage.cache_creation_input_tokens,
                             cache_read_tokens: usage.cache_read_input_tokens,
+                            input_includes_cache: usage.input_includes_cache,
                             duration_ms: self
                                 .state
                                 .turn_started_at

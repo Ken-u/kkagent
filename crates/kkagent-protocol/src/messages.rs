@@ -92,17 +92,20 @@ impl TokenUsage {
     }
 
     /// Compute cache hit ratio adaptively across provider semantics:
-    /// - `cache_creation > 0` (Anthropic style): `input_tokens` excludes cache,
-    ///   so the total input is `input + cache_creation + cache_read`.
-    /// - `cache_creation == 0` (OpenAI style): `input_tokens` already includes
+    /// - `input_includes_cache == Some(false)` (Anthropic style):
+    ///   `input_tokens` excludes cache, so the total input is
+    ///   `input + cache_creation + cache_read`.
+    /// - `Some(true)` (OpenAI / Gemini style): `input_tokens` already includes
     ///   cached tokens, so the total input is `input` alone.
+    /// - `None` (legacy): fall back to the `cache_creation > 0` heuristic.
     ///
     /// Returns `None` when there is no cache read or no measurable input.
     pub fn cache_hit_ratio(&self) -> Option<f32> {
-        cache_hit_ratio(
+        cache_hit_ratio_ex(
             self.input_tokens,
             self.cache_creation_input_tokens,
             self.cache_read_input_tokens,
+            self.input_includes_cache,
         )
     }
 }
@@ -110,15 +113,31 @@ impl TokenUsage {
 /// Free-function form of [`TokenUsage::cache_hit_ratio`] for aggregate totals
 /// (session sums are not a `TokenUsage` instance).
 pub fn cache_hit_ratio(input: u64, cache_creation: u64, cache_read: u64) -> Option<f32> {
+    cache_hit_ratio_ex(input, cache_creation, cache_read, None)
+}
+
+/// Cache-aware variant: `input_includes_cache` states the provider semantics
+/// of `input` (`Some(true)` = OpenAI/Gemini, `Some(false)` = Anthropic,
+/// `None` = unknown, use the `cache_creation > 0` heuristic).
+///
+/// Semantics matter: with Anthropic data and OpenAI math, `cache_read/input`
+/// can exceed 1.0 for warm sessions (input excludes the read bucket).
+pub fn cache_hit_ratio_ex(
+    input: u64,
+    cache_creation: u64,
+    cache_read: u64,
+    input_includes_cache: Option<bool>,
+) -> Option<f32> {
     if cache_read == 0 {
         return None;
     }
-    let total = if cache_creation > 0 {
+    let includes = input_includes_cache.unwrap_or(cache_creation == 0);
+    let total = if includes {
+        input
+    } else {
         input
             .saturating_add(cache_creation)
             .saturating_add(cache_read)
-    } else {
-        input
     };
     if total == 0 {
         return None;

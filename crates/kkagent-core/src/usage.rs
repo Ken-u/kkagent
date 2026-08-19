@@ -2,7 +2,7 @@
 
 use kkagent_protocol::TokenUsage;
 
-pub use kkagent_protocol::cache_hit_ratio;
+pub use kkagent_protocol::cache_hit_ratio_ex;
 
 #[derive(Debug, Clone, Default)]
 pub struct UsageSnapshot {
@@ -10,6 +10,9 @@ pub struct UsageSnapshot {
     pub output_tokens: u64,
     pub cache_creation_input_tokens: u64,
     pub cache_read_input_tokens: u64,
+    /// Provider semantics of `input_tokens` (`Some(false)` = Anthropic,
+    /// `Some(true)` = OpenAI/Gemini, `None` = unknown/empty snapshot).
+    pub input_includes_cache: Option<bool>,
     pub steps: u64,
     pub turns: u64,
 }
@@ -19,11 +22,12 @@ impl UsageSnapshot {
         self.input_tokens.saturating_add(self.output_tokens)
     }
 
-    pub fn cache_hit_ratio(&self) -> Option<f32> {
-        cache_hit_ratio(
+    pub fn cache_hit_ratio(&self, input_includes_cache: Option<bool>) -> Option<f32> {
+        cache_hit_ratio_ex(
             self.input_tokens,
             self.cache_creation_input_tokens,
             self.cache_read_input_tokens,
+            input_includes_cache,
         )
     }
 }
@@ -55,6 +59,7 @@ impl UsageService {
             output_tokens: usage.output_tokens,
             cache_creation_input_tokens: usage.cache_creation_input_tokens,
             cache_read_input_tokens: usage.cache_read_input_tokens,
+            input_includes_cache: usage.input_includes_cache,
             steps: 1,
             turns: 0,
         };
@@ -123,14 +128,14 @@ mod tests {
             input_includes_cache: Some(true),
         });
         assert_eq!(u.session.total_tokens(), 15);
-        assert!((u.session.cache_hit_ratio().unwrap() - 0.4).abs() < 0.01);
+        assert!((u.session.cache_hit_ratio(Some(true)).unwrap() - 0.4).abs() < 0.01);
     }
 
     #[test]
     fn cache_hit_ratio_openai_style() {
         // OpenAI: input_tokens already includes cached tokens.
         // 400 cached out of 1000 total input → 40%.
-        let r = cache_hit_ratio(1000, 0, 400).unwrap();
+        let r = cache_hit_ratio_ex(1000, 0, 400, Some(true)).unwrap();
         assert!((r - 0.4).abs() < 0.01);
     }
 
@@ -138,21 +143,30 @@ mod tests {
     fn cache_hit_ratio_anthropic_style() {
         // Anthropic: input excludes cache; total = 100 + 400 + 500 = 1000,
         // cache_read = 500 → 50%.
-        let r = cache_hit_ratio(100, 400, 500).unwrap();
+        let r = cache_hit_ratio_ex(100, 400, 500, Some(false)).unwrap();
         assert!((r - 0.5).abs() < 0.01);
 
         // Steady-state hit: mostly cache reads.
         // total = 200 + 100 + 2700 = 3000, read = 2700 → 90%.
-        let r = cache_hit_ratio(200, 100, 2_700).unwrap();
+        let r = cache_hit_ratio_ex(200, 100, 2_700, Some(false)).unwrap();
         assert!((r - 0.9).abs() < 0.01);
     }
 
     #[test]
+    fn cache_hit_ratio_semantics_mismatch_caps_at_one() {
+        // Anthropic data + OpenAI math would give 500/100 = 5.0; the explicit
+        // flag keeps the ratio in [0, 1].
+        let r = cache_hit_ratio_ex(100, 0, 500, Some(false)).unwrap();
+        assert!((r - 500.0 / 600.0).abs() < 0.01);
+    }
+
+    #[test]
     fn cache_hit_ratio_none_when_no_read() {
-        assert!(cache_hit_ratio(1000, 500, 0).is_none());
-        assert!(cache_hit_ratio(0, 0, 0).is_none());
-        // Read > 0 but total 0 (creation-only edge) → None to avoid div by zero.
-        assert!(cache_hit_ratio(0, 0, 10).is_none());
+        assert!(cache_hit_ratio_ex(1000, 500, 0, None).is_none());
+        assert!(cache_hit_ratio_ex(0, 0, 0, None).is_none());
+        // All-cache edge: total = 0 + 0 + 10 → ratio 1.0, not None.
+        let r = cache_hit_ratio_ex(0, 0, 10, Some(false)).unwrap();
+        assert!((r - 1.0).abs() < 1e-6);
     }
 
     #[test]

@@ -6769,6 +6769,7 @@ async fn handle_rpc_call(
                         "output_tokens": last_step_usage.output_tokens,
                         "cache_creation_tokens": last_step_usage.cache_creation_input_tokens,
                         "cache_read_tokens": last_step_usage.cache_read_input_tokens,
+                        "input_includes_cache": last_step_usage.input_includes_cache,
                     },
                     "history": {
                         "total": total,
@@ -8991,7 +8992,7 @@ async fn handle_rpc_call(
                 "cache_creation_input_tokens": snap.cache_creation_input_tokens,
                 "steps": snap.steps,
                 "turns": snap.turns,
-                "cache_hit_ratio": snap.cache_hit_ratio(),
+                "cache_hit_ratio": snap.cache_hit_ratio(session.usage.input_includes_cache()),
             }))
         }
         "tasks.list" => {

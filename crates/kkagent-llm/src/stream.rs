@@ -1017,6 +1017,12 @@ fn update_openai_usage(usage: &mut TokenUsage, value: &serde_json::Value) {
         .or_else(|| value.get("input_tokens_details"))
         .and_then(|details| details.get("cached_tokens"))
         .and_then(|token| token.as_u64())
+        // DeepSeek-style flat fields (no details object).
+        .or_else(|| {
+            value
+                .get("prompt_cache_hit_tokens")
+                .and_then(|token| token.as_u64())
+        })
         .unwrap_or(usage.cache_read_input_tokens);
     // OpenAI-compatible: prompt_tokens already includes cached tokens.
     usage.input_includes_cache = Some(true);
@@ -1072,7 +1078,7 @@ async fn upload_kimi_video(
 mod tests {
     use super::{
         anthropic_stream, api_endpoint, drain_utf8, google_stream, kimi_stream, openai_stream,
-        push_strict_provider_message,
+        push_strict_provider_message, update_openai_usage,
     };
     use crate::types::{
         ChatContent, ChatMessage, LlmRequest, StreamEvent, ThinkingParams, ToolDef,
@@ -1088,6 +1094,48 @@ mod tests {
     struct CapturedRequest {
         head: String,
         body: String,
+    }
+
+    #[test]
+    fn openai_usage_parses_standard_and_deepseek_cache_fields() {
+        let mut usage = crate::types::TokenUsage::default();
+
+        // Standard OpenAI shape: cached_tokens inside prompt_tokens_details.
+        update_openai_usage(
+            &mut usage,
+            &json!({
+                "prompt_tokens": 1000,
+                "completion_tokens": 200,
+                "prompt_tokens_details": {"cached_tokens": 950}
+            }),
+        );
+        assert_eq!(usage.input_tokens, 1000);
+        assert_eq!(usage.output_tokens, 200);
+        assert_eq!(usage.cache_read_input_tokens, 950);
+        assert_eq!(usage.input_includes_cache, Some(true));
+
+        // DeepSeek shape: flat prompt_cache_hit_tokens.
+        let mut usage = crate::types::TokenUsage::default();
+        update_openai_usage(
+            &mut usage,
+            &json!({
+                "prompt_tokens": 1000,
+                "completion_tokens": 200,
+                "prompt_cache_hit_tokens": 950,
+                "prompt_cache_miss_tokens": 50
+            }),
+        );
+        assert_eq!(usage.cache_read_input_tokens, 950);
+        assert_eq!(usage.input_includes_cache, Some(true));
+
+        // No cache info at all → zero cache buckets, flag still set.
+        let mut usage = crate::types::TokenUsage::default();
+        update_openai_usage(
+            &mut usage,
+            &json!({"prompt_tokens": 100, "completion_tokens": 10}),
+        );
+        assert_eq!(usage.cache_read_input_tokens, 0);
+        assert_eq!(usage.input_includes_cache, Some(true));
     }
 
     #[test]
