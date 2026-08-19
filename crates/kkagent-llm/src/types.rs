@@ -90,6 +90,10 @@ pub struct LlmRequest {
 /// Anthropic / OpenAI / Google wire formats have no `messages[].tools`, so
 /// providers call this at serialize time. Top-level `LlmRequest.tools` stays
 /// the immutable core set; loaded deferred schemas live on history messages.
+///
+/// The result is sorted by name: providers key their prompt cache on the
+/// serialized `tools[]` prefix, so any order churn (registration timing,
+/// load order of deferred tools) would invalidate the cache every turn.
 pub fn merge_message_level_tools(request: &LlmRequest) -> Vec<ToolDef> {
     let mut tools = request.tools.clone();
     let mut seen: std::collections::HashSet<String> =
@@ -104,6 +108,7 @@ pub fn merge_message_level_tools(request: &LlmRequest) -> Vec<ToolDef> {
             }
         }
     }
+    tools.sort_by(|a, b| a.name.cmp(&b.name));
     tools
 }
 
@@ -182,6 +187,23 @@ mod tests {
         let merged = merge_message_level_tools(&request);
         let names: Vec<_> = merged.iter().map(|t| t.name.as_str()).collect();
         assert_eq!(names, vec!["Read", "SelectTools", "mcp__a"]);
+    }
+
+    #[test]
+    fn merge_sorts_tools_by_name_for_stable_prompt_cache() {
+        let request = LlmRequest {
+            model: "m".into(),
+            messages: vec![ChatMessage::schema(vec![tool("a_z_first")])],
+            tools: vec![tool("Zeta"), tool("alpha")],
+            max_tokens: None,
+            system: None,
+            thinking: None,
+            first_token_timeout: None,
+        };
+        let merged = merge_message_level_tools(&request);
+        let names: Vec<_> = merged.iter().map(|t| t.name.as_str()).collect();
+        // Byte-wise name order, regardless of core-set or load ordering.
+        assert_eq!(names, vec!["Zeta", "a_z_first", "alpha"]);
     }
 
     #[test]
