@@ -247,10 +247,19 @@ pub fn apply_select_tools(
     if !already.is_empty() {
         lines.push(format!("Already available: {}", already.join(", ")));
     }
+    let all_loadable_names: Vec<String> = loadable.iter().cloned().collect();
     for name in &unknown {
-        lines.push(format!(
-            "Unknown tool: {name}. Pick from the latest announced tools list."
-        ));
+        let suggestions = suggest_similar_tools(name, &all_loadable_names, 3);
+        if suggestions.is_empty() {
+            lines.push(format!(
+                "Unknown tool: {name}. Pick from the latest announced tools list."
+            ));
+        } else {
+            lines.push(format!(
+                "Unknown tool: {name}. Did you mean: {}?",
+                suggestions.join(", ")
+            ));
+        }
     }
     let is_error = to_load.is_empty() && already.is_empty();
     SelectToolsApply {
@@ -285,6 +294,98 @@ pub fn inject_loaded_tool_schemas(
     if !tools.is_empty() {
         session.messages.push(ChatMessage::schema(tools));
     }
+}
+
+// ---------------------------------------------------------------------------
+// BM25-based fuzzy tool-name matching
+// ---------------------------------------------------------------------------
+
+/// Tokenize a tool name into searchable terms: split on `__` and `_`, then
+/// generate character bigrams and trigrams for each segment so that minor
+/// typos still produce overlapping tokens.
+fn tokenize_tool_name(name: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    for segment in name.split("__").flat_map(|s| s.split('_')) {
+        let seg = segment.to_lowercase();
+        if seg.is_empty() {
+            continue;
+        }
+        tokens.push(seg.clone());
+        let chars: Vec<char> = seg.chars().collect();
+        for w in 2..=3 {
+            for window in chars.windows(w) {
+                tokens.push(window.iter().collect());
+            }
+        }
+    }
+    tokens
+}
+
+/// Compute BM25 score of `query` against a single `document` (both are tool
+/// names). The "corpus" is `all_names` — used only for IDF estimation.
+fn bm25_score(query: &str, document: &str, all_names: &[&str]) -> f64 {
+    let k1: f64 = 1.2;
+    let b: f64 = 0.75;
+
+    let query_tokens = tokenize_tool_name(query);
+    let doc_tokens = tokenize_tool_name(document);
+    let n = all_names.len() as f64;
+
+    let avg_dl: f64 = if all_names.is_empty() {
+        1.0
+    } else {
+        all_names
+            .iter()
+            .map(|name| tokenize_tool_name(name).len() as f64)
+            .sum::<f64>()
+            / n
+    };
+    let dl = doc_tokens.len() as f64;
+
+    // Term frequency in the document.
+    let mut tf_map = std::collections::HashMap::<&str, usize>::new();
+    for t in &doc_tokens {
+        *tf_map.entry(t.as_str()).or_insert(0) += 1;
+    }
+
+    // Document frequency across the corpus (for IDF).
+    let corpus_tokens: Vec<Vec<String>> = all_names.iter().map(|n| tokenize_tool_name(n)).collect();
+
+    let mut score = 0.0_f64;
+    let mut seen_query = std::collections::HashSet::new();
+    for qt in &query_tokens {
+        if !seen_query.insert(qt.as_str()) {
+            continue;
+        }
+        let df = corpus_tokens
+            .iter()
+            .filter(|tokens| tokens.iter().any(|t| t == qt))
+            .count() as f64;
+        if df == 0.0 {
+            continue;
+        }
+        let idf = ((n - df + 0.5) / (df + 0.5) + 1.0).ln();
+        let tf = *tf_map.get(qt.as_str()).unwrap_or(&0) as f64;
+        score += idf * (tf * (k1 + 1.0)) / (tf + k1 * (1.0 - b + b * dl / avg_dl));
+    }
+    score
+}
+
+/// Return the top-N most similar tool names from `candidates` for `query`,
+/// filtered to a minimum score threshold.
+fn suggest_similar_tools(query: &str, candidates: &[String], top_n: usize) -> Vec<String> {
+    let all_refs: Vec<&str> = candidates.iter().map(|s| s.as_str()).collect();
+    let mut scored: Vec<(f64, &str)> = candidates
+        .iter()
+        .map(|c| (bm25_score(query, c, &all_refs), c.as_str()))
+        .filter(|(s, _)| *s > 0.5)
+        .collect();
+    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    scored
+        .into_iter()
+        .take(top_n)
+        .map(|(_, name)| name.to_string())
+        .collect()
 }
 
 fn message_text(message: &ChatMessage) -> String {
@@ -509,5 +610,84 @@ mod tests {
         assert!(body.contains("<tools_added>\nmcp__server__tool\n</tools_added>"));
         assert!(!body.contains("does a thing"));
         assert!(!body.contains("description"));
+    }
+
+    // ---- BM25 fuzzy matching tests ----
+
+    #[test]
+    fn tokenize_splits_on_underscores_and_generates_ngrams() {
+        let tokens = tokenize_tool_name("mcp__server__read_file");
+        assert!(tokens.contains(&"mcp".to_string()));
+        assert!(tokens.contains(&"server".to_string()));
+        assert!(tokens.contains(&"read".to_string()));
+        assert!(tokens.contains(&"file".to_string()));
+        // bigrams
+        assert!(tokens.contains(&"re".to_string()));
+        assert!(tokens.contains(&"fi".to_string()));
+    }
+
+    #[test]
+    fn bm25_similar_names_score_higher() {
+        let corpus = &[
+            "mcp__server__read_file",
+            "mcp__server__write_file",
+            "mcp__other__delete",
+        ];
+        let score_read = bm25_score("mcp__server__read", "mcp__server__read_file", corpus);
+        let score_delete = bm25_score("mcp__server__read", "mcp__other__delete", corpus);
+        assert!(
+            score_read > score_delete,
+            "read_file ({score_read}) should score higher than delete ({score_delete})"
+        );
+    }
+
+    #[test]
+    fn suggest_returns_top_candidates() {
+        let candidates = vec![
+            "mcp__github__read_file".into(),
+            "mcp__github__read_dir".into(),
+            "mcp__github__delete_repo".into(),
+            "mcp__slack__send_message".into(),
+        ];
+        let suggestions = suggest_similar_tools("mcp__github__read_flie", &candidates, 3);
+        assert!(
+            !suggestions.is_empty(),
+            "should suggest at least one candidate"
+        );
+        assert!(
+            suggestions.contains(&"mcp__github__read_file".to_string()),
+            "should suggest read_file for the typo read_flie, got: {suggestions:?}"
+        );
+    }
+
+    #[test]
+    fn suggest_returns_empty_for_totally_unrelated() {
+        let candidates = vec!["aaa__bbb__ccc".into()];
+        let suggestions = suggest_similar_tools("zzz_yyy_xxx", &candidates, 3);
+        assert!(
+            suggestions.is_empty(),
+            "unrelated names should not be suggested: {suggestions:?}"
+        );
+    }
+
+    #[test]
+    fn select_tools_unknown_with_bm25_suggestion() {
+        let mut session = session();
+        let defs = vec![
+            deferred_def("mcp__server__read_file"),
+            deferred_def("mcp__server__write_file"),
+        ];
+        let applied = apply_select_tools(&mut session, &defs, &["mcp__server__read_flie".into()]);
+        assert!(applied.is_error);
+        assert!(
+            applied.content.contains("Did you mean"),
+            "should contain BM25 suggestion: {}",
+            applied.content
+        );
+        assert!(
+            applied.content.contains("mcp__server__read_file"),
+            "should suggest the correct tool name: {}",
+            applied.content
+        );
     }
 }
