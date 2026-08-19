@@ -457,20 +457,29 @@ impl AgentLoop {
             .cloned()
             .collect();
 
+        let dynamic_tools_enabled = self.config.tools.dynamically_loaded_tools;
+
         // Turn-boundary incremental announcement. System prompt stays byte-stable;
         // loaded deferred schemas live on history messages (Phase 2).
-        if is_turn_boundary {
+        if dynamic_tools_enabled && is_turn_boundary {
             crate::dynamic_tools::inject_deferred_tools_diff(session, &visible_defs);
         }
 
-        // Top-level tools[] is the immutable core set (Inline only). Deferred
-        // schemas are injected as message-level tools after SelectTools.
+        // When dynamic loading is on, top-level tools[] is the immutable core
+        // set (Inline only) and deferred schemas are injected as message-level
+        // tools after SelectTools. When off, all tools are sent in one batch.
         let mut tool_defs: Vec<ToolDef> = visible_defs
             .iter()
             .filter(|td| td.name != "ReadMediaFile" || capability.vision)
-            .filter(|td| td.disclosure != kkagent_protocol::tools::ToolDisclosure::Deferred)
+            .filter(|td| {
+                !dynamic_tools_enabled
+                    || td.disclosure != kkagent_protocol::tools::ToolDisclosure::Deferred
+            })
             .map(crate::dynamic_tools::to_llm_tool_def)
             .collect();
+        if !dynamic_tools_enabled {
+            tool_defs.retain(|td| td.name != "SelectTools");
+        }
         if !capability.tools {
             tool_defs.clear();
         }

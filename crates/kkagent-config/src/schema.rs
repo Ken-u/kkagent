@@ -541,6 +541,11 @@ pub struct ToolsConfig {
     /// Additional directories allowed for file access in strict mode.
     #[serde(default)]
     pub additional_dirs: Vec<std::path::PathBuf>,
+    /// When `true` (default), deferred tools are loaded progressively via
+    /// `SelectTools`. When `false`, all tool schemas are sent to the LLM
+    /// in a single batch — simpler but uses more context.
+    #[serde(default = "default_true")]
+    pub dynamically_loaded_tools: bool,
 }
 
 impl Default for ToolsConfig {
@@ -549,6 +554,7 @@ impl Default for ToolsConfig {
             path_guard_mode: default_path_guard_mode(),
             sensitive_path_check: true,
             additional_dirs: Vec::new(),
+            dynamically_loaded_tools: true,
         }
     }
 }
