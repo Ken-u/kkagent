@@ -30,9 +30,11 @@ impl Tool for SelectToolsTool {
     }
 
     fn description(&self) -> &str {
-        "Load deferred tool definitions by name. Some tools (e.g. MCP tools) are not loaded by \
-         default to conserve context. Call this with their exact names to load their full \
-         definitions before use."
+        "Load one or more deferred tools by name so you can call them. \
+         All available tool names are listed in the <tools_added>/<tools_removed> announcements \
+         in the system context — fold them in order to get the current list. \
+         Pass the exact name(s) you need; their full definitions become available immediately, \
+         so you can call them directly in your next tool call."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -42,7 +44,7 @@ impl Tool for SelectToolsTool {
                 "tools": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Deferred tool names to load. Call with exact names listed in the Deferred Tools section of the system prompt."
+                    "description": "Deferred tool names to load. Call with exact names listed in the <tools_added>/<tools_removed> announcements."
                 }
             }
         })

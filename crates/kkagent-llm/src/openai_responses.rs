@@ -6,7 +6,7 @@ use tokio::sync::mpsc;
 
 use crate::first_token_gate::FirstTokenGate;
 use crate::stream::drain_utf8;
-use crate::types::{ChatContent, LlmRequest, StreamEvent, TokenUsage};
+use crate::types::{merge_message_level_tools, ChatContent, LlmRequest, StreamEvent, TokenUsage};
 
 pub async fn openai_responses_stream(
     client: &Client,
@@ -20,6 +20,9 @@ pub async fn openai_responses_stream(
 
     let mut input: Vec<serde_json::Value> = Vec::new();
     for m in &request.messages {
+        if m.is_schema_only() {
+            continue;
+        }
         let mut texts = Vec::new();
         let mut images = Vec::new();
         let mut tool_calls = Vec::new();
@@ -90,8 +93,7 @@ pub async fn openai_responses_stream(
         }
     }
 
-    let tools: Vec<serde_json::Value> = request
-        .tools
+    let tools: Vec<serde_json::Value> = merge_message_level_tools(&request)
         .iter()
         .map(|t| {
             json!({
@@ -364,6 +366,7 @@ mod tests {
                 content: vec![ChatContent::Text {
                     text: "hello".into(),
                 }],
+                tools: None,
             }],
             tools: vec![ToolDef {
                 name: "Read".into(),

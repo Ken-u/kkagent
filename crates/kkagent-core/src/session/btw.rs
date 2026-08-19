@@ -214,6 +214,7 @@ impl SessionBtwService {
                     messages.push(ChatMessage {
                         role: msg.role.clone(),
                         content: vec![ChatContent::Text { text }],
+                        tools: None,
                     });
                 }
                 _ => {}
@@ -226,12 +227,14 @@ impl SessionBtwService {
                 content: vec![ChatContent::Text {
                     text: turn.question.clone(),
                 }],
+                tools: None,
             });
             messages.push(ChatMessage {
                 role: "assistant".into(),
                 content: vec![ChatContent::Text {
                     text: turn.answer.clone(),
                 }],
+                tools: None,
             });
         }
 
@@ -243,6 +246,7 @@ impl SessionBtwService {
         messages.push(ChatMessage {
             role: "user".into(),
             content: vec![ChatContent::Text { text: q }],
+            tools: None,
         });
 
         messages
@@ -343,12 +347,14 @@ mod tests {
                 content: vec![ChatContent::Text {
                     text: "main q".into(),
                 }],
+                tools: None,
             },
             ChatMessage {
                 role: "assistant".into(),
                 content: vec![ChatContent::Text {
                     text: "main a".into(),
                 }],
+                tools: None,
             },
         ];
 
@@ -371,12 +377,14 @@ mod tests {
             content: vec![ChatContent::Text {
                 text: "first".into(),
             }],
+            tools: None,
         }];
         let later = vec![ChatMessage {
             role: "user".into(),
             content: vec![ChatContent::Text {
                 text: "later".into(),
             }],
+            tools: None,
         }];
 
         assert_eq!(chat_message_text(&svc.context_snapshot(&first)[0]), "first");

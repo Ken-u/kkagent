@@ -69,6 +69,7 @@ mod tests {
         ChatMessage {
             role: role.into(),
             content,
+            tools: None,
         }
     }
 

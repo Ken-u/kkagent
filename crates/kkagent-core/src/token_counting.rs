@@ -82,6 +82,9 @@ impl TokenCounter {
                 ChatContent::Video { .. } => 4_000,
             };
         }
+        if let Some(tools) = &message.tools {
+            n = n.saturating_add(Self::estimate_tools(tools));
+        }
         n
     }
 
@@ -158,6 +161,7 @@ mod tests {
             content: vec![ChatContent::Text {
                 text: "hello".into(),
             }],
+            tools: None,
         }];
         let size = c.context_size(&msgs);
         assert_eq!(size.measured, 10_000);

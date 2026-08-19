@@ -19,6 +19,9 @@ pub fn is_vacuous_part(part: &ChatContent) -> bool {
 }
 
 pub fn is_vacuous_message(msg: &ChatMessage) -> bool {
+    if msg.is_dynamic_tool_schema() {
+        return false;
+    }
     if msg.content.is_empty() {
         return true;
     }
@@ -29,7 +32,7 @@ pub fn is_vacuous_message(msg: &ChatMessage) -> bool {
 pub fn fold_vacuous(messages: &mut Vec<ChatMessage>) -> usize {
     let before = messages.len();
     messages.retain(|m| {
-        if m.role == "system" {
+        if m.role == "system" || m.is_dynamic_tool_schema() {
             return true;
         }
         // Keep messages that still have a non-vacuous tool_use.
@@ -63,6 +66,7 @@ impl CompactionHandoff {
                     self.kept_tail
                 ),
             }],
+            tools: None,
         }
     }
 }
@@ -129,10 +133,12 @@ mod tests {
             ChatMessage {
                 role: "user".into(),
                 content: vec![ChatContent::Text { text: "hi".into() }],
+                tools: None,
             },
             ChatMessage {
                 role: "assistant".into(),
                 content: vec![ChatContent::Text { text: "   ".into() }],
+                tools: None,
             },
         ];
         assert_eq!(fold_vacuous(&mut msgs), 1);

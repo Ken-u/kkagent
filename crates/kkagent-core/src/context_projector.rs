@@ -163,6 +163,7 @@ fn fold_message(msg: &ChatMessage, opts: &ProjectOptions, fold_hard: bool) -> Ch
     ChatMessage {
         role: msg.role.clone(),
         content,
+        tools: msg.tools.clone(),
     }
 }
 
@@ -363,6 +364,7 @@ pub fn repair_tool_exchanges(messages: &mut Vec<ChatMessage>, synthesize_missing
             ChatMessage {
                 role: "user".into(),
                 content,
+                tools: None,
             },
         ));
     }
@@ -401,6 +403,7 @@ pub fn compact_messages(messages: &mut Vec<ChatMessage>, keep_last: usize, summa
                 "<system-reminder>\nConversation compacted. Summary of earlier turns:\n{summary}\n</system-reminder>"
             ),
         }],
+        tools: None,
     });
     messages.extend(kept);
     drop_n
@@ -418,6 +421,7 @@ mod tests {
                 content: content.into(),
                 is_error: false,
             }],
+            tools: None,
         }
     }
 
@@ -458,12 +462,14 @@ mod tests {
                 name: "Edit".into(),
                 input: large_input.clone(),
             }],
+            tools: None,
         }];
         messages.extend((0..20).map(|index| ChatMessage {
             role: "user".into(),
             content: vec![ChatContent::Text {
                 text: format!("later message {index}"),
             }],
+            tools: None,
         }));
 
         let projected = project(&messages, &ProjectOptions::default());
@@ -482,6 +488,7 @@ mod tests {
                 content: vec![ChatContent::Text {
                     text: format!("m{i}"),
                 }],
+                tools: None,
             })
             .collect();
         let dropped = compact_messages(&mut msgs, 3, "summary here");
@@ -498,6 +505,7 @@ mod tests {
             ChatMessage {
                 role: "user".into(),
                 content: vec![ChatContent::Text { text: "old".into() }],
+                tools: None,
             },
             ChatMessage {
                 role: "assistant".into(),
@@ -506,6 +514,7 @@ mod tests {
                     name: "Read".into(),
                     input: serde_json::json!({"path": "a.rs"}),
                 }],
+                tools: None,
             },
             ChatMessage {
                 role: "user".into(),
@@ -514,12 +523,14 @@ mod tests {
                     content: "fn main() {}".into(),
                     is_error: false,
                 }],
+                tools: None,
             },
             ChatMessage {
                 role: "user".into(),
                 content: vec![ChatContent::Text {
                     text: "thanks".into(),
                 }],
+                tools: None,
             },
         ];
         // Naive keep_last=2 would start on the tool_result. The cut should pull
@@ -561,6 +572,7 @@ mod tests {
                     name: "Bash".into(),
                     input: serde_json::json!({"command": "ls"}),
                 }],
+                tools: None,
             },
             ChatMessage {
                 role: "user".into(),
@@ -576,6 +588,7 @@ mod tests {
                         is_error: false,
                     },
                 ],
+                tools: None,
             },
             ChatMessage {
                 role: "assistant".into(),
@@ -584,6 +597,7 @@ mod tests {
                     name: "Read".into(),
                     input: serde_json::json!({"path": "x"}),
                 }],
+                tools: None,
             },
         ];
         repair_tool_exchanges(&mut msgs, true);
@@ -601,6 +615,7 @@ mod tests {
                 media_type: "image/png".into(),
                 data: "AAAA".into(),
             }],
+            tools: None,
         };
         let mut messages = vec![image(), image(), image()];
         assert_eq!(fold_old_media(&mut messages, 1), 2);

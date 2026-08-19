@@ -12,11 +12,7 @@ impl ReplayBuilder {
         records
             .iter()
             .filter_map(|r| {
-                let content: Vec<ChatContent> = serde_json::from_str(&r.content_json).ok()?;
-                Some(ChatMessage {
-                    role: r.role.clone(),
-                    content,
-                })
+                crate::transcript::message_from_transcript(r.role.clone(), &r.content_json)
             })
             .collect()
     }
@@ -31,6 +27,9 @@ impl ReplayBuilder {
                         out.push(ChatMessage {
                             role: role.into(),
                             content: parts,
+                            tools: v
+                                .get("tools")
+                                .and_then(|t| serde_json::from_value(t.clone()).ok()),
                         });
                         continue;
                     }
@@ -38,6 +37,7 @@ impl ReplayBuilder {
                         out.push(ChatMessage {
                             role: role.into(),
                             content: vec![ChatContent::Text { text: text.into() }],
+                            tools: None,
                         });
                     }
                 }

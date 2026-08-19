@@ -7,6 +7,7 @@ pub mod context_breakdown;
 pub mod context_memory;
 pub mod context_projector;
 pub mod conversation_turns;
+pub mod dynamic_tools;
 pub mod event_bus;
 pub mod file_conflict;
 pub mod full_compaction;

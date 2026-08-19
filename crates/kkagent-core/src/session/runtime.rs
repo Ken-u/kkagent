@@ -210,6 +210,9 @@ pub struct Session {
     pub undo_stack: Vec<TurnCheckpoint>,
     /// Names of deferred tools the model has loaded via `SelectTools`.
     pub loaded_deferred_tools: std::collections::HashSet<String>,
+    /// Names of deferred tools already announced via `<tools_added>` diffs.
+    /// Rebuilt from history at turn boundaries so compaction self-heals.
+    pub announced_deferred_tools: std::collections::HashSet<String>,
     /// Turns since last TodoList write (for reminder).
     pub turns_since_todo: u32,
     /// Cross-turn tool dedupe tracker.
@@ -400,6 +403,7 @@ impl Session {
             current_turn_changes: Vec::new(),
             undo_stack: Vec::new(),
             loaded_deferred_tools: std::collections::HashSet::new(),
+            announced_deferred_tools: std::collections::HashSet::new(),
             turns_since_todo: 0,
             tool_dedupe: crate::tool_dedupe::ToolDedupeTracker::new(),
             token_counter: crate::token_counting::TokenCounter::new(
@@ -621,6 +625,10 @@ impl Session {
         }
         // `run_turn_step` re-enters every LLM round within the same turn;
         // keep file snapshots taken in earlier rounds so commit captures all.
+    }
+
+    pub fn is_turn_boundary(&self) -> bool {
+        self.turn_message_start.is_none()
     }
 
     pub fn commit_turn(&mut self) {
@@ -909,6 +917,7 @@ impl Session {
         self.messages.push(ChatMessage {
             role: "user".into(),
             content,
+            tools: None,
         });
     }
 
@@ -1730,6 +1739,7 @@ pub fn messages_for_llm(session: &Session) -> Vec<ChatMessage> {
             content: vec![ChatContent::Text {
                 text: plan_mode_reminder(),
             }],
+            tools: None,
         });
     }
     messages
@@ -1952,6 +1962,7 @@ mod working_directory_tests {
             content: vec![ChatContent::Text {
                 text: "first".into(),
             }],
+            tools: None,
         });
         session.begin_turn();
         session.current_turn_changes.push(FileChange {
@@ -1965,6 +1976,7 @@ mod working_directory_tests {
             content: vec![ChatContent::Text {
                 text: "wrote v1".into(),
             }],
+            tools: None,
         });
         session.commit_turn();
 
@@ -1973,6 +1985,7 @@ mod working_directory_tests {
             content: vec![ChatContent::Text {
                 text: "second".into(),
             }],
+            tools: None,
         });
         session.begin_turn();
         session.current_turn_changes.push(FileChange {
@@ -1986,6 +1999,7 @@ mod working_directory_tests {
             content: vec![ChatContent::Text {
                 text: "wrote v2".into(),
             }],
+            tools: None,
         });
         session.commit_turn();
 
@@ -2017,6 +2031,7 @@ mod working_directory_tests {
             content: vec![ChatContent::Text {
                 text: "edit it".into(),
             }],
+            tools: None,
         });
         session.begin_turn();
         session.record_pre_change(file.clone()).await;
@@ -2026,6 +2041,7 @@ mod working_directory_tests {
             content: vec![ChatContent::Text {
                 text: "wrote v1".into(),
             }],
+            tools: None,
         });
         session.commit_turn();
         let session_dir = session.services.context.session_dir.clone();
@@ -2095,6 +2111,7 @@ mod working_directory_tests {
                 content: vec![ChatContent::Text {
                     text: "please edit".into(),
                 }],
+                tools: None,
             },
             ChatMessage {
                 role: "assistant".into(),
@@ -2103,6 +2120,7 @@ mod working_directory_tests {
                     name: "Edit".into(),
                     input: serde_json::json!({"path": "a.rs"}),
                 }],
+                tools: None,
             },
             ChatMessage {
                 role: "user".into(),
@@ -2111,18 +2129,21 @@ mod working_directory_tests {
                     content: "updated".into(),
                     is_error: false,
                 }],
+                tools: None,
             },
             ChatMessage {
                 role: "assistant".into(),
                 content: vec![ChatContent::Text {
                     text: "done".into(),
                 }],
+                tools: None,
             },
             ChatMessage {
                 role: "user".into(),
                 content: vec![ChatContent::Text {
                     text: "next please".into(),
                 }],
+                tools: None,
             },
         ]);
         assert_eq!(session.user_turn_starts(), vec![0, 4]);

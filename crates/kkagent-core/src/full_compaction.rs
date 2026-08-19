@@ -12,6 +12,7 @@ use tokio::sync::mpsc;
 use crate::context_projector::{
     build_compaction_digest, fold_old_media, project, repair_tool_exchanges, ProjectOptions,
 };
+use crate::dynamic_tools::strip_dynamic_tool_context;
 use crate::token_counting::TokenCounter;
 
 /// Fraction of the model context window that triggers auto-compaction.
@@ -256,6 +257,7 @@ fn replace_message_text(msg: &ChatMessage, text: String) -> ChatMessage {
     ChatMessage {
         role: msg.role.clone(),
         content: vec![ChatContent::Text { text }],
+        tools: None,
     }
 }
 
@@ -396,6 +398,7 @@ pub fn apply_compaction(messages: &mut Vec<ChatMessage>, raw_summary: &str) -> C
             content: vec![ChatContent::Text {
                 text: build_compaction_elision_text(selection.omitted_tokens),
             }],
+            tools: None,
         });
     }
     kept.extend(selection.tail.iter().cloned());
@@ -407,6 +410,7 @@ pub fn apply_compaction(messages: &mut Vec<ChatMessage>, raw_summary: &str) -> C
         content: vec![ChatContent::Text {
             text: summary_text.clone(),
         }],
+        tools: None,
     });
 
     messages.clear();
@@ -483,7 +487,8 @@ fn build_summarizer_messages(
     history: &[ChatMessage],
     custom_instruction: Option<&str>,
 ) -> Vec<ChatMessage> {
-    let mut projected = project(history, &ProjectOptions::default());
+    let stripped = strip_dynamic_tool_context(history);
+    let mut projected = project(&stripped, &ProjectOptions::default());
     repair_tool_exchanges(&mut projected, true);
     let mut instruction = COMPACTION_INSTRUCTION.to_string();
     if let Some(extra) = custom_instruction.map(str::trim).filter(|s| !s.is_empty()) {
@@ -493,6 +498,7 @@ fn build_summarizer_messages(
     projected.push(ChatMessage {
         role: "user".into(),
         content: vec![ChatContent::Text { text: instruction }],
+        tools: None,
     });
     projected
 }
@@ -698,6 +704,7 @@ pub fn compact_full(
                             content: vec![ChatContent::Text {
                                 text: text.chars().take(500).collect(),
                             }],
+                            tools: None,
                         });
                     }
                 }
@@ -773,6 +780,7 @@ mod tests {
                 content: vec![ChatContent::Text {
                     text: "please read a.rs".into(),
                 }],
+                tools: None,
             },
             ChatMessage {
                 role: "assistant".into(),
@@ -781,6 +789,7 @@ mod tests {
                     name: "Read".into(),
                     input: serde_json::json!({"path": "a.rs"}),
                 }],
+                tools: None,
             },
             ChatMessage {
                 role: "user".into(),
@@ -789,12 +798,14 @@ mod tests {
                     content: "fn main() {}".into(),
                     is_error: false,
                 }],
+                tools: None,
             },
             ChatMessage {
                 role: "user".into(),
                 content: vec![ChatContent::Text {
                     text: "continue".into(),
                 }],
+                tools: None,
             },
         ];
         let result = apply_compaction(&mut msgs, "read a.rs then continue");
@@ -820,6 +831,7 @@ mod tests {
                 content: vec![ChatContent::Text {
                     text: format!("user message number {i} {}", "x".repeat(800)),
                 }],
+                tools: None,
             })
             .collect();
         let sel = select_compaction_user_messages(&msgs, 4_000, 800);
@@ -837,6 +849,7 @@ mod tests {
             content: vec![ChatContent::Text {
                 text: "<system-reminder>\nplan mode\n</system-reminder>".into(),
             }],
+            tools: None,
         };
         assert!(!is_real_user_input(&msg));
     }

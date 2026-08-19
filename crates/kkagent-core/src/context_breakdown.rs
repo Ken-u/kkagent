@@ -42,6 +42,13 @@ impl ContextBreakdown {
             ..Default::default()
         };
         for m in messages {
+            if let Some(message_tools) = &m.tools {
+                out.tools =
+                    out.tools
+                        .saturating_add(crate::token_counting::TokenCounter::estimate_tools(
+                            message_tools,
+                        ));
+            }
             for part in &m.content {
                 match part {
                     ChatContent::Text { text } => {

@@ -4,8 +4,8 @@ use serde::{Deserialize, Serialize};
 ///
 /// `Inline` tools always have their full JSON schema sent to the model.
 /// `Deferred` tools are omitted from the schema list until loaded via
-/// `SelectTools`; only their name and description appear in a system-prompt
-/// announcement so the model knows they exist.
+/// `SelectTools`; only their names appear in incremental
+/// `<tools_added>/<tools_removed>` announcements so the model knows they exist.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum ToolDisclosure {
     #[default]

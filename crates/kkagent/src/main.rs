@@ -4216,6 +4216,7 @@ impl ServerState {
                         msgs.push(ChatMessage {
                             role: "assistant".into(),
                             content,
+                            tools: None,
                         });
                     }
                 }
@@ -4474,6 +4475,7 @@ impl ServerState {
                         content: output.clone(),
                         is_error: *is_error,
                     }],
+                    tools: None,
                 });
             }
             AgentEvent::LlmRetry {
@@ -5118,7 +5120,7 @@ fn serialize_transcript_messages(
         .map(|message| {
             Ok((
                 message.role.clone(),
-                serde_json::to_string(&message.content)?,
+                kkagent_core::transcript::encode_transcript_content(message)?,
             ))
         })
         .collect()
@@ -5128,11 +5130,7 @@ fn messages_from_records(records: &[kkagent_core::transcript::MessageRecord]) ->
     let mut messages: Vec<ChatMessage> = records
         .iter()
         .filter_map(|r| {
-            let content: Vec<ChatContent> = serde_json::from_str(&r.content_json).ok()?;
-            Some(ChatMessage {
-                role: r.role.clone(),
-                content,
-            })
+            kkagent_core::transcript::message_from_transcript(r.role.clone(), &r.content_json)
         })
         .collect();
     repair_orphan_tool_uses(&mut messages);
@@ -5208,6 +5206,7 @@ fn repair_orphan_tool_uses(messages: &mut Vec<ChatMessage>) {
                 is_error: true,
             })
             .collect(),
+        tools: None,
     });
 }
 
@@ -5822,6 +5821,7 @@ fn reconnect_append_tool_call(
     entry.partial_messages.push(ChatMessage {
         role: "assistant".into(),
         content,
+        tools: None,
     });
 }
 
@@ -9279,6 +9279,7 @@ mod http_path_tests {
         ChatMessage {
             role: role.into(),
             content: vec![ChatContent::Text { text: text.into() }],
+            tools: None,
         }
     }
 
@@ -9290,6 +9291,7 @@ mod http_path_tests {
                 name: "Read".into(),
                 input: serde_json::json!({"path": "file.rs"}),
             }],
+            tools: None,
         }
     }
 
@@ -9301,6 +9303,7 @@ mod http_path_tests {
                 content: "result".into(),
                 is_error: false,
             }],
+            tools: None,
         }
     }
 
@@ -10071,6 +10074,7 @@ mod runtime_http_tests {
                     text: "done".into(),
                 },
             ],
+            tools: None,
         });
         session.add_user_message("current prompt".into());
         state

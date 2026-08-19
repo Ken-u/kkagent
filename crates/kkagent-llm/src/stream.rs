@@ -3,7 +3,7 @@ use serde_json::json;
 use tokio::sync::mpsc;
 
 use crate::first_token_gate::FirstTokenGate;
-use crate::types::{ChatContent, LlmRequest, StreamEvent, TokenUsage};
+use crate::types::{merge_message_level_tools, ChatContent, LlmRequest, StreamEvent, TokenUsage};
 
 const ANTHROPIC_FALLBACK_MAX_TOKENS: u32 = 128_000;
 
@@ -43,6 +43,9 @@ pub async fn anthropic_stream(
 
     let mut messages = Vec::new();
     for message in &request.messages {
+        if message.is_schema_only() {
+            continue;
+        }
         let content: Vec<serde_json::Value> = message
             .content
             .iter()
@@ -67,8 +70,7 @@ pub async fn anthropic_stream(
         });
     }
 
-    let tools: Vec<serde_json::Value> = request
-        .tools
+    let tools: Vec<serde_json::Value> = merge_message_level_tools(&request)
         .iter()
         .map(|t| {
             json!({
@@ -387,6 +389,9 @@ async fn chat_completions_stream(
         messages.push(json!({"role": "system", "content": system}));
     }
     for m in &request.messages {
+        if m.is_schema_only() {
+            continue;
+        }
         // Flatten content blocks into OpenAI-ish messages.
         let mut text_parts = Vec::new();
         let mut thinking_parts = Vec::new();
@@ -473,8 +478,7 @@ async fn chat_completions_stream(
         }
     }
 
-    let tools: Vec<serde_json::Value> = request
-        .tools
+    let tools: Vec<serde_json::Value> = merge_message_level_tools(&request)
         .iter()
         .map(|t| {
             json!({
@@ -700,6 +704,9 @@ pub async fn google_stream(
 
     let mut contents = Vec::new();
     for m in &request.messages {
+        if m.is_schema_only() {
+            continue;
+        }
         let role = if m.role == "assistant" {
             "model"
         } else {
@@ -746,11 +753,11 @@ pub async fn google_stream(
         }
     }
 
-    let tools: Vec<serde_json::Value> = if request.tools.is_empty() {
+    let merged_tools = merge_message_level_tools(&request);
+    let tools: Vec<serde_json::Value> = if merged_tools.is_empty() {
         Vec::new()
     } else {
-        let decls: Vec<_> = request
-            .tools
+        let decls: Vec<_> = merged_tools
             .iter()
             .map(|t| {
                 json!({
@@ -1019,7 +1026,9 @@ mod tests {
         anthropic_stream, api_endpoint, drain_utf8, google_stream, kimi_stream, openai_stream,
         push_strict_provider_message,
     };
-    use crate::types::{ChatContent, ChatMessage, LlmRequest, StreamEvent, ThinkingParams};
+    use crate::types::{
+        ChatContent, ChatMessage, LlmRequest, StreamEvent, ThinkingParams, ToolDef,
+    };
     use reqwest::Client;
     use serde_json::json;
     use tokio::{
@@ -1163,6 +1172,7 @@ mod tests {
                 content: vec![ChatContent::Text {
                     text: "hello".into(),
                 }],
+                tools: None,
             }],
             tools: Vec::new(),
             max_tokens: Some(128),
@@ -1489,6 +1499,7 @@ mod tests {
                 name: "ReadMediaFile".into(),
                 input: serde_json::json!({"path":"screen.png"}),
             }],
+            tools: None,
         });
         request.messages.push(ChatMessage {
             role: "user".into(),
@@ -1503,6 +1514,7 @@ mod tests {
                     data: "AQID".into(),
                 },
             ],
+            tools: None,
         });
         let (tx, _rx) = mpsc::channel(8);
         openai_stream(&Client::new(), &base_url, "token", request, tx)
@@ -1512,6 +1524,42 @@ mod tests {
         assert_eq!(body["messages"][3]["role"], "tool");
         assert_eq!(body["messages"][4]["role"], "user");
         assert_eq!(body["messages"][4]["content"][0]["type"], "image_url");
+    }
+
+    #[tokio::test]
+    async fn openai_merges_message_level_tools_and_drops_schema_only_messages() {
+        let sse = "data: [DONE]\n";
+        let (base_url, captured) = serve_once("200 OK", "text/event-stream", sse).await;
+        let mut request = request();
+        request.tools = vec![ToolDef {
+            name: "SelectTools".into(),
+            description: "load".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+        }];
+        request.messages.push(ChatMessage::schema(vec![ToolDef {
+            name: "mcp__server__tool".into(),
+            description: "an mcp tool".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+        }]));
+        let (tx, _rx) = mpsc::channel(8);
+        openai_stream(&Client::new(), &base_url, "token", request, tx)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_str(&captured.await.unwrap().body).unwrap();
+        let names: Vec<&str> = body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t["function"]["name"].as_str())
+            .collect();
+        assert_eq!(names, vec!["SelectTools", "mcp__server__tool"]);
+        let roles: Vec<&str> = body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|m| m["role"].as_str())
+            .collect();
+        assert_eq!(roles, vec!["system", "user"]);
     }
 
     #[tokio::test]
@@ -1540,6 +1588,7 @@ mod tests {
                 name: "Read".into(),
                 input: serde_json::json!({"path": "README.md"}),
             }],
+            tools: None,
         });
         request.messages.push(ChatMessage {
             role: "user".into(),
@@ -1548,6 +1597,7 @@ mod tests {
                 content: "contents".into(),
                 is_error: false,
             }],
+            tools: None,
         });
         let (tx, mut rx) = mpsc::channel(8);
         google_stream(&Client::new(), &base_url, "google-key", request, tx)

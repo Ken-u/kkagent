@@ -5,7 +5,52 @@ pub use db::{
     SearchHit, SessionRecord, SharedSqlite, ToolResultRecord, TranscriptDb,
 };
 
-use kkagent_llm::{ChatContent, ChatMessage};
+use kkagent_llm::{ChatContent, ChatMessage, ToolDef};
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TranscriptMessageBody {
+    content: Vec<ChatContent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<ToolDef>>,
+}
+
+/// Encode a chat message body for the transcript `content_json` column.
+///
+/// Legacy rows store a bare `Vec<ChatContent>` array. Messages that carry
+/// progressive-disclosure schemas wrap `{content, tools}` so resume can
+/// rebuild the loaded-tool ledger.
+pub fn encode_transcript_content(message: &ChatMessage) -> anyhow::Result<String> {
+    if message.tools.is_some() {
+        Ok(serde_json::to_string(&TranscriptMessageBody {
+            content: message.content.clone(),
+            tools: message.tools.clone(),
+        })?)
+    } else {
+        Ok(serde_json::to_string(&message.content)?)
+    }
+}
+
+/// Decode a transcript `content_json` value, accepting both the legacy array
+/// form and the wrapped `{content, tools}` form.
+pub fn decode_transcript_content(
+    content_json: &str,
+) -> anyhow::Result<(Vec<ChatContent>, Option<Vec<ToolDef>>)> {
+    if let Ok(content) = serde_json::from_str::<Vec<ChatContent>>(content_json) {
+        return Ok((content, None));
+    }
+    let body: TranscriptMessageBody = serde_json::from_str(content_json)?;
+    Ok((body.content, body.tools))
+}
+
+pub fn message_from_transcript(role: String, content_json: &str) -> Option<ChatMessage> {
+    let (content, tools) = decode_transcript_content(content_json).ok()?;
+    Some(ChatMessage {
+        role,
+        content,
+        tools,
+    })
+}
 
 /// Persist any not-yet-written messages of `session` into the transcript DB.
 ///
@@ -59,12 +104,7 @@ fn serialize_transcript_messages(
 ) -> anyhow::Result<Vec<(String, String)>> {
     messages
         .iter()
-        .map(|message| {
-            Ok((
-                message.role.clone(),
-                serde_json::to_string(&message.content)?,
-            ))
-        })
+        .map(|message| Ok((message.role.clone(), encode_transcript_content(message)?)))
         .collect()
 }
 
@@ -95,6 +135,7 @@ mod tests {
         ChatMessage {
             role: role.into(),
             content: vec![ChatContent::Text { text: text.into() }],
+            tools: None,
         }
     }
 
@@ -217,5 +258,28 @@ mod tests {
         persist_session_delta(&db, &mut session).unwrap();
 
         assert_eq!(session.title.as_ref().unwrap().chars().count(), 200);
+    }
+
+    #[test]
+    fn schema_messages_round_trip_tools_in_transcript() {
+        let db = test_db();
+        db.create_session("delta-test", "test-model", ".").unwrap();
+        let mut session = make_session();
+        session.messages.push(text_msg("user", "hello"));
+        session
+            .messages
+            .push(ChatMessage::schema(vec![kkagent_llm::ToolDef {
+                name: "mcp__a".into(),
+                description: "a".into(),
+                input_schema: serde_json::json!({"type": "object"}),
+            }]));
+        persist_session_delta(&db, &mut session).unwrap();
+
+        let records = db.load_messages("delta-test").unwrap();
+        assert_eq!(records.len(), 2);
+        let restored =
+            message_from_transcript(records[1].role.clone(), &records[1].content_json).unwrap();
+        assert!(restored.is_schema_only());
+        assert_eq!(restored.tools.as_ref().unwrap()[0].name, "mcp__a");
     }
 }

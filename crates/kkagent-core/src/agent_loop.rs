@@ -443,51 +443,31 @@ impl AgentLoop {
 
         session.usage.begin_turn();
         session.services.mark_turn_started();
+        let is_turn_boundary = session.is_turn_boundary();
         session.begin_turn();
 
         let all_defs = self.tools.tool_definitions();
 
-        // Build the deferred-tools announcement: list name + description for
-        // deferred tools that haven't been loaded via SelectTools yet.
-        let mut deferred_announcement = String::new();
-        let unloaded_deferred: Vec<_> = all_defs
-            .iter()
-            .filter(|td| {
-                td.disclosure == kkagent_protocol::tools::ToolDisclosure::Deferred
-                    && !session.loaded_deferred_tools.contains(&td.name)
-            })
-            .collect();
-        if !unloaded_deferred.is_empty() {
-            deferred_announcement.push_str(
-                "\n\n# Deferred Tools\n\n\
-                 The following tools are available but not loaded by default to conserve context. \
-                 Call `SelectTools` with their exact names to load their definitions before use:\n",
-            );
-            for td in &unloaded_deferred {
-                deferred_announcement.push_str(&format!("- `{}`: {}\n", td.name, td.description));
-            }
+        // Turn-boundary incremental announcement. System prompt stays byte-stable;
+        // loaded deferred schemas live on history messages (Phase 2).
+        if is_turn_boundary {
+            crate::dynamic_tools::inject_deferred_tools_diff(session, &all_defs);
         }
 
+        // Top-level tools[] is the immutable core set (Inline only). Deferred
+        // schemas are injected as message-level tools after SelectTools.
         let mut tool_defs: Vec<ToolDef> = all_defs
             .iter()
             .filter(|td| {
                 tool_allowed(session, &td.name) && (td.name != "ReadMediaFile" || capability.vision)
             })
-            .filter(|td| {
-                // Omit unloaded deferred tools — only send their schema once loaded.
-                td.disclosure != kkagent_protocol::tools::ToolDisclosure::Deferred
-                    || session.loaded_deferred_tools.contains(&td.name)
-            })
-            .map(|td| ToolDef {
-                name: td.name.clone(),
-                description: td.description.clone(),
-                input_schema: td.parameters.clone(),
-            })
+            .filter(|td| td.disclosure != kkagent_protocol::tools::ToolDisclosure::Deferred)
+            .map(crate::dynamic_tools::to_llm_tool_def)
             .collect();
         if !capability.tools {
             tool_defs.clear();
         }
-        tracing::debug!("Sending {} tools to LLM", tool_defs.len());
+        tracing::debug!("Sending {} core tools to LLM", tool_defs.len());
 
         // Todo reminder injection
         session.turns_since_todo = session.turns_since_todo.saturating_add(1);
@@ -531,11 +511,6 @@ Do not mention this reminder to the user.\n</system-reminder>"
         }
 
         let system_prompt = session.effective_system_prompt();
-        let system_prompt = if deferred_announcement.is_empty() {
-            system_prompt
-        } else {
-            format!("{system_prompt}{deferred_announcement}")
-        };
         // Early-trigger / blocking auto-compact (LLM summary + user retention).
         self.ensure_context_budget(session, &tool_defs, &system_prompt, false)
             .await?;
@@ -1102,6 +1077,7 @@ Do not mention this reminder to the user.\n</system-reminder>"
                 session.messages.push(ChatMessage {
                     role: "assistant".into(),
                     content,
+                    tools: None,
                 });
                 self.persist_step(session);
             }
@@ -1162,6 +1138,7 @@ Do not mention this reminder to the user.\n</system-reminder>"
             session.messages.push(ChatMessage {
                 role: "assistant".into(),
                 content,
+                tools: None,
             });
             self.persist_step(session);
         }
@@ -1178,6 +1155,7 @@ Do not mention this reminder to the user.\n</system-reminder>"
                             content: reason.clone(),
                             is_error: true,
                         }],
+                        tools: None,
                     });
                     self.persist_step(session);
                     let _ = self
@@ -1719,6 +1697,7 @@ Do not mention this reminder to the user.\n</system-reminder>"
             }
 
             let mut tool_results = Vec::new();
+            let mut pending_schema_loads: Vec<String> = Vec::new();
             for (id, name, input, mut output) in resolved {
                 // ExitPlanMode / EnterPlanMode flip plan_mode inside their helpers /
                 // execute paths; mirror to the TUI here.
@@ -1750,16 +1729,30 @@ Do not mention this reminder to the user.\n</system-reminder>"
                         }
                     }
                 }
-                if name == "SelectTools" && !output.is_error {
-                    if let Some(data) = &output.data {
-                        if let Some(arr) = data.get("tools").and_then(|v| v.as_array()) {
-                            for v in arr {
-                                if let Some(tool_name) = v.as_str() {
-                                    session.loaded_deferred_tools.insert(tool_name.to_string());
-                                }
-                            }
-                        }
+                if name == "SelectTools" {
+                    let requested: Vec<String> = output
+                        .data
+                        .as_ref()
+                        .and_then(|data| data.get("tools"))
+                        .and_then(|v| v.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|v| v.as_str().map(String::from))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let applied = crate::dynamic_tools::apply_select_tools(
+                        session,
+                        &self.tools.tool_definitions(),
+                        &requested,
+                    );
+                    output.content = applied.content;
+                    output.is_error = applied.is_error;
+                    let data = output.data.get_or_insert_with(|| serde_json::json!({}));
+                    if let Some(obj) = data.as_object_mut() {
+                        obj.insert("tools".into(), serde_json::json!(applied.loaded));
                     }
+                    pending_schema_loads.extend(applied.loaded);
                 }
                 if (name == "AgentSwarm" || name == "Task") && !output.is_error {
                     if let Some(reminder) =
@@ -1939,7 +1932,15 @@ Do not mention this reminder to the user.\n</system-reminder>"
             session.messages.push(ChatMessage {
                 role: "user".into(),
                 content: result_content,
+                tools: None,
             });
+            if !pending_schema_loads.is_empty() {
+                crate::dynamic_tools::inject_loaded_tool_schemas(
+                    session,
+                    &self.tools.tool_definitions(),
+                    &pending_schema_loads,
+                );
+            }
             self.persist_step(session);
 
             // Steer / delivery messages land after tool results (next model turn).
@@ -2166,9 +2167,9 @@ Do not mention this reminder to the user.\n</system-reminder>"
         // Checkpoints survive compaction: file snapshots stay restorable,
         // transcript truncation for pre-compaction turns no longer applies.
         session.invalidate_undo_message_indices();
-        // Reset deferred tools: compaction rewrites history so previously
-        // loaded schemas are gone. The model must reload via SelectTools.
-        session.loaded_deferred_tools.clear();
+        // History is the ledger: compaction drops announcements/schemas, so
+        // the next turn-boundary diff self-heals without a manual clear().
+        crate::dynamic_tools::sync_deferred_tool_ledgers(session);
         let after = session
             .token_counter
             .request_size(system, tools, &session.build_messages());
@@ -2259,7 +2260,7 @@ Do not mention this reminder to the user.\n</system-reminder>"
             session.transcript_rewrite_required = true;
             // See full compaction: keep file snapshots, drop stale indices.
             session.invalidate_undo_message_indices();
-            session.loaded_deferred_tools.clear();
+            crate::dynamic_tools::sync_deferred_tool_ledgers(session);
             let after =
                 session
                     .token_counter
@@ -3186,6 +3187,7 @@ mod retry_tests {
                 content: vec![ChatContent::Text {
                     text: "work".into(),
                 }],
+                tools: None,
             },
             ChatMessage {
                 role: "assistant".into(),
@@ -3204,6 +3206,7 @@ mod retry_tests {
                         input: serde_json::Value::Null,
                     },
                 ],
+                tools: None,
             },
             ChatMessage {
                 role: "user".into(),
@@ -3219,6 +3222,7 @@ mod retry_tests {
                         is_error: true,
                     },
                 ],
+                tools: None,
             },
         ];
         let error = format!(
@@ -3245,6 +3249,7 @@ mod retry_tests {
                 name: "BadTool".into(),
                 input: serde_json::json!([1, 2]),
             }],
+            tools: None,
         }];
         let error = "status_code=400, Assistant tool call ***.arguments must be a JSON object.";
         let projected = messages.clone();
@@ -3261,6 +3266,7 @@ mod retry_tests {
                 content: vec![ChatContent::Text {
                     text: "work".into(),
                 }],
+                tools: None,
             },
             ChatMessage {
                 role: "assistant".into(),
@@ -3269,6 +3275,7 @@ mod retry_tests {
                     name: "Edit".into(),
                     input: serde_json::json!({"old_string": "x", "new_string": "y"}),
                 }],
+                tools: None,
             },
             ChatMessage {
                 role: "user".into(),
@@ -3277,6 +3284,7 @@ mod retry_tests {
                     content: "edited".into(),
                     is_error: false,
                 }],
+                tools: None,
             },
         ];
         let mut projected = messages.clone();
@@ -3665,6 +3673,7 @@ mod retry_tests {
                 content: vec![ChatContent::Text {
                     text: "work".into(),
                 }],
+                tools: None,
             },
             ChatMessage {
                 role: "assistant".into(),
@@ -3678,6 +3687,7 @@ mod retry_tests {
                         input: serde_json::Value::Null,
                     },
                 ],
+                tools: None,
             },
             ChatMessage {
                 role: "user".into(),
@@ -3686,6 +3696,7 @@ mod retry_tests {
                     content: "invalid arguments".into(),
                     is_error: true,
                 }],
+                tools: None,
             },
         ];
 
@@ -4376,6 +4387,7 @@ mod retry_tests {
                 content: vec![ChatContent::Text {
                     text: "do work".into(),
                 }],
+                tools: None,
             },
             ChatMessage {
                 role: "assistant".into(),
@@ -4384,6 +4396,7 @@ mod retry_tests {
                     name: "BadTool".into(),
                     input: serde_json::Value::Null,
                 }],
+                tools: None,
             },
             ChatMessage {
                 role: "user".into(),
@@ -4392,6 +4405,7 @@ mod retry_tests {
                     content: "invalid arguments".into(),
                     is_error: true,
                 }],
+                tools: None,
             },
         ];
 
