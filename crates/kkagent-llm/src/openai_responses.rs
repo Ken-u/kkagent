@@ -279,6 +279,9 @@ pub async fn openai_responses_stream(
                             .and_then(|d| d.get("cached_tokens"))
                             .and_then(|v| v.as_u64())
                             .unwrap_or(0);
+                        // Responses API: input_tokens already includes cached
+                        // tokens (cached_tokens is a subset).
+                        usage.input_includes_cache = Some(true);
                     }
                     flush_tools(&event_tx, &mut active_calls).await;
                     let _ = event_tx

@@ -158,6 +158,10 @@ pub struct TokenUsage {
     pub output_tokens: u64,
     pub cache_creation_input_tokens: u64,
     pub cache_read_input_tokens: u64,
+    /// Provider semantics of `input_tokens`: `Some(false)` = excludes cache
+    /// buckets (Anthropic), `Some(true)` = includes them (OpenAI / Gemini),
+    /// `None` = unknown yet.
+    pub input_includes_cache: Option<bool>,
 }
 
 #[cfg(test)]

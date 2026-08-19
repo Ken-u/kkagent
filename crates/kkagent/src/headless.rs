@@ -342,6 +342,7 @@ impl<'a> Driver<'a> {
                 output_tokens: 0,
                 cache_creation_input_tokens: 0,
                 cache_read_input_tokens: 0,
+                input_includes_cache: None,
             },
             stdin_done: false,
         }

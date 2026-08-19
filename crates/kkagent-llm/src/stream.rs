@@ -349,6 +349,8 @@ fn parse_sse_event(
                 .get("cache_read_input_tokens")
                 .and_then(|value| value.as_u64())
                 .unwrap_or(usage.cache_read_input_tokens);
+            // Anthropic: input_tokens excludes both cache buckets.
+            usage.input_includes_cache = Some(false);
             None
         }
         "error" => None,
@@ -830,6 +832,9 @@ pub async fn google_stream(
     let mut buffer = String::new();
     let mut byte_buf: Vec<u8> = Vec::new();
     let mut usage = TokenUsage::default();
+    // Gemini reports thinking tokens separately from candidatesTokenCount;
+    // tracked separately so cumulative usageMetadata chunks stay idempotent.
+    let mut gemini_thought_tokens: u64 = 0;
     let mut completed = false;
     let mut first_token = FirstTokenGate::new(request.first_token_timeout, &request.model);
     while let Some(chunk) = first_token.next_chunk(&mut stream).await? {
@@ -858,14 +863,25 @@ pub async fn google_stream(
                     .get("promptTokenCount")
                     .and_then(|token| token.as_u64())
                     .unwrap_or(usage.input_tokens);
-                usage.output_tokens = value
+                let candidates = value
                     .get("candidatesTokenCount")
                     .and_then(|token| token.as_u64())
-                    .unwrap_or(usage.output_tokens);
+                    .unwrap_or_else(|| usage.output_tokens.saturating_sub(gemini_thought_tokens));
+                // Thinking models bill thoughts as output tokens but report
+                // them separately from candidatesTokenCount. usageMetadata may
+                // arrive on multiple chunks with cumulative counts, so track
+                // the bucket separately and sum idempotently.
+                gemini_thought_tokens = value
+                    .get("thoughtsTokenCount")
+                    .and_then(|token| token.as_u64())
+                    .unwrap_or(gemini_thought_tokens);
+                usage.output_tokens = candidates.saturating_add(gemini_thought_tokens);
                 usage.cache_read_input_tokens = value
                     .get("cachedContentTokenCount")
                     .and_then(|token| token.as_u64())
                     .unwrap_or(usage.cache_read_input_tokens);
+                // Gemini: promptTokenCount already includes cached content.
+                usage.input_includes_cache = Some(true);
             }
             let Some(cands) = event.get("candidates").and_then(|c| c.as_array()) else {
                 continue;
@@ -1002,6 +1018,8 @@ fn update_openai_usage(usage: &mut TokenUsage, value: &serde_json::Value) {
         .and_then(|details| details.get("cached_tokens"))
         .and_then(|token| token.as_u64())
         .unwrap_or(usage.cache_read_input_tokens);
+    // OpenAI-compatible: prompt_tokens already includes cached tokens.
+    usage.input_includes_cache = Some(true);
 }
 
 pub(crate) fn reject_video_inputs(request: &LlmRequest, provider: &str) -> anyhow::Result<()> {
@@ -1345,6 +1363,55 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(rx.recv().await, Some(StreamEvent::TextDelta(text)) if text == "hello"));
+    }
+
+    /// Thinking models report thoughts separately from candidatesTokenCount;
+    /// output usage must include both. Cumulative usageMetadata chunks must
+    /// stay idempotent (no double counting of the thoughts bucket).
+    #[tokio::test]
+    async fn google_usage_includes_thought_tokens() {
+        let sse = concat!(
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hi\"}]}}],\"usageMetadata\":{\"promptTokenCount\":10,\"candidatesTokenCount\":3,\"thoughtsTokenCount\":7}}\n",
+            "data: {\"candidates\":[{\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":10,\"candidatesTokenCount\":3,\"thoughtsTokenCount\":7,\"cachedContentTokenCount\":6}}\n"
+        );
+        let (base_url, _captured) = serve_once("200 OK", "text/event-stream", sse).await;
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut request = request();
+        request.first_token_timeout = Some(std::time::Duration::from_secs(5));
+        google_stream(&Client::new(), &base_url, "key", request, tx)
+            .await
+            .unwrap();
+        let usage = loop {
+            match rx.recv().await {
+                Some(StreamEvent::MessageEnd { usage, .. }) => break usage,
+                Some(_) => continue,
+                None => panic!("stream ended without MessageEnd"),
+            }
+        };
+        assert_eq!(usage.input_tokens, 10);
+        assert_eq!(usage.output_tokens, 10); // 3 candidates + 7 thoughts
+        assert_eq!(usage.cache_read_input_tokens, 6);
+    }
+
+    #[tokio::test]
+    async fn google_usage_without_thought_tokens() {
+        let sse =
+            "data: {\"candidates\":[{\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":5,\"candidatesTokenCount\":2}}\n";
+        let (base_url, _captured) = serve_once("200 OK", "text/event-stream", sse).await;
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut request = request();
+        request.first_token_timeout = Some(std::time::Duration::from_secs(5));
+        google_stream(&Client::new(), &base_url, "key", request, tx)
+            .await
+            .unwrap();
+        let usage = loop {
+            match rx.recv().await {
+                Some(StreamEvent::MessageEnd { usage, .. }) => break usage,
+                Some(_) => continue,
+                None => panic!("stream ended without MessageEnd"),
+            }
+        };
+        assert_eq!(usage.output_tokens, 2);
     }
 
     /// Regression: Google may send `{"text": ""}` parts during thinking;

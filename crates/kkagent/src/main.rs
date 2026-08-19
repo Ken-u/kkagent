@@ -5070,6 +5070,7 @@ fn http_session_json(session: &Session) -> serde_json::Value {
             "output_tokens": usage.output_tokens,
             "cache_creation_tokens": usage.cache_creation_input_tokens,
             "cache_read_tokens": usage.cache_read_input_tokens,
+            "input_includes_cache": session.usage.input_includes_cache(),
             "steps": usage.steps,
             "turns": usage.turns,
             "context": session.usage.last_context,

@@ -285,6 +285,10 @@ pub struct SessionUsageTotals {
     pub cache_read_tokens: u64,
     pub steps: u64,
     pub turns: u64,
+    /// Provider semantics of `input_tokens`: `Some(false)` = Anthropic
+    /// (excludes cache buckets), `Some(true)` = OpenAI/Gemini (includes them),
+    /// `None` = unknown — use heuristic (`cache_creation > 0` → add buckets).
+    pub input_includes_cache: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -5594,7 +5598,7 @@ impl TuiApp {
             ListPickerItem {
                 id: "total".into(),
                 label: "Total tokens".into(),
-                detail: fmt_thousands(u.input_tokens.saturating_add(u.output_tokens)),
+                detail: fmt_thousands(effective_total_input(u).saturating_add(u.output_tokens)),
             },
             ListPickerItem {
                 id: "cache_c".into(),
@@ -7796,6 +7800,7 @@ impl TuiApp {
                     .unwrap_or(0),
                 steps: usage.get("steps").and_then(|v| v.as_u64()).unwrap_or(0),
                 turns: usage.get("turns").and_then(|v| v.as_u64()).unwrap_or(0),
+                input_includes_cache: usage.get("input_includes_cache").and_then(|v| v.as_bool()),
             };
             if let Some(ctx) = usage.get("context") {
                 if let Ok(info) =
@@ -7821,6 +7826,11 @@ impl TuiApp {
                 output_tokens: step_field("output_tokens", output),
                 cache_creation_input_tokens: step_field("cache_creation_tokens", 0),
                 cache_read_input_tokens: step_field("cache_read_tokens", 0),
+                // Server JSON may carry the explicit provider flag; otherwise
+                // `total_input_tokens` falls back to its heuristic.
+                input_includes_cache: step
+                    .and_then(|u| u.get("input_includes_cache"))
+                    .and_then(|v| v.as_bool()),
             };
             self.state.approx_tokens = step_usage.context_size();
             self.state.status_bar.cache_hit = step_usage.cache_hit_ratio();
@@ -11150,6 +11160,29 @@ fn model_pricing(config: &kkagent_config::AppConfig, alias: &str) -> (f64, f64, 
     (0.50, 2.00, 0.50, 0.05, true)
 }
 
+/// Provider-normalized effective input for session totals. With explicit
+/// flag: Anthropic adds both cache buckets, OpenAI uses `input_tokens` alone
+/// (cached subset). Without flag (legacy JSON): heuristic on cache_creation.
+fn effective_total_input(u: &SessionUsageTotals) -> u64 {
+    let includes = u
+        .input_includes_cache
+        .unwrap_or(u.cache_creation_tokens == 0);
+    if includes {
+        u.input_tokens
+    } else {
+        u.input_tokens
+            .saturating_add(u.cache_creation_tokens)
+            .saturating_add(u.cache_read_tokens)
+    }
+}
+
+/// Session totals carry provider-native semantics:
+/// - Anthropic: `input_tokens` excludes both cache buckets.
+/// - OpenAI: `input_tokens` already includes cached tokens.
+///
+/// Normalize to disjoint billable buckets before pricing: for OpenAI-style
+/// totals, cached tokens are a subset of `input_tokens`, so bill only the
+/// remainder at the full input price.
 fn estimate_usd(
     u: &SessionUsageTotals,
     in_price: f64,
@@ -11157,7 +11190,8 @@ fn estimate_usd(
     cache_c: f64,
     cache_r: f64,
 ) -> f64 {
-    (u.input_tokens as f64) * in_price / 1_000_000.0
+    let uncached_input = effective_total_input(u).saturating_sub(u.cache_read_tokens);
+    (uncached_input as f64) * in_price / 1_000_000.0
         + (u.output_tokens as f64) * out_price / 1_000_000.0
         + (u.cache_creation_tokens as f64) * cache_c / 1_000_000.0
         + (u.cache_read_tokens as f64) * cache_r / 1_000_000.0
@@ -11919,6 +11953,77 @@ fn history_turn_summary(text: &str, max_chars: usize) -> String {
 
 fn model_matches_global_fallback(config: &AppConfig, model: &str) -> bool {
     config.fallback_model.as_deref() == Some(model)
+}
+
+#[cfg(test)]
+mod usage_cost_tests {
+    use super::*;
+
+    /// OpenAI-style totals: cached tokens are a subset of input_tokens, so
+    /// they must be billed once (cache price), not twice.
+    #[test]
+    fn estimate_usd_openai_style_no_double_billing() {
+        let u = SessionUsageTotals {
+            input_tokens: 100_000,
+            output_tokens: 50_000,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 95_000,
+            steps: 1,
+            turns: 1,
+            input_includes_cache: Some(true),
+        };
+        // 5k full input + 95k cached + 50k output.
+        let usd = estimate_usd(&u, 3.0, 15.0, 3.75, 0.3);
+        let expected = (5_000.0 * 3.0 + 95_000.0 * 0.3 + 50_000.0 * 15.0) / 1_000_000.0;
+        assert!((usd - expected).abs() < 1e-9);
+    }
+
+    /// Anthropic-style totals: input excludes cache buckets; bill each of the
+    /// three buckets at its own price.
+    #[test]
+    fn estimate_usd_anthropic_style_buckets_disjoint() {
+        let u = SessionUsageTotals {
+            input_tokens: 5_000,
+            output_tokens: 50_000,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 95_000,
+            steps: 1,
+            turns: 1,
+            input_includes_cache: Some(false),
+        };
+        let usd = estimate_usd(&u, 3.0, 15.0, 3.75, 0.3);
+        let expected = (5_000.0 * 3.0 + 95_000.0 * 0.3 + 50_000.0 * 15.0) / 1_000_000.0;
+        assert!((usd - expected).abs() < 1e-9);
+        // Effective input adds the cache bucket.
+        assert_eq!(effective_total_input(&u), 100_000);
+    }
+
+    /// Legacy totals without the explicit flag fall back to the
+    /// cache_creation heuristic (Anthropic when any creation is reported).
+    #[test]
+    fn effective_total_input_legacy_heuristic() {
+        let legacy_anthropic = SessionUsageTotals {
+            input_tokens: 5_000,
+            output_tokens: 1_000,
+            cache_creation_tokens: 3_000,
+            cache_read_tokens: 95_000,
+            steps: 1,
+            turns: 1,
+            input_includes_cache: None,
+        };
+        assert_eq!(effective_total_input(&legacy_anthropic), 103_000);
+
+        let legacy_openai = SessionUsageTotals {
+            input_tokens: 100_000,
+            output_tokens: 1_000,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 95_000,
+            steps: 1,
+            turns: 1,
+            input_includes_cache: None,
+        };
+        assert_eq!(effective_total_input(&legacy_openai), 100_000);
+    }
 }
 
 #[cfg(test)]

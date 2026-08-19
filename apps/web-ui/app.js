@@ -1076,6 +1076,10 @@ function applyEventToView(sessionId, event) {
       (state.usage.cache_creation_tokens || 0) + (u.cache_creation_input_tokens || 0);
     state.usage.cache_read_tokens =
       (state.usage.cache_read_tokens || 0) + (u.cache_read_input_tokens || 0);
+    // Provider semantics of the accumulated input tokens; latest step wins.
+    if (u.input_includes_cache !== undefined && u.input_includes_cache !== null) {
+      state.usage.input_includes_cache = u.input_includes_cache;
+    }
     if (event.steps !== undefined) state.usage.steps = event.steps;
     if (event.turns !== undefined) state.usage.turns = event.turns;
     if (event.context) state.usage.context = event.context;
@@ -1488,7 +1492,15 @@ function formatUsage(usage) {
   const cacheR = usage.cache_read_tokens ?? 0;
   const steps = usage.steps ?? 0;
   const turns = usage.turns ?? 0;
-  const total = inTok + outTok;
+  // Provider-native buckets: Anthropic input excludes cache, OpenAI/Gemini
+  // input already includes it. Normalize so "total" is comparable across
+  // providers (mirrors Rust TokenUsage::total_input_tokens semantics).
+  const includesCache =
+    usage.input_includes_cache !== undefined && usage.input_includes_cache !== null
+      ? usage.input_includes_cache
+      : cacheC > 0; // legacy heuristic: Anthropic always reports cache_creation
+  const effectiveInput = includesCache ? inTok : inTok + cacheC + cacheR;
+  const total = effectiveInput + outTok;
   const hit = cacheHitRatio(inTok, cacheC, cacheR);
 
   const lines = [
@@ -2462,6 +2474,10 @@ function handleAgentEvent(event) {
       (state.usage.cache_creation_tokens || 0) + (u.cache_creation_input_tokens || 0);
     state.usage.cache_read_tokens =
       (state.usage.cache_read_tokens || 0) + (u.cache_read_input_tokens || 0);
+    // Provider semantics of the accumulated input tokens; latest step wins.
+    if (u.input_includes_cache !== undefined && u.input_includes_cache !== null) {
+      state.usage.input_includes_cache = u.input_includes_cache;
+    }
     if (event.steps !== undefined) state.usage.steps = event.steps;
     if (event.turns !== undefined) state.usage.turns = event.turns;
     if (event.context) state.usage.context = event.context;

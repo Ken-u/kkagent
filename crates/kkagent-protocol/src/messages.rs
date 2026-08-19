@@ -55,22 +55,33 @@ pub struct TokenUsage {
     pub cache_creation_input_tokens: u64,
     #[serde(default)]
     pub cache_read_input_tokens: u64,
+    /// Provider semantics of `input_tokens`:
+    /// - `Some(false)` (Anthropic): excludes both cache buckets.
+    /// - `Some(true)` (OpenAI / Gemini): already includes cached tokens
+    ///   (and cache-creation writes, which are a subset).
+    /// - `None`: unknown (deserialized legacy data) — fall back to the
+    ///   `cache_creation > 0` heuristic.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_includes_cache: Option<bool>,
 }
 
 impl TokenUsage {
-    /// Total input (prompt) tokens across provider semantics:
-    /// - Anthropic: `input_tokens` excludes cache, so add both cache buckets.
-    /// - OpenAI: `input_tokens` already includes cached tokens (and
-    ///   `cache_read_input_tokens` is a subset of it), so use it alone.
+    /// Total input (prompt) tokens across provider semantics.
     ///
-    /// This is the right numerator for "current context size" indicators.
+    /// When `input_includes_cache` is unknown, fall back to the heuristic:
+    /// Anthropic reports `cache_creation_input_tokens > 0` on cache writes,
+    /// OpenAI-compatible APIs never populate that field.
     pub fn total_input_tokens(&self) -> u64 {
-        if self.cache_creation_input_tokens > 0 {
+        let includes = match self.input_includes_cache {
+            Some(flag) => flag,
+            None => self.cache_creation_input_tokens == 0,
+        };
+        if includes {
+            self.input_tokens
+        } else {
             self.input_tokens
                 .saturating_add(self.cache_creation_input_tokens)
                 .saturating_add(self.cache_read_input_tokens)
-        } else {
-            self.input_tokens
         }
     }
 
@@ -149,6 +160,7 @@ mod tests {
             output_tokens: 1_000,
             cache_creation_input_tokens: 3_000,
             cache_read_input_tokens: 95_000,
+            input_includes_cache: Some(false),
         };
         assert_eq!(u.total_input_tokens(), 100_000);
         assert_eq!(u.context_size(), 101_000);
@@ -163,8 +175,32 @@ mod tests {
             output_tokens: 1_000,
             cache_creation_input_tokens: 0,
             cache_read_input_tokens: 95_000,
+            input_includes_cache: Some(true),
         };
         assert_eq!(u.total_input_tokens(), 100_000);
         assert_eq!(u.context_size(), 101_000);
+    }
+
+    #[test]
+    fn total_input_tokens_unknown_falls_back_to_heuristic() {
+        // Legacy data without the explicit flag: cache_creation > 0 means
+        // Anthropic-style (add buckets)...
+        let anthropic_like = TokenUsage {
+            input_tokens: 2_000,
+            output_tokens: 1_000,
+            cache_creation_input_tokens: 3_000,
+            cache_read_input_tokens: 95_000,
+            input_includes_cache: None,
+        };
+        assert_eq!(anthropic_like.total_input_tokens(), 100_000);
+        // ...otherwise treat input as all-inclusive (OpenAI-style).
+        let openai_like = TokenUsage {
+            input_tokens: 100_000,
+            output_tokens: 1_000,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 95_000,
+            input_includes_cache: None,
+        };
+        assert_eq!(openai_like.total_input_tokens(), 100_000);
     }
 }

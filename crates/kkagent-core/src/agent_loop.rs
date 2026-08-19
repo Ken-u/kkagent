@@ -763,17 +763,18 @@ Do not mention this reminder to the user.\n</system-reminder>"
                                 usage.output_tokens,
                                 stop_reason.as_deref().unwrap_or("unknown")
                             );
-                            session
-                                .token_counter
-                                .record_measured(usage.input_tokens, usage.output_tokens);
-                            // Successful generate — overflow compact loop can reset.
-                            session.consecutive_overflow_compacts = 0;
                             let tu = kkagent_protocol::TokenUsage {
                                 input_tokens: usage.input_tokens,
                                 output_tokens: usage.output_tokens,
                                 cache_creation_input_tokens: usage.cache_creation_input_tokens,
                                 cache_read_input_tokens: usage.cache_read_input_tokens,
+                                input_includes_cache: usage.input_includes_cache,
                             };
+                            session
+                                .token_counter
+                                .record_measured(tu.total_input_tokens(), tu.output_tokens);
+                            // Successful generate — overflow compact loop can reset.
+                            session.consecutive_overflow_compacts = 0;
                             session.usage.record(&tu);
                             let snap = session.usage.snapshot();
                             let _ = self
@@ -2072,13 +2073,10 @@ Do not mention this reminder to the user.\n</system-reminder>"
         let session_id = session.id.clone();
         if record_goal {
             if let Some(goal_mgr) = &self.goal_mgr {
-                let tokens = session.token_counter.session_usage().0
-                    + session.token_counter.session_usage().1;
-                // Prefer last measured step tokens for this turn accounting.
-                let step_tokens = session.token_counter.latest_measured();
-                goal_mgr
-                    .record_turn(if step_tokens > 0 { step_tokens } else { tokens })
-                    .await;
+                // Per-turn delta of provider-normalized tokens so multi-step
+                // turns count every step (effective input + output), not just
+                // the last measured one.
+                goal_mgr.record_turn(session.usage.turn_tokens()).await;
                 if let Some(goal) = goal_mgr.get_goal().await {
                     if goal.is_budget_exhausted()
                         && goal.status == kkagent_protocol::goal::GoalStatus::Active

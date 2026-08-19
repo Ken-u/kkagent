@@ -34,6 +34,14 @@ pub struct UsageService {
     pub last_step: UsageSnapshot,
     /// Last estimated context breakdown attached by the agent loop.
     pub last_context: Option<kkagent_protocol::ContextBreakdownInfo>,
+    /// Cumulative provider-normalized tokens (effective input + output).
+    total_consumed: u64,
+    /// `total_consumed` baseline captured at the current turn start; goal
+    /// budgeting records the per-turn delta of this counter.
+    turn_start_consumed: u64,
+    /// Provider semantics of the recorded `input_tokens` (latest step wins).
+    /// `None` until the first step with an explicit flag arrives.
+    input_includes_cache: Option<bool>,
 }
 
 impl UsageService {
@@ -64,10 +72,31 @@ impl UsageService {
             .cache_read_input_tokens
             .saturating_add(usage.cache_read_input_tokens);
         self.session.steps = self.session.steps.saturating_add(1);
+        if usage.input_includes_cache.is_some() {
+            self.input_includes_cache = usage.input_includes_cache;
+        }
+        self.total_consumed = self.total_consumed.saturating_add(
+            usage
+                .total_input_tokens()
+                .saturating_add(usage.output_tokens),
+        );
+    }
+
+    /// Provider semantics of the recorded input totals; `None` = unknown
+    /// (legacy data), consumers fall back to the heuristic.
+    pub fn input_includes_cache(&self) -> Option<bool> {
+        self.input_includes_cache
     }
 
     pub fn begin_turn(&mut self) {
         self.session.turns = self.session.turns.saturating_add(1);
+        self.turn_start_consumed = self.total_consumed;
+    }
+
+    /// Provider-normalized tokens consumed by the current turn so far
+    /// (effective input + output across all steps of the turn).
+    pub fn turn_tokens(&self) -> u64 {
+        self.total_consumed.saturating_sub(self.turn_start_consumed)
     }
 
     pub fn set_context(&mut self, ctx: kkagent_protocol::ContextBreakdownInfo) {
@@ -91,6 +120,7 @@ mod tests {
             output_tokens: 5,
             cache_creation_input_tokens: 0,
             cache_read_input_tokens: 4,
+            input_includes_cache: Some(true),
         });
         assert_eq!(u.session.total_tokens(), 15);
         assert!((u.session.cache_hit_ratio().unwrap() - 0.4).abs() < 0.01);
@@ -123,5 +153,56 @@ mod tests {
         assert!(cache_hit_ratio(0, 0, 0).is_none());
         // Read > 0 but total 0 (creation-only edge) → None to avoid div by zero.
         assert!(cache_hit_ratio(0, 0, 10).is_none());
+    }
+
+    #[test]
+    fn turn_tokens_across_multi_step_turn() {
+        let mut u = UsageService::new();
+        u.begin_turn();
+        // Anthropic semantics: input excludes cache buckets.
+        u.record(&TokenUsage {
+            input_tokens: 100,
+            output_tokens: 50,
+            cache_creation_input_tokens: 400,
+            cache_read_input_tokens: 0,
+            input_includes_cache: Some(false),
+        });
+        u.record(&TokenUsage {
+            input_tokens: 100,
+            output_tokens: 30,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 500,
+            input_includes_cache: Some(false),
+        });
+        // Effective input: (100+400) + (100+500) = 1100, output: 80.
+        assert_eq!(u.turn_tokens(), 1180);
+
+        // Next turn starts a fresh baseline.
+        u.begin_turn();
+        assert_eq!(u.turn_tokens(), 0);
+        u.record(&TokenUsage {
+            input_tokens: 200,
+            output_tokens: 10,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            input_includes_cache: None,
+        });
+        assert_eq!(u.turn_tokens(), 210);
+    }
+
+    #[test]
+    fn turn_tokens_openai_style_usage() {
+        let mut u = UsageService::new();
+        u.begin_turn();
+        // OpenAI semantics: input_tokens already includes cached tokens;
+        // effective input stays 1000 (no double counting).
+        u.record(&TokenUsage {
+            input_tokens: 1000,
+            output_tokens: 200,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 400,
+            input_includes_cache: Some(true),
+        });
+        assert_eq!(u.turn_tokens(), 1200);
     }
 }
