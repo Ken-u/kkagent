@@ -1,3 +1,7 @@
+// Keep this binary's tests (Session::new et al.) out of the real
+// ~/.kkagent home.
+kkagent_core::install_test_home!();
+
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::collections::HashMap;

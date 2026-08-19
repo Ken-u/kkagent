@@ -11,6 +11,12 @@ cargo test --workspace --all-targets
 
 对应 Make target 为 `make build`、`make fmt`、`make lint` 和 `make test`。修改局部 crate 时可先执行 `cargo test -p kkagent-tools`，最终提交前仍应跑 workspace 全量检查。测试默认不应依赖外网或真实密钥。
 
+### 测试与真实数据隔离
+
+`Session::new`（`Startup` source）会注册进真实的会话存储目录。为避免 `cargo test` 污染 `~/.kkagent`，`kkagent-core` 与 `kkagent` 的测试二进制在启动时通过 `kkagent_core::install_test_home!()`（见 `crates/kkagent-core/src/test_isolation.rs`）把 kkagent home 重定向到 OS 临时目录下的 `kkagent-test-home-<pid>/`。新增会创建 Session 的测试 crate 时，在 lib/main 顶部同样调用该宏。`test_isolation::tests::test_home_redirect_is_installed` 会在隔离失效时立刻失败。
+
+部署场景也可用 `KKAGENT_HOME` 环境变量整体迁移 kkagent home（配置、sessions、skills、transcript DB）。
+
 ## 实网测试
 
 当前目录的 `.env` 是旧格式本机测试配置，内容是 TOML，因此不会被当成 dotenv 变量加载；可显式作为配置使用：

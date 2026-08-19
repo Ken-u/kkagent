@@ -26,6 +26,9 @@ pub mod session;
 pub mod subagent_runtime;
 pub mod swarm;
 pub mod system_reminder;
+/// Test isolation helpers — redirects the kkagent home during `cargo test`.
+/// No-op outside test binaries that opt in via `install_test_home!`.
+pub mod test_isolation;
 pub mod token_counting;
 pub mod tool_dedupe;
 pub mod tool_policy;
@@ -90,3 +93,8 @@ pub use workspace_registry::{
     list_active_peers_default, resolve_workspace_identity, SessionRegistration,
     WorkspaceRegistryLease,
 };
+
+// Keep this crate's own tests (Session::new et al.) out of the real
+// ~/.kkagent home. Must stay at the end of the file: the macro expands to an
+// item that clippy requires before any test module.
+crate::install_test_home!();

@@ -1,10 +1,97 @@
 use chrono::Utc;
 use rusqlite::{params, Connection};
 use std::path::Path;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 /// Shared SQLite handle used by transcript / durable HTTP / subagent stores.
 pub type SharedSqlite = Arc<Mutex<Connection>>;
+
+/// Serializes `migrate()` across connections within this process. Multiple
+/// connections running `CREATE ... IF NOT EXISTS` / `ALTER TABLE`
+/// concurrently on the same SQLite file can hit `SQLITE_SCHEMA` ("The
+/// database schema changed") when one connection's DDL invalidates another's
+/// prepared statement mid-flight.
+static MIGRATE_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+
+/// Advisory cross-process lock guarding SQLite first-time schema creation.
+/// Held for the duration of `migrate()` so two kkagent processes racing on a
+/// fresh `transcripts.db` cannot interleave DDL.
+struct MigrateFileLock {
+    file: std::fs::File,
+}
+
+impl MigrateFileLock {
+    #[cfg(unix)]
+    fn acquire(path: &Path) -> anyhow::Result<Self> {
+        use std::os::unix::io::AsRawFd;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(path)?;
+        let fd = file.as_raw_fd();
+        // SAFETY: flock(2) on a valid fd; retried on EINTR.
+        let rc = unsafe { libc::flock(fd, libc::LOCK_EX) };
+        if rc != 0 {
+            return Err(anyhow::anyhow!("lock {}: {rc}", path.display(),));
+        }
+        Ok(Self { file })
+    }
+
+    #[cfg(windows)]
+    fn acquire(path: &Path) -> anyhow::Result<Self> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::HANDLE;
+        use windows_sys::Win32::Storage::FileSystem::{
+            LockFileEx, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY,
+        };
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(path)?;
+        let handle = file.as_raw_handle() as HANDLE;
+        // SAFETY: LockFileEx on a valid file handle; blocks until exclusive.
+        let mut overlapped: windows_sys::Win32::System::IO::OVERLAPPED =
+            unsafe { std::mem::zeroed() };
+        let ok = unsafe {
+            LockFileEx(
+                handle,
+                LOCKFILE_EXCLUSIVE_LOCK,
+                0,
+                u32::MAX,
+                u32::MAX,
+                &mut overlapped,
+            )
+        };
+        if ok == 0 {
+            return Err(anyhow::anyhow!("lock {}: failed", path.display()));
+        }
+        Ok(Self { file })
+    }
+}
+
+impl Drop for MigrateFileLock {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            // SAFETY: unlock on the same fd we locked; best-effort.
+            unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle;
+            use windows_sys::Win32::Foundation::HANDLE;
+            use windows_sys::Win32::Storage::FileSystem::UnlockFileEx;
+            let handle = self.file.as_raw_handle() as HANDLE;
+            let mut overlapped: windows_sys::Win32::System::IO::OVERLAPPED =
+                unsafe { std::mem::zeroed() };
+            // SAFETY: mirrors the LockFileEx range (0..u32::MAX).
+            unsafe { UnlockFileEx(handle, 0, u32::MAX, u32::MAX, &mut overlapped) };
+        }
+    }
+}
 
 /// Cheap to clone: the SQLite connection is behind an `Arc`.
 #[derive(Clone)]
@@ -154,6 +241,17 @@ impl TranscriptDb {
         Ok(db)
     }
 
+    /// Absolute path of the main database file backing this connection, if
+    /// it is a real file (not `:memory:`).
+    fn database_path(&self) -> anyhow::Result<Option<std::path::PathBuf>> {
+        let conn = self.lock()?;
+        let path: String = conn.query_row("PRAGMA database_list", [], |row| row.get(2))?;
+        if path.is_empty() || path == ":memory:" {
+            return Ok(None);
+        }
+        Ok(Some(std::path::PathBuf::from(path)))
+    }
+
     pub fn open(db_path: &Path) -> anyhow::Result<Self> {
         Self::from_shared(open_shared_sqlite(db_path)?)
     }
@@ -169,6 +267,21 @@ impl TranscriptDb {
     }
 
     fn migrate(&self) -> anyhow::Result<()> {
+        // Serialize schema creation both in-process (global mutex) and
+        // cross-process (advisory file lock next to the db). Without this,
+        // concurrent first opens of the same database race their DDL and can
+        // fail with SQLITE_SCHEMA ("The database schema changed").
+        let _inproc = MIGRATE_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _file_lock = match self.database_path()? {
+            Some(path) => {
+                let lock_path = path.with_extension("mlock");
+                Some(MigrateFileLock::acquire(&lock_path)?)
+            }
+            None => None, // :memory: connections never race another process
+        };
         let conn = self.lock()?;
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
@@ -989,6 +1102,36 @@ mod tests {
 
     fn test_db() -> TranscriptDb {
         TranscriptDb::open(&PathBuf::from(":memory:")).unwrap()
+    }
+
+    /// Concurrent first opens of the same database file used to race their
+    /// DDL and fail with SQLITE_SCHEMA ("The database schema changed") —
+    /// observed as flaky `messages_fts` vtable creation when tests started
+    /// sharing a fresh per-process home. The migrate mutex + advisory file
+    /// lock serialize schema creation.
+    #[test]
+    fn concurrent_first_open_serializes_schema_creation() {
+        let dir = std::env::temp_dir().join(format!("kkagent-db-race-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("transcripts.db");
+
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let path = db_path.clone();
+            handles.push(std::thread::spawn(move || {
+                TranscriptDb::open(&path).map(|db| {
+                    // Touch FTS right after open: the racing failure mode.
+                    db.search_messages("needle", 1, None, None, None, None)
+                })
+            }));
+        }
+        for handle in handles {
+            let result = handle.join().expect("thread panicked");
+            // FTS query result may legitimately be empty; we only care that
+            // open + migrate + search did not error under concurrency.
+            result.expect("concurrent open/migrate failed").unwrap();
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

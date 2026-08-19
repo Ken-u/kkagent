@@ -1,10 +1,39 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use crate::AppConfig;
 
+/// Process-global redirect of the kkagent home directory. Test-only escape
+/// hatch: once set it cannot be reset, so a stray call in production code
+/// would be obvious (and `#[doc(hidden)]` keeps it out of the public surface).
+static CONFIG_DIR_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
+
+/// Redirect the default config/session home for the current process.
+/// Used by test harnesses to keep `cargo test` from touching the real
+/// `~/.kkagent` store. First call wins; subsequent calls are ignored.
+#[doc(hidden)]
+pub fn set_default_config_dir_override(dir: PathBuf) {
+    let _ = CONFIG_DIR_OVERRIDE.set(dir);
+}
+
+/// Resolve the kkagent home directory.
+///
+/// Precedence: in-process override (tests) → `KKAGENT_HOME` env var →
+/// `~/.kkagent`. `KKAGENT_HOME` makes the whole home (config sidecars,
+/// sessions store, skills, transcript DB) relocatable — useful for portable
+/// installs and CI.
 pub fn default_config_dir() -> PathBuf {
+    if let Some(dir) = CONFIG_DIR_OVERRIDE.get() {
+        return dir.clone();
+    }
+    if let Some(home) = std::env::var_os("KKAGENT_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+    {
+        return home;
+    }
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".kkagent")
