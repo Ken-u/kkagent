@@ -269,23 +269,12 @@ pub fn register_subagent_tools(
 ) {
     use std::sync::Arc;
 
-    registry.register(Arc::new(builtin::TaskTool::new(
-        manager.clone(),
-        launch.clone(),
-    )));
     registry.register(Arc::new(builtin::AgentTool::with_allowed_subagents(
-        manager.clone(),
-        launch.clone(),
-        allowed_subagents.clone(),
-    )));
-    registry.register(Arc::new(builtin::AgentSwarmTool::with_allowed_subagents(
         manager.clone(),
         launch,
         allowed_subagents,
     )));
-    registry.register(Arc::new(builtin::TaskOutputTool::new(manager.clone())));
-    registry.register(Arc::new(builtin::TaskListTool::new(manager.clone())));
-    registry.register(Arc::new(builtin::TaskStopTool::new(manager)));
+    registry.register(Arc::new(builtin::TaskOutputTool::new(manager)));
 }
 
 /// Backward-compatible main-agent core registration.
@@ -303,35 +292,23 @@ impl ProfileToolSet {
         "Grep",
         "Glob",
         "Bash",
-        "TaskList",
         "TaskOutput",
-        "TaskStop",
-        "CronCreate",
-        "CronList",
-        "CronDelete",
+        "Cron",
         "ReadMediaFile",
         "TodoList",
         "Skill",
-        "WebSearch",
+        "Web",
         "Agent",
-        "AgentSwarm",
-        "FetchURL",
         "AskUserQuestion",
         "EnterPlanMode",
         "ExitPlanMode",
-        "CreateGoal",
-        "GetGoal",
-        "SetGoalBudget",
-        "UpdateGoal",
+        "Goal",
     ];
 
     pub const CODER: &'static [&'static str] = &[
         "Agent",
-        "AgentSwarm",
         "Bash",
-        "CronCreate",
-        "CronDelete",
-        "CronList",
+        "Cron",
         "Edit",
         "EnterPlanMode",
         "ExitPlanMode",
@@ -340,24 +317,14 @@ impl ProfileToolSet {
         "Read",
         "ReadMediaFile",
         "Skill",
-        "TaskList",
         "TaskOutput",
-        "TaskStop",
         "TodoList",
-        "WebSearch",
-        "FetchURL",
+        "Web",
         "AskUserQuestion",
     ];
 
-    pub const EXPLORE: &'static [&'static str] = &[
-        "Bash",
-        "Read",
-        "ReadMediaFile",
-        "Glob",
-        "Grep",
-        "WebSearch",
-        "FetchURL",
-    ];
+    pub const EXPLORE: &'static [&'static str] =
+        &["Bash", "Read", "ReadMediaFile", "Glob", "Grep", "Web"];
 
     pub fn for_profile(profile: &str) -> &'static [&'static str] {
         match profile.trim().to_ascii_lowercase().as_str() {
@@ -410,7 +377,6 @@ mod profile_tool_tests {
         assert!(!names.contains(&"Write"));
         assert!(!names.contains(&"Edit"));
         assert!(!names.contains(&"Agent"));
-        assert!(!names.contains(&"AgentSwarm"));
     }
 
     #[test]
@@ -421,9 +387,7 @@ mod profile_tool_tests {
         assert!(names.contains(&"Read"));
         assert!(names.contains(&"Edit"));
         assert!(names.contains(&"Agent"));
-        assert!(names.contains(&"AgentSwarm"));
         assert!(!names.contains(&"Write"));
-        assert!(!names.contains(&"Task"));
     }
 }
 
@@ -440,24 +404,19 @@ mod disclosure_tests {
         let launch: builtin::task::SubagentLaunchFn = Arc::new(|_cfg| {});
         register_subagent_tools(&mut registry, mgr, launch, None);
         let goal = Arc::new(kkagent_protocol::goal::GoalManager::new());
-        registry.register(Arc::new(builtin::CreateGoalTool::new(goal.clone())));
-        registry.register(Arc::new(builtin::GetGoalTool::new(goal.clone())));
-        registry.register(Arc::new(builtin::UpdateGoalTool::new(goal.clone())));
-        registry.register(Arc::new(builtin::SetGoalBudgetTool::new(goal)));
+        registry.register(Arc::new(builtin::GoalTool::new(goal)));
         registry.register(Arc::new(builtin::SkillTool::new(Arc::new(
             builtin::skill::SkillCatalog::new(),
         ))));
-        registry.register(Arc::new(builtin::FetchUrlTool::new(Arc::new(
-            web_providers::WebServicesConfig {
-                search: None,
-                fetch: web_providers::WebFetchServiceConfig::default(),
-                migration_hint: None,
-            },
-        ))));
+        if let Some(web) = builtin::WebTool::try_new(Arc::new(web_providers::WebServicesConfig {
+            search: None,
+            fetch: web_providers::WebFetchServiceConfig::default(),
+            migration_hint: None,
+        })) {
+            registry.register(Arc::new(web));
+        }
         let cron = Arc::new(builtin::cron::CronManager::default());
-        registry.register(Arc::new(builtin::CronCreateTool::new(cron.clone())));
-        registry.register(Arc::new(builtin::CronListTool::new(cron.clone())));
-        registry.register(Arc::new(builtin::CronDeleteTool::new(cron)));
+        registry.register(Arc::new(builtin::CronTool::new(cron)));
         registry
     }
 
@@ -473,23 +432,14 @@ mod disclosure_tests {
             .collect();
         deferred.sort();
 
-        // WebSearch is registered only when [services.web_search] is configured;
-        // it is deferred too (asserted in its own impl).
+        // Web is registered unconditionally (fetch needs no provider config).
         let mut expected = [
             "Agent",
-            "AgentSwarm",
-            "TaskList",
-            "TaskStop",
             "EnterPlanMode",
-            "FetchURL",
+            "Web",
             "ReadMediaFile",
-            "CreateGoal",
-            "GetGoal",
-            "UpdateGoal",
-            "SetGoalBudget",
-            "CronCreate",
-            "CronList",
-            "CronDelete",
+            "Goal",
+            "Cron",
         ]
         .to_vec();
         expected.sort_unstable();
@@ -502,7 +452,6 @@ mod disclosure_tests {
             "Grep",
             "Glob",
             "Bash",
-            "Task",
             "TaskOutput",
         ] {
             let td = full_registry()

@@ -3449,49 +3449,17 @@ async fn build_turn_tool_registry(
             state.bash_shells.clone(),
         ),
     ));
-    tools.register(Arc::new(
-        kkagent_tools::builtin::TaskListTool::with_bash_shells(
-            state.subagents.clone(),
-            state.bash_shells.clone(),
-        ),
-    ));
-    tools.register(Arc::new(
-        kkagent_tools::builtin::TaskStopTool::with_bash_shells(
-            state.subagents.clone(),
-            state.bash_shells.clone(),
-        ),
-    ));
     let goal_mgr = state.goal_for(session_id).await;
-    tools.register(Arc::new(kkagent_tools::builtin::CreateGoalTool::new(
-        goal_mgr.clone(),
-    )));
-    tools.register(Arc::new(kkagent_tools::builtin::GetGoalTool::new(
-        goal_mgr.clone(),
-    )));
-    tools.register(Arc::new(kkagent_tools::builtin::UpdateGoalTool::new(
-        goal_mgr.clone(),
-    )));
-    tools.register(Arc::new(kkagent_tools::builtin::SetGoalBudgetTool::new(
-        goal_mgr,
-    )));
+    tools.register(Arc::new(kkagent_tools::builtin::GoalTool::new(goal_mgr)));
     tools.register(Arc::new(kkagent_tools::builtin::SkillTool::new(
         state.skills.clone(),
     )));
-    if let Some(search) = kkagent_tools::builtin::WebSearchTool::try_new(state.web.clone()) {
-        tools.register(Arc::new(search));
+    if let Some(web) = kkagent_tools::builtin::WebTool::try_new(state.web.clone()) {
+        tools.register(Arc::new(web));
     } else {
-        tracing::debug!("WebSearch not registered: [services.web_search] not configured");
+        tracing::debug!("Web tool not registered: client construction failed");
     }
-    tools.register(Arc::new(kkagent_tools::builtin::FetchUrlTool::new(
-        state.web.clone(),
-    )));
-    tools.register(Arc::new(kkagent_tools::builtin::CronCreateTool::new(
-        state.cron.clone(),
-    )));
-    tools.register(Arc::new(kkagent_tools::builtin::CronListTool::new(
-        state.cron.clone(),
-    )));
-    tools.register(Arc::new(kkagent_tools::builtin::CronDeleteTool::new(
+    tools.register(Arc::new(kkagent_tools::builtin::CronTool::new(
         state.cron.clone(),
     )));
     tools

@@ -797,8 +797,8 @@ impl HttpBackend for MemoryBackend {
     }
     async fn list_tools(&self) -> Value {
         json!({"tools": [
-            "Read","Write","Edit","Bash","Grep","Glob","TodoList","WebSearch","FetchURL",
-            "Task","AskUserQuestion","SelectTools","Skill","CronCreate","ReadMediaFile"
+            "Read","Write","Edit","Bash","Grep","Glob","TodoList","Web",
+            "Agent","TaskOutput","AskUserQuestion","SelectTools","Skill","Cron","Goal","ReadMediaFile"
         ]})
     }
     async fn list_tasks(&self) -> Value {

@@ -5773,7 +5773,7 @@ impl TuiApp {
             .unwrap_or(false);
         items.push(ListPickerItem {
             id: "web".into(),
-            label: "WebSearch".into(),
+            label: "Web".into(),
             detail: if web_configured {
                 "ok — configured".into()
             } else {

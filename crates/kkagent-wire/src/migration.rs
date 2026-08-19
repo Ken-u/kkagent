@@ -97,7 +97,7 @@ impl WireMigration for MigrateV11ToV12 {
             .to_string();
         let pattern = match action.as_str() {
             "run command" => Some("Bash"),
-            "stop background task" => Some("TaskStop"),
+            "stop background task" => Some("TaskOutput"),
             "edit file" | "edit file outside of working directory" | "write file" => Some("Write"),
             "run command in plan mode" | "run background command" => None,
             _ => None,

@@ -247,61 +247,18 @@ fn parse_duration_token(s: &str) -> Duration {
     Duration::minutes(5)
 }
 
-pub struct CronCreateTool {
-    mgr: Arc<CronManager>,
-}
-pub struct CronListTool {
-    mgr: Arc<CronManager>,
-}
-pub struct CronDeleteTool {
+/// Unified cron tool (`Cron`) — subsumes the former CronCreate / CronList /
+/// CronDelete trio behind a single `action` parameter.
+pub struct CronTool {
     mgr: Arc<CronManager>,
 }
 
-impl CronCreateTool {
+impl CronTool {
     pub fn new(mgr: Arc<CronManager>) -> Self {
         Self { mgr }
     }
-}
-impl CronListTool {
-    pub fn new(mgr: Arc<CronManager>) -> Self {
-        Self { mgr }
-    }
-}
-impl CronDeleteTool {
-    pub fn new(mgr: Arc<CronManager>) -> Self {
-        Self { mgr }
-    }
-}
 
-#[async_trait]
-impl Tool for CronCreateTool {
-    fn name(&self) -> &str {
-        "CronCreate"
-    }
-    fn description(&self) -> &str {
-        "Schedule a prompt to run later. Use delay like `in 5m` / `30s`, or a 5-field cron \
-expression with recurring=true (default) / false for one-shot."
-    }
-    fn disclosure(&self) -> crate::ToolDisclosure {
-        crate::ToolDisclosure::Deferred
-    }
-    fn parameters_schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "delay": {"type": "string", "description": "When to run, e.g. 'in 5m', '1h', or cron '*/5 * * * *'"},
-                "cron": {"type": "string", "description": "Alias for delay when using a 5-field cron expression"},
-                "expression": {"type": "string", "description": "Alias for delay"},
-                "prompt": {"type": "string", "description": "Prompt to inject when due"},
-                "recurring": {
-                    "type": "boolean",
-                    "description": "true (default for cron) = fire on every match; false = one-shot. Delays are always one-shot."
-                }
-            },
-            "required": ["prompt"]
-        })
-    }
-    async fn execute(&self, input: Value, _ctx: &ToolContext) -> anyhow::Result<ToolOutput> {
+    async fn create(&self, input: &Value) -> ToolOutput {
         let delay = input
             .get("delay")
             .or_else(|| input.get("cron"))
@@ -315,45 +272,27 @@ expression with recurring=true (default) / false for one-shot."
             .unwrap_or("")
             .to_string();
         if delay.is_empty() || prompt.is_empty() {
-            return Ok(ToolOutput::error("delay/cron and prompt are required"));
+            return ToolOutput::error("delay/cron and prompt are required");
         }
         let recurring = input
             .get("recurring")
             .and_then(|v| v.as_bool())
             .unwrap_or(true);
         match self.mgr.create(delay, prompt, recurring).await {
-            Ok(job) => Ok(ToolOutput::success(format!(
+            Ok(job) => ToolOutput::success(format!(
                 "Cron job created id={} recurring={} next_run={}",
                 job.id,
                 job.recurring,
                 job.next_run.to_rfc3339()
-            ))),
-            Err(e) => Ok(ToolOutput::error(e.to_string())),
+            )),
+            Err(e) => ToolOutput::error(e.to_string()),
         }
     }
-}
 
-#[async_trait]
-impl Tool for CronListTool {
-    fn name(&self) -> &str {
-        "CronList"
-    }
-    fn description(&self) -> &str {
-        "List scheduled cron jobs."
-    }
-    fn disclosure(&self) -> crate::ToolDisclosure {
-        crate::ToolDisclosure::Deferred
-    }
-    fn read_only(&self) -> bool {
-        true
-    }
-    fn parameters_schema(&self) -> Value {
-        json!({"type": "object", "properties": {}})
-    }
-    async fn execute(&self, _input: Value, _ctx: &ToolContext) -> anyhow::Result<ToolOutput> {
+    async fn list(&self) -> ToolOutput {
         let jobs = self.mgr.list().await;
         if jobs.is_empty() {
-            return Ok(ToolOutput::success("No cron jobs."));
+            return ToolOutput::success("No cron jobs.");
         }
         let lines: Vec<String> = jobs
             .iter()
@@ -367,17 +306,31 @@ impl Tool for CronListTool {
                 )
             })
             .collect();
-        Ok(ToolOutput::success(lines.join("\n")))
+        ToolOutput::success(lines.join("\n"))
+    }
+
+    async fn delete(&self, input: &Value) -> ToolOutput {
+        let id = input.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        if id.is_empty() {
+            return ToolOutput::error("Missing id");
+        }
+        if self.mgr.delete(id).await {
+            ToolOutput::success(format!("Deleted cron job {}", id))
+        } else {
+            ToolOutput::error(format!("Unknown cron id {}", id))
+        }
     }
 }
 
 #[async_trait]
-impl Tool for CronDeleteTool {
+impl Tool for CronTool {
     fn name(&self) -> &str {
-        "CronDelete"
+        "Cron"
     }
     fn description(&self) -> &str {
-        "Delete a cron job by id."
+        "Schedule prompts to run later. Actions: create (delay like `in 5m` / `30s`, or a \
+5-field cron expression with recurring=true default / false one-shot), list, delete. \
+Subsumes the former CronCreate / CronList / CronDelete tools."
     }
     fn disclosure(&self) -> crate::ToolDisclosure {
         crate::ToolDisclosure::Deferred
@@ -386,21 +339,38 @@ impl Tool for CronDeleteTool {
         json!({
             "type": "object",
             "properties": {
-                "id": {"type": "string"}
+                "action": {
+                    "type": "string",
+                    "enum": ["create", "list", "delete"],
+                    "description": "Which cron operation to perform"
+                },
+                "delay": {"type": "string", "description": "create: when to run, e.g. 'in 5m', '1h', or cron '*/5 * * * *'"},
+                "cron": {"type": "string", "description": "create: alias for delay when using a 5-field cron expression"},
+                "expression": {"type": "string", "description": "create: alias for delay"},
+                "prompt": {"type": "string", "description": "create: prompt to inject when due"},
+                "recurring": {
+                    "type": "boolean",
+                    "description": "create: true (default for cron) = fire on every match; false = one-shot. Delays are always one-shot."
+                },
+                "id": {"type": "string", "description": "delete: cron job id"}
             },
-            "required": ["id"]
+            "required": ["action"]
         })
     }
+
     async fn execute(&self, input: Value, _ctx: &ToolContext) -> anyhow::Result<ToolOutput> {
-        let id = input.get("id").and_then(|v| v.as_str()).unwrap_or("");
-        if id.is_empty() {
-            return Ok(ToolOutput::error("Missing id"));
-        }
-        if self.mgr.delete(id).await {
-            Ok(ToolOutput::success(format!("Deleted cron job {}", id)))
-        } else {
-            Ok(ToolOutput::error(format!("Unknown cron id {}", id)))
-        }
+        let action = input
+            .get("action")
+            .and_then(|v| v.as_str())
+            .unwrap_or("list");
+        Ok(match action {
+            "create" => self.create(&input).await,
+            "list" => self.list().await,
+            "delete" => self.delete(&input).await,
+            other => ToolOutput::error(format!(
+                "Unknown action: {other}. Use create, list, or delete."
+            )),
+        })
     }
 }
 
@@ -423,5 +393,55 @@ mod tests {
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].id, job.id);
         let _ = tokio::fs::remove_dir_all(dir).await;
+    }
+
+    fn context() -> ToolContext {
+        ToolContext {
+            working_dir: std::env::temp_dir(),
+            session_id: "cron-session".into(),
+            turn_id: "t".into(),
+            plan_file_path: None,
+            image: kkagent_config::ImageConfig::default(),
+            tool_call_id: None,
+            interrupted: None,
+            tools_config: kkagent_config::ToolsConfig::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn cron_tool_covers_the_former_trio() {
+        let mgr = Arc::new(CronManager::new());
+        let tool = CronTool::new(mgr);
+
+        let created = tool
+            .execute(
+                serde_json::json!({"action": "create", "delay": "in 5m", "prompt": "hi"}),
+                &context(),
+            )
+            .await
+            .unwrap();
+        assert!(!created.is_error);
+        let id = created
+            .content
+            .split("id=")
+            .nth(1)
+            .and_then(|s| s.split_whitespace().next())
+            .unwrap()
+            .to_string();
+
+        let list = tool
+            .execute(serde_json::json!({"action": "list"}), &context())
+            .await
+            .unwrap();
+        assert!(list.content.contains(&id));
+
+        let deleted = tool
+            .execute(
+                serde_json::json!({"action": "delete", "id": id}),
+                &context(),
+            )
+            .await
+            .unwrap();
+        assert!(!deleted.is_error);
     }
 }

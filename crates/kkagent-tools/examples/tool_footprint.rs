@@ -18,10 +18,7 @@ fn main() {
     register_subagent_tools(&mut r, mgr, launch, None);
 
     let goal = Arc::new(kkagent_protocol::goal::GoalManager::new());
-    r.register(Arc::new(builtin::CreateGoalTool::new(goal.clone())));
-    r.register(Arc::new(builtin::GetGoalTool::new(goal.clone())));
-    r.register(Arc::new(builtin::UpdateGoalTool::new(goal.clone())));
-    r.register(Arc::new(builtin::SetGoalBudgetTool::new(goal)));
+    r.register(Arc::new(builtin::GoalTool::new(goal)));
 
     r.register(Arc::new(builtin::SkillTool::new(Arc::new(
         builtin::skill::SkillCatalog::new(),
@@ -38,15 +35,12 @@ fn main() {
         fetch: Default::default(),
         migration_hint: None,
     });
-    if let Some(t) = builtin::WebSearchTool::try_new(web.clone()) {
+    if let Some(t) = builtin::WebTool::try_new(web) {
         r.register(Arc::new(t));
     }
-    r.register(Arc::new(builtin::FetchUrlTool::new(web)));
 
     let cron = Arc::new(builtin::cron::CronManager::default());
-    r.register(Arc::new(builtin::CronCreateTool::new(cron.clone())));
-    r.register(Arc::new(builtin::CronListTool::new(cron.clone())));
-    r.register(Arc::new(builtin::CronDeleteTool::new(cron)));
+    r.register(Arc::new(builtin::CronTool::new(cron)));
 
     // --- report ---
     let defs = r.tool_definitions();

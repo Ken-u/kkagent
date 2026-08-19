@@ -636,12 +636,13 @@ mod tests {
     }
 
     #[test]
-    fn try_new_without_config_is_none() {
+    fn try_new_without_search_config_still_enables_fetch() {
         let cfg = Arc::new(WebServicesConfig {
             search: None,
             fetch: WebFetchServiceConfig::default(),
             migration_hint: None,
         });
-        assert!(crate::builtin::WebSearchTool::try_new(cfg).is_none());
+        // Fetch works without any provider config; search errors at call time.
+        assert!(crate::builtin::WebTool::try_new(cfg).is_some());
     }
 }

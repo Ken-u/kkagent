@@ -75,9 +75,9 @@ impl SwarmService {
         }
     }
 
-    /// AgentSwarm must be the sole tool call in a batch.
+    /// An Agent fan-out call must be the sole tool call in a batch.
     pub fn veto_mixed_agent_swarm(tool_names: &[String]) -> Option<String> {
-        let count = tool_names.iter().filter(|n| *n == "AgentSwarm").count();
+        let count = tool_names.iter().filter(|n| *n == "Agent").count();
         if count == 0 {
             return None;
         }
@@ -86,14 +86,14 @@ impl SwarmService {
         }
         if count > 1 {
             Some(
-                "Multiple AgentSwarm calls in one step are not allowed. \
-                 Run a single AgentSwarm invocation."
+                "Multiple Agent fan-out calls in one step are not allowed. \
+                 Run a single Agent invocation."
                     .into(),
             )
         } else {
             Some(
-                "AgentSwarm cannot be mixed with other tools in the same step. \
-                 Call AgentSwarm alone."
+                "An Agent fan-out cannot be mixed with other tools in the same step. \
+                 Call Agent alone."
                     .into(),
             )
         }
@@ -121,9 +121,7 @@ mod tests {
 
     #[test]
     fn exclusivity() {
-        assert!(SwarmService::veto_mixed_agent_swarm(&["AgentSwarm".into()]).is_none());
-        assert!(
-            SwarmService::veto_mixed_agent_swarm(&["AgentSwarm".into(), "Read".into()]).is_some()
-        );
+        assert!(SwarmService::veto_mixed_agent_swarm(&["Agent".into()]).is_none());
+        assert!(SwarmService::veto_mixed_agent_swarm(&["Agent".into(), "Read".into()]).is_some());
     }
 }

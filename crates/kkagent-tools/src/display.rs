@@ -44,12 +44,8 @@ pub fn builtin_display_schemas() -> HashMap<String, ToolDisplaySchema> {
     add(&mut m, "Grep", "grep {pattern}", SummaryMode::Grep);
     add(&mut m, "Glob", "glob {pattern}", SummaryMode::Text);
     add(&mut m, "ReadMediaFile", "media {path}", SummaryMode::Media);
-    add(&mut m, "CreateGoal", "goal+", SummaryMode::Goal);
-    add(&mut m, "GetGoal", "goal?", SummaryMode::Goal);
-    add(&mut m, "UpdateGoal", "goal!", SummaryMode::Goal);
-    add(&mut m, "SetGoalBudget", "goal$", SummaryMode::Goal);
-    add(&mut m, "WebSearch", "web {query}", SummaryMode::Text);
-    add(&mut m, "FetchURL", "fetch {url}", SummaryMode::Text);
+    add(&mut m, "Goal", "goal {action}", SummaryMode::Goal);
+    add(&mut m, "Web", "web {action}", SummaryMode::Text);
     m
 }
 

@@ -160,12 +160,12 @@ Workspace 包含 16 个 crate：
 | 文件读写 | `Read` / `Write` / `Edit` / `Glob` | 读取、写入、行级编辑、批量查找。 |
 | 搜索 | `Grep` | 正则搜索，支持上下文与多文件过滤。 |
 | 执行 | `Bash` | 带沙箱与权限策略的命令执行，支持后台 shell。 |
-| 任务管理 | `TodoList` / `Goal` / `Task` | TODO 追踪、多轮目标、后台子 Agent 任务。 |
+| 任务管理 | `TodoList` / `Goal` / `Agent` / `TaskOutput` | TODO 追踪、多轮目标、子代理委派与后台任务管理。 |
 | 交互 | `AskUserQuestion` / `SelectTools` | 用户确认、工具选择。 |
 | 上下文 | `Skill` | 加载并执行 skill 模板。 |
 | 计划 | `Plan` | 计划模式相关工具。 |
-| 定时 | `CronCreate` / `CronDelete` / `CronList` | 调度提示词到未来执行。 |
-| Web / 媒体 | `Web` / `Media` | 网页抓取、媒体文件读取。 |
+| 定时 | `Cron`（action=create/list/delete） | 调度提示词到未来执行。 |
+| Web / 媒体 | `Web`（action=search/fetch） / `ReadMediaFile` | 网页搜索与抓取、媒体文件读取。 |
 
 工具声明与权限策略由 `kkagent-tools` 统一管理，新增工具会自动进入权限评估流程。
 

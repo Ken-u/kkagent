@@ -1,58 +1,52 @@
-//! WebSearch / FetchURL tools — provider-agnostic.
+//! Web tool (search + fetch) — provider-agnostic.
 
 use async_trait::async_trait;
 use reqwest::redirect::Policy;
 use serde_json::{json, Value};
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::web_providers::{SearchRequest, WebSearchProvider, WebServicesConfig};
 use crate::{Tool, ToolContext, ToolOutput};
 
-pub struct WebSearchTool {
+/// Unified web tool (`Web`) — subsumes the former WebSearch / FetchURL pair
+/// behind a single `action` parameter. Search requires [services.web_search];
+/// fetch works with direct HTTP GET or an optional [services.web_fetch] proxy.
+pub struct WebTool {
     cfg: Arc<WebServicesConfig>,
-    provider: Arc<dyn WebSearchProvider>,
+    provider: Option<Arc<dyn WebSearchProvider>>,
+    client: reqwest::Client,
 }
 
-impl WebSearchTool {
+impl WebTool {
     pub fn try_new(cfg: Arc<WebServicesConfig>) -> Option<Self> {
-        let provider = cfg.build_search_provider()?;
-        Some(Self { cfg, provider })
-    }
-}
-
-#[async_trait]
-impl Tool for WebSearchTool {
-    fn name(&self) -> &str {
-        "WebSearch"
-    }
-    fn description(&self) -> &str {
-        "Search the web for up-to-date information. Requires [services.web_search] in config."
-    }
-    fn disclosure(&self) -> crate::ToolDisclosure {
-        crate::ToolDisclosure::Deferred
-    }
-    fn read_only(&self) -> bool {
-        true
-    }
-    fn parameters_schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "query": {"type": "string", "description": "Search query"},
-                "limit": {"type": "integer", "description": "Max results (default from config)"}
-            },
-            "required": ["query"]
+        let provider = cfg.build_search_provider();
+        let timeout = Duration::from_millis(cfg.fetch.timeout_ms.max(1_000));
+        let client = reqwest::Client::builder()
+            .timeout(timeout)
+            .redirect(Policy::none())
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+        Some(Self {
+            cfg,
+            provider,
+            client,
         })
     }
 
-    async fn execute(&self, input: Value, _ctx: &ToolContext) -> anyhow::Result<ToolOutput> {
+    async fn search(&self, input: &Value) -> ToolOutput {
+        let Some(provider) = &self.provider else {
+            return ToolOutput::error(
+                "Web search is not configured. Add [services.web_search] with a provider (searxng / brave / custom).",
+            );
+        };
         let query = input
             .get("query")
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .trim();
         if query.is_empty() {
-            return Ok(ToolOutput::error("Missing query"));
+            return ToolOutput::error("Missing query");
         }
         let default_limit = self
             .cfg
@@ -67,15 +61,14 @@ impl Tool for WebSearchTool {
             .unwrap_or(default_limit)
             .clamp(1, 20);
 
-        match self
-            .provider
+        match provider
             .search(&SearchRequest {
                 query: query.to_string(),
                 limit,
             })
             .await
         {
-            Ok(hits) if hits.is_empty() => Ok(ToolOutput::success("No search results.")),
+            Ok(hits) if hits.is_empty() => ToolOutput::success("No search results."),
             Ok(hits) => {
                 let mut lines = Vec::new();
                 let mut urls = Vec::new();
@@ -95,7 +88,7 @@ impl Tool for WebSearchTool {
                 let mut out = ToolOutput::success_with_data(
                     lines.join("\n\n"),
                     json!({
-                        "provider": self.provider.name(),
+                        "provider": provider.name(),
                         "count": hits.len(),
                         "urls": urls,
                     }),
@@ -103,75 +96,29 @@ impl Tool for WebSearchTool {
                 if let Some(hint) = &self.cfg.migration_hint {
                     out = out.with_note(hint.clone());
                 }
-                Ok(out)
+                out
             }
             Err(e) => {
                 let msg = e.to_string();
                 // Never leak API keys in tool output.
                 let safe = redact_secrets(&msg);
-                Ok(ToolOutput::error(format!(
-                    "WebSearch failed ({provider}): {safe}. Configure [services.web_search] with a working provider (searxng / brave / custom).",
-                    provider = self.provider.name()
-                )))
+                ToolOutput::error(format!(
+                    "Web search failed ({}): {}. Configure [services.web_search] with a working provider (searxng / brave / custom).",
+                    provider.name(),
+                    safe
+                ))
             }
         }
     }
-}
 
-pub struct FetchUrlTool {
-    cfg: Arc<WebServicesConfig>,
-    client: reqwest::Client,
-}
-
-impl FetchUrlTool {
-    pub fn new(cfg: Arc<WebServicesConfig>) -> Self {
-        let timeout = Duration::from_millis(cfg.fetch.timeout_ms.max(1_000));
-        Self {
-            cfg,
-            client: reqwest::Client::builder()
-                .timeout(timeout)
-                .redirect(Policy::none())
-                .build()
-                .unwrap_or_else(|_| reqwest::Client::new()),
-        }
-    }
-}
-
-use std::time::Duration;
-
-#[async_trait]
-impl Tool for FetchUrlTool {
-    fn name(&self) -> &str {
-        "FetchURL"
-    }
-    fn description(&self) -> &str {
-        "Fetch a URL and return extracted text content. Works with direct HTTP GET; optional [services.web_fetch] proxy."
-    }
-    fn disclosure(&self) -> crate::ToolDisclosure {
-        crate::ToolDisclosure::Deferred
-    }
-    fn read_only(&self) -> bool {
-        true
-    }
-    fn parameters_schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "url": {"type": "string", "description": "URL to fetch"},
-                "max_chars": {"type": "integer", "description": "Max characters to return (default 20000)"}
-            },
-            "required": ["url"]
-        })
-    }
-
-    async fn execute(&self, input: Value, _ctx: &ToolContext) -> anyhow::Result<ToolOutput> {
+    async fn fetch(&self, input: &Value) -> ToolOutput {
         let url = input
             .get("url")
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .trim();
         if url.is_empty() {
-            return Ok(ToolOutput::error("Missing url"));
+            return ToolOutput::error("Missing url");
         }
         let max_chars = input
             .get("max_chars")
@@ -180,10 +127,10 @@ impl Tool for FetchUrlTool {
             .min(200_000) as usize;
         let parsed_url = match reqwest::Url::parse(url) {
             Ok(url) => url,
-            Err(e) => return Ok(ToolOutput::error(format!("Invalid URL: {e}"))),
+            Err(e) => return ToolOutput::error(format!("Invalid URL: {e}")),
         };
         if let Err(e) = validate_public_http_url(&parsed_url).await {
-            return Ok(ToolOutput::error(format!("FetchURL blocked: {e}")));
+            return ToolOutput::error(format!("Web fetch blocked: {e}"));
         }
 
         if let Some(endpoint) = &self.cfg.fetch.base_url {
@@ -197,10 +144,10 @@ impl Tool for FetchUrlTool {
                     match read_response_limited(resp, 4 * 1024 * 1024).await {
                         Ok((_, text)) if status.is_success() => {
                             let body = truncate(&extract_readable_text(&text), max_chars);
-                            return Ok(ToolOutput::success_with_data(
+                            return ToolOutput::success_with_data(
                                 body,
                                 json!({"source_url": url, "via": "web_fetch"}),
-                            ));
+                            );
                         }
                         Ok(_) => {
                             tracing::warn!("web_fetch HTTP {}, falling back to direct GET", status)
@@ -225,14 +172,14 @@ impl Tool for FetchUrlTool {
                     .to_string();
                 let (_, text) = match read_response_limited(resp, 4 * 1024 * 1024).await {
                     Ok(body) => body,
-                    Err(e) => return Ok(ToolOutput::error(format!("FetchURL failed: {e}"))),
+                    Err(e) => return ToolOutput::error(format!("Web fetch failed: {e}")),
                 };
                 if !status.is_success() {
-                    return Ok(ToolOutput::error(format!(
-                        "FetchURL HTTP {}: {}",
+                    return ToolOutput::error(format!(
+                        "Web fetch HTTP {}: {}",
                         status,
                         text.chars().take(300).collect::<String>()
-                    )));
+                    ));
                 }
                 if !(ct.is_empty()
                     || ct.contains("text/")
@@ -241,26 +188,22 @@ impl Tool for FetchUrlTool {
                     || ct.contains("html")
                     || ct.contains("javascript"))
                 {
-                    return Ok(ToolOutput::error(format!(
-                        "FetchURL unsupported content-type: {ct}"
-                    )));
+                    return ToolOutput::error(format!("Web fetch unsupported content-type: {ct}"));
                 }
                 let body = if ct.contains("html") || text.trim_start().starts_with('<') {
                     extract_readable_text(&text)
                 } else {
                     text
                 };
-                Ok(ToolOutput::success_with_data(
+                ToolOutput::success_with_data(
                     truncate(&body, max_chars),
                     json!({"source_url": url, "via": "direct"}),
-                ))
+                )
             }
-            Err(e) => Ok(ToolOutput::error(format!("FetchURL failed: {}", e))),
+            Err(e) => ToolOutput::error(format!("Web fetch failed: {e}")),
         }
     }
-}
 
-impl FetchUrlTool {
     async fn fetch_validated(&self, mut url: reqwest::Url) -> anyhow::Result<reqwest::Response> {
         const MAX_REDIRECTS: usize = 5;
         for redirect_count in 0..=MAX_REDIRECTS {
@@ -280,6 +223,48 @@ impl FetchUrlTool {
             url = url.join(location)?;
         }
         unreachable!("redirect loop always returns or errors")
+    }
+}
+
+#[async_trait]
+impl Tool for WebTool {
+    fn name(&self) -> &str {
+        "Web"
+    }
+    fn description(&self) -> &str {
+        "Web access: search for up-to-date information (action=search, needs [services.web_search]) or fetch a URL and extract its text (action=fetch). Subsumes the former WebSearch / FetchURL tools."
+    }
+    fn disclosure(&self) -> crate::ToolDisclosure {
+        crate::ToolDisclosure::Deferred
+    }
+    fn read_only(&self) -> bool {
+        true
+    }
+    fn parameters_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["search", "fetch"],
+                    "description": "search = web query; fetch = GET a URL and extract text"
+                },
+                "query": {"type": "string", "description": "search: search query"},
+                "limit": {"type": "integer", "description": "search: max results (default from config)"},
+                "url": {"type": "string", "description": "fetch: URL to fetch"},
+                "max_chars": {"type": "integer", "description": "fetch: max characters to return (default 20000)"}
+            },
+            "required": ["action"]
+        })
+    }
+
+    async fn execute(&self, input: Value, _ctx: &ToolContext) -> anyhow::Result<ToolOutput> {
+        let action = input.get("action").and_then(|v| v.as_str()).unwrap_or("");
+        Ok(match action {
+            "search" => self.search(&input).await,
+            "fetch" => self.fetch(&input).await,
+            other => ToolOutput::error(format!("Unknown action: {other}. Use search or fetch.")),
+        })
     }
 }
 

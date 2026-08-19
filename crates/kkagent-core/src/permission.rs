@@ -43,24 +43,20 @@ const SENSITIVE_PATTERNS: &[&str] = &[
 ];
 
 /// Default-approve set aligned with kimi `default-tool-approve`
-/// (Agent/AgentSwarm included; Skill is write-ish and requires ask).
+/// (Agent included; Skill is write-ish and requires ask). TaskOutput stop
+/// and Cron/Goal mutations are gated by their own ask rules.
 const READ_ONLY_TOOLS: &[&str] = &[
     "Read",
     "Grep",
     "Glob",
     "ReadMediaFile",
-    "WebSearch",
-    "FetchURL",
+    "Web",
     "EnterPlanMode",
     "ExitPlanMode",
     "TodoList",
-    "GetGoal",
-    "TaskList",
     "TaskOutput",
-    "CronList",
     "SelectTools",
     "Agent",
-    "AgentSwarm",
 ];
 
 impl PermissionChain {

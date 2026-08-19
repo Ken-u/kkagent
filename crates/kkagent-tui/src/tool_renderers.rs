@@ -26,10 +26,8 @@ impl ToolRenderRegistry {
             "Grep" => format!("grep {}", fit(&tc.input_summary, budget.saturating_sub(5))),
             "Glob" => format!("glob {}", fit(&tc.input_summary, budget.saturating_sub(5))),
             "Skill" => format!("Skill {}", fit(&tc.input_summary, budget.saturating_sub(6))),
-            "CreateGoal" | "GetGoal" | "UpdateGoal" | "SetGoalBudget" => {
-                format!("goal {}", fit(&tc.input_summary, budget.saturating_sub(5)))
-            }
-            "WebSearch" | "FetchURL" => format!(
+            "Goal" => format!("goal {}", fit(&tc.input_summary, budget.saturating_sub(5))),
+            "Web" => format!(
                 "{} {}",
                 tc.name,
                 fit(&tc.input_summary, budget.saturating_sub(tc.name.len() + 1))
@@ -52,7 +50,7 @@ impl ToolRenderRegistry {
                 "Write" | "Edit" => Color::Magenta,
                 "Read" | "Grep" | "Glob" => theme.text_dim,
                 "Skill" => theme.primary,
-                "CreateGoal" | "UpdateGoal" | "SetGoalBudget" | "GetGoal" => Color::Cyan,
+                "Goal" => Color::Cyan,
                 _ => theme.text_dim,
             }
         };
@@ -75,9 +73,7 @@ impl ToolRenderRegistry {
             "Write" | "Edit" => lines.extend(diffish_summary(output, width, theme, max_preview)),
             "ReadMediaFile" => lines.extend(media_summary(output, width, theme, max_preview)),
             "Skill" => lines.extend(skill_summary(output, width, theme, max_preview)),
-            "CreateGoal" | "GetGoal" | "UpdateGoal" | "SetGoalBudget" => {
-                lines.extend(goal_summary(output, width, theme, max_preview))
-            }
+            "Goal" => lines.extend(goal_summary(output, width, theme, max_preview)),
             _ => lines.extend(default_summary(output, width, theme, max_preview)),
         }
         lines
