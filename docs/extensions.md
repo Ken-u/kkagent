@@ -132,6 +132,12 @@ Plugin MCP server 使用 `plugin-<plugin-id>:<server-name>` 作为运行时名�
 注册表时都会读取当前 MCP 工具集，因此新 session 自动获得插件工具。修改或安装插件后
 执行 `/plugins reload`，会重新扫描 manifest、重启 MCP 连接，并让后续 turn 使用新的工具。
 
+暴露给模型的工具名使用缩短的命名空间：单 server 插件为 `mcp__<plugin-id>__<tool>`，
+多 server 插件为 `mcp__<plugin-id>_<server-name>__<tool>`（例如
+`mcp__rk-codesearch__CodeSearch`）。命名空间超过 32 字符或不同插件产生相同命名空间时，
+会追加稳定的短哈希后缀消歧。运行时名称（`/mcp`、`disabled.toml`、OAuth 凭据存储）
+不受影响，仍使用完整形式。
+
 旧版 `prompt_append` 仍兼容，等价于 `systemPrompt`。插件 MCP 可通过 `/mcp` 以其运行时
 名称启用或禁用，状态保存在 `~/.kkagent/disabled.toml`。插件进程是本机可执行代码，只应
 安装可信插件；损坏的 MCP 声明会作为 `/plugins` diagnostics 展示，并且不会阻止其他插件加载。

@@ -225,10 +225,18 @@ impl PluginManager {
         let mut mcp_servers = Vec::new();
         let mut names: Vec<_> = manifest.mcp_servers.keys().cloned().collect();
         names.sort();
+        let multi_server = names.len() > 1;
         for name in names {
             let config = &manifest.mcp_servers[&name];
-            match normalize_mcp_server(&manifest.name, &name, config, &root, &self.kkagent_home)
-                .await
+            match normalize_mcp_server(
+                &manifest.name,
+                &name,
+                config,
+                &root,
+                &self.kkagent_home,
+                multi_server,
+            )
+            .await
             {
                 Ok(config) => mcp_servers.push(config),
                 Err(error) => diagnostics.push(PluginDiagnostic {
@@ -467,6 +475,7 @@ async fn normalize_mcp_server(
     config: &kkagent_config::McpServerConfig,
     plugin_root: &Path,
     kkagent_home: &Path,
+    multi_server: bool,
 ) -> anyhow::Result<kkagent_mcp::McpServerConfig> {
     if server_name.trim().is_empty() {
         anyhow::bail!("server name must not be empty")
@@ -503,10 +512,17 @@ async fn normalize_mcp_server(
     }
 
     let runtime_name = format!("plugin-{plugin_id}:{server_name}");
-    Ok(kkagent_mcp::McpServerConfig::from_app(
-        runtime_name,
-        &normalized,
-    ))
+    let mut server = kkagent_mcp::McpServerConfig::from_app(runtime_name, &normalized);
+    // Shorten exposed tool names to `mcp__<plugin-id>__<tool>`: single-server
+    // plugins (the common case, e.g. `rk-codesearch_search`) expose their id,
+    // multi-server plugins disambiguate with `_<server>`. The runtime name
+    // above stays authoritative for toggles/OAuth so no state migrates.
+    server.tool_namespace = Some(if multi_server {
+        format!("{plugin_id}_{server_name}")
+    } else {
+        plugin_id.to_string()
+    });
+    Ok(server)
 }
 
 async fn resolve_plugin_command(plugin_root: &Path, command: &str) -> anyhow::Result<String> {
@@ -603,6 +619,42 @@ mod tests {
             configs[0].env.get("KKAGENT_PLUGIN_ROOT"),
             Some(&root.canonicalize().unwrap().display().to_string())
         );
+        // Single-server plugin exposes the bare plugin id as tool namespace.
+        assert_eq!(
+            configs[0].tool_namespace.as_deref(),
+            Some("code-search"),
+            "single-server plugins should expose short tool names"
+        );
+
+        let _ = tokio::fs::remove_dir_all(plugins).await;
+    }
+
+    #[tokio::test]
+    async fn multi_server_plugins_suffix_their_tool_namespace() {
+        let plugins = temp_plugins_dir();
+        let root = plugins.join("multi");
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        tokio::fs::write(
+            root.join(KK_ROOT_MANIFEST),
+            serde_json::json!({
+                "name": "multi",
+                "mcpServers": {
+                    "index": { "command": "python3" },
+                    "query": { "command": "python3" }
+                }
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+
+        let manager = PluginManager::discover(&plugins).await;
+        let configs = manager.mcp_server_configs().await;
+        assert_eq!(configs.len(), 2);
+        for config in &configs {
+            let expected = format!("multi_{}", config.name.rsplit(':').next().unwrap());
+            assert_eq!(config.tool_namespace.as_deref(), Some(expected.as_str()));
+        }
 
         let _ = tokio::fs::remove_dir_all(plugins).await;
     }

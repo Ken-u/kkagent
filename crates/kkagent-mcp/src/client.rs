@@ -32,6 +32,10 @@ pub struct McpServerConfig {
     pub headers: HashMap<String, String>,
     pub oauth: Option<kkagent_config::McpOAuthConfig>,
     pub timeout_ms: Option<u64>,
+    /// Optional short namespace used to qualify exposed tool names
+    /// (`mcp__<tool_namespace>__<tool>`). Runtime identity (name, disabled
+    /// state, OAuth store) keeps using `name`, so shortening is display-only.
+    pub tool_namespace: Option<String>,
 }
 
 impl McpServerConfig {
@@ -59,6 +63,7 @@ impl McpServerConfig {
             headers: cfg.headers.clone(),
             oauth: cfg.oauth.clone(),
             timeout_ms: cfg.timeout_ms,
+            tool_namespace: None,
         }
     }
 }
@@ -561,7 +566,7 @@ impl McpManager {
         self.tools_cache.lock().await.clone()
     }
 
-    fn configs_snapshot(&self) -> Vec<McpServerConfig> {
+    pub(crate) fn configs_snapshot(&self) -> Vec<McpServerConfig> {
         self.configs
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -673,6 +678,7 @@ mod tests {
             headers: HashMap::new(),
             oauth: None,
             timeout_ms: None,
+            tool_namespace: None,
         }]);
         manager
             .set_disabled_names(["disabled-test".to_string()])
@@ -710,6 +716,7 @@ mod tests {
                 headers: HashMap::new(),
                 oauth: None,
                 timeout_ms: None,
+                tool_namespace: None,
             }])
             .await
             .unwrap();
