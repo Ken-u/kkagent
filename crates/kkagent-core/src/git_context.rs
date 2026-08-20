@@ -1,63 +1,6 @@
-//! Collect lightweight git context for system prompt injection.
+//! Workspace trust evaluation (shared by sandbox posture decisions).
 
 use std::path::Path;
-use std::process::Command;
-
-pub fn collect_git_context(working_dir: &Path) -> Option<String> {
-    collect_git_context_with_trust(working_dir, None)
-}
-
-pub fn collect_git_context_with_trust(
-    working_dir: &Path,
-    trust: Option<&kkagent_config::WorkspaceTrust>,
-) -> Option<String> {
-    if !kkagent_config::git_metadata_accessible(trust) {
-        return None;
-    }
-    if !working_dir.join(".git").exists() {
-        // Might be a worktree; still try git commands.
-    }
-    let branch = git(working_dir, &["rev-parse", "--abbrev-ref", "HEAD"], trust)?;
-    let status = git(working_dir, &["status", "--short"], trust).unwrap_or_default();
-    let log = git(
-        working_dir,
-        &["log", "-5", "--oneline", "--decorate"],
-        trust,
-    )
-    .unwrap_or_default();
-    let mut out = String::from("\n\n# Git context\n\n");
-    out.push_str(&format!("- branch: `{}`\n", branch.trim()));
-    if status.trim().is_empty() {
-        out.push_str("- status: clean\n");
-    } else {
-        out.push_str("- status:\n```\n");
-        out.push_str(status.trim());
-        out.push_str("\n```\n");
-    }
-    if !log.trim().is_empty() {
-        out.push_str("- recent commits:\n```\n");
-        out.push_str(log.trim());
-        out.push_str("\n```\n");
-    }
-    Some(out)
-}
-
-fn git(
-    cwd: &Path,
-    args: &[&str],
-    trust: Option<&kkagent_config::WorkspaceTrust>,
-) -> Option<String> {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(cwd)
-        .envs(kkagent_config::git_environment(trust))
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    Some(String::from_utf8_lossy(&output.stdout).into_owned())
-}
 
 pub fn is_workspace_trusted(config: &kkagent_config::AppConfig, working_dir: &Path) -> bool {
     if config.sandbox.is_disabled() {

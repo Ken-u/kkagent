@@ -1086,21 +1086,6 @@ impl Session {
         }
     }
 
-    pub fn inject_git_context(&mut self) {
-        self.inject_git_context_with_trust(None);
-    }
-
-    pub fn inject_git_context_with_trust(
-        &mut self,
-        trust: Option<&kkagent_config::WorkspaceTrust>,
-    ) {
-        if let Some(ctx) =
-            crate::git_context::collect_git_context_with_trust(&self.working_dir, trust)
-        {
-            self.system_prompt.push_str(&ctx);
-        }
-    }
-
     pub fn inject_date_reminder(&mut self) {
         let today = chrono::Local::now().format("%Y-%m-%d (%A)");
         self.system_prompt
@@ -1665,11 +1650,9 @@ Write in the user's language unless they explicitly ask for a different one. Det
 
 # Prompt and Tool Use
 
-For simple questions/greetings that do not involve any information in the working directory, you may simply reply directly. For anything else, default to taking action with tools. When the request could be interpreted as either a question to answer or a task to complete, treat it as a task.
+For anything beyond a trivial question or greeting, default to taking action with tools; if a request could be a question or a task, treat it as a task. When it involves creating, modifying, or running code or files, you MUST use tools to make actual changes — do not just describe the solution. Do not provide detailed explanations or chain-of-thought around tool calls; for non-trivial multi-step work, first emit one short user-visible sentence describing what you will do next.
 
-When handling the user's request, if it involves creating, modifying, or running code or files, you MUST use the appropriate tools available to you to make actual changes — do not just describe the solution in text. When calling tools, do not provide detailed explanations or chain-of-thought. For non-trivial or multi-step tasks, first emit one short user-visible sentence describing what you will do next, then call the tool(s).
-
-For broad codebase exploration (map a module, find call sites across many files, compare alternatives), prefer launching a `Task` subagent with a focused prompt so work can proceed in parallel; then use `TaskOutput` / `TaskList` to collect results. Do the exploration yourself only when it is a small, single-path lookup.
+For broad codebase exploration (map a module, find call sites across many files, compare alternatives), prefer launching an `Agent` subagent with a focused prompt so work can proceed in parallel; then collect results with `TaskOutput` (actions: status/list/stop). Do the exploration yourself only when it is a small, single-path lookup.
 
 When a dedicated tool fits the job, reach for it before raw shell: `Read` a known path, `Glob` to find files by name, and `Grep` to search file contents.
 
@@ -1703,7 +1686,7 @@ Tool results and user messages may include `<system-reminder>` tags. These are a
 /// Mirrors kimi-code plan-mode injector `fullReminder`.
 pub fn plan_mode_reminder() -> String {
     r#"<system-reminder>
-Plan mode is active. You MUST NOT make edits through normal file tools or otherwise make changes to the system unless a tool request is explicitly approved. Prefer read-only tools. Use WritePlan only for the host-managed plan document; it does not accept a path. Use Bash only when needed; Bash follows the normal permission mode and rules. This supersedes any other instructions you have received. TaskStop, CronCreate, and CronDelete are also blocked in plan mode — call ExitPlanMode first if you need them.
+Plan mode is active. You MUST NOT make edits through normal file tools or otherwise make changes to the system unless a tool request is explicitly approved. Prefer read-only tools. Use WritePlan only for the host-managed plan document; it does not accept a path. Use Bash only when needed; Bash follows the normal permission mode and rules. This supersedes any other instructions you have received. Mutating side-effectful tool actions (e.g. stopping background tasks, deleting cron jobs) are also blocked in plan mode — call ExitPlanMode first if you need them.
 
 Workflow:
   1. Understand — explore the codebase with Glob, Grep, Read.

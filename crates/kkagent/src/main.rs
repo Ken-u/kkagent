@@ -1782,13 +1782,6 @@ async fn initialize_session_context(state: &ServerState, session: &mut Session) 
     session.inject_working_directory_context();
     session.inject_date_reminder();
     session.inject_workspace_instructions().await;
-    let workspace_trust = state
-        .workspace_trust
-        .read()
-        .unwrap_or_else(|error| error.into_inner())
-        .matching(&session.working_dir)
-        .cloned();
-    session.inject_git_context_with_trust(workspace_trust.as_ref());
     session.attach_workspace_concurrency_guard();
     let skill_section = state
         .skills
