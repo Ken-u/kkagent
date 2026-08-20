@@ -47,7 +47,7 @@ Agent turn 事件（含 Thinking / StatusUpdate / TurnEnd）由 server 扇出到
 ## 一轮请求
 
 1. 前端创建或恢复 Session，并提交 prompt。
-2. Session 合并系统指令、`AGENTS.md`、Skill、插件提示和历史上下文。
+2. Session 合并系统指令、`AGENTS.md`、Skill、插件提示和历史上下文（可用 `kkagent --dump-system-prompt` 查看合成结果）。
 3. LLM adapter 按 Provider 方言发起流式请求。
 4. 文本和工具调用增量转换为统一事件，同时写入会话记录。
 5. Tool policy、Plan guard、权限规则和 Hook 依次参与工具决策。

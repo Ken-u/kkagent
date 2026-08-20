@@ -45,6 +45,15 @@ answer=$(kkagent -p "总结 README" 2>kkagent.err)
 
 最终回答写到 stdout，诊断日志写到 stderr。有写入需求时按风险显式选择 `-y`；无人值守脚本不应默认使用 `--auto`。
 
+## 调试系统提示词
+
+```bash
+kkagent --dump-system-prompt
+kkagent --config ~/.kkagent/config.toml --dump-system-prompt > system-prompt.txt
+```
+
+按当前目录合成完整的系统提示词并打印后退出：包括基础指令、Workspace 段、`AGENTS.md` / `.kkagent/AGENTS.md` 项目指令、Skill 目录段和插件追加段。合成走真实 Session 相同的代码路径，可用于确认项目指令或 Skill 是否注入；不请求模型，不创建、不落盘会话。不能与子命令或 `--prompt` 组合。
+
 排障时可用 `kkagent --disable-sandbox` 临时覆盖 `[sandbox].mode`。该参数不写回配置，也不能与 `--connect` 同时使用；连接独立 Server 时必须在 Server 启动参数或 Server 配置中决定沙箱模式。
 
 Footer 第二行在 `context` 左侧显示当前有效沙箱模式：绿色 `● sandbox:workspace` 表示工作区文件系统隔离，黄色 `● sandbox:process` 表示仅有进程/资源限制，红色 `● sandbox:off` 表示沙箱及资源限制均已关闭。配置为 `auto` 时显示当前平台解析后的实际模式。

@@ -40,6 +40,8 @@ Skill 是一个目录中的 `SKILL.md`。发现顺序包括：
 3. 兼容目录 `.agents/skills/` 和 `.kimi/skills/`；
 4. 工程根目录 `AGENTS.md` 和 `.kkagent/AGENTS.md` 作为项目指令。
 
+在工程目录运行 `kkagent --dump-system-prompt` 可确认 Skill 目录段和项目指令是否被注入。
+
 最小示例：
 
 ```markdown

@@ -5,6 +5,7 @@
 ```bash
 kkagent --help
 kkagent doctor
+kkagent --dump-system-prompt
 rustc --version
 RUST_LOG=kkagent_core=debug,kkagent_llm=debug \
   kkagent --config ~/.kkagent/config.toml -p "只回复 ok" 2>kkagent-debug.log
@@ -25,6 +26,7 @@ TUI 问题同时查看 `~/.kkagent/kkagent.log`。分享日志前删除 token、
 | `first token timeout` | 上游迟迟不吐首字；调大模型/Provider 的 `first_token_timeout_ms`，或设 `0` 禁用；也可配置 `fallback_model`。 |
 | 模型不调用工具 | 加入 `capabilities = ["tool_use"]`，并确认上游支持。 |
 | 上下文过长 | `/compact`，开启 `auto_compact`，或降低 `compact_keep_last`。 |
+| 项目指令/Skill 没生效 | 在工程目录运行 `kkagent --dump-system-prompt` 查看实际合成的系统提示词，确认 `AGENTS.md`、Skill 目录段是否注入。 |
 
 ## 工具
 
