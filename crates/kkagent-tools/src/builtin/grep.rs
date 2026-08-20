@@ -21,7 +21,7 @@ impl Tool for GrepTool {
     }
     fn description(&self) -> &str {
         "Search for a regex pattern across files. Supports output_mode \
-(content/files_with_matches/count_matches), context (-A/-B/-C), -i/-n, \
+(content/files_with_matches/count_matches), surrounding context, case-insensitive matching, \
 multiline, head_limit/offset, and glob/type filters."
     }
     fn read_only(&self) -> bool {
@@ -38,20 +38,16 @@ multiline, head_limit/offset, and glob/type filters."
                 },
                 "glob": {"type": "string", "description": "File glob pattern filter (e.g. '*.rs')"},
                 "type": {"type": "string", "description": "ripgrep file type filter (e.g. 'rust', 'py')"},
-                "-i": {"type": "boolean", "description": "Case-insensitive search (alias: case_insensitive)"},
-                "case_insensitive": {"type": "boolean", "description": "Deprecated alias for -i"},
+                "case_insensitive": {"type": "boolean", "description": "Case-insensitive search"},
                 "output_mode": {
                     "type": "string",
-                    "enum": ["content", "files_with_matches", "count_matches", "count"],
-                    "description": "Output mode (default: files_with_matches). `count` is an alias for count_matches."
+                    "enum": ["content", "files_with_matches", "count_matches"],
+                    "description": "Output mode (default: files_with_matches)"
                 },
                 "-n": {"type": "boolean", "description": "Show line numbers in content mode (default true)"},
-                "-C": {"type": "integer", "description": "Lines of context around each match"},
-                "-B": {"type": "integer", "description": "Lines before each match"},
-                "-A": {"type": "integer", "description": "Lines after each match"},
-                "context": {"type": "integer", "description": "Deprecated alias for -C"},
-                "context_before": {"type": "integer", "description": "Deprecated alias for -B"},
-                "context_after": {"type": "integer", "description": "Deprecated alias for -A"},
+                "context": {"type": "integer", "description": "Lines of context around each match"},
+                "context_before": {"type": "integer", "description": "Lines before each match"},
+                "context_after": {"type": "integer", "description": "Lines after each match"},
                 "head_limit": {"type": "integer", "description": "Max results to return (default 200)"},
                 "offset": {"type": "integer", "description": "Skip first N results"},
                 "multiline": {"type": "boolean", "description": "Enable multiline matching (. matches newlines)"},

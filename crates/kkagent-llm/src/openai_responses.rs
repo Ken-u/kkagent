@@ -119,6 +119,9 @@ pub async fn openai_responses_stream(
     if !tools.is_empty() {
         body["tools"] = json!(tools);
     }
+    if let Some(key) = &request.prompt_cache_key {
+        body["prompt_cache_key"] = json!(key);
+    }
     if let Some(t) = &request.thinking {
         body["reasoning"] = json!({
             "effort": if t.budget_tokens >= 16_000 { "high" }
@@ -264,24 +267,7 @@ pub async fn openai_responses_stream(
                         .and_then(|r| r.get("usage"))
                         .or_else(|| event.get("usage"))
                     {
-                        usage.input_tokens = u
-                            .get("input_tokens")
-                            .or_else(|| u.get("prompt_tokens"))
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0);
-                        usage.output_tokens = u
-                            .get("output_tokens")
-                            .or_else(|| u.get("completion_tokens"))
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0);
-                        usage.cache_read_input_tokens = u
-                            .get("input_tokens_details")
-                            .and_then(|d| d.get("cached_tokens"))
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0);
-                        // Responses API: input_tokens already includes cached
-                        // tokens (cached_tokens is a subset).
-                        usage.input_includes_cache = Some(true);
+                        update_responses_usage(&mut usage, u);
                     }
                     flush_tools(&event_tx, &mut active_calls).await;
                     let _ = event_tx
@@ -310,6 +296,32 @@ pub async fn openai_responses_stream(
         }
     }
     anyhow::bail!("OpenAI Responses stream connection closed before response.completed")
+}
+
+fn update_responses_usage(usage: &mut TokenUsage, value: &serde_json::Value) {
+    usage.input_tokens = value
+        .get("input_tokens")
+        .or_else(|| value.get("prompt_tokens"))
+        .and_then(|token| token.as_u64())
+        .unwrap_or(usage.input_tokens);
+    usage.output_tokens = value
+        .get("output_tokens")
+        .or_else(|| value.get("completion_tokens"))
+        .and_then(|token| token.as_u64())
+        .unwrap_or(usage.output_tokens);
+    let details = value
+        .get("input_tokens_details")
+        .or_else(|| value.get("prompt_tokens_details"));
+    usage.cache_read_input_tokens = details
+        .and_then(|details| details.get("cached_tokens"))
+        .and_then(|token| token.as_u64())
+        .unwrap_or(usage.cache_read_input_tokens);
+    usage.cache_creation_input_tokens = details
+        .and_then(|details| details.get("cache_write_tokens"))
+        .and_then(|token| token.as_u64())
+        .unwrap_or(usage.cache_creation_input_tokens);
+    // Responses API input_tokens already includes both cache subsets.
+    usage.input_includes_cache = Some(true);
 }
 
 struct ActiveCall {
@@ -379,8 +391,30 @@ mod tests {
             max_tokens: Some(128),
             system: None,
             thinking: None,
+            prompt_cache_key: None,
             first_token_timeout: None,
         }
+    }
+
+    #[test]
+    fn parses_cache_reads_and_writes() {
+        let mut usage = TokenUsage::default();
+        update_responses_usage(
+            &mut usage,
+            &json!({
+                "input_tokens": 2600,
+                "output_tokens": 300,
+                "input_tokens_details": {
+                    "cached_tokens": 2000,
+                    "cache_write_tokens": 400
+                }
+            }),
+        );
+        assert_eq!(usage.input_tokens, 2600);
+        assert_eq!(usage.output_tokens, 300);
+        assert_eq!(usage.cache_read_input_tokens, 2000);
+        assert_eq!(usage.cache_creation_input_tokens, 400);
+        assert_eq!(usage.input_includes_cache, Some(true));
     }
 
     async fn serve_sse(body: &'static str) -> String {

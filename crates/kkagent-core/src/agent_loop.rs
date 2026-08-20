@@ -457,8 +457,8 @@ impl AgentLoop {
             .cloned()
             .collect();
 
-        // Progressive disclosure only where the wire format natively supports
-        // message-level `tools` (see `dynamic_tools_enabled`).
+        // Progressive disclosure is native for message-level tool dialects,
+        // and can be explicitly enabled for other model capabilities.
         let dynamic_tools_enabled = crate::dynamic_tools::dynamic_tools_enabled(
             self.config.tools.dynamically_loaded_tools,
             capability.supports("dynamically_loaded_tools"),
@@ -471,9 +471,10 @@ impl AgentLoop {
             crate::dynamic_tools::inject_deferred_tools_diff(session, &visible_defs);
         }
 
-        // When dynamic loading is on, top-level tools[] is the immutable core
-        // set (Inline only) and deferred schemas are injected as message-level
-        // tools after SelectTools. When off, all tools are sent in one batch.
+        // When dynamic loading is on, the request starts with the core set
+        // (Inline only). Deferred schemas are loaded after SelectTools: Kimi
+        // keeps them on messages, while other adapters merge them into the
+        // top-level tools[] request. When off, all tools are sent in one batch.
         let mut tool_defs: Vec<ToolDef> = visible_defs
             .iter()
             .filter(|td| td.name != "ReadMediaFile" || capability.vision)
@@ -652,6 +653,13 @@ Do not mention this reminder to the user.\n</system-reminder>"
                 max_tokens: model_config.max_output_size.map(|v| v as u32),
                 system: Some(system_prompt.clone()),
                 thinking: thinking.clone(),
+                prompt_cache_key: openai_prompt_cache_key(
+                    provider_config,
+                    &active_capability,
+                    &model_config.model,
+                    &system_prompt,
+                    &tool_defs,
+                ),
                 first_token_timeout: kkagent_config::resolve_first_token_timeout(
                     model_config,
                     provider_config,
@@ -2833,6 +2841,43 @@ fn tool_allowed(session: &Session, name: &str) -> bool {
     true
 }
 
+fn openai_prompt_cache_key(
+    provider: &kkagent_config::ProviderConfig,
+    capability: &ModelCapability,
+    model: &str,
+    system: &str,
+    tools: &[ToolDef],
+) -> Option<String> {
+    let openai_wire = matches!(
+        provider.provider_type.as_str(),
+        "openai"
+            | "openai-chat"
+            | "openai-legacy"
+            | "openai-responses"
+            | "openai_responses"
+            | "responses"
+    );
+    if !openai_wire {
+        return None;
+    }
+    let official_endpoint = provider.base_url.as_deref().is_none_or(|base| {
+        base.strip_prefix("https://")
+            .or_else(|| base.strip_prefix("http://"))
+            .unwrap_or(base)
+            .split('/')
+            .next()
+            .is_some_and(|host| host.eq_ignore_ascii_case("api.openai.com"))
+    });
+    if !official_endpoint && !capability.supports("prompt_cache_key") {
+        return None;
+    }
+
+    let serialized_tools = serde_json::to_string(tools).unwrap_or_default();
+    let material = format!("{model}\0{system}\0{serialized_tools}");
+    let digest = crate::workspace_registry::sha256_hex(material.as_bytes());
+    Some(format!("kkagent:{}", &digest[..32]))
+}
+
 struct ParallelToolRequest {
     tools: Arc<ToolRegistry>,
     hooks: Option<Arc<kkagent_mcp::HookManager>>,
@@ -4724,5 +4769,56 @@ mod retry_tests {
         assert!(tool_allowed(&session, "ExitPlanMode"));
 
         std::fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[test]
+    fn prompt_cache_key_is_stable_and_limited_to_supported_openai_endpoints() {
+        let official: kkagent_config::ProviderConfig = serde_json::from_value(
+            serde_json::json!({"type": "openai", "base_url": "https://api.openai.com/v1"}),
+        )
+        .unwrap();
+        let custom: kkagent_config::ProviderConfig = serde_json::from_value(
+            serde_json::json!({"type": "openai", "base_url": "https://gateway.example/v1"}),
+        )
+        .unwrap();
+        let anthropic: kkagent_config::ProviderConfig =
+            serde_json::from_value(serde_json::json!({"type": "anthropic"})).unwrap();
+        let plain_model: kkagent_config::ModelConfig =
+            serde_json::from_value(serde_json::json!({"provider": "p", "model": "gpt-test"}))
+                .unwrap();
+        let opted_in_model: kkagent_config::ModelConfig =
+            serde_json::from_value(serde_json::json!({
+                "provider": "p",
+                "model": "gpt-test",
+                "capabilities": ["prompt_cache_key"]
+            }))
+            .unwrap();
+        let plain = ModelCapability::from_model(&plain_model);
+        let opted_in = ModelCapability::from_model(&opted_in_model);
+        let tools = vec![ToolDef {
+            name: "Read".into(),
+            description: "Read a file".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+        }];
+
+        let first = openai_prompt_cache_key(&official, &plain, "gpt-test", "system", &tools)
+            .expect("official OpenAI endpoint should get a cache key");
+        let second = openai_prompt_cache_key(&official, &plain, "gpt-test", "system", &tools)
+            .expect("same prefix should get a cache key");
+        assert_eq!(first, second);
+        assert!(first.starts_with("kkagent:"));
+        assert_eq!(first.len(), "kkagent:".len() + 32);
+
+        assert!(openai_prompt_cache_key(&custom, &plain, "gpt-test", "system", &tools).is_none());
+        assert!(
+            openai_prompt_cache_key(&custom, &opted_in, "gpt-test", "system", &tools).is_some()
+        );
+        assert!(
+            openai_prompt_cache_key(&anthropic, &opted_in, "gpt-test", "system", &tools).is_none()
+        );
+        assert_ne!(
+            first,
+            openai_prompt_cache_key(&official, &plain, "gpt-test", "changed", &tools).unwrap()
+        );
     }
 }

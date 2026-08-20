@@ -32,14 +32,12 @@ Rejects binary/image files — use ReadMediaFile for media."
                 },
                 "offset": {
                     "type": "integer",
-                    "description": "Starting line (1-indexed; negative counts from end). Alias: line_offset."
+                    "description": "Starting line (1-indexed; negative counts from end)"
                 },
                 "limit": {
                     "type": "integer",
-                    "description": "Number of lines to read. Alias: n_lines."
-                },
-                "line_offset": {"type": "integer", "description": "Deprecated alias for offset"},
-                "n_lines": {"type": "integer", "description": "Deprecated alias for limit"}
+                    "description": "Number of lines to read"
+                }
             },
             "required": ["path"]
         })

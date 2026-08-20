@@ -257,7 +257,6 @@ for background jobs (shell_id/stop remain as aliases)."
         background default {DEFAULT_BG_TIMEOUT_S}s (max {MAX_BG_TIMEOUT_S}s). Ignored when disable_timeout=true on background."
                     )
                 },
-                "timeout_ms": {"type": "integer", "description": "Deprecated alias for timeout (milliseconds)"},
                 "run_in_background": {"type": "boolean", "description": "Start in background and return a shell_id / task id immediately"},
                 "disable_timeout": {"type": "boolean", "description": "If true, do not apply a timeout. Only applies when run_in_background is true."},
                 "shell_id": {"type": "string", "description": "Poll a previously started background shell (prefer TaskOutput)"},

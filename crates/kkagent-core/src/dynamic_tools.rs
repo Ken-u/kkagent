@@ -152,11 +152,11 @@ pub fn deferred_names(all_defs: &[ToolDefinition]) -> Vec<String> {
 ///
 /// `SelectTools`-loaded schemas only stay cache-friendly on wire dialects that
 /// natively support `messages[].tools`; elsewhere every load rewrites the
-/// top-level `tools[]` prefix and busts the provider prompt cache. So the
-/// feature needs BOTH:
-///   - the config toggle (`tools.dynamically_loaded_tools`, default on), and
-///   - support, declared via model `capabilities` (`dynamically_loaded_tools`)
-///     or detected from the provider type (Kimi dialect).
+/// top-level `tools[]` prefix and may refresh the provider prompt cache. The
+/// Kimi wire format preserves message-level schemas and therefore keeps
+/// top-level tools[] stable. Other adapters may still opt in through the model
+/// capability; they merge loaded schemas into top-level tools[], accepting a
+/// prompt-cache refresh in exchange for progressive disclosure.
 pub fn dynamic_tools_enabled(
     config_toggle: bool,
     capability_declared: bool,
@@ -720,7 +720,8 @@ mod tests {
         // Kimi dialect natively supports `messages[].tools`.
         assert!(dynamic_tools_enabled(true, false, "kimi"));
 
-        // Explicit capability declaration wins for any provider.
+        // Other providers can opt in explicitly. Their adapters merge loaded
+        // schemas into top-level tools[], so this may refresh the prompt cache.
         assert!(dynamic_tools_enabled(true, true, "openai-chat"));
 
         // Toggle off always disables.

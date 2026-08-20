@@ -69,8 +69,8 @@ impl TokenUsage {
     /// Total input (prompt) tokens across provider semantics.
     ///
     /// When `input_includes_cache` is unknown, fall back to the heuristic:
-    /// Anthropic reports `cache_creation_input_tokens > 0` on cache writes,
-    /// OpenAI-compatible APIs never populate that field.
+    /// Anthropic reports `cache_creation_input_tokens > 0` on cache writes;
+    /// older OpenAI-compatible records generally leave that field empty.
     pub fn total_input_tokens(&self) -> u64 {
         let includes = match self.input_includes_cache {
             Some(flag) => flag,

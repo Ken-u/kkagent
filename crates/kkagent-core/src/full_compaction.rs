@@ -596,6 +596,7 @@ async fn stream_summary(
             "You compress conversation history into a concise factual handoff note.".into(),
         ),
         thinking: None,
+        prompt_cache_key: None,
         first_token_timeout: kkagent_config::resolve_first_token_timeout(model_cfg, provider_cfg),
     };
     let handle = tokio::spawn(async move {

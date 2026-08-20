@@ -44,9 +44,11 @@ impl Tool for SelectToolsTool {
                 "tools": {
                     "type": "array",
                     "items": {"type": "string"},
+                    "minItems": 1,
                     "description": "Deferred tool names to load. Call with exact names listed in the <tools_added>/<tools_removed> announcements."
                 }
-            }
+            },
+            "required": ["tools"]
         })
     }
 

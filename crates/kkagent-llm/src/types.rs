@@ -81,6 +81,9 @@ pub struct LlmRequest {
     pub max_tokens: Option<u32>,
     pub system: Option<String>,
     pub thinking: Option<ThinkingParams>,
+    /// Stable routing key for providers with native prompt-cache routing.
+    /// Omitted for compatible endpoints unless support is known.
+    pub prompt_cache_key: Option<String>,
     /// When set, abort the stream if no meaningful content arrives in time.
     pub first_token_timeout: Option<std::time::Duration>,
 }
@@ -186,6 +189,7 @@ mod tests {
             max_tokens: None,
             system: None,
             thinking: None,
+            prompt_cache_key: None,
             first_token_timeout: None,
         };
         let merged = merge_message_level_tools(&request);
@@ -202,6 +206,7 @@ mod tests {
             max_tokens: None,
             system: None,
             thinking: None,
+            prompt_cache_key: None,
             first_token_timeout: None,
         };
         let merged = merge_message_level_tools(&request);

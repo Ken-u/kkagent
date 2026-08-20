@@ -466,4 +466,40 @@ mod disclosure_tests {
             );
         }
     }
+
+    #[test]
+    fn model_schemas_hide_legacy_aliases_and_require_tool_selection() {
+        let registry = full_registry();
+        let schema = |name: &str| {
+            registry
+                .tool_definitions()
+                .into_iter()
+                .find(|definition| definition.name == name)
+                .unwrap_or_else(|| panic!("{name} missing"))
+                .parameters
+        };
+
+        let grep = schema("Grep");
+        let grep_properties = grep["properties"].as_object().unwrap();
+        for legacy in ["-i", "-A", "-B", "-C"] {
+            assert!(!grep_properties.contains_key(legacy));
+        }
+        assert!(grep_properties.contains_key("case_insensitive"));
+        assert!(grep_properties.contains_key("context"));
+
+        let read = schema("Read");
+        let read_properties = read["properties"].as_object().unwrap();
+        assert!(!read_properties.contains_key("line_offset"));
+        assert!(!read_properties.contains_key("n_lines"));
+
+        let bash = schema("Bash");
+        assert!(!bash["properties"]
+            .as_object()
+            .unwrap()
+            .contains_key("timeout_ms"));
+
+        let select = schema("SelectTools");
+        assert_eq!(select["required"], serde_json::json!(["tools"]));
+        assert_eq!(select["properties"]["tools"]["minItems"], 1);
+    }
 }

@@ -145,7 +145,6 @@ pub async fn anthropic_stream(
     if !tools.is_empty() {
         body["tools"] = json!(tools);
     }
-
     if let Some(thinking) = &request.thinking {
         if thinking.adaptive {
             body["thinking"] = json!({"type": "adaptive"});
@@ -590,6 +589,11 @@ async fn chat_completions_stream(
     }
     if !tools.is_empty() {
         body["tools"] = json!(tools);
+    }
+    if !kimi {
+        if let Some(key) = &request.prompt_cache_key {
+            body["prompt_cache_key"] = json!(key);
+        }
     }
 
     let resp = client
@@ -1072,6 +1076,12 @@ fn update_openai_usage(usage: &mut TokenUsage, value: &serde_json::Value) {
                 .and_then(|token| token.as_u64())
         })
         .unwrap_or(usage.cache_read_input_tokens);
+    usage.cache_creation_input_tokens = value
+        .get("prompt_tokens_details")
+        .or_else(|| value.get("input_tokens_details"))
+        .and_then(|details| details.get("cache_write_tokens"))
+        .and_then(|token| token.as_u64())
+        .unwrap_or(usage.cache_creation_input_tokens);
     // OpenAI-compatible: prompt_tokens already includes cached tokens.
     usage.input_includes_cache = Some(true);
 }
@@ -1154,12 +1164,13 @@ mod tests {
             &json!({
                 "prompt_tokens": 1000,
                 "completion_tokens": 200,
-                "prompt_tokens_details": {"cached_tokens": 950}
+                "prompt_tokens_details": {"cached_tokens": 950, "cache_write_tokens": 25}
             }),
         );
         assert_eq!(usage.input_tokens, 1000);
         assert_eq!(usage.output_tokens, 200);
         assert_eq!(usage.cache_read_input_tokens, 950);
+        assert_eq!(usage.cache_creation_input_tokens, 25);
         assert_eq!(usage.input_includes_cache, Some(true));
 
         // DeepSeek shape: flat prompt_cache_hit_tokens.
@@ -1322,6 +1333,7 @@ mod tests {
             max_tokens: Some(128),
             system: Some("be helpful".into()),
             thinking: None,
+            prompt_cache_key: None,
             first_token_timeout: None,
         }
     }
@@ -1795,6 +1807,7 @@ mod tests {
         let sse = "data: [DONE]\n";
         let (base_url, captured) = serve_once("200 OK", "text/event-stream", sse).await;
         let mut request = request();
+        request.prompt_cache_key = Some("kkagent:stable".into());
         request.tools = vec![ToolDef {
             name: "SelectTools".into(),
             description: "load".into(),
@@ -1817,6 +1830,7 @@ mod tests {
             .filter_map(|t| t["function"]["name"].as_str())
             .collect();
         assert_eq!(names, vec!["SelectTools", "mcp__server__tool"]);
+        assert_eq!(body["prompt_cache_key"], "kkagent:stable");
         let roles: Vec<&str> = body["messages"]
             .as_array()
             .unwrap()

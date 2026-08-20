@@ -283,6 +283,7 @@ impl SessionBtwService {
             max_tokens: model_config.max_output_size.map(|v| v as u32),
             system: Some(SIDE_QUESTION_SYSTEM_REMINDER.to_string()),
             thinking: None,
+            prompt_cache_key: None,
             first_token_timeout: kkagent_config::resolve_first_token_timeout(
                 model_config,
                 provider_config,

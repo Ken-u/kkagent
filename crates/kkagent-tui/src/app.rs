@@ -5689,10 +5689,7 @@ impl TuiApp {
                 detail: u.turns.to_string(),
             },
         ];
-        // Only Anthropic-style usage has an explicit cache-write billing
-        // bucket (`input_includes_cache == Some(false)`). For other providers
-        // the field is structurally always 0 — hide the row instead of showing
-        // a permanent (and confusing) 0.
+        // Hide the cache-write row when the provider did not report writes.
         if !cache_creation_is_real_semantics(u) {
             items.retain(|item| item.id != "cache_c");
         }
@@ -11246,12 +11243,10 @@ fn effective_total_input(u: &SessionUsageTotals) -> u64 {
     }
 }
 
-/// Whether `cache_creation_tokens` is a real billable bucket for this
-/// provider's usage semantics (Anthropic-style, where `input_tokens`
-/// excludes cache buckets) or structurally always zero (OpenAI / Gemini /
-/// DeepSeek / Kimi cache server-side with no write bucket).
+/// Whether the provider reported a billable cache-write bucket. Anthropic
+/// reports it outside input_tokens; newer OpenAI models report it as a subset.
 fn cache_creation_is_real_semantics(u: &SessionUsageTotals) -> bool {
-    u.input_includes_cache == Some(false) || u.cache_creation_tokens > 0
+    u.cache_creation_tokens > 0
 }
 
 /// Session totals carry provider-native semantics:
@@ -11268,7 +11263,9 @@ fn estimate_usd(
     cache_c: f64,
     cache_r: f64,
 ) -> f64 {
-    let uncached_input = effective_total_input(u).saturating_sub(u.cache_read_tokens);
+    let uncached_input = effective_total_input(u)
+        .saturating_sub(u.cache_read_tokens)
+        .saturating_sub(u.cache_creation_tokens);
     (uncached_input as f64) * in_price / 1_000_000.0
         + (u.output_tokens as f64) * out_price / 1_000_000.0
         + (u.cache_creation_tokens as f64) * cache_c / 1_000_000.0
@@ -12063,14 +12060,15 @@ mod usage_cost_tests {
         let u = SessionUsageTotals {
             input_tokens: 5_000,
             output_tokens: 50_000,
-            cache_creation_tokens: 0,
-            cache_read_tokens: 95_000,
+            cache_creation_tokens: 2_000,
+            cache_read_tokens: 93_000,
             steps: 1,
             turns: 1,
             input_includes_cache: Some(false),
         };
         let usd = estimate_usd(&u, 3.0, 15.0, 3.75, 0.3);
-        let expected = (5_000.0 * 3.0 + 95_000.0 * 0.3 + 50_000.0 * 15.0) / 1_000_000.0;
+        let expected =
+            (5_000.0 * 3.0 + 2_000.0 * 3.75 + 93_000.0 * 0.3 + 50_000.0 * 15.0) / 1_000_000.0;
         assert!((usd - expected).abs() < 1e-9);
         // Effective input adds the cache bucket.
         assert_eq!(effective_total_input(&u), 100_000);
@@ -12103,8 +12101,7 @@ mod usage_cost_tests {
         assert_eq!(effective_total_input(&legacy_openai), 100_000);
     }
 
-    /// /usage hides the Cache creation row for providers without an explicit
-    /// cache-write bucket (OpenAI / Gemini / DeepSeek / Kimi).
+    /// /usage shows the cache-write row only when a provider reports writes.
     #[test]
     fn cache_creation_row_hidden_for_non_anthropic_semantics() {
         let openai_style = SessionUsageTotals {
@@ -12117,6 +12114,12 @@ mod usage_cost_tests {
             input_includes_cache: Some(true),
         };
         assert!(!cache_creation_is_real_semantics(&openai_style));
+
+        let openai_with_writes = SessionUsageTotals {
+            cache_creation_tokens: 4_000,
+            ..openai_style.clone()
+        };
+        assert!(cache_creation_is_real_semantics(&openai_with_writes));
 
         let legacy = SessionUsageTotals {
             input_tokens: 100_000,
@@ -12138,7 +12141,23 @@ mod usage_cost_tests {
             turns: 1,
             input_includes_cache: Some(false),
         };
-        assert!(cache_creation_is_real_semantics(&anthropic));
+        assert!(!cache_creation_is_real_semantics(&anthropic));
+    }
+
+    #[test]
+    fn estimate_usd_openai_cache_writes_are_not_double_billed() {
+        let u = SessionUsageTotals {
+            input_tokens: 100_000,
+            output_tokens: 0,
+            cache_creation_tokens: 20_000,
+            cache_read_tokens: 70_000,
+            steps: 1,
+            turns: 1,
+            input_includes_cache: Some(true),
+        };
+        let usd = estimate_usd(&u, 3.0, 15.0, 3.75, 0.3);
+        let expected = (10_000.0 * 3.0 + 20_000.0 * 3.75 + 70_000.0 * 0.3) / 1_000_000.0;
+        assert!((usd - expected).abs() < 1e-9);
     }
 }
 
