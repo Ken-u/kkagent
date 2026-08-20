@@ -1072,8 +1072,7 @@ impl Session {
 
     /// Inject the server-authoritative workspace root using Kimi's working-directory framing.
     pub fn inject_working_directory_context(&mut self) {
-        self.system_prompt
-            .push_str(&working_directory_context(&self.working_dir));
+        self.system_prompt.push_str(working_directory_context());
     }
 
     /// Append AGENTS.md / `.kkagent/AGENTS.md` into the system prompt (kimi-style workspace instructions).
@@ -1356,20 +1355,13 @@ fn reverse_mutating_tools(messages: &[ChatMessage], working_dir: &std::path::Pat
     }
 }
 
-fn working_directory_context(working_dir: &std::path::Path) -> String {
-    format!(
-        r#"
+fn working_directory_context() -> &'static str {
+    r#"
 
-# Working Environment
+# Workspace
 
-## Working Directory
-
-The current working directory is `{working_dir}`. This should be considered as the project root if you are instructed to perform tasks on the project. Tools may require absolute paths for some parameters; if so, you must use absolute paths for those parameters.
-
-For files inside this project root, prefer paths relative to the working directory in tool parameters and shell commands. Do not repeat the project root with `cd` or `git -C` when the command can run in the session's working directory. Use an absolute path only when a tool requires it or the user explicitly authorizes access outside the working directory.
-"#,
-        working_dir = working_dir.display()
-    )
+Tool paths are relative to the workspace root by default. Prefer relative paths. Use absolute paths only when required to access something outside the workspace.
+"#
 }
 
 fn valid_plan_id(value: &str) -> Option<&str> {
@@ -1729,12 +1721,15 @@ mod working_directory_tests {
     use super::*;
 
     #[test]
-    fn context_names_the_root_and_prefers_relative_paths() {
-        let root = std::path::Path::new("/workspace/project");
-        let context = working_directory_context(root);
-        assert!(context.contains("`/workspace/project`"));
-        assert!(context.contains("prefer paths relative to the working directory"));
-        assert!(context.contains("git -C"));
+    fn context_prefers_relative_paths_without_leaking_the_root() {
+        let context = working_directory_context();
+        assert!(context.contains("# Workspace"));
+        assert!(context.contains("relative to the workspace root by default"));
+        assert!(context.contains("Prefer relative paths"));
+        assert!(context.contains("only when required"));
+        // The concrete root path is intentionally not injected: relative
+        // paths work everywhere, and `pwd` reveals the root when needed.
+        assert!(!context.contains("/workspace/project"));
     }
 
     #[test]
