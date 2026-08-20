@@ -280,7 +280,7 @@ pub struct ClickRecord {
     pub count: u8,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SessionUsageTotals {
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -405,6 +405,7 @@ impl SessionRuntimeState {
         state.prompt_queue = self.prompt_queue;
         state.usage_session = self.usage_session;
         state.usage_turns = self.usage_turns;
+        state.last_step_usage = self.last_step_usage;
         state.context_breakdown = self.context_breakdown;
         state.copy_toast = self.copy_toast;
         state.click_history = self.click_history;
@@ -1144,6 +1145,20 @@ impl AppState {
             tokens,
             self.tool_output_expanded,
         );
+    }
+
+    /// Reset per-session context/usage statistics back to their fresh-session
+    /// defaults. Called when switching to or starting a session so the footer
+    /// context indicator reflects the *new* session instead of leaking the
+    /// previous one's numbers until the next LLM usage event arrives.
+    pub fn reset_context_usage_stats(&mut self) {
+        self.approx_tokens = 0;
+        self.tokens_at_turn_start = 0;
+        self.usage_session = SessionUsageTotals::default();
+        self.usage_turns.clear();
+        self.last_step_usage = None;
+        self.context_breakdown = None;
+        self.status_bar.cache_hit = None;
     }
 
     /// Apply the global tool-output mode to unmodified items in the most recent
@@ -7472,14 +7487,9 @@ impl TuiApp {
         self.state.plan_document = None;
         self.state.plan_scroll_to_top = false;
         self.state.turn_started_at = None;
-        self.state.tokens_at_turn_start = 0;
-        self.state.approx_tokens = 0;
-        self.state.status_bar.cache_hit = None;
+        self.state.reset_context_usage_stats();
         self.state.approval_queue.clear();
         self.state.prompt_queue = crate::prompt_queue::PromptQueue::default();
-        self.state.usage_session = SessionUsageTotals::default();
-        self.state.usage_turns.clear();
-        self.state.context_breakdown = None;
         self.state.scroll_up = 0;
         self.state.follow_bottom = true;
         self.state.render_cache.invalidate_all();
@@ -9284,6 +9294,8 @@ impl TuiApp {
                 self.state.plan_scroll_to_top = false;
                 self.state.status = SessionStatus::Idle;
                 self.state.turn_started_at = None;
+                self.state.reset_context_usage_stats();
+                self.state.render_cache.invalidate_all();
                 let cwd = self.state.working_dir.to_string_lossy().into_owned();
                 let session_id = self
                     .client
@@ -12069,6 +12081,7 @@ mod usage_cost_tests {
 #[cfg(test)]
 mod app_state_tests {
     use super::*;
+    use std::sync::Arc;
 
     fn test_tui_app() -> TuiApp {
         let (client_transport, _server_transport) =
@@ -14694,5 +14707,100 @@ mod app_state_tests {
             u16::MAX - 1,
             "growth near u16::MAX must saturate, not wrap to a small value"
         );
+    }
+
+    #[tokio::test]
+    async fn new_session_resets_context_and_usage_stats() {
+        use futures::FutureExt;
+
+        let (client_transport, server_transport) =
+            kkagent_rpc::transport::memory::create_memory_pair();
+        let (event_tx, event_rx) = tokio::sync::mpsc::channel(16);
+        let rpc = kkagent_rpc::RpcClient::new(client_transport, event_tx);
+        let client = kkagent_client::KkagentClient::new(rpc, event_rx);
+        let handler: kkagent_rpc::server::RequestHandler =
+            Arc::new(move |_id, method, _params, _event_tx| {
+                async move {
+                    match method.as_str() {
+                        "sessions.create" => Ok(serde_json::json!({"session_id": "fresh"})),
+                        "sessions.list" => Ok(serde_json::json!({"sessions": []})),
+                        other => panic!("unexpected RPC method: {other}"),
+                    }
+                }
+                .boxed()
+            });
+        tokio::spawn(async move {
+            kkagent_rpc::RpcServer::new(handler)
+                .serve(server_transport)
+                .await;
+        });
+
+        let mut app = TuiApp::new(AppConfig::default(), client);
+        app.state.session_id = Some("old".into());
+        app.state.tab_strip.ensure_active("old", "old");
+        // Simulate an active session that already burned context: the footer
+        // indicator reads these fields, so a stale value here reproduces the
+        // "new session still shows the old context meter" bug.
+        app.state.approx_tokens = 12345;
+        app.state.tokens_at_turn_start = 12000;
+        app.state.usage_session = SessionUsageTotals {
+            input_tokens: 1000,
+            output_tokens: 500,
+            cache_creation_tokens: 200,
+            cache_read_tokens: 800,
+            steps: 3,
+            turns: 2,
+            input_includes_cache: None,
+        };
+        app.state.usage_turns.push(crate::app::TurnUsageSample {
+            model: None,
+            input_tokens: 500,
+            output_tokens: 250,
+            cache_creation_tokens: 100,
+            cache_read_tokens: 400,
+            input_includes_cache: None,
+            duration_ms: 1_500,
+        });
+        app.state.last_step_usage = Some(kkagent_protocol::TokenUsage {
+            input_tokens: 1,
+            output_tokens: 1,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            input_includes_cache: None,
+        });
+        app.state.context_breakdown = Some(kkagent_protocol::ContextBreakdownInfo::default());
+
+        app.handle_slash_command("/new").await.unwrap();
+
+        assert_eq!(app.state.session_id.as_deref(), Some("fresh"));
+        assert_eq!(
+            app.state.approx_tokens, 0,
+            "context indicator must reset for the new session"
+        );
+        assert_eq!(app.state.tokens_at_turn_start, 0);
+        assert_eq!(app.state.usage_session, SessionUsageTotals::default());
+        assert!(app.state.usage_turns.is_empty());
+        assert!(app.state.last_step_usage.is_none());
+        assert!(app.state.context_breakdown.is_none());
+    }
+
+    #[test]
+    fn restore_runtime_state_recovers_last_step_usage() {
+        let mut state = AppState::new(PermissionMode::Manual, false);
+        state.last_step_usage = Some(kkagent_protocol::TokenUsage {
+            input_tokens: 1,
+            output_tokens: 1,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            input_includes_cache: None,
+        });
+        let captured = SessionRuntimeState::capture(&state);
+
+        // Emulate switching to another session (stats reset)…
+        state.reset_context_usage_stats();
+        assert!(state.last_step_usage.is_none());
+        // …and coming back: the captured snapshot must restore it.
+        captured.restore(&mut state);
+        assert!(state.last_step_usage.is_some());
     }
 }
