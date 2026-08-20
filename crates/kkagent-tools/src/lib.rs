@@ -445,6 +445,7 @@ mod disclosure_tests {
         let mut expected = [
             "Agent",
             "EnterPlanMode",
+            "ExitPlanMode",
             "Web",
             "ReadMediaFile",
             "Goal",

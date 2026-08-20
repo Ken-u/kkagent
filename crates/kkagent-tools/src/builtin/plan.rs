@@ -24,19 +24,14 @@ impl Tool for ExitPlanModeTool {
     }
 
     fn description(&self) -> &str {
-        "Use this tool when you are in plan mode and have finished writing your plan with WritePlan \
-         and are ready for user approval.\n\n\
-         ## How This Tool Works\n\
-         - You should have already submitted the complete plan through WritePlan.\n\
-         - This tool does NOT take the plan content as a parameter — it reads the host-managed plan document.\n\
-         - The user will see the plan and choose 执行 / 修改意见 / 拒绝. In auto permission mode, the tool \
-         exits plan mode without asking.\n\n\
-         ## Multiple Approaches\n\
-         If your plan offers multiple alternative approaches, pass them via the `options` parameter so the \
-         user can choose which one to execute. Do not use reserved labels (执行/拒绝/修改意见/Approve/Reject/Revise).\n\n\
-         ## Before Using\n\
-         - Do NOT use AskUserQuestion to ask \"Is this plan OK?\" — that is exactly what ExitPlanMode does.\n\
-         - If rejected with feedback, call WritePlan with the complete revised document, then call ExitPlanMode again."
+        "Request user approval for the plan you submitted via WritePlan. \
+The plan content is read from the host-managed document, not from parameters. \
+If the plan offers multiple alternative approaches, pass them via `options`. \
+If rejected with feedback, revise via WritePlan and call this tool again."
+    }
+
+    fn disclosure(&self) -> crate::ToolDisclosure {
+        crate::ToolDisclosure::Deferred
     }
 
     fn parameters_schema(&self) -> Value {
@@ -47,7 +42,7 @@ impl Tool for ExitPlanModeTool {
                     "type": "array",
                     "minItems": 1,
                     "maxItems": 3,
-                    "description": "When the plan contains multiple alternative approaches, list them so the user can choose which to execute. 2-3 distinct approaches work best. Do not use 执行/拒绝/修改意见/Approve/Reject/Revise as labels.",
+                    "description": "Alternative approaches for the user to choose from (2-3). Avoid reserved labels like 执行/拒绝/修改意见/Approve/Reject/Revise.",
                     "items": {
                         "type": "object",
                         "properties": {
@@ -55,11 +50,11 @@ impl Tool for ExitPlanModeTool {
                                 "type": "string",
                                 "minLength": 1,
                                 "maxLength": 80,
-                                "description": "Short name for this option (1-8 words). Append \"(Recommended)\" if recommended."
+                                "description": "Short name (1-8 words); append \"(Recommended)\" if recommended."
                             },
                             "description": {
                                 "type": "string",
-                                "description": "Brief summary of this approach and its trade-offs."
+                                "description": "Brief summary and trade-offs."
                             }
                         },
                         "required": ["label"]
