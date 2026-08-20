@@ -291,30 +291,26 @@ impl Drop for WorkspaceRegistryLease {
 
 /// Soft startup reminder when other sessions share the workspace.
 pub fn startup_concurrent_reminder(others: &[SessionRegistration]) -> String {
-    let ids: Vec<&str> = others.iter().map(|r| r.session_id.as_str()).collect();
-    let list = ids.join(", ");
-    format!(
-        r#"
+    let _ = others; // count only; the model has no session-id operations
+    r#"
 
 # Concurrent Sessions
 
-Other active session(s) are already using this workspace: [{list}].
-Be careful when modifying shared files — edits from another session may conflict with yours.
+Other active session(s) are already using this workspace.
+Existing uncommitted changes may belong to the user or to those concurrent sessions: never overwrite, revert, or commit changes unrelated to your task — scope edits to what the request actually implies.
 For larger or risky changes, consider creating a separate git worktree so each session has an isolated working tree.
 "#
-    )
+    .to_string()
 }
 
 /// Strong reminder appended to first write/Bash tool result via `<system-reminder>`.
 pub fn write_concurrent_reminder(others: &[SessionRegistration]) -> String {
-    let ids: Vec<&str> = others.iter().map(|r| r.session_id.as_str()).collect();
-    let list = ids.join(", ");
-    let body = format!(
-        "CONCURRENT SESSION RISK: other active session(s) [{list}] are using this same workspace. \
-Your write may overwrite or conflict with their changes. Prefer creating a git worktree to isolate work. \
-If you continue here, re-read files before editing and coordinate carefully with the other session(s)."
-    );
-    crate::system_reminder::wrap(&body)
+    let _ = others; // count only; the model has no session-id operations
+    let body = "CONCURRENT SESSION RISK: other active session(s) are using this same workspace. \
+Existing changes may belong to the user or to those sessions — never overwrite, revert, or commit unrelated changes. \
+Prefer creating a git worktree to isolate work. \
+If you continue here, re-read files before editing and keep edits scoped to your own task.";
+    crate::system_reminder::wrap(body)
 }
 
 /// Stable map key for `{path → hash}` tracking.
@@ -422,11 +418,13 @@ mod tests {
 
             let reminder = startup_concurrent_reminder(&peers);
             assert!(reminder.contains("Concurrent Sessions"));
-            assert!(reminder.contains("sess-a"));
+            assert!(reminder.contains("never overwrite, revert, or commit"));
+            assert!(!reminder.contains("sess-a"));
 
             let strong = write_concurrent_reminder(&peers);
             assert!(strong.contains("<system-reminder>"));
-            assert!(strong.contains("sess-a"));
+            assert!(strong.contains("CONCURRENT SESSION RISK"));
+            assert!(!strong.contains("sess-a"));
 
             drop(lease_a);
             let peers_after = list_active_peers(&root, &work, "sess-b");
@@ -553,7 +551,10 @@ mod tests {
                 sess_b.system_prompt.contains("Concurrent Sessions"),
                 "startup soft reminder missing"
             );
-            assert!(sess_b.system_prompt.contains("sess-a"));
+            assert!(sess_b
+                .system_prompt
+                .contains("never overwrite, revert, or commit"));
+            assert!(!sess_b.system_prompt.contains("sess-a"));
 
             let mut out = ToolOutput::success("edited");
             sess_b.maybe_append_concurrent_write_reminder("Edit", &mut out);
