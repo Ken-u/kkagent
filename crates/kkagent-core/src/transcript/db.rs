@@ -42,9 +42,7 @@ impl MigrateFileLock {
     fn acquire(path: &Path) -> anyhow::Result<Self> {
         use std::os::windows::io::AsRawHandle;
         use windows_sys::Win32::Foundation::HANDLE;
-        use windows_sys::Win32::Storage::FileSystem::{
-            LockFileEx, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY,
-        };
+        use windows_sys::Win32::Storage::FileSystem::{LockFileEx, LOCKFILE_EXCLUSIVE_LOCK};
         let file = std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
