@@ -1086,12 +1086,6 @@ impl Session {
         }
     }
 
-    pub fn inject_date_reminder(&mut self) {
-        let today = chrono::Local::now().format("%Y-%m-%d (%A)");
-        self.system_prompt
-            .push_str(&format!("\n\n# Date\n\nToday's date is {today}.\n"));
-    }
-
     /// Register this session in the workspace registry and inject a soft concurrent reminder.
     pub fn attach_workspace_concurrency_guard(&mut self) {
         self.attach_workspace_concurrency_guard_in(None);

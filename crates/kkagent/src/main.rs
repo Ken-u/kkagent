@@ -1781,7 +1781,6 @@ struct AgentAcpHost {
 async fn initialize_session_context(state: &ServerState, session: &mut Session) {
     session.image_config = state.config().image.clone();
     session.inject_working_directory_context();
-    session.inject_date_reminder();
     session.inject_workspace_instructions().await;
     session.attach_workspace_concurrency_guard();
     let skill_section = state

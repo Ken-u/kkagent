@@ -1,12 +1,6 @@
 //! Unified system-reminder injection helpers.
 
-use chrono::Local;
 use std::path::Path;
-
-pub fn date_reminder() -> String {
-    let today = Local::now().format("%Y-%m-%d (%A)");
-    format!("<system-reminder>\nToday's date is {today}.\n</system-reminder>")
-}
 
 pub fn interruption_reminder() -> String {
     "<system-reminder>\nThe previous turn was interrupted. Resume carefully without repeating completed work.\n</system-reminder>"
