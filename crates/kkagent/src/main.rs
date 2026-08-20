@@ -1518,6 +1518,7 @@ async fn run_server(
             init_config_path,
             init_shutdown,
             init_http_security,
+            None,
         )
         .await
         {
@@ -4709,22 +4710,30 @@ async fn build_server_state(
         config_path,
         shutdown_tx,
         kkagent_rpc::HttpSecurityOptions::default(),
+        None,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn build_server_state_with_shutdown(
     config: Arc<AppConfig>,
     config_path: PathBuf,
     shutdown_tx: watch::Sender<bool>,
     http_security: kkagent_rpc::HttpSecurityOptions,
+    // Test-only override for the transcript DB path. Production callers
+    // pass None and get `<config dir>/transcripts.db`; tests must pass a
+    // unique temp path so they neither race the shared schema nor touch
+    // the user's real transcript data.
+    transcript_db_override: Option<PathBuf>,
 ) -> Result<Arc<ServerState>> {
     let startup_started = std::time::Instant::now();
     let (events, _) = tokio::sync::broadcast::channel(1024);
     let allow_in_memory = std::env::var("KKAGENT_ALLOW_IN_MEMORY_TRANSCRIPTS")
         .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
-    let transcript_path = kkagent_config::default_config_dir().join("transcripts.db");
+    let transcript_path = transcript_db_override
+        .unwrap_or_else(|| kkagent_config::default_config_dir().join("transcripts.db"));
     let (shared_sqlite, persistence_durable, persistence_error) =
         open_transcript_with_policy(&transcript_path, allow_in_memory)?;
     // One Connection for transcript + durable HTTP + subagents (avoid triple open/busy_timeout).
@@ -9949,14 +9958,21 @@ mod runtime_http_tests {
     }
 
     /// Minimal ServerState for RPC-level tests: default config, no plugins/MCP.
+    /// Uses a unique temp transcript DB per call so parallel tests never share
+    /// a SQLite schema (SQLITE_SCHEMA race) nor touch the user's real
+    /// `~/.kkagent/transcripts.db`.
     async fn test_server_state() -> Arc<ServerState> {
         let config = Arc::new(AppConfig::default());
         let (shutdown_tx, _) = watch::channel(false);
+        let temp_db_dir =
+            std::env::temp_dir().join(format!("kkagent-test-home-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_db_dir).unwrap();
         let state = build_server_state_with_shutdown(
             config,
             PathBuf::from("/tmp/kkagent-test-config.toml"),
             shutdown_tx,
             kkagent_rpc::HttpSecurityOptions::default(),
+            Some(temp_db_dir.join("transcripts.db")),
         )
         .await
         .unwrap();
