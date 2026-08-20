@@ -47,7 +47,7 @@ pub struct ImageSource {
     pub data: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -198,6 +198,30 @@ mod tests {
         };
         assert_eq!(u.total_input_tokens(), 100_000);
         assert_eq!(u.context_size(), 101_000);
+    }
+
+    #[test]
+    fn cache_hit_ratio_anthropic_pure_read_stays_under_100_percent() {
+        // Warm-cache follow-up call: no cache write, tiny uncached input,
+        // huge cache read. The None heuristic would treat input as
+        // all-inclusive and divide read(95k)/input(500) — 190x over.
+        // With the explicit Anthropic flag the ratio must stay ≤ 1.0.
+        let ratio = cache_hit_ratio_ex(500, 0, 95_000, Some(false));
+        assert_eq!(ratio, Some(95_000.0 / 95_500.0));
+        assert!(ratio.unwrap() <= 1.0);
+
+        // Method form (footer controller path) must agree.
+        let u = TokenUsage {
+            input_tokens: 500,
+            output_tokens: 100,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 95_000,
+            input_includes_cache: Some(false),
+        };
+        assert_eq!(u.cache_hit_ratio(), ratio);
+
+        // No cache activity at all → no ratio to show.
+        assert_eq!(cache_hit_ratio_ex(1_000, 0, 0, None), None);
     }
 
     #[test]

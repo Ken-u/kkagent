@@ -75,10 +75,15 @@ impl SessionEventRouter {
                 // `approx_tokens` assignment in app.rs; the value is re-synced
                 // from `approx_tokens` every render frame via components.rs.)
                 status.tokens = usage.context_size();
-                status.cache_hit = kkagent_protocol::cache_hit_ratio(
+                // Provider semantics must ride along: with Anthropic data
+                // (input excludes cache buckets) and the None heuristic, a
+                // pure cache-read request (creation == 0, read >> input) makes
+                // read/input blow past 1.0.
+                status.cache_hit = kkagent_protocol::cache_hit_ratio_ex(
                     usage.input_tokens,
                     usage.cache_creation_input_tokens,
                     usage.cache_read_input_tokens,
+                    usage.input_includes_cache,
                 );
             }
             _ => {}

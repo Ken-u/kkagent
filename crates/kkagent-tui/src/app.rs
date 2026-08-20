@@ -10852,6 +10852,10 @@ impl TuiApp {
                         // Context indicator = full prompt actually sent (cache
                         // tokens included via provider-aware helper) + output.
                         self.state.approx_tokens = usage.context_size();
+                        // Latest-request snapshot for /usage and the footer
+                        // cache indicator — without this the "Latest request"
+                        // section goes stale until the next session switch.
+                        self.state.last_step_usage = Some(usage.clone());
                         let s = &mut self.state.usage_session;
                         s.input_tokens = s.input_tokens.saturating_add(usage.input_tokens);
                         s.output_tokens = s.output_tokens.saturating_add(usage.output_tokens);
@@ -10861,6 +10865,13 @@ impl TuiApp {
                         s.cache_read_tokens = s
                             .cache_read_tokens
                             .saturating_add(usage.cache_read_input_tokens);
+                        // Track the provider's input semantics across calls so
+                        // session-level ratios use the right denominator
+                        // (Anthropic pure-read totals would otherwise inflate
+                        // past 100% via the None heuristic).
+                        if usage.input_includes_cache.is_some() {
+                            s.input_includes_cache = usage.input_includes_cache;
+                        }
                         s.steps = steps;
                         s.turns = turns;
                         if let Some(ctx) = context {
@@ -12986,6 +12997,50 @@ mod app_state_tests {
             .iter()
             .any(|tab| tab.id == "running"));
         assert!(app.state.session_delete_confirm.is_none());
+    }
+
+    #[tokio::test]
+    async fn usage_update_refreshes_latest_request_and_session_semantics() {
+        let mut app = test_tui_app();
+        app.state.session_id = Some("s".into());
+
+        // Anthropic-style pure cache-read request: input excludes cache
+        // buckets, no cache write happened, nearly everything hit the cache.
+        let usage = kkagent_protocol::TokenUsage {
+            input_tokens: 500,
+            output_tokens: 200,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 95_000,
+            input_includes_cache: Some(false),
+        };
+        app.handle_server_event(Frame::Event {
+            event: "agent".into(),
+            scope: None,
+            data: serde_json::to_value(AgentEvent::UsageUpdate {
+                session_id: "s".into(),
+                usage: usage.clone(),
+                context: None,
+                steps: 3,
+                turns: 1,
+            })
+            .unwrap(),
+        });
+
+        // Latest-request snapshot must update live (powers /usage "Latest
+        // request" and the footer cache indicator), not only on session
+        // switch.
+        assert_eq!(app.state.last_step_usage, Some(usage));
+        // Footer cache hit: denominator must include the cache buckets, so a
+        // pure-read request stays ≤ 100%.
+        let hit = app.state.status_bar.cache_hit.expect("cache hit shown");
+        assert!(
+            hit <= 1.0,
+            "cache hit ratio must not exceed 100% (got {hit})"
+        );
+        // Session totals track the provider semantics flag for their own
+        // ratio display.
+        assert_eq!(app.state.usage_session.input_includes_cache, Some(false));
+        assert_eq!(app.state.usage_session.cache_read_tokens, 95_000);
     }
 
     #[tokio::test]
