@@ -289,20 +289,6 @@ impl Drop for WorkspaceRegistryLease {
     }
 }
 
-/// Soft startup reminder when other sessions share the workspace.
-pub fn startup_concurrent_reminder(others: &[SessionRegistration]) -> String {
-    let _ = others; // count only; the model has no session-id operations
-    r#"
-
-# Concurrent Sessions
-
-Other active session(s) are already using this workspace.
-Existing uncommitted changes may belong to the user or to those concurrent sessions: never overwrite, revert, or commit changes unrelated to your task — scope edits to what the request actually implies.
-For larger or risky changes, consider creating a separate git worktree so each session has an isolated working tree.
-"#
-    .to_string()
-}
-
 /// Strong reminder appended to first write/Bash tool result via `<system-reminder>`.
 pub fn write_concurrent_reminder(others: &[SessionRegistration]) -> String {
     let _ = others; // count only; the model has no session-id operations
@@ -415,11 +401,6 @@ mod tests {
             let peers = list_active_peers(&root, &work, "sess-b");
             assert_eq!(peers.len(), 1);
             assert_eq!(peers[0].session_id, "sess-a");
-
-            let reminder = startup_concurrent_reminder(&peers);
-            assert!(reminder.contains("Concurrent Sessions"));
-            assert!(reminder.contains("never overwrite, revert, or commit"));
-            assert!(!reminder.contains("sess-a"));
 
             let strong = write_concurrent_reminder(&peers);
             assert!(strong.contains("<system-reminder>"));
@@ -548,12 +529,9 @@ mod tests {
             );
             sess_b.attach_workspace_concurrency_guard_in(Some(&root));
             assert!(
-                sess_b.system_prompt.contains("Concurrent Sessions"),
-                "startup soft reminder missing"
+                !sess_b.system_prompt.contains("Concurrent Sessions"),
+                "concurrency awareness must stay out of the system prompt"
             );
-            assert!(sess_b
-                .system_prompt
-                .contains("never overwrite, revert, or commit"));
             assert!(!sess_b.system_prompt.contains("sess-a"));
 
             let mut out = ToolOutput::success("edited");

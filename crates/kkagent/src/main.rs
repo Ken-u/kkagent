@@ -102,6 +102,11 @@ struct Cli {
     #[arg(long)]
     no_alt_screen: bool,
 
+    /// Print the fully composed system prompt for the current workspace and exit
+    /// (no model call, no session side effects)
+    #[arg(long)]
+    dump_system_prompt: bool,
+
     /// Disable Bash OS sandboxing and resource limits for this process (unsafe)
     #[arg(long)]
     disable_sandbox: bool,
@@ -278,6 +283,14 @@ fn apply_runtime_overrides(cli: &Cli, config: &mut AppConfig) {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    // --dump-system-prompt prints to stdout and must not disturb the TUI.
+    if cli.dump_system_prompt {
+        if cli.command.is_some() || cli.prompt.is_some() {
+            anyhow::bail!("--dump-system-prompt cannot be combined with a subcommand or --prompt");
+        }
+        return run_dump_system_prompt(cli.config.as_deref()).await;
+    }
+
     let is_tui = cli.command.is_none() && cli.prompt.is_none();
     init_logging(is_tui)?;
 
@@ -291,6 +304,9 @@ async fn main() -> Result<()> {
 }
 
 fn runtime_mode(cli: &Cli) -> &'static str {
+    if cli.dump_system_prompt {
+        return "dump_system_prompt";
+    }
     match (&cli.command, &cli.prompt) {
         (Some(Commands::Server { .. }), _) => "server",
         (Some(Commands::Acp), _) => "acp",
@@ -520,7 +536,7 @@ _kkagent() {{
   local cur="${{COMP_WORDS[COMP_CWORD]}}"
   local cmds="server acp auth init config doctor completions"
   if [[ ${{COMP_CWORD}} -eq 1 ]]; then
-    COMPREPLY=( $(compgen -W "$cmds --help --version --config --yolo --auto --plan --prompt --resume --connect --no-alt-screen" -- "$cur") )
+    COMPREPLY=( $(compgen -W "$cmds --help --version --config --yolo --auto --plan --prompt --resume --connect --no-alt-screen --dump-system-prompt" -- "$cur") )
   elif [[ ${{COMP_WORDS[1]}} == server ]]; then
     COMPREPLY=( $(compgen -W "stop status --listen --http --help" -- "$cur") )
   fi
@@ -544,6 +560,7 @@ _arguments \
   '-r[Resume session]:id:' \
   '--connect[Connect to server]:endpoint:' \
   '--no-alt-screen[Keep primary screen]' \
+  '--dump-system-prompt[Print the composed system prompt and exit]' \
   '1:command:(server acp auth init config doctor completions)'
 "#
             );
@@ -561,6 +578,7 @@ complete -c kkagent -l resume -r
 complete -c kkagent -s r -l resume -r
 complete -c kkagent -l connect -r
 complete -c kkagent -l no-alt-screen
+complete -c kkagent -l dump-system-prompt
 "#
             );
         }
@@ -1783,17 +1801,73 @@ async fn initialize_session_context(state: &ServerState, session: &mut Session) 
     session.inject_working_directory_context();
     session.inject_workspace_instructions().await;
     session.attach_workspace_concurrency_guard();
-    let skill_section = state
-        .skills
+    append_composed_prompt_sections(&state.skills, &state.plugins, session).await;
+}
+
+/// Append the workspace-composed prompt sections (skills catalog, plugin
+/// prompts) that every session shares, regardless of entry point.
+async fn append_composed_prompt_sections(
+    skills: &kkagent_tools::SkillCatalog,
+    plugins: &kkagent_core::PluginManager,
+    session: &mut Session,
+) {
+    let skill_section = skills
         .catalog_prompt_section_for(&session.working_dir)
         .await;
     if !skill_section.is_empty() {
         session.system_prompt.push_str(&skill_section);
     }
-    let plugin_section = state.plugins.prompt_append_all().await;
+    let plugin_section = plugins.prompt_append_all().await;
     if !plugin_section.is_empty() {
         session.system_prompt.push_str(&plugin_section);
     }
+}
+
+/// Print the fully composed system prompt for the current workspace and exit,
+/// without contacting any model or writing session state.
+///
+/// Composes through the same code path a real session uses. The session is
+/// built with `Session::for_subagent`, so the session store is never touched;
+/// the workspace concurrency lease is RAII and cleans itself up on drop.
+async fn run_dump_system_prompt(config_path: Option<&Path>) -> Result<()> {
+    let config = load_config(config_path)?;
+    let working_dir = std::env::current_dir().context("failed to resolve current directory")?;
+
+    let mut session = Session::for_subagent(
+        "dump-system-prompt".to_string(),
+        working_dir.clone(),
+        PermissionMode::default(),
+        config
+            .default_model_alias()
+            .unwrap_or("default")
+            .to_string(),
+    );
+    session.image_config = config.image.clone();
+    session.inject_working_directory_context();
+    session.inject_workspace_instructions().await;
+    session.attach_workspace_concurrency_guard();
+
+    let (skills, plugins) = {
+        let plugins_dir = kkagent_config::default_config_dir().join("plugins");
+        tokio::join!(
+            kkagent_tools::SkillCatalog::configured(
+                &working_dir,
+                &config.extra_skill_dirs,
+                config.merge_all_available_skills,
+            ),
+            kkagent_core::PluginManager::discover(&plugins_dir),
+        )
+    };
+    skills.set_disabled(config.disabled_skills.clone()).await;
+    append_composed_prompt_sections(&skills, &plugins, &mut session).await;
+
+    print!("{}", session.effective_system_prompt());
+    use std::io::Write;
+    io::stdout().flush()?;
+    // Ephemeral subagent scratch dir (SessionCreateSource::Subagent) — remove
+    // it on every exit path so temp storage never accumulates.
+    let _ = std::fs::remove_dir_all(session.session_dir());
+    Ok(())
 }
 
 async fn ensure_session_loaded(state: &Arc<ServerState>, session_id: &str) -> Result<(), String> {

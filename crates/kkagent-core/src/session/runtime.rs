@@ -1091,6 +1091,11 @@ impl Session {
     }
 
     /// Like [`Self::attach_workspace_concurrency_guard`], with an optional registry root (tests).
+    ///
+    /// Registers this session in the workspace registry only. Concurrent-session
+    /// awareness is delivered just-in-time via
+    /// [`Self::maybe_append_concurrent_write_reminder`] on the first write/Bash
+    /// tool result, so nothing is baked into the system prompt here.
     pub fn attach_workspace_concurrency_guard_in(
         &mut self,
         registry_root: Option<&std::path::Path>,
@@ -1107,13 +1112,6 @@ impl Session {
                     &self.working_dir,
                 ),
             };
-        }
-        let peers = self.list_workspace_peers();
-        if !peers.is_empty() {
-            self.system_prompt
-                .push_str(&crate::workspace_registry::startup_concurrent_reminder(
-                    &peers,
-                ));
         }
     }
 
