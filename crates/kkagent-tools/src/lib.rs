@@ -23,8 +23,7 @@ pub use builtin::{
 };
 pub use registry::*;
 pub use toolchain::{
-    deny_toolchain_mutation, doctor_report, toolchain_sandbox_overlay, GrantAccess, ToolchainGrant,
-    ToolchainGrantStore, ToolchainSandboxOverlay,
+    deny_toolchain_mutation, doctor_report, toolchain_sandbox_overlay, ToolchainSandboxOverlay,
 };
 pub use web_providers::WebServicesConfig;
 
@@ -417,15 +416,6 @@ mod disclosure_tests {
         }
         let cron = Arc::new(builtin::cron::CronManager::default());
         registry.register(Arc::new(builtin::CronTool::new(cron)));
-        let grants = Arc::new(toolchain::ToolchainGrantStore::default());
-        registry.register(Arc::new(builtin::RequestToolchainAccessTool::new(
-            grants.clone(),
-            true,
-        )));
-        registry.register(Arc::new(builtin::ToolchainDoctorTool::new(
-            kkagent_config::ToolchainConfig::default(),
-            grants,
-        )));
         registry
     }
 
@@ -450,8 +440,6 @@ mod disclosure_tests {
             "ReadMediaFile",
             "Goal",
             "Cron",
-            "RequestToolchainAccess",
-            "ToolchainDoctor",
         ]
         .to_vec();
         expected.sort_unstable();

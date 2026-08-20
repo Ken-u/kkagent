@@ -259,6 +259,10 @@ async fn ensure_builtin_skills() -> anyhow::Result<()> {
             "write-goal",
             "# write-goal\n\nHelp craft a clear CreateGoal description with measurable done criteria and budgets.\n",
         ),
+        (
+            "toolchain-sandbox",
+            "# toolchain-sandbox\n\nDiagnose sandbox / toolchain failures (blocked installs, cache paths, missing mounts).\n\nUse when:\n- A Bash command is rejected with a `Blocked toolchain mutation` message (e.g. `npm install -g`): the deny list protects host toolchains; use a workspace-local install instead (`npm_config_cache`/`CARGO_HOME` etc. are redirected to `~/.kkagent/toolchains` when enabled).\n- A build picks up the wrong cache/registry path, or seems to re-download everything: caches are profile-scoped and env-redirected only under workspace sandbox mode.\n- You need the current toolchain posture (profiles, env keys, cache sizes, deny patterns): run `kkagent doctor` (add `--json` for machine-readable output) via Bash — the `toolchain` check embeds the full report.\n\nPersisting extra paths: grants are no longer a runtime tool; declare them statically in `~/.kkagent/config.toml` under `[toolchain.profiles.<name>]` (`runtime_read_only` / `agent_cache_read_write` / `env`).\n",
+        ),
     ];
     for (name, body) in builtins {
         let directory = root.join(name);

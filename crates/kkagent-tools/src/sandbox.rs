@@ -156,20 +156,15 @@ impl SandboxPolicy {
     pub fn from_app_config(config: &kkagent_config::AppConfig) -> anyhow::Result<Self> {
         let mut policy = Self::from_config(&config.sandbox)?;
         policy.workspace_trust = config.workspace_trust.workspaces.clone();
-        policy.toolchain_overlay =
-            crate::toolchain::toolchain_sandbox_overlay(&config.toolchain, &[]);
+        policy.toolchain_overlay = crate::toolchain::toolchain_sandbox_overlay(&config.toolchain);
         if policy.toolchain_overlay.force_network {
             policy.network = true;
         }
         Ok(policy)
     }
 
-    pub fn refresh_toolchain(
-        &mut self,
-        config: &kkagent_config::ToolchainConfig,
-        grants: &[crate::toolchain::ToolchainGrant],
-    ) {
-        self.toolchain_overlay = crate::toolchain::toolchain_sandbox_overlay(config, grants);
+    pub fn refresh_toolchain(&mut self, config: &kkagent_config::ToolchainConfig) {
+        self.toolchain_overlay = crate::toolchain::toolchain_sandbox_overlay(config);
         if self.toolchain_overlay.force_network {
             self.network = true;
         }

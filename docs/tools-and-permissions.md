@@ -23,12 +23,12 @@
 为节省上下文，内置工具按使用频率分三层（基于 196 个会话、14,447 次调用的统计）：
 
 - **Inline 常驻**：`Read`、`Write`、`Edit`、`Grep`、`Glob`、`Bash`、`TaskOutput`、`TodoList`、`Skill`、`AskUserQuestion`、`SelectTools` 及 `WritePlan`/`ExitPlanMode`（仅 Plan 模式激活时）。完整 schema 始终随请求发送。
-- **Deferred 按需加载**：`Agent`、`EnterPlanMode`、`Web`、`ReadMediaFile`、`Goal`、`Cron`、`RequestToolchainAccess`、`ToolchainDoctor` 及全部 MCP 工具。仅在请求中以名字公告，模型调用 `SelectTools` 按名加载 schema 后使用。
+- **Deferred 按需加载**：`Agent`、`EnterPlanMode`、`Web`、`ReadMediaFile`、`Goal`、`Cron` 及全部 MCP 工具。仅在请求中以名字公告，模型调用 `SelectTools` 按名加载 schema 后使用。
 - **条件可见**：`WritePlan`/`ExitPlanMode` 仅在 Plan 模式激活时出现在工具列表；执行层（permission guard）独立兜底，隐藏不影响安全性。
 
 渐进式披露仅在**原生支持 `messages[].tools` 的线格式**上启用（Kimi provider，或模型 `capabilities` 声明 `dynamically_loaded_tools`）：加载的 schema 追加在历史消息里，顶层 `tools[]` 保持字节级稳定，provider prompt cache 不受影响。其他 provider（OpenAI/Anthropic/Google）即使 `tools.dynamically_loaded_tools = true` 也会退化为一次性全量发送——因为它们每次加载都要重写顶层 `tools[]` 前缀，会反复击穿缓存。
 
-基线约 4.5k token 的工具 schema 降至常规请求约 2.3k token（约 -49%）。随后通过合并语义重叠的冷门工具（Task/Agent/AgentSwarm → Agent；TaskList/TaskStop → TaskOutput action；Goal 四件套 → Goal；Cron 三件套 → Cron；WebSearch/FetchURL → Web），并把零调用的沙箱元工具（RequestToolchainAccess、ToolchainDoctor）转为 Deferred，工具总数从 29 降至 19，公告名从 15 降至 8，inline schema 降至 12 个。
+基线约 4.5k token 的工具 schema 降至常规请求约 2.3k token（约 -49%）。随后通过合并语义重叠的冷门工具（Task/Agent/AgentSwarm → Agent；TaskList/TaskStop → TaskOutput action；Goal 四件套 → Goal；Cron 三件套 → Cron；WebSearch/FetchURL → Web），并把零调用的沙箱元工具（RequestToolchainAccess、ToolchainDoctor）转为 Deferred，工具总数从 29 降至 19，公告名从 15 降至 8，inline schema 降至 12 个。再后来这两个沙箱元工具因长期零调用被彻底移除：工具链诊断并入 `kkagent doctor`（`toolchain` 检查项含完整报告与缓存配额告警），一次性路径授权改为在 `~/.kkagent/config.toml` 的 `[toolchain.profiles.<name>]` 里静态声明（`runtime_read_only` / `agent_cache_read_write` / `env`），模型侧引导收敛到内置 skill `toolchain-sandbox`。
 
 ## 图片输入
 

@@ -1,88 +1,8 @@
 //! Toolchain sandbox helpers: deny checks, mount/env injection, doctor report.
 
 use kkagent_config::{builtin_deny_patterns, ResolvedToolchainProfile, ToolchainConfig};
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
-
-/// Runtime grants approved via `RequestToolchainAccess`.
-#[derive(Debug, Default, Clone)]
-pub struct ToolchainGrantStore {
-    inner: Arc<Mutex<Vec<ToolchainGrant>>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ToolchainGrant {
-    pub path: PathBuf,
-    pub access: GrantAccess,
-    pub reason: String,
-    pub profile: Option<String>,
-    pub scope: GrantScope,
-    /// Turn ID captured at grant time; used to expire `Turn`-scoped grants.
-    pub turn_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GrantAccess {
-    Read,
-    ReadWrite,
-}
-
-/// How long a [`ToolchainGrant`] remains active.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum GrantScope {
-    /// Valid only for the next single Bash invocation.
-    Once,
-    /// Valid for the current turn (all tool calls within it).
-    Turn,
-    /// Valid for the entire session (default — preserves prior behavior).
-    #[default]
-    Session,
-    /// Valid across all sessions in this workspace.
-    Workspace,
-}
-
-impl ToolchainGrantStore {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn grant(&self, grant: ToolchainGrant) {
-        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(existing) = guard.iter_mut().find(|g| g.path == grant.path) {
-            *existing = grant;
-        } else {
-            guard.push(grant);
-        }
-    }
-
-    pub fn snapshot(&self) -> Vec<ToolchainGrant> {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner()).clone()
-    }
-
-    /// Remove grants whose lifetime has ended.
-    ///
-    /// - `Once` — always removed (caller invokes [`Self::consume_once`] after
-    ///   each Bash execution, but this is a safety net).
-    /// - `Turn` — removed when `turn_id` differs from `current_turn_id`.
-    /// - `Session` / `Workspace` — never pruned here.
-    pub fn prune_expired(&self, current_turn_id: &str) {
-        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        guard.retain(|g| match g.scope {
-            GrantScope::Once => false,
-            GrantScope::Turn => g.turn_id.as_deref() == Some(current_turn_id),
-            GrantScope::Session | GrantScope::Workspace => true,
-        });
-    }
-
-    /// Consume all `Once`-scoped grants. Called after each Bash invocation.
-    pub fn consume_once(&self) {
-        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        guard.retain(|g| g.scope != GrantScope::Once);
-    }
-}
 
 /// Return an error message if `command` matches a toolchain global-install deny rule.
 ///
@@ -102,8 +22,8 @@ pub fn deny_toolchain_mutation(command: &str, config: &ToolchainConfig) -> Optio
             if lower.contains(&collapse_ws(pat)) {
                 return Some(format!(
                     "Blocked toolchain mutation `{pat}`. \
-Use workspace-local installs, or call RequestToolchainAccess for a scoped grant. \
-Host toolchains stay read-only; agent caches live under {}.",
+Use workspace-local installs instead; host toolchains stay read-only, \
+agent caches live under {}.",
                     config.cache_root().display()
                 ));
             }
@@ -114,7 +34,7 @@ Host toolchains stay read-only; agent caches live under {}.",
                 if !p.is_empty() && lower.contains(&p) {
                     return Some(format!(
                         "Blocked by toolchain profile `{}` deny rule `{pat}`. \
-RequestToolchainAccess if a scoped exception is required.",
+Use a workspace-local install instead.",
                         profile.name
                     ));
                 }
@@ -166,23 +86,14 @@ fn collapse_ws(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// Aggregate read-only / read-write paths and env for all enabled profiles + grants.
-pub fn toolchain_sandbox_overlay(
-    config: &ToolchainConfig,
-    grants: &[ToolchainGrant],
-) -> ToolchainSandboxOverlay {
+/// Aggregate read-only / read-write paths and env for all enabled profiles.
+pub fn toolchain_sandbox_overlay(config: &ToolchainConfig) -> ToolchainSandboxOverlay {
     let mut overlay = ToolchainSandboxOverlay::default();
     if !config.enabled {
         return overlay;
     }
     for profile in config.all_resolved() {
         merge_profile_into_overlay(&mut overlay, &profile);
-    }
-    for grant in grants {
-        match grant.access {
-            GrantAccess::Read => overlay.extra_read.push(grant.path.clone()),
-            GrantAccess::ReadWrite => overlay.extra_write.push(grant.path.clone()),
-        }
     }
     overlay.extra_read.sort();
     overlay.extra_read.dedup();
@@ -222,7 +133,7 @@ pub struct ToolchainSandboxOverlay {
 }
 
 /// Human-readable doctor report for toolchain profiles.
-pub fn doctor_report(config: &ToolchainConfig, grants: &[ToolchainGrant]) -> String {
+pub fn doctor_report(config: &ToolchainConfig) -> String {
     let mut lines = Vec::new();
     lines.push(format!(
         "toolchain: enabled={} root={} max_cache_bytes={}",
@@ -250,19 +161,6 @@ pub fn doctor_report(config: &ToolchainConfig, grants: &[ToolchainGrant]) -> Str
         ));
         for (k, v) in &profile.env {
             lines.push(format!("    env {k}={v}"));
-        }
-    }
-    if grants.is_empty() {
-        lines.push("  grants: (none)".into());
-    } else {
-        lines.push(format!("  grants: {}", grants.len()));
-        for g in grants {
-            lines.push(format!(
-                "    {:?} {} ({})",
-                g.access,
-                g.path.display(),
-                g.reason
-            ));
         }
     }
     lines.push(format!(
@@ -313,119 +211,12 @@ mod tests {
             root: Some(tmp.display().to_string()),
             ..Default::default()
         };
-        let overlay = toolchain_sandbox_overlay(&cfg, &[]);
+        let overlay = toolchain_sandbox_overlay(&cfg);
         assert!(!overlay.extra_write.is_empty());
         assert!(
             overlay.env.contains_key("CARGO_HOME") || overlay.env.contains_key("npm_config_cache")
         );
         let _ = std::fs::remove_dir_all(tmp);
-    }
-
-    #[test]
-    fn grant_store_upserts_by_path() {
-        let store = ToolchainGrantStore::new();
-        store.grant(ToolchainGrant {
-            path: PathBuf::from("/tmp/a"),
-            access: GrantAccess::Read,
-            reason: "once".into(),
-            profile: None,
-            scope: GrantScope::Session,
-            turn_id: None,
-        });
-        store.grant(ToolchainGrant {
-            path: PathBuf::from("/tmp/a"),
-            access: GrantAccess::ReadWrite,
-            reason: "upgrade".into(),
-            profile: Some("rust".into()),
-            scope: GrantScope::Session,
-            turn_id: None,
-        });
-        let snap = store.snapshot();
-        assert_eq!(snap.len(), 1);
-        assert_eq!(snap[0].access, GrantAccess::ReadWrite);
-    }
-
-    #[test]
-    fn grant_store_prunes_once_scope_after_consume() {
-        let store = ToolchainGrantStore::new();
-        store.grant(ToolchainGrant {
-            path: PathBuf::from("/tmp/once"),
-            access: GrantAccess::Read,
-            reason: "once".into(),
-            profile: None,
-            scope: GrantScope::Once,
-            turn_id: None,
-        });
-        store.grant(ToolchainGrant {
-            path: PathBuf::from("/tmp/session"),
-            access: GrantAccess::Read,
-            reason: "session".into(),
-            profile: None,
-            scope: GrantScope::Session,
-            turn_id: None,
-        });
-        assert_eq!(store.snapshot().len(), 2);
-        store.consume_once();
-        let snap = store.snapshot();
-        assert_eq!(snap.len(), 1);
-        assert_eq!(snap[0].path, PathBuf::from("/tmp/session"));
-    }
-
-    #[test]
-    fn grant_store_prunes_turn_scope_when_turn_changes() {
-        let store = ToolchainGrantStore::new();
-        store.grant(ToolchainGrant {
-            path: PathBuf::from("/tmp/old-turn"),
-            access: GrantAccess::Read,
-            reason: "old".into(),
-            profile: None,
-            scope: GrantScope::Turn,
-            turn_id: Some("session:5".into()),
-        });
-        store.grant(ToolchainGrant {
-            path: PathBuf::from("/tmp/current-turn"),
-            access: GrantAccess::Read,
-            reason: "current".into(),
-            profile: None,
-            scope: GrantScope::Turn,
-            turn_id: Some("session:6".into()),
-        });
-        store.grant(ToolchainGrant {
-            path: PathBuf::from("/tmp/session"),
-            access: GrantAccess::Read,
-            reason: "session".into(),
-            profile: None,
-            scope: GrantScope::Session,
-            turn_id: None,
-        });
-        store.prune_expired("session:6");
-        let snap = store.snapshot();
-        assert_eq!(snap.len(), 2);
-        assert!(snap
-            .iter()
-            .any(|g| g.path == std::path::Path::new("/tmp/current-turn")));
-        assert!(snap
-            .iter()
-            .any(|g| g.path == std::path::Path::new("/tmp/session")));
-        assert!(!snap
-            .iter()
-            .any(|g| g.path == std::path::Path::new("/tmp/old-turn")));
-    }
-
-    #[test]
-    fn grant_store_keeps_workspace_scope_across_turns() {
-        let store = ToolchainGrantStore::new();
-        store.grant(ToolchainGrant {
-            path: PathBuf::from("/tmp/workspace"),
-            access: GrantAccess::Read,
-            reason: "workspace".into(),
-            profile: None,
-            scope: GrantScope::Workspace,
-            turn_id: None,
-        });
-        store.prune_expired("any-turn");
-        store.consume_once();
-        assert_eq!(store.snapshot().len(), 1);
     }
 
     // --- deny_toolchain_mutation bypass tests ---

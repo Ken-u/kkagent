@@ -3355,46 +3355,29 @@ async fn build_turn_tool_registry(
         // `0` is not a meaningful timeout (would kill instantly); treat as unset.
         .filter(|seconds| *seconds > 0)
         .unwrap_or(kkagent_tools::builtin::bash::DEFAULT_TIMEOUT_S);
-    tools.register(Arc::new(
-        kkagent_tools::builtin::BashTool::new(
-            state.bash_shells.clone(),
-            kkagent_tools::builtin::BashOptions {
-                auto_background_on_timeout,
-                sandbox: state.sandbox_snapshot(),
-                default_timeout_s,
-                toolchain: state.config().toolchain.clone(),
-                kaos: {
-                    let cfg = state.config();
-                    let remote = kkagent_kaos::RemoteConfig {
-                        enabled: cfg.remote.enabled,
-                        host: cfg.remote.host.clone(),
-                        port: cfg.remote.port,
-                        user: cfg.remote.user.clone(),
-                        identity_file: cfg.remote.identity_file.clone(),
-                        remote_cwd: cfg.remote.remote_cwd.clone(),
-                    };
-                    kkagent_kaos::environment_from_remote(
-                        Some(&remote),
-                        std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-                    )
-                },
+    tools.register(Arc::new(kkagent_tools::builtin::BashTool::new(
+        state.bash_shells.clone(),
+        kkagent_tools::builtin::BashOptions {
+            auto_background_on_timeout,
+            sandbox: state.sandbox_snapshot(),
+            default_timeout_s,
+            toolchain: state.config().toolchain.clone(),
+            kaos: {
+                let cfg = state.config();
+                let remote = kkagent_kaos::RemoteConfig {
+                    enabled: cfg.remote.enabled,
+                    host: cfg.remote.host.clone(),
+                    port: cfg.remote.port,
+                    user: cfg.remote.user.clone(),
+                    identity_file: cfg.remote.identity_file.clone(),
+                    remote_cwd: cfg.remote.remote_cwd.clone(),
+                };
+                kkagent_kaos::environment_from_remote(
+                    Some(&remote),
+                    std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+                )
             },
-        )
-        .with_grant_store(state.toolchain_grants.clone()),
-    ));
-    let path_isolation = matches!(
-        state.sandbox_snapshot().mode,
-        kkagent_tools::sandbox::SandboxMode::Workspace
-    );
-    tools.register(Arc::new(
-        kkagent_tools::builtin::RequestToolchainAccessTool::new(
-            state.toolchain_grants.clone(),
-            path_isolation,
-        ),
-    ));
-    tools.register(Arc::new(kkagent_tools::builtin::ToolchainDoctorTool::new(
-        state.config().toolchain.clone(),
-        state.toolchain_grants.clone(),
+        },
     )));
     register_mcp_tools(&mut tools, &state.mcp).await;
 
@@ -3541,10 +3524,6 @@ async fn run_http_turn(
     .with_tool_result_store(state.tool_result_store.clone())
     .with_transcript_db(state.transcript.lock().await.clone());
 
-    // Prune expired toolchain grants (Once/Turn scope) before the turn starts.
-    let turn_id = format!("{}:{}", session.id, session.messages.len());
-    state.toolchain_grants.prune_expired(&turn_id);
-
     let result = agent.run_turn(&mut session).await;
     let steer_result = session.close_and_apply_steers();
     let persist_result = {
@@ -3605,7 +3584,6 @@ struct ServerState {
     mcp: Arc<McpManager>,
     /// Shared background shell jobs for Bash tool.
     bash_shells: Arc<kkagent_tools::builtin::BackgroundShellManager>,
-    toolchain_grants: Arc<kkagent_tools::toolchain::ToolchainGrantStore>,
     cron: Arc<kkagent_tools::CronManager>,
     /// Per-session goal state (isolated; each persisted under the session's wire dir).
     goal_managers: Mutex<HashMap<String, Arc<kkagent_protocol::goal::GoalManager>>>,
@@ -4955,7 +4933,6 @@ async fn build_server_state_with_shutdown(
         subagents,
         mcp,
         bash_shells: Arc::new(kkagent_tools::builtin::BackgroundShellManager::new()),
-        toolchain_grants: Arc::new(kkagent_tools::toolchain::ToolchainGrantStore::new()),
         cron,
         cron_fires,
         goal_managers,

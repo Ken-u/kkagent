@@ -668,18 +668,55 @@ fn doctor_toolchain(config: &AppConfig, checks: &mut Vec<JsonValue>) {
         ));
         return;
     }
-    let profiles = tc.all_resolved();
-    let names: Vec<_> = profiles.iter().map(|p| p.name.as_str()).collect();
-    checks.push(check(
-        "toolchain",
-        "ok",
-        format!(
-            "root={}, profiles=[{}]",
+    let report = kkagent_tools::doctor_report(tc);
+    // Warn when agent-owned caches approach the configured quota.
+    let cache_bytes: u64 = tc
+        .all_resolved()
+        .iter()
+        .flat_map(|p| p.agent_cache_read_write.iter())
+        .map(|p| dir_size_approx(p))
+        .sum();
+    let status = if cache_bytes > tc.max_cache_bytes.saturating_mul(9) / 10 {
+        "warn"
+    } else {
+        "ok"
+    };
+    let hint = if status == "warn" {
+        Some(&format!(
+            "prune {} (≈{} MiB of {} MiB quota)",
             tc.cache_root().display(),
-            names.join(", ")
-        ),
-        None,
-    ));
+            cache_bytes / (1024 * 1024),
+            tc.max_cache_bytes / (1024 * 1024)
+        ))
+    } else {
+        None
+    };
+    checks.push(check("toolchain", status, report, hint.map(String::as_str)));
+}
+
+/// Best-effort on-disk size of `path` (depth-limited, non-fatal on errors).
+fn dir_size_approx(path: &Path) -> u64 {
+    fn walk(path: &Path, depth: u32, total: &mut u64) {
+        if depth > 6 {
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(path) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_file() {
+                *total = total.saturating_add(entry.metadata().map(|m| m.len()).unwrap_or(0));
+            } else if file_type.is_dir() {
+                walk(&entry.path(), depth + 1, total);
+            }
+        }
+    }
+    let mut total = 0u64;
+    walk(path, 0, &mut total);
+    total
 }
 
 async fn probe_provider(config: &AppConfig) -> JsonValue {

@@ -203,9 +203,7 @@ pub fn infer_accesses(
         }
         "Bash" | "Agent" | "AskUserQuestion" | "EnterPlanMode" | "WritePlan" | "ExitPlanMode"
         | "SelectTools" | "TodoList" | "Skill" | "Cron" => tool_accesses::all(),
-        "Web" | "TaskOutput" | "RequestToolchainAccess" | "ToolchainDoctor" => {
-            tool_accesses::none()
-        }
+        "Web" | "TaskOutput" => tool_accesses::none(),
         n if n.starts_with("mcp__") => tool_accesses::all(),
         _ => {
             if tool_name.ends_with("Read") {

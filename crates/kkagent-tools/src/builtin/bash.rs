@@ -203,8 +203,6 @@ impl Default for BackgroundShellManager {
 pub struct BashTool {
     backgrounds: Arc<BackgroundShellManager>,
     options: BashOptions,
-    /// Live grant store for per-execution sandbox overlay refresh.
-    grants: Option<Arc<crate::toolchain::ToolchainGrantStore>>,
 }
 
 impl BashTool {
@@ -212,28 +210,14 @@ impl BashTool {
         Self {
             backgrounds,
             options,
-            grants: None,
         }
     }
 
-    /// Attach a live grant store so the sandbox overlay is refreshed from the
-    /// latest grants on every Bash invocation.
-    pub fn with_grant_store(mut self, grants: Arc<crate::toolchain::ToolchainGrantStore>) -> Self {
-        self.grants = Some(grants);
-        self
-    }
-
-    /// Build a sandbox policy with the latest toolchain overlay (profile +
-    /// live grants). When no grant store is attached, returns the frozen
-    /// policy from `BashOptions`.
+    /// Build the effective sandbox policy. The toolchain overlay is baked in
+    /// by `SandboxPolicy::from_app_config` at startup; profile changes take
+    /// effect on the next session.
     fn effective_sandbox(&self) -> crate::sandbox::SandboxPolicy {
-        if let Some(grants) = &self.grants {
-            let mut policy = self.options.sandbox.clone();
-            policy.refresh_toolchain(&self.options.toolchain, &grants.snapshot());
-            policy
-        } else {
-            self.options.sandbox.clone()
-        }
+        self.options.sandbox.clone()
     }
 }
 
@@ -325,8 +309,6 @@ for background jobs (shell_id/stop remain as aliases)."
         }
         let safety_note = crate::shell_safety::safety_prefix(&risk).unwrap_or_default();
 
-        // Refresh the sandbox overlay from live grants so that
-        // RequestToolchainAccess grants take effect immediately.
         let effective_sandbox = self.effective_sandbox();
 
         let description = input
@@ -528,11 +510,6 @@ impl BashTool {
             )
             .await;
         });
-        // Once-scoped grants are consumed as soon as the sandbox is set up,
-        // even for background commands.
-        if let Some(grants) = &self.grants {
-            grants.consume_once();
-        }
         Ok(ToolOutput::success(format!(
             "Background shell started: {description} (shell_id={id}). \
 Also available as task_id={id} via TaskOutput/TaskStop."
@@ -616,11 +593,6 @@ Also available as task_id={id} via TaskOutput/TaskStop."
             }
             return Ok(ToolOutput::error(result));
         };
-        // Once-scoped grants have been baked into the sandbox; consume them
-        // before the command result is returned.
-        if let Some(grants) = &self.grants {
-            grants.consume_once();
-        }
         match wait_result {
             Ok(Ok(status)) => {
                 join_pump(pump).await;
