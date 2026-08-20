@@ -5689,6 +5689,13 @@ impl TuiApp {
                 detail: u.turns.to_string(),
             },
         ];
+        // Only Anthropic-style usage has an explicit cache-write billing
+        // bucket (`input_includes_cache == Some(false)`). For other providers
+        // the field is structurally always 0 — hide the row instead of showing
+        // a permanent (and confusing) 0.
+        if !cache_creation_is_real_semantics(u) {
+            items.retain(|item| item.id != "cache_c");
+        }
 
         // Context breakdown with progress bars (server-authoritative when
         // available; falls back to a local estimate otherwise).
@@ -11228,6 +11235,14 @@ fn effective_total_input(u: &SessionUsageTotals) -> u64 {
     }
 }
 
+/// Whether `cache_creation_tokens` is a real billable bucket for this
+/// provider's usage semantics (Anthropic-style, where `input_tokens`
+/// excludes cache buckets) or structurally always zero (OpenAI / Gemini /
+/// DeepSeek / Kimi cache server-side with no write bucket).
+fn cache_creation_is_real_semantics(u: &SessionUsageTotals) -> bool {
+    u.input_includes_cache == Some(false) || u.cache_creation_tokens > 0
+}
+
 /// Session totals carry provider-native semantics:
 /// - Anthropic: `input_tokens` excludes both cache buckets.
 /// - OpenAI: `input_tokens` already includes cached tokens.
@@ -12075,6 +12090,44 @@ mod usage_cost_tests {
             input_includes_cache: None,
         };
         assert_eq!(effective_total_input(&legacy_openai), 100_000);
+    }
+
+    /// /usage hides the Cache creation row for providers without an explicit
+    /// cache-write bucket (OpenAI / Gemini / DeepSeek / Kimi).
+    #[test]
+    fn cache_creation_row_hidden_for_non_anthropic_semantics() {
+        let openai_style = SessionUsageTotals {
+            input_tokens: 100_000,
+            output_tokens: 1_000,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 95_000,
+            steps: 2,
+            turns: 1,
+            input_includes_cache: Some(true),
+        };
+        assert!(!cache_creation_is_real_semantics(&openai_style));
+
+        let legacy = SessionUsageTotals {
+            input_tokens: 100_000,
+            output_tokens: 1_000,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 95_000,
+            steps: 2,
+            turns: 1,
+            input_includes_cache: None,
+        };
+        assert!(!cache_creation_is_real_semantics(&legacy));
+
+        let anthropic = SessionUsageTotals {
+            input_tokens: 5_000,
+            output_tokens: 1_000,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 95_000,
+            steps: 2,
+            turns: 1,
+            input_includes_cache: Some(false),
+        };
+        assert!(cache_creation_is_real_semantics(&anthropic));
     }
 }
 

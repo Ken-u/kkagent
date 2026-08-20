@@ -33,6 +33,52 @@ fn anthropic_model_ceiling(model: &str) -> Option<u32> {
     None
 }
 
+/// Anthropic prompt caching: annotate prefix breakpoints with
+/// `cache_control` so agent turns reuse the stable prefix (system + tools)
+/// and the growing conversation tail. Cache reads bill at ~10% of the base
+/// input price, which typically cuts input cost by 80-90% for long
+/// multi-step sessions. Anthropic allows at most 4 breakpoints per request;
+/// we use exactly: system (1), last tool definition (1), and the last
+/// content block of the final two messages (2). Marking the second-to-last
+/// message keeps a fallback checkpoint that still hits when the final
+/// message differs between retries.
+fn apply_anthropic_cache_breakpoints(body: &mut serde_json::Value) {
+    let mark = || json!({"type": "ephemeral"});
+    // System: string form -> single cached text block (already-block form ->
+    // mark the last block).
+    if let Some(system) = body.get_mut("system") {
+        if let Some(text) = system.as_str().map(str::to_string) {
+            *system = json!([{
+                "type": "text",
+                "text": text,
+                "cache_control": mark(),
+            }]);
+        } else if let Some(blocks) = system.as_array_mut() {
+            if let Some(last) = blocks.last_mut() {
+                last["cache_control"] = mark();
+            }
+        }
+    }
+    // Tools: cache the whole tool list by marking its final definition.
+    if let Some(tools) = body.get_mut("tools").and_then(|t| t.as_array_mut()) {
+        if let Some(last) = tools.last_mut() {
+            last["cache_control"] = mark();
+        }
+    }
+    // Messages: cache the conversation prefix by marking the last content
+    // block of the final two messages.
+    if let Some(messages) = body.get_mut("messages").and_then(|m| m.as_array_mut()) {
+        let start = messages.len().saturating_sub(2);
+        for message in &mut messages[start..] {
+            if let Some(content) = message.get_mut("content").and_then(|c| c.as_array_mut()) {
+                if let Some(block) = content.last_mut() {
+                    block["cache_control"] = mark();
+                }
+            }
+        }
+    }
+}
+
 pub async fn anthropic_stream(
     client: &Client,
     base_url: &str,
@@ -113,6 +159,8 @@ pub async fn anthropic_stream(
             });
         }
     }
+
+    apply_anthropic_cache_breakpoints(&mut body);
 
     tracing::debug!("LLM request URL: {}", url);
     tracing::debug!(
@@ -1569,6 +1617,75 @@ mod tests {
             .contains("x-api-key: secret"));
     }
 
+    #[test]
+    fn anthropic_cache_breakpoints_mark_prefix_and_tail_within_four_limit() {
+        let mut body = json!({
+            "system": "be helpful",
+            "tools": [
+                {"name": "Read", "description": "read a file"},
+                {"name": "Bash", "description": "run a command"}
+            ],
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "m1"}]},
+                {"role": "assistant", "content": [{"type": "text", "text": "m2"}]},
+                {"role": "user", "content": [{"type": "text", "text": "m3"}]},
+                {"role": "assistant", "content": [{"type": "text", "text": "m4"}]}
+            ]
+        });
+        super::apply_anthropic_cache_breakpoints(&mut body);
+
+        // System converted to a cached text block.
+        assert_eq!(body["system"][0]["text"], "be helpful");
+        assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
+
+        // Last tool definition carries the breakpoint for the whole list.
+        assert!(
+            body["tools"][0].get("cache_control").is_none(),
+            "only the final tool is marked"
+        );
+        assert_eq!(body["tools"][1]["cache_control"]["type"], "ephemeral");
+
+        // Only the last two messages are marked, each on its final block.
+        assert!(body["messages"][0]["content"][0]
+            .get("cache_control")
+            .is_none());
+        assert!(body["messages"][1]["content"][0]
+            .get("cache_control")
+            .is_none());
+        assert_eq!(
+            body["messages"][2]["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
+        assert_eq!(
+            body["messages"][3]["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
+
+        // Total breakpoints stay within Anthropic's limit of 4.
+        let marks = serde_json::to_string(&body)
+            .unwrap()
+            .matches("ephemeral")
+            .count();
+        assert_eq!(marks, 4, "system(1) + tools(1) + last two messages(2)");
+    }
+
+    #[test]
+    fn anthropic_cache_breakpoints_cope_with_single_message_and_no_tools() {
+        let mut body = json!({
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "only"}]}
+            ]
+        });
+        super::apply_anthropic_cache_breakpoints(&mut body);
+        // No system/tools keys: only the final message gets marked, no panic.
+        assert!(body.get("system").is_none());
+        assert!(body.get("tools").is_none());
+        assert_eq!(
+            body["messages"][0]["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
+    }
+
     #[tokio::test]
     async fn anthropic_streams_text_tool_and_usage() {
         let sse = concat!(
@@ -1599,7 +1716,9 @@ mod tests {
         assert!(events.iter().any(|event| matches!(event, StreamEvent::MessageEnd { usage, stop_reason } if usage.input_tokens == 4 && usage.output_tokens == 2 && stop_reason.as_deref() == Some("tool_use"))));
         let captured = captured.await.unwrap();
         let body: serde_json::Value = serde_json::from_str(&captured.body).unwrap();
-        assert_eq!(body["system"], "be helpful");
+        // System becomes a cached text block via cache_control breakpoints.
+        assert_eq!(body["system"][0]["text"], "be helpful");
+        assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
         assert_eq!(body["messages"][0]["content"][0]["text"], "hello");
         assert_eq!(body["thinking"]["type"], "adaptive");
         assert_eq!(body["output_config"]["effort"], "high");
