@@ -3931,10 +3931,23 @@ pub(crate) fn push_wrapped_indented_text(
     indent: usize,
     style: Style,
 ) {
-    push_wrapped_text_with_first_line_indent(lines, text, width as usize, style, indent, 0);
+    // Last hop to the terminal: strip escape bytes from untrusted text
+    // (thinking deltas, plan blocks, approval file contents) before wrapping
+    // can split them.
+    let sanitized = crate::sanitize::sanitize_text(text);
+    push_wrapped_text_with_first_line_indent(
+        lines,
+        sanitized.as_ref(),
+        width as usize,
+        style,
+        indent,
+        0,
+    );
 }
 
 fn push_wrapped_text(lines: &mut Vec<Line<'static>>, text: &str, width: usize, style: Style) {
+    let sanitized = crate::sanitize::sanitize_text(text);
+    let text = sanitized.as_ref();
     for logical_line in text.split('\n') {
         for chunk in wrap_str(logical_line, width) {
             lines.push(Line::from(Span::styled(chunk, style)));

@@ -32,6 +32,32 @@ pub const TOOL_EXPAND_TURNS: usize = 5;
 pub(crate) const SPINNER_TICKS_PER_FRAME: usize = 4;
 const STREAM_DRAW_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 
+/// Default cadence for self-healing full repaints. Ratatui only rewrites cells
+/// that differ from its own previous buffer, so once the physical terminal
+/// diverges (torn frame over SSH, an injected escape byte, a dropped write) the
+/// stale cells survive every later diff frame — "ghost" artifacts. Forcing a
+/// clear + full repaint periodically resynchronizes the terminal with the
+/// buffer model. The clear happens inside the synchronized-update window, so
+/// compliant terminals never show an intermediate blank frame.
+const DEFAULT_FULL_REPAINT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// `KKAGENT_FULL_REPAINT_SECS` overrides the full-repaint cadence; `0` disables
+/// the periodic self-heal (Ctrl+L keeps working).
+fn full_repaint_interval_from_env() -> std::time::Duration {
+    std::env::var("KKAGENT_FULL_REPAINT_SECS")
+        .ok()
+        .as_deref()
+        .map(parse_full_repaint_interval)
+        .unwrap_or(DEFAULT_FULL_REPAINT_INTERVAL)
+}
+
+fn parse_full_repaint_interval(raw: &str) -> std::time::Duration {
+    raw.trim()
+        .parse::<u64>()
+        .map(std::time::Duration::from_secs)
+        .unwrap_or(DEFAULT_FULL_REPAINT_INTERVAL)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ServerEventRedraw {
     None,
@@ -79,6 +105,10 @@ pub struct TuiApp {
     /// of input events (mouse movement, trackpad scrolling) spin the event loop
     /// faster and accelerate the spinner / loading animations.
     last_tick_at: std::time::Instant,
+    /// Set by Ctrl+L (and after terminal-size changes): the next frame clears
+    /// the screen and repaints every cell instead of diffing, healing any
+    /// divergence between the terminal and ratatui's buffer model.
+    force_full_redraw: bool,
 }
 
 fn tick_requires_redraw(previous: usize, current: usize, animation_active: bool) -> bool {
@@ -1469,6 +1499,7 @@ impl TuiApp {
             allows_background_detach: false,
             connection_alerted: false,
             last_tick_at: std::time::Instant::now(),
+            force_full_redraw: false,
         }
     }
 
@@ -1649,6 +1680,11 @@ impl TuiApp {
             );
         }
 
+        // A panic in the event loop unwinds past the teardown at the bottom of
+        // this function; the guard restores the terminal from the panic hook
+        // so the shell stays usable (see panic_guard for the thread gating).
+        crate::panic_guard::install();
+        crate::panic_guard::set_active(true);
         enable_raw_mode().map_err(|e| {
             anyhow::anyhow!(
                 "Failed to enter raw mode (is stdin a TTY?): {}. \
@@ -1708,6 +1744,7 @@ impl TuiApp {
         }
 
         // Always restore the terminal, even if the loop failed.
+        crate::panic_guard::set_active(false);
         let _ = disable_raw_mode();
         let _ = self.mouse_mode.disable(terminal.backend_mut());
         if self.use_alt_screen {
@@ -1741,6 +1778,8 @@ impl TuiApp {
         self.state.status_bar.activity = self.jobs.active_notice_text();
         self.draw_frame(terminal)?;
         let mut last_draw_at = std::time::Instant::now();
+        let mut last_full_redraw_at = std::time::Instant::now();
+        let full_repaint_interval = full_repaint_interval_from_env();
         let mut stream_redraw_pending = false;
 
         loop {
@@ -1786,6 +1825,14 @@ impl TuiApp {
                             self.state.input.force_flush_paste(fold);
                             self.state.refresh_slash_menu();
                         }
+                        event_changed = true;
+                    }
+                    Event::Resize(_, _) => {
+                        // Repaint immediately on size change instead of waiting
+                        // for the next event / idle tick: the terminal already
+                        // reflowed its cells, so the stale diff model would
+                        // otherwise keep ghost content on screen.
+                        self.force_full_redraw = true;
                         event_changed = true;
                     }
                     _ => {}
@@ -1913,6 +1960,15 @@ impl TuiApp {
             redraw |= tick_requires_redraw(previous_tick, self.state.tick, animation_active);
             redraw |= stream_redraw_due(stream_redraw_pending, last_draw_at, now);
             redraw |= crate::git_badge::take_updated();
+            // Periodic self-heal: even without any local trigger, resync the
+            // terminal with the buffer model so ghost cells from a torn SSH
+            // frame or injected escape byte cannot outlive one interval.
+            if full_repaint_interval > std::time::Duration::ZERO
+                && now.saturating_duration_since(last_full_redraw_at) >= full_repaint_interval
+            {
+                self.force_full_redraw = true;
+            }
+            redraw |= self.force_full_redraw;
 
             if self.state.should_quit {
                 break;
@@ -1921,6 +1977,10 @@ impl TuiApp {
                 self.draw_frame(terminal)?;
                 last_draw_at = std::time::Instant::now();
                 stream_redraw_pending = false;
+                if self.force_full_redraw {
+                    self.force_full_redraw = false;
+                    last_full_redraw_at = now;
+                }
             }
         }
         Ok(())
@@ -1930,6 +1990,17 @@ impl TuiApp {
         &mut self,
         terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     ) -> anyhow::Result<()> {
+        // Keep the panic-guard owner fresh: tokio may migrate this task to
+        // another worker thread between awaits, and the guard only restores
+        // the terminal for the thread that is actually driving the display.
+        crate::panic_guard::note_owner_thread();
+        // A forced frame clears the screen and repaints every cell. The clear
+        // is queued after BeginSynchronizedUpdate so terminals supporting
+        // synchronized updates (mode 2026) swap it in atomically — no blank
+        // flash on compliant terminals, including over SSH.
+        if self.force_full_redraw {
+            terminal.clear()?;
+        }
         crossterm::queue!(terminal.backend_mut(), BeginSynchronizedUpdate)?;
         let draw_result = terminal
             .draw(|frame| components::render_ui(frame, &mut self.state, &self.config))
@@ -2998,6 +3069,15 @@ impl TuiApp {
             return Ok(());
         }
         let key = crate::platform_keys::normalize_key_event(key);
+
+        // F5: force a full repaint in any mode. Ratatui diffs against its own
+        // buffer model, so ghost cells from a torn SSH frame or an injected
+        // escape byte survive normal redraws; this resyncs the terminal.
+        // (Ctrl+L stays bound to the editor's input-box ToggleExpand.)
+        if key.code == KeyCode::F(5) {
+            self.force_full_redraw = true;
+            return Ok(());
+        }
 
         // Quit dialog (turn still running): Terminate / Background / Cancel
         if self.state.quit_dialog.is_some() {
@@ -12876,6 +12956,45 @@ mod app_state_tests {
             start,
             start + STREAM_DRAW_INTERVAL
         ));
+    }
+
+    #[test]
+    fn full_repaint_interval_parses_from_env_semantics() {
+        // Default / invalid / zero-disable all behave as documented.
+        assert_eq!(
+            parse_full_repaint_interval("10"),
+            std::time::Duration::from_secs(10)
+        );
+        assert_eq!(
+            parse_full_repaint_interval(" 7 "),
+            std::time::Duration::from_secs(7)
+        );
+        assert_eq!(
+            parse_full_repaint_interval("not-a-number"),
+            DEFAULT_FULL_REPAINT_INTERVAL
+        );
+        assert_eq!(parse_full_repaint_interval("0"), std::time::Duration::ZERO);
+    }
+
+    #[tokio::test]
+    async fn f5_forces_a_full_redraw_flag() {
+        let mut app = test_tui_app();
+        assert!(!app.force_full_redraw);
+        app.handle_key(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert!(app.force_full_redraw);
+    }
+
+    #[tokio::test]
+    async fn ctrl_l_still_reaches_the_editor_for_toggle_expand() {
+        // Ctrl+L must NOT be stolen by the global redraw path: it toggles the
+        // expanded input box. F5 owns the repaint action instead.
+        let mut app = test_tui_app();
+        app.handle_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+        assert!(!app.force_full_redraw);
     }
 
     #[tokio::test]

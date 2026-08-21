@@ -16,26 +16,30 @@ impl ToolRenderRegistry {
         // a minimum wider than the terminal: mobile SSH clients commonly
         // report widths in the 20–40 column range.
         let budget = (width as usize).saturating_sub(4);
+        // input_summary carries the command line / file path — sanitize once
+        // here rather than at each fit() call below.
+        let input_summary = crate::sanitize::sanitize_text(&tc.input_summary);
+        let input_summary = input_summary.as_ref();
         let label = match tc.name.as_str() {
-            "Bash" => format!("$ {}", fit(&tc.input_summary, budget.saturating_sub(2))),
+            "Bash" => format!("$ {}", fit(input_summary, budget.saturating_sub(2))),
             "Read" | "Write" | "Edit" => format!(
                 "{} {}",
                 tc.name,
-                fit(&tc.input_summary, budget.saturating_sub(tc.name.len() + 1))
+                fit(input_summary, budget.saturating_sub(tc.name.len() + 1))
             ),
-            "Grep" => format!("grep {}", fit(&tc.input_summary, budget.saturating_sub(5))),
-            "Glob" => format!("glob {}", fit(&tc.input_summary, budget.saturating_sub(5))),
-            "Skill" => format!("Skill {}", fit(&tc.input_summary, budget.saturating_sub(6))),
-            "Goal" => format!("goal {}", fit(&tc.input_summary, budget.saturating_sub(5))),
+            "Grep" => format!("grep {}", fit(input_summary, budget.saturating_sub(5))),
+            "Glob" => format!("glob {}", fit(input_summary, budget.saturating_sub(5))),
+            "Skill" => format!("Skill {}", fit(input_summary, budget.saturating_sub(6))),
+            "Goal" => format!("goal {}", fit(input_summary, budget.saturating_sub(5))),
             "Web" => format!(
                 "{} {}",
                 tc.name,
-                fit(&tc.input_summary, budget.saturating_sub(tc.name.len() + 1))
+                fit(input_summary, budget.saturating_sub(tc.name.len() + 1))
             ),
             other => format!(
                 "{} {}",
                 other,
-                fit(&tc.input_summary, budget.saturating_sub(other.len() + 1))
+                fit(input_summary, budget.saturating_sub(other.len() + 1))
             ),
         };
         fit(&label, budget)
@@ -67,6 +71,10 @@ impl ToolRenderRegistry {
         let Some(ref output) = tc.output else {
             return lines;
         };
+        // Tool output is untrusted (build logs, grep hits, file contents):
+        // strip ANSI/OSC sequences before any wrapping can split them.
+        let output = crate::sanitize::sanitize_text(output);
+        let output = output.as_ref();
         match tc.name.as_str() {
             "Bash" => lines.extend(bash_summary(output, width, theme, max_preview)),
             "Grep" => lines.extend(grep_summary(output, width, theme, max_preview)),

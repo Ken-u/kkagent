@@ -287,6 +287,10 @@ impl InputState {
         if self.expand_paste_marker_at_cursor() {
             return;
         }
+        // Pasted bytes are external input (clipboard, terminal); strip escape
+        // sequences before they can be stored and later rendered verbatim.
+        let raw = crate::sanitize::sanitize_text(raw);
+        let raw = raw.as_ref();
         let insert = if fold {
             self.pastes.maybe_fold(raw)
         } else {

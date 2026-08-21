@@ -19,6 +19,10 @@ pub fn render(text: &str, width: usize, theme: &Theme) -> Vec<Line<'static>> {
     if text.trim().is_empty() {
         return Vec::new();
     }
+    // LLM text can carry raw escape bytes (e.g. quoting tool logs); never let
+    // them reach the terminal (see crate::sanitize).
+    let sanitized = crate::sanitize::sanitize_text(text);
+    let text = sanitized.as_ref();
     let normalized = text.replace('\t', "   ");
     let mut writer = MdWriter::new(width, theme);
     let opts = Options::ENABLE_TABLES

@@ -72,7 +72,15 @@ pub fn parse_test_output(text: &str) -> Option<TestSummary> {
 }
 
 /// OSC 8 hyperlink when the terminal likely supports it.
+///
+/// Gated on detected capabilities: an unsupported terminal would print the
+/// raw sequence as text, and any line-wrap/truncation splitting the sequence
+/// leaves the terminal in an unterminated-OSC state that corrupts later
+/// output. When in doubt, return the plain label.
 pub fn osc8_link(url: &str, label: &str) -> String {
+    if !crate::pi::terminal_image::detect_capabilities().hyperlinks {
+        return label.to_string();
+    }
     // ESC ] 8 ; ; URL ST  label ESC ] 8 ; ; ST
     format!("\x1b]8;;{url}\x1b\\{label}\x1b]8;;\x1b\\")
 }
