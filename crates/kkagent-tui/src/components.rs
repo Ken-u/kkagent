@@ -13,7 +13,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::{
     AppMode, AppState, DisplayPart, ListPickerState, MessageRole, PendingApproval, PendingQuestion,
-    TodoItem, ToolExpandHit, ToolExpandTarget, ToolHistorySummary,
+    TaskDetailState, TodoItem, ToolExpandHit, ToolExpandTarget, ToolHistorySummary,
 };
 use crate::git_badge;
 use crate::i18n::{self, Locale};
@@ -3008,10 +3008,26 @@ fn render_list_picker(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme
     f.render_widget(Paragraph::new(Text::from(lines)).block(block), area);
 }
 
+fn format_elapsed_hms(secs: u64) -> String {
+    let h = secs / 3600;
+    let m = (secs % 3600) / 60;
+    let s = secs % 60;
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m:02}:{s:02}")
+    }
+}
+
 fn render_tasks_panel(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let Some(panel) = state.tasks_panel.as_ref() else {
         return;
     };
+
+    if let Some(detail) = panel.detail.as_ref() {
+        render_task_detail(f, area, detail, theme);
+        return;
+    }
 
     let panel_area = popup_rect(area, 90, 28);
     if panel_area.width == 0 || panel_area.height == 0 {
@@ -3020,7 +3036,7 @@ fn render_tasks_panel(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme
 
     f.render_widget(Clear, panel_area);
     let block = Block::default()
-        .title(" background tasks ")
+        .title(" background processes ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.border));
 
@@ -3028,12 +3044,12 @@ fn render_tasks_panel(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme
     let mut lines: Vec<Line> = Vec::new();
     if panel.tasks.is_empty() {
         lines.push(Line::from(Span::styled(
-            "No background tasks yet.",
+            "No running background processes in this session.",
             Style::default().fg(theme.text_muted),
         )));
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            "Tasks launched via the Task tool appear here.",
+            "Background shells (Bash run_in_background, or commands that hit the foreground timeout) appear here.",
             Style::default().fg(theme.text_dim),
         )));
     } else {
@@ -3055,11 +3071,11 @@ fn render_tasks_panel(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme
             } else {
                 Style::default().fg(theme.text)
             };
-            let status = &task.status;
+            let elapsed = format_elapsed_hms(task.elapsed_secs);
             if is_narrow(panel_area.width) {
                 lines.push(Line::from(Span::styled(
                     truncate_display_width(
-                        &format!("{}[{}] {}", prefix, status, task.task_id),
+                        &format!("{}{} {}", prefix, elapsed, task.task_id),
                         inner.width as usize,
                     ),
                     style,
@@ -3076,45 +3092,126 @@ fn render_tasks_panel(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme
                 )));
             } else {
                 let label = format!(
-                    "{}[{}] {} — {}",
+                    "{}{} {} — {}",
                     prefix,
-                    status,
-                    truncate_display_width(&task.task_id, 10),
-                    truncate_display_width(&task.description, 40)
+                    elapsed,
+                    truncate_display_width(&task.description, 40),
+                    truncate_display_width(&task.command, 48)
                 );
                 lines.push(Line::from(Span::styled(
                     truncate_display_width(&label, inner.width as usize),
                     style,
                 )));
             }
-            if selected {
-                if let Some(ref r) = task.result {
-                    lines.push(Line::from(Span::styled(
-                        format!(
-                            "    {}",
-                            truncate_display_width(r, (inner.width as usize).saturating_sub(4))
-                        ),
-                        Style::default().fg(theme.text_dim),
-                    )));
-                }
-                if let Some(ref e) = task.error {
-                    lines.push(Line::from(Span::styled(
-                        format!(
-                            "    err: {}",
-                            truncate_display_width(e, (inner.width as usize).saturating_sub(8))
-                        ),
-                        Style::default().fg(theme.error),
-                    )));
-                }
-            }
         }
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        if panel_area.width < 36 {
-            "↑↓ · r refresh · Esc"
+        if panel_area.width < 40 {
+            "↑↓ · ⏎ out · x stop · Esc"
         } else {
-            "↑↓ navigate · r refresh · Esc close"
+            "↑↓ select · ⏎ output · r refresh · x stop · Esc close"
+        },
+        Style::default().fg(theme.text_muted),
+    )));
+
+    f.render_widget(Paragraph::new(Text::from(lines)).block(block), panel_area);
+}
+
+/// Wrap `s` into lines of at most `width` display columns (word-ish split).
+fn wrap_to_width(s: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![String::new()];
+    }
+    let mut out = Vec::new();
+    for raw in s.split('\n') {
+        if raw.is_empty() {
+            out.push(String::new());
+            continue;
+        }
+        let mut current_width = 0usize;
+        let mut current = String::new();
+        for grapheme in raw.graphemes(true) {
+            let gw = UnicodeWidthStr::width(grapheme);
+            if current_width + gw > width {
+                out.push(std::mem::take(&mut current));
+                current_width = 0;
+            }
+            current.push_str(grapheme);
+            current_width += gw;
+        }
+        out.push(current);
+    }
+    if out.is_empty() {
+        out.push(String::new());
+    }
+    out
+}
+
+fn render_task_detail(f: &mut Frame, area: Rect, detail: &TaskDetailState, theme: &Theme) {
+    let panel_area = popup_rect(area, 92, 40);
+    if panel_area.width == 0 || panel_area.height == 0 {
+        return;
+    }
+
+    f.render_widget(Clear, panel_area);
+    let status_label = if detail.running {
+        format!("running {}", format_elapsed_hms(detail.elapsed_secs))
+    } else {
+        match detail.exit_code {
+            Some(code) => format!("{} (exit {})", detail.status, code),
+            None => detail.status.clone(),
+        }
+    };
+    let block = Block::default()
+        .title(format!(" task {} · {} ", detail.task_id, status_label))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.border));
+
+    let inner = panel_area.inner(Margin::new(1, 1));
+    // Fixed header + footer, scrolling output between them.
+    let footer_height = 1u16;
+    let header_lines = vec![
+        Line::from(Span::styled(
+            format!(
+                "cmd: {}",
+                truncate_display_width(&detail.command, inner.width as usize)
+            ),
+            Style::default().fg(theme.text),
+        )),
+        Line::from(Span::styled(
+            format!(
+                "desc: {}",
+                truncate_display_width(&detail.description, inner.width as usize)
+            ),
+            Style::default().fg(theme.text_dim),
+        )),
+        Line::from(""),
+    ];
+    let header_height = header_lines.len() as u16;
+    let output_area_height = inner
+        .height
+        .saturating_sub(header_height)
+        .saturating_sub(footer_height);
+
+    // Pre-wrap output so scroll offsets count wrapped lines consistently.
+    let wrapped = wrap_to_width(&detail.output, inner.width as usize);
+    let max_scroll = (wrapped.len() as u16).saturating_sub(output_area_height);
+    let scroll = detail.scroll.min(max_scroll);
+    let visible: Vec<Line> = wrapped
+        .iter()
+        .skip(scroll as usize)
+        .take(output_area_height as usize)
+        .map(|l| Line::from(Span::styled(l.clone(), Style::default().fg(theme.text))))
+        .collect();
+
+    let mut lines = header_lines;
+    lines.extend(visible);
+    lines.push(Line::from(Span::styled(
+        if panel_area.width < 40 {
+            "↑↓ scroll · r ref · Esc"
+        } else {
+            "↑↓/PgUp/PgDn scroll · r refresh · x stop · Esc back"
         },
         Style::default().fg(theme.text_muted),
     )));

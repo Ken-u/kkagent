@@ -631,15 +631,29 @@ pub struct ListPickerState {
 pub struct TaskInfo {
     pub task_id: String,
     pub description: String,
+    pub command: String,
+    pub elapsed_secs: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct TaskDetailState {
+    pub task_id: String,
     pub status: String,
-    pub result: Option<String>,
-    pub error: Option<String>,
+    pub running: bool,
+    pub exit_code: Option<i64>,
+    pub description: String,
+    pub command: String,
+    pub elapsed_secs: u64,
+    pub output: String,
+    pub scroll: u16,
 }
 
 #[derive(Debug, Clone)]
 pub struct TasksPanelState {
     pub tasks: Vec<TaskInfo>,
     pub selected: usize,
+    /// When set, the panel shows this job's scrolling output view.
+    pub detail: Option<TaskDetailState>,
 }
 
 #[derive(Debug, Clone)]
@@ -2258,9 +2272,6 @@ impl TuiApp {
                     // Manager open path may still want the picker rebuilt — handled by callers.
                 }
             }
-            crate::async_jobs::JobChannel::TasksList => {
-                self.apply_tasks_list_data(data);
-            }
             _ => {}
         }
     }
@@ -2278,7 +2289,6 @@ impl TuiApp {
             crate::async_jobs::JobChannel::SessionsList
                 | crate::async_jobs::JobChannel::McpStatus
                 | crate::async_jobs::JobChannel::SkillsList
-                | crate::async_jobs::JobChannel::TasksList
                 | crate::async_jobs::JobChannel::SessionPreview
                 | crate::async_jobs::JobChannel::SessionResume
                 | crate::async_jobs::JobChannel::Prompt
@@ -2301,42 +2311,6 @@ impl TuiApp {
             // Leave the error visible; user can press `r`, and the next periodic
             // poll will also retry after the pending slot clears.
         }
-    }
-
-    fn apply_tasks_list_data(&mut self, data: serde_json::Value) {
-        let mut tasks = Vec::new();
-        if let Some(arr) = data.get("tasks").and_then(|v| v.as_array()) {
-            for t in arr {
-                tasks.push(TaskInfo {
-                    task_id: t
-                        .get("task_id")
-                        .or_else(|| t.get("id"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string(),
-                    description: t
-                        .get("description")
-                        .or_else(|| t.get("command"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string(),
-                    status: t
-                        .get("status")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("unknown")
-                        .to_string(),
-                    result: t
-                        .get("result")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string()),
-                    error: t
-                        .get("error")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string()),
-                });
-            }
-        }
-        self.state.tasks_panel = Some(TasksPanelState { tasks, selected: 0 });
     }
 
     /// Close the topmost transient UI (menus / pickers / search / shell).
@@ -3317,8 +3291,102 @@ impl TuiApp {
             }
         }
 
-        // Tasks browser overlay
+        // Tasks browser overlay (`/tasks` and `/ps`)
         if self.state.tasks_panel.is_some() {
+            // Detail view: scroll output, refresh, stop, or go back.
+            let in_detail = self
+                .state
+                .tasks_panel
+                .as_ref()
+                .is_some_and(|p| p.detail.is_some());
+            if in_detail {
+                match key.code {
+                    KeyCode::Up => {
+                        if let Some(ref mut p) = self.state.tasks_panel {
+                            if let Some(ref mut d) = p.detail {
+                                d.scroll = d.scroll.saturating_sub(1);
+                            }
+                        }
+                        return Ok(());
+                    }
+                    KeyCode::Down => {
+                        if let Some(ref mut p) = self.state.tasks_panel {
+                            if let Some(ref mut d) = p.detail {
+                                d.scroll = d.scroll.saturating_add(1);
+                            }
+                        }
+                        return Ok(());
+                    }
+                    KeyCode::PageUp => {
+                        if let Some(ref mut p) = self.state.tasks_panel {
+                            if let Some(ref mut d) = p.detail {
+                                d.scroll = d.scroll.saturating_sub(10);
+                            }
+                        }
+                        return Ok(());
+                    }
+                    KeyCode::PageDown => {
+                        if let Some(ref mut p) = self.state.tasks_panel {
+                            if let Some(ref mut d) = p.detail {
+                                d.scroll = d.scroll.saturating_add(10);
+                            }
+                        }
+                        return Ok(());
+                    }
+                    KeyCode::Char('g') | KeyCode::Home => {
+                        if let Some(ref mut p) = self.state.tasks_panel {
+                            if let Some(ref mut d) = p.detail {
+                                d.scroll = 0;
+                            }
+                        }
+                        return Ok(());
+                    }
+                    KeyCode::Char('G') | KeyCode::End => {
+                        // Large sentinel; renderer clamps to max scroll.
+                        if let Some(ref mut p) = self.state.tasks_panel {
+                            if let Some(ref mut d) = p.detail {
+                                d.scroll = u16::MAX;
+                            }
+                        }
+                        return Ok(());
+                    }
+                    KeyCode::Char('r') | KeyCode::Char('R') => {
+                        if let Some(task_id) = self
+                            .state
+                            .tasks_panel
+                            .as_ref()
+                            .and_then(|p| p.detail.as_ref().map(|d| d.task_id.clone()))
+                        {
+                            self.fetch_task_detail(&task_id).await;
+                        }
+                        return Ok(());
+                    }
+                    KeyCode::Enter | KeyCode::Esc | KeyCode::Backspace => {
+                        if let Some(ref mut p) = self.state.tasks_panel {
+                            p.detail = None;
+                        }
+                        return Ok(());
+                    }
+                    KeyCode::Char('q') => {
+                        self.state.tasks_panel = None;
+                        return Ok(());
+                    }
+                    KeyCode::Char('x') | KeyCode::Char('s') | KeyCode::Char('S') => {
+                        let id = self
+                            .state
+                            .tasks_panel
+                            .as_ref()
+                            .and_then(|p| p.detail.as_ref().map(|d| d.task_id.clone()));
+                        if let Some(task_id) = id {
+                            self.stop_background_task(&task_id, true).await;
+                        }
+                        return Ok(());
+                    }
+                    _ => {}
+                }
+                return Ok(());
+            }
+
             match key.code {
                 KeyCode::Up => {
                     if let Some(ref mut p) = self.state.tasks_panel {
@@ -3341,20 +3409,14 @@ impl TuiApp {
                     return Ok(());
                 }
                 KeyCode::Enter => {
-                    if let Some(ref p) = self.state.tasks_panel {
-                        if let Some(t) = p.tasks.get(p.selected) {
-                            let mut detail =
-                                format!("task {} [{}]\n{}\n", t.task_id, t.status, t.description);
-                            if let Some(ref r) = t.result {
-                                detail.push_str("\nresult:\n");
-                                detail.push_str(r);
-                            }
-                            if let Some(ref e) = t.error {
-                                detail.push_str("\nerror:\n");
-                                detail.push_str(e);
-                            }
-                            self.system_message(detail);
-                        }
+                    if let Some(task_id) = self
+                        .state
+                        .tasks_panel
+                        .as_ref()
+                        .and_then(|p| p.tasks.get(p.selected))
+                        .map(|t| t.task_id.clone())
+                    {
+                        self.fetch_task_detail(&task_id).await;
                     }
                     return Ok(());
                 }
@@ -3366,20 +3428,7 @@ impl TuiApp {
                         .and_then(|p| p.tasks.get(p.selected))
                         .map(|t| t.task_id.clone());
                     if let Some(task_id) = id {
-                        match self
-                            .client
-                            .rpc_call(
-                                "tasks.stop",
-                                Some(serde_json::json!({ "task_id": task_id })),
-                            )
-                            .await
-                        {
-                            Ok(_) => {
-                                self.system_message(format!("Stopped task {}", task_id));
-                                self.open_tasks_panel().await?;
-                            }
-                            Err(e) => self.system_message(format!("Stop failed: {}", e)),
-                        }
+                        self.stop_background_task(&task_id, false).await;
                     }
                     return Ok(());
                 }
@@ -4171,7 +4220,7 @@ impl TuiApp {
             match item.name.as_str() {
                 "model" => self.open_model_picker(),
                 "sessions" | "resume" => self.open_session_picker().await?,
-                "tasks" | "task" => self.open_tasks_panel().await?,
+                "tasks" | "task" | "ps" => self.open_tasks_panel().await?,
                 "agents" | "agent" => self.open_agents_panel(),
                 "permission" => self.open_permission_picker(),
                 "config" => self.open_config_picker(),
@@ -4198,10 +4247,18 @@ impl TuiApp {
     }
 
     async fn open_tasks_panel(&mut self) -> anyhow::Result<()> {
-        match self.client.rpc_call("tasks.list", None).await {
+        let Some(sid) = self.state.session_id.clone() else {
+            self.system_message("No active session.".into());
+            return Ok(());
+        };
+        match self
+            .client
+            .rpc_call("ps.list", Some(serde_json::json!({ "session_id": sid })))
+            .await
+        {
             Ok(data) => {
                 let mut tasks = Vec::new();
-                if let Some(arr) = data.get("tasks").and_then(|v| v.as_array()) {
+                if let Some(arr) = data.get("processes").and_then(|v| v.as_array()) {
                     for t in arr {
                         tasks.push(TaskInfo {
                             task_id: t
@@ -4214,29 +4271,116 @@ impl TuiApp {
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("")
                                 .to_string(),
-                            status: t
-                                .get("status")
-                                .map(|v| match v {
-                                    serde_json::Value::String(s) => s.clone(),
-                                    other => other.to_string().trim_matches('"').to_string(),
-                                })
-                                .unwrap_or_else(|| "?".into()),
-                            result: t.get("result").and_then(|v| v.as_str()).map(String::from),
-                            error: t.get("error").and_then(|v| v.as_str()).map(String::from),
+                            command: t
+                                .get("command")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                            elapsed_secs: t
+                                .get("elapsed_secs")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0),
                         });
                     }
                 }
-                let selected = self
-                    .state
-                    .tasks_panel
+                let prev = self.state.tasks_panel.take();
+                let selected = prev
                     .as_ref()
                     .map(|p| p.selected.min(tasks.len().saturating_sub(1)))
                     .unwrap_or(0);
-                self.state.tasks_panel = Some(TasksPanelState { tasks, selected });
+                // Keep the detail view only if that job is still in the list.
+                let detail = prev.and_then(|p| {
+                    let d = p.detail?;
+                    if tasks.iter().any(|t| t.task_id == d.task_id) {
+                        Some(d)
+                    } else {
+                        None
+                    }
+                });
+                self.state.tasks_panel = Some(TasksPanelState {
+                    tasks,
+                    selected,
+                    detail,
+                });
             }
             Err(e) => self.system_message(format!("Failed to list tasks: {}", e)),
         }
         Ok(())
+    }
+
+    /// Stop a background shell task; refresh list (and detail view when requested).
+    async fn stop_background_task(&mut self, task_id: &str, refresh_detail: bool) {
+        match self
+            .client
+            .rpc_call("ps.stop", Some(serde_json::json!({ "task_id": task_id })))
+            .await
+        {
+            Ok(_) => self.system_message(format!("Stopped task {}", task_id)),
+            Err(e) => self.system_message(format!("Stop failed: {}", e)),
+        }
+        if refresh_detail {
+            self.fetch_task_detail(task_id).await;
+        }
+    }
+
+    async fn fetch_task_detail(&mut self, task_id: &str) {
+        match self
+            .client
+            .rpc_call("ps.output", Some(serde_json::json!({ "task_id": task_id })))
+            .await
+        {
+            Ok(data) => {
+                let detail = TaskDetailState {
+                    task_id: data
+                        .get("task_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(task_id)
+                        .to_string(),
+                    status: data
+                        .get("status")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("?")
+                        .to_string(),
+                    running: data
+                        .get("running")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false),
+                    exit_code: data.get("exit_code").and_then(|v| v.as_i64()),
+                    description: data
+                        .get("description")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    command: data
+                        .get("command")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    elapsed_secs: data
+                        .get("elapsed_secs")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0),
+                    output: data
+                        .get("output")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    // Preserve scroll position on refresh; renderer clamps.
+                    scroll: self
+                        .state
+                        .tasks_panel
+                        .as_ref()
+                        .and_then(|p| p.detail.as_ref())
+                        .filter(|d| d.task_id == task_id)
+                        .map(|d| d.scroll)
+                        .unwrap_or(0),
+                };
+                if let Some(ref mut p) = self.state.tasks_panel {
+                    p.detail = Some(detail);
+                }
+            }
+            Err(e) => self.system_message(format!("Failed to read task output: {}", e)),
+        }
     }
 
     fn open_agents_panel(&mut self) {
@@ -4543,6 +4687,7 @@ impl TuiApp {
                         | "resume"
                         | "tasks"
                         | "task"
+                        | "ps"
                         | "agents"
                         | "agent"
                         | "mcp"
@@ -4572,7 +4717,7 @@ impl TuiApp {
                     self.apply_swarm_action(&item.id).await?;
                     self.clear_list_pickers();
                 }
-                "tasks" => {
+                "tasks" | "ps" => {
                     self.state.list_picker_stack.push(picker);
                     self.open_tasks_panel().await?;
                 }
@@ -6184,7 +6329,7 @@ impl TuiApp {
             "prompts" | "prompt" => self.open_prompts_picker(),
             "experimental-flags" | "flags" => self.open_flags_picker(),
             "sessions" | "resume" => self.open_session_picker().await?,
-            "tasks" | "task" => self.open_tasks_panel().await?,
+            "tasks" | "task" | "ps" => self.open_tasks_panel().await?,
             "agents" | "agent" => self.open_agents_panel(),
             "mcp" => self.open_mcp_manager().await?,
             "skills" => self.open_skill_manager().await?,
@@ -9643,7 +9788,7 @@ impl TuiApp {
                 self.begin_root_picker();
                 self.open_mcp_manager().await?;
             }
-            "tasks" | "task" => {
+            "tasks" | "task" | "ps" => {
                 self.begin_root_picker();
                 self.open_tasks_panel().await?;
             }
@@ -11649,6 +11794,7 @@ fn slash_command_opens_immediately(name: &str) -> bool {
             | "resume"
             | "tasks"
             | "task"
+            | "ps"
             | "permission"
             | "config"
             | "provider"

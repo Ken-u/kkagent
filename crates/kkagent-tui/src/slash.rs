@@ -173,6 +173,13 @@ pub const BUILTIN_SLASH_COMMANDS: &[SlashCommand] = &[
         argument_hint: None,
     },
     SlashCommand {
+        name: "ps",
+        aliases: &[],
+        description: "Browse running background processes",
+        priority: 60,
+        argument_hint: None,
+    },
+    SlashCommand {
         name: "agents",
         aliases: &["agent"],
         description: "Browse subagent status and recent activity",

@@ -9095,6 +9095,64 @@ async fn handle_rpc_call(
                 Err(e) => Err((-32000, e.to_string())),
             }
         }
+        "ps.list" => {
+            let session_id = params
+                .as_ref()
+                .and_then(|p| p.get("session_id"))
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| (-32602, "Missing session_id".into()))?;
+            let processes: Vec<_> = state
+                .bash_shells
+                .list_running_for_session(session_id)
+                .await
+                .into_iter()
+                .map(|job| {
+                    serde_json::json!({
+                        "task_id": job.id,
+                        "description": job.description,
+                        "command": job.command,
+                        "elapsed_secs": job.elapsed_secs,
+                    })
+                })
+                .collect();
+            Ok(serde_json::json!({ "processes": processes }))
+        }
+        "ps.output" => {
+            let task_id = params
+                .as_ref()
+                .and_then(|p| p.get("task_id"))
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| (-32602, "Missing task_id".into()))?;
+            match state.bash_shells.snapshot_detail(task_id).await {
+                Some(job) => Ok(serde_json::json!({
+                    "task_id": job.id,
+                    "description": job.description,
+                    "command": job.command,
+                    "status": job.status,
+                    "elapsed_secs": job.elapsed_secs,
+                    "exit_code": job.exit_code,
+                    "running": job.running,
+                    "output": job.output,
+                })),
+                None => Err((-32000, format!("Unknown task: {task_id}"))),
+            }
+        }
+        "ps.stop" => {
+            let task_id = params
+                .as_ref()
+                .and_then(|p| p.get("task_id"))
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| (-32602, "Missing task_id".into()))?;
+            if state.bash_shells.stop(task_id).await {
+                Ok(serde_json::json!({
+                    "ok": true,
+                    "task_id": task_id,
+                    "status": "cancelled",
+                }))
+            } else {
+                Err((-32000, format!("Unknown or finished task: {task_id}")))
+            }
+        }
         "session.resolve_pending_plan_review" => {
             let params = params.ok_or_else(|| (-32602, "Missing approval response".into()))?;
             let session_id = params

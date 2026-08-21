@@ -63,7 +63,30 @@ struct ShellJob {
     status: ShellStatus,
     output: String,
     exit_code: Option<i32>,
+    started_at: std::time::Instant,
     cancel: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Compact info about a running background shell (for /ps panel lists).
+#[derive(Debug, Clone)]
+pub struct BackgroundJobInfo {
+    pub id: String,
+    pub description: String,
+    pub command: String,
+    pub elapsed_secs: u64,
+}
+
+/// Full snapshot of a background shell (for in-panel output views).
+#[derive(Debug, Clone)]
+pub struct BackgroundJobDetail {
+    pub id: String,
+    pub description: String,
+    pub command: String,
+    pub status: String,
+    pub elapsed_secs: u64,
+    pub exit_code: Option<i32>,
+    pub running: bool,
+    pub output: String,
 }
 
 /// Tracks background / detached shell processes for Bash tool polling.
@@ -114,6 +137,7 @@ impl BackgroundShellManager {
                 status: ShellStatus::Running,
                 output: String::new(),
                 exit_code: None,
+                started_at: std::time::Instant::now(),
                 cancel: cancel.clone(),
             },
         );
@@ -179,6 +203,41 @@ impl BackgroundShellManager {
                 )
             })
             .collect()
+    }
+
+    /// Running background jobs for one session, oldest first (for /ps panel).
+    pub async fn list_running_for_session(&self, session_id: &str) -> Vec<BackgroundJobInfo> {
+        let mut jobs: Vec<BackgroundJobInfo> = self
+            .jobs
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, job)| job.session_id == session_id && job.status == ShellStatus::Running)
+            .map(|(id, job)| BackgroundJobInfo {
+                id: id.clone(),
+                description: job.description.clone(),
+                command: job.command.clone(),
+                elapsed_secs: job.started_at.elapsed().as_secs(),
+            })
+            .collect();
+        // Oldest (earliest started) first: largest elapsed first.
+        jobs.sort_by_key(|job| std::cmp::Reverse(job.elapsed_secs));
+        jobs
+    }
+
+    /// Full snapshot of one background job (for in-panel output view).
+    pub async fn snapshot_detail(&self, id: &str) -> Option<BackgroundJobDetail> {
+        let job = self.jobs.lock().await.get(id)?.clone();
+        Some(BackgroundJobDetail {
+            id: id.to_string(),
+            description: job.description,
+            command: job.command,
+            status: format!("{:?}", job.status).to_lowercase(),
+            elapsed_secs: job.started_at.elapsed().as_secs(),
+            exit_code: job.exit_code,
+            running: job.status == ShellStatus::Running,
+            output: job.output,
+        })
     }
 
     pub async fn stop(&self, id: &str) -> bool {
@@ -1290,5 +1349,121 @@ mod tests {
             resolve_timeout_ms(&json!({"timeout": 9_999}), false, 120),
             300_000
         );
+    }
+
+    fn context_for_session(session_id: &str) -> ToolContext {
+        ToolContext {
+            working_dir: std::env::current_dir().expect("current directory"),
+            session_id: session_id.to_string(),
+            turn_id: "test-turn".into(),
+            plan_file_path: None,
+            image: kkagent_config::ImageConfig::default(),
+            tool_call_id: None,
+            interrupted: None,
+            tools_config: kkagent_config::ToolsConfig::default(),
+        }
+    }
+
+    async fn start_sleep_job(tool: &BashTool, session_id: &str, description: &str) -> String {
+        let started = tool
+            .execute(
+                json!({
+                    "command": "sleep 30",
+                    "description": description,
+                    "run_in_background": true,
+                    "timeout_ms": 30_000
+                }),
+                &context_for_session(session_id),
+            )
+            .await
+            .expect("start background job");
+        started
+            .content
+            .split("shell_id=")
+            .nth(1)
+            .and_then(|tail| tail.split([')', ' ', '/', '.']).next())
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn list_running_for_session_filters_by_session_and_status() {
+        let tool = BashTool::default();
+        let first = start_sleep_job(&tool, "session-1", "first").await;
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        let second = start_sleep_job(&tool, "session-1", "second").await;
+        let _other = start_sleep_job(&tool, "session-2", "other").await;
+        assert!(!first.is_empty() && !second.is_empty());
+
+        let jobs = tool.backgrounds.list_running_for_session("session-1").await;
+        assert_eq!(jobs.len(), 2, "only this session's running jobs");
+        assert_eq!(jobs[0].id, first, "oldest job first");
+        assert_eq!(jobs[1].id, second);
+        assert_eq!(jobs[0].description, "first");
+        assert_eq!(jobs[0].command, "sleep 30");
+        assert_eq!(jobs[0].elapsed_secs, 0, "just started");
+
+        assert!(
+            tool.backgrounds
+                .list_running_for_session("session-unknown")
+                .await
+                .is_empty(),
+            "unknown session has no jobs"
+        );
+
+        // Stop both jobs and wait for the poller to settle the status.
+        for id in [&first, &second, &_other] {
+            tool.backgrounds.stop(id).await;
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(4), async {
+            loop {
+                let remaining = tool.backgrounds.list_running_for_session("session-1").await;
+                if remaining.is_empty() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("stopped jobs must leave the running list");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn snapshot_detail_reports_status_output_and_elapsed() {
+        let tool = BashTool::default();
+        let id = start_sleep_job(&tool, "session-1", "watch").await;
+        assert!(!id.is_empty());
+
+        let detail = tool
+            .backgrounds
+            .snapshot_detail(&id)
+            .await
+            .expect("detail exists");
+        assert_eq!(detail.id, id);
+        assert!(detail.running);
+        assert_eq!(detail.status, "running");
+        assert_eq!(detail.command, "sleep 30");
+
+        tool.backgrounds.stop(&id).await;
+        tokio::time::timeout(std::time::Duration::from_secs(4), async {
+            loop {
+                let detail = tool
+                    .backgrounds
+                    .snapshot_detail(&id)
+                    .await
+                    .expect("detail exists");
+                if !detail.running {
+                    assert_eq!(detail.status, "cancelled");
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("stopped job must settle to cancelled");
+
+        assert!(tool.backgrounds.snapshot_detail("missing").await.is_none());
     }
 }
