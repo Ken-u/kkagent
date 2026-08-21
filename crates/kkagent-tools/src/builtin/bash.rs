@@ -207,22 +207,27 @@ impl BackgroundShellManager {
 
     /// Running background jobs for one session, oldest first (for /ps panel).
     pub async fn list_running_for_session(&self, session_id: &str) -> Vec<BackgroundJobInfo> {
-        let mut jobs: Vec<BackgroundJobInfo> = self
+        let mut jobs: Vec<(std::time::Instant, BackgroundJobInfo)> = self
             .jobs
             .lock()
             .await
             .iter()
             .filter(|(_, job)| job.session_id == session_id && job.status == ShellStatus::Running)
-            .map(|(id, job)| BackgroundJobInfo {
-                id: id.clone(),
-                description: job.description.clone(),
-                command: job.command.clone(),
-                elapsed_secs: job.started_at.elapsed().as_secs(),
+            .map(|(id, job)| {
+                (
+                    job.started_at,
+                    BackgroundJobInfo {
+                        id: id.clone(),
+                        description: job.description.clone(),
+                        command: job.command.clone(),
+                        elapsed_secs: job.started_at.elapsed().as_secs(),
+                    },
+                )
             })
             .collect();
-        // Oldest (earliest started) first: largest elapsed first.
-        jobs.sort_by_key(|job| std::cmp::Reverse(job.elapsed_secs));
-        jobs
+        // Sort by Instant so sub-second starts stay stable (elapsed_secs is too coarse).
+        jobs.sort_by_key(|(started_at, _)| *started_at);
+        jobs.into_iter().map(|(_, info)| info).collect()
     }
 
     /// Full snapshot of one background job (for in-panel output view).
