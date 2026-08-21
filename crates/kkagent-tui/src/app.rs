@@ -29,6 +29,39 @@ use crate::slash::{
 };
 
 pub const TOOL_EXPAND_TURNS: usize = 5;
+pub(crate) const SPINNER_TICKS_PER_FRAME: usize = 4;
+const STREAM_DRAW_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServerEventRedraw {
+    None,
+    Stream,
+    Immediate,
+}
+
+fn server_event_redraw(frame: &Frame) -> ServerEventRedraw {
+    let Frame::Event { event, data, .. } = frame else {
+        return ServerEventRedraw::None;
+    };
+    if event == "mcp.status" {
+        return ServerEventRedraw::Immediate;
+    }
+    match data.get("type").and_then(serde_json::Value::as_str) {
+        Some("message_delta" | "thinking_delta" | "btw_delta" | "btw_thinking_delta") => {
+            ServerEventRedraw::Stream
+        }
+        Some("heartbeat") | None => ServerEventRedraw::None,
+        Some(_) => ServerEventRedraw::Immediate,
+    }
+}
+
+fn stream_redraw_due(
+    pending: bool,
+    last_draw_at: std::time::Instant,
+    now: std::time::Instant,
+) -> bool {
+    pending && now.saturating_duration_since(last_draw_at) >= STREAM_DRAW_INTERVAL
+}
 
 pub struct TuiApp {
     config: AppConfig,
@@ -49,7 +82,7 @@ pub struct TuiApp {
 }
 
 fn tick_requires_redraw(previous: usize, current: usize, animation_active: bool) -> bool {
-    (animation_active && previous / 2 != current / 2)
+    (animation_active && previous / SPINNER_TICKS_PER_FRAME != current / SPINNER_TICKS_PER_FRAME)
         || previous / 80 != current / 80
         || previous / 100 != current / 100
 }
@@ -228,6 +261,8 @@ pub struct AppState {
     pub locale: crate::i18n::Locale,
     /// Cached markdown/layout lines for completed transcript messages.
     pub render_cache: crate::render_cache::RenderCache,
+    /// Cached stable transcript layout; streaming keeps the active tail separate.
+    pub transcript_layout_cache: crate::render_cache::TranscriptLayoutCache,
     /// Older transcript pages still loading after a lazy resume.
     pub history_loading: bool,
     /// Absolute index of the oldest message currently shown (for prepend pages).
@@ -411,6 +446,7 @@ impl SessionRuntimeState {
         state.click_history = self.click_history;
         state.stream_cursor = crate::streaming::StreamingCursor::default();
         state.render_cache.invalidate_all();
+        state.transcript_layout_cache.invalidate();
         state.status_bar.cache_hit = None;
         state.event_router.status = state.status;
         state.event_router.turn_active = matches!(
@@ -801,6 +837,16 @@ pub struct TodoItem {
     pub status: String,
 }
 
+impl TodoItem {
+    pub(crate) fn is_finished(&self) -> bool {
+        matches!(self.status.as_str(), "completed" | "done" | "cancelled")
+    }
+}
+
+fn all_todos_finished(todos: &[TodoItem]) -> bool {
+    !todos.is_empty() && todos.iter().all(TodoItem::is_finished)
+}
+
 #[derive(Debug, Clone)]
 pub struct ApprovalChoice {
     pub label: String,
@@ -1032,6 +1078,7 @@ impl AppState {
             tokens_at_turn_start: 0,
             locale: crate::i18n::Locale::En,
             render_cache: crate::render_cache::RenderCache::new(),
+            transcript_layout_cache: crate::render_cache::TranscriptLayoutCache::default(),
             history_loading: false,
             history_oldest_index: None,
             history_total: None,
@@ -1627,6 +1674,8 @@ impl TuiApp {
         self.jobs.refresh_busy_notices();
         self.state.status_bar.activity = self.jobs.active_notice_text();
         self.draw_frame(terminal)?;
+        let mut last_draw_at = std::time::Instant::now();
+        let mut stream_redraw_pending = false;
 
         loop {
             let mut redraw = false;
@@ -1644,6 +1693,7 @@ impl TuiApp {
             // Drain the full event queue each frame so trackpad bursts stay in-app
             // (one-event-per-poll left a backlog that felt like lag / terminal scroll).
             let mut saw_event = false;
+            let mut event_changed = false;
             let mut scroll_delta = 0i32;
             while event::poll(if saw_event {
                 std::time::Duration::ZERO
@@ -1655,9 +1705,10 @@ impl TuiApp {
                     Event::Key(key) => {
                         self.flush_pending_scroll(&mut scroll_delta);
                         self.handle_key(key).await?;
+                        event_changed = true;
                     }
                     Event::Mouse(mouse) if self.mouse_mode == MouseMode::Capture => {
-                        self.collect_mouse(mouse, &mut scroll_delta);
+                        event_changed |= self.collect_mouse(mouse, &mut scroll_delta);
                     }
                     Event::Paste(text) => {
                         self.flush_pending_scroll(&mut scroll_delta);
@@ -1669,12 +1720,13 @@ impl TuiApp {
                             self.state.input.force_flush_paste(fold);
                             self.state.refresh_slash_menu();
                         }
+                        event_changed = true;
                     }
                     _ => {}
                 }
             }
             self.flush_pending_scroll(&mut scroll_delta);
-            redraw |= saw_event;
+            redraw |= event_changed;
 
             if let Some(action) = self.state.pending_strip_action.take() {
                 redraw = true;
@@ -1719,12 +1771,14 @@ impl TuiApp {
                 redraw = true;
             }
 
-            let mut received_server_event = false;
             while let Ok(frame) = self.client.event_rx.try_recv() {
-                received_server_event = true;
+                match server_event_redraw(&frame) {
+                    ServerEventRedraw::None => {}
+                    ServerEventRedraw::Stream => stream_redraw_pending = true,
+                    ServerEventRedraw::Immediate => redraw = true,
+                }
                 self.handle_server_event(frame);
             }
-            redraw |= received_server_event;
             self.start_next_btw_question().await;
             redraw |= self.refresh_connection_notice();
             if self
@@ -1790,12 +1844,15 @@ impl TuiApp {
                 )
             }) || self.state.subagents.any_active();
             redraw |= tick_requires_redraw(previous_tick, self.state.tick, animation_active);
+            redraw |= stream_redraw_due(stream_redraw_pending, last_draw_at, now);
 
             if self.state.should_quit {
                 break;
             }
             if redraw {
                 self.draw_frame(terminal)?;
+                last_draw_at = std::time::Instant::now();
+                stream_redraw_pending = false;
             }
         }
         Ok(())
@@ -2517,13 +2574,39 @@ impl TuiApp {
 
     fn flush_pending_scroll(&mut self, scroll_delta: &mut i32) {
         if *scroll_delta != 0 {
+            let load_earlier = *scroll_delta > 0;
             self.state.scroll_lines(*scroll_delta);
             *scroll_delta = 0;
             // While dragging, remap focus to the same screen cell under a new scroll.
             if self.state.selection_dragging {
                 self.update_selection_focus_from_last_mouse();
             }
+            if load_earlier {
+                self.enqueue_earlier_history_if_at_top();
+            }
         }
+    }
+
+    fn enqueue_earlier_history_if_at_top(&mut self) {
+        if self.state.mode == AppMode::Btw
+            || self.state.history_loading
+            || self.state.scroll_up != self.state.max_scroll_up()
+        {
+            return;
+        }
+        let Some(oldest) = self.state.history_oldest_index.filter(|oldest| *oldest > 0) else {
+            return;
+        };
+        let Some(session_id) = self.state.session_id.clone() else {
+            return;
+        };
+        // Even when the currently loaded page fits in the viewport, scrolling
+        // upward expresses an intent to read older content. Keep that anchor
+        // instead of snapping back to the bottom when the page arrives.
+        self.state.follow_bottom = false;
+        self.state.history_loading = true;
+        self.jobs
+            .spawn_session_history(self.client.requester(), session_id, oldest, 40);
     }
 
     fn update_selection_focus_from_last_mouse(&mut self) {
@@ -2649,7 +2732,13 @@ impl TuiApp {
         }
     }
 
-    fn collect_mouse(&mut self, mouse: crossterm::event::MouseEvent, scroll_delta: &mut i32) {
+    fn collect_mouse(
+        &mut self,
+        mouse: crossterm::event::MouseEvent,
+        scroll_delta: &mut i32,
+    ) -> bool {
+        let previous_hover = self.state.strip_hover_title.clone();
+        let previous_selection = self.state.selection;
         self.state.last_mouse = Some((mouse.column, mouse.row));
 
         let over_strip = self.mouse_over_session_strip(&mouse);
@@ -2699,7 +2788,7 @@ impl TuiApp {
                             mouse.row.saturating_sub(self.state.transcript_area.y),
                         ));
                         self.clear_selection();
-                        return;
+                        return true;
                     }
                     let (count, selection) = self.classify_click(pos);
                     self.state.selection = Some(selection);
@@ -2756,6 +2845,15 @@ impl TuiApp {
                 }
             }
             _ => {}
+        }
+
+        match mouse.kind {
+            MouseEventKind::Moved => previous_hover != self.state.strip_hover_title,
+            MouseEventKind::Drag(MouseButton::Left) => {
+                previous_hover != self.state.strip_hover_title
+                    || previous_selection != self.state.selection
+            }
+            _ => true,
         }
     }
 
@@ -3783,7 +3881,8 @@ impl TuiApp {
             }
             // Ctrl-T: expand/collapse sticky todo panel
             KeyCode::Char('t')
-                if key.modifiers.contains(KeyModifiers::CONTROL) && self.state.todos.len() > 5 =>
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && (self.state.todos.len() > 5 || all_todos_finished(&self.state.todos)) =>
             {
                 self.state.todos_expanded = !self.state.todos_expanded;
             }
@@ -3975,6 +4074,7 @@ impl TuiApp {
                     self.state.btw.scroll_lines(10);
                 } else {
                     self.state.scroll_lines(10);
+                    self.enqueue_earlier_history_if_at_top();
                 }
             }
             KeyCode::PageDown => {
@@ -3990,6 +4090,7 @@ impl TuiApp {
                 } else {
                     self.state.scroll_up = self.state.max_scroll_up();
                     self.state.follow_bottom = false;
+                    self.enqueue_earlier_history_if_at_top();
                 }
             }
             KeyCode::End if self.state.input.is_empty() => {
@@ -7326,15 +7427,6 @@ impl TuiApp {
         self.restore_session_view(session_id);
         self.replay_background_session_events(session_id);
         self.sync_active_session_status();
-        if let Some(oldest) = self.state.history_oldest_index.filter(|oldest| *oldest > 0) {
-            self.state.history_loading = true;
-            self.jobs.spawn_session_history(
-                self.client.requester(),
-                session_id.to_string(),
-                oldest,
-                40,
-            );
-        }
         self.state.last_switch_metrics = Some(SessionSwitchMetrics {
             target: session_id.to_string(),
             first_feedback_ms: 0,
@@ -7497,6 +7589,7 @@ impl TuiApp {
         self.state.scroll_up = 0;
         self.state.follow_bottom = true;
         self.state.render_cache.invalidate_all();
+        self.state.transcript_layout_cache.invalidate();
         self.state.history_loading = false;
         self.state.history_oldest_index = None;
         self.state.history_total = None;
@@ -7815,6 +7908,9 @@ impl TuiApp {
                     })
                 })
                 .collect();
+            if self.state.todos.is_empty() || all_todos_finished(&self.state.todos) {
+                self.state.todos_expanded = false;
+            }
         }
 
         if let Some(model) = data.get("model").and_then(|v| v.as_str()) {
@@ -7984,17 +8080,9 @@ impl TuiApp {
                 .get("oldest_index")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0) as usize;
-            let older = hist
-                .get("older_available")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
             self.state.history_total = Some(total);
             self.state.history_oldest_index = Some(oldest);
-            if older && oldest > 0 {
-                self.state.history_loading = true;
-                self.jobs
-                    .spawn_session_history(self.client.requester(), sid.clone(), oldest, 40);
-            }
+            self.state.history_loading = false;
         }
         if turn_active {
             self.replay_background_session_events(&sid);
@@ -8078,16 +8166,9 @@ impl TuiApp {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
         self.state.history_oldest_index = Some(new_oldest);
-        if older_available && new_oldest > 0 {
-            self.state.history_loading = true;
-            self.jobs.spawn_session_history(
-                self.client.requester(),
-                session_id.to_string(),
-                new_oldest,
-                40,
-            );
-        } else {
-            self.state.history_loading = false;
+        self.state.history_loading = false;
+        if !older_available {
+            self.state.history_oldest_index = Some(0);
         }
     }
 
@@ -9300,6 +9381,7 @@ impl TuiApp {
                 self.state.turn_started_at = None;
                 self.state.reset_context_usage_stats();
                 self.state.render_cache.invalidate_all();
+                self.state.transcript_layout_cache.invalidate();
                 let cwd = self.state.working_dir.to_string_lossy().into_owned();
                 let session_id = self
                     .client
@@ -10917,7 +10999,7 @@ impl TuiApp {
                                 status: i.status,
                             })
                             .collect();
-                        if self.state.todos.is_empty() {
+                        if self.state.todos.is_empty() || all_todos_finished(&self.state.todos) {
                             self.state.todos_expanded = false;
                         }
                     }
@@ -12402,9 +12484,150 @@ mod app_state_tests {
     #[test]
     fn idle_ticks_do_not_request_high_frequency_redraws() {
         assert!(!tick_requires_redraw(1, 2, false));
-        assert!(tick_requires_redraw(1, 2, true));
+        assert!(!tick_requires_redraw(1, 2, true));
+        assert!(tick_requires_redraw(3, 4, true));
         assert!(tick_requires_redraw(79, 80, false));
         assert!(tick_requires_redraw(99, 100, false));
+    }
+
+    #[test]
+    fn stream_events_are_rate_limited_but_boundaries_render_immediately() {
+        let frame_for = |event: AgentEvent| Frame::Event {
+            event: "agent".into(),
+            scope: None,
+            data: serde_json::to_value(event).unwrap(),
+        };
+        assert_eq!(
+            server_event_redraw(&frame_for(AgentEvent::MessageDelta {
+                session_id: "s".into(),
+                text: "chunk".into(),
+            })),
+            ServerEventRedraw::Stream
+        );
+        assert_eq!(
+            server_event_redraw(&frame_for(AgentEvent::ThinkingDelta {
+                session_id: "s".into(),
+                text: "thought".into(),
+            })),
+            ServerEventRedraw::Stream
+        );
+        assert_eq!(
+            server_event_redraw(&frame_for(AgentEvent::Heartbeat {
+                session_id: "s".into(),
+            })),
+            ServerEventRedraw::None
+        );
+        assert_eq!(
+            server_event_redraw(&frame_for(AgentEvent::ToolCall {
+                session_id: "s".into(),
+                tool_call_id: "tool".into(),
+                tool_name: "Read".into(),
+                input: serde_json::json!({}),
+            })),
+            ServerEventRedraw::Immediate
+        );
+    }
+
+    #[test]
+    fn pending_stream_draw_becomes_due_at_twenty_fps() {
+        let start = std::time::Instant::now();
+        assert!(!stream_redraw_due(
+            true,
+            start,
+            start + STREAM_DRAW_INTERVAL - std::time::Duration::from_millis(1)
+        ));
+        assert!(stream_redraw_due(true, start, start + STREAM_DRAW_INTERVAL));
+        assert!(!stream_redraw_due(
+            false,
+            start,
+            start + STREAM_DRAW_INTERVAL
+        ));
+    }
+
+    #[tokio::test]
+    async fn plain_mouse_movement_does_not_request_a_redraw() {
+        let mut app = test_tui_app();
+        let mut scroll_delta = 0;
+
+        let changed = app.collect_mouse(
+            crossterm::event::MouseEvent {
+                kind: MouseEventKind::Moved,
+                column: 12,
+                row: 4,
+                modifiers: KeyModifiers::NONE,
+            },
+            &mut scroll_delta,
+        );
+
+        assert!(!changed);
+        assert_eq!(app.state.last_mouse, Some((12, 4)));
+    }
+
+    #[tokio::test]
+    async fn reaching_loaded_history_top_requests_only_one_page() {
+        let mut app = test_tui_app();
+        app.state.session_id = Some("history-session".into());
+        app.state.history_oldest_index = Some(80);
+        app.state.content_lines = 100;
+        app.state.viewport_height = 20;
+        app.state.scroll_up = 80;
+
+        app.enqueue_earlier_history_if_at_top();
+        app.enqueue_earlier_history_if_at_top();
+
+        assert!(app.state.history_loading);
+        assert!(!app.state.follow_bottom);
+        assert!(app
+            .jobs
+            .pending
+            .contains_key(&crate::async_jobs::JobChannel::SessionHistory));
+    }
+
+    #[tokio::test]
+    async fn scrolling_down_does_not_request_earlier_history() {
+        let mut app = test_tui_app();
+        app.state.session_id = Some("history-session".into());
+        app.state.history_oldest_index = Some(80);
+        let mut scroll_delta = -3;
+
+        app.flush_pending_scroll(&mut scroll_delta);
+
+        assert!(!app.state.history_loading);
+        assert!(!app
+            .jobs
+            .pending
+            .contains_key(&crate::async_jobs::JobChannel::SessionHistory));
+    }
+
+    #[tokio::test]
+    async fn loaded_history_page_waits_for_another_scroll_before_continuing() {
+        let mut app = test_tui_app();
+        app.state.session_id = Some("history-session".into());
+        app.state.history_oldest_index = Some(80);
+        app.state.history_loading = true;
+
+        app.apply_session_history_page(
+            "history-session",
+            80,
+            serde_json::json!({
+                "messages": [{
+                    "role": "user",
+                    "content": [{"type": "text", "text": "older prompt"}]
+                }],
+                "history": {
+                    "oldest_index": 40,
+                    "older_available": true
+                }
+            }),
+        );
+
+        assert_eq!(app.state.messages.len(), 1);
+        assert_eq!(app.state.history_oldest_index, Some(40));
+        assert!(!app.state.history_loading);
+        assert!(!app
+            .jobs
+            .pending
+            .contains_key(&crate::async_jobs::JobChannel::SessionHistory));
     }
 
     #[test]
@@ -13512,6 +13735,25 @@ mod app_state_tests {
     }
 
     #[tokio::test]
+    async fn resume_with_empty_todos_resets_expanded_panel_state() {
+        let mut app = test_tui_app();
+        app.state.todos_expanded = true;
+
+        app.apply_session_resume_data(
+            "session-empty-todos",
+            serde_json::json!({
+                "session_id": "session-empty-todos",
+                "messages": [],
+                "todos": []
+            }),
+        )
+        .unwrap();
+
+        assert!(app.state.todos.is_empty());
+        assert!(!app.state.todos_expanded);
+    }
+
+    #[tokio::test]
     async fn resume_restores_ask_user_question_panel() {
         let mut app = test_tui_app();
         app.apply_session_resume_data(
@@ -14089,6 +14331,30 @@ mod app_state_tests {
         assert_eq!(app.state.todos[0].content, "finish");
         assert_eq!(app.state.status, SessionStatus::Idle);
         assert!(!app.state.background_session_events.contains_key("a"));
+    }
+
+    #[tokio::test]
+    async fn completed_todo_update_collapses_the_panel() {
+        let mut app = test_tui_app();
+        app.state.session_id = Some("todo-session".into());
+        app.state.todos_expanded = true;
+
+        app.handle_server_event(Frame::Event {
+            event: "agent".into(),
+            scope: None,
+            data: serde_json::to_value(AgentEvent::TodoUpdated {
+                session_id: "todo-session".into(),
+                items: vec![kkagent_protocol::TodoItemEvent {
+                    id: "todo-1".into(),
+                    content: "finish".into(),
+                    status: "completed".into(),
+                }],
+            })
+            .unwrap(),
+        });
+
+        assert_eq!(app.state.todos.len(), 1);
+        assert!(!app.state.todos_expanded);
     }
 
     #[tokio::test]

@@ -5,6 +5,8 @@ use std::process::Command;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+const REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+
 #[derive(Debug, Clone, Default)]
 pub struct GitBadge {
     pub branch: Option<String>,
@@ -34,11 +36,12 @@ struct Cache {
     at: Instant,
     cwd: String,
     badge: GitBadge,
+    refreshing: bool,
 }
 
 static CACHE: Mutex<Option<Cache>> = Mutex::new(None);
 
-/// Refresh at most every 2s per cwd.
+/// Return the cached badge and refresh stale Git metadata off the render thread.
 pub fn git_badge(cwd: &Path, trust: Option<&kkagent_config::WorkspaceTrust>) -> GitBadge {
     let key = format!(
         "{}|{}|{}",
@@ -50,22 +53,49 @@ pub fn git_badge(cwd: &Path, trust: Option<&kkagent_config::WorkspaceTrust>) -> 
             .map(|entry| entry.global_git_config_roots.join(";"))
             .unwrap_or_default()
     );
-    if let Ok(guard) = CACHE.lock() {
-        if let Some(c) = guard.as_ref() {
-            if c.cwd == key && c.at.elapsed() < Duration::from_secs(2) {
-                return c.badge.clone();
+    if let Ok(mut guard) = CACHE.lock() {
+        if let Some(cached) = guard.as_mut() {
+            if cached.cwd == key {
+                if cached.at.elapsed() < REFRESH_INTERVAL || cached.refreshing {
+                    return cached.badge.clone();
+                }
+                cached.refreshing = true;
+                let badge = cached.badge.clone();
+                spawn_refresh(cwd.to_path_buf(), trust.cloned(), key);
+                return badge;
             }
         }
     }
+
+    // A workspace switch is rare and needs an immediate first value. Subsequent
+    // probes use stale-while-revalidate so `git status` never blocks a frame.
     let badge = probe(cwd, trust);
     if let Ok(mut guard) = CACHE.lock() {
         *guard = Some(Cache {
             at: Instant::now(),
             cwd: key,
             badge: badge.clone(),
+            refreshing: false,
         });
     }
     badge
+}
+
+fn spawn_refresh(
+    cwd: std::path::PathBuf,
+    trust: Option<kkagent_config::WorkspaceTrust>,
+    key: String,
+) {
+    std::thread::spawn(move || {
+        let badge = probe(&cwd, trust.as_ref());
+        if let Ok(mut guard) = CACHE.lock() {
+            if let Some(cached) = guard.as_mut().filter(|cached| cached.cwd == key) {
+                cached.at = Instant::now();
+                cached.badge = badge;
+                cached.refreshing = false;
+            }
+        }
+    });
 }
 
 fn probe(cwd: &Path, trust: Option<&kkagent_config::WorkspaceTrust>) -> GitBadge {

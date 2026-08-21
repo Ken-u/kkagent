@@ -7,7 +7,25 @@ use super::index::{
 use super::workdir_key::{encode_work_dir_key, is_safe_session_id, normalize_work_dir};
 use crate::session::metadata::{SessionMeta, SessionMetaPatch, SessionMetadataService};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+// In-process writes invalidate immediately; the TTL only bounds staleness for
+// another kkagent process editing the same store.
+const LIST_CACHE_TTL: Duration = Duration::from_secs(10);
+
+struct CachedSessionList {
+    generation: u64,
+    loaded_at: Instant,
+    summaries: Vec<SessionSummary>,
+}
+
+fn list_cache() -> &'static Mutex<HashMap<PathBuf, CachedSessionList>> {
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, CachedSessionList>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -112,6 +130,26 @@ impl SessionStore {
         include_archived: bool,
         limit: usize,
     ) -> anyhow::Result<Vec<SessionSummary>> {
+        let generation = super::list_generation();
+        {
+            let cache = list_cache()
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if let Some(cached) = cache.get(&self.home_dir).filter(|cached| {
+                cached.generation == generation && cached.loaded_at.elapsed() < LIST_CACHE_TTL
+            }) {
+                if generation == super::list_generation() {
+                    return Ok(cached
+                        .summaries
+                        .iter()
+                        .filter(|summary| include_archived || !summary.archived)
+                        .take(limit)
+                        .cloned()
+                        .collect());
+                }
+            }
+        }
+
         let index = read_session_index(&self.home_dir, &self.sessions_dir)?;
         let mut out = Vec::new();
         for (id, entry) in index {
@@ -123,9 +161,6 @@ impl SessionStore {
             let Ok(meta) = SessionMetadataService::load_or_create(&dir, &id, &work) else {
                 continue;
             };
-            if !include_archived && meta.read().archived {
-                continue;
-            }
             let work = meta
                 .read()
                 .work_dir
@@ -135,10 +170,24 @@ impl SessionStore {
             out.push(summary_from_meta(&id, &dir, &work, meta.read()));
         }
         out.sort_by_key(|item| std::cmp::Reverse(item.updated_at));
-        if out.len() > limit {
-            out.truncate(limit);
-        }
-        Ok(out)
+        let result = out
+            .iter()
+            .filter(|summary| include_archived || !summary.archived)
+            .take(limit)
+            .cloned()
+            .collect();
+        list_cache()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(
+                self.home_dir.clone(),
+                CachedSessionList {
+                    generation,
+                    loaded_at: Instant::now(),
+                    summaries: out,
+                },
+            );
+        Ok(result)
     }
 
     pub fn rename(&self, id: &str, title: &str) -> anyhow::Result<()> {

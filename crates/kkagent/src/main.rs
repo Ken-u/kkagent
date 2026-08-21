@@ -2499,13 +2499,18 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
     }
 
     async fn list_sessions(&self) -> serde_json::Value {
-        let store = SessionStore::open_default();
-        if let Ok(summaries) = store.list(false, 200) {
+        if let Ok(summaries) = self.state.disk_session_summaries(false, 200).await {
             if !summaries.is_empty() {
                 let db = self.state.transcript.lock().await;
+                let session_ids: Vec<String> =
+                    summaries.iter().map(|summary| summary.id.clone()).collect();
+                let records = db.sessions_by_ids(&session_ids).unwrap_or_default();
                 let list: Vec<_> = summaries
                     .into_iter()
-                    .map(|summary| http_session_list_item(&db, summary))
+                    .map(|summary| {
+                        let record = records.get(&summary.id);
+                        http_session_list_item(summary, record)
+                    })
                     .collect();
                 return serde_json::json!({"sessions": list});
             }
@@ -3794,6 +3799,18 @@ impl ServerState {
             return true;
         }
         kkagent_core::is_workspace_trusted(&self.config(), workspace)
+    }
+
+    async fn disk_session_summaries(
+        &self,
+        include_archived: bool,
+        limit: usize,
+    ) -> anyhow::Result<Vec<kkagent_core::session::store::SessionSummary>> {
+        tokio::task::spawn_blocking(move || {
+            SessionStore::open_default().list(include_archived, limit)
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("session list worker failed: {error}"))?
     }
 
     fn apply_workspace_trust(&self, trust: kkagent_config::WorkspaceTrust) -> anyhow::Result<()> {
@@ -5236,11 +5253,10 @@ fn repair_orphan_tool_uses(messages: &mut Vec<ChatMessage>) {
 }
 
 fn http_session_list_item(
-    db: &TranscriptDb,
     summary: kkagent_core::session::store::SessionSummary,
+    record: Option<&kkagent_core::transcript::SessionRecord>,
 ) -> serde_json::Value {
-    let record = db.get_session(&summary.id).ok().flatten();
-    let message_count = record.as_ref().map(|item| item.message_count).unwrap_or(0);
+    let message_count = record.map(|item| item.message_count).unwrap_or(0);
     let preview = summary
         .last_prompt
         .as_deref()
@@ -5251,7 +5267,7 @@ fn http_session_list_item(
         .collect::<String>();
     let updated_at = chrono::DateTime::from_timestamp_millis(summary.updated_at)
         .map(|time| time.to_rfc3339())
-        .or_else(|| record.as_ref().map(|item| item.updated_at.clone()));
+        .or_else(|| record.map(|item| item.updated_at.clone()));
     serde_json::json!({
         "session_id": summary.id,
         "title": summary.title,
@@ -6289,18 +6305,18 @@ async fn handle_rpc_call(
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
             // Prefer disk session store (kimi-aligned); fall back to transcript DB.
-            let store = SessionStore::open_default();
-            if let Ok(summaries) = store.list(include_archived, limit) {
+            if let Ok(summaries) = state.disk_session_summaries(include_archived, limit).await {
                 if !summaries.is_empty() {
                     let db = state.transcript.lock().await;
+                    let session_ids: Vec<String> =
+                        summaries.iter().map(|summary| summary.id.clone()).collect();
+                    let records = db.sessions_by_ids(&session_ids).unwrap_or_default();
                     let list: Vec<_> = summaries
                         .into_iter()
                         .map(|s| {
-                            let message_count = db
-                                .get_session(&s.id)
-                                .ok()
-                                .flatten()
-                                .map(|r| r.message_count)
+                            let message_count = records
+                                .get(&s.id)
+                                .map(|record| record.message_count)
                                 .unwrap_or(0);
                             let empty = message_count == 0
                                 && s.first_prompt

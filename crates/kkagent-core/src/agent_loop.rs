@@ -7,7 +7,7 @@ use kkagent_protocol::{AgentEvent, SessionStatus};
 use kkagent_tools::{infer_accesses, ToolContext, ToolOutput, ToolRegistry};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::{AbortHandle, JoinHandle};
 
@@ -29,6 +29,86 @@ use crate::tool_scheduler::{box_start, ToolCallTask, ToolScheduler};
 use crate::transcript::TranscriptDb;
 use std::path::PathBuf;
 use std::sync::OnceLock;
+
+const STREAM_DELTA_FLUSH_INTERVAL: Duration = Duration::from_millis(16);
+const STREAM_DELTA_FLUSH_BYTES: usize = 64;
+const STREAM_INTERRUPT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamDeltaKind {
+    Message,
+    Thinking,
+}
+
+#[derive(Debug, Default)]
+struct StreamDeltaBuffer {
+    kind: Option<StreamDeltaKind>,
+    text: String,
+    buffered_at: Option<Instant>,
+}
+
+impl StreamDeltaBuffer {
+    /// Append a provider chunk. A kind change flushes the previous kind first
+    /// so message/thinking/tool event ordering remains exact.
+    fn push(&mut self, kind: StreamDeltaKind, text: String) -> Option<(StreamDeltaKind, String)> {
+        let flushed = if self.kind.is_some_and(|current| current != kind) {
+            self.take()
+        } else {
+            None
+        };
+        if self.text.is_empty() {
+            self.kind = Some(kind);
+            self.buffered_at = Some(Instant::now());
+        }
+        self.text.push_str(&text);
+        if flushed.is_none() && self.text.len() >= STREAM_DELTA_FLUSH_BYTES {
+            self.take()
+        } else {
+            flushed
+        }
+    }
+
+    fn take(&mut self) -> Option<(StreamDeltaKind, String)> {
+        let kind = self.kind.take()?;
+        self.buffered_at = None;
+        Some((kind, std::mem::take(&mut self.text)))
+    }
+
+    fn is_due(&self) -> bool {
+        self.buffered_at
+            .is_some_and(|started| started.elapsed() >= STREAM_DELTA_FLUSH_INTERVAL)
+    }
+
+    fn wait_duration(&self) -> Duration {
+        let Some(started) = self.buffered_at else {
+            return STREAM_INTERRUPT_POLL_INTERVAL;
+        };
+        STREAM_DELTA_FLUSH_INTERVAL
+            .saturating_sub(started.elapsed())
+            .min(STREAM_INTERRUPT_POLL_INTERVAL)
+    }
+}
+
+async fn send_buffered_delta(
+    event_tx: &mpsc::Sender<AgentEvent>,
+    session_id: &str,
+    delta: Option<(StreamDeltaKind, String)>,
+) {
+    let Some((kind, text)) = delta else {
+        return;
+    };
+    let event = match kind {
+        StreamDeltaKind::Message => AgentEvent::MessageDelta {
+            session_id: session_id.to_owned(),
+            text,
+        },
+        StreamDeltaKind::Thinking => AgentEvent::ThinkingDelta {
+            session_id: session_id.to_owned(),
+            text,
+        },
+    };
+    let _ = event_tx.send(event).await;
+}
 
 fn global_file_tracker() -> &'static FileConflictTracker {
     static TRACKER: OnceLock<FileConflictTracker> = OnceLock::new();
@@ -684,6 +764,7 @@ Do not mention this reminder to the user.\n</system-reminder>"
 
             let mut active_tools: HashMap<String, (PendingToolCall, String)> = HashMap::new();
             let mut got_message_end = false;
+            let mut delta_buffer = StreamDeltaBuffer::default();
 
             loop {
                 if session.is_interrupted() {
@@ -691,32 +772,26 @@ Do not mention this reminder to the user.\n</system-reminder>"
                     if let Some(h) = self.abort_registry.lock().await.remove(&session_id) {
                         h.abort();
                     }
+                    let pending = delta_buffer.take();
+                    send_buffered_delta(&self.event_tx, &session_id, pending).await;
                     break;
                 }
 
-                match tokio::time::timeout(Duration::from_millis(100), stream_rx.recv()).await {
+                match tokio::time::timeout(delta_buffer.wait_duration(), stream_rx.recv()).await {
                     Ok(Some(event)) => match event {
                         StreamEvent::TextDelta(text) => {
                             assistant_text.push_str(&text);
-                            let _ = self
-                                .event_tx
-                                .send(AgentEvent::MessageDelta {
-                                    session_id: session_id.clone(),
-                                    text,
-                                })
-                                .await;
+                            let ready = delta_buffer.push(StreamDeltaKind::Message, text);
+                            send_buffered_delta(&self.event_tx, &session_id, ready).await;
                         }
                         StreamEvent::ThinkingDelta(text) => {
                             thinking_text.push_str(&text);
-                            let _ = self
-                                .event_tx
-                                .send(AgentEvent::ThinkingDelta {
-                                    session_id: session_id.clone(),
-                                    text,
-                                })
-                                .await;
+                            let ready = delta_buffer.push(StreamDeltaKind::Thinking, text);
+                            send_buffered_delta(&self.event_tx, &session_id, ready).await;
                         }
                         StreamEvent::ToolUseStart { id, name } => {
+                            let pending = delta_buffer.take();
+                            send_buffered_delta(&self.event_tx, &session_id, pending).await;
                             tracing::info!("Tool use start: {} ({})", name, id);
                             active_tools.insert(
                                 id.clone(),
@@ -732,6 +807,8 @@ Do not mention this reminder to the user.\n</system-reminder>"
                             );
                         }
                         StreamEvent::ToolUseInputDelta { id, delta } => {
+                            let pending = delta_buffer.take();
+                            send_buffered_delta(&self.event_tx, &session_id, pending).await;
                             if let Some((_, input)) = active_tools.get_mut(&id) {
                                 input.push_str(&delta);
                             } else {
@@ -739,6 +816,8 @@ Do not mention this reminder to the user.\n</system-reminder>"
                             }
                         }
                         StreamEvent::ToolUseEnd { id } => {
+                            let pending = delta_buffer.take();
+                            send_buffered_delta(&self.event_tx, &session_id, pending).await;
                             if let Some((mut tool, input)) = active_tools.remove(&id) {
                                 (tool.input, tool.input_error) = parse_tool_arguments(&input);
                                 tracing::info!(
@@ -759,6 +838,8 @@ Do not mention this reminder to the user.\n</system-reminder>"
                             usage,
                             stop_reason: reason,
                         } => {
+                            let pending = delta_buffer.take();
+                            send_buffered_delta(&self.event_tx, &session_id, pending).await;
                             for (_, (mut tool, input)) in active_tools.drain() {
                                 (tool.input, tool.input_error) = parse_tool_arguments(&input);
                                 tool_calls.push(tool);
@@ -797,6 +878,8 @@ Do not mention this reminder to the user.\n</system-reminder>"
                                 .await;
                         }
                         StreamEvent::Error(msg) => {
+                            let pending = delta_buffer.take();
+                            send_buffered_delta(&self.event_tx, &session_id, pending).await;
                             if msg.contains(kkagent_llm::FIRST_TOKEN_TIMEOUT_MARKER) {
                                 tracing::warn!(
                                     model = %model_config.model,
@@ -812,6 +895,8 @@ Do not mention this reminder to the user.\n</system-reminder>"
                             message,
                             retry_after,
                         } => {
+                            let pending = delta_buffer.take();
+                            send_buffered_delta(&self.event_tx, &session_id, pending).await;
                             tracing::warn!(
                                 retry_after_seconds = retry_after.map(|delay| delay.as_secs_f64()),
                                 "LLM rate limited: {message}"
@@ -822,8 +907,18 @@ Do not mention this reminder to the user.\n</system-reminder>"
                             stream_failed = true;
                         }
                     },
-                    Ok(None) => break,
-                    Err(_) => continue, // timeout — re-check interrupt
+                    Ok(None) => {
+                        let pending = delta_buffer.take();
+                        send_buffered_delta(&self.event_tx, &session_id, pending).await;
+                        break;
+                    }
+                    Err(_) => {
+                        if delta_buffer.is_due() {
+                            let pending = delta_buffer.take();
+                            send_buffered_delta(&self.event_tx, &session_id, pending).await;
+                        }
+                        continue; // timeout — re-check interrupt
+                    }
                 }
             }
 
@@ -3156,6 +3251,36 @@ mod retry_tests {
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
     };
+
+    #[test]
+    fn stream_delta_buffer_coalesces_same_kind_to_threshold() {
+        let mut buffer = StreamDeltaBuffer::default();
+        assert!(buffer
+            .push(StreamDeltaKind::Message, "a".repeat(63))
+            .is_none());
+        let flushed = buffer
+            .push(StreamDeltaKind::Message, "b".into())
+            .expect("threshold should flush");
+        assert_eq!(flushed.0, StreamDeltaKind::Message);
+        assert_eq!(flushed.1.len(), STREAM_DELTA_FLUSH_BYTES);
+        assert!(buffer.take().is_none());
+    }
+
+    #[test]
+    fn stream_delta_buffer_flushes_before_kind_change() {
+        let mut buffer = StreamDeltaBuffer::default();
+        assert!(buffer
+            .push(StreamDeltaKind::Thinking, "thought".into())
+            .is_none());
+        let flushed = buffer
+            .push(StreamDeltaKind::Message, "answer".into())
+            .expect("kind change should flush");
+        assert_eq!(flushed, (StreamDeltaKind::Thinking, "thought".into()));
+        assert_eq!(
+            buffer.take(),
+            Some((StreamDeltaKind::Message, "answer".into()))
+        );
+    }
 
     #[test]
     fn server_retry_after_overrides_exponential_backoff() {

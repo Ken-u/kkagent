@@ -1,5 +1,6 @@
 use chrono::Utc;
-use rusqlite::{params, Connection};
+use rusqlite::{params, params_from_iter, Connection};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
@@ -703,6 +704,50 @@ impl TranscriptDb {
         Ok(sessions)
     }
 
+    /// Fetch records for a session-list page with a bounded number of SQL
+    /// statements instead of preparing one query per session.
+    pub fn sessions_by_ids(
+        &self,
+        session_ids: &[String],
+    ) -> anyhow::Result<HashMap<String, SessionRecord>> {
+        const SQLITE_BATCH_SIZE: usize = 500;
+
+        let conn = self.lock()?;
+        let mut sessions = HashMap::with_capacity(session_ids.len());
+        for batch in session_ids.chunks(SQLITE_BATCH_SIZE) {
+            if batch.is_empty() {
+                continue;
+            }
+            let placeholders = std::iter::repeat_n("?", batch.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT session_id, title, model, fallback_model, working_dir, created_at, updated_at,
+                        message_count, is_archived
+                 FROM sessions WHERE session_id IN ({placeholders})"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(params_from_iter(batch.iter()), |row| {
+                Ok(SessionRecord {
+                    session_id: row.get(0)?,
+                    title: row.get(1)?,
+                    model: row.get(2)?,
+                    fallback_model: row.get(3)?,
+                    working_dir: row.get(4)?,
+                    created_at: row.get(5)?,
+                    updated_at: row.get(6)?,
+                    message_count: row.get(7)?,
+                    is_archived: row.get::<_, i32>(8)? != 0,
+                })
+            })?;
+            for row in rows {
+                let session = row?;
+                sessions.insert(session.session_id.clone(), session);
+            }
+        }
+        Ok(sessions)
+    }
+
     pub fn get_session(&self, session_id: &str) -> anyhow::Result<Option<SessionRecord>> {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
@@ -1176,6 +1221,22 @@ mod tests {
 
         let sessions = db.list_sessions(10).unwrap();
         assert_eq!(sessions.len(), 2);
+    }
+
+    #[test]
+    fn test_sessions_by_ids_batches_records_and_ignores_missing_ids() {
+        let db = test_db();
+        db.create_session("s1", "claude", ".").unwrap();
+        db.create_session("s2", "gpt", ".").unwrap();
+        db.append_message("s2", "user", r#"[{"type":"text","text":"hello"}]"#, None)
+            .unwrap();
+
+        let records = db
+            .sessions_by_ids(&["s2".into(), "missing".into(), "s1".into()])
+            .unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records["s1"].message_count, 0);
+        assert_eq!(records["s2"].message_count, 1);
     }
 
     #[test]

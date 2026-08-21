@@ -53,6 +53,7 @@ fn append_line(home_dir: &Path, line: &str) -> anyhow::Result<()> {
         .append(true)
         .open(&path)?;
     writeln!(f, "{line}")?;
+    super::invalidate_list_cache();
     Ok(())
 }
 

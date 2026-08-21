@@ -239,7 +239,7 @@ pub fn render_btw(
             );
         } else if state.current_answer.is_empty() && state.current_thinking.is_empty() {
             let frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-            let spinner = frames[(tick / 2) % frames.len()];
+            let spinner = frames[(tick / crate::app::SPINNER_TICKS_PER_FRAME) % frames.len()];
             lines.push(Line::from(Span::styled(
                 if state.streaming {
                     format!("● {spinner} thinking")
@@ -250,7 +250,7 @@ pub fn render_btw(
             )));
         } else if state.current_answer.is_empty() {
             let frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-            let spinner = frames[(tick / 2) % frames.len()];
+            let spinner = frames[(tick / crate::app::SPINNER_TICKS_PER_FRAME) % frames.len()];
             lines.push(Line::from(Span::styled(
                 format!("● {spinner} thinking"),
                 Style::default()

@@ -7,6 +7,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Padding, Paragraph, Wrap},
     Frame,
 };
+use std::hash::{Hash, Hasher};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -429,18 +430,78 @@ fn input_inner_height(state: &AppState, terminal_width: u16) -> u16 {
 
 fn render_messages(f: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) {
     let width = area.width.max(1);
-    let mut lines = build_transcript_lines(state, theme, width);
+    let streaming_tail = streaming_transcript_tail_index(state);
+    let fingerprint = transcript_layout_fingerprint(state, width);
+    if !state.transcript_layout_cache.matches(fingerprint) {
+        let lines = if let Some(tail_index) = streaming_tail {
+            build_transcript_lines_range(state, theme, width, Some(0..tail_index), true)
+        } else {
+            build_transcript_lines(state, theme, width)
+        };
+        state.select_rows = crate::selection::rows_from_lines(&lines);
+        state.transcript_layout_cache.replace(fingerprint, lines);
+    }
+    let static_line_count = state.transcript_layout_cache.lines().len();
+    let mut dynamic_lines = if let Some(tail_index) = streaming_tail {
+        let prefix_starts: Vec<u16> = state
+            .message_line_starts
+            .iter()
+            .take(tail_index)
+            .copied()
+            .collect();
+        let prefix_hits: Vec<ToolExpandHit> = state
+            .tool_expand_hits
+            .iter()
+            .filter(|hit| tool_expand_target_message(hit.target) < tail_index)
+            .copied()
+            .collect();
+        let tail_lines = build_transcript_lines_range(
+            state,
+            theme,
+            width,
+            Some(tail_index..tail_index + 1),
+            false,
+        );
+        let mut tail_starts = std::mem::take(&mut state.message_line_starts);
+        for start in &mut tail_starts {
+            *start = static_line_count
+                .saturating_add(*start as usize)
+                .min(u16::MAX as usize) as u16;
+        }
+        let mut tail_hits = std::mem::take(&mut state.tool_expand_hits);
+        for hit in &mut tail_hits {
+            hit.line = hit.line.saturating_add(static_line_count);
+        }
+        state.message_line_starts = prefix_starts;
+        state.message_line_starts.extend(tail_starts);
+        state.tool_expand_hits = prefix_hits;
+        state.tool_expand_hits.extend(tail_hits);
+        tail_lines
+    } else {
+        Vec::new()
+    };
+    dynamic_lines.extend(build_transcript_status_lines(
+        state,
+        theme,
+        width,
+        area.height,
+    ));
+    state.select_rows.truncate(static_line_count);
+    state
+        .select_rows
+        .extend(crate::selection::rows_from_lines(&dynamic_lines));
     state.transcript_area = area;
-    state.select_rows = crate::selection::rows_from_lines(&lines);
 
     if let Some(sel) = state.selection {
         state.selection = crate::selection::clamp_selection(sel, state.select_rows.len());
     }
-    if let Some(sel) = state.selection {
-        crate::selection::apply_highlight(&mut lines, sel, crate::selection::selection_style());
-    }
 
-    let content_height = lines.len() as u16;
+    let content_height = state
+        .transcript_layout_cache
+        .lines()
+        .len()
+        .saturating_add(dynamic_lines.len())
+        .min(u16::MAX as usize) as u16;
     let visible_height = area.height.max(1);
 
     state.content_lines = content_height;
@@ -471,13 +532,334 @@ fn render_messages(f: &mut Frame, area: Rect, state: &mut AppState, theme: &Them
 
     // scroll_up = 离底部的行数；0 表示贴底跟随
     let scroll_from_top = max_scroll_up.saturating_sub(state.scroll_up);
+    let start = scroll_from_top as usize;
+    let end = start
+        .saturating_add(visible_height as usize)
+        .min(static_line_count.saturating_add(dynamic_lines.len()));
+    let mut visible_lines = Vec::with_capacity(end.saturating_sub(start));
+    let static_start = start.min(static_line_count);
+    let static_end = end.min(static_line_count);
+    visible_lines
+        .extend_from_slice(&state.transcript_layout_cache.lines()[static_start..static_end]);
+    if end > static_line_count {
+        let dynamic_start = start.saturating_sub(static_line_count);
+        let dynamic_end = end - static_line_count;
+        visible_lines.extend_from_slice(&dynamic_lines[dynamic_start..dynamic_end]);
+    }
+    if let Some(sel) = state
+        .selection
+        .and_then(|selection| selection_in_viewport(selection, start, end))
+    {
+        crate::selection::apply_highlight(
+            &mut visible_lines,
+            sel,
+            crate::selection::selection_style(),
+        );
+    }
 
     // Lines are already width-wrapped — do NOT wrap again (that desyncs scroll).
-    let paragraph = Paragraph::new(Text::from(lines)).scroll((scroll_from_top, 0));
+    let paragraph = Paragraph::new(Text::from(visible_lines));
     f.render_widget(paragraph, area);
 }
 
+fn tool_expand_target_message(target: ToolExpandTarget) -> usize {
+    match target {
+        ToolExpandTarget::Part { message, .. } | ToolExpandTarget::Legacy { message, .. } => {
+            message
+        }
+    }
+}
+
+fn streaming_transcript_tail_index(state: &AppState) -> Option<usize> {
+    let index = active_assistant_message_index(state)?;
+    (index.checked_add(1) == Some(state.messages.len())).then_some(index)
+}
+
+fn active_assistant_message_index(state: &AppState) -> Option<usize> {
+    let browsing_sessions = state
+        .list_picker
+        .as_ref()
+        .is_some_and(|picker| picker.kind == crate::app::ListPickerKind::Session);
+    if browsing_sessions || state.plan_focus_active() || state.status == SessionStatus::Idle {
+        return None;
+    }
+    let index = state.active_assistant_message?;
+    state
+        .messages
+        .get(index)
+        .is_some_and(|message| message.role == MessageRole::Assistant)
+        .then_some(index)
+}
+
+fn live_thinking_message_index(state: &AppState) -> Option<usize> {
+    (state.status == SessionStatus::Thinking)
+        .then(|| active_assistant_message_index(state))
+        .flatten()
+}
+
+fn selection_in_viewport(
+    selection: crate::selection::TextSelection,
+    start: usize,
+    end: usize,
+) -> Option<crate::selection::TextSelection> {
+    use crate::selection::{CellPos, TextSelection};
+
+    if start >= end || selection.is_empty() {
+        return None;
+    }
+    let (lo, hi) = selection.normalized();
+    if hi.line < start || lo.line >= end {
+        return None;
+    }
+    let visible_lo = CellPos {
+        line: lo.line.max(start) - start,
+        col: if lo.line < start { 0 } else { lo.col },
+    };
+    let visible_hi = CellPos {
+        line: hi.line.min(end - 1) - start,
+        col: if hi.line >= end { u16::MAX } else { hi.col },
+    };
+    Some(TextSelection {
+        anchor: visible_lo,
+        focus: visible_hi,
+    })
+}
+
+fn transcript_layout_fingerprint(state: &AppState, width: u16) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    width.hash(&mut hasher);
+    state.tool_output_expanded.hash(&mut hasher);
+    state.highlight_message.hash(&mut hasher);
+    std::mem::discriminant(&state.locale).hash(&mut hasher);
+
+    let browsing_sessions = state
+        .list_picker
+        .as_ref()
+        .is_some_and(|picker| picker.kind == crate::app::ListPickerKind::Session);
+    browsing_sessions.hash(&mut hasher);
+    if !browsing_sessions && state.plan_focus_active() {
+        if let Some(document) = &state.plan_document {
+            document.path.hash(&mut hasher);
+            document.content.hash(&mut hasher);
+        }
+        return hasher.finish();
+    }
+
+    let messages = if browsing_sessions {
+        state
+            .session_picker_preview
+            .as_ref()
+            .map(|preview| preview.messages.as_slice())
+            .unwrap_or(&state.messages)
+    } else {
+        &state.messages
+    };
+    live_thinking_message_index(state).hash(&mut hasher);
+    let streaming_tail = streaming_transcript_tail_index(state);
+    streaming_tail.hash(&mut hasher);
+    messages.len().hash(&mut hasher);
+    for (index, message) in messages.iter().enumerate() {
+        if streaming_tail == Some(index) {
+            continue;
+        }
+        hash_display_message(message, &mut hasher);
+    }
+
+    state.history_loading.hash(&mut hasher);
+    if messages.is_empty() && !browsing_sessions {
+        (state.tick / 100).hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+fn hash_display_message(message: &crate::app::DisplayMessage, hasher: &mut impl Hasher) {
+    std::mem::discriminant(&message.role).hash(hasher);
+    match message.role {
+        MessageRole::User => {
+            message.content.hash(hasher);
+            std::mem::discriminant(&message.delivery).hash(hasher);
+            return;
+        }
+        MessageRole::Plan | MessageRole::System => {
+            message.content.hash(hasher);
+            return;
+        }
+        MessageRole::Skill => {
+            message.content.hash(hasher);
+        }
+        MessageRole::Assistant => {
+            message.thinking.hash(hasher);
+            if message.parts.is_empty() {
+                message.content.hash(hasher);
+                message.tool_calls.len().hash(hasher);
+                for tool in &message.tool_calls {
+                    hash_display_tool(tool, hasher);
+                }
+                return;
+            }
+        }
+    }
+
+    message.parts.len().hash(hasher);
+    for part in &message.parts {
+        std::mem::discriminant(part).hash(hasher);
+        match part {
+            DisplayPart::Text(text) => text.hash(hasher),
+            DisplayPart::Tool(tool) => hash_display_tool(tool, hasher),
+            DisplayPart::ToolHistory(history) => {
+                history.tool_count.hash(hasher);
+                history.duration_ms.hash(hasher);
+                history.tokens.hash(hasher);
+                history.expanded.hash(hasher);
+                history.user_overridden.hash(hasher);
+                history.tools.len().hash(hasher);
+                for tool in &history.tools {
+                    hash_display_tool(tool, hasher);
+                }
+            }
+            DisplayPart::SkillActivation { name, args } => {
+                name.hash(hasher);
+                args.hash(hasher);
+            }
+        }
+    }
+}
+
+fn hash_display_tool(tool: &crate::app::DisplayToolCall, hasher: &mut impl Hasher) {
+    tool.id.hash(hasher);
+    tool.name.hash(hasher);
+    tool.input_summary.hash(hasher);
+    tool.output.hash(hasher);
+    tool.is_error.hash(hasher);
+    tool.collapsed.hash(hasher);
+    tool.user_overridden.hash(hasher);
+    tool.stopping.hash(hasher);
+    if tool.output.is_none() {
+        tool.started_at
+            .map(|started| started.elapsed().as_secs())
+            .hash(hasher);
+    }
+}
+
+fn live_thinking_text(state: &AppState) -> &str {
+    if !state.thinking_text.is_empty() {
+        return &state.thinking_text;
+    }
+    state
+        .active_assistant_message
+        .and_then(|index| state.messages.get(index))
+        .and_then(|message| message.thinking.as_deref())
+        .unwrap_or("")
+}
+
+/// The live status tail is deliberately kept outside the full transcript
+/// cache. Spinner and thinking updates can then redraw a few lines without
+/// laying out the entire conversation again.
+fn build_transcript_status_lines(
+    state: &AppState,
+    theme: &Theme,
+    width: u16,
+    viewport_height: u16,
+) -> Vec<Line<'static>> {
+    let browsing_sessions = state
+        .list_picker
+        .as_ref()
+        .is_some_and(|picker| picker.kind == crate::app::ListPickerKind::Session);
+    if !browsing_sessions && state.plan_focus_active() {
+        return Vec::new();
+    }
+    let messages = if browsing_sessions {
+        state
+            .session_picker_preview
+            .as_ref()
+            .map(|preview| preview.messages.as_slice())
+            .unwrap_or(&state.messages)
+    } else {
+        &state.messages
+    };
+    if messages.is_empty() {
+        return Vec::new();
+    }
+
+    let body_height = live_thinking_body_height(viewport_height);
+    let frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+    let ch = frames[(state.tick / crate::app::SPINNER_TICKS_PER_FRAME) % frames.len()];
+    let mut lines = Vec::new();
+    match state.status {
+        SessionStatus::Thinking | SessionStatus::WaitingApproval => {
+            if state.status == SessionStatus::WaitingApproval {
+                let hidden_plan_review = state
+                    .approval_pending
+                    .as_ref()
+                    .is_some_and(|approval| approval.is_plan_review && approval.hidden);
+                let label = if hidden_plan_review {
+                    "plan review hidden · enter to reopen · ctrl-c to cancel"
+                } else {
+                    "waiting for approval"
+                };
+                lines.push(Line::from(Span::styled(
+                    format!("● {ch} {label}"),
+                    Style::default()
+                        .fg(theme.warning)
+                        .add_modifier(Modifier::ITALIC),
+                )));
+            } else {
+                lines.push(Line::from(Span::styled(
+                    format!("● {ch} thinking"),
+                    Style::default()
+                        .fg(theme.text_dim)
+                        .add_modifier(Modifier::ITALIC),
+                )));
+                let mut tail: Vec<&str> =
+                    live_thinking_text(state).lines().rev().take(12).collect();
+                tail.reverse();
+                let mut body = Vec::new();
+                for line in tail {
+                    push_wrapped_indented_text(
+                        &mut body,
+                        line,
+                        width,
+                        2,
+                        Style::default().fg(theme.text_muted),
+                    );
+                }
+                if body.len() > body_height {
+                    body.drain(..body.len() - body_height);
+                }
+                lines.extend(body);
+            }
+        }
+        SessionStatus::ToolExecuting => {
+            let tool = state.last_tool_name.as_deref().unwrap_or("tool");
+            lines.push(Line::from(Span::styled(
+                format!("● {ch} running {tool}"),
+                Style::default()
+                    .fg(theme.primary)
+                    .add_modifier(Modifier::ITALIC),
+            )));
+        }
+        _ => {}
+    }
+    lines
+}
+
+fn live_thinking_body_height(viewport_height: u16) -> usize {
+    let available = viewport_height.saturating_sub(1);
+    let proportional = (viewport_height / 3).max(1);
+    usize::from(available.min(proportional).min(12))
+}
+
 fn build_transcript_lines(state: &mut AppState, theme: &Theme, width: u16) -> Vec<Line<'static>> {
+    build_transcript_lines_range(state, theme, width, None, true)
+}
+
+fn build_transcript_lines_range(
+    state: &mut AppState,
+    theme: &Theme,
+    width: u16,
+    message_range: Option<std::ops::Range<usize>>,
+    include_prefix_chrome: bool,
+) -> Vec<Line<'static>> {
     let mut lines: Vec<Line> = Vec::new();
     state.message_line_starts.clear();
     state.tool_expand_hits.clear();
@@ -491,7 +873,7 @@ fn build_transcript_lines(state: &mut AppState, theme: &Theme, width: u16) -> Ve
         .map(|p| p.kind == crate::app::ListPickerKind::Session)
         .unwrap_or(false);
 
-    if !browsing_sessions && state.plan_focus_active() {
+    if include_prefix_chrome && !browsing_sessions && state.plan_focus_active() {
         if let Some(doc) = state.plan_document.clone() {
             // Single synthetic index so scroll helpers stay consistent.
             state.message_line_starts.push(0);
@@ -515,7 +897,7 @@ fn build_transcript_lines(state: &mut AppState, theme: &Theme, width: u16) -> Ve
     let interactive_tools = browse_msgs.is_none();
     let locale = state.locale;
 
-    if messages.is_empty() {
+    if include_prefix_chrome && messages.is_empty() {
         if browsing_sessions {
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
@@ -564,7 +946,7 @@ fn build_transcript_lines(state: &mut AppState, theme: &Theme, width: u16) -> Ve
         return lines;
     }
 
-    if state.history_loading {
+    if include_prefix_chrome && state.history_loading {
         lines.push(Line::from(Span::styled(
             "  Loading earlier messages…",
             Style::default().fg(theme.text_muted),
@@ -572,7 +954,13 @@ fn build_transcript_lines(state: &mut AppState, theme: &Theme, width: u16) -> Ve
         lines.push(Line::from(""));
     }
 
-    for (msg_idx, msg) in messages.iter().enumerate() {
+    let range = message_range.unwrap_or(0..messages.len());
+    for (msg_idx, msg) in messages
+        .iter()
+        .enumerate()
+        .take(range.end.min(messages.len()))
+        .skip(range.start)
+    {
         state
             .message_line_starts
             .push(lines.len().min(u16::MAX as usize) as u16);
@@ -647,7 +1035,13 @@ fn build_transcript_lines(state: &mut AppState, theme: &Theme, width: u16) -> Ve
             }
             MessageRole::Assistant => {
                 // Thinking block (dim), like kimi
-                if let Some(ref thinking) = msg.thinking {
+                let thinking_is_in_live_viewport =
+                    live_thinking_message_index(state) == Some(msg_idx);
+                if let Some(thinking) = msg
+                    .thinking
+                    .as_ref()
+                    .filter(|_| !thinking_is_in_live_viewport)
+                {
                     push_thinking_lines(
                         &mut lines,
                         thinking,
@@ -662,15 +1056,8 @@ fn build_transcript_lines(state: &mut AppState, theme: &Theme, width: u16) -> Ve
                 let mut first_bullet = true;
                 let mut rendered_any = false;
 
-                let parts: Vec<(usize, &DisplayPart)> = if !msg.parts.is_empty() {
-                    msg.parts.iter().enumerate().collect()
-                } else {
-                    // Legacy fallback: tools then content (prefer tools above text).
-                    Vec::new()
-                };
-
-                if !parts.is_empty() {
-                    for (part_idx, part) in parts {
+                if !msg.parts.is_empty() {
+                    for (part_idx, part) in msg.parts.iter().enumerate() {
                         match part {
                             DisplayPart::Text(text) => {
                                 if text.is_empty() {
@@ -803,61 +1190,6 @@ fn build_transcript_lines(state: &mut AppState, theme: &Theme, width: u16) -> Ve
                 Style::default().fg(theme.accent),
             )));
         }
-    }
-
-    match state.status {
-        SessionStatus::Thinking | SessionStatus::WaitingApproval => {
-            let frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-            let ch = frames[(state.tick / 2) % frames.len()];
-            if state.status == SessionStatus::WaitingApproval {
-                let hidden_plan_review = state
-                    .approval_pending
-                    .as_ref()
-                    .is_some_and(|approval| approval.is_plan_review && approval.hidden);
-                let label = if hidden_plan_review {
-                    "plan review hidden · enter to reopen · ctrl-c to cancel"
-                } else {
-                    "waiting for approval"
-                };
-                lines.push(Line::from(Span::styled(
-                    format!("● {ch} {label}"),
-                    Style::default()
-                        .fg(theme.warning)
-                        .add_modifier(Modifier::ITALIC),
-                )));
-            } else {
-                lines.push(Line::from(Span::styled(
-                    format!("● {} thinking", ch),
-                    Style::default()
-                        .fg(theme.text_dim)
-                        .add_modifier(Modifier::ITALIC),
-                )));
-                // Live streaming thinking (last ~12 lines)
-                let all: Vec<&str> = state.thinking_text.lines().collect();
-                let start = all.len().saturating_sub(12);
-                for l in &all[start..] {
-                    push_wrapped_indented_text(
-                        &mut lines,
-                        l,
-                        width,
-                        2,
-                        Style::default().fg(theme.text_muted),
-                    );
-                }
-            }
-        }
-        SessionStatus::ToolExecuting => {
-            let frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-            let ch = frames[(state.tick / 2) % frames.len()];
-            let tool = state.last_tool_name.as_deref().unwrap_or("tool");
-            lines.push(Line::from(Span::styled(
-                format!("● {} running {tool}", ch),
-                Style::default()
-                    .fg(theme.primary)
-                    .add_modifier(Modifier::ITALIC),
-            )));
-        }
-        _ => {}
     }
 
     state.render_cache = render_cache;
@@ -1171,7 +1503,7 @@ fn render_subagent_strip(f: &mut Frame, area: Rect, state: &AppState, theme: &Th
 }
 
 fn todo_panel_height(state: &AppState, terminal_width: u16) -> u16 {
-    if state.todos.is_empty() {
+    if !todo_panel_visible(state) {
         return 0;
     }
     // separator + title + rows (+ optional overflow hint)
@@ -1180,9 +1512,9 @@ fn todo_panel_height(state: &AppState, terminal_width: u16) -> u16 {
     } else {
         state.todos.len().min(TODO_MAX_VISIBLE)
     };
-    let overflow = !state.todos_expanded && state.todos.len() > TODO_MAX_VISIBLE;
+    let toggle_hint = state.todos.len() > TODO_MAX_VISIBLE;
     if !is_narrow(terminal_width) {
-        return (2 + rows + usize::from(overflow)) as u16;
+        return (2 + rows + usize::from(toggle_hint)) as u16;
     }
 
     let content_width = terminal_width.saturating_sub(4).max(1) as usize;
@@ -1200,11 +1532,11 @@ fn todo_panel_height(state: &AppState, terminal_width: u16) -> u16 {
         height.saturating_add(width.max(1).div_ceil(content_width) as u16)
     });
     2u16.saturating_add(wrapped_rows)
-        .saturating_add(u16::from(overflow))
+        .saturating_add(u16::from(toggle_hint))
 }
 
 fn render_todo_panel(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
-    if area.height == 0 || state.todos.is_empty() {
+    if area.height == 0 || !todo_panel_visible(state) {
         return;
     }
 
@@ -1269,6 +1601,11 @@ fn render_todo_panel(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
         Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }),
         area,
     );
+}
+
+fn todo_panel_visible(state: &AppState) -> bool {
+    !state.todos.is_empty()
+        && (state.todos_expanded || state.todos.iter().any(|todo| !todo.is_finished()))
 }
 
 fn todo_row_line(todo: &TodoItem, theme: &Theme) -> Line<'static> {
@@ -3772,6 +4109,46 @@ mod render_smoke {
     }
 
     #[test]
+    fn completed_todo_panel_auto_hides_and_can_be_reopened() {
+        let mut state = AppState::new(PermissionMode::Manual, false);
+        state.todos = vec![
+            TodoItem {
+                id: "one".into(),
+                content: "first".into(),
+                status: "completed".into(),
+            },
+            TodoItem {
+                id: "two".into(),
+                content: "second".into(),
+                status: "done".into(),
+            },
+            TodoItem {
+                id: "three".into(),
+                content: "third".into(),
+                status: "cancelled".into(),
+            },
+        ];
+
+        assert_eq!(todo_panel_height(&state, 80), 0);
+        state.todos_expanded = true;
+        assert!(todo_panel_height(&state, 80) > 0);
+
+        state.todos_expanded = false;
+        state.todos[0].status = "in_progress".into();
+        assert!(todo_panel_height(&state, 80) > 0);
+
+        state.todos = (0..6)
+            .map(|index| TodoItem {
+                id: index.to_string(),
+                content: format!("item {index}"),
+                status: "pending".into(),
+            })
+            .collect();
+        state.todos_expanded = true;
+        assert_eq!(todo_panel_height(&state, 80), 9);
+    }
+
+    #[test]
     fn long_system_errors_wrap_without_losing_content() {
         let mut state = AppState::new(PermissionMode::Manual, false);
         let reason =
@@ -4059,6 +4436,336 @@ mod render_smoke {
         assert!(joined.contains("scroll = full plan only"));
         // No earlier transcript noise
         assert!(!joined.contains("kkagent"));
+    }
+
+    #[test]
+    fn transcript_fingerprint_changes_with_visible_content() {
+        let mut state = AppState::new(PermissionMode::Manual, false);
+        state.messages.push(DisplayMessage {
+            role: MessageRole::User,
+            content: "before".into(),
+            thinking: None,
+            parts: Vec::new(),
+            tool_calls: Vec::new(),
+            delivery: crate::prompt_queue::DeliveryState::Sent,
+            idempotency_key: None,
+        });
+        let before = transcript_layout_fingerprint(&state, 80);
+        assert_eq!(before, transcript_layout_fingerprint(&state, 80));
+
+        state.messages[0].content = "after".into();
+        assert_ne!(before, transcript_layout_fingerprint(&state, 80));
+        assert_ne!(before, transcript_layout_fingerprint(&state, 79));
+    }
+
+    #[test]
+    fn spinner_updates_do_not_invalidate_full_transcript_layout() {
+        let mut state = AppState::new(PermissionMode::Manual, false);
+        state.messages.push(DisplayMessage {
+            role: MessageRole::User,
+            content: "hello".into(),
+            thinking: None,
+            parts: Vec::new(),
+            tool_calls: Vec::new(),
+            delivery: crate::prompt_queue::DeliveryState::Sent,
+            idempotency_key: None,
+        });
+        state.status = SessionStatus::Thinking;
+        let before = transcript_layout_fingerprint(&state, 80);
+        let status_before = build_transcript_status_lines(&state, &Theme::default(), 80, 24);
+
+        state.tick = crate::app::SPINNER_TICKS_PER_FRAME;
+        assert_eq!(before, transcript_layout_fingerprint(&state, 80));
+        assert_ne!(
+            status_before[0].to_string(),
+            build_transcript_status_lines(&state, &Theme::default(), 80, 24)[0].to_string()
+        );
+    }
+
+    #[test]
+    fn live_thinking_is_bounded_and_never_pads_empty_rows() {
+        let mut state = AppState::new(PermissionMode::Manual, false);
+        state.messages.push(DisplayMessage {
+            role: MessageRole::User,
+            content: "hello".into(),
+            thinking: None,
+            parts: Vec::new(),
+            tool_calls: Vec::new(),
+            delivery: crate::prompt_queue::DeliveryState::Sent,
+            idempotency_key: None,
+        });
+        state.status = SessionStatus::Thinking;
+        let max_height = 1 + live_thinking_body_height(24);
+
+        assert_eq!(
+            build_transcript_status_lines(&state, &Theme::default(), 24, 24).len(),
+            1
+        );
+        state.thinking_text = "short thought".into();
+        assert_eq!(
+            build_transcript_status_lines(&state, &Theme::default(), 24, 24).len(),
+            2
+        );
+
+        state.thinking_text = (0..20)
+            .map(|index| format!("thought {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let lines = build_transcript_status_lines(&state, &Theme::default(), 24, 24);
+        assert_eq!(lines.len(), max_height);
+        assert!(lines.iter().all(|line| !line.to_string().is_empty()));
+        assert!(lines.last().unwrap().to_string().contains("thought 19"));
+        assert!(!lines
+            .iter()
+            .any(|line| line.to_string().contains("thought 0")));
+
+        for status in [SessionStatus::ToolExecuting, SessionStatus::WaitingApproval] {
+            state.status = status;
+            assert_eq!(
+                build_transcript_status_lines(&state, &Theme::default(), 24, 24).len(),
+                1
+            );
+        }
+        for status in [
+            SessionStatus::WaitingQuestion,
+            SessionStatus::Compacting,
+            SessionStatus::Cancelling,
+            SessionStatus::Idle,
+        ] {
+            state.status = status;
+            assert!(build_transcript_status_lines(&state, &Theme::default(), 24, 24).is_empty());
+        }
+    }
+
+    #[test]
+    fn active_message_keeps_thinking_in_the_live_viewport() {
+        let mut state = AppState::new(PermissionMode::Manual, false);
+        state.messages.push(DisplayMessage {
+            role: MessageRole::User,
+            content: "hello".into(),
+            thinking: None,
+            parts: Vec::new(),
+            tool_calls: Vec::new(),
+            delivery: crate::prompt_queue::DeliveryState::Sent,
+            idempotency_key: None,
+        });
+        state.messages.push(DisplayMessage {
+            role: MessageRole::Assistant,
+            content: "answer".into(),
+            thinking: Some("moved thought".into()),
+            parts: vec![DisplayPart::Text("answer".into())],
+            tool_calls: Vec::new(),
+            delivery: crate::prompt_queue::DeliveryState::Sent,
+            idempotency_key: None,
+        });
+        state.active_assistant_message = Some(1);
+        state.status = SessionStatus::Thinking;
+
+        let active_lines =
+            build_transcript_lines_range(&mut state, &Theme::default(), 80, Some(1..2), false);
+        let active_text = active_lines
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(active_text.contains("answer"));
+        assert!(!active_text.contains("moved thought"));
+        assert!(
+            build_transcript_status_lines(&state, &Theme::default(), 80, 24)
+                .iter()
+                .any(|line| line.to_string().contains("moved thought"))
+        );
+
+        state.status = SessionStatus::Idle;
+        let completed_lines =
+            build_transcript_lines_range(&mut state, &Theme::default(), 80, Some(1..2), false);
+        assert!(completed_lines
+            .iter()
+            .any(|line| line.to_string().contains("moved thought")));
+    }
+
+    #[test]
+    fn tool_status_keeps_active_thinking_visible_without_disabling_tail_cache() {
+        let mut state = AppState::new(PermissionMode::Manual, false);
+        state.messages.push(DisplayMessage {
+            role: MessageRole::User,
+            content: "hello".into(),
+            thinking: None,
+            parts: Vec::new(),
+            tool_calls: Vec::new(),
+            delivery: crate::prompt_queue::DeliveryState::Sent,
+            idempotency_key: None,
+        });
+        state.messages.push(DisplayMessage {
+            role: MessageRole::Assistant,
+            content: "answer".into(),
+            thinking: Some("visible while tool runs".into()),
+            parts: vec![DisplayPart::Text("answer".into())],
+            tool_calls: Vec::new(),
+            delivery: crate::prompt_queue::DeliveryState::Sent,
+            idempotency_key: None,
+        });
+        state.active_assistant_message = Some(1);
+        state.status = SessionStatus::ToolExecuting;
+
+        assert_eq!(streaming_transcript_tail_index(&state), Some(1));
+        assert_eq!(live_thinking_message_index(&state), None);
+        let lines =
+            build_transcript_lines_range(&mut state, &Theme::default(), 80, Some(1..2), false);
+        assert!(lines
+            .iter()
+            .any(|line| line.to_string().contains("visible while tool runs")));
+    }
+
+    #[test]
+    fn non_tail_active_thinking_invalidates_layout_when_turn_ends() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = AppState::new(PermissionMode::Manual, false);
+        state.messages = vec![
+            DisplayMessage {
+                role: MessageRole::User,
+                content: "prompt".into(),
+                thinking: None,
+                parts: Vec::new(),
+                tool_calls: Vec::new(),
+                delivery: crate::prompt_queue::DeliveryState::Sent,
+                idempotency_key: None,
+            },
+            DisplayMessage {
+                role: MessageRole::Assistant,
+                content: "answer".into(),
+                thinking: Some("thinking restored after completion".into()),
+                parts: vec![DisplayPart::Text("answer".into())],
+                tool_calls: Vec::new(),
+                delivery: crate::prompt_queue::DeliveryState::Sent,
+                idempotency_key: None,
+            },
+            DisplayMessage {
+                role: MessageRole::User,
+                content: "steered follow-up".into(),
+                thinking: None,
+                parts: Vec::new(),
+                tool_calls: Vec::new(),
+                delivery: crate::prompt_queue::DeliveryState::Sent,
+                idempotency_key: None,
+            },
+        ];
+        state.active_assistant_message = Some(1);
+        state.status = SessionStatus::Thinking;
+
+        let active_fingerprint = transcript_layout_fingerprint(&state, 80);
+        terminal
+            .draw(|frame| render_ui(frame, &mut state, &AppConfig::default()))
+            .unwrap();
+        assert!(!state
+            .transcript_layout_cache
+            .lines()
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+            .contains("thinking restored after completion"));
+
+        state.active_assistant_message = None;
+        state.status = SessionStatus::Idle;
+        assert_ne!(
+            active_fingerprint,
+            transcript_layout_fingerprint(&state, 80)
+        );
+        terminal
+            .draw(|frame| render_ui(frame, &mut state, &AppConfig::default()))
+            .unwrap();
+        assert!(state
+            .transcript_layout_cache
+            .lines()
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+            .contains("thinking restored after completion"));
+    }
+
+    #[test]
+    fn streaming_last_message_reuses_the_completed_transcript_prefix() {
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = AppState::new(PermissionMode::Manual, false);
+        state.messages.push(DisplayMessage {
+            role: MessageRole::User,
+            content: "prompt".into(),
+            thinking: None,
+            parts: Vec::new(),
+            tool_calls: Vec::new(),
+            delivery: crate::prompt_queue::DeliveryState::Sent,
+            idempotency_key: None,
+        });
+        state.messages.push(DisplayMessage {
+            role: MessageRole::Assistant,
+            content: "streaming".into(),
+            thinking: None,
+            parts: vec![DisplayPart::Text("streaming".into())],
+            tool_calls: Vec::new(),
+            delivery: crate::prompt_queue::DeliveryState::Sent,
+            idempotency_key: None,
+        });
+        state.active_assistant_message = Some(1);
+        state.status = SessionStatus::Thinking;
+
+        let fingerprint = transcript_layout_fingerprint(&state, 80);
+        terminal
+            .draw(|frame| render_ui(frame, &mut state, &AppConfig::default()))
+            .unwrap();
+        let cached_prefix: Vec<String> = state
+            .transcript_layout_cache
+            .lines()
+            .iter()
+            .map(Line::to_string)
+            .collect();
+        let static_line_count = cached_prefix.len();
+        assert_eq!(state.message_line_starts.len(), 2);
+        assert_eq!(state.message_line_starts[1] as usize, static_line_count);
+
+        state.messages[1].append_assistant_text(" continued");
+        assert_eq!(fingerprint, transcript_layout_fingerprint(&state, 80));
+        terminal
+            .draw(|frame| render_ui(frame, &mut state, &AppConfig::default()))
+            .unwrap();
+        assert_eq!(
+            cached_prefix,
+            state
+                .transcript_layout_cache
+                .lines()
+                .iter()
+                .map(Line::to_string)
+                .collect::<Vec<_>>()
+        );
+        assert!(buffer_rows(terminal.backend().buffer())
+            .join("\n")
+            .contains("streaming continued"));
+
+        state.active_assistant_message = None;
+        assert_ne!(fingerprint, transcript_layout_fingerprint(&state, 80));
+    }
+
+    #[test]
+    fn selection_is_clipped_to_visible_transcript_lines() {
+        use crate::selection::{CellPos, TextSelection};
+
+        let selection = TextSelection {
+            anchor: CellPos { line: 2, col: 4 },
+            focus: CellPos { line: 8, col: 7 },
+        };
+        let visible = selection_in_viewport(selection, 4, 7).unwrap();
+        assert_eq!(visible.anchor, CellPos { line: 0, col: 0 });
+        assert_eq!(
+            visible.focus,
+            CellPos {
+                line: 2,
+                col: u16::MAX
+            }
+        );
+        assert!(selection_in_viewport(selection, 9, 12).is_none());
     }
 
     #[test]

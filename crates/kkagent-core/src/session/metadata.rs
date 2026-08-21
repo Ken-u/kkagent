@@ -272,6 +272,7 @@ impl SessionMetadataService {
         let text = serde_json::to_string_pretty(&self.data)?;
         std::fs::write(&tmp, text)?;
         std::fs::rename(&tmp, &self.path)?;
+        crate::session::store::invalidate_list_cache();
         Ok(())
     }
 }

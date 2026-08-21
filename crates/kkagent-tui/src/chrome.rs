@@ -50,7 +50,8 @@ impl SessionIndicator {
 }
 
 fn session_indicator(entry: &WorkspaceSessionEntry, tick: usize) -> SessionIndicator {
-    let frame = SESSION_SPINNER_FRAMES[(tick / 2) % SESSION_SPINNER_FRAMES.len()];
+    let frame = SESSION_SPINNER_FRAMES
+        [(tick / crate::app::SPINNER_TICKS_PER_FRAME) % SESSION_SPINNER_FRAMES.len()];
     let running = matches!(
         entry.status,
         SessionStatus::Thinking
@@ -879,8 +880,8 @@ mod tests {
             .iter()
             .map(|span| span.content.as_ref())
             .collect();
-        let frame_2: String = strip
-            .render_spans(80, &theme, 2)
+        let next_frame: String = strip
+            .render_spans(80, &theme, crate::app::SPINNER_TICKS_PER_FRAME)
             .iter()
             .map(|span| span.content.as_ref())
             .collect();
@@ -889,8 +890,8 @@ mod tests {
         assert!(frame_0.contains("⠋ beta"), "{frame_0:?}");
         assert!(frame_0.contains("gamma"), "{frame_0:?}");
         assert!(!frame_0.contains("⠋ gamma"), "{frame_0:?}");
-        assert!(frame_2.contains("[⠙ alpha]"), "{frame_2:?}");
-        assert!(frame_2.contains("⠙ beta"), "{frame_2:?}");
+        assert!(next_frame.contains("[⠙ alpha]"), "{next_frame:?}");
+        assert!(next_frame.contains("⠙ beta"), "{next_frame:?}");
         let alpha = hits
             .iter()
             .find(|hit| hit.session_id == "thinking")

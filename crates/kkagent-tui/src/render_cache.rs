@@ -26,6 +26,34 @@ pub struct RenderCache {
     last_width: u16,
 }
 
+/// Cached, laid-out stable transcript. Rendering a frame only needs to clone
+/// visible lines; while streaming, the active assistant tail stays separate.
+#[derive(Debug, Default)]
+pub struct TranscriptLayoutCache {
+    fingerprint: Option<u64>,
+    lines: Vec<Line<'static>>,
+}
+
+impl TranscriptLayoutCache {
+    pub fn matches(&self, fingerprint: u64) -> bool {
+        self.fingerprint == Some(fingerprint)
+    }
+
+    pub fn replace(&mut self, fingerprint: u64, lines: Vec<Line<'static>>) {
+        self.fingerprint = Some(fingerprint);
+        self.lines = lines;
+    }
+
+    pub fn lines(&self) -> &[Line<'static>] {
+        &self.lines
+    }
+
+    pub fn invalidate(&mut self) {
+        self.fingerprint = None;
+        self.lines.clear();
+    }
+}
+
 impl RenderCache {
     pub fn new() -> Self {
         Self {
@@ -112,5 +140,18 @@ mod tests {
         let b = cache.get_or_insert_markdown("same", 60, &theme);
         assert_eq!(a.len(), b.len());
         assert_eq!(cache.entries.len(), 1);
+    }
+
+    #[test]
+    fn transcript_layout_reuses_only_matching_fingerprint() {
+        let mut cache = TranscriptLayoutCache::default();
+        cache.replace(7, vec![Line::from("one"), Line::from("two")]);
+        assert!(cache.matches(7));
+        assert!(!cache.matches(8));
+        assert_eq!(cache.lines().len(), 2);
+
+        cache.invalidate();
+        assert!(!cache.matches(7));
+        assert!(cache.lines().is_empty());
     }
 }
