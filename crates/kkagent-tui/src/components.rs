@@ -564,9 +564,9 @@ fn render_messages(f: &mut Frame, area: Rect, state: &mut AppState, theme: &Them
 
 fn tool_expand_target_message(target: ToolExpandTarget) -> usize {
     match target {
-        ToolExpandTarget::Part { message, .. } | ToolExpandTarget::Legacy { message, .. } => {
-            message
-        }
+        ToolExpandTarget::Part { message, .. }
+        | ToolExpandTarget::Legacy { message, .. }
+        | ToolExpandTarget::Plan { message } => message,
     }
 }
 
@@ -629,6 +629,7 @@ fn transcript_layout_fingerprint(state: &AppState, width: u16) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     width.hash(&mut hasher);
     state.tool_output_expanded.hash(&mut hasher);
+    state.plan_transcript_collapsed.hash(&mut hasher);
     state.highlight_message.hash(&mut hasher);
     std::mem::discriminant(&state.locale).hash(&mut hasher);
 
@@ -1010,7 +1011,42 @@ fn build_transcript_lines_range(
                     }
                     (path.to_string(), body.to_string())
                 };
-                push_plan_box_lines(&mut lines, &path, &body, width, theme, false);
+                if state.plan_transcript_collapsed {
+                    let line = lines.len();
+                    let name = path.rsplit('/').next().unwrap_or(&path);
+                    lines.push(Line::from(vec![
+                        Span::styled("● ", Style::default().fg(theme.text)),
+                        Span::styled(
+                            format!("▸ plan: {name} ({} lines)", body.lines().count()),
+                            Style::default()
+                                .fg(theme.plan_mode)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(
+                            "  ctrl+o / click to expand",
+                            Style::default().fg(theme.text_muted),
+                        ),
+                    ]));
+                    if interactive_tools {
+                        tool_expand_hits.push(ToolExpandHit {
+                            line,
+                            target: ToolExpandTarget::Plan { message: msg_idx },
+                        });
+                    }
+                } else {
+                    push_plan_box_lines(&mut lines, &path, &body, width, theme, false);
+                    let line = lines.len();
+                    lines.push(Line::from(Span::styled(
+                        "  ▾ ctrl+o / click to collapse",
+                        Style::default().fg(theme.text_muted),
+                    )));
+                    if interactive_tools {
+                        tool_expand_hits.push(ToolExpandHit {
+                            line,
+                            target: ToolExpandTarget::Plan { message: msg_idx },
+                        });
+                    }
+                }
                 lines.push(Line::from(""));
             }
             MessageRole::Skill => {
@@ -4873,6 +4909,74 @@ mod render_smoke {
         state.on_plan_mode_changed(false);
         assert!(!state.plan_focus_active());
         assert!(state.follow_bottom);
+    }
+
+    #[test]
+    fn plan_block_collapses_after_leaving_plan_mode() {
+        let mut state = AppState::new(PermissionMode::Manual, false);
+        state.apply_plan_document("plan.md".into(), "# Hello\n\nbody".into());
+        // Fresh plan blocks start folded in the transcript.
+        assert!(state.plan_transcript_collapsed);
+        assert!(!state.plan_transcript_overridden);
+
+        // Click-to-expand detaches from the global Ctrl-O mode.
+        state.plan_transcript_collapsed = false;
+        state.plan_transcript_overridden = true;
+        state.tool_output_expanded = false;
+        state.apply_tool_output_mode();
+        assert!(!state.plan_transcript_collapsed, "override survives Ctrl-O");
+
+        // Leaving plan mode re-folds and clears the override.
+        state.on_plan_mode_changed(false);
+        assert!(state.plan_transcript_collapsed);
+        assert!(!state.plan_transcript_overridden);
+
+        // Ctrl-O now flips the plan block globally.
+        state.tool_output_expanded = true;
+        state.apply_tool_output_mode();
+        assert!(!state.plan_transcript_collapsed);
+        state.tool_output_expanded = false;
+        state.apply_tool_output_mode();
+        assert!(state.plan_transcript_collapsed);
+    }
+
+    #[test]
+    fn plan_transcript_renders_collapsed_summary_and_expanded_box() {
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut state = AppState::new(PermissionMode::Manual, false);
+        state.apply_plan_document("plan.md".into(), "# Hello\n\nbody".into());
+
+        terminal
+            .draw(|frame| render_ui(frame, &mut state, &AppConfig::default()))
+            .unwrap();
+        let collapsed_text = buffer_text(&terminal);
+        assert!(collapsed_text.contains("▸ plan: plan.md (3 lines)"));
+        assert!(collapsed_text.contains("click to expand"));
+        assert!(!collapsed_text.contains("# Hello"));
+
+        // Expand via a registered hit: the summary line is hit-registered.
+        assert!(state
+            .tool_expand_hits
+            .iter()
+            .any(|hit| matches!(hit.target, ToolExpandTarget::Plan { .. })));
+        state.plan_transcript_collapsed = false;
+        terminal
+            .draw(|frame| render_ui(frame, &mut state, &AppConfig::default()))
+            .unwrap();
+        let expanded_text = buffer_text(&terminal);
+        assert!(expanded_text.contains("plan: plan.md"));
+        assert!(expanded_text.contains("Hello"));
+        assert!(expanded_text.contains("click to collapse"));
+    }
+
+    #[test]
+    fn plan_mode_focus_overlay_shows_full_document() {
+        let mut state = AppState::new(PermissionMode::Manual, true);
+        state.apply_plan_document("plan.md".into(), "# Hello\n\nbody".into());
+        // Focus overlay path is independent of transcript folding.
+        assert!(state.plan_focus_active());
+        assert!(state.plan_transcript_collapsed);
     }
 
     #[test]

@@ -251,6 +251,11 @@ pub struct AppState {
     pub highlight_message: Option<usize>,
     /// Latest plan.md snapshot; while `plan_mode` is on, TUI locks scroll to this doc.
     pub plan_document: Option<PlanDocument>,
+    /// Transcript plan.md block collapsed? Plan messages render as one summary
+    /// line unless expanded (Ctrl-O / click), matching tool-output folding.
+    pub plan_transcript_collapsed: bool,
+    /// A click makes the plan block independent from the global Ctrl-O mode.
+    pub plan_transcript_overridden: bool,
     /// Jump once to the top of the focused plan after it appears / is replaced.
     pub plan_scroll_to_top: bool,
     /// Wall-clock start of the active agent turn (for tool-history duration).
@@ -359,6 +364,8 @@ pub struct SessionRuntimeState {
     pub last_tool_name: Option<String>,
     pub plan_document: Option<PlanDocument>,
     pub plan_scroll_to_top: bool,
+    pub plan_transcript_collapsed: bool,
+    pub plan_transcript_overridden: bool,
     pub turn_started_at: Option<std::time::Instant>,
     pub tokens_at_turn_start: u64,
     pub history_oldest_index: Option<usize>,
@@ -401,6 +408,8 @@ impl SessionRuntimeState {
             last_tool_name: state.last_tool_name.clone(),
             plan_document: state.plan_document.clone(),
             plan_scroll_to_top: state.plan_scroll_to_top,
+            plan_transcript_collapsed: state.plan_transcript_collapsed,
+            plan_transcript_overridden: state.plan_transcript_overridden,
             turn_started_at: state.turn_started_at,
             tokens_at_turn_start: state.tokens_at_turn_start,
             history_oldest_index: state.history_oldest_index,
@@ -432,6 +441,8 @@ impl SessionRuntimeState {
         state.last_tool_name = self.last_tool_name;
         state.plan_document = self.plan_document;
         state.plan_scroll_to_top = self.plan_scroll_to_top;
+        state.plan_transcript_collapsed = self.plan_transcript_collapsed;
+        state.plan_transcript_overridden = self.plan_transcript_overridden;
         state.turn_started_at = self.turn_started_at;
         state.tokens_at_turn_start = self.tokens_at_turn_start;
         state.history_loading = false;
@@ -697,8 +708,18 @@ pub struct ToolHistorySummary {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolExpandTarget {
-    Part { message: usize, part: usize },
-    Legacy { message: usize, tool: usize },
+    Part {
+        message: usize,
+        part: usize,
+    },
+    Legacy {
+        message: usize,
+        tool: usize,
+    },
+    /// Transcript plan.md block (summary line ↔ full document box).
+    Plan {
+        message: usize,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1088,6 +1109,8 @@ impl AppState {
             highlight_message: None,
             plan_document: None,
             plan_scroll_to_top: false,
+            plan_transcript_collapsed: true,
+            plan_transcript_overridden: false,
             turn_started_at: None,
             tokens_at_turn_start: 0,
             locale: crate::i18n::Locale::En,
@@ -1130,6 +1153,10 @@ impl AppState {
             content: content.clone(),
         });
         self.messages.retain(|m| m.role != MessageRole::Plan);
+        // Fresh plan in transcript starts collapsed; plan-mode viewing goes
+        // through the focus overlay, not the transcript block.
+        self.plan_transcript_collapsed = true;
+        self.plan_transcript_overridden = false;
         self.messages.push(DisplayMessage {
             role: MessageRole::Plan,
             content: format!("file: {}\n\n{}", path, content),
@@ -1178,6 +1205,10 @@ impl AppState {
             self.plan_scroll_to_top = false;
             self.follow_bottom = true;
             self.scroll_up = 0;
+            // Leaving plan mode (shift-tab or plan execution): the transcript
+            // plan block becomes collapsible and starts folded.
+            self.plan_transcript_collapsed = true;
+            self.plan_transcript_overridden = false;
         }
     }
 
@@ -1243,6 +1274,11 @@ impl AppState {
                     tool.collapsed = !self.tool_output_expanded;
                 }
             }
+        }
+        // The transcript plan block is a single one-off block (not per-turn
+        // tool output), so Ctrl-O applies globally, ignoring the turn cutoff.
+        if !self.plan_transcript_overridden {
+            self.plan_transcript_collapsed = !self.tool_output_expanded;
         }
     }
 
@@ -2855,13 +2891,20 @@ impl TuiApp {
             return false;
         };
         let Some(message) = self.state.messages.get_mut(match hit.target {
-            ToolExpandTarget::Part { message, .. } | ToolExpandTarget::Legacy { message, .. } => {
-                message
-            }
+            ToolExpandTarget::Part { message, .. }
+            | ToolExpandTarget::Legacy { message, .. }
+            | ToolExpandTarget::Plan { message } => message,
         }) else {
             return false;
         };
         match hit.target {
+            ToolExpandTarget::Plan { .. } => {
+                if message.role != MessageRole::Plan {
+                    return false;
+                }
+                self.state.plan_transcript_collapsed = !self.state.plan_transcript_collapsed;
+                self.state.plan_transcript_overridden = true;
+            }
             ToolExpandTarget::Part { part, .. } => match message.parts.get_mut(part) {
                 Some(DisplayPart::Tool(tool)) => {
                     tool.collapsed = !tool.collapsed;
