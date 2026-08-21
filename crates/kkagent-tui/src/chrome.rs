@@ -196,6 +196,11 @@ pub struct WorkspaceSessionEntry {
     pub status: SessionStatus,
     pub dirty: bool,
     pub needs_attention: bool,
+    /// Working directory recorded for the session (when known from the list
+    /// response). The strip may surface sessions from other workspaces; the
+    /// resume request must pass this directory so the server-side check
+    /// accepts cross-directory switches.
+    pub working_dir: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -833,6 +838,7 @@ mod tests {
                 status: SessionStatus::Idle,
                 dirty: false,
                 needs_attention: false,
+                working_dir: None,
             });
         }
         strip.set_entries(entries, Some("id8"));
@@ -856,6 +862,7 @@ mod tests {
                     status: SessionStatus::Thinking,
                     dirty: true,
                     needs_attention: false,
+                    working_dir: None,
                 },
                 WorkspaceSessionEntry {
                     id: "tool".into(),
@@ -863,6 +870,7 @@ mod tests {
                     status: SessionStatus::ToolExecuting,
                     dirty: true,
                     needs_attention: false,
+                    working_dir: None,
                 },
                 WorkspaceSessionEntry {
                     id: "idle".into(),
@@ -870,6 +878,7 @@ mod tests {
                     status: SessionStatus::Idle,
                     dirty: false,
                     needs_attention: false,
+                    working_dir: None,
                 },
             ],
             Some("thinking"),
@@ -912,6 +921,7 @@ mod tests {
                 status: SessionStatus::WaitingApproval,
                 dirty: true,
                 needs_attention: false,
+                working_dir: None,
             }],
             Some("approval"),
         );
@@ -935,6 +945,7 @@ mod tests {
                     status: SessionStatus::Idle,
                     dirty: false,
                     needs_attention: false,
+                    working_dir: None,
                 },
                 WorkspaceSessionEntry {
                     id: "b".into(),
@@ -942,6 +953,7 @@ mod tests {
                     status: SessionStatus::Idle,
                     dirty: false,
                     needs_attention: false,
+                    working_dir: None,
                 },
                 WorkspaceSessionEntry {
                     id: "c".into(),
@@ -949,6 +961,7 @@ mod tests {
                     status: SessionStatus::Idle,
                     dirty: false,
                     needs_attention: false,
+                    working_dir: None,
                 },
             ],
             Some("b"),
@@ -962,6 +975,7 @@ mod tests {
                     status: SessionStatus::Thinking,
                     dirty: true,
                     needs_attention: false,
+                    working_dir: None,
                 },
                 WorkspaceSessionEntry {
                     id: "a".into(),
@@ -969,6 +983,7 @@ mod tests {
                     status: SessionStatus::Idle,
                     dirty: false,
                     needs_attention: false,
+                    working_dir: None,
                 },
                 WorkspaceSessionEntry {
                     id: "d".into(),
@@ -976,6 +991,7 @@ mod tests {
                     status: SessionStatus::Idle,
                     dirty: false,
                     needs_attention: false,
+                    working_dir: None,
                 },
                 WorkspaceSessionEntry {
                     id: "b".into(),
@@ -983,6 +999,7 @@ mod tests {
                     status: SessionStatus::Idle,
                     dirty: false,
                     needs_attention: true,
+                    working_dir: None,
                 },
             ],
             Some("b"),
@@ -1004,6 +1021,7 @@ mod tests {
                 status: SessionStatus::Idle,
                 dirty: false,
                 needs_attention: false,
+                working_dir: None,
             }],
             Some("session"),
         );

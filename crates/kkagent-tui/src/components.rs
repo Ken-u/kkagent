@@ -2346,6 +2346,7 @@ fn sync_footer_session_entries(state: &mut AppState) {
                 status: state.status,
                 dirty: false,
                 needs_attention: false,
+                working_dir: None,
             });
     }
 

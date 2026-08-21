@@ -1021,6 +1021,13 @@ fn maybe_auto_resume(resume: &mut Option<Option<String>>, server_alive: bool) {
             kkagent_config::clear_active_session();
             return;
         }
+        if session_resume_unavailable_here(&session_id) {
+            // Starting fresh in another directory is expected, not an error:
+            // skip the resume quietly and keep the marker so the original
+            // directory can still auto-resume this session later.
+            tracing::info!(%session_id, "Active session belongs to an unavailable working directory; starting a new session");
+            return;
+        }
         tracing::info!(%session_id, "Auto-resuming session from active-session");
         *resume = Some(Some(session_id));
         return;
@@ -1031,10 +1038,48 @@ fn maybe_auto_resume(resume: &mut Option<Option<String>>, server_alive: bool) {
         tracing::warn!(%session_id, "Active-session marker references a non-existent session; starting fresh");
         return;
     }
+    if session_resume_unavailable_here(&session_id) {
+        tracing::info!(%session_id, "Active session belongs to an unavailable working directory; starting fresh");
+        return;
+    }
     eprintln!(
         "Previous standalone server is gone; in-flight tasks were lost. Restoring conversation history for session {session_id}."
     );
     *resume = Some(Some(session_id));
+}
+
+/// Whether resuming `session_id` from the current directory would be rejected by
+/// the server's working-directory check. Auto-resume must stay silent, so we
+/// pre-check with the exact same rules `session.resume` applies and start a new
+/// session instead of surfacing an error to the user. Returns false whenever the
+/// check cannot be performed, leaving the normal resume path in charge.
+fn session_resume_unavailable_here(session_id: &str) -> bool {
+    match std::env::current_dir() {
+        Ok(cwd) => session_resume_unavailable_in(session_id, &cwd),
+        Err(_) => false,
+    }
+}
+
+/// Same check as [`session_resume_unavailable_here`] with an explicit current
+/// directory, so tests don't depend on the process cwd.
+fn session_resume_unavailable_in(session_id: &str, cwd: &std::path::Path) -> bool {
+    if !is_safe_session_id(session_id) {
+        return false;
+    }
+    let stored_working_dir = TranscriptDb::open_default()
+        .ok()
+        .and_then(|db| db.get_session(session_id).ok().flatten())
+        .map(|record| record.working_dir)
+        .or_else(|| {
+            SessionStore::open_default()
+                .get(session_id)
+                .ok()
+                .map(|summary| summary.work_dir)
+        });
+    let Some(stored_working_dir) = stored_working_dir else {
+        return false;
+    };
+    resolve_resume_working_dir(&stored_working_dir, Some(cwd)).is_err()
 }
 
 /// Check whether a session still has a retrievable record (DB or disk store).
@@ -9628,6 +9673,34 @@ mod http_path_tests {
 
         std::fs::remove_dir_all(root).unwrap();
         std::fs::remove_dir_all(other).unwrap();
+    }
+
+    #[test]
+    fn auto_resume_precheck_detects_directory_mismatch() {
+        let home_dir =
+            std::env::temp_dir().join(format!("kkagent-resume-home-{}", uuid::Uuid::new_v4()));
+        let other_dir =
+            std::env::temp_dir().join(format!("kkagent-resume-other-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&home_dir).unwrap();
+        std::fs::create_dir_all(&other_dir).unwrap();
+        let session_id = format!("sess-{}", uuid::Uuid::new_v4().simple());
+
+        let db = TranscriptDb::open_default().unwrap();
+        db.create_session(&session_id, "unknown", home_dir.to_str().unwrap())
+            .unwrap();
+
+        // Same directory (even before canonicalization) is still resumable.
+        assert!(!session_resume_unavailable_in(&session_id, &home_dir));
+        // A different directory is silently skipped instead of erroring.
+        assert!(session_resume_unavailable_in(&session_id, &other_dir));
+        // Unknown sessions fall back to the normal resume path (no pre-check).
+        assert!(!session_resume_unavailable_in(
+            "sess-does-not-exist",
+            &other_dir
+        ));
+
+        std::fs::remove_dir_all(home_dir).unwrap();
+        std::fs::remove_dir_all(other_dir).unwrap();
     }
 
     #[test]

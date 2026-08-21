@@ -8387,7 +8387,7 @@ impl TuiApp {
             return;
         };
 
-        let mut rows: Vec<(String, String)> = Vec::new();
+        let mut rows: Vec<(String, String, Option<String>)> = Vec::new();
         if let Some(sessions) = data.get("sessions").and_then(|v| v.as_array()) {
             for s in sessions {
                 let id = s
@@ -8416,7 +8416,12 @@ impl TuiApp {
                     s.get("first_prompt").and_then(|v| v.as_str()),
                     &id,
                 );
-                rows.push((id, title));
+                let working_dir = s
+                    .get("working_dir")
+                    .and_then(|v| v.as_str())
+                    .filter(|dir| !dir.is_empty())
+                    .map(|dir| dir.to_string());
+                rows.push((id, title, working_dir));
             }
         }
 
@@ -8424,7 +8429,7 @@ impl TuiApp {
         // Skip when the current id was just closed (Ctrl-D) and the follow-up
         // session switch has not landed yet — it must not re-enter the strip.
         let current_open = !self.state.closed_tab_ids.contains(&current_id);
-        if current_open && !rows.iter().any(|(id, _)| id == &current_id) {
+        if current_open && !rows.iter().any(|(id, _, _)| id == &current_id) {
             // Prefer the tab title we already know (e.g. a `/title` set earlier),
             // so a transient missing-row does not revert to the first prompt.
             let existing_title = self
@@ -8465,7 +8470,7 @@ impl TuiApp {
                     &current_id,
                 )
             };
-            rows.push((current_id.clone(), title));
+            rows.push((current_id.clone(), title, None));
         }
 
         // The footer is an open-tab strip: refreshes may update metadata and
@@ -8498,13 +8503,14 @@ impl TuiApp {
                 let dirty = tab.map(|t| t.dirty).unwrap_or(false);
                 let needs_attention = self.state.parked_approvals.contains_key(&id)
                     || self.state.parked_questions.contains_key(&id);
-                if let Some((_, title)) = rows.iter().find(|(rid, _)| rid == &id) {
+                if let Some((_, title, working_dir)) = rows.iter().find(|(rid, _, _)| rid == &id) {
                     crate::chrome::WorkspaceSessionEntry {
                         id,
                         title: title.clone(),
                         status,
                         dirty,
                         needs_attention,
+                        working_dir: working_dir.clone(),
                     }
                 } else {
                     let title = tab
@@ -8523,6 +8529,7 @@ impl TuiApp {
                         status,
                         dirty,
                         needs_attention,
+                        working_dir: None,
                     }
                 }
             })
@@ -8550,8 +8557,8 @@ impl TuiApp {
                 .map(|e| e.title.clone())
                 .or_else(|| {
                     rows.iter()
-                        .find(|(id, _)| id == &current_id)
-                        .map(|(_, title)| title.clone())
+                        .find(|(id, _, _)| id == &current_id)
+                        .map(|(_, title, _)| title.clone())
                 })
                 .unwrap_or_else(|| "main".into());
             self.state.tab_strip.ensure_active(&current_id, title);
@@ -8708,7 +8715,18 @@ impl TuiApp {
         if self.state.session_id.as_deref() == Some(id) {
             return Ok(());
         }
-        self.resume_session(id).await
+        // The strip may surface sessions from other workspaces; pass the
+        // session's own working directory so the server accepts the switch
+        // instead of rejecting it with a directory-mismatch error.
+        let working_dir = self
+            .state
+            .workspace_sessions
+            .entries
+            .iter()
+            .find(|entry| entry.id == id)
+            .and_then(|entry| entry.working_dir.clone());
+        self.resume_session_in_workspace(id, working_dir.as_deref())
+            .await
     }
 
     async fn cycle_attention_session(&mut self) -> anyhow::Result<()> {
@@ -8725,7 +8743,7 @@ impl TuiApp {
                     let idx = (start + offset) % entries.len();
                     let e = &entries[idx];
                     if (e.needs_attention || e.dirty) && current.as_deref() != Some(e.id.as_str()) {
-                        Some(e.id.clone())
+                        Some((e.id.clone(), e.working_dir.clone()))
                     } else {
                         None
                     }
@@ -8747,15 +8765,17 @@ impl TuiApp {
                             SessionStatus::WaitingApproval | SessionStatus::WaitingQuestion
                         );
                     if needs && current.as_deref() != Some(tab.id.as_str()) {
-                        Some(tab.id.clone())
+                        Some((tab.id.clone(), None))
                     } else {
                         None
                     }
                 })
             }
         };
-        if let Some(id) = target {
-            return self.resume_session(&id).await;
+        if let Some((id, working_dir)) = target {
+            return self
+                .resume_session_in_workspace(&id, working_dir.as_deref())
+                .await;
         }
         self.system_message("No session needs attention.".into());
         Ok(())
@@ -13152,6 +13172,7 @@ mod app_state_tests {
                 status: SessionStatus::Idle,
                 dirty: false,
                 needs_attention: false,
+                working_dir: None,
             }],
             Some("session-btw"),
         );
@@ -13371,6 +13392,7 @@ mod app_state_tests {
                     status: SessionStatus::Thinking,
                     dirty: false,
                     needs_attention: false,
+                    working_dir: None,
                 },
                 crate::chrome::WorkspaceSessionEntry {
                     id: "fallback".into(),
@@ -13378,6 +13400,7 @@ mod app_state_tests {
                     status: SessionStatus::Idle,
                     dirty: false,
                     needs_attention: false,
+                    working_dir: None,
                 },
             ],
             Some("running"),
