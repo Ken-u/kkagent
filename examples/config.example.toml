@@ -103,7 +103,7 @@ max_processes = 128 # Windows Job Object only; Linux/macOS cannot enforce this p
 # timeout = 5
 
 # [services.web_search]
-# provider = "searxng" # searxng | brave | custom
+# provider = "searxng" # searxng | brave | custom (see docs/configuration.md for wire formats)
 # base_url = "http://127.0.0.1:8080/search" # full search endpoint URL
 # api_key_env = "BRAVE_API_KEY" # preferred over inline api_key
 # timeout_ms = 15000

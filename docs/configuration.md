@@ -228,22 +228,64 @@ timeout = 5
 
 ## 服务
 
+`[services]` 为内置 `Web` 工具的两个动作提供可选后端：`action = "search"`（搜索）与 `action = "fetch"`（抓取网页正文）。`fetch` 不配置后端也能用（直接 HTTP GET + SSRF 校验）；`search` 必须配置 `[services.web_search]`，未配置时工具会返回错误并提示补配置。
+
+### Web 搜索
+
 ```toml
 [services.web_search]
-provider = "searxng" # searxng | brave | custom
-base_url = "http://127.0.0.1:8080/search" # 完整搜索 endpoint，不会自动再拼 /v1/search
-api_key_env = "BRAVE_API_KEY" # 优先于 inline api_key
-timeout_ms = 15000
-default_limit = 5
-
-# 可选：FetchURL 外部代理；未配置时走直接 HTTP GET + SSRF 校验
-# [services.web_fetch]
-# base_url = "https://example.invalid/fetch"
-# api_key_env = "WEB_FETCH_API_KEY"
-# timeout_ms = 30000
+provider = "searxng" # searxng | brave | custom，默认 searxng（大小写不敏感）
+base_url = "http://127.0.0.1:8080/search" # 完整搜索 endpoint，不会自动再拼路径
+api_key = "..."          # 二选一；api_key_env 优先
+api_key_env = "BRAVE_API_KEY"
+timeout_ms = 15000       # 默认 15000，运行时下限 1000
+default_limit = 5        # 默认 5，实际生效范围 1..20
 ```
 
-`web_search` 为内置 `WebSearch` 提供后端；未配置时不注册该工具。`FetchURL` 在未配置 `web_fetch` 时仍可直接抓取公网页面。旧的 `[services.moonshot_search]` / `[services.moonshot_fetch]` 仍可读一次并给出迁移提示。
+三种 `provider` 的线上协议（对接外部搜索服务时按此实现）：
+
+**`searxng`** — 直连 SearXNG 实例的 JSON API：
+
+- 请求：`GET {base_url}?q={query}&format=json`（`base_url` 通常是 `.../search` 路径）。
+- 鉴权：配置了 key 时发送 `Authorization: Bearer <key>`，未配置则不带。
+- 响应：`{"results": [{"title", "url", "content"|"snippet", "publishedDate"|"published_at", "engine"|"source"}]}`，字段均可缺省，`url` 非法或重复的条目会被丢弃。
+
+**`brave`** — 直连 Brave Search API：
+
+- 请求：`GET {base_url}?q={query}&count={limit}`。
+- 鉴权：`X-Subscription-Token: <key>`。
+- 响应：`{"web": {"results": [{"title", "url", "description"|"snippet", "age"}]}}`；`age` 映射为发布时间，`source` 固定为 `brave`。
+
+**`custom`** — 通用 JSON 端点，用于对接任意外部搜索服务（或自建适配层）：
+
+- 请求：`GET {base_url}?q={query}&limit={limit}`，配置了 key 时带 `Authorization: Bearer <key>`。
+- 响应：`{"results": [...]}`，每个条目取 `title` / `url` / `snippet`|`content`|`description` / `published_at` / `source`，全部字段宽松解析。
+
+一个特例：`base_url` 包含 `/v1/search` 时，`custom` 自动切换为 Moonshot 兼容协议——`POST {base_url}`，body 为 `{"text_query": "<query>"}`，Bearer 鉴权，响应解析 `{"search_results": [...]}`（字段同上）。因此可以直接把 `base_url` 指向 `https://api.kimi.com/coding/v1/search` 之类的 Moonshot 端点。
+
+三种 provider 共同的后处理：`url` 规范化（仅 http/https）→ 按去重 → 截断到 `limit`。`limit` 由模型调用参数或 `default_limit` 决定，clamp 到 1..20。
+
+### 网页抓取
+
+```toml
+[services.web_fetch]
+base_url = "https://example.invalid/fetch" # 可选代理 endpoint；未配置时走直接 GET
+api_key_env = "WEB_FETCH_API_KEY"
+timeout_ms = 30000                          # 默认 30000，运行时下限 1000
+```
+
+配置了 `base_url` 后，`Web(action = "fetch")` 的抓取协议为：
+
+- 请求：`POST {base_url}`，`Content-Type: application/json`，body `{"url": "<目标 URL>"}`。
+- 鉴权：配置了 key 时发送 `Authorization: Bearer <key>`。
+- 响应：`2xx` 且 body 不超过 4 MiB 时，body 整体当作**已抽取的正文**（纯文本或 markdown）——服务端负责把 HTML 抽取成正文，kkagent 只做一次可读文本清洗并按 `max_chars`（默认 20000，上限 200000）截断。
+- 回落：代理返回非 2xx、网络错误或 body 超限时，自动回退为直接 GET 目标 URL（带 SSRF 校验、最多 5 次重定向逐一校验、Content-Type 白名单：text/json/xml/html/javascript，HTML 会做本地正文抽取）。
+
+对接外部 fetch 服务时只需实现上面这一个 POST 端点：入参 `url`，返回 2xx + 抽取后的正文文本。Moonshot 的 `.../v1/fetch` coding fetch 端点与此协议兼容（服务端已做正文抽取）。
+
+### 兼容旧配置
+
+旧的 `[services.moonshot_search]` / `[services.moonshot_fetch]` 仍会被读取一次（用于一次性迁移）：`moonshot_search` 自动补 `/v1/search` 后缀并按 Moonshot 兼容协议处理，api_key 缺失时从 `moonshot_fetch` 兜底复用；`moonshot_fetch` 自动补 `/v1/fetch` 后缀。迁移期间工具输出会附带迁移提示，建议尽快改用 `[services.web_search]` / `[services.web_fetch]`。
 
 ## MCP Server
 
@@ -287,8 +329,11 @@ client_label = "kkagent"
 | `KKAGENT_PERMISSION_MODE` | 默认权限模式。 |
 | `KKAGENT_PLUGIN_MARKETPLACE_URL` | 覆盖顶层 `plugin_marketplace`，指定本地路径、file URL 或 HTTP(S) marketplace JSON。 |
 | `ANTHROPIC_API_KEY`、`OPENAI_API_KEY`、`KIMI_API_KEY`、`GOOGLE_API_KEY` | 对应 Provider 密钥。 |
-| `KKAGENT_MOONSHOT_SEARCH_URL` | 搜索服务地址。 |
-| `KKAGENT_MOONSHOT_SEARCH_KEY` 或 `MOONSHOT_API_KEY` | 搜索服务密钥。 |
+| `KKAGENT_WEB_SEARCH_URL` | 覆盖 `[services.web_search]` 的 `base_url`，并同时读取下述 key / provider 变量。 |
+| `KKAGENT_WEB_SEARCH_KEY` | 搜索服务密钥；未设置时回退 `KKAGENT_MOONSHOT_SEARCH_KEY`、`MOONSHOT_API_KEY`。 |
+| `KKAGENT_WEB_SEARCH_PROVIDER` | 搜索 provider（`searxng` / `brave` / `custom`）。 |
+| `KKAGENT_MOONSHOT_SEARCH_URL` | 旧搜索服务地址，仍映射到已废弃的 `moonshot_search` 做一次性兼容。 |
+| `KKAGENT_MOONSHOT_SEARCH_KEY` 或 `MOONSHOT_API_KEY` | 旧搜索服务密钥。 |
 | `KKAGENT_HTTP_TOKEN` | Agent Server HTTP/WS Bearer token。 |
 | `KKAGENT_HTTP_READ_TOKEN` | 只读 API token。 |
 | `KKAGENT_HTTP_WRITE_TOKEN` | read + 非 terminal 写操作 token。 |
