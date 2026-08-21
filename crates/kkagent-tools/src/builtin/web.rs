@@ -15,14 +15,24 @@ use crate::{Tool, ToolContext, ToolOutput};
 pub struct WebTool {
     cfg: Arc<WebServicesConfig>,
     provider: Option<Arc<dyn WebSearchProvider>>,
-    client: reqwest::Client,
+    /// Client for the optional [services.web_fetch] endpoint (applies its
+    /// proxy policy — auto-bypasses for local endpoints).
+    endpoint_client: reqwest::Client,
+    /// Client for direct public GETs — always follows system proxy settings.
+    direct_client: reqwest::Client,
 }
 
 impl WebTool {
     pub fn try_new(cfg: Arc<WebServicesConfig>) -> Option<Self> {
         let provider = cfg.build_search_provider();
         let timeout = Duration::from_millis(cfg.fetch.timeout_ms.max(1_000));
-        let client = reqwest::Client::builder()
+        let endpoint_client = crate::web_providers::build_web_client(
+            cfg.fetch.base_url.as_deref().unwrap_or(""),
+            cfg.fetch.timeout_ms.max(1_000),
+            cfg.fetch.proxy,
+        )
+        .unwrap_or_else(|_| reqwest::Client::new());
+        let direct_client = reqwest::Client::builder()
             .timeout(timeout)
             .redirect(Policy::none())
             .build()
@@ -30,7 +40,8 @@ impl WebTool {
         Some(Self {
             cfg,
             provider,
-            client,
+            endpoint_client,
+            direct_client,
         })
     }
 
@@ -129,12 +140,16 @@ impl WebTool {
             Ok(url) => url,
             Err(e) => return ToolOutput::error(format!("Invalid URL: {e}")),
         };
-        if let Err(e) = validate_public_http_url(&parsed_url).await {
+        // Validate URL scheme/host only — skip DNS resolution so a configured
+        // fetch provider works behind fake-IP DNS (e.g. Clash). The provider
+        // owns its outbound safety; the direct-GET fallback still runs full
+        // SSRF checks inside fetch_validated.
+        if let Err(e) = validate_http_url_format(&parsed_url) {
             return ToolOutput::error(format!("Web fetch blocked: {e}"));
         }
 
         if let Some(endpoint) = &self.cfg.fetch.base_url {
-            let mut req = self.client.post(endpoint).json(&json!({ "url": url }));
+            let mut req = self.endpoint_client.post(endpoint).json(&json!({ "url": url }));
             if let Some(key) = &self.cfg.fetch.api_key {
                 req = req.bearer_auth(key);
             }
@@ -208,7 +223,7 @@ impl WebTool {
         const MAX_REDIRECTS: usize = 5;
         for redirect_count in 0..=MAX_REDIRECTS {
             validate_public_http_url(&url).await?;
-            let response = self.client.get(url.clone()).send().await?;
+            let response = self.direct_client.get(url.clone()).send().await?;
             if !response.status().is_redirection() {
                 return Ok(response);
             }
@@ -304,7 +319,9 @@ async fn read_response_limited(
     Ok((len, String::from_utf8_lossy(&bytes).into_owned()))
 }
 
-async fn validate_public_http_url(url: &reqwest::Url) -> anyhow::Result<()> {
+/// Validates URL scheme/host/port without DNS resolution. Used before
+/// delegating to a fetch provider — the provider owns its outbound safety.
+fn validate_http_url_format(url: &reqwest::Url) -> anyhow::Result<()> {
     if !matches!(url.scheme(), "http" | "https") {
         anyhow::bail!("only http and https URLs are allowed");
     }
@@ -314,6 +331,30 @@ async fn validate_public_http_url(url: &reqwest::Url) -> anyhow::Result<()> {
     if host.eq_ignore_ascii_case("localhost") || host.to_ascii_lowercase().ends_with(".localhost") {
         anyhow::bail!("local hosts are not allowed");
     }
+    let _port = url
+        .port_or_known_default()
+        .ok_or_else(|| anyhow::anyhow!("URL has no usable port"))?;
+    // If the host is an IP literal, check it is public — this needs no DNS
+    // lookup (the IP is already in the URL), so fake-IP DNS is irrelevant,
+    // and it still blocks obvious SSRF targets (private/loopback/link-local)
+    // from being forwarded to a configured fetch provider. Domain hosts skip
+    // DNS resolution here; the provider owns outbound safety for them.
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        if !is_public_ip(ip) {
+            anyhow::bail!("URL host is a non-public IP address {ip}");
+        }
+    }
+    Ok(())
+}
+
+/// Validates scheme/host/port **and** resolves the host to ensure it is a
+/// public IP. Used for the direct-GET fallback where the agent itself opens
+/// the connection.
+async fn validate_public_http_url(url: &reqwest::Url) -> anyhow::Result<()> {
+    validate_http_url_format(url)?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("URL has no host"))?;
     let port = url
         .port_or_known_default()
         .ok_or_else(|| anyhow::anyhow!("URL has no usable port"))?;
@@ -447,5 +488,35 @@ mod fetch_security_tests {
         let text = extract_readable_text(html);
         assert!(text.contains("Hello"));
         assert!(!text.contains("alert"));
+    }
+
+    #[test]
+    fn validate_http_url_format_skips_dns_resolution() {
+        // A normal domain http URL passes the format check with no DNS lookup,
+        // so a configured fetch provider can be reached behind fake-IP DNS
+        // (e.g. Clash) without being blocked up front.
+        let url = reqwest::Url::parse("https://example.com/a").unwrap();
+        validate_http_url_format(&url).unwrap();
+
+        // Non-http schemes are rejected at the format stage.
+        let bad = reqwest::Url::parse("file:///etc/passwd").unwrap();
+        assert!(validate_http_url_format(&bad).is_err());
+
+        // localhost is rejected at the format stage too.
+        let lh = reqwest::Url::parse("http://localhost/a").unwrap();
+        assert!(validate_http_url_format(&lh).is_err());
+
+        // A private IP literal is rejected without any DNS lookup (SSRF guard
+        // for the provider-forwarded path).
+        let priv_ip = reqwest::Url::parse("http://192.168.1.1/a").unwrap();
+        assert!(validate_http_url_format(&priv_ip).is_err());
+
+        // A cloud-metadata IP literal is rejected too.
+        let meta = reqwest::Url::parse("http://169.254.169.254/latest").unwrap();
+        assert!(validate_http_url_format(&meta).is_err());
+
+        // A public IP literal is allowed.
+        let pub_ip = reqwest::Url::parse("http://8.8.8.8/a").unwrap();
+        validate_http_url_format(&pub_ip).unwrap();
     }
 }
