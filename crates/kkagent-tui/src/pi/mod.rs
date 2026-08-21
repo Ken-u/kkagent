@@ -11,8 +11,8 @@ pub mod undo_stack;
 pub mod word_navigation;
 
 pub use autocomplete::{
-    complete_at_files, complete_path, complete_slash, extract_at_token, format_at_completion,
-    Autocomplete, CompletionItem,
+    complete_at_files, complete_at_files_with_heavy, complete_at_files_with_options, complete_path,
+    complete_slash, extract_at_token, format_at_completion, Autocomplete, CompletionItem,
 };
 pub use fuzzy::{fuzzy_filter, fuzzy_match, FuzzyMatch};
 pub use keybindings::{map_key, EditorAction};

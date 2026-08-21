@@ -208,6 +208,11 @@ pub fn load_config(path: Option<&Path>) -> Result<AppConfig> {
     }
 
     apply_env_overrides(&mut config);
+    // Project-level `.kkagent/config.toml` can override heavy-dir skips for
+    // the current working directory (AOSP / monorepo tuning).
+    if let Ok(cwd) = std::env::current_dir() {
+        config.tools.merge_project_overrides(&cwd);
+    }
     config
         .validate()
         .with_context(|| format!("Invalid kkagent configuration: {config_path:?}"))?;

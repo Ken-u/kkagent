@@ -329,6 +329,10 @@ for background jobs (shell_id/stop remain as aliases)."
         })
     }
 
+    fn accesses(&self, input: &Value, working_dir: &Path) -> crate::ToolAccesses {
+        crate::accesses::bash_accesses(input, working_dir)
+    }
+
     async fn execute(&self, input: Value, ctx: &ToolContext) -> anyhow::Result<ToolOutput> {
         if let Some(shell_id) = input.get("shell_id").and_then(|v| v.as_str()) {
             let has_command = input

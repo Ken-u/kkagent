@@ -119,9 +119,26 @@ pub fn complete_slash(commands: &[(&str, &str)], prefix: &str) -> Vec<Completion
     scored.into_iter().map(|(_, i)| i).collect()
 }
 
+/// One-level path completion under `cwd` for `partial` (shell-style).
+/// Lists only the current directory segment; type `/` to descend.
 pub fn complete_path(cwd: &Path, partial: &str) -> Vec<CompletionItem> {
-    let path = PathBuf::from(partial);
-    let (dir, file_prefix) = if partial.ends_with('/') || partial.ends_with('\\') {
+    complete_path_level(
+        cwd,
+        partial,
+        kkagent_config::ToolsConfig::DEFAULT_HEAVY_DIRS,
+        40,
+    )
+}
+
+fn complete_path_level(
+    cwd: &Path,
+    partial: &str,
+    heavy_dirs: &[impl AsRef<str>],
+    max: usize,
+) -> Vec<CompletionItem> {
+    let partial = to_display_path(partial);
+    let path = PathBuf::from(&partial);
+    let (dir, file_prefix) = if partial.ends_with('/') {
         (cwd.join(&path), String::new())
     } else {
         let parent = path.parent().unwrap_or_else(|| Path::new(""));
@@ -134,24 +151,39 @@ pub fn complete_path(cwd: &Path, partial: &str) -> Vec<CompletionItem> {
     let Ok(rd) = std::fs::read_dir(&dir) else {
         return vec![];
     };
+    let prefix_lower = file_prefix.to_lowercase();
     let mut items = Vec::new();
     for ent in rd.flatten() {
         let name = ent.file_name().to_string_lossy().into_owned();
-        if name.starts_with('.') && file_prefix.is_empty() {
+        if name == "." || name == ".." {
             continue;
         }
-        if !file_prefix.is_empty() && !fuzzy_match(&file_prefix, &name).matches {
+        // Hide dotfiles unless the user is already typing a leading `.`.
+        if name.starts_with('.') && !prefix_lower.starts_with('.') {
+            continue;
+        }
+        if heavy_dirs.iter().any(|h| h.as_ref() == name) {
+            continue;
+        }
+        if !prefix_lower.is_empty() && !name.to_lowercase().starts_with(&prefix_lower) {
             continue;
         }
         let is_dir = ent.file_type().map(|t| t.is_dir()).unwrap_or(false);
-        let insert = if !partial.starts_with('/') && !partial.starts_with('\\') {
-            let rel = PathBuf::from(partial);
-            let base = rel.parent().unwrap_or_else(|| Path::new(""));
-            base.join(&name)
-        } else {
-            dir.join(&name)
+        let insert = {
+            let rel = PathBuf::from(&partial);
+            let base = if partial.ends_with('/') {
+                rel
+            } else {
+                rel.parent().unwrap_or_else(|| Path::new("")).to_path_buf()
+            };
+            let joined = if base.as_os_str().is_empty() {
+                PathBuf::from(&name)
+            } else {
+                base.join(&name)
+            };
+            to_display_path(&joined.to_string_lossy())
         };
-        let mut s = to_display_path(&insert.to_string_lossy());
+        let mut s = insert;
         if is_dir && !s.ends_with('/') {
             s.push('/');
         }
@@ -160,15 +192,13 @@ pub fn complete_path(cwd: &Path, partial: &str) -> Vec<CompletionItem> {
         } else {
             CompletionItem::file(name, s, None)
         });
-        if items.len() >= 40 {
-            break;
-        }
     }
     items.sort_by(|a, b| {
         b.is_directory
             .cmp(&a.is_directory)
             .then_with(|| a.label.cmp(&b.label))
     });
+    items.truncate(max);
     items
 }
 
@@ -232,30 +262,83 @@ fn find_unclosed_at_quote(before: &str) -> Option<usize> {
     Some(start)
 }
 
-/// `@` file/dir fuzzy completion (gitignore-aware walk, optional `fd`).
+/// `@` file/dir completion. Default is one directory level at a time.
 pub fn complete_at_files(cwd: &Path, query: &str, max: usize) -> Vec<CompletionItem> {
+    complete_at_files_with_options(
+        cwd,
+        query,
+        max,
+        &kkagent_config::ToolsConfig::DEFAULT_HEAVY_DIRS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect::<Vec<_>>(),
+        false,
+    )
+}
+
+/// Like [`complete_at_files`], with heavy-dir skips and optional smart mode.
+pub fn complete_at_files_with_heavy(
+    cwd: &Path,
+    query: &str,
+    max: usize,
+    heavy_dirs: &[String],
+) -> Vec<CompletionItem> {
+    complete_at_files_with_options(cwd, query, max, heavy_dirs, false)
+}
+
+/// `@` completion with an explicit smart/level mode switch.
+///
+/// - `smart = false` (default): list only the current path segment; press `/`
+///   to complete the next level.
+/// - `smart = true`: experimental recursive fuzzy walk (fd / deep ignore walk).
+pub fn complete_at_files_with_options(
+    cwd: &Path,
+    query: &str,
+    max: usize,
+    heavy_dirs: &[String],
+    smart: bool,
+) -> Vec<CompletionItem> {
     let query = to_display_path(query);
-    let mut items = if let Some(via_fd) = try_fd_complete(cwd, &query, max) {
-        via_fd
+    let mut items = if smart {
+        complete_at_files_smart(cwd, &query, max, heavy_dirs)
     } else {
-        walk_complete(cwd, &query, max)
+        complete_path_level(cwd, query.trim_start_matches("./"), heavy_dirs, max)
+            .into_iter()
+            .map(with_at_prefix)
+            .collect()
     };
-    // Also include shallow path listing when query looks like a directory prefix.
-    if query.contains('/') || query.ends_with('/') {
-        for extra in complete_path(cwd, query.trim_start_matches("./")) {
-            if !items.iter().any(|i| i.insert == extra.insert) {
-                items.push(with_at_prefix(extra));
-            }
-        }
-    }
-    // Ensure insert values are `@…`
     for item in &mut items {
         if !item.insert.starts_with('@') {
             *item = with_at_prefix(item.clone());
         }
     }
-    rank_at_items(&mut items, &query);
+    if smart {
+        rank_at_items(&mut items, &query);
+    }
     items.truncate(max);
+    items
+}
+
+fn complete_at_files_smart(
+    cwd: &Path,
+    query: &str,
+    max: usize,
+    heavy_dirs: &[String],
+) -> Vec<CompletionItem> {
+    let mut items = if let Some(via_fd) = try_fd_complete(cwd, query, max, heavy_dirs) {
+        via_fd
+    } else {
+        walk_complete(cwd, query, max, heavy_dirs)
+    };
+    // Also include shallow path listing when query looks like a directory prefix.
+    if query.contains('/') || query.ends_with('/') {
+        for extra in complete_path_level(cwd, query.trim_start_matches("./"), heavy_dirs, max) {
+            let extra = with_at_prefix(extra);
+            if !items.iter().any(|i| i.insert == extra.insert) {
+                items.push(extra);
+            }
+        }
+    }
     items
 }
 
@@ -288,7 +371,12 @@ fn rank_at_items(items: &mut [CompletionItem], query: &str) {
     });
 }
 
-fn try_fd_complete(cwd: &Path, query: &str, max: usize) -> Option<Vec<CompletionItem>> {
+fn try_fd_complete(
+    cwd: &Path,
+    query: &str,
+    max: usize,
+    heavy_dirs: &[String],
+) -> Option<Vec<CompletionItem>> {
     let fd = which_fd()?;
     let mut args = vec![
         "--base-directory".into(),
@@ -299,9 +387,11 @@ fn try_fd_complete(cwd: &Path, query: &str, max: usize) -> Option<Vec<Completion
         "f".into(),
         "--type".into(),
         "d".into(),
-        "--exclude".into(),
-        ".git".into(),
     ];
+    for heavy in heavy_dirs {
+        args.push("--exclude".into());
+        args.push(heavy.clone());
+    }
     if query.contains('/') {
         args.push("--full-path".into());
     }
@@ -401,25 +491,28 @@ fn which_fd() -> Option<&'static str> {
     })
 }
 
-fn walk_complete(cwd: &Path, query: &str, max: usize) -> Vec<CompletionItem> {
+fn walk_complete(
+    cwd: &Path,
+    query: &str,
+    max: usize,
+    heavy_dirs: &[String],
+) -> Vec<CompletionItem> {
     let mut items = Vec::new();
     // `hidden(false)` is required for `.github`-style entries, but it also
     // re-enables `.repo/`, which holds millions of entries in an AOSP
     // checkout and would eat the whole scan budget. Prune heavy/hidden
     // metadata dirs explicitly instead.
+    let heavy_owned: Vec<String> = heavy_dirs.to_vec();
     let walker = ignore::WalkBuilder::new(cwd)
         .hidden(false)
         .git_ignore(true)
         .git_global(true)
         .git_exclude(true)
         .max_depth(Some(8))
-        .filter_entry(|e| {
+        .filter_entry(move |e| {
             if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                 let name = e.file_name().to_string_lossy();
-                !matches!(
-                    name.as_ref(),
-                    ".repo" | "out" | "target" | "node_modules" | ".git"
-                )
+                !heavy_owned.iter().any(|h| h.as_str() == name.as_ref())
             } else {
                 true
             }
@@ -495,6 +588,9 @@ fn walk_complete(cwd: &Path, query: &str, max: usize) -> Vec<CompletionItem> {
                 if name.starts_with('.') {
                     continue;
                 }
+                if heavy_dirs.iter().any(|h| h == &name) {
+                    continue;
+                }
                 let is_dir = ent.file_type().map(|t| t.is_dir()).unwrap_or(false);
                 let display = if is_dir {
                     format!("{name}/")
@@ -565,20 +661,28 @@ mod tests {
     }
 
     #[test]
-    fn complete_at_top_level() {
+    fn complete_at_top_level_only_by_default() {
         let dir = std::env::temp_dir().join(format!("kkagent-at-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::create_dir_all(dir.join("src/deep")).unwrap();
         std::fs::write(dir.join("README.md"), "x").unwrap();
+        std::fs::write(dir.join("src/deep/nested.rs"), "x").unwrap();
         let items = complete_at_files(&dir, "", 20);
         assert!(items.iter().any(|i| i.insert.contains("README")));
         assert!(items
             .iter()
             .any(|i| i.is_directory && i.insert.contains("src")));
+        // Nested files must not appear until the user descends with `/`.
+        assert!(!items.iter().any(|i| i.insert.contains("nested")));
+        let nested = complete_at_files(&dir, "src/", 20);
+        assert!(nested.iter().any(|i| i.insert.contains("src/deep")));
+        assert!(!nested.iter().any(|i| i.insert.contains("nested.rs")));
+        let deep = complete_at_files(&dir, "src/deep/", 20);
+        assert!(deep.iter().any(|i| i.insert.contains("nested.rs")));
         let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
-    fn complete_at_filters() {
+    fn complete_at_filters_prefix_on_current_level() {
         let dir = std::env::temp_dir().join(format!("kkagent-atf-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("alpha.rs"), "x").unwrap();
@@ -586,6 +690,24 @@ mod tests {
         let items = complete_at_files(&dir, "alp", 20);
         assert!(items.iter().any(|i| i.insert.contains("alpha")));
         assert!(!items.iter().any(|i| i.insert.contains("beta")));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn smart_mode_can_find_nested_without_slash() {
+        let dir = std::env::temp_dir().join(format!("kkagent-ats-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("src/deep")).unwrap();
+        std::fs::write(dir.join("src/deep/nested.rs"), "x").unwrap();
+        let heavy: Vec<String> = kkagent_config::ToolsConfig::DEFAULT_HEAVY_DIRS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        let items = complete_at_files_with_options(&dir, "nested", 20, &heavy, true);
+        assert!(
+            items.iter().any(|i| i.insert.contains("nested")),
+            "smart items: {:?}",
+            items.iter().map(|i| &i.insert).collect::<Vec<_>>()
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 }

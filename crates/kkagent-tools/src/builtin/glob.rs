@@ -1,5 +1,5 @@
 use crate::path_policy::is_sensitive_path;
-use crate::{inside_heavy_dir, Tool, ToolContext, ToolOutput, HEAVY_DIRS};
+use crate::{inside_heavy_dir_list, Tool, ToolContext, ToolOutput};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::cmp::Reverse;
@@ -12,6 +12,10 @@ use std::time::{Duration, Instant};
 pub struct GlobTool;
 
 const DEFAULT_MAX: usize = 100;
+/// Cap for `head_limit = 0` (unlimited). Without this, `**/*.java` on AOSP can
+/// materialize millions of paths and hundreds of MB before the walk budget
+/// stops the search.
+const HARD_MATCH_CAP: usize = 100_000;
 /// Hard wall-clock budget for one directory walk. Giant trees (e.g. an AOSP
 /// checkout with a populated `out/`) can take many minutes to walk; stop
 /// early and report partial results so the agent stays responsive.
@@ -43,6 +47,10 @@ Returns paths sorted by modification time (newest first)."
             },
             "required": ["pattern"]
         })
+    }
+
+    fn accesses(&self, input: &Value, working_dir: &Path) -> crate::ToolAccesses {
+        crate::accesses::glob_accesses(input, working_dir)
     }
 
     async fn execute(&self, input: Value, ctx: &ToolContext) -> anyhow::Result<ToolOutput> {
@@ -85,9 +93,10 @@ Returns paths sorted by modification time (newest first)."
         // instead of scanning the whole tree (crucial on huge checkouts).
         let walk_root =
             literal_prefix_dir(&glob_pattern, &root_dir).unwrap_or_else(|| root_dir.clone());
+        let heavy_dirs = ctx.tools_config.effective_heavy_dirs();
         // Heavy dirs are pruned unless the caller explicitly descended into
         // one (pattern literal prefix or `path` argument), e.g. `out/soong/**`.
-        let skip_heavy = !inside_heavy_dir(&walk_root);
+        let skip_heavy = !inside_heavy_dir_list(&walk_root, &heavy_dirs);
 
         let sensitive = ctx.sensitive_check_enabled();
         let interrupted = ctx.interrupted.clone();
@@ -103,6 +112,7 @@ Returns paths sorted by modification time (newest first)."
                 head_limit,
                 sensitive,
                 skip_heavy,
+                heavy_dirs,
                 walk_budget: WALK_BUDGET,
                 interrupted,
             })
@@ -120,10 +130,20 @@ Returns paths sorted by modification time (newest first)."
             .map(|p| p.display().to_string())
             .collect();
         if outcome.truncated {
-            output.push(format!(
-                "... truncated at {} matches (raise head_limit to see more) ...",
+            let cap = if head_limit == 0 {
+                HARD_MATCH_CAP
+            } else {
                 head_limit
-            ));
+            };
+            if head_limit == 0 {
+                output.push(format!(
+                    "... truncated at hard cap of {cap} matches (narrow the pattern or pass a deeper `path`) ..."
+                ));
+            } else {
+                output.push(format!(
+                    "... truncated at {cap} matches (raise head_limit to see more) ..."
+                ));
+            }
         }
         if let Some(note) = outcome.stopped_note {
             output.push(note);
@@ -144,10 +164,10 @@ struct WalkConfig {
     include_ignored: bool,
     head_limit: usize,
     sensitive: bool,
-    /// Prune heavy build dirs (see [`crate::HEAVY_DIRS`]) during the walk.
-    /// False when the walk root is already inside a heavy dir (explicit
-    /// descent), in which case pruning would drop everything.
+    /// Prune heavy build dirs during the walk. False when the walk root is
+    /// already inside a heavy dir (explicit descent).
     skip_heavy: bool,
+    heavy_dirs: Vec<String>,
     /// Hard wall-clock budget for the walk.
     walk_budget: Duration,
     interrupted: Option<Arc<AtomicBool>>,
@@ -185,10 +205,11 @@ fn walk_matches(cfg: WalkConfig) -> WalkOutcome {
     // Skip heavy build dirs (AOSP `out/`, cargo `target/`, ...) unless the
     // walk root is already inside one of them.
     if cfg.skip_heavy {
-        walker.filter_entry(|e| {
+        let heavy = cfg.heavy_dirs.clone();
+        walker.filter_entry(move |e| {
             if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                 let name = e.file_name().to_string_lossy();
-                return !HEAVY_DIRS.contains(&name.as_ref());
+                return !heavy.iter().any(|h| h.as_str() == name.as_ref());
             }
             true
         });
@@ -196,7 +217,12 @@ fn walk_matches(cfg: WalkConfig) -> WalkOutcome {
 
     let deadline = Instant::now() + cfg.walk_budget;
     let mut newest: BinaryHeap<Reverse<(std::time::SystemTime, PathBuf)>> = BinaryHeap::new();
-    let mut unlimited = Vec::new();
+    // `head_limit == 0` means "no caller limit" but still respects HARD_MATCH_CAP.
+    let effective_limit = if cfg.head_limit == 0 {
+        HARD_MATCH_CAP
+    } else {
+        cfg.head_limit
+    };
 
     for entry in walker.build().filter_map(|e| e.ok()) {
         if let Some(flag) = cfg.interrupted.as_ref() {
@@ -234,29 +260,46 @@ fn walk_matches(cfg: WalkConfig) -> WalkOutcome {
                 .and_then(|m| m.modified().ok())
                 .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
             result.total_matches += 1;
-            if cfg.head_limit == 0 {
-                unlimited.push((display_path, mtime));
-            } else {
-                newest.push(Reverse((mtime, display_path)));
-                if newest.len() > cfg.head_limit {
-                    newest.pop();
-                }
+            newest.push(Reverse((mtime, display_path)));
+            if newest.len() > effective_limit {
+                newest.pop();
+            }
+            // Stop collecting once we know the hard/caller cap is exceeded so
+            // memory stays bounded even before the walk budget fires.
+            if result.total_matches > effective_limit && cfg.head_limit == 0 {
+                // Keep walking briefly? No — hard-cap truncate is enough; note
+                // is attached below. Breaking early saves IO on huge trees.
+                result.truncated = true;
+                break;
             }
         }
     }
 
-    let mut items: Vec<(PathBuf, std::time::SystemTime)> = if cfg.head_limit == 0 {
-        unlimited
-    } else {
-        newest
-            .into_iter()
-            .map(|Reverse((mtime, path))| (path, mtime))
-            .collect()
-    };
+    let mut items: Vec<(PathBuf, std::time::SystemTime)> = newest
+        .into_iter()
+        .map(|Reverse((mtime, path))| (path, mtime))
+        .collect();
     items.sort_by_key(|item| Reverse(item.1));
     result.results = items.into_iter().map(|(p, _)| p).collect();
-    result.truncated = cfg.head_limit > 0 && result.total_matches > cfg.head_limit;
+    result.truncated = result.truncated || result.total_matches > effective_limit;
     result
+}
+
+/// Resolve the directory Glob will actually walk (for conflict declaration).
+pub fn resolve_glob_walk_root(working_dir: &Path, pattern: &str, path: Option<&str>) -> PathBuf {
+    let root = path.unwrap_or(".");
+    let requested_root = if Path::new(root).is_absolute() {
+        PathBuf::from(root)
+    } else {
+        working_dir.join(root)
+    };
+    let root_dir = std::fs::canonicalize(&requested_root).unwrap_or(requested_root);
+    let glob_pattern = if pattern.starts_with("**/") {
+        pattern.to_string()
+    } else {
+        format!("**/{pattern}")
+    };
+    literal_prefix_dir(&glob_pattern, &root_dir).unwrap_or(root_dir)
 }
 
 /// If the glob pattern (already normalized to start with `**/`) begins with a

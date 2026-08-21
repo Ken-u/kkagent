@@ -139,6 +139,10 @@ pub struct UiConfig {
     /// Check crates.io / release notes when idle (cached).
     #[serde(default = "default_true")]
     pub check_updates: bool,
+    /// Experimental: recursive fuzzy `@` path completion (fd / deep walk).
+    /// Default is one directory level at a time (type `/` to descend).
+    #[serde(default)]
+    pub experimental_smart_at_complete: bool,
     /// Optional key override map: action name → key chord (e.g. "interrupt" = "ctrl-c").
     #[serde(default)]
     pub keybindings: HashMap<String, String>,
@@ -150,6 +154,7 @@ impl Default for UiConfig {
             high_contrast: false,
             reduce_motion: false,
             check_updates: true,
+            experimental_smart_at_complete: false,
             keybindings: HashMap::new(),
         }
     }
@@ -548,6 +553,14 @@ pub struct ToolsConfig {
     /// which may refresh the provider prompt cache.
     #[serde(default = "default_true")]
     pub dynamically_loaded_tools: bool,
+    /// Directory names skipped by Glob / Grep / `@` completion walks.
+    /// When set (including `[]`), replaces the built-in default list.
+    /// Use [`Self::extra_heavy_dirs`] to append without replacing.
+    #[serde(default)]
+    pub heavy_dirs: Option<Vec<String>>,
+    /// Extra heavy directory names appended to the effective list.
+    #[serde(default)]
+    pub extra_heavy_dirs: Vec<String>,
 }
 
 impl Default for ToolsConfig {
@@ -557,6 +570,74 @@ impl Default for ToolsConfig {
             sensitive_path_check: true,
             additional_dirs: Vec::new(),
             dynamically_loaded_tools: true,
+            heavy_dirs: None,
+            extra_heavy_dirs: Vec::new(),
+        }
+    }
+}
+
+impl ToolsConfig {
+    /// Built-in names always skipped unless the caller explicitly descends
+    /// into them (e.g. Glob `out/soong/**`). Includes `.repo` for AOSP-style
+    /// multi-git checkouts.
+    pub const DEFAULT_HEAVY_DIRS: &'static [&'static str] =
+        &["node_modules", "target", ".git", "out", ".repo"];
+
+    /// Resolve the effective heavy-dir skip list (override + extras).
+    pub fn effective_heavy_dirs(&self) -> Vec<String> {
+        let mut base: Vec<String> = match &self.heavy_dirs {
+            Some(dirs) => dirs.clone(),
+            None => Self::DEFAULT_HEAVY_DIRS
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
+        };
+        for extra in &self.extra_heavy_dirs {
+            if !extra.is_empty() && !base.iter().any(|d| d == extra) {
+                base.push(extra.clone());
+            }
+        }
+        base
+    }
+
+    /// Merge project-level `.kkagent/config.toml` `[tools]` overrides into
+    /// this config. Only heavy-dir related fields are applied (other project
+    /// settings stay global / `--config`).
+    pub fn merge_project_overrides(&mut self, workspace: &std::path::Path) {
+        let path = workspace.join(".kkagent").join("config.toml");
+        if !path.is_file() {
+            return;
+        }
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            return;
+        };
+        #[derive(Deserialize, Default)]
+        struct ProjectFile {
+            #[serde(default)]
+            tools: Option<ProjectTools>,
+        }
+        #[derive(Deserialize, Default)]
+        struct ProjectTools {
+            #[serde(default)]
+            heavy_dirs: Option<Vec<String>>,
+            #[serde(default)]
+            extra_heavy_dirs: Option<Vec<String>>,
+        }
+        let Ok(parsed) = toml::from_str::<ProjectFile>(&content) else {
+            return;
+        };
+        let Some(tools) = parsed.tools else {
+            return;
+        };
+        if tools.heavy_dirs.is_some() {
+            self.heavy_dirs = tools.heavy_dirs;
+        }
+        if let Some(extra) = tools.extra_heavy_dirs {
+            for name in extra {
+                if !name.is_empty() && !self.extra_heavy_dirs.iter().any(|d| d == &name) {
+                    self.extra_heavy_dirs.push(name);
+                }
+            }
         }
     }
 }

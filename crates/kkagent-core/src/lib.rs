@@ -81,7 +81,7 @@ pub use tool_results::{
     parse_result_filename, persist as persist_tool_result, sanitize_fragment, tool_results_root,
     PersistedToolResult, TOOL_RESULT_MAX_CHARS, TOOL_RESULT_PREVIEW_CHARS,
 };
-pub use tool_scheduler::{ToolCallTask, ToolScheduler};
+pub use tool_scheduler::{SchedulerStatus, ToolCallTask, ToolScheduler};
 pub use transcript::{
     open_shared_sqlite, open_shared_sqlite_memory, IntegrityReport, IsolatedMessage, SharedSqlite,
     TranscriptDb,

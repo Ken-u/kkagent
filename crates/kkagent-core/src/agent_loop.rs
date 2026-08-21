@@ -25,7 +25,7 @@ use crate::plan_review::{
 use crate::session::Session;
 use crate::token_counting::TokenCountingStrategy;
 use crate::tool_results::{TOOL_RESULT_MAX_CHARS, TOOL_RESULT_PREVIEW_CHARS};
-use crate::tool_scheduler::{box_start, ToolCallTask, ToolScheduler};
+use crate::tool_scheduler::{box_start, SchedulerStatus, ToolCallTask, ToolScheduler};
 use crate::transcript::TranscriptDb;
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -1762,9 +1762,14 @@ Do not mention this reminder to the user.\n</system-reminder>"
                     let interrupted = session.interrupted.clone();
                     let plan_file_path = session.plan_file_path.clone();
                     let image = self.config.image.clone();
-                    let tools_config = self.config.tools.clone();
+                    let mut tools_config = self.config.tools.clone();
+                    tools_config.merge_project_overrides(&session.working_dir);
                     let msg_count = session.messages.len();
+                    let task_id = tool_call_id.clone();
+                    let task_name = name.clone();
                     tasks.push(ToolCallTask {
+                        tool_call_id: task_id,
+                        tool_name: task_name,
                         accesses,
                         start: box_start(move || {
                             let tools = tools;
@@ -1801,7 +1806,34 @@ Do not mention this reminder to the user.\n</system-reminder>"
             let parallel_outputs = if tasks.is_empty() {
                 Vec::new()
             } else {
-                ToolScheduler::run_all(tasks).await
+                let (status_tx, mut status_rx) = tokio::sync::mpsc::unbounded_channel();
+                let event_tx = self.event_tx.clone();
+                let status_session = session_id.clone();
+                let status_forward = tokio::spawn(async move {
+                    while let Some(status) = status_rx.recv().await {
+                        let (tool_call_id, status_label, queued_behind) = match status {
+                            SchedulerStatus::Queued {
+                                tool_call_id,
+                                behind,
+                            } => (tool_call_id, "queued".to_string(), Some(behind)),
+                            SchedulerStatus::Started { tool_call_id } => {
+                                (tool_call_id, "running".to_string(), None)
+                            }
+                        };
+                        let _ = event_tx
+                            .send(AgentEvent::ToolExecutionStatus {
+                                session_id: status_session.clone(),
+                                tool_call_id,
+                                status: status_label,
+                                queued_behind,
+                            })
+                            .await;
+                    }
+                });
+                let outputs = ToolScheduler::run_all_with_status(tasks, Some(status_tx)).await;
+                // Drop the sender (end of run_all) then wait for the forwarder.
+                let _ = status_forward.await;
+                outputs
             };
             let mut parallel_iter = parallel_outputs.into_iter();
             let mut resolved: Vec<(String, String, Option<serde_json::Value>, ToolOutput)> =

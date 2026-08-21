@@ -735,6 +735,7 @@ fn hash_display_tool(tool: &crate::app::DisplayToolCall, hasher: &mut impl Hashe
     tool.collapsed.hash(hasher);
     tool.user_overridden.hash(hasher);
     tool.stopping.hash(hasher);
+    tool.queued_behind.hash(hasher);
     if tool.output.is_none() {
         tool.started_at
             .map(|started| started.elapsed().as_secs())
@@ -1314,6 +1315,8 @@ fn status_icon(tc: &crate::app::DisplayToolCall) -> &'static str {
         } else {
             "✓"
         }
+    } else if tc.queued_behind.is_some() {
+        "…"
     } else {
         "·"
     }
@@ -1336,7 +1339,9 @@ fn render_tool_call_lines(
             ToolRenderRegistry::chip_label(tc, width)
         );
         if tc.output.is_none() {
-            if let Some(started) = tc.started_at {
+            if let Some(behind) = tc.queued_behind.as_ref() {
+                label.push_str(&format!(" queued behind {behind}"));
+            } else if let Some(started) = tc.started_at {
                 let secs = started.elapsed().as_secs();
                 if secs >= 2 {
                     label.push_str(&format!(" {secs}s"));
@@ -4380,6 +4385,7 @@ mod render_smoke {
                     user_overridden: false,
                     started_at: None,
                     stopping: false,
+                    queued_behind: None,
                 }),
                 DisplayPart::ToolHistory(ToolHistorySummary {
                     tool_count: 1,
@@ -4440,6 +4446,7 @@ mod render_smoke {
                 user_overridden: true,
                 started_at: None,
                 stopping: false,
+                queued_behind: None,
             })],
             tool_calls: Vec::new(),
             delivery: crate::prompt_queue::DeliveryState::Sent,

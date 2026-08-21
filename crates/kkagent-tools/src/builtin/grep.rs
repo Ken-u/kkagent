@@ -1,5 +1,5 @@
 use crate::path_policy::sensitive_glob_excludes;
-use crate::{inside_heavy_dir, Tool, ToolContext, ToolOutput, HEAVY_DIRS};
+use crate::{inside_heavy_dir_list, Tool, ToolContext, ToolOutput};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -132,7 +132,9 @@ multiline, head_limit/offset, and glob/type filters."
             std::fs::canonicalize(&search_dir).unwrap_or_else(|_| search_dir.clone());
         // Huge-workspace guard computed before `resolved_search_dir` is moved
         // into `search_arg` below.
-        let skip_heavy = !include_ignored && !inside_heavy_dir(&resolved_search_dir);
+        let heavy_dirs = ctx.tools_config.effective_heavy_dirs();
+        let skip_heavy =
+            !include_ignored && !inside_heavy_dir_list(&resolved_search_dir, &heavy_dirs);
         let search_arg = resolved_search_dir
             .strip_prefix(&workspace_dir)
             .map(|path| {
@@ -196,7 +198,7 @@ Install ripgrep (e.g. `apt install ripgrep`, `dnf install ripgrep`, \
         // `out/`, cargo `target/`, ...) unless the search path is already
         // inside one of them.
         if skip_heavy {
-            for heavy in HEAVY_DIRS {
+            for heavy in &heavy_dirs {
                 cmd.arg("--glob").arg(format!("!{heavy}/"));
             }
         }

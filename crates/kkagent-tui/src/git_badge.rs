@@ -2,6 +2,7 @@
 
 use std::path::Path;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -30,6 +31,15 @@ impl GitBadge {
         }
         Some(s)
     }
+
+    fn placeholder() -> Self {
+        Self {
+            branch: Some("…".into()),
+            dirty: false,
+            ahead: 0,
+            behind: 0,
+        }
+    }
 }
 
 struct Cache {
@@ -40,6 +50,12 @@ struct Cache {
 }
 
 static CACHE: Mutex<Option<Cache>> = Mutex::new(None);
+static BADGE_UPDATED: AtomicBool = AtomicBool::new(false);
+
+/// True when a background probe finished since the last call (UI should redraw).
+pub fn take_updated() -> bool {
+    BADGE_UPDATED.swap(false, Ordering::Relaxed)
+}
 
 /// Return the cached badge and refresh stale Git metadata off the render thread.
 pub fn git_badge(cwd: &Path, trust: Option<&kkagent_config::WorkspaceTrust>) -> GitBadge {
@@ -65,20 +81,20 @@ pub fn git_badge(cwd: &Path, trust: Option<&kkagent_config::WorkspaceTrust>) -> 
                 return badge;
             }
         }
-    }
-
-    // A workspace switch is rare and needs an immediate first value. Subsequent
-    // probes use stale-while-revalidate so `git status` never blocks a frame.
-    let badge = probe(cwd, trust);
-    if let Ok(mut guard) = CACHE.lock() {
+        // Workspace switch / first probe: never block the UI thread on
+        // `git status` (can take seconds on huge AOSP sub-repos).
+        let badge = GitBadge::placeholder();
         *guard = Some(Cache {
             at: Instant::now(),
-            cwd: key,
+            cwd: key.clone(),
             badge: badge.clone(),
-            refreshing: false,
+            refreshing: true,
         });
+        spawn_refresh(cwd.to_path_buf(), trust.cloned(), key);
+        return badge;
     }
-    badge
+
+    GitBadge::placeholder()
 }
 
 fn spawn_refresh(
@@ -93,6 +109,7 @@ fn spawn_refresh(
                 cached.at = Instant::now();
                 cached.badge = badge;
                 cached.refreshing = false;
+                BADGE_UPDATED.store(true, Ordering::Relaxed);
             }
         }
     });
@@ -174,5 +191,10 @@ mod tests {
             behind: 0,
         };
         assert_eq!(b.render().unwrap(), "git:main*↑1");
+    }
+
+    #[test]
+    fn placeholder_renders_ellipsis() {
+        assert_eq!(GitBadge::placeholder().render().unwrap(), "git:…");
     }
 }

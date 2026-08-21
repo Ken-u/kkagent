@@ -30,17 +30,30 @@ pub use web_providers::WebServicesConfig;
 /// Directory names that are always skipped by recursive file tools (Glob,
 /// Grep, TUI file completion). They are build outputs or VCS metadata that can
 /// hold millions of entries in huge workspaces (e.g. an AOSP checkout with a
-/// populated `out/`). Tools that explicitly descend into one of them (e.g. a
-/// Glob pattern `out/soong/**` or a Grep `path` inside `out/`) opt out via
-/// [`inside_heavy_dir`].
-pub const HEAVY_DIRS: [&str; 4] = ["node_modules", "target", ".git", "out"];
+/// populated `out/` or `.repo/`). Tools that explicitly descend into one of
+/// them (e.g. a Glob pattern `out/soong/**` or a Grep `path` inside `out/`)
+/// opt out via [`inside_heavy_dir`].
+///
+/// Prefer [`kkagent_config::ToolsConfig::effective_heavy_dirs`] at runtime so
+/// user/project config can override this list. This constant mirrors the
+/// default for call sites without a ToolsConfig.
+pub const HEAVY_DIRS: &[&str] = kkagent_config::ToolsConfig::DEFAULT_HEAVY_DIRS;
 
-/// True when `path` has one of [`HEAVY_DIRS`] as a component, i.e. the caller
+/// True when `path` has one of `heavy` as a component, i.e. the caller
 /// explicitly descended into a heavy tree and heavy-dir filtering must not
 /// prune it.
+pub fn inside_heavy_dir_list(path: &Path, heavy: &[impl AsRef<str>]) -> bool {
+    path.components().any(|c| {
+        let Some(name) = c.as_os_str().to_str() else {
+            return false;
+        };
+        heavy.iter().any(|h| h.as_ref() == name)
+    })
+}
+
+/// True when `path` has one of the default [`HEAVY_DIRS`] as a component.
 pub fn inside_heavy_dir(path: &Path) -> bool {
-    path.components()
-        .any(|c| matches!(c.as_os_str().to_str(), Some(name) if HEAVY_DIRS.contains(&name)))
+    inside_heavy_dir_list(path, HEAVY_DIRS)
 }
 
 pub use kkagent_protocol::tools::ToolDisclosure;

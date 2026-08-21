@@ -274,6 +274,7 @@ mod tests {
             is_error: false,
             collapsed: true,
             user_overridden: false,
+            queued_behind: None,
         };
         let label = ToolRenderRegistry::chip_label(&tc, 80);
         assert!(UnicodeWidthStr::width(label.as_str()) <= 80);
@@ -292,6 +293,7 @@ mod tests {
             is_error: false,
             collapsed: true,
             user_overridden: false,
+            queued_behind: None,
         };
         for width in 4..48 {
             let label = ToolRenderRegistry::chip_label(&tc, width);

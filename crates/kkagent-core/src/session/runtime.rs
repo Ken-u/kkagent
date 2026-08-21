@@ -1072,7 +1072,8 @@ impl Session {
 
     /// Inject the server-authoritative workspace root using Kimi's working-directory framing.
     pub fn inject_working_directory_context(&mut self) {
-        self.system_prompt.push_str(working_directory_context());
+        self.system_prompt
+            .push_str(&working_directory_context(&self.working_dir));
     }
 
     /// Append AGENTS.md / `.kkagent/AGENTS.md` into the system prompt (kimi-style workspace instructions).
@@ -1353,13 +1354,34 @@ fn reverse_mutating_tools(messages: &[ChatMessage], working_dir: &std::path::Pat
     }
 }
 
-fn working_directory_context() -> &'static str {
-    r#"
+fn working_directory_context(working_dir: &std::path::Path) -> String {
+    let mut out = String::from(
+        r#"
 
 # Workspace
 
 Tool paths are relative to the workspace root by default. Prefer relative paths. Use absolute paths only when required to access something outside the workspace.
-"#
+"#,
+    );
+    if is_repo_managed_workspace(working_dir) {
+        out.push_str(
+            r#"
+# Android / repo-managed multi-git workspace
+
+This workspace is managed by the Android `repo` tool (`.repo/manifests` is present). Important:
+- The workspace root is **not** a single git repository. Do not expect `.git` at the root, and do not try to `git clone` the whole tree.
+- Individual project directories (for example `frameworks/base`, `system/core`) are separate git repositories.
+- Prefer `repo status`, `repo forall`, and `repo sync` for cross-project operations; use plain `git` only inside a specific project directory.
+- Build outputs live under `out/` (often tens of GB). Prefer targeted `path` / literal glob prefixes, and avoid recursive walks of `out/` or `.repo/` unless explicitly needed.
+"#,
+        );
+    }
+    out
+}
+
+fn is_repo_managed_workspace(working_dir: &std::path::Path) -> bool {
+    working_dir.join(".repo").join("manifests").is_dir()
+        || working_dir.join(".repo").join("manifest.xml").is_file()
 }
 
 fn valid_plan_id(value: &str) -> Option<&str> {
@@ -1718,14 +1740,29 @@ mod working_directory_tests {
 
     #[test]
     fn context_prefers_relative_paths_without_leaking_the_root() {
-        let context = working_directory_context();
+        let dir = std::env::temp_dir().join(format!("kkagent-wd-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let context = working_directory_context(&dir);
         assert!(context.contains("# Workspace"));
         assert!(context.contains("relative to the workspace root by default"));
         assert!(context.contains("Prefer relative paths"));
         assert!(context.contains("only when required"));
         // The concrete root path is intentionally not injected: relative
         // paths work everywhere, and `pwd` reveals the root when needed.
-        assert!(!context.contains("/workspace/project"));
+        assert!(!context.contains(dir.to_string_lossy().as_ref()));
+        assert!(!context.contains("repo-managed"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn repo_managed_workspace_injects_aosp_guidance() {
+        let dir = std::env::temp_dir().join(format!("kkagent-repo-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join(".repo/manifests")).unwrap();
+        let context = working_directory_context(&dir);
+        assert!(context.contains("repo-managed multi-git"));
+        assert!(context.contains("`repo status`"));
+        assert!(context.contains("`out/`"));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

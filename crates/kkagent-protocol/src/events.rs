@@ -24,6 +24,16 @@ pub enum AgentEvent {
         tool_name: String,
         input: serde_json::Value,
     },
+    /// Scheduler queue/start updates so the TUI can show `queued behind <tool>`
+    /// instead of painting every pending tool as running.
+    ToolExecutionStatus {
+        session_id: String,
+        tool_call_id: String,
+        /// `queued` or `running`.
+        status: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        queued_behind: Option<String>,
+    },
     ToolResult {
         session_id: String,
         tool_call_id: String,
@@ -217,6 +227,7 @@ impl AgentEvent {
             | Self::MessageDelta { session_id, .. }
             | Self::ThinkingDelta { session_id, .. }
             | Self::ToolCall { session_id, .. }
+            | Self::ToolExecutionStatus { session_id, .. }
             | Self::ToolResult { session_id, .. }
             | Self::TurnStart { session_id, .. }
             | Self::TurnEnd { session_id, .. }

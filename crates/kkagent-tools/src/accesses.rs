@@ -2,6 +2,9 @@
 
 use std::path::{Component, Path, PathBuf};
 
+use crate::bash_ast::{collect_commands, extract_dependencies, parse as parse_bash};
+use crate::builtin::glob::resolve_glob_walk_root;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolFileAccessOperation {
     Read,
@@ -165,6 +168,86 @@ pub fn resolve_tool_path(working_dir: &Path, path: &str) -> String {
     normalize_path(&abs.to_string_lossy())
 }
 
+/// Glob conflict scope follows the literal-prefix walk root, not the whole
+/// workspace, so a subtree Glob can run alongside an unrelated Bash.
+pub fn glob_accesses(input: &serde_json::Value, working_dir: &Path) -> ToolAccesses {
+    let pattern = input
+        .get("pattern")
+        .and_then(|v| v.as_str())
+        .unwrap_or("**/*");
+    let path = input.get("path").and_then(|v| v.as_str());
+    let walk = resolve_glob_walk_root(working_dir, pattern, path);
+    tool_accesses::search_tree(normalize_path(&walk.to_string_lossy()))
+}
+
+/// Ambient pathless commands that do not touch the filesystem for conflict
+/// purposes (lets `Bash pwd` run parallel with a subtree Glob).
+const PATHLESS_AMBIENT: &[&str] = &[
+    "pwd", "echo", "printf", "true", "false", ":", "clear", "sleep", "date", "whoami", "hostname",
+    "uname", "id", "nproc", "arch", "basename", "dirname", "yes",
+];
+
+/// Bash accesses derived from AST path deps. Unknown mutating commands without
+/// clear paths fall back to `all` (conservative).
+pub fn bash_accesses(input: &serde_json::Value, working_dir: &Path) -> ToolAccesses {
+    let Some(command) = input.get("command").and_then(|v| v.as_str()) else {
+        return tool_accesses::all();
+    };
+    if command.trim().is_empty() {
+        // Polling / stop background shells — no filesystem conflict.
+        return tool_accesses::none();
+    }
+
+    let cwd = input
+        .get("cwd")
+        .and_then(|v| v.as_str())
+        .map(|c| resolve_tool_path(working_dir, c));
+
+    let ast = parse_bash(command);
+    let deps = extract_dependencies(&ast);
+    let mut out = ToolAccesses::new();
+
+    if let Some(cwd) = cwd {
+        // Running in an explicit cwd still only conflicts if other tools
+        // write there; treat as a read of that tree.
+        out.push(ToolResourceAccess::File {
+            operation: ToolFileAccessOperation::Read,
+            path: cwd,
+            recursive: true,
+        });
+    }
+
+    for path in &deps.writes {
+        out.push(ToolResourceAccess::File {
+            operation: ToolFileAccessOperation::Write,
+            path: resolve_tool_path(working_dir, path),
+            recursive: false,
+        });
+    }
+    for path in &deps.reads {
+        out.push(ToolResourceAccess::File {
+            operation: ToolFileAccessOperation::Read,
+            path: resolve_tool_path(working_dir, path),
+            recursive: false,
+        });
+    }
+
+    if !out.is_empty() {
+        return out;
+    }
+
+    let cmds = collect_commands(&ast);
+    if !cmds.is_empty()
+        && cmds
+            .iter()
+            .all(|c| PATHLESS_AMBIENT.contains(&c.to_ascii_lowercase().as_str()))
+    {
+        return tool_accesses::none();
+    }
+
+    tool_accesses::all()
+}
+
 /// Default access inference for builtin tools.
 pub fn infer_accesses(
     tool_name: &str,
@@ -193,7 +276,7 @@ pub fn infer_accesses(
                 tool_accesses::all()
             }
         }
-        "Grep" | "Glob" => {
+        "Grep" => {
             let root = input
                 .get("path")
                 .or_else(|| input.get("directory"))
@@ -201,7 +284,9 @@ pub fn infer_accesses(
                 .unwrap_or(".");
             tool_accesses::search_tree(resolve_tool_path(working_dir, root))
         }
-        "Bash" | "Agent" | "AskUserQuestion" | "EnterPlanMode" | "WritePlan" | "ExitPlanMode"
+        "Glob" => glob_accesses(input, working_dir),
+        "Bash" => bash_accesses(input, working_dir),
+        "Agent" | "AskUserQuestion" | "EnterPlanMode" | "WritePlan" | "ExitPlanMode"
         | "SelectTools" | "TodoList" | "Skill" | "Cron" => tool_accesses::all(),
         "Web" | "TaskOutput" => tool_accesses::none(),
         n if n.starts_with("mcp__") => tool_accesses::all(),
@@ -218,6 +303,7 @@ pub fn infer_accesses(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn reads_do_not_conflict() {
@@ -238,5 +324,39 @@ mod tests {
         let a = tool_accesses::write_tree("/tmp/proj");
         let b = tool_accesses::read_file("/tmp/proj/src/main.rs");
         assert!(tool_accesses::conflict(&a, &b));
+    }
+
+    #[test]
+    fn glob_literal_prefix_narrows_conflict_scope() {
+        let dir = std::env::temp_dir().join(format!("kkagent-acc-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("src/deep")).unwrap();
+        let accesses = glob_accesses(&json!({"pattern": "src/**/*.rs"}), &dir);
+        let walk = resolve_glob_walk_root(&dir, "src/**/*.rs", None);
+        assert_eq!(
+            accesses,
+            tool_accesses::search_tree(normalize_path(&walk.to_string_lossy()))
+        );
+        assert!(walk.ends_with("src") || walk.ends_with("src/deep") || walk == dir.join("src"));
+        let bash = bash_accesses(&json!({"command": "pwd"}), &dir);
+        assert!(!tool_accesses::conflict(&accesses, &bash));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn bash_pwd_is_ambient_and_make_is_all() {
+        let cwd = Path::new("/tmp");
+        assert_eq!(
+            bash_accesses(&json!({"command": "pwd"}), cwd),
+            tool_accesses::none()
+        );
+        assert_eq!(
+            bash_accesses(&json!({"command": "make -j8"}), cwd),
+            tool_accesses::all()
+        );
+        let with_path = bash_accesses(&json!({"command": "cat src/main.rs"}), cwd);
+        assert!(!tool_accesses::conflict(
+            &with_path,
+            &tool_accesses::search_tree("/tmp/other")
+        ));
     }
 }

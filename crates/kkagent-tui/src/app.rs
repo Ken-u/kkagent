@@ -285,6 +285,8 @@ pub struct AppState {
     pub background_session_event_bytes: std::collections::HashMap<String, usize>,
     /// Debounced `/sessions` preview target.
     pub preview_debounce: Option<PreviewDebounce>,
+    /// Debounced `@` file completion request (avoids sync walks on every key).
+    pub file_complete_debounce: Option<FileCompleteDebounce>,
     /// LRU cache of session.preview JSON payloads.
     pub preview_cache: crate::session_view::PreviewLru,
     /// Queued prompts waiting for the current turn to finish.
@@ -493,6 +495,14 @@ pub enum StripAction {
 #[derive(Debug, Clone)]
 pub struct PreviewDebounce {
     pub session_id: String,
+    pub due_at: std::time::Instant,
+}
+
+#[derive(Debug, Clone)]
+pub struct FileCompleteDebounce {
+    pub token_start: usize,
+    pub query: String,
+    pub quoted: bool,
     pub due_at: std::time::Instant,
 }
 
@@ -863,6 +873,8 @@ pub struct DisplayToolCall {
     pub user_overridden: bool,
     pub started_at: Option<std::time::Instant>,
     pub stopping: bool,
+    /// When set, the scheduler has not started this tool yet.
+    pub queued_behind: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1124,6 +1136,7 @@ impl AppState {
             background_session_events: std::collections::HashMap::new(),
             background_session_event_bytes: std::collections::HashMap::new(),
             preview_debounce: None,
+            file_complete_debounce: None,
             preview_cache: crate::session_view::PreviewLru::new(12),
             prompt_queue: crate::prompt_queue::PromptQueue::default(),
             queue_when_busy: true,
@@ -1400,6 +1413,7 @@ impl AppState {
     pub fn refresh_file_menu(&mut self) {
         if self.mode == AppMode::Shell {
             self.file_menu = None;
+            self.file_complete_debounce = None;
             return;
         }
         let text = self.input.text.clone();
@@ -1407,28 +1421,30 @@ impl AppState {
         let Some((token_start, query)) = crate::pi::autocomplete::extract_at_token(&text, cursor)
         else {
             self.file_menu = None;
+            self.file_complete_debounce = None;
             return;
         };
         let quoted = text[token_start..].starts_with("@\"");
-        let items = crate::pi::autocomplete::complete_at_files(&self.working_dir, &query, 24);
-        let selected = self
-            .file_menu
-            .as_ref()
-            .filter(|m| m.token_start == token_start)
-            .map(|m| {
-                if items.is_empty() {
-                    0
-                } else {
-                    m.selected.min(items.len() - 1)
-                }
-            })
-            .unwrap_or(0);
-        self.file_menu = Some(FileMenuState {
-            items,
-            selected,
+        // Keep the previous menu visible while a new background scan runs, but
+        // update the token metadata so Tab still applies against the live cursor.
+        if let Some(menu) = self.file_menu.as_mut() {
+            menu.token_start = token_start;
+            menu.query = query.clone();
+            menu.quoted = quoted;
+        } else {
+            self.file_menu = Some(FileMenuState {
+                items: Vec::new(),
+                selected: 0,
+                token_start,
+                query: query.clone(),
+                quoted,
+            });
+        }
+        self.file_complete_debounce = Some(FileCompleteDebounce {
             token_start,
             query,
             quoted,
+            due_at: std::time::Instant::now() + std::time::Duration::from_millis(100),
         });
     }
 }
@@ -1867,6 +1883,7 @@ impl TuiApp {
                 }
             }
             self.flush_preview_debounce();
+            self.flush_file_complete_debounce();
             if matches!(
                 self.state.status,
                 SessionStatus::Thinking | SessionStatus::ToolExecuting
@@ -1895,6 +1912,7 @@ impl TuiApp {
             }) || self.state.subagents.any_active();
             redraw |= tick_requires_redraw(previous_tick, self.state.tick, animation_active);
             redraw |= stream_redraw_due(stream_redraw_pending, last_draw_at, now);
+            redraw |= crate::git_badge::take_updated();
 
             if self.state.should_quit {
                 break;
@@ -2234,6 +2252,46 @@ impl TuiApp {
                     }
                     Err(error) => crate::version_check::record_check_error(&error),
                 },
+                crate::async_jobs::JobPayload::FileComplete {
+                    token_start,
+                    query,
+                    quoted,
+                    items,
+                } => {
+                    self.jobs.mark_done(channel, generation);
+                    // Drop stale results if the cursor left this `@` token.
+                    let text = self.state.input.text.clone();
+                    let cursor = self.state.input.cursor.min(text.len());
+                    let Some((live_start, live_query)) =
+                        crate::pi::autocomplete::extract_at_token(&text, cursor)
+                    else {
+                        self.state.file_menu = None;
+                        continue;
+                    };
+                    if live_start != token_start || live_query != query {
+                        continue;
+                    }
+                    let selected = self
+                        .state
+                        .file_menu
+                        .as_ref()
+                        .filter(|m| m.token_start == token_start)
+                        .map(|m| {
+                            if items.is_empty() {
+                                0
+                            } else {
+                                m.selected.min(items.len() - 1)
+                            }
+                        })
+                        .unwrap_or(0);
+                    self.state.file_menu = Some(FileMenuState {
+                        items,
+                        selected,
+                        token_start,
+                        query,
+                        quoted,
+                    });
+                }
             }
         }
         received
@@ -8871,6 +8929,43 @@ impl TuiApp {
             .spawn_session_preview(self.client.requester(), sid);
     }
 
+    fn flush_file_complete_debounce(&mut self) {
+        let Some(pending) = self.state.file_complete_debounce.as_ref() else {
+            return;
+        };
+        if std::time::Instant::now() < pending.due_at {
+            return;
+        }
+        let token_start = pending.token_start;
+        let query = pending.query.clone();
+        let quoted = pending.quoted;
+        self.state.file_complete_debounce = None;
+
+        // Cursor may have left the `@` token while we waited.
+        let text = self.state.input.text.clone();
+        let cursor = self.state.input.cursor.min(text.len());
+        let Some((live_start, live_query)) =
+            crate::pi::autocomplete::extract_at_token(&text, cursor)
+        else {
+            self.state.file_menu = None;
+            return;
+        };
+        if live_start != token_start || live_query != query {
+            return;
+        }
+
+        let mut tools = self.config.tools.clone();
+        tools.merge_project_overrides(&self.state.working_dir);
+        self.jobs.spawn_file_complete(
+            self.state.working_dir.clone(),
+            tools.effective_heavy_dirs(),
+            self.config.ui.experimental_smart_at_complete,
+            token_start,
+            query,
+            quoted,
+        );
+    }
+
     fn apply_session_preview_data(&mut self, session_id: &str, data: serde_json::Value) {
         // Ignore if the user has already moved the highlight.
         let still_selected = self.state.list_picker.as_ref().is_some_and(|p| {
@@ -9669,11 +9764,15 @@ impl TuiApp {
                             if tc.output.is_none() {
                                 let secs =
                                     tc.started_at.map(|t| t.elapsed().as_secs()).unwrap_or(0);
-                                lines.push(format!(
-                                    "running: {} ({secs}s){}",
-                                    tc.name,
-                                    if tc.stopping { " stopping…" } else { "" }
-                                ));
+                                if let Some(behind) = &tc.queued_behind {
+                                    lines.push(format!("queued: {} behind {behind}", tc.name));
+                                } else {
+                                    lines.push(format!(
+                                        "running: {} ({secs}s){}",
+                                        tc.name,
+                                        if tc.stopping { " stopping…" } else { "" }
+                                    ));
+                                }
                             }
                         }
                     }
@@ -10996,6 +11095,7 @@ impl TuiApp {
                             id: tool_call_id,
                             started_at: Some(std::time::Instant::now()),
                             stopping: false,
+                            queued_behind: None,
                             name: tool_name,
                             input_summary: summary,
                             output: None,
@@ -11029,6 +11129,29 @@ impl TuiApp {
                         self.state.active_assistant_message =
                             Some(self.state.messages.len().saturating_sub(1));
                     }
+                    AgentEvent::ToolExecutionStatus {
+                        tool_call_id,
+                        status,
+                        queued_behind,
+                        ..
+                    } => {
+                        if let Some(tc) = self
+                            .state
+                            .messages
+                            .iter_mut()
+                            .rev()
+                            .find_map(|message| message.find_tool_by_id_mut(&tool_call_id))
+                        {
+                            if status == "queued" {
+                                tc.queued_behind = queued_behind;
+                            } else {
+                                tc.queued_behind = None;
+                                if tc.started_at.is_none() {
+                                    tc.started_at = Some(std::time::Instant::now());
+                                }
+                            }
+                        }
+                    }
                     AgentEvent::ToolResult {
                         tool_call_id,
                         tool_name,
@@ -11045,6 +11168,7 @@ impl TuiApp {
                             tc.output = Some(output);
                             tc.is_error = is_error;
                             tc.stopping = false;
+                            tc.queued_behind = None;
                             if is_error {
                                 tc.collapsed = false;
                             }
@@ -12036,6 +12160,7 @@ fn transcript_messages_to_display(msgs: &[serde_json::Value]) -> Vec<DisplayMess
                                 is_error: false,
                                 collapsed: true,
                                 user_overridden: false,
+                                queued_behind: None,
                             }));
                         }
                         _ => {}
@@ -14670,6 +14795,7 @@ mod app_state_tests {
             is_error: false,
             collapsed: true,
             user_overridden: false,
+            queued_behind: None,
         }));
         asst.parts.push(DisplayPart::Tool(DisplayToolCall {
             id: String::new(),
@@ -14681,6 +14807,7 @@ mod app_state_tests {
             is_error: false,
             collapsed: true,
             user_overridden: false,
+            queued_behind: None,
         }));
         asst.parts.push(DisplayPart::Text("done".into()));
         state.messages.push(asst);
@@ -14715,6 +14842,7 @@ mod app_state_tests {
                     user_overridden: false,
                     started_at: None,
                     stopping: false,
+                    queued_behind: None,
                 }],
             })],
             tool_calls: Vec::new(),
@@ -15082,6 +15210,7 @@ mod app_state_tests {
                     user_overridden: false,
                     started_at: None,
                     stopping: false,
+                    queued_behind: None,
                 }),
                 DisplayPart::Tool(DisplayToolCall {
                     id: "b".into(),
@@ -15093,6 +15222,7 @@ mod app_state_tests {
                     user_overridden: false,
                     started_at: None,
                     stopping: false,
+                    queued_behind: None,
                 }),
             ],
             tool_calls: Vec::new(),

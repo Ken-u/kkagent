@@ -31,6 +31,7 @@ pub enum JobChannel {
     Interrupt,
     LocalShell,
     VersionCheck,
+    FileComplete,
     Generic,
 }
 
@@ -49,6 +50,7 @@ impl JobChannel {
             Self::Interrupt => "Interrupting",
             Self::LocalShell => "Running shell",
             Self::VersionCheck => "Checking for updates",
+            Self::FileComplete => "Completing paths",
             Self::Generic => "Working",
         }
     }
@@ -85,6 +87,12 @@ pub enum JobPayload {
     },
     VersionCheck {
         result: Result<crate::version_check::LatestRelease, String>,
+    },
+    FileComplete {
+        token_start: usize,
+        query: String,
+        quoted: bool,
+        items: Vec<crate::pi::autocomplete::CompletionItem>,
     },
 }
 
@@ -635,6 +643,10 @@ impl AsyncJobHub {
         let threshold = Duration::from_millis(SLOW_OP_NOTICE_MS);
         let now = Instant::now();
         for pending in self.pending.values() {
+            // Path completion is expected to be frequent and silent.
+            if matches!(pending.channel, JobChannel::FileComplete) {
+                continue;
+            }
             if now.duration_since(pending.started) < threshold {
                 continue;
             }
@@ -721,6 +733,56 @@ impl AsyncJobHub {
 
     pub fn can_auto_retry(&self, retry_count: u32) -> bool {
         retry_count < self.max_auto_retries
+    }
+
+    /// Background `@` path completion. Uses generation so stale keystroke
+    /// results are discarded when a newer query is in flight.
+    pub fn spawn_file_complete(
+        &mut self,
+        cwd: std::path::PathBuf,
+        heavy_dirs: Vec<String>,
+        smart: bool,
+        token_start: usize,
+        query: String,
+        quoted: bool,
+    ) -> u64 {
+        let channel = JobChannel::FileComplete;
+        let generation = self.next_generation(channel);
+        let started = Instant::now();
+        self.pending.insert(
+            channel,
+            PendingJob {
+                channel,
+                generation,
+                label: channel.label().to_string(),
+                started,
+                retryable: false,
+                retry_method: None,
+                retry_params: None,
+            },
+        );
+        let tx = self.tx.clone();
+        tokio::task::spawn_blocking(move || {
+            let items = crate::pi::autocomplete::complete_at_files_with_options(
+                &cwd,
+                &query,
+                24,
+                &heavy_dirs,
+                smart,
+            );
+            let _ = tx.send(JobOutcome {
+                channel,
+                generation,
+                started,
+                payload: JobPayload::FileComplete {
+                    token_start,
+                    query,
+                    quoted,
+                    items,
+                },
+            });
+        });
+        generation
     }
 
     pub fn apply_mcp_status(&mut self, data: &Value) {

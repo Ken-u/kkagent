@@ -106,9 +106,12 @@ keep = "all"
 high_contrast = false
 reduce_motion = false
 check_updates = true
+# experimental_smart_at_complete = true  # 递归模糊 `@` 补全；默认关闭，按级目录补全
 ```
 
 `check_updates` 默认启用：TUI 首屏不会等待网络，而是在后台查询 `Ken-u/kkagent` 的最新 GitHub Release；成功结果缓存 24 小时，失败结果一小时后重试。发现新版本时只显示 Release 链接和 `kkagent-update`（Windows 为 `kkagent-update.ps1`）提示，不会自动下载或替换程序。设为 `false` 可完全关闭检查。
+
+`@` 路径补全默认只列出**当前一级**目录/文件（输入前缀过滤，选中目录后以 `/` 结尾并继续下一级）。需要原来的递归模糊搜索时，设置 `experimental_smart_at_complete = true`。
 
 ## Agent 循环
 
@@ -149,6 +152,23 @@ approval_timeout_s = 900
 ```
 
 `max_running_tasks` 控制 Agent 后台任务并发；`approval_timeout_s` 到期后按拒绝处理，范围在运行时限制为 1 秒到 24 小时。`bash_auto_background_on_timeout` 控制前台 Bash 命令超时后是否自动转入后台（默认 `true`）。`bash_task_timeout_s` 控制前台 Bash 命令的默认超时秒数（默认 `120`，即 2 分钟），LLM 可通过 `timeout` 参数覆盖。
+
+## 工具与超大工程
+
+```toml
+[tools]
+path_guard_mode = "warn"          # warn | strict
+sensitive_path_check = true
+additional_dirs = []
+dynamically_loaded_tools = true
+# 覆盖默认重型目录跳过列表（Glob / Grep / `@` 补全共用）。
+# 默认：["node_modules", "target", ".git", "out", ".repo"]
+# heavy_dirs = ["out", "target", "node_modules", ".git", ".repo"]
+# 在默认（或 heavy_dirs）之上追加：
+# extra_heavy_dirs = ["bazel-out", "dist"]
+```
+
+`heavy_dirs` 一旦写出（含空数组）就会替换内置默认值；只想追加时用 `extra_heavy_dirs`。项目级 `.kkagent/config.toml` 也可写同样的 `[tools]` 字段，启动时与全局配置合并。显式定向到重型目录的搜索（例如 Glob `out/soong/**` 或 Grep `path = "out"`）仍会进入该目录。
 
 ## Standalone Server
 
