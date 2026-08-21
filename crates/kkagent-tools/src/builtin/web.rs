@@ -149,7 +149,10 @@ impl WebTool {
         }
 
         if let Some(endpoint) = &self.cfg.fetch.base_url {
-            let mut req = self.endpoint_client.post(endpoint).json(&json!({ "url": url }));
+            let mut req = self
+                .endpoint_client
+                .post(endpoint)
+                .json(&json!({ "url": url }));
             if let Some(key) = &self.cfg.fetch.api_key {
                 req = req.bearer_auth(key);
             }

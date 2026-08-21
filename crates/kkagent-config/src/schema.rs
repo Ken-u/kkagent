@@ -688,6 +688,25 @@ pub struct ServicesConfig {
     pub moonshot_fetch: Option<ServiceEndpoint>,
 }
 
+/// Outbound HTTP proxy policy for a web service endpoint.
+///
+/// reqwest honors `http_proxy` / `https_proxy` / `all_proxy` by default, which
+/// breaks endpoints that live on loopback or private networks (the remote proxy
+/// cannot reach them). `auto` (default) bypasses the proxy for such endpoints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum WebProxyMode {
+    /// Bypass the proxy when the endpoint host is loopback / link-local /
+    /// private (literal IPs or `localhost`-style names); otherwise follow the
+    /// system proxy environment.
+    #[default]
+    Auto,
+    /// Never use a proxy for this endpoint, regardless of environment.
+    None,
+    /// Always follow system proxy environment variables.
+    System,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WebSearchConfig {
     /// `searxng` | `brave` | `custom`
@@ -704,6 +723,9 @@ pub struct WebSearchConfig {
     pub timeout_ms: Option<u64>,
     #[serde(default)]
     pub default_limit: Option<usize>,
+    /// Outbound proxy policy when reaching `base_url` (default `auto`).
+    #[serde(default)]
+    pub proxy: WebProxyMode,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -716,6 +738,9 @@ pub struct WebFetchConfig {
     pub api_key_env: Option<String>,
     #[serde(default)]
     pub timeout_ms: Option<u64>,
+    /// Outbound proxy policy when reaching `base_url` (default `auto`).
+    #[serde(default)]
+    pub proxy: WebProxyMode,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

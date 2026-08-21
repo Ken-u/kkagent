@@ -1,6 +1,7 @@
 //! Web search / fetch providers — provider-agnostic, no Kimi/Moonshot coupling.
 
 use async_trait::async_trait;
+use kkagent_config::WebProxyMode;
 use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::time::Duration;
@@ -34,6 +35,8 @@ pub struct WebSearchServiceConfig {
     pub api_key: Option<String>,
     pub timeout_ms: u64,
     pub default_limit: usize,
+    /// Outbound proxy policy when reaching `base_url`.
+    pub proxy: WebProxyMode,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -42,6 +45,8 @@ pub struct WebFetchServiceConfig {
     pub base_url: Option<String>,
     pub api_key: Option<String>,
     pub timeout_ms: u64,
+    /// Outbound proxy policy when reaching `base_url`.
+    pub proxy: WebProxyMode,
 }
 
 #[derive(Clone)]
@@ -68,6 +73,7 @@ impl WebServicesConfig {
                 api_key,
                 timeout_ms: ws.timeout_ms.unwrap_or(15_000),
                 default_limit: ws.default_limit.unwrap_or(5).clamp(1, 20),
+                proxy: ws.proxy,
             })
         } else if let Some(old) = services.and_then(|s| s.moonshot_search.as_ref()) {
             migration_hint = Some(
@@ -86,6 +92,8 @@ impl WebServicesConfig {
                 }),
                 timeout_ms: 15_000,
                 default_limit: 5,
+                // Legacy endpoints predate the proxy knob; default to auto-bypass.
+                proxy: WebProxyMode::Auto,
             })
         } else {
             None
@@ -96,6 +104,7 @@ impl WebServicesConfig {
                 base_url: Some(wf.base_url.clone()),
                 api_key: resolve_api_key(wf.api_key.as_deref(), wf.api_key_env.as_deref()),
                 timeout_ms: wf.timeout_ms.unwrap_or(30_000),
+                proxy: wf.proxy,
             }
         } else if let Some(old) = services.and_then(|s| s.moonshot_fetch.as_ref()) {
             if migration_hint.is_none() {
@@ -108,12 +117,14 @@ impl WebServicesConfig {
                 base_url: Some(normalize_legacy_moonshot_fetch_endpoint(&old.base_url)),
                 api_key: old.api_key.clone(),
                 timeout_ms: 30_000,
+                proxy: WebProxyMode::Auto,
             }
         } else {
             WebFetchServiceConfig {
                 base_url: None,
                 api_key: None,
                 timeout_ms: 30_000,
+                proxy: WebProxyMode::Auto,
             }
         };
 
@@ -135,10 +146,7 @@ impl WebServicesConfig {
         if cfg.base_url.trim().is_empty() {
             return None;
         }
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_millis(cfg.timeout_ms.max(1_000)))
-            .build()
-            .ok()?;
+        let client = build_web_client(&cfg.base_url, cfg.timeout_ms.max(1_000), cfg.proxy).ok()?;
         let provider: std::sync::Arc<dyn WebSearchProvider> = match cfg.provider.as_str() {
             "brave" => std::sync::Arc::new(BraveProvider {
                 endpoint: cfg.base_url.clone(),
@@ -160,6 +168,87 @@ impl WebServicesConfig {
         };
         Some(provider)
     }
+}
+
+/// True when the host is one a remote HTTP proxy can rarely reach on the
+/// user's behalf: loopback, link-local, or RFC1918/ULA private ranges
+/// (literal IPs), or a `localhost`-style name.
+fn is_local_endpoint_host(host: &str) -> bool {
+    let h = host.trim().trim_end_matches('.');
+    // `Url::host_str()` serializes IPv6 hosts with brackets; strip them so the
+    // IP still parses.
+    let h = h
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(h);
+    let lower = h.to_ascii_lowercase();
+    if lower == "localhost" || lower.ends_with(".localhost") || lower.ends_with(".local") {
+        return true;
+    }
+    if let Ok(ip) = h.parse::<std::net::IpAddr>() {
+        return match ip {
+            std::net::IpAddr::V4(v4) => {
+                v4.is_loopback()
+                    || v4.is_link_local()
+                    || v4.is_private()
+                    || v4.is_unspecified()
+                    || v4.is_broadcast()
+            }
+            std::net::IpAddr::V6(v6) => {
+                v6.is_loopback() || v6.is_unspecified() || {
+                    // Unique-local fc00::/7 and link-local fe80::/10.
+                    let seg = v6.segments()[0];
+                    (seg & 0xfe00) == 0xfc00 || (seg & 0xffc0) == 0xfe80
+                }
+            }
+        };
+    }
+    false
+}
+
+/// Whether to bypass system proxy env vars for this endpoint under
+/// [`WebProxyMode::Auto`]: only when the host resolves to something clearly
+/// local. We check the literal host; DNS-resolving here would add startup
+/// latency and ordering surprises, so hostnames that point at private IPs are
+/// out of scope (use `proxy = "none"` for those).
+fn auto_bypasses_proxy(endpoint: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(endpoint.trim()) else {
+        return false;
+    };
+    match url.host_str() {
+        Some(host) => is_local_endpoint_host(host),
+        None => false,
+    }
+}
+
+/// Whether requests to `endpoint` should bypass system proxy env vars under
+/// the given policy. Exposed separately from [`build_web_client`] so the
+/// mode mapping is unit-testable (the process env is global, so an
+/// end-to-end env-mutating test would race with sibling tests).
+fn should_bypass_proxy(endpoint: &str, proxy: WebProxyMode) -> bool {
+    match proxy {
+        WebProxyMode::None => true,
+        WebProxyMode::System => false,
+        WebProxyMode::Auto => auto_bypasses_proxy(endpoint),
+    }
+}
+
+/// Build the HTTP client used to reach a configured web service endpoint,
+/// applying the endpoint's proxy policy:
+/// - `System`: reqwest default (honor `http_proxy`/`https_proxy`/`all_proxy`).
+/// - `None`: never proxy.
+/// - `Auto` (default): `None` for loopback/link-local/private endpoints,
+///   `System` otherwise.
+pub fn build_web_client(
+    endpoint: &str,
+    timeout_ms: u64,
+    proxy: WebProxyMode,
+) -> anyhow::Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder().timeout(Duration::from_millis(timeout_ms));
+    if should_bypass_proxy(endpoint, proxy) {
+        builder = builder.no_proxy();
+    }
+    Ok(builder.build()?)
 }
 
 fn resolve_api_key(inline: Option<&str>, env_name: Option<&str>) -> Option<String> {
@@ -471,6 +560,115 @@ mod tests {
     use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    #[test]
+    fn local_endpoint_hosts_are_detected() {
+        for host in [
+            "localhost",
+            "Localhost.",
+            "foo.localhost",
+            "myhost.local",
+            "127.0.0.1",
+            "127.8.8.8",
+            "0.0.0.0",
+            "10.0.0.5",
+            "192.168.1.2",
+            "172.16.0.1",
+            "169.254.3.4",
+            "::1",
+            "fe80::1",
+            "fc00::abcd",
+            "fd12:3456::1",
+            "::",
+        ] {
+            assert!(is_local_endpoint_host(host), "expected local: {host}");
+        }
+        for host in [
+            "example.com",
+            "api.moonshot.cn",
+            "search.brave.com",
+            "8.8.8.8",
+            "172.32.0.1", // just outside 172.16/12
+            "172.15.0.1",
+            "2001:db8::1",
+            "fe::1", // not link-local (fe80::/10)
+        ] {
+            assert!(!is_local_endpoint_host(host), "expected public: {host}");
+        }
+    }
+
+    #[test]
+    fn auto_bypass_matches_endpoint_url() {
+        assert!(auto_bypasses_proxy("http://127.0.0.1:8080/search"));
+        assert!(auto_bypasses_proxy("http://localhost:9/search"));
+        assert!(auto_bypasses_proxy("http://192.168.1.10:8080/search"));
+        assert!(auto_bypasses_proxy("http://[fd00::1]:8080/search"));
+        assert!(!auto_bypasses_proxy(
+            "https://api.search.brave.com/res/v1/web/search"
+        ));
+        assert!(!auto_bypasses_proxy("not a url"));
+    }
+
+    #[test]
+    fn proxy_mode_mapping() {
+        let local = "http://127.0.0.1:8080/search";
+        let public = "https://api.search.brave.com/res/v1/web/search";
+        // None: never proxy, regardless of endpoint.
+        assert!(should_bypass_proxy(local, WebProxyMode::None));
+        assert!(should_bypass_proxy(public, WebProxyMode::None));
+        // System: always follow env proxy (old behavior).
+        assert!(!should_bypass_proxy(local, WebProxyMode::System));
+        assert!(!should_bypass_proxy(public, WebProxyMode::System));
+        // Auto: bypass only for local/private endpoints.
+        assert!(should_bypass_proxy(local, WebProxyMode::Auto));
+        assert!(!should_bypass_proxy(public, WebProxyMode::Auto));
+    }
+
+    #[test]
+    fn build_web_client_modes_build_successfully() {
+        // All modes must build; behavior (proxy vs not) is covered by
+        // `local_endpoint_hosts_are_detected` + mode mapping above.
+        for mode in [WebProxyMode::Auto, WebProxyMode::None, WebProxyMode::System] {
+            assert!(build_web_client("http://127.0.0.1:8080/x", 5_000, mode).is_ok());
+            assert!(build_web_client("https://example.com", 5_000, mode).is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn local_search_endpoint_ignores_proxy_env() {
+        // NOTE: deliberately does NOT mutate `http_proxy` via `set_var` — env
+        // is process-global and sibling tests (which build raw clients that
+        // honor it) run in parallel. Proxy behavior is delegated to reqwest's
+        // `no_proxy()`, selected via `should_bypass_proxy` (see
+        // `proxy_mode_mapping`); here we only verify the default Auto policy
+        // wires through `build_search_provider` and works against loopback.
+        let url = serve_once(
+            200,
+            r#"{"results":[{"title":"t","url":"https://a","content":"s"}]}"#,
+        )
+        .await;
+        let cfg = WebServicesConfig {
+            search: Some(WebSearchServiceConfig {
+                provider: "searxng".into(),
+                base_url: url,
+                api_key: None,
+                timeout_ms: 5_000,
+                default_limit: 5,
+                proxy: WebProxyMode::Auto,
+            }),
+            fetch: Default::default(),
+            migration_hint: None,
+        };
+        let provider = cfg.build_search_provider().expect("provider builds");
+        let hits = provider
+            .search(&SearchRequest {
+                query: "q".into(),
+                limit: 5,
+            })
+            .await
+            .expect("loopback search must work under Auto");
+        assert_eq!(hits.len(), 1);
+    }
 
     #[test]
     fn dedupe_and_normalize() {

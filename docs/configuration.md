@@ -260,7 +260,18 @@ api_key = "..."          # 二选一；api_key_env 优先
 api_key_env = "BRAVE_API_KEY"
 timeout_ms = 15000       # 默认 15000，运行时下限 1000
 default_limit = 5        # 默认 5，实际生效范围 1..20
+proxy = "auto"           # auto | none | system，默认 auto（见下）
 ```
+
+#### 代理策略（`proxy`）
+
+`Web` 工具的 HTTP 客户端默认遵循系统代理环境变量（`http_proxy` / `https_proxy` / `all_proxy`）。但当你用本地 provider（如 SearXNG 跑在 `127.0.0.1`）时，系统代理通常会劫持 loopback 请求——远端代理服务器无法回连你本机，导致连接被拒或超时。`proxy` 字段控制该 endpoint 的出站代理行为：
+
+- `auto`（默认）：`base_url` 的 host 是 loopback（`localhost` / `127.0.0.0/8` / `::1`）、link-local、或私网地址（RFC1918 / IPv6 ULA）时**自动绕过代理**，其余情况跟随系统代理。仅解析字面量地址，不做 DNS 解析；本地域名（如 `mybox.local`、`*.localhost`）也按本地处理。私网 hostname 需要强制直连时用 `none`。
+- `none`：该 endpoint 永远不走代理。
+- `system`：永远跟随系统代理环境变量（等价于旧行为）。
+
+注意：仅 `[services.web_search]` / `[services.web_fetch]` 的 endpoint 请求受此配置影响；`fetch` 未配置后端时对公网页面的直接 GET 始终跟随系统代理。
 
 三种 `provider` 的线上协议（对接外部搜索服务时按此实现）：
 
@@ -292,6 +303,7 @@ default_limit = 5        # 默认 5，实际生效范围 1..20
 base_url = "https://example.invalid/fetch" # 可选代理 endpoint；未配置时走直接 GET
 api_key_env = "WEB_FETCH_API_KEY"
 timeout_ms = 30000                          # 默认 30000，运行时下限 1000
+proxy = "auto"                              # auto | none | system，默认 auto（同 web_search）
 ```
 
 配置了 `base_url` 后，`Web(action = "fetch")` 的抓取协议为：

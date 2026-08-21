@@ -337,6 +337,7 @@ fn apply_env_overrides(config: &mut AppConfig) {
             api_key_env: None,
             timeout_ms: None,
             default_limit: None,
+            proxy: Default::default(),
         });
     } else if let Ok(url) = std::env::var("KKAGENT_MOONSHOT_SEARCH_URL") {
         // Legacy env — still maps to deprecated moonshot_search for one-time compat.

@@ -31,6 +31,7 @@ fn main() {
             api_key: None,
             timeout_ms: 10_000,
             default_limit: 5,
+            proxy: Default::default(),
         }),
         fetch: Default::default(),
         migration_hint: None,
