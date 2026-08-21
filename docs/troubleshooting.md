@@ -38,6 +38,7 @@ TUI 问题同时查看 `~/.kkagent/kkagent.log`。分享日志前删除 token、
 | Bash 超时但还在跑 | 可能已转后台；查看 `/tasks` 并按 ID stop。 |
 | Grep 没有结果 | 检查 pattern、glob、工作目录和敏感/忽略路径。 |
 | Web 搜索不可用 | 配置 `[services.web_search]`（provider / base_url / api_key_env），协议要求见[配置参考](configuration.md#服务)。 |
+| 本地搜索/抓取服务连不上 | 多为系统代理劫持了 loopback / 私网请求（`http_proxy` 对 `127.0.0.1` 生效）；默认 `proxy = "auto"` 会自动绕过，仍失败可显式设 `proxy = "none"`，或检查 `NO_PROXY`，详见[代理策略](configuration.md#代理策略proxy)。 |
 | FetchURL 拒绝地址 | 地址命中 SSRF/私网保护；改用允许的公开端点。 |
 
 ## Server 与 SDK
