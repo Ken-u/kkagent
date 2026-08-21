@@ -1,14 +1,21 @@
 use crate::path_policy::is_sensitive_path;
-use crate::{Tool, ToolContext, ToolOutput};
+use crate::{inside_heavy_dir, Tool, ToolContext, ToolOutput, HEAVY_DIRS};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 pub struct GlobTool;
 
 const DEFAULT_MAX: usize = 100;
+/// Hard wall-clock budget for one directory walk. Giant trees (e.g. an AOSP
+/// checkout with a populated `out/`) can take many minutes to walk; stop
+/// early and report partial results so the agent stays responsive.
+const WALK_BUDGET: Duration = Duration::from_secs(15);
 
 #[async_trait]
 impl Tool for GlobTool {
@@ -74,91 +81,208 @@ Returns paths sorted by modification time (newest first)."
             format!("**/{}", pattern)
         };
 
-        let matcher = globset::GlobBuilder::new(&glob_pattern)
-            .literal_separator(false)
-            .build()
-            .map_err(|e| anyhow::anyhow!("Invalid glob: {}", e))?
-            .compile_matcher();
+        // Literal-prefix fast path: `a/b/**` walks `<root>/a/b` directly
+        // instead of scanning the whole tree (crucial on huge checkouts).
+        let walk_root =
+            literal_prefix_dir(&glob_pattern, &root_dir).unwrap_or_else(|| root_dir.clone());
+        // Heavy dirs are pruned unless the caller explicitly descended into
+        // one (pattern literal prefix or `path` argument), e.g. `out/soong/**`.
+        let skip_heavy = !inside_heavy_dir(&walk_root);
 
-        let mut walker = ignore::WalkBuilder::new(&root_dir);
-        walker.hidden(true);
-        walker.git_ignore(!include_ignored);
-        walker.git_global(!include_ignored);
-        walker.git_exclude(!include_ignored);
-        walker.ignore(!include_ignored);
-        // Always skip heavy build dirs unless explicitly included via pattern under include_ignored.
-        walker.filter_entry(|e| {
-            let name = e.file_name().to_string_lossy();
-            if name == "node_modules" || name == "target" || name == ".git" {
-                return false;
-            }
-            true
-        });
+        let sensitive = ctx.sensitive_check_enabled();
+        let interrupted = ctx.interrupted.clone();
+        // The walk is synchronous and can visit millions of entries on large
+        // trees; run it on the blocking pool so the async runtime never stalls.
+        let outcome = tokio::task::spawn_blocking(move || {
+            walk_matches(WalkConfig {
+                root_dir,
+                walk_root,
+                workspace_dir,
+                glob_pattern,
+                include_ignored,
+                head_limit,
+                sensitive,
+                skip_heavy,
+                walk_budget: WALK_BUDGET,
+                interrupted,
+            })
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("glob walk failed: {}", e))?;
 
-        let mut newest: BinaryHeap<Reverse<(std::time::SystemTime, std::path::PathBuf)>> =
-            BinaryHeap::new();
-        let mut unlimited = Vec::new();
-        let mut total_matches = 0usize;
-
-        for entry in walker.build().filter_map(|e| e.ok()) {
-            if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
-                continue;
-            }
-            if ctx.sensitive_check_enabled() && is_sensitive_path(entry.path()) {
-                continue;
-            }
-            let rel = entry.path().strip_prefix(&root_dir).unwrap_or(entry.path());
-            if matcher.is_match(rel) {
-                let display_path = entry
-                    .path()
-                    .strip_prefix(&workspace_dir)
-                    .map(std::path::Path::to_path_buf)
-                    .unwrap_or_else(|_| entry.path().to_path_buf());
-                let mtime = entry
-                    .metadata()
-                    .ok()
-                    .and_then(|m| m.modified().ok())
-                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-                total_matches += 1;
-                if head_limit == 0 {
-                    unlimited.push((display_path, mtime));
-                } else {
-                    newest.push(Reverse((mtime, display_path)));
-                    if newest.len() > head_limit {
-                        newest.pop();
-                    }
-                }
-            }
-        }
-
-        let mut results: Vec<(std::path::PathBuf, std::time::SystemTime)> = if head_limit == 0 {
-            unlimited
-        } else {
-            newest
-                .into_iter()
-                .map(|Reverse((mtime, path))| (path, mtime))
-                .collect()
-        };
-        results.sort_by_key(|item| Reverse(item.1));
-        let truncated = head_limit > 0 && total_matches > head_limit;
-
-        if results.is_empty() {
+        if outcome.results.is_empty() && outcome.stopped_note.is_none() {
             return Ok(ToolOutput::success("No files matched.".to_string()));
         }
 
-        let mut output: Vec<String> = results
+        let mut output: Vec<String> = outcome
+            .results
             .iter()
-            .map(|(p, _)| p.display().to_string())
+            .map(|p| p.display().to_string())
             .collect();
-        if truncated {
+        if outcome.truncated {
             output.push(format!(
                 "... truncated at {} matches (raise head_limit to see more) ...",
                 head_limit
             ));
         }
+        if let Some(note) = outcome.stopped_note {
+            output.push(note);
+        }
 
         Ok(ToolOutput::success(output.join("\n")))
     }
+}
+
+struct WalkConfig {
+    /// Paths are matched and displayed relative to this directory.
+    root_dir: PathBuf,
+    /// Directory actually walked; may be deeper than `root_dir` when the
+    /// pattern starts with a literal directory prefix.
+    walk_root: PathBuf,
+    workspace_dir: PathBuf,
+    glob_pattern: String,
+    include_ignored: bool,
+    head_limit: usize,
+    sensitive: bool,
+    /// Prune heavy build dirs (see [`crate::HEAVY_DIRS`]) during the walk.
+    /// False when the walk root is already inside a heavy dir (explicit
+    /// descent), in which case pruning would drop everything.
+    skip_heavy: bool,
+    /// Hard wall-clock budget for the walk.
+    walk_budget: Duration,
+    interrupted: Option<Arc<AtomicBool>>,
+}
+
+struct WalkOutcome {
+    results: Vec<PathBuf>,
+    total_matches: usize,
+    truncated: bool,
+    stopped_note: Option<String>,
+}
+
+fn walk_matches(cfg: WalkConfig) -> WalkOutcome {
+    let mut result = WalkOutcome {
+        results: Vec::new(),
+        total_matches: 0,
+        truncated: false,
+        stopped_note: None,
+    };
+
+    let matcher = match globset::GlobBuilder::new(&cfg.glob_pattern)
+        .literal_separator(false)
+        .build()
+    {
+        Ok(glob) => glob.compile_matcher(),
+        Err(_) => return result, // pattern was validated earlier; nothing to do
+    };
+
+    let mut walker = ignore::WalkBuilder::new(&cfg.walk_root);
+    walker.hidden(true);
+    walker.git_ignore(!cfg.include_ignored);
+    walker.git_global(!cfg.include_ignored);
+    walker.git_exclude(!cfg.include_ignored);
+    walker.ignore(!cfg.include_ignored);
+    // Skip heavy build dirs (AOSP `out/`, cargo `target/`, ...) unless the
+    // walk root is already inside one of them.
+    if cfg.skip_heavy {
+        walker.filter_entry(|e| {
+            if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                let name = e.file_name().to_string_lossy();
+                return !HEAVY_DIRS.contains(&name.as_ref());
+            }
+            true
+        });
+    }
+
+    let deadline = Instant::now() + cfg.walk_budget;
+    let mut newest: BinaryHeap<Reverse<(std::time::SystemTime, PathBuf)>> = BinaryHeap::new();
+    let mut unlimited = Vec::new();
+
+    for entry in walker.build().filter_map(|e| e.ok()) {
+        if let Some(flag) = cfg.interrupted.as_ref() {
+            if flag.load(Ordering::Relaxed) {
+                result.stopped_note = Some("... walk interrupted (partial results) ...".into());
+                break;
+            }
+        }
+        if Instant::now() >= deadline {
+            result.stopped_note = Some(format!(
+                "... walk stopped after {}s with partial results; pass a deeper `path` to speed up the search ...",
+                cfg.walk_budget.as_secs()
+            ));
+            break;
+        }
+        if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+            continue;
+        }
+        if cfg.sensitive && is_sensitive_path(entry.path()) {
+            continue;
+        }
+        let rel = entry
+            .path()
+            .strip_prefix(&cfg.root_dir)
+            .unwrap_or(entry.path());
+        if matcher.is_match(rel) {
+            let display_path = entry
+                .path()
+                .strip_prefix(&cfg.workspace_dir)
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|_| entry.path().to_path_buf());
+            let mtime = entry
+                .metadata()
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            result.total_matches += 1;
+            if cfg.head_limit == 0 {
+                unlimited.push((display_path, mtime));
+            } else {
+                newest.push(Reverse((mtime, display_path)));
+                if newest.len() > cfg.head_limit {
+                    newest.pop();
+                }
+            }
+        }
+    }
+
+    let mut items: Vec<(PathBuf, std::time::SystemTime)> = if cfg.head_limit == 0 {
+        unlimited
+    } else {
+        newest
+            .into_iter()
+            .map(|Reverse((mtime, path))| (path, mtime))
+            .collect()
+    };
+    items.sort_by_key(|item| Reverse(item.1));
+    result.results = items.into_iter().map(|(p, _)| p).collect();
+    result.truncated = cfg.head_limit > 0 && result.total_matches > cfg.head_limit;
+    result
+}
+
+/// If the glob pattern (already normalized to start with `**/`) begins with a
+/// run of literal directory segments and that directory exists under `root`,
+/// return it so the walk can start there instead of the whole tree.
+fn literal_prefix_dir(glob_pattern: &str, root: &Path) -> Option<PathBuf> {
+    let rest = glob_pattern.strip_prefix("**/")?;
+    let mut dir = root.to_path_buf();
+    let mut depth = 0usize;
+    for segment in rest.split('/') {
+        if segment.is_empty() || segment == "." || segment == ".." {
+            break;
+        }
+        if segment
+            .chars()
+            .any(|c| matches!(c, '*' | '?' | '[' | ']' | '{' | '}'))
+        {
+            break;
+        }
+        dir.push(segment);
+        depth += 1;
+    }
+    if depth == 0 {
+        return None;
+    }
+    dir.is_dir().then_some(dir)
 }
 
 #[cfg(test)]
@@ -219,6 +343,111 @@ mod tests {
             std::path::PathBuf::from("src").join("lib.rs")
         );
         assert!(!output.content.contains(dir.to_string_lossy().as_ref()));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn literal_prefix_walk_finds_nested_matches() {
+        let dir = std::env::temp_dir().join(format!("kkagent-glob-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("src/deep")).unwrap();
+        std::fs::write(dir.join("src/deep/lib.rs"), "fn main() {}\n").unwrap();
+        // Noise outside the literal prefix that must not be returned.
+        std::fs::create_dir_all(dir.join("other")).unwrap();
+        std::fs::write(dir.join("other/noise.rs"), "// noise\n").unwrap();
+        let output = GlobTool
+            .execute(
+                json!({"pattern": "src/**/*.rs"}),
+                &ToolContext {
+                    working_dir: dir.clone(),
+                    session_id: "glob-test".into(),
+                    turn_id: "test-turn".into(),
+                    plan_file_path: None,
+                    image: kkagent_config::ImageConfig::default(),
+                    tool_call_id: None,
+                    interrupted: None,
+                    tools_config: kkagent_config::ToolsConfig::default(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            output.content.contains("src/deep/lib.rs"),
+            "content: {}",
+            output.content
+        );
+        assert!(!output.content.contains("noise.rs"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn heavy_build_dirs_are_skipped() {
+        let dir = std::env::temp_dir().join(format!("kkagent-glob-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("out")).unwrap();
+        std::fs::write(dir.join("out/generated.rs"), "// generated\n").unwrap();
+        std::fs::write(dir.join("real.rs"), "// real\n").unwrap();
+        let output = GlobTool
+            .execute(
+                json!({"pattern": "**/*.rs"}),
+                &ToolContext {
+                    working_dir: dir.clone(),
+                    session_id: "glob-test".into(),
+                    turn_id: "test-turn".into(),
+                    plan_file_path: None,
+                    image: kkagent_config::ImageConfig::default(),
+                    tool_call_id: None,
+                    interrupted: None,
+                    tools_config: kkagent_config::ToolsConfig::default(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(output.content.contains("real.rs"));
+        assert!(!output.content.contains("generated.rs"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn explicit_descent_into_heavy_dir_is_not_pruned() {
+        let dir = std::env::temp_dir().join(format!("kkagent-glob-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("out/soong")).unwrap();
+        std::fs::write(dir.join("out/soong/generated.rs"), "// generated\n").unwrap();
+        let output = GlobTool
+            .execute(
+                json!({"pattern": "out/soong/**/*.rs"}),
+                &ToolContext {
+                    working_dir: dir.clone(),
+                    session_id: "glob-test".into(),
+                    turn_id: "test-turn".into(),
+                    plan_file_path: None,
+                    image: kkagent_config::ImageConfig::default(),
+                    tool_call_id: None,
+                    interrupted: None,
+                    tools_config: kkagent_config::ToolsConfig::default(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            output.content.contains("out/soong/generated.rs"),
+            "content: {}",
+            output.content
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn literal_prefix_dir_requires_existing_directory() {
+        let dir = std::env::temp_dir().join(format!("kkagent-glob-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("a/b")).unwrap();
+
+        assert_eq!(
+            literal_prefix_dir("**/a/b/*.rs", &dir),
+            Some(dir.join("a/b"))
+        );
+        // Missing directory -> fall back to a full walk.
+        assert_eq!(literal_prefix_dir("**/missing/**", &dir), None);
+        // No literal leading segment -> full walk.
+        assert_eq!(literal_prefix_dir("**/*.rs", &dir), None);
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

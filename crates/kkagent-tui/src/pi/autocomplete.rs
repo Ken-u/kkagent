@@ -386,29 +386,44 @@ fn regex_escape(s: &str) -> String {
     out
 }
 
-fn which_fd() -> Option<String> {
-    for name in ["fd", "fdfind"] {
-        if Command::new(name)
-            .arg("--version")
-            .output()
-            .ok()?
-            .status
-            .success()
-        {
-            return Some(name.into());
-        }
-    }
-    None
+fn which_fd() -> Option<&'static str> {
+    // Probing spawns a process; cache the result so `@` completion does not
+    // pay for it on every keystroke.
+    static FD_BIN: std::sync::OnceLock<Option<&'static str>> = std::sync::OnceLock::new();
+    *FD_BIN.get_or_init(|| {
+        ["fd", "fdfind"].into_iter().find(|name| {
+            Command::new(name)
+                .arg("--version")
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        })
+    })
 }
 
 fn walk_complete(cwd: &Path, query: &str, max: usize) -> Vec<CompletionItem> {
     let mut items = Vec::new();
+    // `hidden(false)` is required for `.github`-style entries, but it also
+    // re-enables `.repo/`, which holds millions of entries in an AOSP
+    // checkout and would eat the whole scan budget. Prune heavy/hidden
+    // metadata dirs explicitly instead.
     let walker = ignore::WalkBuilder::new(cwd)
         .hidden(false)
         .git_ignore(true)
         .git_global(true)
         .git_exclude(true)
         .max_depth(Some(8))
+        .filter_entry(|e| {
+            if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                let name = e.file_name().to_string_lossy();
+                !matches!(
+                    name.as_ref(),
+                    ".repo" | "out" | "target" | "node_modules" | ".git"
+                )
+            } else {
+                true
+            }
+        })
         .build();
     let q_lower = query.to_lowercase();
     let mut scanned = 0usize;

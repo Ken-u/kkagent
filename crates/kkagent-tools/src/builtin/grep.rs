@@ -1,5 +1,5 @@
 use crate::path_policy::sensitive_glob_excludes;
-use crate::{Tool, ToolContext, ToolOutput};
+use crate::{inside_heavy_dir, Tool, ToolContext, ToolOutput, HEAVY_DIRS};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -130,6 +130,9 @@ multiline, head_limit/offset, and glob/type filters."
             std::fs::canonicalize(&ctx.working_dir).unwrap_or_else(|_| ctx.working_dir.clone());
         let resolved_search_dir =
             std::fs::canonicalize(&search_dir).unwrap_or_else(|_| search_dir.clone());
+        // Huge-workspace guard computed before `resolved_search_dir` is moved
+        // into `search_arg` below.
+        let skip_heavy = !include_ignored && !inside_heavy_dir(&resolved_search_dir);
         let search_arg = resolved_search_dir
             .strip_prefix(&workspace_dir)
             .map(|path| {
@@ -142,6 +145,15 @@ multiline, head_limit/offset, and glob/type filters."
             .unwrap_or(resolved_search_dir);
 
         let mut cmd = Command::new("rg");
+        // Fail fast with an actionable message when ripgrep is not installed
+        // (common on minimal Linux build servers) instead of a bare os error.
+        if !rg_available() {
+            return Ok(ToolOutput::error(
+                "ripgrep (rg) is not installed or not on PATH; the Grep tool depends on it. \
+Install ripgrep (e.g. `apt install ripgrep`, `dnf install ripgrep`, \
+`cargo install ripgrep`) or add it to PATH, then retry.",
+            ));
+        }
         cmd.arg("--color=never");
         cmd.current_dir(&ctx.working_dir);
 
@@ -178,6 +190,14 @@ multiline, head_limit/offset, and glob/type filters."
         if ctx.sensitive_check_enabled() {
             for exclude in sensitive_glob_excludes() {
                 cmd.arg("--glob").arg(exclude);
+            }
+        }
+        // Huge-workspace guard: never descend into heavy build dirs (AOSP
+        // `out/`, cargo `target/`, ...) unless the search path is already
+        // inside one of them.
+        if skip_heavy {
+            for heavy in HEAVY_DIRS {
+                cmd.arg("--glob").arg(format!("!{heavy}/"));
             }
         }
         if let Some(t) = file_type {
@@ -371,6 +391,21 @@ fn is_interrupted(flag: Option<&Arc<std::sync::atomic::AtomicBool>>) -> bool {
         .unwrap_or(false)
 }
 
+/// Cached `rg` presence probe. Probing on every search would spawn a process
+/// per call; on PATH-less environments that probe is pure overhead.
+fn rg_available() -> bool {
+    static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        std::process::Command::new("rg")
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    })
+}
+
 async fn wait_for_interrupt(flag: Option<Arc<std::sync::atomic::AtomicBool>>) {
     let Some(flag) = flag else {
         std::future::pending::<()>().await;
@@ -489,6 +524,42 @@ mod tests {
             .unwrap();
         assert!(output.is_error, "{}", output.content);
         assert!(output.content.contains("Search failed"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn heavy_dirs_are_excluded_by_default_and_included_when_targeted() {
+        let dir = std::env::temp_dir().join(format!("kkagent-grep-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("out")).unwrap();
+        std::fs::write(dir.join("out/generated.txt"), "needle generated\n").unwrap();
+        std::fs::write(dir.join("real.txt"), "needle real\n").unwrap();
+
+        let default = GrepTool
+            .execute(
+                json!({"pattern": "needle", "path": ".", "output_mode": "content"}),
+                &context(&dir),
+            )
+            .await
+            .unwrap();
+        assert!(default.content.contains("real.txt"), "{}", default.content);
+        assert!(
+            !default.content.contains("generated.txt"),
+            "{}",
+            default.content
+        );
+
+        let targeted = GrepTool
+            .execute(
+                json!({"pattern": "needle", "path": "out", "output_mode": "content"}),
+                &context(&dir),
+            )
+            .await
+            .unwrap();
+        assert!(
+            targeted.content.contains("generated.txt"),
+            "{}",
+            targeted.content
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

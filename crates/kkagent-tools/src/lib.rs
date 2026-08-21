@@ -27,6 +27,22 @@ pub use toolchain::{
 };
 pub use web_providers::WebServicesConfig;
 
+/// Directory names that are always skipped by recursive file tools (Glob,
+/// Grep, TUI file completion). They are build outputs or VCS metadata that can
+/// hold millions of entries in huge workspaces (e.g. an AOSP checkout with a
+/// populated `out/`). Tools that explicitly descend into one of them (e.g. a
+/// Glob pattern `out/soong/**` or a Grep `path` inside `out/`) opt out via
+/// [`inside_heavy_dir`].
+pub const HEAVY_DIRS: [&str; 4] = ["node_modules", "target", ".git", "out"];
+
+/// True when `path` has one of [`HEAVY_DIRS`] as a component, i.e. the caller
+/// explicitly descended into a heavy tree and heavy-dir filtering must not
+/// prune it.
+pub fn inside_heavy_dir(path: &Path) -> bool {
+    path.components()
+        .any(|c| matches!(c.as_os_str().to_str(), Some(name) if HEAVY_DIRS.contains(&name)))
+}
+
 pub use kkagent_protocol::tools::ToolDisclosure;
 
 use async_trait::async_trait;
