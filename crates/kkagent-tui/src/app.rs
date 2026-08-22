@@ -32,6 +32,11 @@ pub const TOOL_EXPAND_TURNS: usize = 5;
 pub(crate) const SPINNER_TICKS_PER_FRAME: usize = 4;
 const STREAM_DRAW_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 
+/// After this much idle time (no content/state changes), suppress the
+/// periodic self-refresh redraws so a quiet terminal stays quiet instead
+/// of looking like it keeps receiving notifications.
+const IDLE_PERIODIC_REDRAW_CUTOFF: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Default cadence for self-healing full repaints. Ratatui only rewrites cells
 /// that differ from its own previous buffer, so once the physical terminal
 /// diverges (torn frame over SSH, an injected escape byte, a dropped write) the
@@ -105,16 +110,29 @@ pub struct TuiApp {
     /// of input events (mouse movement, trackpad scrolling) spin the event loop
     /// faster and accelerate the spinner / loading animations.
     last_tick_at: std::time::Instant,
+    /// Wall-clock timestamp of the last *content-driven* redraw (user input,
+    /// server event, streaming token, git-badge update, …).  When the UI has
+    /// been idle longer than `IDLE_PERIODIC_REDRAW_CUTOFF` we stop issuing the
+    /// periodic self-refresh redraws so the terminal doesn't look like it
+    /// keeps receiving notifications.
+    last_content_at: std::time::Instant,
     /// Set by Ctrl+L (and after terminal-size changes): the next frame clears
     /// the screen and repaints every cell instead of diffing, healing any
     /// divergence between the terminal and ratatui's buffer model.
     force_full_redraw: bool,
 }
 
-fn tick_requires_redraw(previous: usize, current: usize, animation_active: bool) -> bool {
-    (animation_active && previous / SPINNER_TICKS_PER_FRAME != current / SPINNER_TICKS_PER_FRAME)
-        || previous / 80 != current / 80
-        || previous / 100 != current / 100
+fn tick_requires_redraw(
+    previous: usize,
+    current: usize,
+    animation_active: bool,
+    allow_periodic: bool,
+) -> bool {
+    allow_periodic
+        && ((animation_active
+            && previous / SPINNER_TICKS_PER_FRAME != current / SPINNER_TICKS_PER_FRAME)
+            || previous / 80 != current / 80
+            || previous / 100 != current / 100)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1499,6 +1517,7 @@ impl TuiApp {
             allows_background_detach: false,
             connection_alerted: false,
             last_tick_at: std::time::Instant::now(),
+            last_content_at: std::time::Instant::now(),
             force_full_redraw: false,
         }
     }
@@ -1957,13 +1976,39 @@ impl TuiApp {
                         | SessionStatus::Cancelling
                 )
             }) || self.state.subagents.any_active();
-            redraw |= tick_requires_redraw(previous_tick, self.state.tick, animation_active);
-            redraw |= stream_redraw_due(stream_redraw_pending, last_draw_at, now);
-            redraw |= crate::git_badge::take_updated();
+
+            // Determine whether any *content-driven* redraw is pending so we
+            // can refresh the "last activity" timestamp.  Streaming deltas and
+            // git-badge updates are content too, so evaluate them here.
+            let stream_due = stream_redraw_due(stream_redraw_pending, last_draw_at, now);
+            let git_updated = crate::git_badge::take_updated();
+            if redraw || stream_due || git_updated {
+                self.last_content_at = now;
+            }
+
+            // After the UI has been quiet for a while, suppress the periodic
+            // self-refresh redraws (spinner frames, elapsed-time ticks and
+            // self-heal full repaint) so the terminal doesn't look like it
+            // keeps receiving notifications.  Real data updates (streaming
+            // tokens, git-badge changes, user input, …) refresh
+            // `last_content_at`, so the UI stays fully responsive while the
+            // agent loop is actively producing output.
+            let allow_periodic =
+                now.saturating_duration_since(self.last_content_at) <= IDLE_PERIODIC_REDRAW_CUTOFF;
+
+            redraw |= tick_requires_redraw(
+                previous_tick,
+                self.state.tick,
+                animation_active,
+                allow_periodic,
+            );
+            redraw |= stream_due;
+            redraw |= git_updated;
             // Periodic self-heal: even without any local trigger, resync the
             // terminal with the buffer model so ghost cells from a torn SSH
             // frame or injected escape byte cannot outlive one interval.
-            if full_repaint_interval > std::time::Duration::ZERO
+            if allow_periodic
+                && full_repaint_interval > std::time::Duration::ZERO
                 && now.saturating_duration_since(last_full_redraw_at) >= full_repaint_interval
             {
                 self.force_full_redraw = true;
@@ -12897,11 +12942,19 @@ mod app_state_tests {
 
     #[test]
     fn idle_ticks_do_not_request_high_frequency_redraws() {
-        assert!(!tick_requires_redraw(1, 2, false));
-        assert!(!tick_requires_redraw(1, 2, true));
-        assert!(tick_requires_redraw(3, 4, true));
-        assert!(tick_requires_redraw(79, 80, false));
-        assert!(tick_requires_redraw(99, 100, false));
+        assert!(!tick_requires_redraw(1, 2, false, true));
+        assert!(!tick_requires_redraw(1, 2, true, true));
+        assert!(tick_requires_redraw(3, 4, true, true));
+        assert!(tick_requires_redraw(79, 80, false, true));
+        assert!(tick_requires_redraw(99, 100, false, true));
+        // When periodic redraws are suppressed (idle past the cutoff), nothing
+        // fires — not even spinner animation frames.  Real data updates refresh
+        // `last_content_at`, so the spinner keeps turning while the agent loop
+        // is actually producing output.
+        assert!(!tick_requires_redraw(79, 80, false, false));
+        assert!(!tick_requires_redraw(99, 100, false, false));
+        assert!(!tick_requires_redraw(3, 4, true, false));
+        assert!(!tick_requires_redraw(1, 2, true, false));
     }
 
     #[test]
