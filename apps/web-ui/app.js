@@ -852,6 +852,23 @@ function parseTranscript(messages) {
       if (text) out.push({ role: "system", content: text, created_at: raw.created_at, tool_calls: [] });
     }
   }
+  // Merge thinking content from consecutive assistant messages that belong to
+  // the same multi-step agent turn.  The server stores each step as a separate
+  // assistant message (each with its own thinking block), but tool-result-only
+  // user messages are skipped above, so consecutive assistant entries in `out`
+  // are part of the same turn.  Without this merge the UI would show one
+  // collapsed thinking box per step, cluttering the transcript.
+  //
+  // Walk backwards so each assistant's thinking is appended to the *first*
+  // assistant in the run (the one that originally opened the turn), and all
+  // subsequent thinking in the same run is cleared.
+  for (let i = out.length - 1; i > 0; i--) {
+    if (out[i].role === "assistant" && out[i].thinking && out[i - 1].role === "assistant") {
+      const prev = out[i - 1].thinking;
+      out[i - 1].thinking = prev ? prev + "\n" + out[i].thinking : out[i].thinking;
+      out[i].thinking = "";
+    }
+  }
   return out;
 }
 
@@ -2266,6 +2283,12 @@ function syncThinking(el, thinking, done) {
   }
   const body = details.querySelector(".thinking-body");
   if (body && body.textContent !== thinking) body.textContent = thinking;
+  // Auto-scroll the thinking body so the latest content is visible when the
+  // box is open (especially during live streaming where content overflows the
+  // 280px max-height and new lines get pushed below the fold).
+  if (body && details.hasAttribute("open")) {
+    body.scrollTop = body.scrollHeight;
+  }
   const label = details.querySelector(".thinking-label");
   if (label) label.textContent = done ? "思考过程" : "思考中…";
   const wasLive = details.classList.contains("is-live");
