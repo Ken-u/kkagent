@@ -1332,25 +1332,36 @@ fn render_tool_call_lines(
 ) -> Option<usize> {
     use crate::tool_renderers::ToolRenderRegistry;
 
+    // Status suffixes are appended after the chip; reserve their columns so
+    // the composed line never exceeds the viewport width.
+    let mut suffix = String::new();
+    if tc.output.is_none() {
+        if let Some(behind) = tc.queued_behind.as_ref() {
+            suffix.push_str(&format!(" queued behind {behind}"));
+        } else if let Some(started) = tc.started_at {
+            let secs = started.elapsed().as_secs();
+            if secs >= 2 {
+                suffix.push_str(&format!(" {secs}s"));
+            }
+        }
+        if tc.stopping {
+            suffix.push_str(" stopping…");
+        }
+    }
+    let suffix_cols = UnicodeWidthStr::width(suffix.as_str()).min(u16::MAX as usize) as u16;
+    let chip_width = width.saturating_sub(suffix_cols);
+    let input_truncated = ToolRenderRegistry::chip_truncated(tc, chip_width);
+
     if first_bullet {
         let mut label = format!(
             "{} {}",
             status_icon(tc),
-            ToolRenderRegistry::chip_label(tc, width)
+            ToolRenderRegistry::chip_label(tc, chip_width)
         );
-        if tc.output.is_none() {
-            if let Some(behind) = tc.queued_behind.as_ref() {
-                label.push_str(&format!(" queued behind {behind}"));
-            } else if let Some(started) = tc.started_at {
-                let secs = started.elapsed().as_secs();
-                if secs >= 2 {
-                    label.push_str(&format!(" {secs}s"));
-                }
-            }
-            if tc.stopping {
-                label.push_str(" stopping…");
-            }
-        }
+        label.push_str(&suffix);
+        // Degenerate narrow terminals can still overflow once the bullet is
+        // prepended; clamp so nothing spills past the viewport edge.
+        let label = truncate_display_width(&label, (width as usize).saturating_sub(2));
         lines.push(Line::from(vec![
             Span::styled("● ", Style::default().fg(theme.text)),
             Span::styled(label, ToolRenderRegistry::chip_style(tc, theme)),
@@ -1359,10 +1370,13 @@ fn render_tool_call_lines(
         lines.push(tool_continuation_line(tc, width, theme));
     }
 
+    let output_lines = tc.output.as_ref().map(|o| o.lines().count()).unwrap_or(0);
     if !tc.collapsed {
-        let toggle_line = if include_toggle_hint
-            && tc.output.as_ref().map(|o| o.lines().count()).unwrap_or(0) > 1
-        {
+        // The chip ellipsizes long commands; the expanded view spells them out.
+        if input_truncated {
+            lines.extend(ToolRenderRegistry::full_input_lines(tc, width, theme));
+        }
+        let toggle_line = if include_toggle_hint && (output_lines > 1 || input_truncated) {
             let line = lines.len();
             lines.push(Line::from(Span::styled(
                 "  … (ctrl+o to collapse)",
@@ -1380,12 +1394,14 @@ fn render_tool_call_lines(
             max_preview,
         ));
         return toggle_line;
-    } else if include_toggle_hint && tc.output.as_ref().map(|o| o.lines().count()).unwrap_or(0) > 1
-    {
-        let n = tc.output.as_ref().map(|o| o.lines().count()).unwrap_or(0);
+    } else if include_toggle_hint && (output_lines > 1 || input_truncated) {
         let line = lines.len();
         lines.push(Line::from(Span::styled(
-            format!("  … ({n} more lines, ctrl+o to expand)"),
+            if output_lines > 1 {
+                format!("  … ({output_lines} more lines, ctrl+o to expand)")
+            } else {
+                "  … (ctrl+o to expand)".to_string()
+            },
             Style::default().fg(theme.text_muted),
         )));
         return Some(line);
@@ -4421,6 +4437,87 @@ mod render_smoke {
         for hit in &state.tool_expand_hits {
             let text = lines[hit.line].to_string();
             assert!(text.contains("ctrl+o to"), "unexpected hit line: {text}");
+        }
+    }
+
+    #[test]
+    fn long_command_chip_is_clamped_and_expandable() {
+        let long_cmd = format!("echo {}", "z".repeat(200));
+        let theme = Theme::default();
+        let width = 60u16;
+
+        let mut state = AppState::new(PermissionMode::Manual, false);
+        state.messages.push(DisplayMessage {
+            role: MessageRole::Assistant,
+            content: String::new(),
+            thinking: None,
+            parts: vec![DisplayPart::Tool(DisplayToolCall {
+                id: "live".into(),
+                name: "Bash".into(),
+                input_summary: long_cmd.clone(),
+                output: None,
+                is_error: false,
+                collapsed: true,
+                user_overridden: false,
+                started_at: None,
+                stopping: false,
+                queued_behind: None,
+            })],
+            tool_calls: Vec::new(),
+            delivery: crate::prompt_queue::DeliveryState::Sent,
+            idempotency_key: None,
+        });
+
+        let lines = build_transcript_lines(&mut state, &theme, width);
+        let text = lines
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // The chip line must not overflow the viewport.
+        for l in &lines {
+            assert!(
+                UnicodeWidthStr::width(l.to_string().as_str()) <= width as usize,
+                "line overflows: {l:?}"
+            );
+        }
+        // Collapsed: full command hidden, ctrl+o hint present and clickable.
+        assert!(!text.contains(&long_cmd), "{text:?}");
+        assert!(text.contains("ctrl+o to expand"), "{text:?}");
+        assert_eq!(state.tool_expand_hits.len(), 1);
+        let hit = state.tool_expand_hits[0];
+        assert!(lines[hit.line].to_string().contains("ctrl+o to expand"));
+
+        // Expanded (what ctrl+o / the click does): full command wrapped in,
+        // still clamped to the viewport, collapse hint present.
+        if let Some(DisplayPart::Tool(tc)) = state.messages[0].parts.first_mut() {
+            tc.collapsed = false;
+            tc.user_overridden = true;
+        }
+        let lines = build_transcript_lines(&mut state, &theme, width);
+        // Wrapped continuation lines carry a 2-col indent; strip it so the
+        // wrapped chunks reconstruct the original command string.
+        let joined = lines
+            .iter()
+            .map(|l| l.to_string().trim_start().to_string())
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(
+            joined.contains(&long_cmd),
+            "expanded view must show the full command: {joined:?}"
+        );
+        let text = lines
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("ctrl+o to collapse"), "{text:?}");
+        for l in &lines {
+            assert!(
+                UnicodeWidthStr::width(l.to_string().as_str()) <= width as usize,
+                "line overflows: {l:?}"
+            );
         }
     }
 

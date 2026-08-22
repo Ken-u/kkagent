@@ -16,33 +16,40 @@ impl ToolRenderRegistry {
         // a minimum wider than the terminal: mobile SSH clients commonly
         // report widths in the 20–40 column range.
         let budget = (width as usize).saturating_sub(4);
-        // input_summary carries the command line / file path — sanitize once
-        // here rather than at each fit() call below.
+        fit(&Self::chip_text(tc), budget)
+    }
+
+    /// Full (unfitted) chip text: `$ cmd`, `Read path`, `grep pattern`, …
+    /// input_summary carries the command line / file path — sanitize once
+    /// here rather than at each fit() call below.
+    fn chip_text(tc: &DisplayToolCall) -> String {
         let input_summary = crate::sanitize::sanitize_text(&tc.input_summary);
         let input_summary = input_summary.as_ref();
-        let label = match tc.name.as_str() {
-            "Bash" => format!("$ {}", fit(input_summary, budget.saturating_sub(2))),
-            "Read" | "Write" | "Edit" => format!(
-                "{} {}",
-                tc.name,
-                fit(input_summary, budget.saturating_sub(tc.name.len() + 1))
-            ),
-            "Grep" => format!("grep {}", fit(input_summary, budget.saturating_sub(5))),
-            "Glob" => format!("glob {}", fit(input_summary, budget.saturating_sub(5))),
-            "Skill" => format!("Skill {}", fit(input_summary, budget.saturating_sub(6))),
-            "Goal" => format!("goal {}", fit(input_summary, budget.saturating_sub(5))),
-            "Web" => format!(
-                "{} {}",
-                tc.name,
-                fit(input_summary, budget.saturating_sub(tc.name.len() + 1))
-            ),
-            other => format!(
-                "{} {}",
-                other,
-                fit(input_summary, budget.saturating_sub(other.len() + 1))
-            ),
-        };
-        fit(&label, budget)
+        match tc.name.as_str() {
+            "Bash" => format!("$ {input_summary}"),
+            "Read" | "Write" | "Edit" => format!("{} {input_summary}", tc.name),
+            "Grep" => format!("grep {input_summary}"),
+            "Glob" => format!("glob {input_summary}"),
+            "Skill" => format!("Skill {input_summary}"),
+            "Goal" => format!("goal {input_summary}"),
+            other => format!("{other} {input_summary}"),
+        }
+    }
+
+    /// True when the chip cannot show the whole input within `width`
+    /// (i.e. the label ends in an ellipsis and hides part of the command).
+    pub fn chip_truncated(tc: &DisplayToolCall, width: u16) -> bool {
+        let budget = (width as usize).saturating_sub(4);
+        UnicodeWidthStr::width(Self::chip_text(tc).as_str()) > budget
+    }
+
+    /// The full command/input, wrapped — used by the expanded (ctrl+o /
+    /// click) view so a long command is never lost to the chip ellipsis.
+    pub fn full_input_lines(tc: &DisplayToolCall, width: u16, theme: &Theme) -> Vec<Line<'static>> {
+        let mut lines = Vec::new();
+        let style = Style::default().fg(theme.text_muted);
+        push_wrapped_output_line(&mut lines, &Self::chip_text(tc), width, style);
+        lines
     }
 
     pub fn chip_style(tc: &DisplayToolCall, theme: &Theme) -> Style {
@@ -308,6 +315,59 @@ mod tests {
             assert!(
                 UnicodeWidthStr::width(label.as_str()) <= (width as usize).saturating_sub(4),
                 "width={width}, label={label:?}"
+            );
+        }
+    }
+
+    fn bash_tc(cmd: &str) -> DisplayToolCall {
+        DisplayToolCall {
+            id: String::new(),
+            started_at: None,
+            stopping: false,
+            name: "Bash".into(),
+            input_summary: cmd.into(),
+            output: None,
+            is_error: false,
+            collapsed: true,
+            user_overridden: false,
+            queued_behind: None,
+        }
+    }
+
+    #[test]
+    fn chip_truncated_reports_hidden_command() {
+        let long = bash_tc(&format!("echo {}", "x".repeat(200)));
+        assert!(ToolRenderRegistry::chip_truncated(&long, 80));
+        let short = bash_tc("ls");
+        assert!(!ToolRenderRegistry::chip_truncated(&short, 80));
+        // Narrow viewport hides even modest commands ("$ ls" needs 4 cols
+        // plus the icon/bullet reserve, so budget 3 truncates it).
+        assert!(ToolRenderRegistry::chip_truncated(&short, 7));
+    }
+
+    #[test]
+    fn full_input_lines_wrap_without_overflow() {
+        let tc = bash_tc(&format!("echo {}", "y".repeat(120)));
+        let theme = Theme::default();
+        let lines = ToolRenderRegistry::full_input_lines(&tc, 40, &theme);
+        assert!(lines.len() > 1, "expected wrapping, got {lines:?}");
+        let joined = lines
+            .iter()
+            .map(|l| l.to_string().trim_start().to_string())
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(
+            joined.contains("$ echo "),
+            "command text must be present: {joined:?}"
+        );
+        assert!(
+            joined.ends_with(&"y".repeat(120)),
+            "full command must be present: {joined:?}"
+        );
+        for l in &lines {
+            assert!(
+                UnicodeWidthStr::width(l.to_string().as_str()) <= 40,
+                "line overflows: {l:?}"
             );
         }
     }
