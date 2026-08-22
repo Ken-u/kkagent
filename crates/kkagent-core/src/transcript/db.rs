@@ -112,7 +112,7 @@ pub struct SessionRecord {
     pub is_archived: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct MessageRecord {
     pub id: i64,
     pub session_id: String,
@@ -1124,7 +1124,7 @@ pub struct IsolatedMessage {
     pub reason: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct ToolResultRecord {
     pub id: String,
     pub session_id: String,

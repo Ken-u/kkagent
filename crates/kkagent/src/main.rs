@@ -208,6 +208,21 @@ enum Commands {
         /// bash | zsh | fish | powershell
         shell: String,
     },
+    /// Export one session as a self-contained debug bundle for analysis
+    ///
+    /// Writes transcript.json, filtered audit.jsonl, filtered kkagent.log,
+    /// tool-results, and the on-disk session directory into a single folder
+    /// (default under ~/.kkagent/exports/). Never includes other sessions.
+    ExportSession {
+        /// Session id (see `kk config show` / session index)
+        session_id: String,
+        /// Output directory (created; must not already exist)
+        #[arg(long)]
+        output: Option<PathBuf>,
+        /// Also print the manifest JSON to stdout
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -316,6 +331,7 @@ fn runtime_mode(cli: &Cli) -> &'static str {
         (Some(Commands::Doctor { .. }), _) => "doctor",
         (Some(Commands::Migrate { .. }), _) => "migrate",
         (Some(Commands::Completions { .. }), _) => "completions",
+        (Some(Commands::ExportSession { .. }), _) => "export_session",
         (None, Some(_)) => "print",
         (None, None) => "tui",
     }
@@ -383,6 +399,13 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Some(Commands::Completions { shell }) => {
             return print_completions(shell);
+        }
+        Some(Commands::ExportSession {
+            session_id,
+            output,
+            json,
+        }) => {
+            return run_export_session(session_id, output.as_deref(), *json);
         }
         _ => {}
     }
@@ -486,7 +509,8 @@ async fn run(cli: Cli) -> Result<()> {
             | Commands::Config { .. }
             | Commands::Doctor { .. }
             | Commands::Migrate { .. }
-            | Commands::Completions { .. },
+            | Commands::Completions { .. }
+            | Commands::ExportSession { .. },
         ) => {
             unreachable!("setup commands handled before runtime startup")
         }
@@ -559,7 +583,7 @@ _arguments \
   '--connect[Connect to server]:endpoint:' \
   '--no-alt-screen[Keep primary screen]' \
   '--dump-system-prompt[Print the composed system prompt and exit]' \
-  '1:command:(server acp auth init config doctor completions)'
+  '1:command:(server acp auth init config doctor completions export-session)'
 "#
             );
         }
@@ -1190,6 +1214,111 @@ async fn run_server_stop(listen: Option<String>) -> Result<()> {
         }
         Err(error) => Err(anyhow::anyhow!("{error}")),
     }
+}
+
+/// `kk export-session <id>` — single-session debug bundle for bug analysis.
+///
+/// Runs fully offline against the local data dir (no server, no LLM). The
+/// bundle contains only artifacts belonging to the requested session:
+/// transcript, filtered audit trail, filtered diagnostic log, tool results,
+/// and the on-disk session directory. Partial sources are tolerated and
+/// reported in the manifest rather than failing the export.
+fn run_export_session(session_id: &str, output: Option<&Path>, json: bool) -> Result<()> {
+    use kkagent_core::session::store::SessionStore;
+
+    if session_id.trim().is_empty() {
+        anyhow::bail!("session id must not be empty");
+    }
+
+    let store = SessionStore::open_default();
+    let summary = match store.get(session_id) {
+        Ok(s) => s,
+        Err(_) => {
+            // The session index may be pruned even though the transcript and
+            // the on-disk session directory survived; locate the directory by
+            // scanning the buckets so export still works.
+            let sessions_dir = &store.sessions_dir;
+            let mut found: Option<PathBuf> = None;
+            // Layouts: flat `sessions/<id>` or bucketed `sessions/<bucket>/<id>`.
+            let direct = sessions_dir.join(session_id);
+            if direct.is_dir() {
+                found = Some(direct);
+            } else if let Ok(buckets) = std::fs::read_dir(sessions_dir) {
+                for bucket in buckets.flatten() {
+                    let candidate = bucket.path().join(session_id);
+                    if candidate.is_dir() {
+                        found = Some(candidate);
+                        break;
+                    }
+                }
+            }
+            let Some(session_dir) = found else {
+                anyhow::bail!(
+                    "session not found: {session_id} (nothing in session store under {})",
+                    sessions_dir.display()
+                );
+            };
+            kkagent_core::session::store::SessionSummary {
+                id: session_id.to_string(),
+                session_dir: session_dir.to_string_lossy().into_owned(),
+                work_dir: std::env::current_dir()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+                title: None,
+                is_custom_title: false,
+                archived: false,
+                last_prompt: None,
+                first_prompt: None,
+                created_at: 0,
+                updated_at: 0,
+                forked_from: None,
+            }
+        }
+    };
+
+    let output_dir = match output {
+        Some(p) => p.to_path_buf(),
+        None => kkagent_config::default_config_dir()
+            .join("exports")
+            .join(format!(
+                "kkagent-debug-{}-{}",
+                &summary.id[..summary.id.len().min(8)],
+                chrono::Utc::now().format("%Y%m%d-%H%M%S")
+            )),
+    };
+    if output_dir.exists() {
+        anyhow::bail!("output directory already exists: {}", output_dir.display());
+    }
+
+    let result = kkagent_core::export_session_debug_bundle(&summary, &output_dir)?;
+
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "output_dir": result.output_dir.display().to_string(),
+                "entries": result.entries,
+                "manifest": result.manifest,
+            })
+        );
+    } else {
+        println!(
+            "Exported session {} to {}",
+            summary.id,
+            result.output_dir.display()
+        );
+        println!("  messages:      {:?}", result.manifest.message_count);
+        println!("  audit events:  {:?}", result.manifest.audit_event_count);
+        println!("  log lines:     {:?}", result.manifest.log_line_count);
+        println!("  files:         {}", result.manifest.files.len());
+        if !result.manifest.missing.is_empty() {
+            println!("  missing sources:");
+            for m in &result.manifest.missing {
+                println!("    - {m}");
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn run_server_status(listen: Option<String>, json: bool) -> Result<()> {

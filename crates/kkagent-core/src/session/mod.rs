@@ -45,7 +45,10 @@ pub use btw::{
 };
 pub use context::SessionContext;
 pub use cron::{SessionCronJob, SessionCronService};
-pub use export::{default_export_dir_name, export_session_directory, ExportManifest, ExportResult};
+pub use export::{
+    default_export_dir_name, export_session_debug_bundle, export_session_directory,
+    DebugExportManifest, DebugExportResult, ExportManifest, ExportResult,
+};
 pub use external_hooks::{SessionExternalHooks, SessionHookEvent, HOOK_EVENT_TYPES};
 pub use init::SessionInitService;
 pub use instructions::{InstructionFile, SessionInstructionsProvider};
