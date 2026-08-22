@@ -444,10 +444,8 @@ async fn run(cli: Cli) -> Result<()> {
         }) => {
             let mut token = http_token.or_else(|| std::env::var("KKAGENT_HTTP_TOKEN").ok());
             if http.is_some() && token.as_deref().is_none_or(str::is_empty) {
-                let generated = generate_http_token();
-                tracing::warn!(
-                    "No HTTP token was supplied. Generated one for this server process: {generated}"
-                );
+                let generated = load_or_generate_http_token();
+                tracing::warn!("No HTTP token was supplied. Using persisted token: {generated}");
                 token = Some(generated);
             }
             let mut scoped_tokens = HashMap::new();
@@ -2039,6 +2037,47 @@ async fn recover_durable_turns(backend: Arc<AgentHttpBackend>) {
 /// High-entropy token generated when no HTTP token is supplied.
 fn generate_http_token() -> String {
     format!("{}{}", uuid::Uuid::new_v4(), uuid::Uuid::new_v4())
+}
+
+/// Load a persisted auto-generated HTTP token, or generate and persist a new one.
+///
+/// When no explicit `--http-token` / `KKAGENT_HTTP_TOKEN` is supplied, the server
+/// auto-generates a high-entropy token. Persisting it to `~/.kkagent/http_token`
+/// keeps the token stable across server restarts so that browsers which already
+/// authenticated don't need to re-enter the token.
+fn load_or_generate_http_token() -> String {
+    let path = kkagent_config::default_config_dir().join("http_token");
+    // Try to reuse a previously persisted token.
+    if let Ok(content) = std::fs::read_to_string(&path) {
+        let trimmed = content.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    // Generate a new token and persist it for future restarts.
+    let token = generate_http_token();
+    if let Err(error) = persist_http_token(&path, &token) {
+        tracing::warn!(
+            "Failed to persist HTTP token to {}: {error}; token will change on next restart",
+            path.display()
+        );
+    }
+    token
+}
+
+/// Write the HTTP token to disk with restrictive permissions (0600 on Unix).
+fn persist_http_token(path: &Path, token: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).context("creating config directory")?;
+    }
+    std::fs::write(path, token).with_context(|| format!("writing {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("setting permissions on {}", path.display()))?;
+    }
+    Ok(())
 }
 
 async fn recover_subagents(state: Arc<ServerState>) {
@@ -6091,8 +6130,8 @@ async fn handle_rpc_call(
                     ));
                 }
             }
-            // Spec: no token provided → generate a high-entropy one and return it.
-            let token = provided_token.or_else(|| Some(generate_http_token()));
+            // Spec: no token provided → load or generate a stable high-entropy one and return it.
+            let token = provided_token.or_else(|| Some(load_or_generate_http_token()));
             let backend = Arc::new(AgentHttpBackend {
                 state: state.clone(),
             });
