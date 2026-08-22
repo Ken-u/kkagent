@@ -2040,13 +2040,28 @@ impl TuiApp {
         // the terminal for the thread that is actually driving the display.
         crate::panic_guard::note_owner_thread();
         // A forced frame clears the screen and repaints every cell. The clear
-        // is queued after BeginSynchronizedUpdate so terminals supporting
-        // synchronized updates (mode 2026) swap it in atomically — no blank
-        // flash on compliant terminals, including over SSH.
-        if self.force_full_redraw {
-            terminal.clear()?;
-        }
+        // must be QUEUED (not executed) after BeginSynchronizedUpdate so that
+        // `CSI 2J` shares one write burst with the full-cell repaint:
+        // - terminals supporting synchronized updates (mode 2026) present the
+        //   whole burst atomically — no blank flash, including over SSH;
+        // - terminals without 2026 process the entire burst (clear + frame)
+        //   before presenting, so no intermediate blank frame shows either.
         crossterm::queue!(terminal.backend_mut(), BeginSynchronizedUpdate)?;
+        if self.force_full_redraw {
+            // `Terminal::clear()` would execute! the clear — flushing `2J`
+            // immediately OUTSIDE the synchronized-update window; that
+            // momentary blank-then-repaint was the periodic screen flash.
+            crossterm::queue!(
+                terminal.backend_mut(),
+                crossterm::terminal::Clear(crossterm::terminal::ClearType::All)
+            )?;
+            // Reproduce `Terminal::clear()`'s diff-base reset through the
+            // public API: two swaps empty both buffers, so the upcoming
+            // draw() diffs against an empty back buffer and re-sends every
+            // cell instead of a sparse incremental diff.
+            terminal.swap_buffers();
+            terminal.swap_buffers();
+        }
         let draw_result = terminal
             .draw(|frame| components::render_ui(frame, &mut self.state, &self.config))
             .map(|_| ());
