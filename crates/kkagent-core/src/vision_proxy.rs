@@ -59,19 +59,32 @@ fn image_key(data: &str) -> String {
 
 /// Replacement text for one image block once its description is known.
 fn replacement_text(media_type: &str, alias: &str, description: &str) -> String {
-    format!("[image {media_type} described by vision proxy '{alias}']\n{description}")
+    format!(
+        "[image {media_type} described by vision proxy '{alias}']\n\
+         {description}\n\
+         [To see the original image, ask ReadMediaFile again with its path.]"
+    )
 }
 
-/// Replace every image block in `messages` with a proxy-generated description.
+/// Replace every image block with a proxy-generated description.
 ///
-/// Returns the number of blocks replaced. Blocks are processed in order; each
-/// unique image is described at most once thanks to the shared cache.
+/// Two slices are modified in lock-step:
+/// - `session_messages`: the persistent history. Image blocks are permanently
+///   replaced by text descriptions, dropping the base64 payload to save memory
+///   and context budget. The original file path remains in the surrounding
+///   message text (user `<image-attached>` markers or ReadMediaFile tool
+///   results), so a vision model can re-read the source later.
+/// - `turn_messages`: the per-turn working copy sent to the primary model.
+///
+/// Returns the number of blocks replaced. Each unique image is described at
+/// most once thanks to the shared cache.
 pub async fn substitute_image_blocks(
     config: &AppConfig,
     cache: &Mutex<VisionCache>,
-    messages: &mut [ChatMessage],
+    session_messages: &mut [ChatMessage],
+    turn_messages: &mut [ChatMessage],
 ) -> anyhow::Result<usize> {
-    if count_image_blocks(messages) == 0 {
+    if count_image_blocks(session_messages) == 0 && count_image_blocks(turn_messages) == 0 {
         return Ok(0);
     }
     let Some((alias, model_cfg, provider_cfg)) = config.vision_proxy() else {
@@ -83,47 +96,77 @@ pub async fn substitute_image_blocks(
     );
 
     let mut replaced = 0_usize;
-    for message in messages.iter_mut() {
-        if !message
-            .content
-            .iter()
-            .any(|c| matches!(c, ChatContent::Image { .. }))
-        {
+    for message in session_messages.iter_mut() {
+        replaced += replace_image_blocks_in_message(
+            &alias,
+            &model_cfg,
+            &provider_cfg,
+            &provider,
+            cache,
+            message,
+        )
+        .await?;
+    }
+    // Session is now text-only; mirror the same descriptions into the turn copy
+    // so the outgoing request matches.
+    for message in turn_messages.iter_mut() {
+        replaced += replace_image_blocks_in_message(
+            &alias,
+            &model_cfg,
+            &provider_cfg,
+            &provider,
+            cache,
+            message,
+        )
+        .await?;
+    }
+    Ok(replaced)
+}
+
+/// Replace `Image` blocks inside a single message with cached/fresh descriptions.
+async fn replace_image_blocks_in_message(
+    alias: &str,
+    model_cfg: &kkagent_config::ModelConfig,
+    provider_cfg: &kkagent_config::ProviderConfig,
+    provider: &Arc<dyn LlmProvider>,
+    cache: &Mutex<VisionCache>,
+    message: &mut ChatMessage,
+) -> anyhow::Result<usize> {
+    if !message
+        .content
+        .iter()
+        .any(|c| matches!(c, ChatContent::Image { .. }))
+    {
+        return Ok(0);
+    }
+    let mut replaced = 0_usize;
+    for part in message.content.iter_mut() {
+        let ChatContent::Image { media_type, data } = part else {
             continue;
-        }
-        for part in message.content.iter_mut() {
-            let ChatContent::Image { media_type, data } = part else {
-                continue;
-            };
-            let key = image_key(data);
-            let description = {
-                let cached = cache.lock().await.get(&key).cloned();
-                match cached {
-                    Some(description) => description,
-                    None => {
-                        let description = describe_one(
-                            provider.clone(),
-                            &model_cfg,
-                            &provider_cfg,
-                            media_type,
-                            data,
-                        )
-                        .await
-                        .map_err(|error| {
-                            anyhow::anyhow!(
-                                "vision proxy '{alias}' failed to describe image: {error}"
-                            )
-                        })?;
-                        cache.lock().await.insert(key, description.clone());
-                        description
-                    }
+        };
+        let key = image_key(data);
+        let description = {
+            let cached = cache.lock().await.get(&key).cloned();
+            match cached {
+                Some(description) => description,
+                None => {
+                    let description =
+                        describe_one(provider.clone(), model_cfg, provider_cfg, media_type, data)
+                            .await
+                            .map_err(|error| {
+                                anyhow::anyhow!(
+                                    "vision proxy '{alias}' failed to describe image: {error}"
+                                )
+                            })?;
+                    cache.lock().await.insert(key, description.clone());
+                    description
                 }
-            };
-            *part = ChatContent::Text {
-                text: replacement_text(media_type, &alias, &description),
-            };
-            replaced += 1;
-        }
+            }
+        };
+        *part = ChatContent::Text {
+            text: replacement_text(media_type, alias, &description),
+        };
+        replaced += 1;
     }
     Ok(replaced)
 }
@@ -238,15 +281,22 @@ mod tests {
     async fn substitution_without_images_is_a_noop() {
         let config = AppConfig::default();
         let cache = Mutex::new(VisionCache::default());
-        let mut messages = vec![ChatMessage {
+        let mut session = vec![ChatMessage {
             role: "user".into(),
             content: vec![ChatContent::Text { text: "hi".into() }],
             tools: None,
         }];
+        let mut turn = session.clone();
         // Even without a configured proxy, zero images short-circuits.
-        let replaced = substitute_image_blocks(&config, &cache, &mut messages)
+        let replaced = substitute_image_blocks(&config, &cache, &mut session, &mut turn)
             .await
             .unwrap();
         assert_eq!(replaced, 0);
+    }
+
+    #[test]
+    fn replacement_text_mentions_readmedia_hint() {
+        let text = replacement_text("image/png", "proxy-a", "a red circle");
+        assert!(text.contains("ReadMediaFile"));
     }
 }

@@ -728,13 +728,16 @@ Do not mention this reminder to the user.\n</system-reminder>"
             });
 
             // Non-vision primary model with a vision proxy configured: replace
-            // image blocks with proxy-generated descriptions before the request.
-            // Session history keeps originals; only this turn's working copy is
-            // mutated, so switching back to a vision model restores native reads.
+            // image blocks with proxy-generated descriptions. The replacement is
+            // permanent in session history (base64 dropped, text kept) to save
+            // memory and context budget; the per-turn copy is mirrored so the
+            // outgoing request matches. Original file paths remain in the
+            // surrounding message text, so a vision model can re-read later.
             if crate::vision_proxy::engaged(&self.config, active_capability.vision) {
                 let replaced = crate::vision_proxy::substitute_image_blocks(
                     &self.config,
                     &self.vision_cache,
+                    &mut session.messages,
                     &mut messages,
                 )
                 .await?;
@@ -743,6 +746,7 @@ Do not mention this reminder to the user.\n</system-reminder>"
                         replaced,
                         "vision proxy replaced image blocks with descriptions"
                     );
+                    session.transcript_rewrite_required = true;
                 }
             }
 
