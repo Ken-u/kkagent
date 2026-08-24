@@ -274,8 +274,12 @@ MCP 工具（`mcp__*` 命名空间）不属于内置工具：`toolOverrides` 的
 ```
 
 本地 marketplace 的 `source` 支持相对目录或 ZIP、绝对路径和 `file://`；远程
-marketplace 的相对 `source` 应指向 ZIP。也支持普通 HTTP(S) ZIP，以及 GitHub 仓库、
-`tree/<ref>`、release tag 和 commit URL。安装内容先进入临时目录，
+marketplace 的相对 `source` 应指向 ZIP。也支持普通 HTTP(S) ZIP，以及 GitHub /
+GitBucket 等 GitHub 兼容 forge 的仓库、`tree/<ref>`、`tree/<ref>/<subdir>`、
+release tag 和 commit URL。多插件单体仓库用 `tree/<branch>/<plugin-dir>` 指向子目录；
+安装时下载 `{repo}/archive/<ref>.zip`（GitHub 走 `codeload.github.com`）并只取该子目录。
+若 marketplace 配置的是仓库首页（HTML），会自动尝试
+`raw/main/marketplace.json` 与 `raw/master/marketplace.json`。安装内容先进入临时目录，
 验证 `kk.plugin.json` 后复制到 `~/.kkagent/plugins/managed/<id>/`，再原子更新
 `~/.kkagent/plugins/installed.json`；失败时恢复原版本。ZIP 下载限制为 64 MiB、解压后
 限制为 256 MiB/10000 个文件，并拒绝路径逃逸与符号链接。

@@ -141,28 +141,22 @@ enum CatalogLocation {
 
 pub async fn load_marketplace(source: &str, work_dir: &Path) -> Result<PluginMarketplace> {
     let location = resolve_catalog_location(source, work_dir)?;
-    let (raw, resolved_source) = match &location {
+    let (raw, resolved_source, location) = match location {
         CatalogLocation::Remote(url) => {
-            let response = reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(30))
-                .build()?
-                .get(url.clone())
-                .send()
-                .await?
-                .error_for_status()?;
-            (
-                read_response_limited(response, MAX_CATALOG_BYTES, "plugin marketplace").await?,
-                url.to_string(),
-            )
+            let (bytes, resolved) = fetch_remote_marketplace(&url).await?;
+            let resolved_url = reqwest::Url::parse(&resolved)
+                .with_context(|| format!("invalid resolved marketplace URL {resolved}"))?;
+            (bytes, resolved, CatalogLocation::Remote(resolved_url))
         }
         CatalogLocation::Local(path) => {
-            let bytes = tokio::fs::read(path)
+            let bytes = tokio::fs::read(&path)
                 .await
                 .with_context(|| format!("cannot read plugin marketplace {}", path.display()))?;
             if bytes.len() > MAX_CATALOG_BYTES {
                 anyhow::bail!("plugin marketplace exceeds 4 MiB")
             }
-            (bytes, path.display().to_string())
+            let resolved = path.display().to_string();
+            (bytes, resolved, CatalogLocation::Local(path))
         }
     };
     let parsed: RawMarketplace = serde_json::from_slice(&raw)
@@ -346,8 +340,7 @@ pub async fn install_plugin(
     let source_root_result: Result<PathBuf> = async {
         if is_http_source(source) {
             cleanup_download = true;
-            let archive = download_archive(source).await?;
-            extract_archive(archive, download_staging.clone()).await
+            materialize_http_plugin(source, download_staging.clone()).await
         } else {
             let path = source_path(source)?;
             let metadata = tokio::fs::metadata(&path)
@@ -361,7 +354,7 @@ pub async fn install_plugin(
                 if archive.len() > MAX_ARCHIVE_BYTES {
                     anyhow::bail!("plugin archive exceeds 64 MiB")
                 }
-                extract_archive(archive, download_staging.clone()).await
+                extract_archive(archive, download_staging.clone(), None).await
             }
         }
     }
@@ -484,13 +477,88 @@ fn source_path(source: &str) -> Result<PathBuf> {
     })
 }
 
-async fn download_archive(source: &str) -> Result<Vec<u8>> {
-    let url = github_archive_url(source)?.unwrap_or_else(|| source.to_string());
+async fn fetch_remote_marketplace(url: &reqwest::Url) -> Result<(Vec<u8>, String)> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .build()?;
+    let mut candidates = vec![url.clone()];
+    candidates.extend(marketplace_catalog_fallbacks(url));
+    let mut errors = Vec::new();
+    for candidate in candidates {
+        match fetch_marketplace_candidate(&client, &candidate).await {
+            Ok(bytes) => return Ok((bytes, candidate.to_string())),
+            Err(error) => errors.push(format!("{candidate}: {error}")),
+        }
+    }
+    anyhow::bail!(
+        "cannot load plugin marketplace from {url}: {}",
+        errors.join("; ")
+    )
+}
+
+async fn fetch_marketplace_candidate(
+    client: &reqwest::Client,
+    url: &reqwest::Url,
+) -> Result<Vec<u8>> {
+    let response = client.get(url.clone()).send().await?.error_for_status()?;
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let bytes = read_response_limited(response, MAX_CATALOG_BYTES, "plugin marketplace").await?;
+    if content_type.contains("text/html")
+        || bytes.as_slice().starts_with(b"<!DOCTYPE")
+        || bytes.as_slice().starts_with(b"<html")
+    {
+        anyhow::bail!("response is HTML, not a marketplace catalog")
+    }
+    let _: RawMarketplace = serde_json::from_slice(&bytes).context("invalid marketplace JSON")?;
+    Ok(bytes)
+}
+
+fn marketplace_catalog_fallbacks(url: &reqwest::Url) -> Vec<reqwest::Url> {
+    let path = url.path().trim_end_matches('/');
+    if path.ends_with(".json") {
+        return Vec::new();
+    }
+    let mut base = url.clone();
+    base.set_path(&format!("{path}/"));
+    ["main", "master"]
+        .into_iter()
+        .filter_map(|branch| {
+            base.join(&format!("raw/{branch}/marketplace.json"))
+                .ok()
+                .filter(|candidate| candidate.as_str() != url.as_str())
+        })
+        .collect()
+}
+
+async fn materialize_http_plugin(source: &str, destination: PathBuf) -> Result<PathBuf> {
+    let mut last_error = None;
+    for attempt in forge_download_attempts(source)? {
+        match download_bytes(&attempt.download_url).await {
+            Ok(archive) => {
+                match extract_archive(archive, destination.clone(), attempt.subdir).await {
+                    Ok(root) => return Ok(root),
+                    Err(error) => last_error = Some(error),
+                }
+            }
+            Err(error) => last_error = Some(error),
+        }
+        let _ = tokio::fs::remove_dir_all(&destination).await;
+    }
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("cannot download plugin from {source}")))
+}
+
+async fn download_bytes(url: &str) -> Result<Vec<u8>> {
     let response = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(120))
         .redirect(reqwest::redirect::Policy::limited(10))
         .build()?
-        .get(&url)
+        .get(url)
         .send()
         .await?
         .error_for_status()?;
@@ -520,37 +588,186 @@ async fn read_response_limited(
     Ok(bytes)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ForgeDownloadAttempt {
+    download_url: String,
+    subdir: Option<String>,
+}
+
+fn forge_download_attempts(source: &str) -> Result<Vec<ForgeDownloadAttempt>> {
+    let url = reqwest::Url::parse(source)?;
+    if url.path().ends_with(".zip") {
+        return Ok(vec![ForgeDownloadAttempt {
+            download_url: source.to_string(),
+            subdir: None,
+        }]);
+    }
+    let Some(parsed) = parse_forge_repo_url(&url)? else {
+        return Ok(vec![ForgeDownloadAttempt {
+            download_url: source.to_string(),
+            subdir: None,
+        }]);
+    };
+    let mut attempts = Vec::new();
+    if let Some(subdir) = &parsed.subdir {
+        attempts.push(ForgeDownloadAttempt {
+            download_url: forge_archive_download_url(&parsed, &parsed.reference)?,
+            subdir: Some(subdir.clone()),
+        });
+        if parsed.reference_is_prefix {
+            let full_ref = format!("{}/{}", parsed.reference, subdir);
+            attempts.push(ForgeDownloadAttempt {
+                download_url: forge_archive_download_url(&parsed, &full_ref)?,
+                subdir: None,
+            });
+        }
+    } else {
+        attempts.push(ForgeDownloadAttempt {
+            download_url: forge_archive_download_url(&parsed, &parsed.reference)?,
+            subdir: None,
+        });
+    }
+    Ok(attempts)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedForgeRepo {
+    origin: String,
+    owner: String,
+    repo: String,
+    reference: String,
+    subdir: Option<String>,
+    /// `true` when `reference` is only the first path segment after `tree/` and
+    /// `subdir` holds the remainder — used to retry slash-containing branch names.
+    reference_is_prefix: bool,
+    github: bool,
+}
+
+fn parse_forge_repo_url(url: &reqwest::Url) -> Result<Option<ParsedForgeRepo>> {
+    if !matches!(url.scheme(), "http" | "https") {
+        return Ok(None);
+    }
+    let host = url
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("plugin URL has no host"))?;
+    let segments: Vec<&str> = url
+        .path_segments()
+        .map(|segments| segments.filter(|part| !part.is_empty()).collect())
+        .unwrap_or_default();
+    if segments.len() < 2 {
+        return Ok(None);
+    }
+    // Ignore raw/blob file endpoints and API paths — those are not repo archives.
+    if matches!(segments.get(2).copied(), Some("raw" | "api")) {
+        return Ok(None);
+    }
+    let owner = segments[0].to_string();
+    let repo = segments[1].trim_end_matches(".git").to_string();
+    let github = matches!(host, "github.com" | "www.github.com");
+    let origin = forge_origin(url)?;
+    let rest = &segments[2..];
+    let (reference, subdir, reference_is_prefix) = match rest {
+        [] => ("HEAD".to_string(), None, false),
+        ["tree", first, rest @ ..] => {
+            if rest.is_empty() {
+                ((*first).to_string(), None, false)
+            } else {
+                (
+                    (*first).to_string(),
+                    Some(rest.join("/")),
+                    true, // may actually be a slash-containing ref; retry without subdir
+                )
+            }
+        }
+        ["commit", sha] => ((*sha).to_string(), None, false),
+        ["releases", "tag", tag @ ..] if !tag.is_empty() => (tag.join("/"), None, false),
+        ["archive", file] if file.ends_with(".zip") => {
+            let reference = file.trim_end_matches(".zip").to_string();
+            if reference.is_empty() {
+                anyhow::bail!("unsupported plugin archive URL {url}");
+            }
+            return Ok(Some(ParsedForgeRepo {
+                origin,
+                owner,
+                repo,
+                reference,
+                subdir: None,
+                reference_is_prefix: false,
+                github,
+            }));
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some(ParsedForgeRepo {
+        origin,
+        owner,
+        repo,
+        reference,
+        subdir,
+        reference_is_prefix,
+        github,
+    }))
+}
+
+fn forge_origin(url: &reqwest::Url) -> Result<String> {
+    let host = url
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("plugin URL has no host"))?;
+    let mut origin = format!("{}://{}", url.scheme(), host);
+    if let Some(port) = url.port() {
+        origin.push(':');
+        origin.push_str(&port.to_string());
+    }
+    Ok(origin)
+}
+
+fn forge_archive_download_url(parsed: &ParsedForgeRepo, reference: &str) -> Result<String> {
+    if parsed.github {
+        return Ok(format!(
+            "https://codeload.github.com/{}/{}/zip/{reference}",
+            parsed.owner, parsed.repo
+        ));
+    }
+    Ok(format!(
+        "{}/{}/{}/archive/{reference}.zip",
+        parsed.origin, parsed.owner, parsed.repo
+    ))
+}
+
+/// Compatibility wrapper used by `source_kind` and older tests.
 fn github_archive_url(source: &str) -> Result<Option<String>> {
     let url = match reqwest::Url::parse(source) {
         Ok(url) if matches!(url.host_str(), Some("github.com" | "www.github.com")) => url,
         _ => return Ok(None),
     };
-    let segments: Vec<_> = url
-        .path_segments()
-        .map(|segments| segments.filter(|part| !part.is_empty()).collect())
-        .unwrap_or_default();
-    if segments.len() < 2 {
-        anyhow::bail!("GitHub plugin URL must include owner and repository")
-    }
-    let owner = segments[0];
-    let repo = segments[1].trim_end_matches(".git");
-    let reference = match segments.as_slice() {
-        [_, _] => "HEAD".to_string(),
-        [_, _, "tree", reference @ ..] if !reference.is_empty() => reference.join("/"),
-        [_, _, "commit", sha] => (*sha).to_string(),
-        [_, _, "releases", "tag", tag @ ..] if !tag.is_empty() => tag.join("/"),
-        _ => anyhow::bail!("unsupported GitHub plugin URL {source}"),
+    let Some(parsed) = parse_forge_repo_url(&url)? else {
+        return Ok(None);
     };
-    Ok(Some(format!(
-        "https://codeload.github.com/{owner}/{repo}/zip/{reference}"
-    )))
+    // Preserve historical behavior for slash-containing branch names on GitHub:
+    // `tree/release/1.x` maps to the full ref when no successful subdir install is implied.
+    let reference = match (&parsed.subdir, parsed.reference_is_prefix) {
+        (Some(subdir), true) => format!("{}/{}", parsed.reference, subdir),
+        _ => parsed.reference.clone(),
+    };
+    Ok(Some(forge_archive_download_url(&parsed, &reference)?))
 }
 
-async fn extract_archive(bytes: Vec<u8>, destination: PathBuf) -> Result<PathBuf> {
-    tokio::task::spawn_blocking(move || extract_archive_blocking(bytes, &destination)).await?
+async fn extract_archive(
+    bytes: Vec<u8>,
+    destination: PathBuf,
+    subdir: Option<String>,
+) -> Result<PathBuf> {
+    tokio::task::spawn_blocking(move || {
+        extract_archive_blocking(bytes, &destination, subdir.as_deref())
+    })
+    .await?
 }
 
-fn extract_archive_blocking(bytes: Vec<u8>, destination: &Path) -> Result<PathBuf> {
+fn extract_archive_blocking(
+    bytes: Vec<u8>,
+    destination: &Path,
+    subdir: Option<&str>,
+) -> Result<PathBuf> {
     std::fs::create_dir_all(destination)?;
     let mut archive = zip::ZipArchive::new(Cursor::new(bytes)).context("invalid plugin ZIP")?;
     if archive.len() > MAX_ARCHIVE_FILES {
@@ -588,7 +805,45 @@ fn extract_archive_blocking(bytes: Vec<u8>, destination: &Path) -> Result<PathBu
         }
         std::io::copy(&mut file.take(MAX_EXTRACTED_BYTES + 1), &mut output_file)?;
     }
-    detect_plugin_root(destination)
+    let search_root = match subdir {
+        Some(subdir) => resolve_archive_subdir(destination, subdir)?,
+        None => destination.to_path_buf(),
+    };
+    detect_plugin_root(&search_root)
+}
+
+fn resolve_archive_subdir(extracted: &Path, subdir: &str) -> Result<PathBuf> {
+    let subdir_path = path_from_urlish(subdir);
+    if subdir_path
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        anyhow::bail!("plugin archive subdirectory must not contain '..'")
+    }
+    let mut candidates = Vec::new();
+    let direct = extracted.join(&subdir_path);
+    if direct.is_dir() {
+        candidates.push(direct);
+    }
+    for entry in std::fs::read_dir(extracted)? {
+        let entry = entry?;
+        let path = entry.path();
+        let metadata = std::fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_symlink() {
+            anyhow::bail!("plugin archive contains a symbolic link")
+        }
+        if metadata.is_dir() {
+            let nested = path.join(&subdir_path);
+            if nested.is_dir() {
+                candidates.push(nested);
+            }
+        }
+    }
+    candidates.sort_by_key(|path| path.components().count());
+    candidates
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("plugin archive has no subdirectory {subdir}"))
 }
 
 fn detect_plugin_root(extracted: &Path) -> Result<PathBuf> {
@@ -745,6 +1000,12 @@ async fn install_from_directory(
 fn source_kind(source: &str) -> &'static str {
     if github_archive_url(source).ok().flatten().is_some() {
         "github"
+    } else if reqwest::Url::parse(source)
+        .ok()
+        .and_then(|url| parse_forge_repo_url(&url).ok().flatten())
+        .is_some()
+    {
+        "git-forge"
     } else if is_http_source(source) || source.ends_with(".zip") {
         "zip-url"
     } else {
@@ -1026,7 +1287,7 @@ mod tests {
             .unwrap();
         writer.write_all(b"unsafe").unwrap();
         let archive = writer.finish().unwrap().into_inner();
-        let error = extract_archive(archive, root.join("extract"))
+        let error = extract_archive(archive, root.join("extract"), None)
             .await
             .unwrap_err();
         assert!(error.to_string().contains("unsafe path"));
@@ -1143,5 +1404,82 @@ mod tests {
                 .unwrap(),
             "https://codeload.github.com/acme/demo/zip/v1.2.3"
         );
+    }
+
+    #[test]
+    fn resolves_gitbucket_style_tree_subdir_downloads() {
+        let attempts =
+            forge_download_attempts("http://10.10.10.205:8091/bjc/kk-plugins/tree/main/codesearch")
+                .unwrap();
+        assert_eq!(
+            attempts,
+            vec![
+                ForgeDownloadAttempt {
+                    download_url: "http://10.10.10.205:8091/bjc/kk-plugins/archive/main.zip".into(),
+                    subdir: Some("codesearch".into()),
+                },
+                ForgeDownloadAttempt {
+                    download_url:
+                        "http://10.10.10.205:8091/bjc/kk-plugins/archive/main/codesearch.zip".into(),
+                    subdir: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn marketplace_repo_root_falls_back_to_raw_catalog() {
+        let url = reqwest::Url::parse("http://10.10.10.205:8091/bjc/kk-plugins").unwrap();
+        let fallbacks = marketplace_catalog_fallbacks(&url);
+        assert_eq!(
+            fallbacks
+                .iter()
+                .map(|value| value.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "http://10.10.10.205:8091/bjc/kk-plugins/raw/main/marketplace.json",
+                "http://10.10.10.205:8091/bjc/kk-plugins/raw/master/marketplace.json",
+            ]
+        );
+        assert!(marketplace_catalog_fallbacks(
+            &reqwest::Url::parse(
+                "http://10.10.10.205:8091/bjc/kk-plugins/raw/main/marketplace.json"
+            )
+            .unwrap()
+        )
+        .is_empty());
+    }
+
+    #[tokio::test]
+    async fn installs_plugin_from_multi_root_zip_subdir() {
+        let root = temp_dir();
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        for (path, body) in [
+            (
+                "repo-main/codesearch/kk.plugin.json",
+                br#"{"name":"codesearch","version":"1.0.0"}"#,
+            ),
+            (
+                "repo-main/web-search/kk.plugin.json",
+                br#"{"name":"web-search","version":"1.0.0"}"#,
+            ),
+        ] {
+            writer
+                .start_file(
+                    path,
+                    zip::write::SimpleFileOptions::default()
+                        .compression_method(zip::CompressionMethod::Deflated),
+                )
+                .unwrap();
+            writer.write_all(body).unwrap();
+        }
+        let archive = writer.finish().unwrap().into_inner();
+        let extracted = extract_archive(archive, root.join("extract"), Some("codesearch".into()))
+            .await
+            .unwrap();
+        assert!(extracted.join("kk.plugin.json").is_file());
+        assert!(extracted.ends_with("codesearch"));
+        let _ = tokio::fs::remove_dir_all(root).await;
     }
 }

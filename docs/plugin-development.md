@@ -235,8 +235,8 @@ provider 取值与 wire 格式要求见 [configuration.md 的 Web 搜索](config
 ```
 
    本地 marketplace 的 `source` 支持相对目录/ZIP/绝对路径/`file://`；远程 marketplace
-   的相对 source 应指向 ZIP，也支持任意 HTTP(S) ZIP 与 GitHub 仓库 URL
-   （含 `tree/<ref>`、release tag、commit）。
+   的相对 source 应指向 ZIP，也支持任意 HTTP(S) ZIP 与 GitHub / GitBucket 等兼容 forge
+   的仓库 URL（含 `tree/<ref>`、`tree/<ref>/<subdir>`、release tag、commit）。
 3. 用户侧：`/plugins marketplace <source>` 添加后安装，或直接
    `/plugins install <github-url>`。
 
