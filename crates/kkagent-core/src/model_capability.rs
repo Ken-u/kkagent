@@ -1,6 +1,6 @@
 //! Model capability registry derived from config `capabilities` lists.
 
-use kkagent_config::ModelConfig;
+use kkagent_config::{declares_image_input, ModelConfig};
 use std::collections::HashSet;
 
 #[derive(Debug, Clone, Default)]
@@ -31,7 +31,7 @@ impl ModelCapability {
         };
         Self {
             tools,
-            vision: has(&["vision", "image", "image_in", "multimodal"]),
+            vision: declares_image_input(&model.capabilities),
             thinking: has(&["thinking", "reasoning", "extended_thinking"]),
             audio: has(&["audio", "audio_in"]),
             video: has(&["video", "video_in"]),
@@ -67,6 +67,7 @@ mod tests {
             default_effort: None,
             pricing: None,
             experimental_adaptive_thinking: false,
+            experimental_vision_proxy: false,
             experimental_visible_empty_retries: 0,
             experimental_bad_toolcall_auto_retries: 0,
             first_token_timeout_ms: None,
@@ -91,6 +92,7 @@ mod tests {
             default_effort: None,
             pricing: None,
             experimental_adaptive_thinking: false,
+            experimental_vision_proxy: false,
             experimental_visible_empty_retries: 0,
             experimental_bad_toolcall_auto_retries: 0,
             first_token_timeout_ms: None,

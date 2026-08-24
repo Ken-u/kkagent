@@ -270,6 +270,13 @@ pub struct ModelConfig {
     /// Experimental: use Anthropic adaptive thinking and forward configured effort.
     #[serde(default)]
     pub experimental_adaptive_thinking: bool,
+    /// Experimental: act as the vision proxy for non-vision models. Exactly one
+    /// model may set this, and it must also declare an image input capability
+    /// (e.g. `image_in`). When the active primary model declares no image input,
+    /// image blocks are replaced by text descriptions produced by this model
+    /// before each request, and `ReadMediaFile` stays visible to the agent.
+    #[serde(default)]
+    pub experimental_vision_proxy: bool,
     /// Experimental: retry a thinking-only/empty response immediately after tool results.
     #[serde(default)]
     pub experimental_visible_empty_retries: u32,
@@ -292,6 +299,17 @@ pub struct ModelPricing {
     pub cache_creation_per_mtok: Option<f64>,
     #[serde(default)]
     pub cache_read_per_mtok: Option<f64>,
+}
+
+/// Whether a `capabilities` list declares image input support. Shared by
+/// capability derivation and vision-proxy validation so the two cannot drift.
+pub fn declares_image_input(capabilities: &[String]) -> bool {
+    capabilities.iter().any(|c| {
+        matches!(
+            c.to_lowercase().as_str(),
+            "vision" | "image" | "image_in" | "multimodal"
+        )
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -942,6 +960,18 @@ impl AppConfig {
                     model.provider
                 );
             }
+            if model.experimental_vision_proxy {
+                if alias == default_model {
+                    anyhow::bail!(
+                        "model {alias} cannot be both the default model and experimental_vision_proxy"
+                    );
+                }
+                if !declares_image_input(&model.capabilities) {
+                    anyhow::bail!(
+                        "model {alias} sets experimental_vision_proxy without an image input capability (add `image_in` to its capabilities)"
+                    );
+                }
+            }
             if model.max_context_size == Some(0) || model.max_output_size == Some(0) {
                 anyhow::bail!("model {alias} token limits must be greater than zero");
             }
@@ -1000,6 +1030,20 @@ impl AppConfig {
         let model = self.models.get(alias)?;
         let provider = self.providers.get(&model.provider)?;
         Some((model, provider))
+    }
+
+    /// The model designated as the multimodal vision proxy, if configured.
+    ///
+    /// Returns the alias plus owned clones of the model/provider configs so
+    /// callers can build a standalone provider without borrowing `self`.
+    pub fn vision_proxy(&self) -> Option<(String, ModelConfig, ProviderConfig)> {
+        self.models
+            .iter()
+            .find(|(_, m)| m.experimental_vision_proxy)
+            .and_then(|(alias, m)| {
+                let provider = self.providers.get(&m.provider)?;
+                Some((alias.clone(), m.clone(), provider.clone()))
+            })
     }
 
     /// Resolve streaming first-token timeout for a model/provider pair.
@@ -1089,6 +1133,7 @@ mod tests {
                 default_effort: None,
                 pricing: None,
                 experimental_adaptive_thinking: false,
+                experimental_vision_proxy: false,
                 experimental_visible_empty_retries: 0,
                 experimental_bad_toolcall_auto_retries: 0,
                 first_token_timeout_ms: None,
@@ -1110,6 +1155,7 @@ mod tests {
             default_effort: None,
             pricing: None,
             experimental_adaptive_thinking: false,
+            experimental_vision_proxy: false,
             experimental_visible_empty_retries: 0,
             experimental_bad_toolcall_auto_retries: 0,
             first_token_timeout_ms: None,
@@ -1305,5 +1351,85 @@ experimental_bad_toolcall_auto_retries = 2
         config.set_mcp_disabled("demo", false);
         assert!(!config.is_mcp_disabled("demo"));
         assert_eq!(config.mcp_servers["demo"].enabled, Some(true));
+    }
+
+    fn add_model(config: &mut AppConfig, alias: &str, capabilities: Vec<String>) {
+        config.models.insert(
+            alias.into(),
+            ModelConfig {
+                provider: "test".into(),
+                model: alias.into(),
+                max_context_size: Some(100_000),
+                max_output_size: Some(4_096),
+                capabilities,
+                display_name: None,
+                support_efforts: Vec::new(),
+                default_effort: None,
+                pricing: None,
+                experimental_adaptive_thinking: false,
+                experimental_vision_proxy: false,
+                experimental_visible_empty_retries: 0,
+                experimental_bad_toolcall_auto_retries: 0,
+                first_token_timeout_ms: None,
+            },
+        );
+    }
+
+    #[test]
+    fn vision_proxy_requires_image_capability() {
+        let mut config = valid_config();
+        add_model(&mut config, "test/vision", Vec::new());
+        config
+            .models
+            .get_mut("test/vision")
+            .unwrap()
+            .experimental_vision_proxy = true;
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("experimental_vision_proxy without an image input capability"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn vision_proxy_cannot_be_default_model() {
+        let mut config = valid_config();
+        add_model(&mut config, "test/vision", vec!["image_in".into()]);
+        config
+            .models
+            .get_mut("test/vision")
+            .unwrap()
+            .experimental_vision_proxy = true;
+        config.default_model = Some("test/vision".into());
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("cannot be both the default model"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn vision_proxy_access_returns_resolved_configs() {
+        let mut config = valid_config();
+        add_model(&mut config, "test/vision", vec!["image_in".into()]);
+        config
+            .models
+            .get_mut("test/vision")
+            .unwrap()
+            .experimental_vision_proxy = true;
+        config.validate().unwrap();
+        let (alias, model, _provider) = config.vision_proxy().expect("proxy configured");
+        assert_eq!(alias, "test/vision");
+        assert!(model.experimental_vision_proxy);
+    }
+
+    #[test]
+    fn declares_image_input_matches_capability_aliases() {
+        assert!(declares_image_input(&["image_in".into()]));
+        assert!(declares_image_input(&["vision".into()]));
+        assert!(declares_image_input(&["multimodal".into()]));
+        assert!(!declares_image_input(&["tool_use".into()]));
+        assert!(!declares_image_input(&[]));
     }
 }

@@ -69,6 +69,7 @@ default_effort = "medium"
 # experimental_adaptive_thinking = true
 # experimental_visible_empty_retries = 1
 # experimental_bad_toolcall_auto_retries = 2
+# experimental_vision_proxy = true  # 让该模型为非 vision 主模型充当多模态读图代理
 ```
 
 `provider` 必须引用已有 Provider。`max_context_size` 和 `max_output_size` 参与上下文预算。`tool_use` 控制是否向模型发送工具定义；`image_in`、`video_in`、`audio_in` 声明多模态输入能力；`support_efforts` 和 `default_effort` 描述可用推理强度。
@@ -76,6 +77,8 @@ default_effort = "medium"
 `first_token_timeout_ms` 控制流式请求等待第一个有效内容 chunk（文本 / thinking / tool_use）的超时。优先级为：模型级 → Provider 级 → 默认 `60000`（60 秒）。设为 `0` 表示禁用（退化为仅受 HTTP 总超时 300s 约束）。≥ 300s 的配置会被 clamp 到 290s。超时后请求中断；若配置了 `fallback_model`，Agent loop 会按既有重试策略切换。
 
 `experimental_adaptive_thinking` 仅影响 Anthropic 请求：开启后发送 `thinking.type = "adaptive"`，并通过 `output_config.effort` 转发当前 thinking effort。`experimental_visible_empty_retries` 指定 tool result 后遇到“无正文且无新 tool call”的成功响应时最多重试几次；thinking-only 也属于这种响应。重试只重新请求模型，不会再次执行已经完成的工具。`experimental_bad_toolcall_auto_retries` 指定模型返回的 tool call 参数不是合法 JSON 对象、被服务端以 HTTP 400 拒绝时，自动回滚该条 assistant 小步骤并重新请求模型的次数；回滚只丢弃这一步及其后的 tool result，不会反向恢复已发生的工具副作用。重试次数耗尽后仍按原有行为停下来等待 `continue`。三个选项都按模型配置，未设置时保持原有行为。
+
+`experimental_vision_proxy` 让一个**具备图像输入能力**（`image_in` 等）的模型为非 vision 主模型充当多模态读图代理。配置时在某个 vision 模型上设置该 flag，整个配置最多一个；该模型不能同时是 `default_model`。当主模型声明无图像输入能力时，Agent loop 在每轮请求前把消息中的图像块替换为该代理模型生成的文字描述（逐字转写文字、描述布局与 UI、报告图表数据），session 历史保留原始图像块——切换回 vision 主模型即恢复原生读图。描述按图像 SHA-256 缓存，重复发送同一张图只调用一次代理。非 vision 主模型此前被隐藏的 `ReadMediaFile` 工具也会重新可见。
 
 官方 OpenAI endpoint 会自动使用稳定的 `prompt_cache_key`。自定义 OpenAI-compatible endpoint 为避免未知字段导致 HTTP 400，默认不发送；确认兼容后可在模型的 `capabilities` 中加入 `prompt_cache_key` 开启。
 

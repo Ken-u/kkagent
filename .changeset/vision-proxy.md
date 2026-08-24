@@ -1,0 +1,16 @@
+# Vision proxy for non-vision models
+
+A model configured with `experimental_vision_proxy = true` can act as a shared
+multimodal interface for primary models that declare no image input capability.
+
+- When the active primary model is non-vision and a vision proxy is configured,
+  image blocks in outgoing requests are replaced with text descriptions
+  produced by the proxy model before the request goes out.
+- Session history keeps the original image blocks; only the per-turn working
+  copy is mutated, so switching back to a vision model restores native reads.
+- `ReadMediaFile` stays visible to non-vision primary models when a proxy is
+  configured, instead of being hidden.
+- Descriptions are cached by SHA-256 of the image payload, so repeated rounds
+  with the same image cost one proxy call in total.
+- The proxy model must itself declare an image input capability (`image_in`
+  etc.) and cannot be the `default_model`. At most one proxy per config.

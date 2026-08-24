@@ -39,6 +39,7 @@ pub mod transcript;
 pub mod trash;
 pub mod undo_service;
 pub mod usage;
+pub mod vision_proxy;
 pub mod workspace_registry;
 
 pub use activity_view::{ActivityItem, ActivityView};

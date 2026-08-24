@@ -98,6 +98,7 @@ pub fn run_init(
             default_effort: None,
             pricing: None,
             experimental_adaptive_thinking: false,
+            experimental_vision_proxy: false,
             experimental_visible_empty_retries: 0,
             experimental_bad_toolcall_auto_retries: 0,
             first_token_timeout_ms: None,

@@ -133,6 +133,8 @@ pub struct AgentLoop {
     /// to the transcript DB at once (never per stream chunk). Cuts the crash
     /// window from a whole turn down to the currently streaming/executing step.
     transcript_db: Option<TranscriptDb>,
+    /// Vision-proxy description cache shared across turns (see `vision_proxy`).
+    vision_cache: Arc<Mutex<crate::vision_proxy::VisionCache>>,
 }
 
 /// Spills oversized tool results to `<config_dir>/tool-results/` and, when a
@@ -348,6 +350,7 @@ impl AgentLoop {
             goal_mgr: None,
             tool_result_store: None,
             transcript_db: None,
+            vision_cache: Arc::new(Mutex::new(Default::default())),
         }
     }
 
@@ -551,13 +554,14 @@ impl AgentLoop {
             crate::dynamic_tools::inject_deferred_tools_diff(session, &visible_defs);
         }
 
+        let vision_proxy_engaged = crate::vision_proxy::engaged(&self.config, capability.vision);
         // When dynamic loading is on, the request starts with the core set
         // (Inline only). Deferred schemas are loaded after SelectTools: Kimi
         // keeps them on messages, while other adapters merge them into the
         // top-level tools[] request. When off, all tools are sent in one batch.
         let mut tool_defs: Vec<ToolDef> = visible_defs
             .iter()
-            .filter(|td| td.name != "ReadMediaFile" || capability.vision)
+            .filter(|td| td.name != "ReadMediaFile" || capability.vision || vision_proxy_engaged)
             .filter(|td| {
                 !dynamic_tools_enabled
                     || td.disclosure != kkagent_protocol::tools::ToolDisclosure::Deferred
@@ -596,7 +600,7 @@ Do not mention this reminder to the user.\n</system-reminder>"
                 .await;
         }
 
-        if !capability.vision {
+        if !capability.vision && !vision_proxy_engaged {
             let latest_has_image = session.messages.last().is_some_and(|message| {
                 message
                     .content
@@ -692,6 +696,7 @@ Do not mention this reminder to the user.\n</system-reminder>"
             let active_capability = ModelCapability::from_model(model_config);
             if using_fallback
                 && !active_capability.vision
+                && !crate::vision_proxy::engaged(&self.config, active_capability.vision)
                 && messages.iter().any(|message| {
                     message
                         .content
@@ -721,6 +726,25 @@ Do not mention this reminder to the user.\n</system-reminder>"
                     None
                 }
             });
+
+            // Non-vision primary model with a vision proxy configured: replace
+            // image blocks with proxy-generated descriptions before the request.
+            // Session history keeps originals; only this turn's working copy is
+            // mutated, so switching back to a vision model restores native reads.
+            if crate::vision_proxy::engaged(&self.config, active_capability.vision) {
+                let replaced = crate::vision_proxy::substitute_image_blocks(
+                    &self.config,
+                    &self.vision_cache,
+                    &mut messages,
+                )
+                .await?;
+                if replaced > 0 {
+                    tracing::info!(
+                        replaced,
+                        "vision proxy replaced image blocks with descriptions"
+                    );
+                }
+            }
 
             let request = LlmRequest {
                 model: model_config.model.clone(),
@@ -3758,6 +3782,7 @@ mod retry_tests {
                 default_effort: None,
                 pricing: None,
                 experimental_adaptive_thinking: false,
+                experimental_vision_proxy: false,
                 experimental_visible_empty_retries: 0,
                 experimental_bad_toolcall_auto_retries: 0,
                 first_token_timeout_ms: None,
@@ -3882,6 +3907,7 @@ mod retry_tests {
                 default_effort: None,
                 pricing: None,
                 experimental_adaptive_thinking: false,
+                experimental_vision_proxy: false,
                 experimental_visible_empty_retries: 0,
                 experimental_bad_toolcall_auto_retries: 1,
                 first_token_timeout_ms: None,
@@ -4056,6 +4082,7 @@ mod retry_tests {
                     default_effort: None,
                     pricing: None,
                     experimental_adaptive_thinking: false,
+                    experimental_vision_proxy: false,
                     experimental_visible_empty_retries: 0,
                     experimental_bad_toolcall_auto_retries: 0,
                     first_token_timeout_ms: None,
@@ -4160,6 +4187,7 @@ mod retry_tests {
                     default_effort: None,
                     pricing: None,
                     experimental_adaptive_thinking: false,
+                    experimental_vision_proxy: false,
                     experimental_visible_empty_retries: 0,
                     experimental_bad_toolcall_auto_retries: 0,
                     first_token_timeout_ms: None,
@@ -4298,6 +4326,7 @@ mod retry_tests {
                 default_effort: None,
                 pricing: None,
                 experimental_adaptive_thinking: false,
+                experimental_vision_proxy: false,
                 experimental_visible_empty_retries: 0,
                 experimental_bad_toolcall_auto_retries: 0,
                 first_token_timeout_ms: None,
@@ -4392,6 +4421,7 @@ mod retry_tests {
                 default_effort: None,
                 pricing: None,
                 experimental_adaptive_thinking: false,
+                experimental_vision_proxy: false,
                 experimental_visible_empty_retries: 0,
                 experimental_bad_toolcall_auto_retries: 0,
                 first_token_timeout_ms: None,
@@ -4492,6 +4522,7 @@ mod retry_tests {
                 default_effort: None,
                 pricing: None,
                 experimental_adaptive_thinking: false,
+                experimental_vision_proxy: false,
                 experimental_visible_empty_retries: 1,
                 experimental_bad_toolcall_auto_retries: 0,
                 first_token_timeout_ms: None,
@@ -4599,6 +4630,7 @@ mod retry_tests {
                 default_effort: None,
                 pricing: None,
                 experimental_adaptive_thinking: false,
+                experimental_vision_proxy: false,
                 experimental_visible_empty_retries: 0,
                 experimental_bad_toolcall_auto_retries: 0,
                 first_token_timeout_ms: None,
@@ -4790,6 +4822,7 @@ mod retry_tests {
                 default_effort: None,
                 pricing: None,
                 experimental_adaptive_thinking: false,
+                experimental_vision_proxy: false,
                 experimental_visible_empty_retries: 0,
                 experimental_bad_toolcall_auto_retries: 0,
                 first_token_timeout_ms: None,
