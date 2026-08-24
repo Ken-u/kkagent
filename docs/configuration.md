@@ -332,10 +332,10 @@ proxy = "auto"                              # auto | none | system，默认 auto
 
 `fetch` 在两处做安全校验，策略不同：
 
-- **入口预校验（转发到代理前）**：仅校验 scheme（`http`/`https`）、host 非空且非 `localhost`/`*.localhost`、以及 **IP 字面量** 是否为公网地址（如 `192.168.1.1`、`169.254.169.254` 等私网/环回/链路本地地址会被拦）。**不做 DNS 解析**——目标域名的出站安全由 fetch 代理负责。这样在 fake-IP DNS 环境（如 Clash `enhanced-mode: fake-ip`，域名解析到 `198.18.0.0/15`）下仍能正常转发给代理，不会在入口被误拦。
-- **直连回落校验（未配代理或代理失败时）**：在入口预校验基础上**额外做 DNS 解析**，确保解析到的 IP 是公网地址，拦截域名指向内网的情况。直接 GET 本身仍跟随系统代理。
+- **入口预校验（转发到代理前）**：只校验 scheme（`http`/`https`）。host / 私网 IP / DNS 一律不查——出站安全由 `[services.web_fetch]` provider 负责。这样内网目标（如 `http://10.10.10.205/...`）和 fake-IP DNS 环境都能正常转发给代理。
+- **直连回落校验（未配代理或代理失败时）**：校验 scheme、拒绝 `localhost`/`*.localhost` 与非公网 IP 字面量，并**额外做 DNS 解析**，确保解析到的 IP 是公网地址。直接 GET 本身仍跟随系统代理。
 
-> 简言之：配了 fetch 代理时，入口只做轻量格式 + IP 字面量校验，域名 DNS 安全交给代理；走直连时恢复完整 SSRF 校验。两条路径都保留对 localhost 和私网 IP 字面量的拦截。
+> 简言之：配了 fetch 代理时，kkagent 只拦非 http(s) URL，其余防护交给 provider；走直连时才做完整 SSRF 校验。
 
 对接外部 fetch 服务时只需实现上面这一个 POST 端点：入参 `url`，返回 2xx + 抽取后的正文文本。Moonshot 的 `.../v1/fetch` coding fetch 端点与此协议兼容（服务端已做正文抽取）。
 

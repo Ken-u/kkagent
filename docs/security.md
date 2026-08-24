@@ -71,7 +71,7 @@ AOSP `repo` checkout 的项目 Git 状态可能位于工作目录之外的 `.rep
 
 ## 网络和扩展
 
-`FetchURL` 有 SSRF 防护，仍应在网络层阻止访问云 metadata 和内网管理接口。MCP Server、Hook 和插件提示均跨越信任边界：stdio MCP 与 Hook 是本机进程，远程 MCP 能接收工具参数，Skill 和插件能影响模型行为。
+`Web(action = "fetch")` 在直连 GET（未配 `[services.web_fetch]` 或代理失败回落）时做 SSRF 防护；配置了 fetch provider 时由 provider 负责出站安全。仍应在网络层阻止访问云 metadata 和内网管理接口。MCP Server、Hook 和插件提示均跨越信任边界：stdio MCP 与 Hook 是本机进程，远程 MCP 能接收工具参数，Skill 和插件能影响模型行为。
 
 ## 遥测
 

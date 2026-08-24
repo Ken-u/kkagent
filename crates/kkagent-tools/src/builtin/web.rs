@@ -140,11 +140,10 @@ impl WebTool {
             Ok(url) => url,
             Err(e) => return ToolOutput::error(format!("Invalid URL: {e}")),
         };
-        // Validate URL scheme/host only — skip DNS resolution so a configured
-        // fetch provider works behind fake-IP DNS (e.g. Clash). The provider
-        // owns its outbound safety; the direct-GET fallback still runs full
-        // SSRF checks inside fetch_validated.
-        if let Err(e) = validate_http_url_format(&parsed_url) {
+        // Scheme only at the tool entry. A configured fetch provider owns
+        // outbound safety (including private/loopback targets). Direct GET
+        // still runs full SSRF checks inside fetch_validated.
+        if let Err(e) = validate_http_scheme(&parsed_url) {
             return ToolOutput::error(format!("Web fetch blocked: {e}"));
         }
 
@@ -322,12 +321,17 @@ async fn read_response_limited(
     Ok((len, String::from_utf8_lossy(&bytes).into_owned()))
 }
 
-/// Validates URL scheme/host/port without DNS resolution. Used before
-/// delegating to a fetch provider — the provider owns its outbound safety.
-fn validate_http_url_format(url: &reqwest::Url) -> anyhow::Result<()> {
+fn validate_http_scheme(url: &reqwest::Url) -> anyhow::Result<()> {
     if !matches!(url.scheme(), "http" | "https") {
         anyhow::bail!("only http and https URLs are allowed");
     }
+    Ok(())
+}
+
+/// Validates URL scheme/host/port without DNS resolution. Used by the
+/// direct-GET path before looking up the host.
+fn validate_http_url_format(url: &reqwest::Url) -> anyhow::Result<()> {
+    validate_http_scheme(url)?;
     let host = url
         .host_str()
         .ok_or_else(|| anyhow::anyhow!("URL has no host"))?;
@@ -337,11 +341,6 @@ fn validate_http_url_format(url: &reqwest::Url) -> anyhow::Result<()> {
     let _port = url
         .port_or_known_default()
         .ok_or_else(|| anyhow::anyhow!("URL has no usable port"))?;
-    // If the host is an IP literal, check it is public — this needs no DNS
-    // lookup (the IP is already in the URL), so fake-IP DNS is irrelevant,
-    // and it still blocks obvious SSRF targets (private/loopback/link-local)
-    // from being forwarded to a configured fetch provider. Domain hosts skip
-    // DNS resolution here; the provider owns outbound safety for them.
     if let Ok(ip) = host.parse::<std::net::IpAddr>() {
         if !is_public_ip(ip) {
             anyhow::bail!("URL host is a non-public IP address {ip}");
@@ -494,31 +493,30 @@ mod fetch_security_tests {
     }
 
     #[test]
+    fn validate_http_scheme_allows_private_literals_for_provider() {
+        validate_http_scheme(&reqwest::Url::parse("http://10.10.10.205/a").unwrap()).unwrap();
+        validate_http_scheme(&reqwest::Url::parse("http://localhost/a").unwrap()).unwrap();
+        let bad = reqwest::Url::parse("file:///etc/passwd").unwrap();
+        assert!(validate_http_scheme(&bad).is_err());
+    }
+
+    #[test]
     fn validate_http_url_format_skips_dns_resolution() {
-        // A normal domain http URL passes the format check with no DNS lookup,
-        // so a configured fetch provider can be reached behind fake-IP DNS
-        // (e.g. Clash) without being blocked up front.
         let url = reqwest::Url::parse("https://example.com/a").unwrap();
         validate_http_url_format(&url).unwrap();
 
-        // Non-http schemes are rejected at the format stage.
         let bad = reqwest::Url::parse("file:///etc/passwd").unwrap();
         assert!(validate_http_url_format(&bad).is_err());
 
-        // localhost is rejected at the format stage too.
         let lh = reqwest::Url::parse("http://localhost/a").unwrap();
         assert!(validate_http_url_format(&lh).is_err());
 
-        // A private IP literal is rejected without any DNS lookup (SSRF guard
-        // for the provider-forwarded path).
         let priv_ip = reqwest::Url::parse("http://192.168.1.1/a").unwrap();
         assert!(validate_http_url_format(&priv_ip).is_err());
 
-        // A cloud-metadata IP literal is rejected too.
         let meta = reqwest::Url::parse("http://169.254.169.254/latest").unwrap();
         assert!(validate_http_url_format(&meta).is_err());
 
-        // A public IP literal is allowed.
         let pub_ip = reqwest::Url::parse("http://8.8.8.8/a").unwrap();
         validate_http_url_format(&pub_ip).unwrap();
     }
