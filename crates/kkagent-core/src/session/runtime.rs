@@ -380,7 +380,7 @@ impl Session {
             id,
             title,
             messages: Vec::new(),
-            system_prompt: default_system_prompt(),
+            system_prompt: crate::plugin_overrides::effective_base_system_prompt(),
             working_dir,
             image_config: kkagent_config::ImageConfig::default(),
             permission_mode: Arc::new(std::sync::Mutex::new(permission_mode)),
@@ -1644,7 +1644,9 @@ mod tests {
     }
 }
 
-fn default_system_prompt() -> String {
+/// Built-in default persona. Overridable as a whole by plugins via
+/// `replaceSystemPrompt: true`; see `plugin_overrides::effective_base_system_prompt`.
+pub fn default_system_prompt() -> String {
     // Aligned with kimi-code `profile/default/system.md` (trimmed for CLI v1 scope).
     r#"You are kkagent, an interactive general AI agent running on a user's computer.
 

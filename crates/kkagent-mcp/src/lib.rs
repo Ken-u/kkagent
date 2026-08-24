@@ -10,4 +10,6 @@ pub use client::{
 };
 pub use hooks::{HookConfig as McpHookConfig, HookEvent, HookManager, HookOutcome};
 pub use skills::SkillsManager;
-pub use tool_bridge::{qualify_mcp_tool_name, register_mcp_tools};
+pub use tool_bridge::{
+    qualified_tool_name as qualify_namespaced_tool_name, qualify_mcp_tool_name, register_mcp_tools,
+};

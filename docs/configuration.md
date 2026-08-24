@@ -246,6 +246,15 @@ timeout = 5
 
 事件支持 `pre_tool_call`、`post_tool_call`、`session_start`、`session_end`、`turn_start`、`turn_end`、`notification`。`matcher` 支持精确工具名和 `*` 通配；带 matcher 的非工具事件不会触发。JSON Hook 格式见[扩展机制](extensions.md)。
 
+## 插件（`[plugins]`）
+
+```toml
+[plugins]
+extra_overridable_tools = ["Bash"]  # 允许插件 toolOverride 覆盖高危内置工具
+```
+
+`extra_overridable_tools`：在默认可覆盖清单（`Web`/`TaskOutput`/`Skill`/`Cron`/`ReadMediaFile`）之外，允许插件覆盖的内置工具名。`Bash`/`Edit`/`Write` 等高危工具必须在此显式列出才可被 `toolOverrides` 替换；`AskUserQuestion`/`EnterPlanMode`/`ExitPlanMode`/`Goal` 为守卫工具，无论如何配置都不可覆盖。完整 19 个内置工具的分级表见[扩展机制](extensions.md#插件-override)。注意该开关只管 `toolOverrides`（MCP 替换工具本体）；插件通过 `services` 段替换 `[services.web_search]`/`[services.web_fetch]` 后端不受此限制，也不需要任何 MCP server。
+
 ## 服务
 
 `[services]` 为内置 `Web` 工具的两个动作提供可选后端：`action = "search"`（搜索）与 `action = "fetch"`（抓取网页正文）。`fetch` 不配置后端也能用（直接 HTTP GET + SSRF 校验）；`search` 必须配置 `[services.web_search]`，未配置时工具会返回错误并提示补配置。

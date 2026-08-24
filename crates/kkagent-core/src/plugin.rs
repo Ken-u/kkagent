@@ -5,7 +5,7 @@
 //! `mcpServers` manifest field and are bridged by `kkagent-mcp`.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
@@ -28,6 +28,63 @@ pub struct PluginInterface {
     pub website_url: Option<String>,
 }
 
+/// A slash command contributed by a plugin. Legacy manifests may list plain
+/// command names; those surface in completion but resolve to a hint that the
+/// plugin must handle them via MCP prompts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum PluginSlashCommand {
+    /// Legacy form: bare command name.
+    Name(String),
+    /// Full definition: name, description, and a prompt template where
+    /// `{{args}}` (and `{{arg0}}`, `{{arg1}}, …`) expand from user input.
+    Definition {
+        name: String,
+        #[serde(default)]
+        description: String,
+        #[serde(default, rename = "promptTemplate", alias = "prompt")]
+        prompt_template: Option<String>,
+        #[serde(default, rename = "argumentHint")]
+        argument_hint: Option<String>,
+    },
+}
+
+impl PluginSlashCommand {
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Name(name) => name,
+            Self::Definition { name, .. } => name,
+        }
+    }
+
+    pub fn description(&self) -> &str {
+        match self {
+            Self::Name(_) => "",
+            Self::Definition { description, .. } => description,
+        }
+    }
+
+    pub fn prompt_template(&self) -> Option<&str> {
+        match self {
+            Self::Name(_) => None,
+            Self::Definition {
+                prompt_template, ..
+            } => prompt_template.as_deref(),
+        }
+    }
+}
+
+/// Service-backend overrides contributed by a plugin. Mirrors the
+/// `[services]` config section; a plugin's entry replaces the user's
+/// config for that service (no MCP server involved).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PluginServiceOverrides {
+    #[serde(default, rename = "webSearch")]
+    pub web_search: Option<kkagent_config::WebSearchConfig>,
+    #[serde(default, rename = "webFetch")]
+    pub web_fetch: Option<kkagent_config::WebFetchConfig>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PluginManifest {
     pub name: String,
@@ -37,8 +94,28 @@ pub struct PluginManifest {
     pub description: String,
     #[serde(default, rename = "systemPrompt", alias = "prompt_append")]
     pub system_prompt: Option<String>,
+    /// When true, `systemPrompt` replaces the built-in base persona instead
+    /// of being appended. Workspace injections and other plugins' appended
+    /// prompts still apply after the replaced base.
+    #[serde(default, rename = "replaceSystemPrompt", alias = "replace_prompt")]
+    pub replace_system_prompt: bool,
+    /// Built-in tool name -> `"<server>.<tool>"` from this plugin's
+    /// `mcpServers`. The bridged MCP tool replaces the built-in under its
+    /// original name (subject to the override policy).
+    #[serde(default, rename = "toolOverrides")]
+    pub tool_overrides: BTreeMap<String, String>,
+    /// Built-in service backends this plugin provides/overrides without an
+    /// MCP server — e.g. `webSearch` replaces `[services.web_search]`.
+    /// Field names mirror config.toml so snippets are copy-pasteable.
     #[serde(default)]
-    pub slash_commands: Vec<String>,
+    pub services: PluginServiceOverrides,
+    /// Slash commands contributed by this plugin. Accepts the legacy plain
+    /// name list (command does nothing but gets listed) or full definitions
+    /// with a prompt template expanded client-side on execution.
+    /// `slash_commands` (snake_case) is the original field name and stays
+    /// accepted for pre-1.0 manifests.
+    #[serde(default, rename = "slashCommands", alias = "slash_commands")]
+    pub slash_commands: Vec<PluginSlashCommand>,
     #[serde(default, rename = "mcpServers")]
     pub mcp_servers: HashMap<String, kkagent_config::McpServerConfig>,
     #[serde(default)]
@@ -76,6 +153,15 @@ pub struct PluginInfo {
     pub enabled: bool,
     pub managed: bool,
     pub source: Option<String>,
+    /// Built-in tool names this plugin overrides (may be rejected by policy).
+    #[serde(default)]
+    pub tool_overrides: Vec<String>,
+    /// True when this plugin replaces the base system prompt.
+    #[serde(default)]
+    pub replaces_system_prompt: bool,
+    /// Full slash-command definitions (templates included) for the TUI.
+    #[serde(default)]
+    pub slash_commands: Vec<PluginSlashCommand>,
 }
 
 pub struct PluginManager {
@@ -131,7 +217,20 @@ impl PluginManager {
         if !self.plugins_dir.exists() {
             return Ok(HashMap::new());
         }
-        let installed = crate::plugin_marketplace::read_installed(&self.plugins_dir).await?;
+        // A malformed/unsupported installed.json (hand-edited, older format)
+        // must not wipe out plugin discovery: degrade to directory scanning
+        // with a warning instead of failing the whole reload.
+        let installed = match crate::plugin_marketplace::read_installed(&self.plugins_dir).await {
+            Ok(installed) => installed,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    path = %self.plugins_dir.join("installed.json").display(),
+                    "ignoring broken installed plugin state; falling back to directory scan"
+                );
+                crate::plugin_marketplace::InstalledPluginsFile::default()
+            }
+        };
         let has_installed_state = self.plugins_dir.join("installed.json").is_file();
         let mut roots: Vec<(PathBuf, bool, bool, Option<String>)> = installed
             .plugins
@@ -279,6 +378,14 @@ impl PluginManager {
                 enabled: plugin.enabled,
                 managed: plugin.managed,
                 source: plugin.source.clone(),
+                tool_overrides: plugin.manifest.tool_overrides.keys().cloned().collect(),
+                replaces_system_prompt: plugin.manifest.replace_system_prompt
+                    && plugin
+                        .manifest
+                        .system_prompt
+                        .as_deref()
+                        .is_some_and(|p| !p.trim().is_empty()),
+                slash_commands: plugin.manifest.slash_commands.clone(),
             })
             .collect();
         out.sort_by(|a, b| a.name.cmp(&b.name));
@@ -296,16 +403,128 @@ impl PluginManager {
             .collect()
     }
 
+    /// Effective base-prompt override, if any enabled plugin declares
+    /// `replaceSystemPrompt: true`. Multiple candidates resolve by plugin
+    /// name (ascending); losers are reported so callers can surface a
+    /// diagnostic.
+    pub async fn system_prompt_override(&self) -> Option<(String, Vec<String>)> {
+        let plugins = self.plugins.read().await;
+        let mut names: Vec<_> = plugins.keys().cloned().collect();
+        names.sort();
+        let mut winner: Option<String> = None;
+        let mut losers: Vec<String> = Vec::new();
+        for name in names {
+            let plugin = &plugins[&name];
+            if !plugin.enabled {
+                continue;
+            }
+            if !plugin.manifest.replace_system_prompt {
+                continue;
+            }
+            let prompt = plugin.manifest.system_prompt.as_deref();
+            if let Some(prompt) = prompt.filter(|p| !p.trim().is_empty()) {
+                if winner.is_none() {
+                    winner = Some(prompt.to_string());
+                } else {
+                    losers.push(name);
+                }
+            }
+        }
+        winner.map(|prompt| (prompt, losers))
+    }
+
+    /// All enabled plugins' tool overrides as `(builtin_name, source_ref)`
+    /// pairs, deterministically ordered by plugin name then builtin name.
+    /// Source refs are `"plugin:<plugin-id>:<server.tool>"` and are resolved
+    /// against the plugin's own MCP namespace at apply time.
+    pub async fn tool_overrides(&self) -> Vec<(String, String)> {
+        let plugins = self.plugins.read().await;
+        let mut names: Vec<_> = plugins.keys().cloned().collect();
+        names.sort();
+        let mut out = Vec::new();
+        for name in names {
+            let plugin = &plugins[&name];
+            if !plugin.enabled {
+                continue;
+            }
+            for (builtin, source) in &plugin.manifest.tool_overrides {
+                out.push((builtin.clone(), format!("plugin:{name}:{source}")));
+            }
+        }
+        out
+    }
+
+    /// `(plugin_id, mcp_servers)` for every enabled plugin, sorted by id.
+    /// Lock-free snapshot consumers use this to resolve override source refs.
+    pub async fn manifest_snapshot(
+        &self,
+    ) -> Vec<(String, HashMap<String, kkagent_config::McpServerConfig>)> {
+        let plugins = self.plugins.read().await;
+        let mut names: Vec<_> = plugins.keys().cloned().collect();
+        names.sort();
+        names
+            .into_iter()
+            .map(|name| {
+                let servers = plugins[&name].manifest.mcp_servers.clone();
+                (name, servers)
+            })
+            .collect()
+    }
+
+    /// Effective service overrides: first enabled plugin (by id order) that
+    /// declares each service wins; losers per service are reported so callers
+    /// can surface diagnostics. Config-style overrides replace `[services]`
+    /// without any MCP server involvement.
+    pub async fn service_overrides(&self) -> (PluginServiceOverrides, Vec<(String, Vec<String>)>) {
+        let plugins = self.plugins.read().await;
+        let mut names: Vec<_> = plugins.keys().cloned().collect();
+        names.sort();
+        let mut effective = PluginServiceOverrides::default();
+        let mut losers: Vec<(String, Vec<String>)> = Vec::new();
+        for name in names {
+            let plugin = &plugins[&name];
+            if !plugin.enabled {
+                continue;
+            }
+            if plugin.manifest.services.web_search.is_some() {
+                if effective.web_search.is_none() {
+                    effective.web_search = plugin.manifest.services.web_search.clone();
+                } else if let Some((_, list)) = losers.iter_mut().find(|(k, _)| k == "web_search") {
+                    list.push(name.clone());
+                } else {
+                    losers.push(("web_search".into(), vec![name.clone()]));
+                }
+            }
+            if plugin.manifest.services.web_fetch.is_some() {
+                if effective.web_fetch.is_none() {
+                    effective.web_fetch = plugin.manifest.services.web_fetch.clone();
+                } else if let Some((_, list)) = losers.iter_mut().find(|(k, _)| k == "web_fetch") {
+                    list.push(name.clone());
+                } else {
+                    losers.push(("web_fetch".into(), vec![name.clone()]));
+                }
+            }
+        }
+        (effective, losers)
+    }
+
     pub async fn prompt_append_all(&self) -> String {
         let plugins = self.plugins.read().await;
         let mut names: Vec<_> = plugins.keys().cloned().collect();
         names.sort();
         let mut out = String::new();
         for name in names {
-            if !plugins[&name].enabled {
+            let plugin = &plugins[&name];
+            if !plugin.enabled {
                 continue;
             }
-            if let Some(prompt) = plugins[&name].manifest.system_prompt.as_deref() {
+            // Replace-style prompts already form the session's base persona
+            // (see `system_prompt_override`); appending them again here would
+            // duplicate the text.
+            if plugin.manifest.replace_system_prompt {
+                continue;
+            }
+            if let Some(prompt) = plugin.manifest.system_prompt.as_deref() {
                 if !prompt.trim().is_empty() {
                     out.push_str("\n\n");
                     out.push_str(prompt);
@@ -517,12 +736,19 @@ async fn normalize_mcp_server(
     // plugins (the common case, e.g. `rk-codesearch_search`) expose their id,
     // multi-server plugins disambiguate with `_<server>`. The runtime name
     // above stays authoritative for toggles/OAuth so no state migrates.
-    server.tool_namespace = Some(if multi_server {
+    server.tool_namespace = Some(plugin_tool_namespace(plugin_id, server_name, multi_server));
+    Ok(server)
+}
+
+/// Exposed tool namespace for a plugin MCP server: the plugin id for
+/// single-server plugins, `<plugin-id>_<server-name>` when several servers
+/// share one plugin. Keep in sync with `normalize_mcp_server`.
+pub fn plugin_tool_namespace(plugin_id: &str, server_name: &str, multi_server: bool) -> String {
+    if multi_server {
         format!("{plugin_id}_{server_name}")
     } else {
         plugin_id.to_string()
-    });
-    Ok(server)
+    }
 }
 
 async fn resolve_plugin_command(plugin_root: &Path, command: &str) -> anyhow::Result<String> {
@@ -729,5 +955,255 @@ mod tests {
         assert!(validate_plugin_name("code-search_2").is_ok());
         assert!(validate_plugin_name("Bad Name").is_err());
         assert!(validate_plugin_name("").is_err());
+    }
+
+    async fn write_plugin(dir: &Path, id: &str, manifest: serde_json::Value) {
+        let root = dir.join(id);
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        tokio::fs::write(root.join(KK_ROOT_MANIFEST), manifest.to_string())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn parses_override_fields_and_slash_command_definitions() {
+        let dir = temp_plugins_dir();
+        write_plugin(
+            &dir,
+            "kk-web",
+            serde_json::json!({
+                "name": "kk-web",
+                "version": "1.0.0",
+                "systemPrompt": "custom persona",
+                "replaceSystemPrompt": true,
+                "toolOverrides": { "Web": "tavily.search" },
+                "slashCommands": [
+                    "legacy-name",
+                    {
+                        "name": "search",
+                        "description": "Search the web",
+                        "argumentHint": "<query>",
+                        "promptTemplate": "Search the web for {{args}} and summarize."
+                    }
+                ],
+                "mcpServers": {
+                    "tavily": { "command": "npx", "args": ["-y", "tavily-mcp"] }
+                }
+            }),
+        )
+        .await;
+
+        let manager = PluginManager::discover(&dir).await;
+        let overrides = manager.tool_overrides().await;
+        assert_eq!(
+            overrides,
+            vec![("Web".to_string(), "plugin:kk-web:tavily.search".to_string())]
+        );
+
+        let (prompt, losers) = manager.system_prompt_override().await.unwrap();
+        assert_eq!(prompt, "custom persona");
+        assert!(losers.is_empty());
+
+        let info = manager.list().await;
+        assert_eq!(info[0].tool_overrides, vec!["Web".to_string()]);
+        assert!(info[0].replaces_system_prompt);
+        assert_eq!(info[0].slash_commands.len(), 2);
+        assert_eq!(info[0].slash_commands[0].name(), "legacy-name");
+        assert_eq!(info[0].slash_commands[1].name(), "search");
+        assert_eq!(
+            info[0].slash_commands[1].prompt_template(),
+            Some("Search the web for {{args}} and summarize.")
+        );
+
+        let _ = tokio::fs::remove_dir_all(dir).await;
+    }
+
+    #[tokio::test]
+    async fn prompt_override_conflict_resolves_by_name_with_losers() {
+        let dir = temp_plugins_dir();
+        for (id, prompt) in [("a-plugin", "persona A"), ("b-plugin", "persona B")] {
+            write_plugin(
+                &dir,
+                id,
+                serde_json::json!({
+                    "name": id,
+                    "systemPrompt": prompt,
+                    "replaceSystemPrompt": true
+                }),
+            )
+            .await;
+        }
+
+        let manager = PluginManager::discover(&dir).await;
+        let (prompt, losers) = manager.system_prompt_override().await.unwrap();
+        assert_eq!(prompt, "persona A");
+        assert_eq!(losers, vec!["b-plugin".to_string()]);
+
+        let _ = tokio::fs::remove_dir_all(dir).await;
+    }
+
+    #[tokio::test]
+    async fn append_only_system_prompt_is_not_an_override() {
+        let dir = temp_plugins_dir();
+        // systemPrompt without replaceSystemPrompt keeps default behavior.
+        write_plugin(
+            &dir,
+            "appender",
+            serde_json::json!({
+                "name": "appender",
+                "systemPrompt": "extra guidance"
+            }),
+        )
+        .await;
+
+        let manager = PluginManager::discover(&dir).await;
+        assert!(manager.system_prompt_override().await.is_none());
+        // Append channel still exposes the text.
+        assert!(manager.prompt_append_all().await.contains("extra guidance"));
+
+        let _ = tokio::fs::remove_dir_all(dir).await;
+    }
+
+    #[tokio::test]
+    async fn replace_style_prompt_is_not_also_appended() {
+        let dir = temp_plugins_dir();
+        write_plugin(
+            &dir,
+            "replacer",
+            serde_json::json!({
+                "name": "replacer",
+                "systemPrompt": "custom persona",
+                "replaceSystemPrompt": true
+            }),
+        )
+        .await;
+        write_plugin(
+            &dir,
+            "appender",
+            serde_json::json!({ "name": "appender", "systemPrompt": "extra guidance" }),
+        )
+        .await;
+
+        let manager = PluginManager::discover(&dir).await;
+        let appended = manager.prompt_append_all().await;
+        assert!(
+            !appended.contains("custom persona"),
+            "replace-style prompt must not double as an appended section"
+        );
+        assert!(
+            appended.contains("extra guidance"),
+            "append-style unaffected"
+        );
+
+        let _ = tokio::fs::remove_dir_all(dir).await;
+    }
+
+    #[tokio::test]
+    async fn disabled_plugins_contribute_no_overrides() {
+        let dir = temp_plugins_dir();
+        // installed.json record fields are camelCase; a plain top-level
+        // plugin with no record stays enabled, so exercise the disabled
+        // path via the managed layout.
+        let off_root = dir.join("managed/off");
+        tokio::fs::create_dir_all(&off_root).await.unwrap();
+        let manifest = serde_json::json!({
+            "name": "off",
+            "systemPrompt": "persona",
+            "replaceSystemPrompt": true,
+            "toolOverrides": { "Web": "s.search" },
+            "mcpServers": { "s": { "command": "npx" } }
+        });
+        tokio::fs::write(off_root.join(KK_ROOT_MANIFEST), manifest.to_string())
+            .await
+            .unwrap();
+        tokio::fs::write(
+            dir.join("installed.json"),
+            &format!(
+                r#"{{"version":1,"plugins":[{{"id":"off","root":"{}","source":"./off","enabled":false,"installedAt":"2024-01-01T00:00:00Z"}}]}}"#,
+                off_root.display()
+            ),
+        )
+        .await
+        .unwrap();
+        let manager = PluginManager::discover(&dir).await;
+
+        assert!(manager.system_prompt_override().await.is_none());
+        assert!(manager.tool_overrides().await.is_empty());
+
+        let _ = tokio::fs::remove_dir_all(dir).await;
+    }
+
+    #[tokio::test]
+    async fn service_overrides_first_enabled_plugin_wins() {
+        let dir = temp_plugins_dir();
+        write_plugin(
+            &dir,
+            "b-search",
+            serde_json::json!({
+                "name": "b-search",
+                "services": {
+                    "webSearch": {
+                        "provider": "brave",
+                        "base_url": "https://b.example/search",
+                        "api_key_env": "BRAVE_KEY"
+                    }
+                }
+            }),
+        )
+        .await;
+        write_plugin(
+            &dir,
+            "a-search",
+            serde_json::json!({
+                "name": "a-search",
+                "services": {
+                    "webSearch": {
+                        "provider": "searxng",
+                        "base_url": "http://127.0.0.1:8888/search"
+                    }
+                }
+            }),
+        )
+        .await;
+        let manager = PluginManager::discover(&dir).await;
+
+        let (effective, losers) = manager.service_overrides().await;
+        let search = effective.web_search.clone().expect("web search override");
+        assert_eq!(search.provider.as_deref(), Some("searxng"));
+        assert_eq!(search.base_url, "http://127.0.0.1:8888/search");
+        // b-search loses on webSearch (id order: a-search first).
+        assert!(losers
+            .iter()
+            .any(|(svc, names)| svc == "web_search" && names == &vec!["b-search".to_string()]));
+
+        // Merging into a WebServicesConfig replaces the search backend.
+        let mut web = kkagent_tools::WebServicesConfig::from_app(&Default::default());
+        web.merge_plugin_overrides(&kkagent_config::ServicesConfig {
+            web_search: effective.web_search.clone(),
+            web_fetch: effective.web_fetch,
+            moonshot_search: None,
+            moonshot_fetch: None,
+        });
+        assert!(web.search.is_some());
+
+        let _ = tokio::fs::remove_dir_all(dir).await;
+    }
+
+    #[tokio::test]
+    async fn service_overrides_absent_when_no_plugin_declares_them() {
+        let dir = temp_plugins_dir();
+        write_plugin(
+            &dir,
+            "plain",
+            serde_json::json!({ "name": "plain", "mcpServers": { "s": { "command": "npx" } } }),
+        )
+        .await;
+        let manager = PluginManager::discover(&dir).await;
+        let (effective, losers) = manager.service_overrides().await;
+        assert!(effective.web_search.is_none());
+        assert!(effective.web_fetch.is_none());
+        assert!(losers.is_empty());
+
+        let _ = tokio::fs::remove_dir_all(dir).await;
     }
 }

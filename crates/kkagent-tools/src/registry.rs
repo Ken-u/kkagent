@@ -1,7 +1,10 @@
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::sync::Arc;
 
-use crate::Tool;
+use serde_json::Value;
+
+use crate::{Tool, ToolAccesses, ToolContext, ToolDisclosure, ToolDisplaySchema, ToolOutput};
 
 pub struct ToolRegistry {
     /// Name-keyed `BTreeMap`: iteration is deterministically sorted by name,
@@ -20,6 +23,13 @@ impl ToolRegistry {
 
     pub fn register(&mut self, tool: Arc<dyn Tool>) {
         self.tools.insert(tool.name().to_string(), tool);
+    }
+
+    /// Register a tool under an explicit name, replacing any existing entry.
+    /// Used by plugin overrides to re-bind a bridged MCP tool onto a
+    /// built-in tool's name (the stub keeps the original wire name).
+    pub fn register_at(&mut self, name: &str, tool: Arc<dyn Tool>) {
+        self.tools.insert(name.to_string(), tool);
     }
 
     pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
@@ -52,6 +62,71 @@ impl ToolRegistry {
 impl Default for ToolRegistry {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Identity-preserving adapter for plugin tool overrides.
+///
+/// The *behavior surface* (description, schema, execution, display) comes
+/// from `replacement`; the *identity and policy surface* — wire name,
+/// `read_only`, disclosure posture, resource-access inference, approval
+/// rule, default-approve — is inherited from `original`, so an overridden
+/// built-in is indistinguishable from the original for the model,
+/// permission chain, and progressive disclosure.
+pub struct OverrideTool {
+    original: Arc<dyn Tool>,
+    replacement: Arc<dyn Tool>,
+}
+
+impl OverrideTool {
+    pub fn new(original: Arc<dyn Tool>, replacement: Arc<dyn Tool>) -> Self {
+        Self {
+            original,
+            replacement,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Tool for OverrideTool {
+    fn name(&self) -> &str {
+        self.original.name()
+    }
+
+    fn description(&self) -> &str {
+        self.replacement.description()
+    }
+
+    fn parameters_schema(&self) -> Value {
+        self.replacement.parameters_schema()
+    }
+
+    fn read_only(&self) -> bool {
+        self.original.read_only()
+    }
+
+    fn disclosure(&self) -> ToolDisclosure {
+        self.original.disclosure()
+    }
+
+    fn accesses(&self, input: &Value, working_dir: &Path) -> ToolAccesses {
+        self.original.accesses(input, working_dir)
+    }
+
+    fn approval_rule(&self) -> &str {
+        self.original.approval_rule()
+    }
+
+    fn default_approve(&self) -> bool {
+        self.original.default_approve()
+    }
+
+    fn display_schema(&self) -> Option<ToolDisplaySchema> {
+        self.replacement.display_schema()
+    }
+
+    async fn execute(&self, input: Value, ctx: &ToolContext) -> anyhow::Result<ToolOutput> {
+        self.replacement.execute(input, ctx).await
     }
 }
 

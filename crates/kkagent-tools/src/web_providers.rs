@@ -135,6 +135,35 @@ impl WebServicesConfig {
         }
     }
 
+    /// Apply plugin service overrides on top of the config-derived state.
+    /// A plugin-declared service replaces the config one wholesale (field
+    /// names mirror config.toml, so snippets are copy-pasteable).
+    pub fn merge_plugin_overrides(&mut self, overrides: &kkagent_config::ServicesConfig) {
+        if let Some(ws) = overrides.web_search.as_ref() {
+            let api_key = resolve_api_key(ws.api_key.as_deref(), ws.api_key_env.as_deref());
+            self.search = Some(WebSearchServiceConfig {
+                provider: ws
+                    .provider
+                    .clone()
+                    .unwrap_or_else(|| "searxng".into())
+                    .to_ascii_lowercase(),
+                base_url: ws.base_url.clone(),
+                api_key,
+                timeout_ms: ws.timeout_ms.unwrap_or(15_000),
+                default_limit: ws.default_limit.unwrap_or(5).clamp(1, 20),
+                proxy: ws.proxy,
+            });
+        }
+        if let Some(wf) = overrides.web_fetch.as_ref() {
+            self.fetch = WebFetchServiceConfig {
+                base_url: Some(wf.base_url.clone()),
+                api_key: resolve_api_key(wf.api_key.as_deref(), wf.api_key_env.as_deref()),
+                timeout_ms: wf.timeout_ms.unwrap_or(30_000),
+                proxy: wf.proxy,
+            };
+        }
+    }
+
     pub fn search_configured(&self) -> bool {
         self.search
             .as_ref()

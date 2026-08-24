@@ -1,5 +1,6 @@
 pub mod loader;
 pub mod migrate;
+pub mod plugin_policy;
 pub mod schema;
 pub mod toolchain;
 pub mod workspace_trust;

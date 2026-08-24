@@ -1,0 +1,19 @@
+{
+  "name": "kk-web-brave",
+  "version": "1.0.0",
+  "description": "Example service-override plugin: points the built-in Web tool at Brave Search without any MCP server.",
+  "services": {
+    "webSearch": {
+      "provider": "brave",
+      "base_url": "https://api.search.brave.com/res/v1/web/search",
+      "api_key_env": "BRAVE_API_KEY",
+      "timeout_ms": 15000,
+      "default_limit": 5
+    }
+  },
+  "interface": {
+    "displayName": "KK Web via Brave",
+    "shortDescription": "WebSearch backend override example (no MCP)",
+    "developerName": "kkagent"
+  }
+}

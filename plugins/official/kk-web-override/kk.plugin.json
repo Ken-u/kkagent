@@ -1,0 +1,29 @@
+{
+  "name": "kk-web-override",
+  "version": "1.0.0",
+  "description": "Example override plugin: replaces the built-in Web tool with the plugin's MCP tools and demonstrates a full slash command.",
+  "systemPrompt": "When answering questions that need up-to-date information, use the overridden Web tool (backed by the kk-web-override plugin).",
+  "toolOverrides": {
+    "Web": "web.everything_search"
+  },
+  "slashCommands": [
+    {
+      "name": "lookup",
+      "description": "Look something up on the web",
+      "argumentHint": "<query>",
+      "promptTemplate": "Use the Web tool to look up: {{args}}. Summarize the key findings."
+    }
+  ],
+  "interface": {
+    "displayName": "KK Web Override",
+    "shortDescription": "Web tool override example",
+    "developerName": "kkagent"
+  },
+  "mcpServers": {
+    "web": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-everything"],
+      "env": {}
+    }
+  }
+}

@@ -42,7 +42,7 @@ pub fn qualify_mcp_tool_name(server_name: &str, tool_name: &str) -> String {
 
 /// Same as [`qualify_mcp_tool_name`] but with an explicit (possibly shortened)
 /// tool namespace instead of the raw server name.
-fn qualified_tool_name(namespace: &str, tool_name: &str) -> String {
+pub fn qualified_tool_name(namespace: &str, tool_name: &str) -> String {
     let full = format!(
         "{}{}{}{}",
         MCP_NAME_PREFIX,

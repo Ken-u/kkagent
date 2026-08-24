@@ -20,6 +20,26 @@
       "description": "Official example browser-control plugin (headless Chromium via MCP).",
       "keywords": ["browser", "automation", "cdp", "example"],
       "source": "./official/kk-browser"
+    },
+    {
+      "id": "kk-web-override",
+      "type": "plugin",
+      "tier": "official",
+      "displayName": "KK Web Override",
+      "version": "1.0.0",
+      "description": "Official example override plugin: replaces the built-in Web tool via toolOverrides and adds a full slash command.",
+      "keywords": ["override", "web", "slash-command", "example"],
+      "source": "./official/kk-web-override"
+    },
+    {
+      "id": "kk-web-brave",
+      "type": "plugin",
+      "tier": "official",
+      "displayName": "KK Web via Brave",
+      "version": "1.0.0",
+      "description": "Official example service-override plugin: points the built-in Web tool at Brave Search without MCP.",
+      "keywords": ["override", "services", "web", "no-mcp", "example"],
+      "source": "./official/kk-web-brave"
     }
   ]
 }

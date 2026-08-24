@@ -98,6 +98,9 @@ Hook 进程工作目录是当前 workspace，并收到 `KKAGENT_HOOK_EVENT` 和 
 
 ## 插件
 
+> 面向插件作者的上手指南与 manifest 字段参考见[插件开发指南](plugin-development.md)；
+> 本节是机制原理参考。
+
 插件从 `~/.kkagent/plugins/<directory>/` 发现，也兼容
 `~/.kkagent/plugins/managed/<id>/` 布局。Manifest 按以下优先级读取：
 
@@ -143,6 +146,108 @@ Plugin MCP server 使用 `plugin-<plugin-id>:<server-name>` 作为运行时名�
 旧版 `prompt_append` 仍兼容，等价于 `systemPrompt`。插件 MCP 可通过 `/mcp` 以其运行时
 名称启用或禁用，状态保存在 `~/.kkagent/disabled.toml`。插件进程是本机可执行代码，只应
 安装可信插件；损坏的 MCP 声明会作为 `/plugins` diagnostics 展示，并且不会阻止其他插件加载。
+
+### 插件 Override
+
+插件可以覆盖内置工具和替换基础系统提示词，用于深度定制（如把 `Web` 换成 Tavily
+MCP、发行版自定义 persona）：
+
+```json
+{
+  "name": "kk-web-tavily",
+  "version": "1.0.0",
+  "description": "Replace built-in Web with Tavily MCP",
+  "systemPrompt": "You are MyAgent...",
+  "replaceSystemPrompt": true,
+  "toolOverrides": {
+    "Web": "tavily.tavily_search"
+  },
+  "mcpServers": {
+    "tavily": { "command": "npx", "args": ["-y", "tavily-mcp"] }
+  }
+}
+```
+
+- **`toolOverrides`**：`内置工具名 → "<server>.<tool>"`（server 必须属于本插件的
+  `mcpServers`）。应用时机是工具注册表构建的最后一步：桥接后的 MCP 工具会以内置
+  工具的原始名字（如 `Web`）注册，内置实现被完全替换，对模型不可见。子代理 profile
+  按名字过滤工具，因此替换自动对子代理生效。替换采用**身份继承**语义：wire 名、渐进
+  披露（Inline/Deferred）、只读判定、审批规则与被覆盖工具完全一致，只有描述、参数
+  schema 与执行逻辑来自替换者。
+- **`services`**：服务后端覆盖（免 MCP）。`webSearch`/`webFetch` 字段与 `config.toml`
+  的 `[services.web_search]`/`[services.web_fetch]` 同构，启用即整体替换用户配置。
+  适合"只换搜索 provider"这类场景：不换工具实例，schema/权限/披露零变化，不拉起
+  任何进程。多插件声明同一服务按插件名字典序取第一个。详见
+  [插件开发指南](plugin-development.md#服务覆盖免-mcp)。
+- **`replaceSystemPrompt`**：`systemPrompt` 从「追加」变为「替换基础 persona」。
+  workspace 注入（AGENTS.md）、skills、其他插件的追加段仍然叠加在后面。主会话与
+  子代理统一生效。多个插件声明替换时按插件名字典序取第一个，其余记入日志警告。
+
+**策略边界**（`kkagent-config/src/plugin_policy.rs`）。内置工具共 19 个，全部列出：
+
+**永不可覆盖（4 个）**——权限/计划模式守卫按工具名硬编码，替换会绕过安全检查，即使写入 `extra_overridable_tools` 也会被拒绝：
+
+| 工具 | 原因 |
+|---|---|
+| `AskUserQuestion` | auto 模式强制 deny 守卫（防止无人值守会话卡在提问） |
+| `EnterPlanMode` | 计划模式入口守卫 |
+| `ExitPlanMode` | 计划模式审批出口守卫 |
+| `Goal` | 目标生命周期与预算守卫 |
+
+**默认可覆盖（5 个）**——低风险/纯数据面工具，manifest 声明即可替换：
+
+| 工具 | 说明 |
+|---|---|
+| `Web` | web search/fetch（最常见的 override 目标） |
+| `TaskOutput` | 后台任务/子代理结果查询 |
+| `Skill` | skill 加载 |
+| `Cron` | 定时任务管理 |
+| `ReadMediaFile` | 媒体文件读取 |
+
+**需配置显式开启（10 个）**——文件写入、命令执行、代理与内部机制类工具，须在 `config.toml` 中 opt-in：
+
+```toml
+[plugins]
+extra_overridable_tools = ["Bash"]  # 可列多项
+```
+
+| 工具 | 风险点 |
+|---|---|
+| `Bash` | 绕过沙箱/shell AST 安全检查/path policy |
+| `Edit` | 绕过路径守卫与文件冲突检测 |
+| `Write` | 同上 |
+| `Read` | 绕过敏感文件检查与工作区边界（只读，风险较低） |
+| `Grep` / `Glob` | 绕过工作区路径边界 |
+| `TodoList` | 低风险，但与 TUI 状态展示联动 |
+| `Agent` | 子代理启动（权限模式随宿主，但描述/协议可能被替换） |
+| `WritePlan` | 计划模式配套（覆盖后计划文件写入流程失效） |
+| `SelectTools` | 延迟工具加载机制（覆盖可能破坏 MCP 工具发现） |
+
+MCP 工具（`mcp__*` 命名空间）不属于内置工具：`toolOverrides` 的目标是内置工具名，对
+`mcp__*` 名字默认同样被策略拒绝，如确需替换另一插件的 MCP 工具也要走
+`extra_overridable_tools` 显式 opt-in。
+
+被策略拒绝或源工具不可用（server 未连接/被禁用）的 override 会**自动回退**到内置实现，
+并在日志中输出诊断，不会让工具消失。
+
+### 插件 Slash 命令
+
+`slashCommands` 支持完整命令定义，TUI 中以 `/plugin:<name>` 形式补全和执行：
+
+```json
+"slashCommands": [
+  {
+    "name": "search",
+    "description": "Search the web",
+    "argumentHint": "<query>",
+    "promptTemplate": "Search the web for {{args}} and summarize the top results."
+  }
+]
+```
+
+执行时模板中的 `{{args}}`（全部参数）和 `{{arg0}}`、`{{arg1}}`…（逐词）展开为用户
+输入，渲染结果作为普通用户消息提交给 agent。旧版纯命令名列表仍兼容，仅出现在补全中。
+
 
 ### 插件市场
 

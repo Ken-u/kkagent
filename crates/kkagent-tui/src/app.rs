@@ -221,6 +221,10 @@ pub struct AppState {
     pub skill_slash_commands: Vec<SlashSuggestion>,
     /// Maps slash command name → skill name.
     pub skill_command_map: std::collections::HashMap<String, String>,
+    /// Plugin-contributed slash entries (`plugin:<name>`).
+    pub plugin_slash_commands: Vec<SlashSuggestion>,
+    /// Maps `plugin:<command>` → rendered prompt template.
+    pub plugin_command_templates: std::collections::HashMap<String, (String, Option<String>)>,
     /// `@` file path autocomplete popup
     pub file_menu: Option<FileMenuState>,
     /// Model / session list picker overlay
@@ -1126,6 +1130,8 @@ impl AppState {
             slash_menu: None,
             skill_slash_commands: Vec::new(),
             skill_command_map: std::collections::HashMap::new(),
+            plugin_slash_commands: Vec::new(),
+            plugin_command_templates: std::collections::HashMap::new(),
             file_menu: None,
             list_picker: None,
             list_picker_stack: Vec::new(),
@@ -1442,7 +1448,9 @@ impl AppState {
             return;
         }
         self.file_menu = None;
-        let items = filter_slash_commands_with_extras(&text, &self.skill_slash_commands);
+        let mut extras: Vec<SlashSuggestion> = self.skill_slash_commands.clone();
+        extras.extend(self.plugin_slash_commands.iter().cloned());
+        let items = filter_slash_commands_with_extras(&text, &extras);
         if items.is_empty() {
             self.slash_menu = Some(SlashMenuState {
                 items: Vec::new(),
@@ -2490,6 +2498,9 @@ impl TuiApp {
             }
             crate::async_jobs::JobChannel::SkillsList => {
                 self.apply_skills_list(Some(data));
+            }
+            crate::async_jobs::JobChannel::PluginsList => {
+                self.apply_plugins_list(Some(data));
             }
             crate::async_jobs::JobChannel::McpStatus | crate::async_jobs::JobChannel::McpList => {
                 self.jobs.apply_mcp_status(&data);
@@ -6835,6 +6846,35 @@ impl TuiApp {
                 detail: mcp,
             });
         }
+        let overrides = plugin
+            .get("tool_overrides")
+            .and_then(|value| value.as_array())
+            .map(|names| {
+                names
+                    .iter()
+                    .filter_map(|value| value.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default();
+        if !overrides.is_empty() {
+            items.push(ListPickerItem {
+                id: "__info__".into(),
+                label: "Tool overrides".into(),
+                detail: overrides,
+            });
+        }
+        if plugin
+            .get("replaces_system_prompt")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false)
+        {
+            items.push(ListPickerItem {
+                id: "__info__".into(),
+                label: "System prompt".into(),
+                detail: "replaces the built-in base persona".into(),
+            });
+        }
         self.replace_list_picker(ListPickerState {
             kind: ListPickerKind::PluginInstalledDetail,
             title: format!(" {id} · plugin details · Esc back "),
@@ -9656,6 +9696,80 @@ impl TuiApp {
         Ok(())
     }
 
+    /// Shared delivery tail of `submit_input_with_delivery`.
+    async fn deliver_prompt_text(&mut self, text: String) -> anyhow::Result<()> {
+        let busy = matches!(
+            self.state.status,
+            SessionStatus::Thinking
+                | SessionStatus::ToolExecuting
+                | SessionStatus::WaitingApproval
+                | SessionStatus::WaitingQuestion
+                | SessionStatus::Compacting
+        );
+        if busy && self.state.queue_when_busy {
+            let Some(session_id) = self.state.session_id.clone() else {
+                self.system_message("No active session.".into());
+                return Ok(());
+            };
+            self.state
+                .prompt_queue
+                .push(crate::prompt_queue::QueuedPrompt::next_turn(
+                    session_id,
+                    text.clone(),
+                ));
+            self.state.messages.push(DisplayMessage {
+                role: MessageRole::User,
+                content: text,
+                thinking: None,
+                parts: Vec::new(),
+                tool_calls: Vec::new(),
+                delivery: crate::prompt_queue::DeliveryState::Queued,
+                idempotency_key: None,
+            });
+            self.system_message(format!(
+                "Queued ({} waiting) — will send after current turn.",
+                self.state.prompt_queue.items.len()
+            ));
+            self.enqueue_prompt_queue_sync();
+            return Ok(());
+        }
+
+        let idem = uuid::Uuid::new_v4().to_string();
+        if let Some(warn) = crate::draft_store::redact_sensitive_preview(&text) {
+            self.system_message(warn);
+        }
+        self.state.messages.push(DisplayMessage {
+            role: MessageRole::User,
+            content: text.clone(),
+            thinking: None,
+            parts: Vec::new(),
+            tool_calls: Vec::new(),
+            delivery: crate::prompt_queue::DeliveryState::Sending,
+            idempotency_key: Some(idem.clone()),
+        });
+        self.state.status = SessionStatus::Thinking;
+        self.state.thinking_text.clear();
+        self.state.scroll_up = 0;
+        self.state.follow_bottom = true;
+
+        if let Some(sid) = self.state.session_id.clone() {
+            if self.jobs.mcp.configured && !self.jobs.mcp.initialized {
+                self.jobs.mcp.waiting_for_prompt = true;
+                self.enqueue_mcp_status_poll();
+            }
+            self.jobs
+                .spawn_prompt(self.client.requester(), sid.clone(), text, Vec::new(), idem);
+            crate::draft_store::clear_draft(&sid);
+        } else {
+            self.state.status = SessionStatus::Idle;
+            if let Some(msg) = self.state.messages.last_mut() {
+                msg.delivery = crate::prompt_queue::DeliveryState::Failed;
+            }
+            self.system_message("No active session.".into());
+        }
+        Ok(())
+    }
+
     /// Execute `!cmd` / shell-mode input locally without involving the LLM.
     fn submit_local_shell(&mut self, cmd: String) -> anyhow::Result<()> {
         self.state.push_input_history(&cmd);
@@ -9734,6 +9848,23 @@ impl TuiApp {
         // Dynamic skill slash (`/skill:foo` or bare `/foo` mapped to a skill).
         if let Some(skill_name) = self.resolve_skill_command(&command) {
             return self.activate_skill(&skill_name, &args).await;
+        }
+
+        // Plugin-contributed commands (`/plugin:foo <args>`): expand the
+        // manifest prompt template and submit as a normal user message.
+        // Routes through the no-slash submission path (history, queueing,
+        // paste display) without re-entering slash dispatch.
+        if let Some(rendered) = self.render_plugin_command(&command, &args) {
+            let history_entry = format!("/{command} {args}").trim().to_string();
+            self.state.push_input_history(&history_entry);
+            return self.deliver_prompt_text(rendered).await;
+        }
+        if command.starts_with("plugin:") {
+            self.system_message(format!(
+                "Unknown plugin command `{command}` — plugin not installed, \
+                 disabled, or command has no prompt template."
+            ));
+            return Ok(());
         }
 
         // Resolve aliases via registry
@@ -10513,9 +10644,32 @@ impl TuiApp {
         None
     }
 
+    /// Expand a plugin command's prompt template with user args. Returns
+    /// `None` when the command is unknown or has no template (legacy names).
+    fn render_plugin_command(&self, command: &str, args: &str) -> Option<String> {
+        let (_name, template) = self.state.plugin_command_templates.get(command)?;
+        let template = template.as_deref()?;
+        let args = args.trim();
+        let parts: Vec<&str> = if args.is_empty() {
+            Vec::new()
+        } else {
+            args.split_whitespace().collect()
+        };
+        let mut out = template.to_string();
+        out = out.replace("{{args}}", args);
+        for (index, part) in parts.iter().enumerate() {
+            out = out.replace(&format!("{{{{arg{index}}}}}"), part);
+        }
+        Some(out)
+    }
+
     async fn refresh_skill_commands(&mut self) -> anyhow::Result<()> {
         let data = self.client.rpc_call("skills.list", None).await.ok();
         self.apply_skills_list(data);
+        // Plugin slash commands ride along so both dynamic sources refresh
+        // together (startup, /skills, /plugins reload).
+        let plugins = self.client.rpc_call("plugins.list", None).await.ok();
+        self.apply_plugins_list(plugins);
         Ok(())
     }
 
@@ -10549,6 +10703,78 @@ impl TuiApp {
         let (commands, map) = build_skill_slash_commands(&pairs);
         self.state.skill_slash_commands = commands;
         self.state.skill_command_map = map;
+    }
+
+    /// Rebuild plugin slash-command state from a `plugins.list` RPC result.
+    /// Full definitions (with `promptTemplate`) become executable commands;
+    /// legacy bare names still surface in completion with a hint.
+    fn apply_plugins_list(&mut self, data: Option<serde_json::Value>) {
+        let Some(data) = data else {
+            return;
+        };
+        let mut commands = Vec::new();
+        let mut templates = std::collections::HashMap::new();
+        if let Some(arr) = data.get("plugins").and_then(|v| v.as_array()) {
+            for plugin in arr {
+                if !plugin
+                    .get("enabled")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+                let Some(list) = plugin.get("slashCommands").and_then(|v| v.as_array()) else {
+                    continue;
+                };
+                for entry in list {
+                    // Untagged enum: legacy form serializes as a bare string.
+                    let (name, description, hint, template) = match entry
+                        .as_str()
+                        .map(|s| (s.to_string(), String::new(), None, None))
+                    {
+                        Some(legacy) => legacy,
+                        None => (
+                            entry
+                                .get("name")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                            entry
+                                .get("description")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                            entry
+                                .get("argumentHint")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string()),
+                            entry
+                                .get("promptTemplate")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string()),
+                        ),
+                    };
+                    if name.is_empty() {
+                        continue;
+                    }
+                    let command = format!("plugin:{name}");
+                    if let Some(template) = template {
+                        templates.insert(command.clone(), (name.clone(), Some(template)));
+                    }
+                    commands.push(SlashSuggestion {
+                        name: command.clone(),
+                        description: if description.is_empty() {
+                            format!("Plugin command ({name})")
+                        } else {
+                            description
+                        },
+                        argument_hint: hint,
+                    });
+                }
+            }
+        }
+        self.state.plugin_slash_commands = commands;
+        self.state.plugin_command_templates = templates;
     }
 
     async fn activate_skill(&mut self, name: &str, args: &str) -> anyhow::Result<()> {

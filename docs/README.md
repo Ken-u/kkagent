@@ -15,6 +15,7 @@
 
 - [Agent Server API](server-api.md)：独立 Server、HTTP、WebSocket、RPC、认证和示例。
 - [ACP、MCP、Skills、Hooks 与插件](extensions.md)：编辑器协议和扩展机制。
+- [插件开发指南](plugin-development.md)：manifest 字段、MCP 工具、override、slash 命令、测试与发布。
 - [安全说明](security.md)：信任边界、网络暴露、敏感文件、Shell、凭据和遥测。
 - [运维指南](operations.md)：数据目录、日志、备份、升级、健康检查和资源限制。
 - [Node.js SDK](../sdk/node/README.md)：从 Node.js 控制 Agent Server。

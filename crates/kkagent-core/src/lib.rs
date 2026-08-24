@@ -20,6 +20,7 @@ mod plan_filename;
 pub mod plan_review;
 pub mod plugin;
 pub mod plugin_marketplace;
+pub mod plugin_overrides;
 pub mod replay;
 pub mod scope_context;
 pub mod session;

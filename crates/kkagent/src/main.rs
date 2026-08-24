@@ -2005,6 +2005,23 @@ async fn run_dump_system_prompt(config_path: Option<&Path>) -> Result<()> {
     let config = load_config(config_path)?;
     let working_dir = std::env::current_dir().context("failed to resolve current directory")?;
 
+    let (skills, plugins) = {
+        let plugins_dir = kkagent_config::default_config_dir().join("plugins");
+        tokio::join!(
+            kkagent_tools::SkillCatalog::configured(
+                &working_dir,
+                &config.extra_skill_dirs,
+                config.merge_all_available_skills,
+            ),
+            kkagent_core::PluginManager::discover(&plugins_dir),
+        )
+    };
+    // `--dump-system-prompt` must reflect plugin persona replacement too.
+    // Sync BEFORE creating the session: the base prompt is fixed at
+    // `Session::for_subagent` construction time.
+    kkagent_core::plugin_overrides::sync_system_prompt_override(&plugins).await;
+    skills.set_disabled(config.disabled_skills.clone()).await;
+
     let mut session = Session::for_subagent(
         "dump-system-prompt".to_string(),
         working_dir.clone(),
@@ -2019,18 +2036,6 @@ async fn run_dump_system_prompt(config_path: Option<&Path>) -> Result<()> {
     session.inject_workspace_instructions().await;
     session.attach_workspace_concurrency_guard();
 
-    let (skills, plugins) = {
-        let plugins_dir = kkagent_config::default_config_dir().join("plugins");
-        tokio::join!(
-            kkagent_tools::SkillCatalog::configured(
-                &working_dir,
-                &config.extra_skill_dirs,
-                config.merge_all_available_skills,
-            ),
-            kkagent_core::PluginManager::discover(&plugins_dir),
-        )
-    };
-    skills.set_disabled(config.disabled_skills.clone()).await;
     append_composed_prompt_sections(&skills, &plugins, &mut session).await;
 
     print!("{}", session.effective_system_prompt());
@@ -3722,7 +3727,7 @@ async fn build_turn_tool_registry(
     tools.register(Arc::new(kkagent_tools::builtin::SkillTool::new(
         state.skills.clone(),
     )));
-    if let Some(web) = kkagent_tools::builtin::WebTool::try_new(state.web.clone()) {
+    if let Some(web) = kkagent_tools::builtin::WebTool::try_new(state.web.read().await.clone()) {
         tools.register(Arc::new(web));
     } else {
         tracing::debug!("Web tool not registered: client construction failed");
@@ -3730,6 +3735,23 @@ async fn build_turn_tool_registry(
     tools.register(Arc::new(kkagent_tools::builtin::CronTool::new(
         state.cron.clone(),
     )));
+
+    // Plugin overrides run LAST: built-ins and MCP-bridged tools are all
+    // registered above, so re-binding cannot be clobbered by later registers.
+    let overrides = state.plugins.tool_overrides().await;
+    if !overrides.is_empty() {
+        let policy = state.config().plugins.clone();
+        let skipped = kkagent_core::plugin_overrides::apply_plugin_tool_overrides(
+            &mut tools,
+            &overrides,
+            &state.plugins,
+            &policy,
+        )
+        .await;
+        for (builtin, reason) in skipped {
+            tracing::warn!(tool = %builtin, %reason, "plugin tool override skipped");
+        }
+    }
     tools
 }
 
@@ -3876,7 +3898,9 @@ struct ServerState {
     cron_fires: Arc<Mutex<Vec<String>>>,
     hooks: Arc<kkagent_mcp::HookManager>,
     skills: Arc<kkagent_tools::SkillCatalog>,
-    web: Arc<kkagent_tools::WebServicesConfig>,
+    /// Web service backends; rebuilt when plugin service overrides change
+    /// (`/plugins reload` etc.) so the next turn's `WebTool` picks them up.
+    web: tokio::sync::RwLock<Arc<kkagent_tools::WebServicesConfig>>,
     plugins: Arc<kkagent_core::PluginManager>,
     telemetry: kkagent_telemetry::TelemetryServiceHandle,
     events: tokio::sync::broadcast::Sender<serde_json::Value>,
@@ -4952,10 +4976,37 @@ async fn refresh_plugin_mcp(state: &ServerState) -> Result<(usize, usize)> {
     );
     state.mcp.set_disabled_names(disabled).await;
     state.mcp.replace_configs(configs).await?;
+    // Prompt overrides are manifest-level: refresh them on every plugin
+    // mutation so active sessions pick the change up on their next turn.
+    kkagent_core::plugin_overrides::sync_system_prompt_override(&state.plugins).await;
+    // Service overrides too: rebuild the web backends so the next turn's
+    // WebTool uses the effective plugin-declared provider.
+    rebuild_web_services(state).await;
     Ok((
         state.mcp.configured_count(),
         state.mcp.list_tools().await.len(),
     ))
+}
+
+/// Recompute `WebServicesConfig` from user config + plugin service overrides.
+async fn rebuild_web_services(state: &ServerState) {
+    let (svc_overrides, svc_losers) = state.plugins.service_overrides().await;
+    for (service, names) in &svc_losers {
+        tracing::warn!(
+            service,
+            losers = names.join(", "),
+            "multiple plugins override the same service; first by plugin id wins"
+        );
+    }
+    let mut web_cfg = kkagent_tools::WebServicesConfig::from_app(state.config().as_ref());
+    let svc_as_config = kkagent_config::ServicesConfig {
+        web_search: svc_overrides.web_search,
+        web_fetch: svc_overrides.web_fetch,
+        moonshot_search: None,
+        moonshot_fetch: None,
+    };
+    web_cfg.merge_plugin_overrides(&svc_as_config);
+    *state.web.write().await = Arc::new(web_cfg);
 }
 
 async fn install_marketplace_plugin(
@@ -5076,6 +5127,8 @@ async fn build_server_state_with_shutdown(
 
     let plugins_dir = kkagent_config::default_config_dir().join("plugins");
     let plugins = kkagent_core::PluginManager::discover(&plugins_dir).await;
+    // Install any plugin base-prompt replacement before sessions are created.
+    kkagent_core::plugin_overrides::sync_system_prompt_override(&plugins).await;
     let mcp_configs = combined_mcp_servers(&config, &plugins).await;
     let mcp_server_count = mcp_configs.len();
     let mcp_servers_configured = !mcp_configs.is_empty();
@@ -5142,7 +5195,18 @@ async fn build_server_state_with_shutdown(
     let cron = Arc::new(cron);
     let goal_managers: Mutex<HashMap<String, Arc<kkagent_protocol::goal::GoalManager>>> =
         Mutex::new(HashMap::new());
-    let web = Arc::new(kkagent_tools::WebServicesConfig::from_app(&config));
+    // Web backends: user config + plugin service overrides. The lock is
+    // written here at startup and by `rebuild_web_services` on plugin changes.
+    let mut web_cfg = kkagent_tools::WebServicesConfig::from_app(&config);
+    let (svc_overrides, _svc_losers) = plugins.service_overrides().await;
+    let svc_as_config = kkagent_config::ServicesConfig {
+        web_search: svc_overrides.web_search,
+        web_fetch: svc_overrides.web_fetch,
+        moonshot_search: None,
+        moonshot_fetch: None,
+    };
+    web_cfg.merge_plugin_overrides(&svc_as_config);
+    let web = tokio::sync::RwLock::new(Arc::new(web_cfg));
 
     let cron_fires: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     {

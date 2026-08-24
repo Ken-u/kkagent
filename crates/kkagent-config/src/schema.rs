@@ -79,6 +79,28 @@ pub struct AppConfig {
     /// Optional SSH remote execution target (`[remote]`).
     #[serde(default)]
     pub remote: RemoteConfig,
+    /// Plugin system behavior (`[plugins]`).
+    #[serde(default)]
+    pub plugins: PluginsConfig,
+}
+
+/// Plugin system behavior (`[plugins]` in config.toml).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct PluginsConfig {
+    /// Built-in tool names plugins may override in addition to the default
+    /// low-risk allowlist (`Web`, `TaskOutput`, `Skill`, `Cron`,
+    /// `ReadMediaFile`). High-risk tools such as `Bash`/`Edit`/`Write` must
+    /// be opted into explicitly here. Guard tools (`AskUserQuestion`,
+    /// `EnterPlanMode`, `ExitPlanMode`, `Goal`) can never be overridden.
+    #[serde(default)]
+    pub extra_overridable_tools: Vec<String>,
+}
+
+impl PluginsConfig {
+    /// True when `name` may be overridden by a plugin under this config.
+    pub fn is_overridable(&self, name: &str) -> bool {
+        crate::plugin_policy::tool_overridable(name, &self.extra_overridable_tools)
+    }
 }
 
 /// Optional SSH remote environment (`[remote]` in config.toml).
