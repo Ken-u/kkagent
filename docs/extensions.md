@@ -251,10 +251,20 @@ MCP 工具（`mcp__*` 命名空间）不属于内置工具：`toolOverrides` 的
 
 ### 插件市场
 
-顶层 `plugin_marketplace` 可配置本地路径、`file://` URL 或 HTTP(S) URL，也可通过
-`KKAGENT_PLUGIN_MARKETPLACE_URL` 覆盖。两者都未设置时，如果
-`~/.kkagent/plugins/marketplace.json` 存在则自动使用。Marketplace JSON 至少包含
-`id` 和 `source`：
+顶层 `plugin_marketplace` 配置默认市场（本地路径、`file://` 或 HTTP(S) URL），
+`KKAGENT_PLUGIN_MARKETPLACE_URL` 只覆盖这一项。多个市场用 `plugin_marketplaces`：
+
+```toml
+plugin_marketplace = "https://plugins.example.com/marketplace.json"
+plugin_marketplaces = [
+  "http://10.10.10.205:8091/bjc/kk-plugins",
+  { name = "team", source = "/data/kk-plugins/marketplace.json" },
+]
+```
+
+两者都未设置时，如果 `~/.kkagent/plugins/marketplace.json` 存在则自动使用。
+通过 `/plugins` 弹窗添加的市场仍保存在 `~/.kkagent/plugins/marketplaces.json`。
+Marketplace JSON 至少包含 `id` 和 `source`：
 
 ```json
 {
@@ -288,8 +298,9 @@ release tag 和 commit URL。多插件单体仓库用 `tree/<branch>/<plugin-dir
 marketplace、从本地目录/ZIP/GitHub 来源安装或重新加载。选择 marketplace 后会先显示
 插件列表，再进入插件详情执行安装或更新；已安装插件详情支持启用、禁用、更新和带确认
 的移除。通过弹窗添加的 marketplace 会验证后保存到
-`~/.kkagent/plugins/marketplaces.json`，下次启动仍然可用。配置文件或环境变量指定的默认
-marketplace 也会显示在同一列表中。
+`~/.kkagent/plugins/marketplaces.json`，下次启动仍然可用。配置文件中的
+`plugin_marketplace` / `plugin_marketplaces` 以及环境变量指定的默认 marketplace
+也会显示在同一列表中（配置来源不可从弹窗删除）。
 
 ```text
 /plugins marketplace [source]

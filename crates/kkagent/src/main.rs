@@ -4940,26 +4940,38 @@ async fn combined_mcp_servers(
     configs
 }
 
+fn configured_plugin_marketplace_catalogs(
+    config: &AppConfig,
+) -> Vec<kkagent_config::PluginMarketplaceCatalog> {
+    let mut catalogs = config.plugin_marketplace_catalogs();
+    if catalogs.is_empty() {
+        let local = kkagent_config::default_config_dir()
+            .join("plugins")
+            .join("marketplace.json");
+        if local.is_file() {
+            catalogs.push(kkagent_config::PluginMarketplaceCatalog {
+                source: local.display().to_string(),
+                name: None,
+            });
+        }
+    }
+    catalogs
+}
+
 fn configured_plugin_marketplace(config: &AppConfig, explicit: Option<&str>) -> Result<String> {
     explicit
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
         .or_else(|| {
-            std::env::var("KKAGENT_PLUGIN_MARKETPLACE_URL")
-                .ok()
-                .filter(|value| !value.trim().is_empty())
-        })
-        .or_else(|| config.plugin_marketplace.clone())
-        .or_else(|| {
-            let local = kkagent_config::default_config_dir()
-                .join("plugins")
-                .join("marketplace.json");
-            local.is_file().then(|| local.display().to_string())
+            configured_plugin_marketplace_catalogs(config)
+                .into_iter()
+                .next()
+                .map(|catalog| catalog.source)
         })
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "plugin marketplace is not configured; set plugin_marketplace in config.toml, \
+                "plugin marketplace is not configured; set plugin_marketplace / plugin_marketplaces in config.toml, \
                  KKAGENT_PLUGIN_MARKETPLACE_URL, or pass a source"
             )
         })
@@ -5015,18 +5027,44 @@ async fn install_marketplace_plugin(
     id: &str,
     explicit_marketplace: Option<&str>,
 ) -> Result<kkagent_core::InstalledPluginRecord> {
-    let source = configured_plugin_marketplace(state.config().as_ref(), explicit_marketplace)?;
     let cwd = std::env::current_dir()?;
-    let marketplace = state.plugins.marketplace(&source, &cwd).await?;
-    let entry = marketplace
-        .plugins
-        .iter()
-        .find(|entry| entry.id == id)
-        .ok_or_else(|| anyhow::anyhow!("plugin {id} was not found in {source}"))?;
-    state
-        .plugins
-        .install(&entry.source, Some((&marketplace.source, entry)))
-        .await
+    let mut sources = Vec::new();
+    if let Some(explicit) = explicit_marketplace
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        sources.push(explicit.to_string());
+    } else {
+        for catalog in configured_plugin_marketplace_catalogs(state.config().as_ref()) {
+            sources.push(catalog.source);
+        }
+        for marketplace in state.plugins.registered_marketplaces().await? {
+            if !sources.iter().any(|source| source == &marketplace.source) {
+                sources.push(marketplace.source);
+            }
+        }
+    }
+    if sources.is_empty() {
+        anyhow::bail!(
+            "plugin marketplace is not configured; set plugin_marketplace / plugin_marketplaces in config.toml, \
+             KKAGENT_PLUGIN_MARKETPLACE_URL, or pass a source"
+        );
+    }
+    for source in &sources {
+        let marketplace = state.plugins.marketplace(source, &cwd).await?;
+        if let Some(entry) = marketplace
+            .plugins
+            .iter()
+            .find(|entry| entry.id == id)
+            .cloned()
+        {
+            return state
+                .plugins
+                .install(&entry.source, Some((&marketplace.source, &entry)))
+                .await;
+        }
+    }
+    anyhow::bail!("plugin {id} was not found in {}", sources.join(", "))
 }
 
 fn open_transcript_with_policy(
@@ -8892,12 +8930,29 @@ async fn handle_rpc_call(
         "plugins.marketplaces.list" => {
             let mut marketplaces = Vec::new();
             let mut sources = std::collections::HashSet::new();
-            if let Ok(source) = configured_plugin_marketplace(state.config().as_ref(), None) {
-                sources.insert(source.clone());
+            for (index, catalog) in configured_plugin_marketplace_catalogs(state.config().as_ref())
+                .into_iter()
+                .enumerate()
+            {
+                if !sources.insert(catalog.source.clone()) {
+                    continue;
+                }
+                let id = if index == 0 {
+                    "default".to_string()
+                } else {
+                    format!("config-{index}")
+                };
+                let name = catalog.name.unwrap_or_else(|| {
+                    if index == 0 {
+                        "Default marketplace".into()
+                    } else {
+                        format!("Marketplace {}", index + 1)
+                    }
+                });
                 marketplaces.push(serde_json::json!({
-                    "id": "default",
-                    "name": "Default marketplace",
-                    "source": source,
+                    "id": id,
+                    "name": name,
+                    "source": catalog.source,
                     "removable": false,
                 }));
             }

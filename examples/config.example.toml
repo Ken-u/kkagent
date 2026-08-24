@@ -10,6 +10,10 @@ extra_skill_dirs = []               # 额外 Skill 根目录；相对路径基�
 # disabled_skills = []              # 或由 TUI /skills 写入 ~/.kkagent/disabled.toml
 # disabled_mcp_servers = []         # 或由 TUI /mcp 写入 ~/.kkagent/disabled.toml
 # plugin_marketplace = "https://plugins.example.com/marketplace.json"
+# plugin_marketplaces = [
+#   "http://10.10.10.205:8091/bjc/kk-plugins",
+#   { name = "team", source = "/data/kk-plugins/marketplace.json" },
+# ]
 telemetry = false
 # trusted_workspaces = ["/absolute/path/to/project"]
 

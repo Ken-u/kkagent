@@ -34,10 +34,16 @@ pub struct AppConfig {
     /// Also honored when `[mcp_servers.X] enabled = false`.
     #[serde(default)]
     pub disabled_mcp_servers: Vec<String>,
-    /// Optional local path, file URL, or HTTP(S) URL for the KK plugin
-    /// marketplace catalog.
+    /// Optional local path, file URL, or HTTP(S) URL for the default KK plugin
+    /// marketplace catalog. Kept for backward compatibility; additional catalogs
+    /// go in `plugin_marketplaces`.
     #[serde(default)]
     pub plugin_marketplace: Option<String>,
+    /// Extra plugin marketplace catalogs. Each entry is a URL/path string or
+    /// `{ name = "...", source = "..." }`. Combined with `plugin_marketplace`
+    /// (which stays first when set).
+    #[serde(default)]
+    pub plugin_marketplaces: Vec<PluginMarketplaceSpec>,
     #[serde(default)]
     pub telemetry: bool,
     /// Trusted workspace roots (absolute paths). Empty = trust cwd implicitly.
@@ -105,6 +111,69 @@ impl PluginsConfig {
     /// True when `name` may be overridden by a plugin under this config.
     pub fn is_overridable(&self, name: &str) -> bool {
         crate::plugin_policy::tool_overridable(name, &self.extra_overridable_tools)
+    }
+}
+
+/// A plugin marketplace catalog declared in config.toml.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum PluginMarketplaceSpec {
+    Source(String),
+    Named {
+        #[serde(default)]
+        name: Option<String>,
+        source: String,
+    },
+}
+
+impl PluginMarketplaceSpec {
+    pub fn source(&self) -> &str {
+        match self {
+            Self::Source(source) => source,
+            Self::Named { source, .. } => source,
+        }
+    }
+
+    pub fn name(&self) -> Option<&str> {
+        match self {
+            Self::Named { name, .. } => name
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty()),
+            Self::Source(_) => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginMarketplaceCatalog {
+    pub source: String,
+    pub name: Option<String>,
+}
+
+impl AppConfig {
+    /// Configured marketplace catalogs: `plugin_marketplace` first (if set),
+    /// then `plugin_marketplaces`, de-duplicated by source.
+    pub fn plugin_marketplace_catalogs(&self) -> Vec<PluginMarketplaceCatalog> {
+        let mut catalogs = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut push = |source: &str, name: Option<String>| {
+            let source = source.trim();
+            if source.is_empty() || !seen.insert(source.to_string()) {
+                return;
+            }
+            catalogs.push(PluginMarketplaceCatalog {
+                source: source.to_string(),
+                name,
+            });
+        };
+        if let Some(source) = self.plugin_marketplace.as_deref() {
+            push(source, None);
+        }
+        for spec in &self.plugin_marketplaces {
+            push(spec.source(), spec.name().map(str::to_string));
+        }
+        catalogs
     }
 }
 
@@ -916,6 +985,14 @@ impl AppConfig {
         {
             anyhow::bail!("plugin_marketplace must not be empty");
         }
+        for (index, spec) in self.plugin_marketplaces.iter().enumerate() {
+            if spec.source().trim().is_empty() {
+                anyhow::bail!("plugin_marketplaces[{index}] source must not be empty");
+            }
+            if spec.name().is_some_and(|name| name.chars().count() > 80) {
+                anyhow::bail!("plugin_marketplaces[{index}] name must be at most 80 characters");
+            }
+        }
         for (name, provider) in &self.providers {
             if !matches!(
                 provider.provider_type.as_str(),
@@ -1312,6 +1389,40 @@ experimental_bad_toolcall_auto_retries = 2
             .unwrap_err()
             .to_string()
             .contains("plugin_marketplace"));
+    }
+
+    #[test]
+    fn parses_multiple_plugin_marketplaces() {
+        let config: AppConfig = toml::from_str(
+            r#"
+plugin_marketplace = "https://a.example/marketplace.json"
+plugin_marketplaces = [
+  "https://b.example/marketplace.json",
+  { name = "internal", source = "http://10.10.10.205:8091/bjc/kk-plugins" },
+]
+"#,
+        )
+        .unwrap();
+        let catalogs = config.plugin_marketplace_catalogs();
+        assert_eq!(catalogs.len(), 3);
+        assert_eq!(catalogs[0].source, "https://a.example/marketplace.json");
+        assert_eq!(catalogs[1].source, "https://b.example/marketplace.json");
+        assert_eq!(catalogs[2].name.as_deref(), Some("internal"));
+        assert_eq!(
+            catalogs[2].source,
+            "http://10.10.10.205:8091/bjc/kk-plugins"
+        );
+    }
+
+    #[test]
+    fn rejects_empty_plugin_marketplaces_source() {
+        let mut config = valid_config();
+        config.plugin_marketplaces = vec![PluginMarketplaceSpec::Source("  ".into())];
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("plugin_marketplaces[0]"));
     }
 
     #[test]

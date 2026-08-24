@@ -27,7 +27,8 @@ kkagent config preset safe
 | `default_plan_mode` | bool | `false` | 新会话是否以 Plan 模式开始。 |
 | `merge_all_available_skills` | bool | `false` | 把全部 Skill 正文合入初始上下文；默认只注入目录并按需加载。 |
 | `extra_skill_dirs` | string[] | `[]` | 额外 Skill 根目录；相对路径基于 Server 启动目录。 |
-| `plugin_marketplace` | string | 无 | KK plugin marketplace JSON 的本地路径、`file://` URL 或 HTTP(S) URL。环境变量 `KKAGENT_PLUGIN_MARKETPLACE_URL` 优先。 |
+| `plugin_marketplace` | string | 无 | 默认 KK plugin marketplace JSON 的本地路径、`file://` URL 或 HTTP(S) URL。环境变量 `KKAGENT_PLUGIN_MARKETPLACE_URL` 优先。 |
+| `plugin_marketplaces` | array | `[]` | 额外 marketplace 列表。元素可以是 URL/路径字符串，或 `{ name = "...", source = "..." }`。与 `plugin_marketplace` 合并去重后全部出现在 `/plugins` 市场列表中（配置项不可移除）。 |
 | `telemetry` | bool | `false` | 是否启用云遥测发送。 |
 | `trusted_workspaces` | string[] | `[]` | 预配置的绝对工作区；TUI 也会通过首次进入信任弹窗维护配置旁的 trust sidecar。为空时，非交互 Server 仍只隐式信任启动目录。 |
 
@@ -383,7 +384,7 @@ client_label = "kkagent"
 | `KKAGENT_DEFAULT_MODEL` | 默认模型。 |
 | `KKAGENT_SECONDARY_MODEL` | 辅助模型。 |
 | `KKAGENT_PERMISSION_MODE` | 默认权限模式。 |
-| `KKAGENT_PLUGIN_MARKETPLACE_URL` | 覆盖顶层 `plugin_marketplace`，指定本地路径、file URL 或 HTTP(S) marketplace JSON。 |
+| `KKAGENT_PLUGIN_MARKETPLACE_URL` | 覆盖顶层 `plugin_marketplace`（默认市场），指定本地路径、file URL 或 HTTP(S) marketplace JSON。不影响 `plugin_marketplaces`。 |
 | `ANTHROPIC_API_KEY`、`OPENAI_API_KEY`、`KIMI_API_KEY`、`GOOGLE_API_KEY` | 对应 Provider 密钥。 |
 | `KKAGENT_WEB_SEARCH_URL` | 覆盖 `[services.web_search]` 的 `base_url`，并同时读取下述 key / provider 变量。 |
 | `KKAGENT_WEB_SEARCH_KEY` | 搜索服务密钥；未设置时回退 `KKAGENT_MOONSHOT_SEARCH_KEY`、`MOONSHOT_API_KEY`。 |
