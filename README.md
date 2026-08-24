@@ -16,7 +16,7 @@ TUI 与 Agent Server 可分离，中间走 RPC（默认进程内 memory transpor
 - 内置工具：Read / Write / Edit / Grep / Glob / Bash / TodoList / Goal / Task / AskUser / SelectTools / Cron / Web / Media / Skill / Plan
 - 会话、事件、turn 队列和后台 Agent 任务统一持久化到 `~/.kkagent/transcripts.db`
 - Bash 系统隔离：Linux Bubblewrap、macOS Seatbelt、Windows Job Object
-- MCP / Skills / Hooks（配置驱动）
+- MCP / Skills / Hooks / 插件市场（配置驱动）
 
 ## 快速安装
 
@@ -127,7 +127,7 @@ kk -y -p "Read ./Cargo.toml and count workspace members"
   - `plan`：先审阅计划再执行，默认只读倾向。
 - **沙箱隔离**：Bash 默认使用系统级沙箱（Linux Bubblewrap、macOS Seatbelt、Windows Job Object），支持只读 / 限制网络等策略。
 - **持久化**：会话、事件、turn 队列和后台 Agent 任务统一写入 `~/.kkagent/transcripts.db`，支持 `--resume` 恢复。
-- **MCP 与 Skills**：通过配置接入外部 MCP Server，用 Skill 封装常用提示词和工具组合。
+- **MCP、Skills 与插件**：通过配置接入外部 MCP Server，用 Skill 封装常用提示词和工具组合；`/plugins` 从 marketplace 安装、更新和管理插件。
 - **可观测性**：结构化日志、HTTP 审计日志、telemetry 事件（可配置上报）。
 
 ## 架构概览
@@ -193,7 +193,21 @@ kkagent config preset safe
 
 排障时可用 `kkagent --disable-sandbox` 仅对当前进程关闭 Bash OS 沙箱和资源限制；它不修改配置，只建议在受控容器或 VM 中使用。
 
-完整配置项、Provider、Model、MCP、Hooks 说明见 [docs/configuration.md](docs/configuration.md)。
+完整配置项、Provider、Model、MCP、Hooks、插件市场说明见 [docs/configuration.md](docs/configuration.md)。
+
+### 插件市场
+
+`/plugins` 打开插件管理（已安装列表、市场浏览、安装/更新/启用/禁用）。默认市场用 `plugin_marketplace`，额外市场用 `plugin_marketplaces`：
+
+```toml
+plugin_marketplace = "https://plugins.example.com/marketplace.json"
+plugin_marketplaces = [
+  "http://git.example.com/org/kk-plugins",
+  { name = "team", source = "/data/kk-plugins/marketplace.json" },
+]
+```
+
+`KKAGENT_PLUGIN_MARKETPLACE_URL` 只覆盖默认那一项。也支持 GitHub / GitBucket 等兼容 forge 的仓库首页和 `tree/<ref>/<plugin-dir>` 源（安装时下 zip 并只取该子目录）。详情见 [docs/extensions.md](docs/extensions.md)。
 
 ## 文档索引
 

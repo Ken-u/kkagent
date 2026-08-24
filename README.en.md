@@ -16,7 +16,7 @@ The TUI and Agent Server are decoupled and communicate over RPC (default: in-pro
 - Built-in tools: Read, Write, Edit, Grep, Glob, Bash, TodoList, Goal, Task, AskUser, SelectTools, Cron, Web, Media, Skill, Plan
 - Sessions, events, turn queues, and background Agent tasks are persisted to `~/.kkagent/transcripts.db`
 - Bash sandboxing: Linux Bubblewrap, macOS Seatbelt, Windows Job Object
-- MCP / Skills / Hooks (configuration-driven)
+- MCP / Skills / Hooks / plugin marketplaces (configuration-driven)
 
 ## Quick Install
 
@@ -127,7 +127,7 @@ See [docs/cli-and-tui.md](docs/cli-and-tui.md) for more.
   - `plan`: the Agent drafts a plan first; the user reviews it before batch execution; read-only by default.
 - **Sandboxed execution**: Bash runs in a system-level sandbox (Linux Bubblewrap, macOS Seatbelt, Windows Job Object) with read-only / network-restricted policies.
 - **Persistence**: sessions, events, turn queues, and background Agent tasks are stored in `~/.kkagent/transcripts.db`; supports `--resume`.
-- **MCP and Skills**: connect external MCP Servers via configuration and wrap common prompts and tool combinations as Skills.
+- **MCP, Skills, and plugins**: connect external MCP Servers via configuration, wrap common prompts and tool combinations as Skills, and install or update plugins from marketplaces with `/plugins`.
 - **Observability**: structured logging, HTTP audit logs, telemetry events (configurable upload).
 
 ## Architecture Overview
@@ -193,7 +193,21 @@ kkagent config preset safe
 
 For troubleshooting, `kkagent --disable-sandbox` disables the Bash OS sandbox and resource limits for the current process without modifying the config. Use it only inside a controlled container or VM.
 
-For the full list of config options, providers, models, MCP, and hooks, see [docs/configuration.md](docs/configuration.md).
+For the full list of config options, providers, models, MCP, hooks, and plugin marketplaces, see [docs/configuration.md](docs/configuration.md).
+
+### Plugin marketplaces
+
+`/plugins` opens plugin management (installed list, marketplace browse, install/update/enable/disable). Set the default catalog with `plugin_marketplace` and extra catalogs with `plugin_marketplaces`:
+
+```toml
+plugin_marketplace = "https://plugins.example.com/marketplace.json"
+plugin_marketplaces = [
+  "http://git.example.com/org/kk-plugins",
+  { name = "team", source = "/data/kk-plugins/marketplace.json" },
+]
+```
+
+`KKAGENT_PLUGIN_MARKETPLACE_URL` overrides only the default catalog. GitHub-compatible forges (including GitBucket) are supported: a repo homepage or `tree/<ref>/<plugin-dir>` downloads the archive and extracts that subdirectory. See [docs/extensions.md](docs/extensions.md) for details.
 
 ## Documentation Index
 
