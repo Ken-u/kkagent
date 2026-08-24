@@ -960,17 +960,10 @@ impl AppConfig {
                     model.provider
                 );
             }
-            if model.experimental_vision_proxy {
-                if alias == default_model {
-                    anyhow::bail!(
-                        "model {alias} cannot be both the default model and experimental_vision_proxy"
-                    );
-                }
-                if !declares_image_input(&model.capabilities) {
-                    anyhow::bail!(
-                        "model {alias} sets experimental_vision_proxy without an image input capability (add `image_in` to its capabilities)"
-                    );
-                }
+            if model.experimental_vision_proxy && !declares_image_input(&model.capabilities) {
+                anyhow::bail!(
+                    "model {alias} sets experimental_vision_proxy without an image input capability (add `image_in` to its capabilities)"
+                );
             }
             if model.max_context_size == Some(0) || model.max_output_size == Some(0) {
                 anyhow::bail!("model {alias} token limits must be greater than zero");
@@ -1388,23 +1381,6 @@ experimental_bad_toolcall_auto_retries = 2
         assert!(
             err.to_string()
                 .contains("experimental_vision_proxy without an image input capability"),
-            "got: {err}"
-        );
-    }
-
-    #[test]
-    fn vision_proxy_cannot_be_default_model() {
-        let mut config = valid_config();
-        add_model(&mut config, "test/vision", vec!["image_in".into()]);
-        config
-            .models
-            .get_mut("test/vision")
-            .unwrap()
-            .experimental_vision_proxy = true;
-        config.default_model = Some("test/vision".into());
-        let err = config.validate().unwrap_err();
-        assert!(
-            err.to_string().contains("cannot be both the default model"),
             "got: {err}"
         );
     }

@@ -16,4 +16,6 @@ multimodal interface for primary models that declare no image input capability.
 - Descriptions are cached by SHA-256 of the image payload, so repeated rounds
   with the same image cost one proxy call in total.
 - The proxy model must itself declare an image input capability (`image_in`
-  etc.) and cannot be the `default_model`. At most one proxy per config.
+  etc.). At most one proxy per config. The proxy model may also serve as the
+  primary model — when it is active and has vision, `engaged()` returns false
+  and no substitution occurs.
