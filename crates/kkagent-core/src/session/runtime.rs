@@ -775,20 +775,6 @@ impl Session {
 
     pub fn request_interrupt(&self) {
         self.interrupted.store(true, Ordering::SeqCst);
-        // Unblock any in-flight approval wait
-        let _ = self.approval_tx.try_send(ApprovalResponse {
-            approval_id: String::new(),
-            decision: kkagent_protocol::ApprovalDecision::Cancelled,
-            scope: None,
-            feedback: Some("interrupted".into()),
-            selected_label: None,
-        });
-        let _ = self.question_tx.try_send(QuestionResponse {
-            question_id: String::new(),
-            selected_option_ids: Vec::new(),
-            free_text: None,
-            cancelled: true,
-        });
     }
 
     pub fn is_interrupted(&self) -> bool {
@@ -1004,10 +990,7 @@ impl Session {
             .await
             {
                 Ok(Some(resp)) => {
-                    if resp.approval_id == approval_id
-                        || resp.approval_id.is_empty()
-                        || matches!(resp.decision, kkagent_protocol::ApprovalDecision::Cancelled)
-                    {
+                    if resp.approval_id == approval_id {
                         return resp;
                     }
                 }
@@ -1046,10 +1029,7 @@ impl Session {
             .await
             {
                 Ok(Some(resp)) => {
-                    if resp.question_id == question_id
-                        || resp.question_id.is_empty()
-                        || resp.cancelled
-                    {
+                    if resp.question_id == question_id {
                         return resp;
                     }
                 }
@@ -1627,6 +1607,15 @@ fn subagent_scratch_dir(id: &str) -> PathBuf {
 mod tests {
     use super::*;
 
+    fn test_session() -> Session {
+        Session::new(
+            format!("runtime-test-{}", uuid::Uuid::new_v4().simple()),
+            std::env::temp_dir(),
+            PermissionMode::Manual,
+            "test-model".into(),
+        )
+    }
+
     #[test]
     fn subagent_source_never_touches_session_store() {
         let home =
@@ -1641,6 +1630,109 @@ mod tests {
         let dir2 = subagent_scratch_dir("sub-test");
         assert_ne!(dir, dir2);
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[tokio::test]
+    async fn wait_approval_ignores_stale_cancellation_from_another_request() {
+        let mut session = test_session();
+        session.submit_approval(ApprovalResponse {
+            approval_id: "old-approval".into(),
+            decision: kkagent_protocol::ApprovalDecision::Cancelled,
+            scope: None,
+            feedback: Some("stale interrupt".into()),
+            selected_label: None,
+        });
+        session.submit_approval(ApprovalResponse {
+            approval_id: "current-approval".into(),
+            decision: kkagent_protocol::ApprovalDecision::Approved,
+            scope: None,
+            feedback: None,
+            selected_label: None,
+        });
+
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            session.wait_approval("current-approval"),
+        )
+        .await
+        .expect("current approval should not be blocked by a stale response");
+
+        assert_eq!(response.approval_id, "current-approval");
+        assert_eq!(
+            response.decision,
+            kkagent_protocol::ApprovalDecision::Approved
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_question_ignores_stale_cancellation_from_another_request() {
+        let mut session = test_session();
+        session.submit_question(QuestionResponse {
+            question_id: "old-question".into(),
+            selected_option_ids: Vec::new(),
+            free_text: None,
+            cancelled: true,
+        });
+        session.submit_question(QuestionResponse {
+            question_id: "current-question".into(),
+            selected_option_ids: vec!["yes".into()],
+            free_text: None,
+            cancelled: false,
+        });
+
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            session.wait_question("current-question"),
+        )
+        .await
+        .expect("current question should not be blocked by a stale response");
+
+        assert_eq!(response.question_id, "current-question");
+        assert!(!response.cancelled);
+    }
+
+    #[tokio::test]
+    async fn clearing_interrupt_does_not_leave_cross_turn_cancellation_messages() {
+        let mut session = test_session();
+        session.request_interrupt();
+        session.clear_interrupt();
+        session.submit_approval(ApprovalResponse {
+            approval_id: "next-turn-approval".into(),
+            decision: kkagent_protocol::ApprovalDecision::Approved,
+            scope: None,
+            feedback: None,
+            selected_label: None,
+        });
+        session.submit_question(QuestionResponse {
+            question_id: "next-turn-question".into(),
+            selected_option_ids: vec!["continue".into()],
+            free_text: None,
+            cancelled: false,
+        });
+
+        let approval = session.wait_approval("next-turn-approval").await;
+        let question = session.wait_question("next-turn-question").await;
+
+        assert_eq!(approval.approval_id, "next-turn-approval");
+        assert_eq!(question.question_id, "next-turn-question");
+        assert!(!question.cancelled);
+    }
+
+    #[tokio::test]
+    async fn interrupt_still_cancels_active_approval_and_question_waits() {
+        let mut session = test_session();
+        session.request_interrupt();
+
+        let approval = session.wait_approval("active-approval").await;
+        let question = session.wait_question("active-question").await;
+
+        assert_eq!(approval.approval_id, "active-approval");
+        assert_eq!(
+            approval.decision,
+            kkagent_protocol::ApprovalDecision::Cancelled
+        );
+        assert_eq!(question.question_id, "active-question");
+        assert!(question.cancelled);
     }
 }
 

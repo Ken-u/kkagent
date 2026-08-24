@@ -7815,24 +7815,6 @@ async fn handle_rpc_call(
             if let Some(flag) = state.interrupt_flags.lock().await.get(&session_id) {
                 flag.store(true, std::sync::atomic::Ordering::SeqCst);
             }
-            // Cancel any in-flight approval / question waiters even mid-turn.
-            if let Some(tx) = state.approval_txs.lock().await.get(&session_id) {
-                let _ = tx.try_send(kkagent_protocol::ApprovalResponse {
-                    approval_id: String::new(),
-                    decision: kkagent_protocol::ApprovalDecision::Cancelled,
-                    scope: None,
-                    feedback: Some("interrupted".into()),
-                    selected_label: None,
-                });
-            }
-            if let Some(tx) = state.question_txs.lock().await.get(&session_id) {
-                let _ = tx.try_send(kkagent_protocol::QuestionResponse {
-                    question_id: String::new(),
-                    selected_option_ids: Vec::new(),
-                    free_text: None,
-                    cancelled: true,
-                });
-            }
             state.clear_pending_question(&session_id, None).await;
             state.clear_pending_tool_approval(&session_id, None).await;
             state
@@ -9542,35 +9524,64 @@ async fn handle_rpc_call(
                         .get("session_id")
                         .and_then(|v| v.as_str())
                         .map(String::from);
-
-                    let txs = state.approval_txs.lock().await;
-                    if let Some(sid) = session_id {
-                        let tx = txs.get(&sid).ok_or_else(|| {
-                            (-32602, format!("No approval channel for session: {sid}"))
-                        })?;
-                        tx.try_send(response.clone()).map_err(|error| {
+                    let mut pending = state.pending_tool_approvals.lock().await;
+                    let sid = if let Some(sid) = session_id {
+                        let is_current = pending
+                            .get(&sid)
+                            .is_some_and(|request| request.approval_id == response.approval_id);
+                        if !is_current {
+                            return Err((
+                                -32000,
+                                format!(
+                                    "Approval {} expired or is no longer pending for session {sid}",
+                                    response.approval_id
+                                ),
+                            ));
+                        }
+                        sid
+                    } else {
+                        let mut matches = pending
+                            .iter()
+                            .filter(|(_, request)| request.approval_id == response.approval_id)
+                            .map(|(sid, _)| sid.clone());
+                        let sid = matches.next().ok_or_else(|| {
                             (
                                 -32000,
-                                format!("Failed to deliver approval response: {error}"),
+                                format!(
+                                    "Approval {} expired or is no longer pending",
+                                    response.approval_id
+                                ),
                             )
                         })?;
-                        drop(txs);
-                        state
-                            .clear_pending_tool_approval(&sid, Some(response.approval_id.as_str()))
-                            .await;
-                        return Ok(serde_json::json!({"ok": true}));
-                    }
-                    let mut delivered = 0usize;
-                    for tx in txs.values() {
-                        if tx.try_send(response.clone()).is_ok() {
-                            delivered += 1;
+                        if matches.next().is_some() {
+                            return Err((
+                                -32000,
+                                format!(
+                                    "Approval {} is ambiguous without a session_id",
+                                    response.approval_id
+                                ),
+                            ));
                         }
-                    }
-                    return if delivered > 0 {
-                        Ok(serde_json::json!({"ok": true, "delivered": delivered}))
-                    } else {
-                        Err((-32000, "No approval channel accepted the response".into()))
+                        sid
                     };
+
+                    let tx = state
+                        .approval_txs
+                        .lock()
+                        .await
+                        .get(&sid)
+                        .cloned()
+                        .ok_or_else(|| {
+                            (-32602, format!("No approval channel for session: {sid}"))
+                        })?;
+                    tx.try_send(response.clone()).map_err(|error| {
+                        (
+                            -32000,
+                            format!("Failed to deliver approval response: {error}"),
+                        )
+                    })?;
+                    pending.remove(&sid);
+                    return Ok(serde_json::json!({"ok": true}));
                 }
             }
             Err((-32602, "Invalid approval response".into()))
@@ -10434,6 +10445,171 @@ mod runtime_http_tests {
     fn rpc_event_sink() -> mpsc::Sender<Frame> {
         let (tx, _rx) = mpsc::channel(16);
         tx
+    }
+
+    #[tokio::test]
+    async fn approval_response_requires_the_matching_pending_request() {
+        let state = test_server_state().await;
+        let params = serde_json::json!({
+            "session_id": "approval-session",
+            "approval_id": "approval-1",
+            "decision": "approved"
+        });
+
+        let error = handle_rpc_call(
+            state.clone(),
+            "approval.respond",
+            Some(params.clone()),
+            rpc_event_sink(),
+        )
+        .await
+        .expect_err("an orphaned approval response must be rejected");
+        assert_eq!(error.0, -32000);
+        assert!(error.1.contains("expired"));
+
+        let (approval_tx, mut approval_rx) = mpsc::channel(1);
+        state
+            .approval_txs
+            .lock()
+            .await
+            .insert("approval-session".into(), approval_tx);
+        state
+            .remember_pending_tool_approval(kkagent_protocol::ApprovalRequest {
+                approval_id: "approval-1".into(),
+                session_id: "approval-session".into(),
+                tool_call_id: "tool-call-1".into(),
+                tool_name: "Bash".into(),
+                action: "run command".into(),
+                tool_input_display: None,
+                created_at: chrono::Utc::now(),
+            })
+            .await;
+
+        let result = handle_rpc_call(
+            state.clone(),
+            "approval.respond",
+            Some(params.clone()),
+            rpc_event_sink(),
+        )
+        .await
+        .expect("the matching pending approval should be delivered");
+        assert_eq!(result["ok"], serde_json::json!(true));
+        let response = approval_rx
+            .recv()
+            .await
+            .expect("approval response delivered");
+        assert_eq!(response.approval_id, "approval-1");
+        assert_eq!(
+            response.decision,
+            kkagent_protocol::ApprovalDecision::Approved
+        );
+        assert!(state
+            .pending_tool_approval_for_session("approval-session")
+            .await
+            .is_none());
+
+        let error = handle_rpc_call(
+            state.clone(),
+            "approval.respond",
+            Some(params),
+            rpc_event_sink(),
+        )
+        .await
+        .expect_err("a duplicate approval response must be rejected");
+        assert!(error.1.contains("expired"));
+        state.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn interrupt_then_next_turn_approval_reaches_the_current_waiter() {
+        let state = test_server_state().await;
+        let session_id = "approval-after-interrupt";
+        let workspace =
+            std::env::temp_dir().join(format!("kkagent-approval-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let session = Session::new(
+            session_id.into(),
+            workspace.clone(),
+            PermissionMode::Manual,
+            "test-model".into(),
+        );
+        state
+            .interrupt_flags
+            .lock()
+            .await
+            .insert(session_id.into(), session.interrupted.clone());
+        state
+            .approval_txs
+            .lock()
+            .await
+            .insert(session_id.into(), session.approval_tx.clone());
+        state
+            .question_txs
+            .lock()
+            .await
+            .insert(session_id.into(), session.question_tx.clone());
+        state
+            .sessions
+            .lock()
+            .await
+            .insert(session_id.into(), session);
+
+        handle_rpc_call(
+            state.clone(),
+            "session.interrupt",
+            Some(serde_json::json!({"session_id": session_id})),
+            rpc_event_sink(),
+        )
+        .await
+        .expect("interrupt should succeed");
+
+        let mut session = state
+            .sessions
+            .lock()
+            .await
+            .remove(session_id)
+            .expect("session remains available after interrupt");
+        assert!(session.is_interrupted());
+        session.clear_interrupt();
+
+        state
+            .remember_pending_tool_approval(kkagent_protocol::ApprovalRequest {
+                approval_id: "next-turn-approval".into(),
+                session_id: session_id.into(),
+                tool_call_id: "bash-call".into(),
+                tool_name: "Bash".into(),
+                action: "run command".into(),
+                tool_input_display: None,
+                created_at: chrono::Utc::now(),
+            })
+            .await;
+        handle_rpc_call(
+            state.clone(),
+            "approval.respond",
+            Some(serde_json::json!({
+                "session_id": session_id,
+                "approval_id": "next-turn-approval",
+                "decision": "approved"
+            })),
+            rpc_event_sink(),
+        )
+        .await
+        .expect("next-turn approval should be accepted");
+
+        let response = tokio::time::timeout(
+            Duration::from_secs(1),
+            session.wait_approval("next-turn-approval"),
+        )
+        .await
+        .expect("next-turn waiter should receive its approval");
+        assert_eq!(response.approval_id, "next-turn-approval");
+        assert_eq!(
+            response.decision,
+            kkagent_protocol::ApprovalDecision::Approved
+        );
+
+        state.shutdown().await;
+        let _ = std::fs::remove_dir_all(workspace);
     }
 
     #[tokio::test]

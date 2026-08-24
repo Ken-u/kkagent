@@ -3290,6 +3290,11 @@ impl TuiApp {
             .approval_pending
             .as_ref()
             .is_some_and(|approval| approval.is_plan_review);
+        let visible_approval_pending = self
+            .state
+            .approval_pending
+            .as_ref()
+            .is_some_and(|approval| !approval.hidden);
         if plan_review_pending && matches!(key.code, KeyCode::Esc) {
             if let Some(approval) = self.state.approval_pending.as_mut() {
                 if approval.feedback_mode {
@@ -3322,7 +3327,7 @@ impl TuiApp {
         // Ctrl+C is intentionally not handled here — it drives quit confirm / dialog.
         if !matches!(self.state.status, SessionStatus::Idle)
             && matches!(key.code, KeyCode::Esc)
-            && !plan_review_pending
+            && !visible_approval_pending
         {
             if let Some(sid) = self.state.session_id.clone() {
                 match self.client.interrupt(&sid).await {
@@ -3463,9 +3468,9 @@ impl TuiApp {
                 KeyCode::Esc => {
                     self.respond_approval_choice(
                         ApprovalChoice {
-                            label: "cancel".into(),
-                            decision: kkagent_protocol::ApprovalDecision::Cancelled,
-                            selected_label: "cancel".into(),
+                            label: "reject".into(),
+                            decision: kkagent_protocol::ApprovalDecision::Rejected,
+                            selected_label: "reject".into(),
                             requires_feedback: false,
                             scope: None,
                         },
@@ -11009,6 +11014,13 @@ impl TuiApp {
         self.state.scroll_up = 0;
     }
 
+    fn clear_pending_interactions(&mut self) {
+        self.state.approval_pending = None;
+        self.state.approval_queue.clear();
+        self.state.question_pending = None;
+        self.state.btw_hid_approval = false;
+    }
+
     async fn respond_approval_choice(
         &mut self,
         choice: ApprovalChoice,
@@ -11352,14 +11364,28 @@ impl TuiApp {
                                 .set_status(&evt_sid, SessionStatus::WaitingQuestion);
                             self.state.tab_strip.mark_dirty(&evt_sid, true);
                         }
-                        AgentEvent::Error { message, .. } if message != "Interrupted" => {
-                            self.state.tab_strip.mark_dirty(&evt_sid, true);
+                        AgentEvent::Error { message, .. } => {
+                            self.state.parked_approvals.remove(&evt_sid);
+                            self.state.parked_questions.remove(&evt_sid);
+                            self.state
+                                .tab_strip
+                                .set_status(&evt_sid, SessionStatus::Idle);
+                            if message != "Interrupted" {
+                                self.state.tab_strip.mark_dirty(&evt_sid, true);
+                            }
                         }
                         AgentEvent::LlmRetry { initial: true, .. } => {
                             self.state.tab_strip.mark_dirty(&evt_sid, true);
                         }
                         AgentEvent::CompactCompleted { .. } => {
                             self.state.tab_strip.mark_dirty(&evt_sid, true);
+                        }
+                        AgentEvent::TurnEnd { .. } => {
+                            self.state.parked_approvals.remove(&evt_sid);
+                            self.state.parked_questions.remove(&evt_sid);
+                            self.state
+                                .tab_strip
+                                .set_status(&evt_sid, SessionStatus::Idle);
                         }
                         _ => {}
                     }
@@ -11673,6 +11699,7 @@ impl TuiApp {
                         }
                     }
                     AgentEvent::Error { message, .. } => {
+                        self.clear_pending_interactions();
                         self.state.status = SessionStatus::Idle;
                         if message != "Interrupted" {
                             self.system_message(format!("Error: {}", message));
@@ -11720,6 +11747,7 @@ impl TuiApp {
                         }
                     }
                     AgentEvent::TurnEnd { .. } => {
+                        self.clear_pending_interactions();
                         let active_assistant = self.state.active_assistant_message.take();
                         if !self.state.thinking_text.is_empty() {
                             let t = std::mem::take(&mut self.state.thinking_text);
@@ -14659,6 +14687,140 @@ mod app_state_tests {
             },
             choice,
         )
+    }
+
+    fn pending_bash_approval(id: &str) -> PendingApproval {
+        PendingApproval {
+            approval_id: id.into(),
+            tool_name: "Bash".into(),
+            action: "run command".into(),
+            detail: "cargo check".into(),
+            selected: 0,
+            choices: vec![ApprovalChoice {
+                label: "allow".into(),
+                decision: kkagent_protocol::ApprovalDecision::Approved,
+                selected_label: "allow".into(),
+                requires_feedback: false,
+                scope: Some(kkagent_protocol::ApprovalScope::Once),
+            }],
+            is_plan_review: false,
+            hidden: false,
+            resumed_plan_review: false,
+            feedback_mode: false,
+            feedback: String::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_approval_escape_rejects_only_the_tool() {
+        use futures::FutureExt;
+
+        let (client_transport, server_transport) =
+            kkagent_rpc::transport::memory::create_memory_pair();
+        let (event_tx, event_rx) = tokio::sync::mpsc::channel(16);
+        let rpc = kkagent_rpc::RpcClient::new(client_transport, event_tx);
+        let client = kkagent_client::KkagentClient::new(rpc, event_rx);
+        let (request_tx, mut request_rx) = tokio::sync::mpsc::unbounded_channel();
+        let handler: kkagent_rpc::server::RequestHandler =
+            Arc::new(move |_id, method, params, _event_tx| {
+                let request_tx = request_tx.clone();
+                async move {
+                    request_tx.send((method, params)).unwrap();
+                    Ok(serde_json::json!({"ok": true}))
+                }
+                .boxed()
+            });
+        tokio::spawn(async move {
+            kkagent_rpc::RpcServer::new(handler)
+                .serve(server_transport)
+                .await;
+        });
+
+        let mut app = TuiApp::new(AppConfig::default(), client);
+        app.state.session_id = Some("session-1".into());
+        app.state.status = SessionStatus::WaitingApproval;
+        app.state.approval_pending = Some(pending_bash_approval("approval-1"));
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        let (method, params) = request_rx.recv().await.expect("approval RPC sent");
+        assert_eq!(method, "approval.respond");
+        let params = params.expect("approval params");
+        assert_eq!(params["session_id"], serde_json::json!("session-1"));
+        assert_eq!(params["approval_id"], serde_json::json!("approval-1"));
+        assert_eq!(params["decision"], serde_json::json!("rejected"));
+        assert!(
+            request_rx.try_recv().is_err(),
+            "Esc must not interrupt the turn"
+        );
+        assert!(app.state.approval_pending.is_none());
+        assert_eq!(app.state.status, SessionStatus::Thinking);
+    }
+
+    #[tokio::test]
+    async fn terminal_turn_event_clears_pending_interaction_ui() {
+        let mut app = test_tui_app();
+        app.state.session_id = Some("session-1".into());
+        app.state.status = SessionStatus::WaitingApproval;
+        app.state.approval_pending = Some(pending_bash_approval("approval-1"));
+        app.state
+            .approval_queue
+            .push_back(pending_bash_approval("approval-2"));
+        app.state.question_pending = Some(PendingQuestion {
+            question_id: "question-1".into(),
+            text: "continue?".into(),
+            options: vec![("yes".into(), "Yes".into())],
+            allow_free_text: false,
+            allow_multiple: false,
+            selected: 0,
+            toggled: vec![false],
+            free_text: String::new(),
+        });
+        app.state.btw_hid_approval = true;
+
+        app.handle_server_event(Frame::Event {
+            event: "agent".into(),
+            scope: None,
+            data: serde_json::to_value(AgentEvent::TurnEnd {
+                session_id: "session-1".into(),
+            })
+            .unwrap(),
+        });
+
+        assert!(app.state.approval_pending.is_none());
+        assert!(app.state.approval_queue.is_empty());
+        assert!(app.state.question_pending.is_none());
+        assert!(!app.state.btw_hid_approval);
+        assert_eq!(app.state.status, SessionStatus::Idle);
+
+        app.state
+            .parked_approvals
+            .insert("session-2".into(), pending_bash_approval("approval-3"));
+        app.state.parked_questions.insert(
+            "session-2".into(),
+            PendingQuestion {
+                question_id: "question-2".into(),
+                text: "continue?".into(),
+                options: Vec::new(),
+                allow_free_text: true,
+                allow_multiple: false,
+                selected: 0,
+                toggled: Vec::new(),
+                free_text: String::new(),
+            },
+        );
+        app.handle_server_event(Frame::Event {
+            event: "agent".into(),
+            scope: None,
+            data: serde_json::to_value(AgentEvent::TurnEnd {
+                session_id: "session-2".into(),
+            })
+            .unwrap(),
+        });
+        assert!(!app.state.parked_approvals.contains_key("session-2"));
+        assert!(!app.state.parked_questions.contains_key("session-2"));
     }
 
     #[tokio::test]
