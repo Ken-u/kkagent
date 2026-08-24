@@ -9117,17 +9117,17 @@ async fn handle_rpc_call(
                     )
                 })?;
 
-            let messages = {
+            let (messages, session_model_alias) = {
                 let sessions = state.sessions.lock().await;
                 if let Some(session) = sessions.get(&session_id) {
-                    session.messages.clone()
+                    (session.messages.clone(), Some(session.get_model_alias()))
                 } else {
                     drop(sessions);
                     let db = state.transcript.lock().await;
                     let records = db
                         .load_messages(&session_id)
                         .map_err(|e| (-32000, e.to_string()))?;
-                    messages_from_records(&records)
+                    (messages_from_records(&records), None)
                 }
             };
 
@@ -9161,6 +9161,7 @@ async fn handle_rpc_call(
                     state_clone.config(),
                     &mut messages,
                     instruction.as_deref(),
+                    session_model_alias.as_deref(),
                 )
                 .await;
 

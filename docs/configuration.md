@@ -22,6 +22,7 @@ kkagent config preset safe
 | `default_model` | string | 必填 | 默认模型别名，必须存在于 `models`。 |
 | `fallback_model` | string | 无 | 全局 fallback 模型别名；主模型耗尽单步重试后使用，必须存在于 `models`。 |
 | `secondary_model` | string | 无 | 可选的辅助模型别名。 |
+| `compaction_model` | string | 无 | 专用于 `/compact` 历史压缩摘要的模型别名，必须存在于 `models`。设置后优先级最高，高于 `secondary_model`、session 当前模型和 `default_model`。也可用环境变量 `KKAGENT_COMPACTION_MODEL` 覆盖。 |
 | `default_permission_mode` | string | `manual` | `manual`、`yolo` 或 `auto`。 |
 | `default_plan_mode` | bool | `false` | 新会话是否以 Plan 模式开始。 |
 | `merge_all_available_skills` | bool | `false` | 把全部 Skill 正文合入初始上下文；默认只注入目录并按需加载。 |

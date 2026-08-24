@@ -503,12 +503,40 @@ fn build_summarizer_messages(
     projected
 }
 
+/// Resolve the model alias used for compaction summaries.
+///
+/// Priority: `compaction_model` > `secondary_model` > session model alias >
+/// `default_model`. Empty strings are ignored.
+pub fn resolve_compaction_model_alias(
+    config: &AppConfig,
+    session_model_alias: Option<&str>,
+) -> Option<String> {
+    config
+        .compaction_model
+        .clone()
+        .filter(|m| !m.is_empty())
+        .or_else(|| config.secondary_model.clone().filter(|m| !m.is_empty()))
+        .or_else(|| {
+            session_model_alias.and_then(|s| {
+                // Only honor aliases that still resolve; stale session aliases
+                // fall through to the validated global default.
+                if !s.is_empty() && config.resolve_model(s).is_some() {
+                    Some(s.to_string())
+                } else {
+                    None
+                }
+            })
+        })
+        .or_else(|| config.default_model_alias().map(|s| s.to_string()))
+}
+
 /// LLM summary with overflow shrink + empty/truncated retry. Never panics.
 /// Falls back to local digest when the model is unavailable.
 pub async fn summarize_history_with_llm(
     config: Arc<AppConfig>,
     history: &[ChatMessage],
     custom_instruction: Option<&str>,
+    session_model_alias: Option<&str>,
 ) -> (String, usize) {
     let mut history_for_model = history.to_vec();
     let mut dropped_count = 0usize;
@@ -516,10 +544,7 @@ pub async fn summarize_history_with_llm(
     let mut overflow_shrink = 0u32;
     let mut empty_shrink = 0u32;
 
-    let alias = config
-        .secondary_model
-        .clone()
-        .or_else(|| config.default_model_alias().map(|s| s.to_string()));
+    let alias = resolve_compaction_model_alias(&config, session_model_alias);
     let Some(alias) = alias else {
         return (local_digest_summary(history), 0);
     };
@@ -636,6 +661,7 @@ pub async fn compact_full_async(
     config: Arc<AppConfig>,
     messages: &mut Vec<ChatMessage>,
     custom_instruction: Option<&str>,
+    session_model_alias: Option<&str>,
 ) -> CompactionResult {
     if messages.is_empty() {
         return CompactionResult {
@@ -648,7 +674,7 @@ pub async fn compact_full_async(
         };
     }
     let (raw, summarizer_dropped) =
-        summarize_history_with_llm(config, messages, custom_instruction).await;
+        summarize_history_with_llm(config, messages, custom_instruction, session_model_alias).await;
     let mut result = apply_compaction(messages, &raw);
     result.summarizer_dropped_count = summarizer_dropped;
     result
@@ -853,5 +879,81 @@ mod tests {
             tools: None,
         };
         assert!(!is_real_user_input(&msg));
+    }
+
+    fn test_config() -> kkagent_config::AppConfig {
+        use kkagent_config::{AppConfig, ModelConfig, ProviderConfig};
+        use std::collections::HashMap;
+        let mut config = AppConfig::default();
+        let provider = ProviderConfig {
+            provider_type: "openai".into(),
+            api_key: None,
+            base_url: Some("https://example.test".into()),
+            custom_headers: HashMap::new(),
+            oauth: None,
+            first_token_timeout_ms: None,
+        };
+        config.providers.insert("test".into(), provider);
+        for alias in ["default", "session", "secondary", "compaction"] {
+            config.models.insert(
+                alias.into(),
+                ModelConfig {
+                    provider: "test".into(),
+                    model: format!("upstream-{alias}"),
+                    max_context_size: Some(100_000),
+                    max_output_size: Some(4_096),
+                    capabilities: vec!["tool_use".into()],
+                    display_name: None,
+                    support_efforts: Vec::new(),
+                    default_effort: None,
+                    pricing: None,
+                    experimental_adaptive_thinking: false,
+                    experimental_visible_empty_retries: 0,
+                    experimental_bad_toolcall_auto_retries: 0,
+                    first_token_timeout_ms: None,
+                },
+            );
+        }
+        config.default_model = Some("default".into());
+        config
+    }
+
+    #[test]
+    fn compaction_model_priority() {
+        let mut config = test_config();
+
+        // No dedicated models configured: session alias wins over default.
+        assert_eq!(
+            resolve_compaction_model_alias(&config, Some("session")),
+            Some("session".into())
+        );
+        // No session alias: global default.
+        assert_eq!(
+            resolve_compaction_model_alias(&config, None),
+            Some("default".into())
+        );
+        // Stale session alias that no longer resolves: falls back to default.
+        assert_eq!(
+            resolve_compaction_model_alias(&config, Some("ghost")),
+            Some("default".into())
+        );
+        // Empty strings are ignored at every level.
+        let mut empty = test_config();
+        empty.default_model = None;
+        assert_eq!(resolve_compaction_model_alias(&empty, Some("")), None);
+
+        // secondary_model outranks session alias and default.
+        config.secondary_model = Some("secondary".into());
+        assert_eq!(
+            resolve_compaction_model_alias(&config, Some("session")),
+            Some("secondary".into())
+        );
+
+        // compaction_model is the highest priority.
+        config.compaction_model = Some("compaction".into());
+        assert_eq!(
+            resolve_compaction_model_alias(&config, Some("session")),
+            Some("compaction".into())
+        );
     }
 }

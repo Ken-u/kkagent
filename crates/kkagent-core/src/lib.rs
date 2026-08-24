@@ -55,9 +55,9 @@ pub use event_bus::EventBus;
 pub use file_conflict::FileConflictTracker;
 pub use full_compaction::{
     apply_compaction, compact_full, compact_full_async, is_real_user_input,
-    observe_context_overflow, select_compaction_user_messages, summarize_history_with_llm,
-    CompactionPolicy, CompactionResult, CompactionStrategy, DEFAULT_BLOCK_RATIO,
-    DEFAULT_TRIGGER_RATIO, MAX_OVERFLOW_COMPACTION_ATTEMPTS,
+    observe_context_overflow, resolve_compaction_model_alias, select_compaction_user_messages,
+    summarize_history_with_llm, CompactionPolicy, CompactionResult, CompactionStrategy,
+    DEFAULT_BLOCK_RATIO, DEFAULT_TRIGGER_RATIO, MAX_OVERFLOW_COMPACTION_ATTEMPTS,
 };
 pub use git_context::is_workspace_trusted;
 pub use legacy_migrate::{migrate_legacy_home, MigrateReport};

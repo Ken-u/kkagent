@@ -269,6 +269,9 @@ fn apply_env_overrides(config: &mut AppConfig) {
     if let Ok(v) = std::env::var("KKAGENT_SECONDARY_MODEL") {
         config.secondary_model = Some(v);
     }
+    if let Ok(v) = std::env::var("KKAGENT_COMPACTION_MODEL") {
+        config.compaction_model = Some(v);
+    }
     if let Ok(v) = std::env::var("KKAGENT_PERMISSION_MODE") {
         config.default_permission_mode = Some(v);
     }

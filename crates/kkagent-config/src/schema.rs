@@ -14,6 +14,11 @@ pub struct AppConfig {
     /// Optional secondary model alias for subagents / summarization.
     #[serde(default)]
     pub secondary_model: Option<String>,
+    /// Dedicated model alias for history compaction summaries. When set it
+    /// takes precedence over `secondary_model`, the session model and
+    /// `default_model` when resolving the compaction summarizer.
+    #[serde(default)]
+    pub compaction_model: Option<String>,
     #[serde(default)]
     pub default_permission_mode: Option<String>,
     #[serde(default)]
@@ -949,6 +954,11 @@ impl AppConfig {
                 anyhow::bail!("secondary_model {secondary} is not present in [models]");
             }
         }
+        if let Some(compaction) = self.compaction_model.as_deref() {
+            if !self.models.contains_key(compaction) {
+                anyhow::bail!("compaction_model {compaction} is not present in [models]");
+            }
+        }
         if let Some(fallback) = self.fallback_model.as_deref() {
             if !self.models.contains_key(fallback) {
                 anyhow::bail!("fallback_model {fallback} is not present in [models]");
@@ -1154,6 +1164,20 @@ mod tests {
             .contains("fallback_model missing/model"));
 
         config.fallback_model = Some("test/model".into());
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn validates_compaction_model() {
+        let mut config = valid_config();
+        config.compaction_model = Some("missing/model".into());
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("compaction_model missing/model"));
+
+        config.compaction_model = Some("test/model".into());
         config.validate().unwrap();
     }
 

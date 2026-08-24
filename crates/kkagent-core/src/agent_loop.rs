@@ -2322,7 +2322,16 @@ Do not mention this reminder to the user.\n</system-reminder>"
             })
             .await;
 
-        let result = compact_full_async(self.config.clone(), &mut session.messages, None).await;
+        // Session model alias wins over the global default for auto compaction
+        // summaries unless a dedicated compaction/secondary model is set.
+        let session_model_alias = session.get_model_alias();
+        let result = compact_full_async(
+            self.config.clone(),
+            &mut session.messages,
+            None,
+            Some(&session_model_alias),
+        )
+        .await;
         session.transcript_rewrite_required = true;
         // Checkpoints survive compaction: file snapshots stay restorable,
         // transcript truncation for pre-compaction turns no longer applies.
