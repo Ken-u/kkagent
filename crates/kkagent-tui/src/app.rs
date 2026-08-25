@@ -2138,8 +2138,11 @@ impl TuiApp {
                 outcome.payload,
                 crate::async_jobs::JobPayload::LocalShell { .. }
                     | crate::async_jobs::JobPayload::Prompt { .. }
+                    | crate::async_jobs::JobPayload::PluginAction { .. }
             );
-            // Local shells and prompts from different sessions may complete out of order.
+            // Local shells and prompts from different sessions may complete out of
+            // order; plugin actions are independent downloads that overlap when
+            // the user queues another while one is running.
             if !may_finish_out_of_order
                 && !self.jobs.is_current(outcome.channel, outcome.generation)
             {
@@ -2375,6 +2378,10 @@ impl TuiApp {
                 crate::async_jobs::JobPayload::LocalShell { command, result } => {
                     self.jobs.mark_done(channel, generation);
                     self.apply_local_shell_result(&command, result);
+                }
+                crate::async_jobs::JobPayload::PluginAction { job, result } => {
+                    self.jobs.mark_done(channel, generation);
+                    self.apply_plugin_action_result(job, result).await;
                 }
                 crate::async_jobs::JobPayload::VersionCheck { result } => match result {
                     Ok(release) => {
@@ -7096,52 +7103,24 @@ impl TuiApp {
             self.state.plugin_prompt = Some(prompt);
             return Ok(());
         }
-        let result = match prompt.kind {
-            PluginPromptKind::AddMarketplace => {
-                self.client
-                    .rpc_call(
-                        "plugins.marketplaces.add",
-                        Some(serde_json::json!({"source": value})),
-                    )
-                    .await
-            }
-            PluginPromptKind::InstallSource => {
-                self.client
-                    .rpc_call(
-                        "plugins.install",
-                        Some(serde_json::json!({"source": value})),
-                    )
-                    .await
-            }
+        let (method, action) = match prompt.kind {
+            PluginPromptKind::AddMarketplace => ("plugins.marketplaces.add", "add"),
+            PluginPromptKind::InstallSource => ("plugins.install", "install"),
         };
-        match result {
-            Ok(_) => {
-                self.system_message(match prompt.kind {
-                    PluginPromptKind::AddMarketplace => {
-                        format!("Plugin marketplace added: {value}")
-                    }
-                    PluginPromptKind::InstallSource => format!("Plugin installed from {value}"),
-                });
-                self.begin_root_picker();
-                self.open_plugins_picker().await?;
-                let root = self.state.list_picker.take().expect("plugin root picker");
-                self.state.list_picker_stack.push(root);
-                let open_result = match prompt.kind {
-                    PluginPromptKind::AddMarketplace => {
-                        self.open_plugin_marketplaces_picker().await
-                    }
-                    PluginPromptKind::InstallSource => self.open_installed_plugins_picker().await,
-                };
-                if let Err(error) = open_result {
-                    self.pop_list_picker_level();
-                    self.system_message(format!("Failed to refresh plugin manager: {error}"));
-                }
-            }
-            Err(error) => {
-                self.system_message(format!("Plugin operation failed: {error}"));
-                self.state.plugin_prompt = Some(prompt);
-            }
-        }
+        // Installs and marketplace fetches can download for a while — dispatch
+        // to the background so a `⏳ …` system message shows in the transcript
+        // instead of freezing the UI. The manager reopens (or the prompt is
+        // restored with its typed value) when the outcome lands.
+        self.begin_plugin_job(crate::async_jobs::PluginJob {
+            method: method.into(),
+            params: Some(serde_json::json!({"source": value})),
+            id: value.to_string(),
+            action: action.into(),
+            origin: crate::async_jobs::PluginOrigin::Prompt {
+                kind: prompt.kind,
+                value: prompt.value,
+            },
+        });
         Ok(())
     }
 
@@ -7212,6 +7191,20 @@ impl TuiApp {
                 return Ok(());
             }
         };
+        // Updates download from the marketplace and can take a while — run in
+        // the background with a busy notice; the detail view reopens when the
+        // outcome arrives. The picker is intentionally not restored meanwhile,
+        // so the overlay closes while the status bar shows the busy notice.
+        if action == "update" {
+            self.begin_plugin_job(crate::async_jobs::PluginJob {
+                method: method.into(),
+                params: Some(serde_json::json!({"id": id})),
+                id,
+                action: action.into(),
+                origin: crate::async_jobs::PluginOrigin::InstalledDetail,
+            });
+            return Ok(());
+        }
         match self
             .client
             .rpc_call(method, Some(serde_json::json!({"id": id})))
@@ -7254,20 +7247,135 @@ impl TuiApp {
             return Ok(());
         }
         let params = serde_json::json!({"source": id, "marketplace": source});
-        match self.client.rpc_call("plugins.install", Some(params)).await {
-            Ok(_) => {
-                self.system_message(format!("Plugin {action} succeeded: {id}"));
-                if let Err(error) = self.open_marketplace_plugin_detail(&id).await {
-                    self.state.list_picker = Some(picker);
-                    self.system_message(format!("Failed to refresh marketplace plugin: {error}"));
+        // Install/update download from the marketplace and can take a while —
+        // run in the background with a `⏳ …` transcript message; the detail
+        // view reopens when the outcome arrives. The overlay closes meanwhile
+        // on purpose.
+        self.begin_plugin_job(crate::async_jobs::PluginJob {
+            method: "plugins.install".into(),
+            params: Some(params),
+            id,
+            action: action.into(),
+            origin: crate::async_jobs::PluginOrigin::MarketplaceDetail,
+        });
+        Ok(())
+    }
+
+    /// Handle the outcome of a background plugin action: replace its `⏳ …`
+    /// loading message in the transcript with the outcome and run the
+    /// origin-specific follow-up (reopen the plugin manager / detail).
+    async fn apply_plugin_action_result(
+        &mut self,
+        job: crate::async_jobs::PluginJob,
+        result: Result<serde_json::Value, String>,
+    ) {
+        let loading = format!(
+            "{}{} …",
+            Self::PLUGIN_JOB_LOADING_PREFIX,
+            job.notice_label()
+        );
+        let crate::async_jobs::PluginJob {
+            id, action, origin, ..
+        } = job;
+        match result {
+            Ok(result) => {
+                let resolved = result
+                    .get("plugin")
+                    .and_then(|plugin| plugin.get("id"))
+                    .or_else(|| result.get("id"))
+                    .and_then(|value| value.as_str())
+                    .unwrap_or(id.as_str())
+                    .to_string();
+                let outcome_text = match &origin {
+                    crate::async_jobs::PluginOrigin::Prompt { kind, .. } => match kind {
+                        PluginPromptKind::AddMarketplace => {
+                            format!("Plugin marketplace added: {id}")
+                        }
+                        PluginPromptKind::InstallSource => {
+                            format!("Plugin installed from {id}")
+                        }
+                    },
+                    _ => format!("Plugin {action} succeeded: {resolved}"),
+                };
+                self.finish_plugin_message(&loading, outcome_text);
+                match origin {
+                    crate::async_jobs::PluginOrigin::Slash => {}
+                    crate::async_jobs::PluginOrigin::Prompt { kind, .. } => {
+                        self.begin_root_picker();
+                        if let Err(error) = self.open_plugins_picker().await {
+                            self.system_message(format!(
+                                "Failed to refresh plugin manager: {error}"
+                            ));
+                            return;
+                        }
+                        let root = self.state.list_picker.take().expect("plugin root picker");
+                        self.state.list_picker_stack.push(root);
+                        let open_result = match kind {
+                            PluginPromptKind::AddMarketplace => {
+                                self.open_plugin_marketplaces_picker().await
+                            }
+                            PluginPromptKind::InstallSource => {
+                                self.open_installed_plugins_picker().await
+                            }
+                        };
+                        if let Err(error) = open_result {
+                            self.pop_list_picker_level();
+                            self.system_message(format!(
+                                "Failed to refresh plugin manager: {error}"
+                            ));
+                        }
+                    }
+                    crate::async_jobs::PluginOrigin::MarketplaceDetail => {
+                        if let Err(error) = self.open_marketplace_plugin_detail(&id).await {
+                            self.pop_list_picker_level();
+                            self.system_message(format!(
+                                "Failed to refresh marketplace plugin: {error}"
+                            ));
+                        }
+                    }
+                    crate::async_jobs::PluginOrigin::InstalledDetail => {
+                        if let Err(error) = self.open_installed_plugin_detail(&id).await {
+                            self.pop_list_picker_level();
+                            self.system_message(format!(
+                                "Failed to refresh plugin details: {error}"
+                            ));
+                        }
+                    }
+                    crate::async_jobs::PluginOrigin::RemoveConfirm => {
+                        self.state.plugin_selected_id = None;
+                        self.begin_root_picker();
+                        if let Err(error) = self.open_plugins_picker().await {
+                            self.system_message(format!(
+                                "Failed to refresh installed plugins: {error}"
+                            ));
+                            return;
+                        }
+                        let root = self.state.list_picker.take().expect("plugin root picker");
+                        self.state.list_picker_stack.push(root);
+                        if let Err(error) = self.open_installed_plugins_picker().await {
+                            self.pop_list_picker_level();
+                            self.system_message(format!(
+                                "Failed to refresh installed plugins: {error}"
+                            ));
+                        }
+                    }
                 }
             }
             Err(error) => {
-                self.state.list_picker = Some(picker);
-                self.system_message(format!("Plugin {action} failed: {error}"));
+                let outcome_text = match &origin {
+                    crate::async_jobs::PluginOrigin::Prompt { .. } => {
+                        format!("Plugin operation failed: {error}")
+                    }
+                    _ => format!("Plugin {action} failed: {error}"),
+                };
+                self.finish_plugin_message(&loading, outcome_text);
+                if let crate::async_jobs::PluginOrigin::Prompt { kind, value } = origin {
+                    // Restore the prompt with its typed value so the user can fix
+                    // the input instead of retyping it.
+                    self.state.plugin_prompt = Some(PluginPromptState { kind, value });
+                }
             }
         }
-        Ok(())
     }
 
     async fn apply_plugin_confirmation(
@@ -7287,27 +7395,16 @@ impl TuiApp {
             self.state.list_picker = Some(picker);
             return Ok(());
         }
-        match self
-            .client
-            .rpc_call("plugins.remove", Some(serde_json::json!({"id": id})))
-            .await
-        {
-            Ok(_) => {
-                self.system_message(format!("Plugin removed: {id}"));
-                self.begin_root_picker();
-                self.open_plugins_picker().await?;
-                let root = self.state.list_picker.take().expect("plugin root picker");
-                self.state.list_picker_stack.push(root);
-                if let Err(error) = self.open_installed_plugins_picker().await {
-                    self.pop_list_picker_level();
-                    self.system_message(format!("Failed to refresh installed plugins: {error}"));
-                }
-            }
-            Err(error) => {
-                self.state.list_picker = Some(picker);
-                self.system_message(format!("Plugin remove failed: {error}"));
-            }
-        }
+        // Removal can touch the filesystem; run in the background with a `⏳ …`
+        // transcript message. The installed list reopens when the outcome
+        // arrives.
+        self.begin_plugin_job(crate::async_jobs::PluginJob {
+            method: "plugins.remove".into(),
+            params: Some(serde_json::json!({"id": id})),
+            id,
+            action: "remove".into(),
+            origin: crate::async_jobs::PluginOrigin::RemoveConfirm,
+        });
         Ok(())
     }
 
@@ -10413,6 +10510,19 @@ impl TuiApp {
                         } else {
                             serde_json::json!({"id": value})
                         };
+                        // Install/update download from the marketplace and can
+                        // take a while — run in the background with a `⏳ …`
+                        // transcript message instead of freezing the UI.
+                        if matches!(command, "install" | "update") {
+                            self.begin_plugin_job(crate::async_jobs::PluginJob {
+                                method: method.into(),
+                                params: Some(params),
+                                id: value.to_string(),
+                                action: command.into(),
+                                origin: crate::async_jobs::PluginOrigin::Slash,
+                            });
+                            return Ok(());
+                        }
                         match self.client.rpc_call(method, Some(params)).await {
                             Ok(result) if command == "info" => {
                                 self.system_message(
@@ -10982,6 +11092,50 @@ impl TuiApp {
             delivery: crate::prompt_queue::DeliveryState::Sent,
             idempotency_key: None,
         });
+    }
+
+    /// Marker prefix for in-transcript plugin job loading notices.
+    const PLUGIN_JOB_LOADING_PREFIX: &str = "⏳ ";
+
+    /// Spawn a background plugin job and surface a `⏳ Installing plugin x …`
+    /// system message in the transcript while it runs; the message is replaced
+    /// in place by the outcome when `apply_plugin_action_result` fires.
+    fn begin_plugin_job(&mut self, job: crate::async_jobs::PluginJob) {
+        self.system_message(format!(
+            "{}{} …",
+            Self::PLUGIN_JOB_LOADING_PREFIX,
+            job.notice_label()
+        ));
+        self.state.follow_bottom = true;
+        self.state.scroll_up = 0;
+        self.jobs.spawn_plugin_action(self.client.requester(), job);
+    }
+
+    /// Replace the `⏳ …` loading message for a finished plugin job with the
+    /// final outcome text (falls back to appending when the transcript no
+    /// longer holds the loading message, e.g. after a clear). Any other
+    /// dangling loading message from a superseded job is marked cancelled so
+    /// it never reads as stuck.
+    fn finish_plugin_message(&mut self, loading_text: &str, final_text: String) {
+        let mut replaced = false;
+        for message in self.state.messages.iter_mut().rev() {
+            if message.role != MessageRole::System
+                || !message.content.starts_with(Self::PLUGIN_JOB_LOADING_PREFIX)
+            {
+                continue;
+            }
+            if !replaced && message.content == loading_text {
+                message.content = final_text.clone();
+                replaced = true;
+            } else if replaced && !message.content.ends_with(" (cancelled)") {
+                message.content.push_str(" (cancelled)");
+            }
+        }
+        if !replaced {
+            self.system_message(final_text);
+        }
+        self.state.follow_bottom = true;
+        self.state.scroll_up = 0;
     }
 
     fn update_llm_retry_message(

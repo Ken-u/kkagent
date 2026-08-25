@@ -33,6 +33,7 @@ pub enum JobChannel {
     LocalShell,
     VersionCheck,
     FileComplete,
+    PluginAction,
     Generic,
 }
 
@@ -53,6 +54,7 @@ impl JobChannel {
             Self::LocalShell => "Running shell",
             Self::VersionCheck => "Checking for updates",
             Self::FileComplete => "Completing paths",
+            Self::PluginAction => "Working with plugin",
             Self::Generic => "Working",
         }
     }
@@ -95,6 +97,10 @@ pub enum JobPayload {
         query: String,
         quoted: bool,
         items: Vec<crate::pi::autocomplete::CompletionItem>,
+    },
+    PluginAction {
+        job: PluginJob,
+        result: Result<Value, String>,
     },
 }
 
@@ -143,6 +149,56 @@ pub struct UiNotice {
     pub retry_count: u32,
     pub retry_method: Option<String>,
     pub retry_params: Option<Value>,
+}
+
+/// Describes a mutating plugin action dispatched to the background so the UI
+/// keeps rendering a busy notice instead of freezing on the RPC await.
+#[derive(Debug, Clone)]
+pub struct PluginJob {
+    /// RPC method, e.g. `plugins.install`.
+    pub method: String,
+    /// RPC params payload.
+    pub params: Option<Value>,
+    /// Plugin id (or raw source) used in user-facing messages.
+    pub id: String,
+    /// What the user asked for, e.g. `install` / `update`.
+    pub action: String,
+    /// How to follow up once the outcome lands back on the UI thread.
+    pub origin: PluginOrigin,
+}
+
+/// Where a plugin action was triggered from; decides the follow-up UX.
+#[derive(Debug, Clone)]
+pub enum PluginOrigin {
+    /// `/plugins <action> …` slash command — report via system message.
+    Slash,
+    /// Plugin-manager input prompt — reopen the manager on success, restore
+    /// the prompt (with its typed value) on failure.
+    Prompt {
+        kind: crate::app::PluginPromptKind,
+        value: String,
+    },
+    /// Marketplace detail picker — refresh the detail view on success.
+    MarketplaceDetail,
+    /// Installed detail picker — refresh the detail view on success.
+    InstalledDetail,
+    /// Confirmed removal from the installed detail picker — reopen the
+    /// installed plugin list on success.
+    RemoveConfirm,
+}
+
+impl PluginJob {
+    /// Busy-notice label, e.g. `Installing plugin demo`.
+    pub fn notice_label(&self) -> String {
+        let verb = match self.action.as_str() {
+            "install" => "Installing plugin",
+            "update" => "Updating plugin",
+            "remove" => "Removing plugin",
+            "add" => "Adding marketplace",
+            other => return format!("{other} plugin {}", self.id),
+        };
+        format!("{verb} {}", self.id)
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -282,6 +338,49 @@ impl AsyncJobHub {
                 generation,
                 started,
                 payload: JobPayload::Rpc { method, result },
+            });
+        });
+        generation
+    }
+
+    /// Run a mutating plugin RPC (`plugins.install` / `plugins.update` / …) on a
+    /// background task. Unlike `spawn_rpc`, the result keeps the originating
+    /// `PluginJob` around so the caller can render action-specific follow-ups
+    /// (detail refresh, picker restore) when the outcome arrives. Like version
+    /// checks, the job is intentionally absent from `pending`: progress is
+    /// surfaced via the `⏳ …` transcript message managed by the app, not via
+    /// a status-bar busy notice.
+    pub fn spawn_plugin_action(&mut self, requester: KkagentRequester, job: PluginJob) -> u64 {
+        let channel = JobChannel::PluginAction;
+        let generation = self.next_generation(channel);
+        let started = Instant::now();
+        let tx = self.tx.clone();
+        let PluginJob {
+            method,
+            params,
+            id,
+            action,
+            origin,
+        } = job;
+        tokio::spawn(async move {
+            let result = requester
+                .rpc_call(&method, params)
+                .await
+                .map_err(|e| e.to_string());
+            let _ = tx.send(JobOutcome {
+                channel,
+                generation,
+                started,
+                payload: JobPayload::PluginAction {
+                    job: PluginJob {
+                        method,
+                        params: None,
+                        id,
+                        action,
+                        origin,
+                    },
+                    result,
+                },
             });
         });
         generation
@@ -1018,5 +1117,21 @@ mod tests {
         assert!(rendered.ends_with(&"z".repeat(32)));
         assert!(rendered.contains("output truncated"));
         assert!(rendered.len() < 128);
+    }
+
+    #[test]
+    fn plugin_job_notice_labels() {
+        let job = |action: &str| PluginJob {
+            method: "plugins.install".into(),
+            params: None,
+            id: "demo".into(),
+            action: action.into(),
+            origin: PluginOrigin::Slash,
+        };
+        assert_eq!(job("install").notice_label(), "Installing plugin demo");
+        assert_eq!(job("update").notice_label(), "Updating plugin demo");
+        assert_eq!(job("remove").notice_label(), "Removing plugin demo");
+        assert_eq!(job("add").notice_label(), "Adding marketplace demo");
+        assert_eq!(job("sync").notice_label(), "sync plugin demo");
     }
 }
