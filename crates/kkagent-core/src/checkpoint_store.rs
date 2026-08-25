@@ -186,12 +186,9 @@ mod tests {
 
     fn temp_dir() -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
-            "kkagent-cp-test-{}-{:x}",
+            "kkagent-cp-test-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            uuid::Uuid::new_v4()
         ));
         fs::create_dir_all(&dir).unwrap();
         dir

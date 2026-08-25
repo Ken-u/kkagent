@@ -27,10 +27,13 @@ const state = {
   defaultPermissionMode: "manual",
   planMode: false,
   model: "",
+  defaultModel: "",
   models: [],
   usage: null,
   mdRaf: 0,
   pendingMd: null,
+  selectionVersion: 0,
+  sessionsRefreshVersion: 0,
 };
 
 const logEl = document.getElementById("log");
@@ -63,7 +66,6 @@ const sessionTitle = document.getElementById("sessionTitle");
 const sessionMeta = document.getElementById("sessionMeta");
 const permissionModeEl = document.getElementById("permissionMode");
 const planBtn = document.getElementById("planBtn");
-const stopBtn = document.getElementById("stopBtn");
 const moreBtn = document.getElementById("moreBtn");
 const sessionMenu = document.getElementById("sessionMenu");
 const jumpBottom = document.getElementById("jumpBottom");
@@ -556,19 +558,24 @@ function bindMessageActions(div, role, content, toolCalls, messageIndex) {
   const msgEdit = div.querySelector(".msg-edit");
   if (msgEdit) {
     msgEdit.onclick = async () => {
+      const sessionId = state.sessionId;
+      if (!sessionId) return;
+      const selectionVersion = state.selectionVersion;
       promptEl.value = content;
       promptEl.focus();
       adjustPromptHeight();
       if (typeof messageIndex === "number") {
         try {
-          const forked = await api(`/api/v1/sessions/${state.sessionId}/fork`, {
+          const forked = await api(`/api/v1/sessions/${sessionId}/fork`, {
             method: "POST",
             body: JSON.stringify({ message_limit: messageIndex, title: "Edit" }),
           });
           await refreshSessions();
-          await selectSession(forked.session_id || forked.id);
+          if (state.sessionId === sessionId && state.selectionVersion === selectionVersion) {
+            await selectSession(forked.session_id || forked.id);
+          }
         } catch (err) {
-          appendMessage("system", `fork 失败: ${err.message || err}`, new Date().toISOString());
+          appendSessionMessage(sessionId, "system", `fork 失败: ${err.message || err}`, new Date().toISOString());
         }
       }
     };
@@ -652,9 +659,12 @@ function jumpToLatest() {
 function setRunning(running) {
   state.running = running;
   // Keep the composer enabled while running so extra input is steered into
-  // the active turn instead of being blocked.
+  // the active turn instead of being blocked. The send button morphs into a
+  // stop button while the agent loop is active.
   sendBtn.disabled = false;
-  if (stopBtn) stopBtn.hidden = !running;
+  sendBtn.classList.toggle("running", running);
+  sendBtn.title = running ? "停止 (Esc)" : "发送 (Enter)";
+  sendBtn.setAttribute("aria-label", running ? "Stop" : "Send");
 }
 
 function applySessionMeta(sess = {}) {
@@ -662,7 +672,7 @@ function applySessionMeta(sess = {}) {
   const mode = String(sess.permission_mode || state.defaultPermissionMode || "manual").toLowerCase();
   state.permissionMode = ["manual", "yolo", "auto"].includes(mode) ? mode : state.defaultPermissionMode || "manual";
   state.planMode = Boolean(sess.plan_mode);
-  state.model = sess.model || sess.model_alias || "";
+  state.model = sess.model || sess.model_alias || state.defaultModel || "";
   state.usage = sess.usage || null;
   if (sessionBar) sessionBar.classList.toggle("active", Boolean(state.sessionId));
   if (sessionTitle && document.activeElement !== sessionTitle) {
@@ -673,11 +683,24 @@ function applySessionMeta(sess = {}) {
     ? state.permissionMode
     : "manual";
   if (planBtn) planBtn.classList.toggle("active", state.planMode);
-  if (sessionMeta) {
-    const bits = [state.permissionMode, state.planMode ? "plan" : ""].filter(Boolean);
-    sessionMeta.textContent = bits.join(" · ");
-  }
+  if (sessionMeta) sessionMeta.textContent = "";
   renderModelSelect();
+}
+
+function updateSessionMeta(sessionId, sess = {}) {
+  if (!sessionId) return {};
+  const view = viewOf(sessionId);
+  const meta = { ...(view.meta || {}) };
+  if (Object.hasOwn(sess, "title")) meta.title = sess.title || "";
+  if (Object.hasOwn(sess, "permission_mode") && sess.permission_mode != null) {
+    meta.permission_mode = sess.permission_mode;
+  }
+  if (Object.hasOwn(sess, "plan_mode") && sess.plan_mode != null) meta.plan_mode = Boolean(sess.plan_mode);
+  if (Object.hasOwn(sess, "model") && sess.model != null) meta.model = sess.model;
+  else if (Object.hasOwn(sess, "model_alias") && sess.model_alias != null) meta.model = sess.model_alias;
+  if (Object.hasOwn(sess, "usage")) meta.usage = sess.usage || null;
+  view.meta = meta;
+  return meta;
 }
 
 function confirmAction({ title, body, ok = "确定", danger = false }) {
@@ -699,6 +722,11 @@ function confirmAction({ title, body, ok = "确定", danger = false }) {
 }
 
 function showTyping() {
+  // Idempotent: the composer and the turn_start WS event can both call this
+  // for the same turn — reuse the existing bubble instead of stacking a
+  // second "typing" message.
+  const existing = logEl.querySelector(".typing-msg");
+  if (existing) return existing;
   const div = document.createElement("div");
   div.className = "message assistant typing-msg";
   div.innerHTML = `
@@ -714,12 +742,102 @@ function showTyping() {
 }
 
 function removeTyping() {
-  const el = logEl.querySelector(".typing-msg");
-  if (el) el.remove();
+  // Remove every stale typing bubble (historically more than one could be
+  // stacked before showTyping became idempotent / after session repaints).
+  logEl.querySelectorAll(".typing-msg").forEach((el) => el.remove());
+}
+
+function viewMessageKey(message) {
+  const tools = (message.tool_calls || []).map((tool) => tool._id || tool.id || "").join(",");
+  const images = (message.images || []).map((image) => image.path || image.src || image.media_type || image.mediaType || "image").join(",");
+  return `${message.role || "assistant"}\u0000${message.content || ""}\u0000${tools}\u0000${images}`;
+}
+
+function mergeTransientMessages(serverMessages, previousMessages) {
+  const transientMessages = (previousMessages || []).filter((message) => message.localOnly || message.optimistic);
+  if (!transientMessages.length) return serverMessages;
+
+  // A system message may eventually become part of the canonical transcript.
+  // Consume matching server entries first so repeated fetches do not duplicate
+  // it while still preserving multiple equal local notices in their order.
+  const serverKeyCounts = new Map();
+  for (const message of serverMessages) {
+    const key = viewMessageKey(message);
+    serverKeyCounts.set(key, (serverKeyCounts.get(key) || 0) + 1);
+  }
+  const pending = transientMessages.filter((message) => {
+    const key = viewMessageKey(message);
+    const count = serverKeyCounts.get(key) || 0;
+    if (!count) return true;
+    serverKeyCounts.set(key, count - 1);
+    return false;
+  });
+
+  const unanchored = [];
+  const anchored = new Map();
+  for (const message of pending) {
+    if (!message.afterMessageKey) {
+      unanchored.push(message);
+      continue;
+    }
+    const occurrence = message.afterMessageOccurrence || 1;
+    const anchor = `${message.afterMessageKey}\u0000${occurrence}`;
+    if (!anchored.has(anchor)) anchored.set(anchor, []);
+    anchored.get(anchor).push(message);
+  }
+
+  const merged = [...unanchored];
+  const occurrences = new Map();
+  for (const message of serverMessages) {
+    merged.push(message);
+    const key = viewMessageKey(message);
+    const occurrence = (occurrences.get(key) || 0) + 1;
+    occurrences.set(key, occurrence);
+    const anchor = `${key}\u0000${occurrence}`;
+    const following = anchored.get(anchor);
+    if (following) {
+      merged.push(...following);
+      anchored.delete(anchor);
+    }
+  }
+  // If compaction removed a local notice's anchor, keep the notice at the end
+  // instead of silently dropping it.
+  for (const messages of anchored.values()) merged.push(...messages);
+  return merged;
+}
+
+function cacheSessionMessage(sessionId, role, content, timestamp, toolCalls = [], extras = {}) {
+  if (!sessionId) return null;
+  const view = viewOf(sessionId);
+  const previousServerMessage = [...view.messages].reverse().find((message) => !message.localOnly);
+  const afterMessageKey = previousServerMessage ? viewMessageKey(previousServerMessage) : null;
+  const afterMessageOccurrence = afterMessageKey
+    ? view.messages.filter((message) => !message.localOnly && viewMessageKey(message) === afterMessageKey).length
+    : null;
+  const message = {
+    role,
+    content,
+    created_at: timestamp,
+    tool_calls: toolCalls,
+    images: extras.images || [],
+    thinking: extras.thinking || "",
+    thinkingDone: extras.thinkingDone !== false,
+    localOnly: extras.localOnly ?? role === "system",
+    optimistic: extras.optimistic ?? role === "user",
+    afterMessageKey,
+    afterMessageOccurrence,
+  };
+  view.messages.push(message);
+  touchView(view);
+  return message;
 }
 
 function appendMessage(role, content, timestamp, toolCalls = [], extras = {}) {
   removeTyping();
+  logEl.querySelector(".welcome")?.remove();
+  if (!state.suppressScroll && extras.cache !== false) {
+    cacheSessionMessage(state.sessionId, role, content, timestamp, toolCalls, extras);
+  }
   const el = renderMessage(role, content, timestamp, toolCalls, extras);
   if (extras.images && extras.images.length) {
     const body = el.querySelector(".message-body");
@@ -731,6 +849,12 @@ function appendMessage(role, content, timestamp, toolCalls = [], extras = {}) {
   logEl.appendChild(el);
   maybeScrollLog();
   return el;
+}
+
+function appendSessionMessage(sessionId, role, content, timestamp, toolCalls = [], extras = {}) {
+  if (!sessionId) return null;
+  if (sessionId === state.sessionId) return appendMessage(role, content, timestamp, toolCalls, extras);
+  return cacheSessionMessage(sessionId, role, content, timestamp, toolCalls, extras);
 }
 
 function createImagePreview(image) {
@@ -850,7 +974,10 @@ function parseTranscript(messages) {
         tool_calls: tools,
       });
     } else if (role === "system") {
-      const text = visibleUserText(raw.text || (typeof raw.content === "string" ? raw.content : ""));
+      const rawText = parts
+        ? parts.filter((part) => part.type === "text").map((part) => part.text || "").join("\n")
+        : raw.text || (typeof raw.content === "string" ? raw.content : "");
+      const text = visibleUserText(rawText);
       if (text) out.push({ role: "system", content: text, created_at: raw.created_at, tool_calls: [] });
     }
   }
@@ -861,11 +988,13 @@ function parseTranscript(messages) {
   // are part of the same turn.  Without this merge the UI would show one
   // collapsed thinking box per step, cluttering the transcript.
   //
-  // Walk backwards so each assistant's thinking is appended to the *first*
-  // assistant in the run (the one that originally opened the turn), and all
-  // subsequent thinking in the same run is cleared.
+  // Walk backwards so tool/text steps append their thinking to the *first*
+  // assistant in the run (the one that originally opened the turn). Preserve
+  // a thinking-only terminal message: clearing it would leave an empty bubble
+  // and hide the only payload some providers emit for the final step.
   for (let i = out.length - 1; i > 0; i--) {
-    if (out[i].role === "assistant" && out[i].thinking && out[i - 1].role === "assistant") {
+    const hasVisiblePayload = Boolean(out[i].content.trim() || out[i].tool_calls.length);
+    if (out[i].role === "assistant" && out[i].thinking && hasVisiblePayload && out[i - 1].role === "assistant") {
       const prev = out[i - 1].thinking;
       out[i - 1].thinking = prev ? prev + "\n" + out[i].thinking : out[i].thinking;
       out[i].thinking = "";
@@ -875,10 +1004,14 @@ function parseTranscript(messages) {
 }
 
 function renderLog(messages, { jump = true, parsed = false } = {}) {
-  const items = parsed ? messages || [] : parseTranscript(messages);
+  let items = parsed ? messages || [] : parseTranscript(messages);
   if (!parsed && state.sessionId) {
     const view = viewOf(state.sessionId);
-    if (!view.live && !view.running) view.messages = items;
+    if (!view.live && !view.running) {
+      view.messages = mergeTransientMessages(items, view.messages);
+      items = view.messages;
+      touchView(view);
+    }
   }
   state.suppressScroll = true;
   logEl.classList.add("is-history");
@@ -921,10 +1054,14 @@ function sessionIdOf(session) {
 function emptySessionView() {
   return {
     messages: [],
+    meta: null,
+    draft: "",
+    attachments: [],
     live: null,
     running: false,
     pendingApproval: null,
     pendingQuestion: null,
+    revision: 0,
   };
 }
 
@@ -932,6 +1069,22 @@ function viewOf(id) {
   if (!id) return emptySessionView();
   if (!state.views[id]) state.views[id] = emptySessionView();
   return state.views[id];
+}
+
+function saveComposerState(sessionId) {
+  if (!sessionId) return;
+  const view = viewOf(sessionId);
+  view.draft = promptEl.value;
+  view.attachments = [...state.attachments];
+}
+
+function restoreComposerState(sessionId) {
+  const view = viewOf(sessionId);
+  promptEl.value = view.draft || "";
+  state.attachments = [...(view.attachments || [])];
+  adjustPromptHeight();
+  renderAttachments();
+  closeCmdPalette();
 }
 
 function updatePlanBtn() {
@@ -953,18 +1106,57 @@ function ensurePanel(id, title) {
   return el;
 }
 
+function ensureTodoPopover() {
+  let el = document.getElementById("todoPanel");
+  if (!el) {
+    el = document.createElement("section");
+    el.id = "todoPanel";
+    el.className = "todo-popover";
+    el.innerHTML = `
+      <header class="todo-pop-header">
+        <span class="todo-pop-title">任务清单</span>
+        <span class="todo-pop-count"></span>
+        <button type="button" class="todo-pop-toggle" aria-label="展开/折叠" title="展开/折叠">⤢</button>
+        <button type="button" class="todo-pop-close" aria-label="关闭">×</button>
+      </header>
+      <div class="todo-pop-body"><ul class="todo-list"></ul></div>`;
+    el.querySelector(".todo-pop-close").onclick = () => { el.classList.remove("open"); };
+    el.querySelector(".todo-pop-toggle").onclick = () => {
+      el.classList.toggle("expanded");
+      el.querySelector(".todo-pop-toggle").textContent = el.classList.contains("expanded") ? "⤡" : "⤢";
+    };
+    // Anchor inside the composer wrap so the popover floats right above the
+    // input box, aligned to the right edge (next to the send button).
+    document.querySelector(".composer-wrap")?.appendChild(el);
+  }
+  return el;
+}
+
 function renderTodos(todos) {
-  if (!Array.isArray(todos) || !todos.length) return;
-  const el = ensurePanel("todoPanel", "任务清单");
-  const body = el.querySelector(".side-panel-body");
+  const el = ensureTodoPopover();
+  const ul = el.querySelector(".todo-list");
+  if (!Array.isArray(todos) || !todos.length) {
+    ul.innerHTML = '<li class="todo-empty">暂无任务</li>';
+    const count = el.querySelector(".todo-pop-count");
+    if (count) count.textContent = "0/0";
+    el.classList.remove("open");
+    return;
+  }
   const rows = todos
     .map((t) => {
-      const mark = t.status === "done" ? "☑" : t.status === "in_progress" ? "◐" : "☐";
-      const cls = t.status === "done" ? "todo-done" : t.status === "in_progress" ? "todo-active" : "";
+      const done = t.status === "done" || t.status === "completed";
+      const cancelled = t.status === "cancelled" || t.status === "canceled";
+      const mark = done ? "☑" : cancelled ? "☒" : t.status === "in_progress" ? "◐" : "☐";
+      const cls = done || cancelled ? "todo-done" : t.status === "in_progress" ? "todo-active" : "";
       return `<li class="${cls}"><span class="todo-mark">${mark}</span><span>${escapeHtml(t.title || t.content || "")}</span></li>`;
     })
     .join("");
-  body.innerHTML = `<ul class="todo-list">${rows}</ul>`;
+  ul.innerHTML = rows;
+  const count = el.querySelector(".todo-pop-count");
+  if (count) {
+    const done = todos.filter((t) => t.status === "done" || t.status === "completed").length;
+    count.textContent = `${done}/${todos.length}`;
+  }
   el.classList.add("open");
 }
 
@@ -1018,31 +1210,128 @@ function ensureViewLive(view) {
   return view.live;
 }
 
-function mergeServerSession(id, sess) {
-  const view = viewOf(id);
-  const fetched = parseTranscript(sess.messages || []);
-  if (view.messages.length === 0 || fetched.length >= view.messages.length) {
-    view.messages = fetched;
+function touchView(view) {
+  view.revision = (view.revision || 0) + 1;
+}
+
+function finishViewLive(view) {
+  const live = view.live;
+  if (!live || (!live.text && !live.thinking && !live.tools.length)) {
+    view.live = null;
+    return false;
   }
+  if (live.el && live.el.parentNode) {
+    live.el.classList.remove("is-live");
+    syncLiveMarkdown(live.el, live.text);
+    syncThinking(live.el, live.thinking, true);
+  }
+  view.messages.push({
+    role: "assistant",
+    content: live.text,
+    thinking: live.thinking,
+    thinkingDone: true,
+    created_at: live.time,
+    tool_calls: live.tools,
+  });
+  view.live = null;
+  return true;
+}
+
+function ensureCurrentAssistantStep(view) {
+  // A new model step starts only after every tool from the previous assistant
+  // message has settled. Commit that message before collecting the next
+  // thinking/text/tool delta so intermediate tool steps remain distinct.
+  if (view.live && view.live.tools.length && view.live.tools.every((tool) => tool.status !== "running" && tool.status !== "queued")) {
+    finishViewLive(view);
+  }
+  return ensureViewLive(view);
+}
+
+function splitServerLiveTail(sess) {
+  const raw = Array.isArray(sess.messages) ? sess.messages : [];
   const liveUi = sess.live_ui || {};
-  if (!view.live && (liveUi.thinking_text || liveUi.assistant_text)) {
-    view.live = {
-      text: liveUi.assistant_text || "",
+  const thinking = liveUi.thinking_text || "";
+  const text = liveUi.assistant_text || "";
+  if (!thinking && !text) return { messages: raw, live: null };
+
+  // get_session includes the current streaming tail in messages for reconnect
+  // safety and also exposes the same bytes in live_ui. When the final raw
+  // assistant message is exactly that tail, remove it from history and keep it
+  // as the live bubble; otherwise prefer the transcript and avoid duplication.
+  const last = raw[raw.length - 1];
+  const parts = last && last.role === "assistant" && Array.isArray(last.content) ? last.content : null;
+  if (!parts || !parts.every((part) => part.type === "thinking" || part.type === "text")) {
+    return { messages: raw, live: null };
+  }
+  const tailThinking = parts
+    .filter((part) => part.type === "thinking")
+    .map((part) => part.thinking || part.text || "")
+    .join("");
+  const tailText = parts
+    .filter((part) => part.type === "text")
+    .map((part) => part.text || "")
+    .join("");
+  if (tailThinking !== thinking || tailText !== text) return { messages: raw, live: null };
+  return {
+    messages: raw.slice(0, -1),
+    live: {
+      text,
       tools: [],
       time: new Date().toISOString(),
-      thinking: liveUi.thinking_text || "",
-      thinkingDone: Boolean(liveUi.assistant_text),
+      thinking,
+      thinkingDone: Boolean(text),
       el: null,
-    };
-    view.running = true;
+    },
+  };
+}
+
+function mergeServerSession(id, sess, { expectedRevision } = {}) {
+  const view = viewOf(id);
+  updateSessionMeta(id, sess);
+  const unchanged = expectedRevision === undefined || view.revision === expectedRevision;
+  const mayReplaceTranscript = unchanged || view.messages.length === 0;
+  let transcriptChanged = false;
+  if (mayReplaceTranscript) {
+    const server = splitServerLiveTail(sess);
+    view.messages = mergeTransientMessages(parseTranscript(server.messages), view.messages);
+    if (unchanged || !view.live) view.live = server.live;
+    transcriptChanged = true;
+    touchView(view);
   }
-  if (sess.pending_approval) view.pendingApproval = sess.pending_approval;
-  if (sess.pending_question) view.pendingQuestion = sess.pending_question;
+  const liveUi = sess.live_ui || {};
+  if (liveUi.thinking_text || liveUi.assistant_text || (sess.status && sess.status !== "idle")) {
+    view.running = true;
+  } else if (unchanged) {
+    view.running = false;
+  }
+  if (unchanged) {
+    view.pendingApproval = sess.pending_approval || null;
+    view.pendingQuestion = sess.pending_question || null;
+  }
+  if (Array.isArray(sess.todos) && (unchanged || !Array.isArray(view.todos))) {
+    view.todos = sess.todos;
+  }
+  return transcriptChanged;
 }
 
 function paintSessionView(id, { jump = true } = {}) {
   const view = viewOf(id);
   renderLog(view.messages, { jump: false, parsed: true });
+  // Sync the todo popover with the session being shown: render its list, or
+  // collapse the popover entirely when this session has no todos (prevents
+  // stale content from a previously viewed session).
+  const todoPanel = document.getElementById("todoPanel");
+  if (Array.isArray(view.todos) && view.todos.length) {
+    renderTodos(view.todos);
+  } else if (todoPanel) {
+    todoPanel.classList.remove("open");
+  }
+  const planPanel = document.getElementById("planPanel");
+  if (view.plan && (view.plan.content || view.plan.path)) renderPlanPanel(view.plan);
+  else if (planPanel) planPanel.classList.remove("open");
+  const subagentPanel = document.getElementById("subagentPanel");
+  if (view.subagents && view.subagents.size) renderSubagents(view);
+  else if (subagentPanel) subagentPanel.classList.remove("open");
   state.live = cloneLive(view.live);
   if (state.live && (state.live.text || state.live.thinking || state.live.tools.length)) {
     replaceLiveMessage();
@@ -1058,10 +1347,39 @@ function paintSessionView(id, { jump = true } = {}) {
   else updateJumpButton();
 }
 
+function applyUsageUpdate(sessionId, event) {
+  if (!sessionId) return;
+  const view = viewOf(sessionId);
+  const usage = {
+    ...(view.meta?.usage || (sessionId === state.sessionId ? state.usage : {}) || {}),
+  };
+  const delta = event.usage || {};
+  // Token values are per-call deltas; steps/turns/context are authoritative
+  // session snapshots. Keep the accumulation on the owning session only.
+  usage.input_tokens = (usage.input_tokens || 0) + (delta.input_tokens || 0);
+  usage.output_tokens = (usage.output_tokens || 0) + (delta.output_tokens || 0);
+  usage.cache_creation_tokens =
+    (usage.cache_creation_tokens || 0) + (delta.cache_creation_input_tokens || 0);
+  usage.cache_read_tokens =
+    (usage.cache_read_tokens || 0) + (delta.cache_read_input_tokens || 0);
+  if (delta.input_includes_cache !== undefined && delta.input_includes_cache !== null) {
+    usage.input_includes_cache = delta.input_includes_cache;
+  }
+  if (event.steps !== undefined) usage.steps = event.steps;
+  if (event.turns !== undefined) usage.turns = event.turns;
+  if (event.context) usage.context = event.context;
+  updateSessionMeta(sessionId, { usage });
+  if (sessionId === state.sessionId) state.usage = usage;
+}
+
 function applyEventToView(sessionId, event) {
   if (!sessionId) return;
   const view = viewOf(sessionId);
   const type = event.type;
+  if (type === "session_config_changed") {
+    updateSessionMeta(sessionId, event);
+    return;
+  }
   if (type === "turn_start") {
     view.running = true;
     view.live = {
@@ -1072,24 +1390,27 @@ function applyEventToView(sessionId, event) {
       thinkingDone: false,
       el: null,
     };
+    touchView(view);
     return;
   }
   if (type === "thinking_delta" && event.text) {
-    ensureViewLive(view);
-    view.live.thinking += event.text;
-    view.live.thinkingDone = false;
+    const live = ensureCurrentAssistantStep(view);
+    live.thinking += event.text;
+    live.thinkingDone = false;
     view.running = true;
+    touchView(view);
     return;
   }
   if (type === "message_delta" && event.text) {
-    ensureViewLive(view);
-    view.live.text += event.text;
-    if (view.live.thinking) view.live.thinkingDone = true;
+    const live = ensureCurrentAssistantStep(view);
+    live.text += event.text;
+    if (live.thinking) live.thinkingDone = true;
     view.running = true;
+    touchView(view);
     return;
   }
   if (type === "tool_call") {
-    const live = ensureViewLive(view);
+    const live = ensureCurrentAssistantStep(view);
     if (live.thinking) live.thinkingDone = true;
     live.tools.push({
       _id: event.tool_call_id,
@@ -1098,93 +1419,110 @@ function applyEventToView(sessionId, event) {
       status: "running",
     });
     view.running = true;
+    touchView(view);
     return;
   }
-  if (type === "tool_result" && view.live) {
-    const tool = view.live.tools.find((item) => item._id === event.tool_call_id);
+  if (type === "tool_execution_status") {
+    const tool = view.live?.tools.find((item) => item._id === event.tool_call_id);
+    if (tool) {
+      tool.status = event.status || tool.status;
+      tool.queued_behind = event.queued_behind || null;
+      touchView(view);
+    }
+    return;
+  }
+  if (type === "tool_result") {
+    const tool = view.live?.tools.find((item) => item._id === event.tool_call_id)
+      || [...view.messages].reverse().flatMap((message) => message.tool_calls || []).find((item) => item._id === event.tool_call_id);
     if (tool) {
       tool.output = event.output;
       tool.status = event.is_error ? "error" : "success";
       if (event.is_error) tool.error = event.output;
+      touchView(view);
     }
     return;
   }
-  if (type === "turn_end") {
-    if (view.live && (view.live.text || view.live.thinking || view.live.tools.length)) {
-      view.messages.push({
-        role: "assistant",
-        content: view.live.text,
-        thinking: view.live.thinking,
-        thinkingDone: true,
-        created_at: view.live.time,
-        tool_calls: view.live.tools,
-      });
+  if (type === "tool_cancelled") {
+    const tool = view.live?.tools.find((item) => item._id === event.tool_call_id)
+      || [...view.messages].reverse().flatMap((message) => message.tool_calls || []).find((item) => item._id === event.tool_call_id);
+    if (tool) {
+      tool.status = "cancelled";
+      tool.error = event.reason || "cancelled";
+      touchView(view);
     }
-    view.live = null;
+    return;
+  }
+  if (type === "turn_end" && sessionId) {
+    finishViewLive(view);
     view.running = false;
     view.pendingApproval = null;
     view.pendingQuestion = null;
+    touchView(view);
     return;
   }
   if (type === "error") {
+    finishViewLive(view);
     view.running = false;
+    cacheSessionMessage(sessionId, "system", event.message || "turn error", new Date().toISOString(), [], {
+      localOnly: true,
+    });
     return;
   }
   if (type === "status_update") {
     if (event.status === "idle") view.running = false;
     else if (event.status) view.running = true;
+    touchView(view);
     return;
   }
-  if (type === "compact_completed" && event.messages) {
-    view.messages = parseTranscript(event.messages);
+  if (type === "compact_completed") {
+    if (event.messages) {
+      view.messages = mergeTransientMessages(parseTranscript(event.messages), view.messages);
+    }
     view.live = null;
     view.running = false;
+    const note = event.error
+      ? `Compact 失败: ${event.error}`
+      : event.messages
+        ? `上下文已压缩，保留 ${event.kept_user_message_count || 0} 条用户消息。`
+        : "上下文压缩已完成。";
+    cacheSessionMessage(sessionId, "system", note, new Date().toISOString(), [], { localOnly: true });
     return;
   }
   if (type === "usage_update") {
-    if (event.session_id && event.session_id !== state.sessionId) return;
-    // Per-call usage accumulates into session totals; steps/turns/context are
-    // server-authoritative snapshots that overwrite.
-    const u = event.usage || {};
-    if (!state.usage) state.usage = {};
-    state.usage.input_tokens = (state.usage.input_tokens || 0) + (u.input_tokens || 0);
-    state.usage.output_tokens = (state.usage.output_tokens || 0) + (u.output_tokens || 0);
-    state.usage.cache_creation_tokens =
-      (state.usage.cache_creation_tokens || 0) + (u.cache_creation_input_tokens || 0);
-    state.usage.cache_read_tokens =
-      (state.usage.cache_read_tokens || 0) + (u.cache_read_input_tokens || 0);
-    // Provider semantics of the accumulated input tokens; latest step wins.
-    if (u.input_includes_cache !== undefined && u.input_includes_cache !== null) {
-      state.usage.input_includes_cache = u.input_includes_cache;
-    }
-    if (event.steps !== undefined) state.usage.steps = event.steps;
-    if (event.turns !== undefined) state.usage.turns = event.turns;
-    if (event.context) state.usage.context = event.context;
+    applyUsageUpdate(sessionId, event);
     return;
   }
   if (type === "approval_requested") {
-    view.pendingApproval = event.request || {};
+    view.pendingApproval = { ...(event.request || {}), session_id: event.request?.session_id || sessionId };
+    touchView(view);
     return;
   }
   if (type === "question_asked") {
-    view.pendingQuestion = event.question || {};
+    view.pendingQuestion = { ...(event.question || {}), session_id: event.question?.session_id || sessionId };
+    touchView(view);
     return;
   }
   if (type === "todo_updated") {
     view.todos = Array.isArray(event.items) ? event.items : [];
-    renderTodos(view.todos);
+    // Only render the popover for the session the user is looking at —
+    // background sessions updating their list must not hijack the view.
+    if (sessionId === state.sessionId) renderTodos(view.todos);
+    touchView(view);
     return;
   }
   if (type === "plan_file_updated") {
     view.plan = { path: event.path || "", content: event.content || "" };
-    renderPlanPanel(view.plan);
+    // Same guard as todo_updated: only the displayed session may repaint UI.
+    if (sessionId === state.sessionId) {
+      if (view.plan.path || view.plan.content) renderPlanPanel(view.plan);
+      else document.getElementById("planPanel")?.classList.remove("open");
+    }
+    touchView(view);
     return;
   }
   if (type === "plan_mode_changed") {
-    if (event.session_id === state.sessionId || !event.session_id) {
-      state.planMode = !!event.enabled;
-      updatePlanBtn();
-    }
+    const meta = updateSessionMeta(sessionId, { plan_mode: Boolean(event.enabled) });
+    if (sessionId === state.sessionId) applySessionMeta(meta);
     return;
   }
   if (type === "goal_updated") {
@@ -1210,7 +1548,7 @@ function applyEventToView(sessionId, event) {
         },
       });
     }
-    showNotice(`MCP 服务器 ${server} 需要授权`, actions);
+    if (sessionId === state.sessionId) showNotice(`MCP 服务器 ${server} 需要授权`, actions);
     return;
   }
   if (type === "subagent_spawned" || type === "subagent_started") {
@@ -1222,7 +1560,7 @@ function applyEventToView(sessionId, event) {
       status: "running",
       detail: "",
     });
-    renderSubagents(view);
+    if (sessionId === state.sessionId) renderSubagents(view);
     return;
   }
   if (type === "subagent_child_event") {
@@ -1237,7 +1575,7 @@ function applyEventToView(sessionId, event) {
       entry.detail = child.status;
     }
     view.subagents.set(key, entry);
-    renderSubagents(view);
+    if (sessionId === state.sessionId) renderSubagents(view);
     return;
   }
   if (type === "subagent_completed" || type === "subagent_failed") {
@@ -1248,7 +1586,7 @@ function applyEventToView(sessionId, event) {
       entry.status = type === "subagent_completed" ? "done" : "failed";
       entry.detail = type === "subagent_failed" ? event.error || "failed" : entry.detail;
       view.subagents.set(key, entry);
-      renderSubagents(view);
+      if (sessionId === state.sessionId) renderSubagents(view);
     }
     return;
   }
@@ -1263,7 +1601,9 @@ function applyEventToView(sessionId, event) {
     return;
   }
   if (type === "btw_retry") {
-    showNotice(`后台问答重试（第 ${event.retry_number || "?"} 次）${event.reason ? `：${event.reason}` : ""}`, [{ label: "知道了", onclick: () => hideNotice() }]);
+    if (sessionId === state.sessionId) {
+      showNotice(`后台问答重试（第 ${event.retry_number || "?"} 次）${event.reason ? `：${event.reason}` : ""}`, [{ label: "知道了", onclick: () => hideNotice() }]);
+    }
     return;
   }
 }
@@ -1306,7 +1646,7 @@ function renderSessions() {
       : '<span class="session-expander-spacer"></span>';
     const title = s.title || id.slice(0, 8);
     const path = escapeHtml(s.workspace || s.working_dir || s.path || "");
-    const preview = s.preview || "";
+    const preview = s.preview && s.preview !== title ? s.preview : "";
     div.innerHTML = `
       <div class="session-row">
         <div class="session-title">
@@ -1318,7 +1658,7 @@ function renderSessions() {
         </div>
       </div>
       ${path ? `<div class="session-path">${path}</div>` : ""}
-      <div class="session-meta">${escapeHtml(preview)}</div>
+      ${preview ? `<div class="session-meta">${escapeHtml(preview)}</div>` : ""}
     `;
     div.onclick = () => {
       const wasActive = div.classList.contains("active");
@@ -1348,7 +1688,9 @@ function renderSessions() {
 }
 
 async function refreshSessions() {
+  const refreshVersion = ++state.sessionsRefreshVersion;
   const body = await api("/api/v1/sessions");
+  if (refreshVersion !== state.sessionsRefreshVersion) return;
   const live = body.sessions || [];
   const archived = body.transcript || [];
   const seen = new Set(live.map(sessionIdOf));
@@ -1358,17 +1700,34 @@ async function refreshSessions() {
 
 async function selectSession(id, { jump = true } = {}) {
   hidePromptModal();
+  if (state.sessionId && state.sessionId !== id) saveComposerState(state.sessionId);
+  const selectionVersion = ++state.selectionVersion;
   state.sessionId = id;
+  restoreComposerState(id);
   if (jump) state.followBottom = true;
   renderSessions();
   const cached = viewOf(id);
+  if (cached.meta) {
+    applySessionMeta(cached.meta);
+  } else {
+    const summary = state.sessions.find((session) => sessionIdOf(session) === id);
+    applySessionMeta({ title: summary?.title || "" });
+  }
   if (cached.messages.length || cached.live || cached.running) {
     paintSessionView(id, { jump });
   } else {
     logEl.innerHTML = "";
   }
-  const sess = await api(`/api/v1/sessions/${id}`);
-  if (state.sessionId !== id) return;
+  const expectedRevision = cached.revision;
+  let sess;
+  try {
+    sess = await api(`/api/v1/sessions/${id}`);
+  } catch (err) {
+    if (state.sessionId !== id || state.selectionVersion !== selectionVersion) return;
+    appendSessionMessage(id, "system", `加载会话失败: ${err.message || err}`, new Date().toISOString());
+    return;
+  }
+  if (state.sessionId !== id || state.selectionVersion !== selectionVersion) return;
   const current = state.sessions.find((s) => sessionIdOf(s) === id);
   if (current) {
     if (sess.forked_from) {
@@ -1377,35 +1736,48 @@ async function selectSession(id, { jump = true } = {}) {
     }
     if (sess.title) current.title = sess.title;
   }
-  mergeServerSession(id, sess);
-  applySessionMeta(sess);
+  mergeServerSession(id, sess, { expectedRevision });
+  applySessionMeta(viewOf(id).meta || sess);
   paintSessionView(id, { jump });
 }
 
 async function ensureSession() {
   if (state.sessionId) return state.sessionId;
+  const selectionVersion = state.selectionVersion;
   const created = await api("/api/v1/sessions", {
     method: "POST",
     body: JSON.stringify({ workspace: state.cwd || "." }),
   });
-  state.sessionId = created.session_id;
-  applySessionMeta(created);
+  const createdId = created.session_id;
+  const meta = updateSessionMeta(createdId, created);
+  // Creating a session may take long enough for the user to select another
+  // one. Keep the new session, but do not steal the selection back.
+  if (!state.sessionId && state.selectionVersion === selectionVersion) {
+    state.sessionId = createdId;
+    restoreComposerState(createdId);
+    applySessionMeta(meta);
+  }
   await refreshSessions();
-  return state.sessionId;
+  return createdId;
 }
 
 async function forkCurrentSession(title) {
-  if (!state.sessionId) return;
+  const sessionId = state.sessionId;
+  if (!sessionId) return;
+  const selectionVersion = state.selectionVersion;
   try {
-    const forked = await api(`/api/v1/sessions/${state.sessionId}/fork`, {
+    const forked = await api(`/api/v1/sessions/${sessionId}/fork`, {
       method: "POST",
       body: JSON.stringify({ title: title || undefined }),
     });
     await refreshSessions();
-    await selectSession(forked.session_id || forked.id);
-    appendMessage("system", "已 fork 新会话。", new Date().toISOString());
+    const forkedId = forked.session_id || forked.id;
+    if (state.sessionId === sessionId && state.selectionVersion === selectionVersion) {
+      await selectSession(forkedId);
+      appendSessionMessage(forkedId, "system", "已 fork 新会话。", new Date().toISOString());
+    }
   } catch (err) {
-    appendMessage("system", `fork 失败: ${err.message || err}`, new Date().toISOString());
+    appendSessionMessage(sessionId, "system", `fork 失败: ${err.message || err}`, new Date().toISOString());
   }
 }
 
@@ -1449,12 +1821,13 @@ async function renameSession(id, title) {
       method: "PATCH",
       body: JSON.stringify({ title: next }),
     });
+    const meta = updateSessionMeta(id, { ...sess, title: sess.title || next });
     const current = state.sessions.find((s) => sessionIdOf(s) === id);
     if (current) current.title = sess.title || next;
-    if (id === state.sessionId) applySessionMeta({ ...sess, title: sess.title || next });
+    if (id === state.sessionId) applySessionMeta(meta);
     renderSessions();
   } catch (err) {
-    appendMessage("system", `改名失败: ${err.message || err}`, new Date().toISOString());
+    appendSessionMessage(id, "system", `改名失败: ${err.message || err}`, new Date().toISOString());
   }
 }
 
@@ -1482,64 +1855,72 @@ async function deleteSession(id, title) {
     }
     await refreshSessions();
   } catch (err) {
-    appendMessage("system", `删除失败: ${err.message || err}`, new Date().toISOString());
+    appendSessionMessage(id, "system", `删除失败: ${err.message || err}`, new Date().toISOString());
   }
 }
 
-async function patchCurrentSession(body) {
-  if (!state.sessionId) return null;
-  const sess = await api(`/api/v1/sessions/${state.sessionId}`, {
+async function patchCurrentSession(body, sessionId = state.sessionId) {
+  if (!sessionId) return null;
+  const sess = await api(`/api/v1/sessions/${sessionId}`, {
     method: "PATCH",
     body: JSON.stringify(body),
   });
-  applySessionMeta(sess);
-  const current = state.sessions.find((s) => sessionIdOf(s) === state.sessionId);
+  const meta = updateSessionMeta(sessionId, sess);
+  if (state.sessionId === sessionId) applySessionMeta(meta);
+  const current = state.sessions.find((s) => sessionIdOf(s) === sessionId);
   if (current && sess.title) current.title = sess.title;
   renderSessions();
   return sess;
 }
 
 async function interruptCurrent() {
-  if (!state.sessionId) return;
+  const sessionId = state.sessionId;
+  if (!sessionId) return;
   try {
-    await api(`/api/v1/sessions/${state.sessionId}/interrupt`, { method: "POST", body: "{}" });
-    setRunning(false);
-    appendMessage("system", "已请求中断当前 turn。", new Date().toISOString());
+    await api(`/api/v1/sessions/${sessionId}/interrupt`, { method: "POST", body: "{}" });
+    appendSessionMessage(sessionId, "system", "已请求中断当前 turn。", new Date().toISOString());
   } catch (err) {
-    appendMessage("system", `中断失败: ${err.message || err}`, new Date().toISOString());
+    appendSessionMessage(sessionId, "system", `中断失败: ${err.message || err}`, new Date().toISOString());
   }
 }
 
 async function compactCurrent(instruction) {
-  if (!state.sessionId) return;
+  const sessionId = state.sessionId;
+  if (!sessionId) return;
   try {
-    await api(`/api/v1/sessions/${state.sessionId}/compact`, {
+    await api(`/api/v1/sessions/${sessionId}/compact`, {
       method: "POST",
       body: JSON.stringify({ instruction: instruction || undefined }),
     });
-    appendMessage("system", "正在压缩上下文…", new Date().toISOString());
+    appendSessionMessage(sessionId, "system", "正在压缩上下文…", new Date().toISOString());
   } catch (err) {
-    appendMessage("system", `Compact 失败: ${err.message || err}`, new Date().toISOString());
+    appendSessionMessage(sessionId, "system", `Compact 失败: ${err.message || err}`, new Date().toISOString());
   }
 }
 
 async function undoCurrent(count) {
-  if (!state.sessionId) return;
+  const sessionId = state.sessionId;
+  if (!sessionId) return;
   try {
-    const result = await api(`/api/v1/sessions/${state.sessionId}/undo`, {
+    const result = await api(`/api/v1/sessions/${sessionId}/undo`, {
       method: "POST",
       body: JSON.stringify({ count: count || 1 }),
     });
     if (result.messages) {
-      viewOf(state.sessionId).messages = parseTranscript(result.messages);
-      viewOf(state.sessionId).live = null;
-      viewOf(state.sessionId).running = false;
-      renderLog(result.messages, { jump: state.followBottom });
+      const view = viewOf(sessionId);
+      view.messages = mergeTransientMessages(parseTranscript(result.messages), view.messages);
+      view.live = null;
+      view.running = false;
+      touchView(view);
+      if (state.sessionId === sessionId) paintSessionView(sessionId, { jump: state.followBottom });
+    } else if (state.sessionId === sessionId) {
+      await selectSession(sessionId, { jump: state.followBottom });
+    } else {
+      reconcileCompletedSession(sessionId, viewOf(sessionId).revision);
     }
-    else await selectSession(state.sessionId, { jump: state.followBottom });
-    appendMessage("system", `已撤销 ${result.undone || count || 1} 轮。`, new Date().toISOString());
+    appendSessionMessage(sessionId, "system", `已撤销 ${result.undone || count || 1} 轮。`, new Date().toISOString());
   } catch (err) {
-    appendMessage("system", `Undo 失败: ${err.message || err}`, new Date().toISOString());
+    appendSessionMessage(sessionId, "system", `Undo 失败: ${err.message || err}`, new Date().toISOString());
   }
 }
 
@@ -1552,9 +1933,13 @@ async function archiveCurrent() {
       body: JSON.stringify({ archived: true }),
     });
     state.sessions = state.sessions.filter((s) => sessionIdOf(s) !== id);
-    state.sessionId = null;
-    applySessionMeta({});
+    const wasActive = state.sessionId === id;
+    if (wasActive) {
+      state.sessionId = null;
+      applySessionMeta({});
+    }
     await refreshSessions();
+    if (!wasActive || state.sessionId) return;
     const next = filterSessions()[0] || state.sessions[0];
     if (next) await selectSession(sessionIdOf(next));
     else {
@@ -1562,57 +1947,65 @@ async function archiveCurrent() {
       updateJumpButton();
     }
   } catch (err) {
-    appendMessage("system", `归档失败: ${err.message || err}`, new Date().toISOString());
+    appendSessionMessage(id, "system", `归档失败: ${err.message || err}`, new Date().toISOString());
   }
 }
 
 async function exportCurrent() {
-  if (!state.sessionId) return;
+  const sessionId = state.sessionId;
+  if (!sessionId) return;
+  const title = state.title;
   try {
-    const body = await api(`/api/v1/sessions/${state.sessionId}/export`);
+    const body = await api(`/api/v1/sessions/${sessionId}/export`);
     const blob = new Blob([JSON.stringify(body, null, 2)], { type: "application/json" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = `${state.title || state.sessionId}.json`;
+    a.download = `${title || sessionId}.json`;
     a.click();
     URL.revokeObjectURL(url);
   } catch (err) {
-    appendMessage("system", `导出失败: ${err.message || err}`, new Date().toISOString());
+    appendSessionMessage(sessionId, "system", `导出失败: ${err.message || err}`, new Date().toISOString());
   }
 }
 
 async function setPermissionMode(mode) {
+  const sessionId = state.sessionId;
+  if (!sessionId) return;
   try {
-    await patchCurrentSession({ permission_mode: mode });
-    appendMessage("system", `权限模式：${mode}`, new Date().toISOString());
+    await patchCurrentSession({ permission_mode: mode }, sessionId);
+    appendSessionMessage(sessionId, "system", `权限模式：${mode}`, new Date().toISOString());
   } catch (err) {
-    appendMessage("system", `切换权限失败: ${err.message || err}`, new Date().toISOString());
+    appendSessionMessage(sessionId, "system", `切换权限失败: ${err.message || err}`, new Date().toISOString());
   }
 }
 
 async function togglePlanMode(enabled) {
+  const sessionId = state.sessionId;
+  if (!sessionId) return;
   const next = typeof enabled === "boolean" ? enabled : !state.planMode;
   try {
-    await patchCurrentSession({ plan_mode: next });
-    appendMessage("system", next ? "已进入 Plan 模式。" : "已退出 Plan 模式。", new Date().toISOString());
+    await patchCurrentSession({ plan_mode: next }, sessionId);
+    appendSessionMessage(sessionId, "system", next ? "已进入 Plan 模式。" : "已退出 Plan 模式。", new Date().toISOString());
   } catch (err) {
-    appendMessage("system", `Plan 模式失败: ${err.message || err}`, new Date().toISOString());
+    appendSessionMessage(sessionId, "system", `Plan 模式失败: ${err.message || err}`, new Date().toISOString());
   }
 }
 
 async function setModel(model, { quiet = false } = {}) {
+  const sessionId = state.sessionId;
+  if (!sessionId) return;
   const next = String(model || "").trim();
   if (!next || next === state.model) {
     renderModelSelect();
     return;
   }
   try {
-    await patchCurrentSession({ model: next });
-    if (!quiet) appendMessage("system", `模型：${next}`, new Date().toISOString());
+    await patchCurrentSession({ model: next }, sessionId);
+    if (!quiet) appendSessionMessage(sessionId, "system", `模型：${next}`, new Date().toISOString());
   } catch (err) {
-    renderModelSelect();
-    appendMessage("system", `切换模型失败: ${err.message || err}`, new Date().toISOString());
+    if (state.sessionId === sessionId) renderModelSelect();
+    appendSessionMessage(sessionId, "system", `切换模型失败: ${err.message || err}`, new Date().toISOString());
   }
 }
 
@@ -1761,9 +2154,29 @@ function setPromptActions(actions = []) {
   }
 }
 
+async function runPromptRequest(request) {
+  for (const button of promptActions.querySelectorAll("button")) button.disabled = true;
+  promptExtra.querySelector(".prompt-error")?.remove();
+  try {
+    await request();
+    return true;
+  } catch (err) {
+    const error = document.createElement("div");
+    error.className = "prompt-error";
+    error.textContent = String(err.message || err);
+    promptExtra.prepend(error);
+    return false;
+  } finally {
+    if (promptModal.classList.contains("active")) {
+      for (const button of promptActions.querySelectorAll("button")) button.disabled = false;
+    }
+  }
+}
+
 function showApprovalModal(request = {}) {
   if (!promptModal) return;
   const id = request.approval_id;
+  const sessionId = request.session_id || state.sessionId;
   const display = request.tool_input_display;
   // Plan review (ExitPlanMode): dedicated panel with execute / revise / reject semantics.
   if (display && typeof display === "object" && display.kind === "plan_review") {
@@ -1787,7 +2200,7 @@ function showApprovalModal(request = {}) {
     return api(`/api/v1/approvals/${id}`, { method: "POST", body: JSON.stringify({ decision, scope }) });
   };
   const done = () => {
-    const view = viewOf(state.sessionId);
+    const view = viewOf(sessionId);
     view.pendingApproval = null;
     hidePromptModal();
   };
@@ -1796,16 +2209,14 @@ function showApprovalModal(request = {}) {
       label: "拒绝",
       danger: true,
       onclick: async () => {
-        await post("rejected");
-        done();
+        if (await runPromptRequest(() => post("rejected"))) done();
       },
     },
     {
       label: "批准",
       primary: true,
       onclick: async () => {
-        await post("approved");
-        done();
+        if (await runPromptRequest(() => post("approved"))) done();
       },
     },
   ]);
@@ -1814,6 +2225,7 @@ function showApprovalModal(request = {}) {
 
 function showPlanReviewModal(request, display) {
   const id = request.approval_id;
+  const sessionId = request.session_id || state.sessionId;
   promptTitle.textContent = "计划待确认";
   const plan = typeof display.plan === "string" ? display.plan : JSON.stringify(display.plan ?? "", null, 2);
   const pathHtml = display.path
@@ -1841,12 +2253,12 @@ function showPlanReviewModal(request, display) {
     return api(`/api/v1/approvals/${id}`, { method: "POST", body: JSON.stringify(body) });
   };
   const done = (note) => {
-    const view = viewOf(state.sessionId);
+    const view = viewOf(sessionId);
     view.pendingApproval = null;
     hidePromptModal();
-    if (note) appendMessage("system", note, new Date().toISOString());
+    if (note) appendSessionMessage(sessionId, "system", note, new Date().toISOString());
   };
-  const selectedLabel = () => promptExtra.querySelector("input[name='plan-option']:checked")?.value || null;
+  const selectedLabel = () => promptBody.querySelector("input[name='plan-option']:checked")?.value || null;
   const feedbackValue = () => document.getElementById("planFeedback")?.value?.trim() || "";
   setPromptActions([
     {
@@ -1854,8 +2266,9 @@ function showPlanReviewModal(request, display) {
       danger: true,
       onclick: async () => {
         const feedback = feedbackValue();
-        await post("rejected", feedback || "用户拒绝了该计划。", null);
-        done("已拒绝计划。");
+        if (await runPromptRequest(() => post("rejected", feedback || "用户拒绝了该计划。", null))) {
+          done("已拒绝计划。");
+        }
       },
     },
     {
@@ -1866,16 +2279,18 @@ function showPlanReviewModal(request, display) {
           document.getElementById("planFeedback")?.focus();
           return;
         }
-        await post("approved", feedback, selectedLabel());
-        done("已提交修改意见，Agent 将按反馈修改计划。");
+        if (await runPromptRequest(() => post("approved", feedback, selectedLabel()))) {
+          done("已提交修改意见，Agent 将按反馈修改计划。");
+        }
       },
     },
     {
       label: "执行",
       primary: true,
       onclick: async () => {
-        await post("approved", null, selectedLabel());
-        done("已确认计划，开始执行。");
+        if (await runPromptRequest(() => post("approved", null, selectedLabel()))) {
+          done("已确认计划，开始执行。");
+        }
       },
     },
   ]);
@@ -1885,6 +2300,7 @@ function showPlanReviewModal(request, display) {
 function showQuestionModal(question = {}) {
   if (!promptModal) return;
   const qid = question.question_id;
+  const sessionId = question.session_id || state.sessionId;
   promptTitle.textContent = "需要你的回答";
   promptBody.innerHTML = `<div>${escapeHtml(question.text || question.prompt || question.header || "请选择或输入回答")}</div>`;
   const options = question.options || [];
@@ -1904,15 +2320,16 @@ function showQuestionModal(question = {}) {
   const submit = async (cancelled = false) => {
     const selected = [...promptExtra.querySelectorAll("input[name='prompt-option']:checked")].map((el) => el.value);
     const freeText = document.getElementById("promptFreeText")?.value?.trim() || "";
-    await api(`/api/v1/questions/${qid}`, {
+    const submitted = await runPromptRequest(() => api(`/api/v1/questions/${qid}`, {
       method: "POST",
       body: JSON.stringify({
         selected_option_ids: selected,
         free_text: freeText || null,
         cancelled,
       }),
-    });
-    const view = viewOf(state.sessionId);
+    }));
+    if (!submitted) return;
+    const view = viewOf(sessionId);
     view.pendingQuestion = null;
     hidePromptModal();
   };
@@ -1995,8 +2412,18 @@ promptEl.addEventListener("keydown", (e) => {
     }
     if (e.key === "Enter" || e.key === "Tab") {
       e.preventDefault();
-      if (selected?.dataset.example) insertCommand(selected.dataset.example);
-      return;
+      const example = selected?.dataset.example;
+      const alreadyComplete = e.key === "Enter"
+        && example
+        && !example.endsWith(" ")
+        && promptEl.value.trim() === example.trim();
+      if (alreadyComplete) {
+        closeCmdPalette();
+        // Continue below and submit the complete command on the first Enter.
+      } else {
+        if (example) insertCommand(example);
+        return;
+      }
     }
     if (e.key === "Escape") {
       closeCmdPalette();
@@ -2005,6 +2432,12 @@ promptEl.addEventListener("keydown", (e) => {
   }
   if (e.key === "Enter" && !e.shiftKey) {
     e.preventDefault();
+    // Running + empty input + Enter = stop (mirrors the button morph).
+    // Running + text = steer, which the submit handler sends normally.
+    if (state.running && !promptEl.value.trim() && state.attachments.length === 0) {
+      interruptCurrent();
+      return;
+    }
     document.getElementById("composer").dispatchEvent(new Event("submit"));
   }
 });
@@ -2039,37 +2472,40 @@ async function sendBtwMessage(text) {
   btwPrompt.value = "";
   btwPrompt.style.height = "auto";
   appendBtwMessage("user", text, new Date().toISOString());
-  const sid = await ensureSession();
   btwSend.disabled = true;
-  state.btwLive = { agentId: null, text: "", el: null };
-  const typing = document.createElement("div");
-  typing.className = "message assistant typing-msg";
-  typing.innerHTML = `
-    <div class="avatar assistant">K</div>
-    <div class="message-body">
-      <div class="message-header"><span class="role-name">kkagent</span></div>
-      <div class="bubble"><div class="typing"><span></span><span></span><span></span></div></div>
-    </div>
-  `;
-  btwLog.appendChild(typing);
-  btwLog.scrollTop = btwLog.scrollHeight;
+  let sid = null;
+  let typing = null;
   try {
+    sid = await ensureSession();
+    state.btwLive = { sessionId: sid, agentId: null, text: "", el: null };
+    typing = document.createElement("div");
+    typing.className = "message assistant typing-msg";
+    typing.innerHTML = `
+      <div class="avatar assistant">K</div>
+      <div class="message-body">
+        <div class="message-header"><span class="role-name">kkagent</span></div>
+        <div class="bubble"><div class="typing"><span></span><span></span><span></span></div></div>
+      </div>
+    `;
+    btwLog.appendChild(typing);
+    btwLog.scrollTop = btwLog.scrollHeight;
     const result = await api(`/api/v1/sessions/${sid}/btw`, {
       method: "POST",
       body: JSON.stringify({ text: `关于以下内容：\n${btwContextText}\n\n${text}` }),
     });
-    if (result.agent_id) state.btwLive.agentId = result.agent_id;
+    if (result.agent_id && state.btwLive?.sessionId === sid) state.btwLive.agentId = result.agent_id;
     if (result.answer) {
-      typing.remove();
+      typing?.remove();
       appendBtwMessage("assistant", result.answer, new Date().toISOString());
-      state.btwLive = null;
+      if (state.btwLive?.sessionId === sid) state.btwLive = null;
     }
   } catch (err) {
-    typing.remove();
-    state.btwLive = null;
+    typing?.remove();
+    if (!sid || state.btwLive?.sessionId === sid) state.btwLive = null;
     appendBtwMessage("system", String(err.message || err), new Date().toISOString());
   } finally {
-    btwSend.disabled = false;
+    // A streaming BTW request stays exclusive until its matching btw_end.
+    if (!state.btwLive) btwSend.disabled = false;
   }
 }
 
@@ -2115,12 +2551,14 @@ btwPrompt.addEventListener("keydown", (e) => {
 async function openTimelinePanel() {
   document.body.classList.add("timeline-open");
   timelineList.innerHTML = "";
-  if (!state.sessionId) {
+  const sessionId = state.sessionId;
+  if (!sessionId) {
     timelineList.innerHTML = '<div class="timeline-empty">当前没有会话。</div>';
     return;
   }
   try {
-    const tl = await api(`/api/v1/sessions/${state.sessionId}/timeline`);
+    const tl = await api(`/api/v1/sessions/${sessionId}/timeline`);
+    if (state.sessionId !== sessionId) return;
     const events = tl.events || [];
     if (!events.length) {
       timelineList.innerHTML = '<div class="timeline-empty">当前会话还没有可回看的改动。</div>';
@@ -2159,12 +2597,14 @@ async function openTimelinePanel() {
       timelineList.appendChild(el);
     }
   } catch (err) {
+    if (state.sessionId !== sessionId) return;
     timelineList.innerHTML = `<div class="timeline-empty">${escapeHtml(String(err.message || err))}</div>`;
   }
 }
 
 async function restoreTurn(turnIndex, label) {
-  if (!state.sessionId || !Number.isFinite(turnIndex)) return;
+  const sessionId = state.sessionId;
+  if (!sessionId || !Number.isFinite(turnIndex)) return;
   const ok = await confirmAction({
     title: "恢复代码状态",
     body: `撤销「${label}」之后的对话和文件改动，恢复到该轮结束时的代码？`,
@@ -2173,16 +2613,24 @@ async function restoreTurn(turnIndex, label) {
   });
   if (!ok) return;
   try {
-    const result = await api(`/api/v1/sessions/${state.sessionId}/restore`, {
+    const result = await api(`/api/v1/sessions/${sessionId}/restore`, {
       method: "POST",
       body: JSON.stringify({ turn_index: turnIndex }),
     });
-    if (result.messages) renderLog(result.messages, { jump: true });
-    else await selectSession(state.sessionId);
-    await openTimelinePanel();
-    appendMessage("system", result.restored === false ? "已经是这一轮的状态。" : `已恢复到 ${label} 结束时的代码。`, new Date().toISOString());
+    if (result.messages) {
+      const view = viewOf(sessionId);
+      view.messages = mergeTransientMessages(parseTranscript(result.messages), view.messages);
+      view.live = null;
+      view.running = false;
+      touchView(view);
+      if (state.sessionId === sessionId) paintSessionView(sessionId, { jump: true });
+    } else if (state.sessionId === sessionId) {
+      await selectSession(sessionId);
+    }
+    if (state.sessionId === sessionId) await openTimelinePanel();
+    appendSessionMessage(sessionId, "system", result.restored === false ? "已经是这一轮的状态。" : `已恢复到 ${label} 结束时的代码。`, new Date().toISOString());
   } catch (err) {
-    appendMessage("system", `恢复失败: ${err.message || err}`, new Date().toISOString());
+    appendSessionMessage(sessionId, "system", `恢复失败: ${err.message || err}`, new Date().toISOString());
   }
 }
 
@@ -2209,14 +2657,24 @@ document.addEventListener("click", (e) => {
 });
 
 document.getElementById("newSession").onclick = async () => {
+  const previousSessionId = state.sessionId;
+  if (previousSessionId) saveComposerState(previousSessionId);
   try {
     state.sessionId = null;
     state.live = null;
     const id = await ensureSession();
-    await selectSession(id);
-    appendMessage("system", "新会话已创建。", new Date().toISOString());
+    if (state.sessionId === id) await selectSession(id);
+    appendSessionMessage(id, "system", "新会话已创建。", new Date().toISOString());
   } catch (err) {
-    appendMessage("system", `创建会话失败: ${err.message || err}`, new Date().toISOString());
+    if (!state.sessionId && previousSessionId) {
+      state.sessionId = previousSessionId;
+      restoreComposerState(previousSessionId);
+      applySessionMeta(viewOf(previousSessionId).meta || {});
+      paintSessionView(previousSessionId, { jump: state.followBottom });
+      appendSessionMessage(previousSessionId, "system", `创建会话失败: ${err.message || err}`, new Date().toISOString());
+    } else if (!state.sessionId) {
+      appendMessage("system", `创建会话失败: ${err.message || err}`, new Date().toISOString());
+    }
   }
 };
 
@@ -2268,7 +2726,18 @@ function fileToAttachment(file) {
 }
 
 async function addFiles(files) {
-  for (const f of files) state.attachments.push(await fileToAttachment(f));
+  const sessionId = state.sessionId;
+  const selectionVersion = state.selectionVersion;
+  const added = [];
+  for (const f of files) added.push(await fileToAttachment(f));
+  if (sessionId && state.sessionId !== sessionId) {
+    viewOf(sessionId).attachments.push(...added);
+    return;
+  }
+  // A file picker opened on the welcome screen must not attach its result to
+  // an unrelated session selected while FileReader was still working.
+  if (!sessionId && state.selectionVersion !== selectionVersion) return;
+  state.attachments.push(...added);
   renderAttachments();
 }
 
@@ -2451,6 +2920,15 @@ async function handleSlash(text) {
 
 document.getElementById("composer").onsubmit = async (e) => {
   e.preventDefault();
+  const submittedSessionId = state.sessionId;
+  const wasRunning = state.running;
+  // While the agent loop is running the send button is in "stop" mode:
+  // submit becomes an interrupt request instead of sending a new message.
+  // (Typing text and pressing Enter still steers, see below.)
+  if (state.running && !promptEl.value.trim() && state.attachments.length === 0) {
+    interruptCurrent();
+    return;
+  }
   const text = promptEl.value.trim();
   if (!text && state.attachments.length === 0) return;
   closeCmdPalette();
@@ -2477,35 +2955,36 @@ document.getElementById("composer").onsubmit = async (e) => {
     }
   }
   const payloadText = [text, ...extraTexts].filter(Boolean).join("\n\n");
-  const sid = await ensureSession();
+  const sid = submittedSessionId || await ensureSession();
   const imagesForLog = images.map((img) => ({ media_type: img.media_type, data: img.data }));
-  viewOf(sid).messages.push({
-    role: "user",
-    content: payloadText || " ",
-    created_at: new Date().toISOString(),
+  const view = viewOf(sid);
+  view.running = true;
+  touchView(view);
+  const sentAt = new Date().toISOString();
+  appendSessionMessage(sid, "user", payloadText || " ", sentAt, [], {
     images: imagesForLog,
-    tool_calls: [],
+    optimistic: true,
   });
-  viewOf(sid).running = true;
-  appendMessage("user", payloadText || " ", new Date().toISOString(), [], {
-    images: imagesForLog,
-  });
-  if (state.running) {
+  if (wasRunning) {
     // Turn is active: post_message delivers this as steer input.
-    appendMessage("system", "已发送，将作为引导输入注入当前运行中的任务。", new Date().toISOString());
-  } else {
+    appendSessionMessage(sid, "system", "已发送，将作为引导输入注入当前运行中的任务。", new Date().toISOString());
+  } else if (state.sessionId === sid) {
     showTyping();
   }
-  setRunning(true);
+  if (state.sessionId === sid) setRunning(true);
   try {
     await api(`/api/v1/sessions/${sid}/messages`, {
       method: "POST",
       body: JSON.stringify({ text: payloadText, images }),
     });
   } catch (err) {
-    removeTyping();
-    setRunning(false);
-    appendMessage("system", String(err.message || err), new Date().toISOString());
+    view.running = false;
+    touchView(view);
+    if (state.sessionId === sid) {
+      removeTyping();
+      setRunning(false);
+    }
+    appendSessionMessage(sid, "system", String(err.message || err), new Date().toISOString());
   }
 };
 
@@ -2638,6 +3117,22 @@ function finalizeLiveMessage() {
   }
 }
 
+function reconcileCompletedSession(sessionId, expectedRevision) {
+  api(`/api/v1/sessions/${sessionId}`).then((sess) => {
+    const changed = mergeServerSession(sessionId, sess, { expectedRevision });
+    if (state.sessionId !== sessionId) return;
+    applySessionMeta(viewOf(sessionId).meta || sess);
+    if (!changed) return;
+    const follow = state.followBottom;
+    const scrollTop = logEl.scrollTop;
+    paintSessionView(sessionId, { jump: follow });
+    if (!follow) {
+      logEl.scrollTop = scrollTop;
+      updateJumpButton();
+    }
+  }).catch(() => {});
+}
+
 function handleAgentEvent(event) {
   const type = event.type;
   const sessionId = event.session_id;
@@ -2663,6 +3158,17 @@ function handleAgentEvent(event) {
     return;
   }
   if (sessionId) applyEventToView(sessionId, event);
+  if (type === "turn_end" && sessionId) {
+    const active = sessionId === state.sessionId;
+    if (active) {
+      setRunning(false);
+      finalizeLiveMessage();
+      state.live = null;
+      refreshSessions().catch(() => {});
+    }
+    reconcileCompletedSession(sessionId, viewOf(sessionId).revision);
+    return;
+  }
   if (sessionId && state.sessionId && sessionId !== state.sessionId && type !== "btw_delta" && type !== "btw_end") {
     return;
   }
@@ -2676,7 +3182,7 @@ function handleAgentEvent(event) {
     }
     return;
   }
-  if (type === "thinking_delta" || type === "message_delta" || type === "tool_call" || type === "tool_result") {
+  if (type === "thinking_delta" || type === "message_delta" || type === "tool_call" || type === "tool_execution_status" || type === "tool_result" || type === "tool_cancelled") {
     if (sessionId === state.sessionId) {
       state.live = viewOf(sessionId).live;
       if (state.live) replaceLiveMessage();
@@ -2684,24 +3190,13 @@ function handleAgentEvent(event) {
     }
     return;
   }
-  if (type === "turn_end") {
-    setRunning(false);
-    if (sessionId === state.sessionId) {
-      finalizeLiveMessage();
-      state.live = null;
-      refreshSessions().catch(() => {});
-      api(`/api/v1/sessions/${sessionId}`).then((sess) => {
-        if (state.sessionId !== sessionId) return;
-        applySessionMeta(sess);
-        mergeServerSession(sessionId, sess);
-      }).catch(() => {});
-    }
-    return;
-  }
   if (type === "error") {
     setRunning(false);
     removeTyping();
-    appendMessage("system", event.message || "turn error", new Date().toISOString());
+    state.live = null;
+    appendMessage("system", event.message || "turn error", new Date().toISOString(), [], {
+      cache: !sessionId,
+    });
     return;
   }
   if (type === "status_update") {
@@ -2714,60 +3209,40 @@ function handleAgentEvent(event) {
   }
   if (type === "session_config_changed") {
     if (sessionId === state.sessionId) {
-      applySessionMeta({
-        title: state.title,
-        permission_mode: event.permission_mode || state.permissionMode,
-        plan_mode: typeof event.plan_mode === "boolean" ? event.plan_mode : state.planMode,
-        model: event.model || state.model,
-        usage: state.usage,
-      });
+      applySessionMeta(viewOf(sessionId).meta || {});
     }
     return;
   }
   if (type === "compact_completed") {
     if (sessionId === state.sessionId) {
       setRunning(false);
-      if (event.error) appendMessage("system", `Compact 失败: ${event.error}`, new Date().toISOString());
-      else if (event.messages) {
-        renderLog(event.messages, { jump: state.followBottom });
-        appendMessage("system", `上下文已压缩，保留 ${event.kept_user_message_count || 0} 条用户消息。`, new Date().toISOString());
-      }
+      paintSessionView(sessionId, { jump: state.followBottom });
     }
     return;
   }
   if (type === "usage_update") {
-    if (event.session_id && event.session_id !== state.sessionId) return;
-    // Per-call usage accumulates into session totals; steps/turns/context are
-    // server-authoritative snapshots that overwrite.
-    const u = event.usage || {};
-    if (!state.usage) state.usage = {};
-    state.usage.input_tokens = (state.usage.input_tokens || 0) + (u.input_tokens || 0);
-    state.usage.output_tokens = (state.usage.output_tokens || 0) + (u.output_tokens || 0);
-    state.usage.cache_creation_tokens =
-      (state.usage.cache_creation_tokens || 0) + (u.cache_creation_input_tokens || 0);
-    state.usage.cache_read_tokens =
-      (state.usage.cache_read_tokens || 0) + (u.cache_read_input_tokens || 0);
-    // Provider semantics of the accumulated input tokens; latest step wins.
-    if (u.input_includes_cache !== undefined && u.input_includes_cache !== null) {
-      state.usage.input_includes_cache = u.input_includes_cache;
-    }
-    if (event.steps !== undefined) state.usage.steps = event.steps;
-    if (event.turns !== undefined) state.usage.turns = event.turns;
-    if (event.context) state.usage.context = event.context;
+    if (!sessionId && state.sessionId) applyUsageUpdate(state.sessionId, event);
     return;
   }
   if (type === "approval_requested") {
-    if (sessionId === state.sessionId) showApprovalModal(event.request || {});
+    if (sessionId === state.sessionId) {
+      showApprovalModal({ ...(event.request || {}), session_id: event.request?.session_id || sessionId });
+    }
     return;
   }
   if (type === "question_asked") {
-    if (sessionId === state.sessionId) showQuestionModal(event.question || {});
+    if (sessionId === state.sessionId) {
+      showQuestionModal({ ...(event.question || {}), session_id: event.question?.session_id || sessionId });
+    }
     return;
   }
   if (type === "btw_delta" && event.text) {
+    if (state.btwLive?.sessionId && sessionId && state.btwLive.sessionId !== sessionId) return;
+    if (state.btwLive?.agentId && event.agent_id && state.btwLive.agentId !== event.agent_id) return;
     const typing = btwLog.querySelector(".typing-msg");
     if (typing) typing.remove();
-    if (!state.btwLive) state.btwLive = { agentId: event.agent_id, text: "", el: null };
+    if (!state.btwLive) state.btwLive = { sessionId, agentId: event.agent_id, text: "", el: null };
+    state.btwLive.sessionId = sessionId || state.btwLive.sessionId;
     state.btwLive.agentId = event.agent_id || state.btwLive.agentId;
     state.btwLive.text += event.text;
     const fresh = renderMessage("assistant", state.btwLive.text, new Date().toISOString());
@@ -2778,6 +3253,8 @@ function handleAgentEvent(event) {
     return;
   }
   if (type === "btw_end") {
+    if (state.btwLive?.sessionId && sessionId && state.btwLive.sessionId !== sessionId) return;
+    if (state.btwLive?.agentId && event.agent_id && state.btwLive.agentId !== event.agent_id) return;
     const typing = btwLog.querySelector(".typing-msg");
     if (typing) typing.remove();
     btwSend.disabled = false;
@@ -2810,10 +3287,10 @@ function connectWs() {
       return;
     }
     if (frame.type === "resync_required") {
-      if (typeof frame.latest_event_seq === "number") {
-        wsLastSeq = Math.max(wsLastSeq, frame.latest_event_seq);
-      }
-      resyncFromHistory();
+      // Replay from the last event we actually processed. Advancing straight
+      // to latest_event_seq here skips exactly the events the server reported
+      // as lost.
+      resyncFromHistory(wsLastSeq);
       return;
     }
     if (frame.type === "event" && frame.data) {
@@ -2829,9 +3306,9 @@ function connectWs() {
   ws.onclose = () => setTimeout(connectWs, 1500);
 }
 
-async function resyncFromHistory() {
+async function resyncFromHistory(since = wsLastSeq) {
   try {
-    const body = await api(`/api/v1/events?since=${wsLastSeq}`);
+    const body = await api(`/api/v1/events?since=${since}`);
     const events = Array.isArray(body?.events) ? body.events : [];
     for (const event of events) {
       if (typeof event?.event_seq === "number") wsLastSeq = Math.max(wsLastSeq, event.event_seq);
@@ -2926,7 +3403,33 @@ if (modelSelect) {
 if (planBtn) planBtn.onclick = () => togglePlanMode();
 const pluginsBtn = document.getElementById("pluginsBtn");
 if (pluginsBtn) pluginsBtn.onclick = () => openPluginsPanel();
-if (stopBtn) stopBtn.onclick = () => interruptCurrent();
+
+sendBtn.onclick = (e) => {
+  if (!state.running) return;
+  // Clicking the visible stop button always interrupts and keeps any draft in
+  // the composer. Pressing Enter with text still submits steer input through
+  // the keydown handler above.
+  e.preventDefault();
+  interruptCurrent();
+};
+
+const todoBtn = document.getElementById("todoBtn");
+if (todoBtn) {
+  todoBtn.onclick = () => {
+    const el = ensureTodoPopover();
+    if (el.classList.contains("open")) {
+      el.classList.remove("open");
+      return;
+    }
+    // Re-render the last known todos for the active session so reopening
+    // shows fresh content instead of whatever was left in the DOM.
+    const view = state.sessionId ? viewOf(state.sessionId) : null;
+    renderTodos(view && Array.isArray(view.todos) ? view.todos : []);
+    el.classList.add("open");
+  };
+}
+// Stop is handled by the send button morphing into a stop button while
+// running (see setRunning / composer submit handler).
 
 if (confirmModal) {
   confirmModal.addEventListener("click", (e) => {
@@ -2970,7 +3473,9 @@ async function boot() {
     const cfg = await api("/api/v1/config").catch(() => ({}));
     const defaultMode = String(cfg.default_permission_mode || "manual").toLowerCase();
     state.defaultPermissionMode = ["manual", "yolo", "auto"].includes(defaultMode) ? defaultMode : "manual";
+    state.defaultModel = cfg.default_model || "";
     if (!state.sessionId) state.permissionMode = state.defaultPermissionMode;
+    if (!state.sessionId) state.model = state.defaultModel;
     await loadModels();
     await refreshSessions();
     const first = filterSessions()[0] || state.sessions[0];

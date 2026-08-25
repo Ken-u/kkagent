@@ -223,14 +223,15 @@
       border-color: var(--accent);
       color: var(--text);
     }
-    #stopBtn {
+    #sendBtn .stop-icon { display: none; }
+    #sendBtn.running {
       background: rgba(248,81,73,0.14);
+      border-color: rgba(248,81,73,0.35);
       color: var(--danger);
-      border: 1px solid rgba(248,81,73,0.35);
-      font-size: 12px;
-      padding: 6px 10px;
     }
-    #stopBtn:hover { background: rgba(248,81,73,0.22); }
+    #sendBtn.running:hover { background: rgba(248,81,73,0.22); }
+    #sendBtn.running .send-icon { display: none; }
+    #sendBtn.running .stop-icon { display: block; }
     #sessionMenu {
       display: none;
       position: absolute; top: calc(100% - 6px); right: 12px;
@@ -751,7 +752,12 @@
     .cmd-item .cmd-name { font-weight: 600; color: var(--accent); width: 112px; flex-shrink: 0; }
     .cmd-item .cmd-desc { color: var(--text-secondary); font-size: 13px; }
 
-    .composer-wrap { padding: 14px 24px 24px; background: var(--bg); flex-shrink: 0; }
+    .composer-wrap { padding: 14px 24px 24px; background: var(--bg); flex-shrink: 0; position: relative; }
+    .composer-toolbar {
+      display: flex; align-items: center; gap: 8px;
+      padding: 0 2px 8px;
+    }
+    .composer-toolbar .btn-secondary { padding: 4px 10px; font-size: 12px; }
     #composer {
       position: relative;
       display: flex; align-items: flex-end; gap: 10px;
@@ -1015,6 +1021,7 @@
       color: var(--text); font-size: 13px;
     }
     #promptActions { display: flex; justify-content: flex-end; gap: 8px; flex-wrap: wrap; }
+    .prompt-error { color: var(--danger); font-size: 12px; margin-bottom: 8px; }
 
     @media (max-width: 760px) {
       body { grid-template-columns: 1fr; }
@@ -1035,8 +1042,14 @@
       #sessionBar { padding: 10px 16px 10px 52px; }
       #jumpBottom { right: 16px; }
       .composer-wrap { padding: 12px 16px 16px; }
+      /* Todo popover on narrow screens: full width, single-row height so it
+         never covers the transcript. Tap ⤢ to expand. */
+      .todo-popover { right: 0; left: 0; width: auto; }
+      .todo-pop-body { max-height: 38px; }
+      .todo-popover.expanded .todo-pop-body { max-height: 50vh; }
       .kv-row { grid-template-columns: 72px minmax(0, 1fr); gap: 8px; }
       .tool-meta { display: none; }
+      .msg-actions { opacity: 1; }
     }
     @media (min-width: 761px) { .menu-toggle { display: none; } }
 
@@ -1066,10 +1079,38 @@
     .side-panel-header { display: flex; align-items: center; justify-content: space-between; padding: 14px 16px; font-weight: 600; border-bottom: 1px solid var(--border); }
     .side-panel-close { background: none; border: none; color: var(--text-secondary); font-size: 18px; cursor: pointer; }
     .side-panel-body { padding: 12px 16px; overflow: auto; flex: 1; font-size: 13px; }
-    .todo-list, .subagent-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
-    .todo-list li { display: flex; gap: 8px; align-items: baseline; color: var(--text-secondary); }
-    .todo-list li.todo-active { color: var(--text); font-weight: 600; }
-    .todo-list li.todo-done { text-decoration: line-through; opacity: 0.6; }
+    /* Todo popover: floats above the composer, right-aligned (PC) */
+    .todo-popover {
+      display: none;
+      position: absolute; right: 24px; bottom: calc(100% + 6px);
+      width: min(420px, calc(100vw - 48px));
+      background: var(--surface); border: 1px solid var(--border-strong);
+      border-radius: var(--radius); box-shadow: var(--shadow);
+      z-index: 40; flex-direction: column; overflow: hidden;
+    }
+    .todo-popover.open { display: flex; }
+    .todo-pop-header {
+      display: flex; align-items: center; gap: 8px;
+      padding: 6px 10px; font-size: 12px; font-weight: 600;
+      border-bottom: 1px solid var(--border); cursor: default;
+    }
+    .todo-pop-title { flex: 1; }
+    .todo-pop-count { color: var(--text-secondary); font-weight: 400; }
+    .todo-pop-toggle, .todo-pop-close {
+      background: none; border: none; color: var(--text-secondary);
+      font-size: 14px; cursor: pointer; padding: 0 2px; line-height: 1;
+    }
+    .todo-pop-toggle:hover, .todo-pop-close:hover { color: var(--text); }
+    .todo-pop-body { overflow: auto; padding: 6px 10px; font-size: 13px; max-height: 132px; }
+    .todo-popover.expanded .todo-pop-body { max-height: min(50vh, 420px); }
+    .todo-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 4px; }
+    .todo-list li { display: flex; align-items: baseline; gap: 8px; line-height: 1.45; color: var(--text-secondary); }
+    .todo-list .todo-mark { flex-shrink: 0; }
+    .todo-list .todo-done { color: var(--text-secondary); text-decoration: line-through; opacity: 0.6; }
+    .todo-list .todo-active { color: var(--text); font-weight: 600; }
+    .todo-list .todo-active .todo-mark { color: var(--accent); }
+    .todo-list .todo-empty { justify-content: center; padding: 8px 0; color: var(--text-secondary); }
+    .subagent-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
     .plan-path { font-family: var(--mono, monospace); font-size: 12px; color: var(--text-secondary); margin-bottom: 8px; }
     .subagent-list li { display: flex; gap: 8px; padding: 6px 0; border-bottom: 1px solid var(--border); }
     .subagent-list .sub-running { color: var(--text); }
@@ -1147,9 +1188,7 @@
           <option value="yolo">yolo</option>
           <option value="auto">auto</option>
         </select>
-        <button type="button" id="planBtn" class="btn-secondary" title="Plan 模式">Plan</button>
         <button type="button" id="pluginsBtn" class="btn-secondary" title="插件管理">插件</button>
-        <button type="button" id="stopBtn" hidden>停止</button>
         <button type="button" id="moreBtn" class="composer-action" title="更多" aria-label="更多">⋯</button>
       </div>
       <div id="sessionMenu">
@@ -1171,6 +1210,10 @@
       <button type="button" id="jumpBottom">↓ 最新</button>
     </div>
     <div class="composer-wrap">
+      <div class="composer-toolbar" id="composerToolbar">
+        <button type="button" id="planBtn" class="btn-secondary" title="Plan 模式">Plan</button>
+        <button type="button" id="todoBtn" class="btn-secondary" title="任务清单">任务</button>
+      </div>
       <form id="composer">
         <div class="composer-left">
           <div id="attachmentRow" class="attachment-row"></div>
@@ -1185,8 +1228,9 @@
           <button type="button" id="attachBtn" class="composer-action" title="添加附件 / 截图 (Ctrl+V)" aria-label="添加附件">
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"></path></svg>
           </button>
-          <button type="submit" id="sendBtn" aria-label="Send">
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"></line><polygon points="22 2 15 22 11 13 2 9 22 2"></polygon></svg>
+          <button type="submit" id="sendBtn" aria-label="Send" title="发送 (Enter)">
+            <svg class="send-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"></line><polygon points="22 2 15 22 11 13 2 9 22 2"></polygon></svg>
+            <svg class="stop-icon" width="14" height="14" viewBox="0 0 24 24" fill="currentColor" stroke="none"><rect x="5" y="5" width="14" height="14" rx="2"></rect></svg>
           </button>
         </div>
       </form>

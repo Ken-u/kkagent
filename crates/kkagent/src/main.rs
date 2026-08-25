@@ -2756,21 +2756,81 @@ impl AgentHttpBackend {
         session_id: &str,
         mut body: serde_json::Value,
     ) -> serde_json::Value {
+        // A running turn temporarily owns the Session, so `body` may come from
+        // the checkout-time in_flight_views snapshot. Configuration controls
+        // remain live through shared handles; overlay their current values so
+        // switching away and back never resurrects the pre-turn model/mode.
+        let model_alias = self
+            .state
+            .model_aliases
+            .lock()
+            .await
+            .get(session_id)
+            .cloned();
+        let current_model = model_alias.map(|alias| {
+            alias
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone()
+        });
+        let permission_mode = self
+            .state
+            .permission_modes
+            .lock()
+            .await
+            .get(session_id)
+            .cloned();
+        let current_permission_mode = permission_mode.map(|mode| {
+            mode.lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .to_string()
+        });
+        let plan_mode = self
+            .state
+            .plan_mode_requests
+            .lock()
+            .await
+            .get(session_id)
+            .cloned()
+            .map(|requested| requested.load(std::sync::atomic::Ordering::SeqCst));
         let extra = self.state.resume_reconnect_fields(session_id).await;
+        let approval = self
+            .state
+            .pending_tool_approval_for_session(session_id)
+            .await;
+        let question = self.state.pending_question_for_session(session_id).await;
+        let status = self
+            .state
+            .resume_status_for_session(
+                session_id,
+                self.state.turn_locks.is_busy(session_id).await,
+                approval.is_some(),
+                question.is_some(),
+            )
+            .await;
         if let Some(object) = body.as_object_mut() {
+            if let Some(model) = current_model {
+                object.insert("model".into(), serde_json::json!(model));
+            }
+            if let Some(mode) = current_permission_mode {
+                object.insert("permission_mode".into(), serde_json::json!(mode));
+            }
+            if let Some(enabled) = plan_mode {
+                object.insert("plan_mode".into(), serde_json::json!(enabled));
+            }
             for (key, value) in extra {
                 object.insert(key, value);
             }
-            if let Some(approval) = self
-                .state
-                .pending_tool_approval_for_session(session_id)
-                .await
-            {
+            object.insert(
+                "status".into(),
+                serde_json::to_value(status).unwrap_or_else(|_| serde_json::json!("idle")),
+            );
+            if let Some(approval) = approval {
                 if let Ok(value) = serde_json::to_value(approval) {
                     object.insert("pending_approval".into(), value);
                 }
             }
-            if let Some(question) = self.state.pending_question_for_session(session_id).await {
+            if let Some(question) = question {
                 object.insert("pending_question".into(), question);
             }
         }
@@ -3050,6 +3110,27 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
         self.state.active_btw_sessions.lock().await.remove(id);
         self.state.reconnect_ui.lock().await.remove(id);
         self.state.turn_locks.remove(id).await;
+        // Remove the on-disk session directory as well — list_sessions()
+        // primarily serves disk summaries, so skipping this would keep the
+        // deleted session visible in the session list.
+        match tokio::task::spawn_blocking({
+            let id = id.to_string();
+            move || SessionStore::open_default().delete(&id)
+        })
+        .await
+        {
+            Ok(Ok(())) => {}
+            // Transcript-only sessions legitimately have no journal directory.
+            Ok(Err(error)) if error.to_string().contains("session not found") => {}
+            Ok(Err(error)) => {
+                return Err(format!("session {id}: disk delete failed ({error:#})"));
+            }
+            Err(error) => {
+                return Err(format!(
+                    "session {id}: disk delete worker failed ({error:?})"
+                ));
+            }
+        }
         {
             let db = self.state.transcript.lock().await;
             // Archive the full session (messages + oversized tool results) to
@@ -3091,7 +3172,14 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
             return Err("message text must not be empty".into());
         }
         ensure_session_loaded(&self.state, id).await?;
-        let turn_permit = self.state.turn_locks.try_acquire(id).await?;
+        // An interrupt completes asynchronously. Match the native RPC prompt
+        // path and briefly wait for the cancelled turn to release ownership,
+        // instead of rejecting a prompt submitted immediately after Stop.
+        let turn_permit = self
+            .state
+            .turn_locks
+            .try_acquire_with_grace(id, TURN_PERMIT_GRACE)
+            .await?;
         if let Some(task_id) = task_id {
             self.state
                 .durable_http
@@ -3102,16 +3190,7 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
         let session = sessions
             .get_mut(id)
             .ok_or_else(|| "session not found".to_string())?;
-        session
-            .add_user_message_with_images(
-                text.to_string(),
-                images
-                    .iter()
-                    .map(|image| (image.media_type.clone(), image.data.clone()))
-                    .collect(),
-            )
-            .map_err(|error| format!("invalid image input: {error}"))?;
-        let n = session.messages.len();
+        let n = prepare_http_user_message(session, text, images)?;
         drop(sessions);
         let state = self.state.clone();
         let sid = id.to_string();
@@ -3654,6 +3733,27 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
             "persistence": "durable",
         }))
     }
+}
+
+fn prepare_http_user_message(
+    session: &mut Session,
+    text: &str,
+    images: &[kkagent_rpc::HttpImageInput],
+) -> Result<usize, String> {
+    // `session.interrupt` sets a cooperative flag shared with the in-flight
+    // turn. That flag belongs to the old turn and must never poison the next
+    // one (notably after changing models in the WebUI).
+    session.clear_interrupt();
+    session
+        .add_user_message_with_images(
+            text.to_string(),
+            images
+                .iter()
+                .map(|image| (image.media_type.clone(), image.data.clone()))
+                .collect(),
+        )
+        .map_err(|error| format!("invalid image input: {error}"))?;
+    Ok(session.messages.len())
 }
 
 fn trusted_http_roots(config: &AppConfig) -> Result<Vec<PathBuf>, String> {
@@ -4992,6 +5092,20 @@ impl ServerState {
                         .await;
                 }
             }
+            AgentEvent::TodoUpdated {
+                session_id, items, ..
+            } => {
+                let mut views = self.in_flight_views.lock().await;
+                if let Some(object) = views
+                    .get_mut(session_id)
+                    .and_then(serde_json::Value::as_object_mut)
+                {
+                    object.insert(
+                        "todos".into(),
+                        serde_json::to_value(items).unwrap_or_default(),
+                    );
+                }
+            }
             AgentEvent::CompactCompleted { session_id, .. } => {
                 self.set_reconnect_status(session_id, SessionStatus::Idle)
                     .await;
@@ -5548,6 +5662,7 @@ fn http_session_json(session: &Session) -> serde_json::Value {
         "plan_mode": session.plan_mode,
         "model": session.get_model_alias(),
         "messages": session.messages,
+        "todos": session.todo_items(),
         "usage": {
             "input_tokens": usage.input_tokens,
             "output_tokens": usage.output_tokens,
@@ -5671,6 +5786,14 @@ fn http_session_list_item(
     record: Option<&kkagent_core::transcript::SessionRecord>,
 ) -> serde_json::Value {
     let message_count = record.map(|item| item.message_count).unwrap_or(0);
+    // The transcript auto-title can be committed before the journal summary
+    // is refreshed. Prefer the summary's explicit/custom title, but fall back
+    // to the authoritative transcript record instead of showing a raw ID in
+    // the WebUI sidebar.
+    let title = summary
+        .title
+        .clone()
+        .or_else(|| record.and_then(|item| item.title.clone()));
     let preview = summary
         .last_prompt
         .as_deref()
@@ -5684,7 +5807,7 @@ fn http_session_list_item(
         .or_else(|| record.map(|item| item.updated_at.clone()));
     serde_json::json!({
         "session_id": summary.id,
-        "title": summary.title,
+        "title": title,
         "workspace": summary.work_dir,
         "working_dir": summary.work_dir,
         "updated_at": updated_at,
@@ -10602,6 +10725,57 @@ mod runtime_http_tests {
         tx
     }
 
+    #[test]
+    fn session_list_item_falls_back_to_transcript_title() {
+        let summary = kkagent_core::session::store::SessionSummary {
+            id: "title-fallback".into(),
+            session_dir: "/tmp/title-fallback".into(),
+            work_dir: "/tmp".into(),
+            title: None,
+            is_custom_title: false,
+            archived: false,
+            last_prompt: Some("first prompt".into()),
+            first_prompt: Some("first prompt".into()),
+            created_at: 0,
+            updated_at: 0,
+            forked_from: None,
+        };
+        let record = kkagent_core::transcript::SessionRecord {
+            session_id: "title-fallback".into(),
+            title: Some("Generated title".into()),
+            model: "model".into(),
+            fallback_model: None,
+            working_dir: "/tmp".into(),
+            created_at: "1970-01-01T00:00:00Z".into(),
+            updated_at: "1970-01-01T00:00:00Z".into(),
+            message_count: 1,
+            is_archived: false,
+        };
+
+        let item = http_session_list_item(summary, Some(&record));
+        assert_eq!(item["title"], "Generated title");
+    }
+
+    #[test]
+    fn http_message_starts_fresh_turn_after_interrupt() {
+        let mut session = Session::new(
+            "http-after-interrupt".into(),
+            std::env::temp_dir(),
+            PermissionMode::Manual,
+            "old-model".into(),
+        );
+        session.request_interrupt();
+        assert!(session.is_interrupted());
+
+        let message_count =
+            prepare_http_user_message(&mut session, "continue with the newly selected model", &[])
+                .expect("the next HTTP message should be accepted");
+
+        assert!(!session.is_interrupted());
+        assert_eq!(message_count, 1);
+        assert_eq!(session.messages.len(), 1);
+    }
+
     #[tokio::test]
     async fn approval_response_requires_the_matching_pending_request() {
         let state = test_server_state().await;
@@ -10975,11 +11149,35 @@ mod runtime_http_tests {
         state.reconnect_ui.lock().await.remove("resume-tools");
         let event_state = state.clone();
         event_state
+            .note_agent_event_for_resume(&AgentEvent::ThinkingDelta {
+                session_id: "resume-tools".into(),
+                text: "step one thought".into(),
+            })
+            .await;
+        event_state
+            .note_agent_event_for_resume(&AgentEvent::MessageDelta {
+                session_id: "resume-tools".into(),
+                text: "step one answer".into(),
+            })
+            .await;
+        event_state
             .note_agent_event_for_resume(&AgentEvent::ToolCall {
                 session_id: "resume-tools".into(),
                 tool_call_id: "call-1".into(),
                 tool_name: "bash".into(),
                 input: serde_json::json!({"command": "ls"}),
+            })
+            .await;
+        event_state
+            .note_agent_event_for_resume(&AgentEvent::ThinkingDelta {
+                session_id: "resume-tools".into(),
+                text: "step two thought".into(),
+            })
+            .await;
+        event_state
+            .note_agent_event_for_resume(&AgentEvent::MessageDelta {
+                session_id: "resume-tools".into(),
+                text: "step two answer".into(),
             })
             .await;
         event_state
@@ -11000,17 +11198,101 @@ mod runtime_http_tests {
             .await
             .expect("in-flight session should remain readable");
         let messages = got["messages"].as_array().expect("messages array");
-        assert_eq!(messages.len(), 3);
+        assert_eq!(messages.len(), 4);
         assert_eq!(messages[0]["content"][0]["text"], "run tools");
-        assert_eq!(messages[1]["content"][0]["type"], "tool_use");
-        assert_eq!(messages[1]["content"][0]["id"], "call-1");
+        assert_eq!(messages[1]["content"][0]["thinking"], "step one thought");
+        assert_eq!(messages[1]["content"][1]["text"], "step one answer");
+        assert_eq!(messages[1]["content"][2]["type"], "tool_use");
+        assert_eq!(messages[1]["content"][2]["id"], "call-1");
         assert_eq!(
             messages[2]["content"][0]["type"], "tool_result",
             "tool result must survive after its reconnect_ui entry was recreated"
         );
         assert_eq!(messages[2]["content"][0]["tool_use_id"], "call-1");
+        assert_eq!(messages[3]["content"][0]["thinking"], "step two thought");
+        assert_eq!(messages[3]["content"][1]["text"], "step two answer");
 
         state.checkin_session("resume-tools", taken).await;
+        std::fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[tokio::test]
+    async fn get_session_keeps_live_config_todos_and_status_while_checked_out() {
+        let state = test_server_state().await;
+        let workspace =
+            std::env::temp_dir().join(format!("kkagent-resume-todos-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let mut session = Session::new(
+            "resume-todos".into(),
+            workspace.clone(),
+            PermissionMode::Manual,
+            "model".into(),
+        );
+        session.add_user_message("update todos".into());
+        state
+            .model_aliases
+            .lock()
+            .await
+            .insert(session.id.clone(), session.model_alias.clone());
+        state
+            .permission_modes
+            .lock()
+            .await
+            .insert(session.id.clone(), session.permission_mode.clone());
+        state
+            .plan_mode_requests
+            .lock()
+            .await
+            .insert(session.id.clone(), session.plan_mode_requested.clone());
+        state
+            .sessions
+            .lock()
+            .await
+            .insert(session.id.clone(), session);
+
+        let taken = state
+            .checkout_session("resume-todos")
+            .await
+            .expect("session should check out");
+        let _permit = state
+            .turn_locks
+            .try_acquire("resume-todos")
+            .await
+            .expect("turn lock should be free");
+        *state.model_aliases.lock().await["resume-todos"]
+            .lock()
+            .unwrap() = "switched-model".into();
+        *state.permission_modes.lock().await["resume-todos"]
+            .lock()
+            .unwrap() = PermissionMode::Yolo;
+        state.plan_mode_requests.lock().await["resume-todos"]
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        state
+            .note_agent_event_for_resume(&AgentEvent::TodoUpdated {
+                session_id: "resume-todos".into(),
+                items: vec![kkagent_protocol::TodoItemEvent {
+                    id: "1".into(),
+                    content: "Preserve current list".into(),
+                    status: "in_progress".into(),
+                }],
+            })
+            .await;
+
+        let backend = AgentHttpBackend {
+            state: state.clone(),
+        };
+        let got = backend
+            .get_session("resume-todos")
+            .await
+            .expect("checked-out session should remain readable");
+        assert_eq!(got["status"], "thinking");
+        assert_eq!(got["model"], "switched-model");
+        assert_eq!(got["permission_mode"], "yolo");
+        assert_eq!(got["plan_mode"], true);
+        assert_eq!(got["todos"][0]["content"], "Preserve current list");
+        assert_eq!(got["todos"][0]["status"], "in_progress");
+
+        state.checkin_session("resume-todos", taken).await;
         std::fs::remove_dir_all(workspace).unwrap();
     }
 
