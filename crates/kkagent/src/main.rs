@@ -3373,24 +3373,55 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
         id: &str,
         decision: &str,
         feedback: Option<String>,
+        selected_label: Option<String>,
+        scope: Option<String>,
     ) -> Result<serde_json::Value, String> {
         let dec = match decision {
             "approved" | "approve" | "allow" => kkagent_protocol::ApprovalDecision::Approved,
             "rejected" | "reject" | "deny" => kkagent_protocol::ApprovalDecision::Rejected,
             _ => kkagent_protocol::ApprovalDecision::Cancelled,
         };
+        let scope = match scope.as_deref().map(str::trim) {
+            Some("session") => Some(kkagent_protocol::ApprovalScope::Session),
+            Some("always") => Some(kkagent_protocol::ApprovalScope::Always),
+            Some("turn") => Some(kkagent_protocol::ApprovalScope::Turn),
+            _ => None,
+        };
         let resp = kkagent_protocol::ApprovalResponse {
             approval_id: id.to_string(),
             decision: dec,
-            scope: None,
+            scope,
             feedback,
-            selected_label: None,
+            selected_label,
         };
         let txs = self.state.approval_txs.lock().await;
         for tx in txs.values() {
             let _ = tx.try_send(resp.clone());
         }
         Ok(serde_json::json!({"ok": true, "approval_id": id}))
+    }
+
+    async fn plugin_rpc(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        const ALLOWED: &[&str] = &[
+            "plugins.list",
+            "plugins.install",
+            "plugins.update",
+            "plugins.enable",
+            "plugins.disable",
+            "plugins.remove",
+            "plugins.marketplaces.list",
+            "plugins.marketplaces.add",
+            "plugins.marketplaces.remove",
+            "plugins.marketplace",
+        ];
+        if !ALLOWED.contains(&method) {
+            return Err(format!("unsupported plugin method: {method}"));
+        }
+        http_rpc(&self.state, method, params).await
     }
 
     async fn cancel_turn(&self, task_id: &str) -> Result<serde_json::Value, String> {

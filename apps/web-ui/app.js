@@ -651,7 +651,9 @@ function jumpToLatest() {
 
 function setRunning(running) {
   state.running = running;
-  sendBtn.disabled = running;
+  // Keep the composer enabled while running so extra input is steered into
+  // the active turn instead of being blocked.
+  sendBtn.disabled = false;
   if (stopBtn) stopBtn.hidden = !running;
 }
 
@@ -932,6 +934,64 @@ function viewOf(id) {
   return state.views[id];
 }
 
+function updatePlanBtn() {
+  if (planBtn) planBtn.classList.toggle("active", Boolean(state.planMode));
+}
+
+// --- Todo / plan / subagent side panels -------------------------------------
+
+function ensurePanel(id, title) {
+  let el = document.getElementById(id);
+  if (!el) {
+    el = document.createElement("section");
+    el.id = id;
+    el.className = "side-panel";
+    el.innerHTML = `<header class="side-panel-header">${escapeHtml(title)}<button type="button" class="side-panel-close" aria-label="关闭">×</button></header><div class="side-panel-body"></div>`;
+    el.querySelector(".side-panel-close").onclick = () => { el.classList.remove("open"); };
+    document.getElementById("log")?.parentElement?.appendChild(el);
+  }
+  return el;
+}
+
+function renderTodos(todos) {
+  if (!Array.isArray(todos) || !todos.length) return;
+  const el = ensurePanel("todoPanel", "任务清单");
+  const body = el.querySelector(".side-panel-body");
+  const rows = todos
+    .map((t) => {
+      const mark = t.status === "done" ? "☑" : t.status === "in_progress" ? "◐" : "☐";
+      const cls = t.status === "done" ? "todo-done" : t.status === "in_progress" ? "todo-active" : "";
+      return `<li class="${cls}"><span class="todo-mark">${mark}</span><span>${escapeHtml(t.title || t.content || "")}</span></li>`;
+    })
+    .join("");
+  body.innerHTML = `<ul class="todo-list">${rows}</ul>`;
+  el.classList.add("open");
+}
+
+function renderPlanPanel(plan) {
+  if (!plan || (!plan.content && !plan.path)) return;
+  const el = ensurePanel("planPanel", "当前计划");
+  const body = el.querySelector(".side-panel-body");
+  body.innerHTML = `${plan.path ? `<div class="plan-path">${escapeHtml(plan.path)}</div>` : ""}<div class="plan-content">${markdownToHtml(plan.content || "")}</div>`;
+  el.classList.add("open");
+}
+
+function renderSubagents(view) {
+  const agents = view.subagents;
+  if (!agents || !agents.size) return;
+  const el = ensurePanel("subagentPanel", "子代理");
+  const body = el.querySelector(".side-panel-body");
+  const rows = [...agents.values()]
+    .map((a) => {
+      const dot = a.status === "done" ? "●" : a.status === "failed" ? "✕" : "◐";
+      const cls = a.status === "failed" ? "sub-failed" : a.status === "done" ? "sub-done" : "sub-running";
+      return `<li class="${cls}"><span>${dot}</span><div><div class="sub-desc">${escapeHtml(a.description || a.id)}</div>${a.detail ? `<div class="sub-detail">${escapeHtml(a.detail.slice(-200))}</div>` : ""}</div></li>`;
+    })
+    .join("");
+  body.innerHTML = `<ul class="subagent-list">${rows}</ul>`;
+  el.classList.add("open");
+}
+
 function cloneLive(live) {
   if (!live) return null;
   return {
@@ -1108,6 +1168,103 @@ function applyEventToView(sessionId, event) {
   }
   if (type === "question_asked") {
     view.pendingQuestion = event.question || {};
+    return;
+  }
+  if (type === "todo_updated") {
+    view.todos = Array.isArray(event.items) ? event.items : [];
+    renderTodos(view.todos);
+    return;
+  }
+  if (type === "plan_file_updated") {
+    view.plan = { path: event.path || "", content: event.content || "" };
+    renderPlanPanel(view.plan);
+    return;
+  }
+  if (type === "plan_mode_changed") {
+    if (event.session_id === state.sessionId || !event.session_id) {
+      state.planMode = !!event.enabled;
+      updatePlanBtn();
+    }
+    return;
+  }
+  if (type === "goal_updated") {
+    view.goal = { goal: event.goal || null, budget: event.budget || null, change: event.change || "" };
+    return;
+  }
+  if (type === "skill_activated") {
+    view.systemNotes = view.systemNotes || [];
+    view.systemNotes.push(`技能 ${event.skill_name || ""} 已激活`);
+    return;
+  }
+  if (type === "mcp_auth_required") {
+    const server = event.server_name || "MCP server";
+    view.mcpAuthPending = server;
+    const actions = [{ label: "知道了", onclick: () => hideNotice() }];
+    if (event.authorization_url) {
+      actions.unshift({
+        label: "打开授权页",
+        primary: true,
+        onclick: () => {
+          window.open(event.authorization_url, "_blank", "noopener");
+          hideNotice();
+        },
+      });
+    }
+    showNotice(`MCP 服务器 ${server} 需要授权`, actions);
+    return;
+  }
+  if (type === "subagent_spawned" || type === "subagent_started") {
+    view.subagents = view.subagents || new Map();
+    const key = event.subagent_id || event.agent_id || event.id || String(view.subagents.size);
+    view.subagents.set(key, {
+      id: key,
+      description: event.description || event.subagent_name || "",
+      status: "running",
+      detail: "",
+    });
+    renderSubagents(view);
+    return;
+  }
+  if (type === "subagent_child_event") {
+    view.subagents = view.subagents || new Map();
+    const key = event.subagent_id || event.agent_id || event.id;
+    if (!key) return;
+    const entry = view.subagents.get(key) || { id: key, description: "", status: "running", detail: "" };
+    const child = event.event || {};
+    if (child.type === "message_delta" && child.text) {
+      entry.detail = (entry.detail + child.text).slice(-500);
+    } else if (child.type === "status_update" && child.status) {
+      entry.detail = child.status;
+    }
+    view.subagents.set(key, entry);
+    renderSubagents(view);
+    return;
+  }
+  if (type === "subagent_completed" || type === "subagent_failed") {
+    view.subagents = view.subagents || new Map();
+    const key = event.subagent_id || event.agent_id || event.id;
+    if (key) {
+      const entry = view.subagents.get(key) || { id: key, description: "", status: "running", detail: "" };
+      entry.status = type === "subagent_completed" ? "done" : "failed";
+      entry.detail = type === "subagent_failed" ? event.error || "failed" : entry.detail;
+      view.subagents.set(key, entry);
+      renderSubagents(view);
+    }
+    return;
+  }
+  if (type === "steer_input") {
+    view.steerNotes = view.steerNotes || [];
+    view.steerNotes.push(event.text || "");
+    return;
+  }
+  if (type === "llm_retry") {
+    view.retryNotes = view.retryNotes || [];
+    view.retryNotes.push(`第 ${event.retry_number || "?"} 次重试${event.reason ? `：${event.reason}` : ""}`);
+    return;
+  }
+  if (type === "btw_retry") {
+    showNotice(`后台问答重试（第 ${event.retry_number || "?"} 次）${event.reason ? `：${event.reason}` : ""}`, [{ label: "知道了", onclick: () => hideNotice() }]);
+    return;
   }
 }
 
@@ -1606,36 +1763,119 @@ function setPromptActions(actions = []) {
 
 function showApprovalModal(request = {}) {
   if (!promptModal) return;
+  const id = request.approval_id;
+  const display = request.tool_input_display;
+  // Plan review (ExitPlanMode): dedicated panel with execute / revise / reject semantics.
+  if (display && typeof display === "object" && display.kind === "plan_review") {
+    showPlanReviewModal(request, display);
+    return;
+  }
   const tool = request.tool_name || "tool";
   const action = request.action ? ` · ${request.action}` : "";
   promptTitle.textContent = "需要批准工具";
-  const input = request.tool_input_display ?? request.input;
-  const inputHtml = input
-    ? `<pre>${escapeHtml(typeof input === "string" ? input : JSON.stringify(input, null, 2))}</pre>`
+  const input = display ?? request.input;
+  const inputStr = typeof input === "string" ? input : JSON.stringify(input, null, 2);
+  const isLong = inputStr && inputStr.length > 2000;
+  const inputHtml = inputStr
+    ? `<details class="prompt-input"${isLong ? "" : " open"}><summary>工具输入</summary><pre>${escapeHtml(inputStr)}</pre></details>`
     : "";
   promptBody.innerHTML = `<div class="prompt-kicker">${escapeHtml(tool)}${escapeHtml(action)}</div>
     <div>Agent 想要调用该工具，请确认是否允许。</div>${inputHtml}`;
-  promptExtra.innerHTML = "";
-  const id = request.approval_id;
+  promptExtra.innerHTML = `<label class="prompt-scope"><input type="checkbox" id="approvalScopeSession"> 本会话内不再询问该工具</label>`;
+  const post = (decision) => {
+    const scope = document.getElementById("approvalScopeSession")?.checked ? "session" : null;
+    return api(`/api/v1/approvals/${id}`, { method: "POST", body: JSON.stringify({ decision, scope }) });
+  };
+  const done = () => {
+    const view = viewOf(state.sessionId);
+    view.pendingApproval = null;
+    hidePromptModal();
+  };
   setPromptActions([
     {
       label: "拒绝",
       danger: true,
       onclick: async () => {
-        await api(`/api/v1/approvals/${id}`, { method: "POST", body: JSON.stringify({ decision: "rejected" }) });
-        const view = viewOf(state.sessionId);
-        view.pendingApproval = null;
-        hidePromptModal();
+        await post("rejected");
+        done();
       },
     },
     {
       label: "批准",
       primary: true,
       onclick: async () => {
-        await api(`/api/v1/approvals/${id}`, { method: "POST", body: JSON.stringify({ decision: "approved" }) });
-        const view = viewOf(state.sessionId);
-        view.pendingApproval = null;
-        hidePromptModal();
+        await post("approved");
+        done();
+      },
+    },
+  ]);
+  promptModal.classList.add("active");
+}
+
+function showPlanReviewModal(request, display) {
+  const id = request.approval_id;
+  promptTitle.textContent = "计划待确认";
+  const plan = typeof display.plan === "string" ? display.plan : JSON.stringify(display.plan ?? "", null, 2);
+  const pathHtml = display.path
+    ? `<div class="prompt-kicker">计划文件：${escapeHtml(display.path)}</div>`
+    : "";
+  const options = Array.isArray(display.options) ? display.options : [];
+  const optionsHtml = options.length
+    ? `<div class="plan-options">${options
+        .map(
+          (o, i) => `
+        <label class="plan-option"><input type="radio" name="plan-option" value="${escapeHtml(o.label || `方案 ${i + 1}`)}" ${i === 0 ? "checked" : ""}>
+          <span><strong>${escapeHtml(o.label || `方案 ${i + 1}`)}</strong>${o.description ? `<small>${escapeHtml(o.description)}</small>` : ""}</span>
+        </label>`,
+        )
+        .join("")}</div>`
+    : "";
+  promptBody.innerHTML = `${pathHtml}
+    <div class="prompt-plan">${markdownToHtml(plan)}</div>
+    ${options.length ? '<div class="prompt-plan-label">选择要执行的方案：</div>' : ""}${optionsHtml}`;
+  promptExtra.innerHTML = `<textarea id="planFeedback" rows="3" placeholder="修改意见（选择「修改意见」时填写）…"></textarea>`;
+  const post = (decision, feedback, selectedLabel) => {
+    const body = { decision };
+    if (feedback) body.feedback = feedback;
+    if (selectedLabel) body.selected_label = selectedLabel;
+    return api(`/api/v1/approvals/${id}`, { method: "POST", body: JSON.stringify(body) });
+  };
+  const done = (note) => {
+    const view = viewOf(state.sessionId);
+    view.pendingApproval = null;
+    hidePromptModal();
+    if (note) appendMessage("system", note, new Date().toISOString());
+  };
+  const selectedLabel = () => promptExtra.querySelector("input[name='plan-option']:checked")?.value || null;
+  const feedbackValue = () => document.getElementById("planFeedback")?.value?.trim() || "";
+  setPromptActions([
+    {
+      label: "拒绝并退出",
+      danger: true,
+      onclick: async () => {
+        const feedback = feedbackValue();
+        await post("rejected", feedback || "用户拒绝了该计划。", null);
+        done("已拒绝计划。");
+      },
+    },
+    {
+      label: "修改意见",
+      onclick: async () => {
+        const feedback = feedbackValue();
+        if (!feedback) {
+          document.getElementById("planFeedback")?.focus();
+          return;
+        }
+        await post("approved", feedback, selectedLabel());
+        done("已提交修改意见，Agent 将按反馈修改计划。");
+      },
+    },
+    {
+      label: "执行",
+      primary: true,
+      onclick: async () => {
+        await post("approved", null, selectedLabel());
+        done("已确认计划，开始执行。");
       },
     },
   ]);
@@ -2250,7 +2490,12 @@ document.getElementById("composer").onsubmit = async (e) => {
   appendMessage("user", payloadText || " ", new Date().toISOString(), [], {
     images: imagesForLog,
   });
-  showTyping();
+  if (state.running) {
+    // Turn is active: post_message delivers this as steer input.
+    appendMessage("system", "已发送，将作为引导输入注入当前运行中的任务。", new Date().toISOString());
+  } else {
+    showTyping();
+  }
   setRunning(true);
   try {
     await api(`/api/v1/sessions/${sid}/messages`, {
@@ -2396,6 +2641,11 @@ function finalizeLiveMessage() {
 function handleAgentEvent(event) {
   const type = event.type;
   const sessionId = event.session_id;
+  if (type === "plugins.changed") {
+    const panel = document.getElementById("pluginsPanel");
+    if (panel && panel.classList.contains("open")) refreshPluginsPanel().catch(() => {});
+    return;
+  }
   if (type === "session.created" || type === "session.forked" || type === "session.updated" || type === "session.archived" || type === "session.restored") {
     refreshSessions().catch(() => {});
     return;
@@ -2536,19 +2786,60 @@ function handleAgentEvent(event) {
   }
 }
 
+let wsLastSeq = 0;
+
 function connectWs() {
   const proto = location.protocol === "https:" ? "wss:" : "ws:";
   const qs = new URLSearchParams();
   if (token) qs.set("token", token);
+  if (wsLastSeq > 0) qs.set("since", String(wsLastSeq));
   const ws = new WebSocket(`${proto}//${location.host}${base}/api/v1/ws?${qs.toString()}`);
   ws.onmessage = (ev) => {
+    let frame;
     try {
-      handleAgentEvent(JSON.parse(ev.data));
+      frame = JSON.parse(ev.data);
     } catch {
       /* ignore malformed frames */
+      return;
     }
+    if (!frame || typeof frame.type !== "string") return;
+    if (frame.type === "hello") {
+      if (wsLastSeq === 0 && typeof frame.latest_event_seq === "number") {
+        wsLastSeq = frame.latest_event_seq;
+      }
+      return;
+    }
+    if (frame.type === "resync_required") {
+      if (typeof frame.latest_event_seq === "number") {
+        wsLastSeq = Math.max(wsLastSeq, frame.latest_event_seq);
+      }
+      resyncFromHistory();
+      return;
+    }
+    if (frame.type === "event" && frame.data) {
+      // Enveloped variant (kept for compatibility).
+      if (typeof frame.seq === "number") wsLastSeq = Math.max(wsLastSeq, frame.seq);
+      handleAgentEvent(frame.data);
+      return;
+    }
+    // Raw agent events carry event_seq directly.
+    if (typeof frame.event_seq === "number") wsLastSeq = Math.max(wsLastSeq, frame.event_seq);
+    handleAgentEvent(frame);
   };
   ws.onclose = () => setTimeout(connectWs, 1500);
+}
+
+async function resyncFromHistory() {
+  try {
+    const body = await api(`/api/v1/events?since=${wsLastSeq}`);
+    const events = Array.isArray(body?.events) ? body.events : [];
+    for (const event of events) {
+      if (typeof event?.event_seq === "number") wsLastSeq = Math.max(wsLastSeq, event.event_seq);
+      if (event && event.type && event.type !== "hello") handleAgentEvent(event);
+    }
+  } catch {
+    /* offline; next reconnect retries */
+  }
 }
 
 function openSidebar() { sidebar.classList.add("open"); }
@@ -2633,6 +2924,8 @@ if (modelSelect) {
   };
 }
 if (planBtn) planBtn.onclick = () => togglePlanMode();
+const pluginsBtn = document.getElementById("pluginsBtn");
+if (pluginsBtn) pluginsBtn.onclick = () => openPluginsPanel();
 if (stopBtn) stopBtn.onclick = () => interruptCurrent();
 
 if (confirmModal) {
@@ -2697,3 +2990,190 @@ async function boot() {
 
 if (!token) showTokenPrompt();
 else boot();
+
+// --- Plugins panel -----------------------------------------------------------
+
+async function refreshPluginsPanel() {
+  const body = document.querySelector("#pluginsPanel .side-panel-body");
+  if (!body) return;
+  body.innerHTML = `<div class="plugin-loading">加载中…</div>`;
+  const [installed, marketplaces] = await Promise.all([
+    api("/api/v1/plugins").catch(() => null),
+    api("/api/v1/plugins/marketplaces").catch(() => null),
+  ]);
+  const installedList = Array.isArray(installed?.plugins) ? installed.plugins : Array.isArray(installed) ? installed : [];
+  const mktList = Array.isArray(marketplaces?.marketplaces)
+    ? marketplaces.marketplaces
+    : Array.isArray(marketplaces) ? marketplaces : [];
+
+  const rows = installedList
+    .map((p) => {
+      const id = p.name || p.id;
+      const diag = (p.diagnostics || []).map((d) => d.message || d).join("; ");
+      return `<li class="plugin-item${p.enabled ? "" : " disabled"}">
+        <div class="plugin-info">
+          <div class="plugin-name">${escapeHtml(p.display_name || id)} <small>v${escapeHtml(p.version || "?")}${p.enabled ? "" : " · 已停用"}</small></div>
+          <div class="plugin-desc">${escapeHtml(p.description || "")}${diag ? `<div class="plugin-diag">${escapeHtml(diag)}</div>` : ""}</div>
+        </div>
+        <div class="plugin-actions">
+          ${p.managed ? `<button type="button" class="btn-mini" data-plugin-update="${escapeHtml(id)}">更新</button>` : ""}
+          <button type="button" class="btn-mini" data-plugin-toggle="${escapeHtml(id)}" data-enabled="${p.enabled ? "1" : ""}">${p.enabled ? "停用" : "启用"}</button>
+          ${p.managed ? `<button type="button" class="btn-mini btn-mini-danger" data-plugin-remove="${escapeHtml(id)}">卸载</button>` : ""}
+        </div>
+      </li>`;
+    })
+    .join("");
+
+  const mktRows = mktList
+    .map(
+      (m) => `<li class="plugin-mkt">
+        <span>${escapeHtml(m.name || m.id)} <small>${escapeHtml(m.source || "")}</small></span>
+        <button type="button" class="btn-mini btn-mini-danger" data-mkt-remove="${escapeHtml(m.id || m.name)}">移除</button>
+      </li>`,
+    )
+    .join("");
+
+  body.innerHTML = `
+    <div class="plugin-section-title">已安装（${installedList.length}）</div>
+    <ul class="plugin-list">${rows || '<li class="plugin-empty">暂无插件</li>'}</ul>
+    <div class="plugin-section-title">市场源</div>
+    <ul class="plugin-mkt-list">${mktRows || '<li class="plugin-empty">未配置</li>'}</ul>
+    <div class="plugin-add-mkt">
+      <input id="pluginMktInput" placeholder="市场源 URL 或 GitHub 仓库…" />
+      <button type="button" class="btn-mini" id="pluginMktAdd">添加市场源</button>
+    </div>
+    <div class="plugin-section-title">浏览市场</div>
+    <div class="plugin-browse-bar">
+      <button type="button" class="btn-mini" id="pluginBrowseBtn">浏览插件</button>
+    </div>
+    <ul class="plugin-list" id="pluginMarketList"></ul>
+    <div class="plugin-install-src">
+      <input id="pluginInstallInput" placeholder="直接安装：git URL / 本地路径…" />
+      <button type="button" class="btn-mini" id="pluginInstallBtn">安装</button>
+    </div>`;
+
+  body.querySelector("#pluginMktAdd").onclick = async () => {
+    const input = body.querySelector("#pluginMktInput");
+    const source = input.value.trim();
+    if (!source) return;
+    try {
+      await api("/api/v1/plugins/marketplaces", { method: "POST", body: JSON.stringify({ source }) });
+      await refreshPluginsPanel();
+    } catch (err) {
+      showNotice(`添加市场源失败: ${err.message || err}`, [{ label: "知道了", onclick: () => hideNotice() }]);
+    }
+  };
+  body.querySelector("#pluginBrowseBtn").onclick = async () => {
+    const list = body.querySelector("#pluginMarketList");
+    list.innerHTML = `<div class="plugin-loading">加载中…</div>`;
+    try {
+      const mkt = await api("/api/v1/plugins/marketplace");
+      const entries = Array.isArray(mkt?.plugins) ? mkt.plugins : [];
+      list.innerHTML =
+        entries
+          .map(
+            (e) => `<li class="plugin-item">
+          <div class="plugin-info">
+            <div class="plugin-name">${escapeHtml(e.display_name || e.id)} <small>v${escapeHtml(e.version || "?")}${e.tier ? ` · ${escapeHtml(e.tier)}` : ""}</small></div>
+            <div class="plugin-desc">${escapeHtml(e.description || "")}</div>
+          </div>
+          <div class="plugin-actions">
+            <button type="button" class="btn-mini" data-mkt-install="${escapeHtml(e.id)}">安装</button>
+          </div>
+        </li>`,
+          )
+          .join("") || `<li class="plugin-empty">市场为空</li>`;
+      list.querySelectorAll("[data-mkt-install]").forEach((btn) => {
+        btn.onclick = async () => {
+          btn.disabled = true;
+          btn.textContent = "安装中…";
+          try {
+            await api("/api/v1/plugins/install", {
+              method: "POST",
+              body: JSON.stringify({ source: btn.dataset.mktInstall, marketplace: "default" }),
+            });
+            await refreshPluginsPanel();
+          } catch (err) {
+            showNotice(`安装失败: ${err.message || err}`, [{ label: "知道了", onclick: () => hideNotice() }]);
+            btn.disabled = false;
+            btn.textContent = "安装";
+          }
+        };
+      });
+    } catch (err) {
+      list.innerHTML = `<li class="plugin-empty">加载失败: ${escapeHtml(err.message || String(err))}</li>`;
+    }
+  };
+  body.querySelector("#pluginInstallBtn").onclick = async () => {
+    const input = body.querySelector("#pluginInstallInput");
+    const source = input.value.trim();
+    if (!source) return;
+    const btn = body.querySelector("#pluginInstallBtn");
+    btn.disabled = true;
+    try {
+      await api("/api/v1/plugins/install", { method: "POST", body: JSON.stringify({ source }) });
+      await refreshPluginsPanel();
+    } catch (err) {
+      showNotice(`安装失败: ${err.message || err}`, [{ label: "知道了", onclick: () => hideNotice() }]);
+      btn.disabled = false;
+    }
+  };
+  body.querySelectorAll("[data-plugin-toggle]").forEach((btn) => {
+    btn.onclick = async () => {
+      const enabled = !btn.dataset.enabled;
+      try {
+        await api(`/api/v1/plugins/${encodeURIComponent(btn.dataset.pluginToggle)}`, {
+          method: "PATCH",
+          body: JSON.stringify({ enabled }),
+        });
+        await refreshPluginsPanel();
+      } catch (err) {
+        showNotice(`操作失败: ${err.message || err}`, [{ label: "知道了", onclick: () => hideNotice() }]);
+      }
+    };
+  });
+  body.querySelectorAll("[data-plugin-update]").forEach((btn) => {
+    btn.onclick = async () => {
+      btn.disabled = true;
+      btn.textContent = "更新中…";
+      try {
+        await api(`/api/v1/plugins/${encodeURIComponent(btn.dataset.pluginUpdate)}`, { method: "POST" });
+        await refreshPluginsPanel();
+      } catch (err) {
+        showNotice(`更新失败: ${err.message || err}`, [{ label: "知道了", onclick: () => hideNotice() }]);
+        btn.disabled = false;
+        btn.textContent = "更新";
+      }
+    };
+  });
+  body.querySelectorAll("[data-plugin-remove]").forEach((btn) => {
+    btn.onclick = async () => {
+      if (!confirm(`确定卸载插件 ${btn.dataset.pluginRemove}？`)) return;
+      try {
+        await api(`/api/v1/plugins/${encodeURIComponent(btn.dataset.pluginRemove)}`, { method: "DELETE" });
+        await refreshPluginsPanel();
+      } catch (err) {
+        showNotice(`卸载失败: ${err.message || err}`, [{ label: "知道了", onclick: () => hideNotice() }]);
+      }
+    };
+  });
+  body.querySelectorAll("[data-mkt-remove]").forEach((btn) => {
+    btn.onclick = async () => {
+      try {
+        await api(`/api/v1/plugins/marketplaces/${encodeURIComponent(btn.dataset.mktRemove)}`, { method: "DELETE" });
+        await refreshPluginsPanel();
+      } catch (err) {
+        showNotice(`移除失败: ${err.message || err}`, [{ label: "知道了", onclick: () => hideNotice() }]);
+      }
+    };
+  });
+}
+
+function openPluginsPanel() {
+  const el = ensurePanel("pluginsPanel", "插件");
+  el.classList.add("open");
+  refreshPluginsPanel().catch((err) => {
+    const body = el.querySelector(".side-panel-body");
+    if (body) body.innerHTML = `<div class="plugin-empty">加载失败: ${escapeHtml(err.message || String(err))}</div>`;
+  });
+}

@@ -1044,6 +1044,57 @@
     ::-webkit-scrollbar-track { background: transparent; }
     ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
     ::-webkit-scrollbar-thumb:hover { background: var(--border-strong); }
+    /* Plan review / plugins / side panels (web-ui additions) */
+    #promptModal .card { width: min(640px, 100%); }
+    .prompt-plan { max-height: 40vh; overflow: auto; border: 1px solid var(--border); border-radius: var(--radius); padding: 12px 14px; background: var(--bg, rgba(127,127,127,0.06)); }
+    .prompt-plan h1, .prompt-plan h2, .prompt-plan h3 { font-size: 14px; margin: 10px 0 6px; }
+    .prompt-plan ul, .prompt-plan ol { padding-left: 20px; }
+    .prompt-plan-label { margin: 12px 0 6px; font-weight: 600; color: var(--text); }
+    .plan-options { display: flex; flex-direction: column; gap: 8px; }
+    .plan-option { display: flex; gap: 8px; align-items: flex-start; border: 1px solid var(--border); border-radius: var(--radius); padding: 8px 10px; cursor: pointer; }
+    .plan-option:has(input:checked) { border-color: var(--accent, #4b7bec); }
+    .plan-option span { display: flex; flex-direction: column; gap: 2px; font-size: 13px; }
+    .plan-option small { color: var(--text-secondary); }
+    #promptExtra textarea { width: 100%; margin-top: 10px; resize: vertical; }
+    .prompt-scope { display: flex; gap: 6px; align-items: center; font-size: 13px; color: var(--text-secondary); }
+    .prompt-input { margin-top: 10px; }
+    .prompt-input summary { cursor: pointer; color: var(--text-secondary); font-size: 12px; }
+    .prompt-input pre { white-space: pre-wrap; word-break: break-all; max-height: 30vh; overflow: auto; }
+
+    .side-panel { display: none; position: fixed; top: 0; right: 0; bottom: 0; width: min(420px, 92vw); background: var(--surface); border-left: 1px solid var(--border); z-index: 45; flex-direction: column; box-shadow: var(--shadow); }
+    .side-panel.open { display: flex; }
+    .side-panel-header { display: flex; align-items: center; justify-content: space-between; padding: 14px 16px; font-weight: 600; border-bottom: 1px solid var(--border); }
+    .side-panel-close { background: none; border: none; color: var(--text-secondary); font-size: 18px; cursor: pointer; }
+    .side-panel-body { padding: 12px 16px; overflow: auto; flex: 1; font-size: 13px; }
+    .todo-list, .subagent-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+    .todo-list li { display: flex; gap: 8px; align-items: baseline; color: var(--text-secondary); }
+    .todo-list li.todo-active { color: var(--text); font-weight: 600; }
+    .todo-list li.todo-done { text-decoration: line-through; opacity: 0.6; }
+    .plan-path { font-family: var(--mono, monospace); font-size: 12px; color: var(--text-secondary); margin-bottom: 8px; }
+    .subagent-list li { display: flex; gap: 8px; padding: 6px 0; border-bottom: 1px solid var(--border); }
+    .subagent-list .sub-running { color: var(--text); }
+    .subagent-list .sub-done { opacity: 0.6; }
+    .subagent-list .sub-failed { color: var(--danger, #e0503f); }
+    .sub-desc { font-weight: 600; }
+    .sub-detail { color: var(--text-secondary); font-size: 12px; max-height: 3em; overflow: hidden; }
+
+    .plugin-list, .plugin-mkt-list { list-style: none; margin: 0 0 12px; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+    .plugin-item { display: flex; justify-content: space-between; gap: 10px; border: 1px solid var(--border); border-radius: var(--radius); padding: 10px 12px; }
+    .plugin-item.disabled .plugin-name { opacity: 0.6; }
+    .plugin-name { font-weight: 600; }
+    .plugin-name small { font-weight: 400; color: var(--text-secondary); }
+    .plugin-desc { color: var(--text-secondary); font-size: 12px; margin-top: 2px; }
+    .plugin-diag { color: var(--danger, #e0503f); font-size: 12px; margin-top: 4px; }
+    .plugin-actions { display: flex; gap: 6px; align-items: center; flex-shrink: 0; }
+    .plugin-section-title { font-weight: 600; margin: 12px 0 8px; }
+    .plugin-empty, .plugin-loading { color: var(--text-secondary); padding: 8px 0; }
+    .plugin-mkt { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+    .plugin-mkt small { color: var(--text-secondary); font-family: var(--mono, monospace); font-size: 11px; }
+    .plugin-add-mkt, .plugin-install-src, .plugin-browse-bar { display: flex; gap: 6px; margin: 8px 0; }
+    .plugin-add-mkt input, .plugin-install-src input { flex: 1; }
+    .btn-mini { font-size: 12px; padding: 3px 10px; border-radius: var(--radius); border: 1px solid var(--border-strong); background: var(--surface); color: var(--text); cursor: pointer; }
+    .btn-mini:disabled { opacity: 0.5; cursor: default; }
+    .btn-mini-danger { color: var(--danger, #e0503f); border-color: var(--danger, #e0503f); }
   </style>
 </head>
 <body>
@@ -1097,6 +1148,7 @@
           <option value="auto">auto</option>
         </select>
         <button type="button" id="planBtn" class="btn-secondary" title="Plan 模式">Plan</button>
+        <button type="button" id="pluginsBtn" class="btn-secondary" title="插件管理">插件</button>
         <button type="button" id="stopBtn" hidden>停止</button>
         <button type="button" id="moreBtn" class="composer-action" title="更多" aria-label="更多">⋯</button>
       </div>

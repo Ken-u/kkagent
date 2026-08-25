@@ -5,7 +5,7 @@ use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::IntoResponse;
-use axum::routing::{get, post};
+use axum::routing::{delete, get, patch, post};
 use axum::{Json, Router};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -544,7 +544,16 @@ pub trait HttpBackend: Send + Sync {
         id: &str,
         decision: &str,
         feedback: Option<String>,
+        selected_label: Option<String>,
+        scope: Option<String>,
     ) -> Result<Value, String>;
+
+    /// Whitelisted plugin RPC used by the `/api/v1/plugins*` routes. The HTTP
+    /// layer only ever forwards a fixed set of `plugins.*` method names.
+    async fn plugin_rpc(&self, method: &str, params: Value) -> Result<Value, String> {
+        let _ = (method, params);
+        Err("plugins are not supported by this backend".into())
+    }
     async fn cancel_turn(&self, _task_id: &str) -> Result<Value, String> {
         Err("turn cancellation is not supported by this backend".into())
     }
@@ -818,8 +827,12 @@ impl HttpBackend for MemoryBackend {
         id: &str,
         decision: &str,
         feedback: Option<String>,
+        selected_label: Option<String>,
+        scope: Option<String>,
     ) -> Result<Value, String> {
-        Ok(json!({"ok": true, "approval_id": id, "decision": decision, "feedback": feedback}))
+        Ok(
+            json!({"ok": true, "approval_id": id, "decision": decision, "feedback": feedback, "selected_label": selected_label, "scope": scope}),
+        )
     }
     async fn fs_read(&self, path: &str) -> Result<String, String> {
         std::fs::read_to_string(path).map_err(|e| e.to_string())
@@ -1126,6 +1139,10 @@ impl HttpState {
 #[derive(Deserialize, Default)]
 pub struct AuthQuery {
     pub token: Option<String>,
+    /// Optional passthrough for endpoints that need one extra query param
+    /// (e.g. `?source=` for marketplace browse) without a second extractor.
+    #[serde(default)]
+    pub extra: Option<String>,
 }
 
 fn check_auth(state: &HttpState, q: &AuthQuery) -> Result<(), StatusCode> {
@@ -1140,6 +1157,27 @@ fn check_auth(state: &HttpState, q: &AuthQuery) -> Result<(), StatusCode> {
 }
 
 fn authorize_request(state: &HttpState, request: &mut Request) -> Result<String, StatusCode> {
+    // Cross-origin browser requests are rejected outright (DNS-rebinding and
+    // cross-site token abuse). Non-browser clients simply omit Origin.
+    if let Some(origin) = request
+        .headers()
+        .get(axum::http::header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+    {
+        let host = request
+            .headers()
+            .get(axum::http::header::HOST)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        let same = origin
+            .strip_prefix("http://")
+            .or_else(|| origin.strip_prefix("https://"))
+            .map(|rest| rest == host)
+            .unwrap_or(false);
+        if !same {
+            return Err(StatusCode::FORBIDDEN);
+        }
+    }
     if state.token_scopes.is_empty() {
         return Ok("anonymous".into());
     }
@@ -1485,7 +1523,13 @@ async fn events_history(
     State(state): State<HttpState>,
     Query(query): Query<EventsQuery>,
 ) -> Result<Json<Value>, StatusCode> {
-    check_auth(&state, &AuthQuery { token: query.token })?;
+    check_auth(
+        &state,
+        &AuthQuery {
+            token: query.token,
+            ..Default::default()
+        },
+    )?;
     let events = state.events_since(query.since, query.session_id.as_deref(), query.limit);
     Ok(Json(json!({
         "events": events,
@@ -1645,6 +1689,13 @@ async fn patch_session(
         "permission_mode": sess.get("permission_mode").cloned().unwrap_or(Value::Null),
         "plan_mode": sess.get("plan_mode").cloned().unwrap_or(Value::Null),
         "model": sess.get("model").cloned().unwrap_or(Value::Null),
+    }));
+    state.publish(json!({
+        "type": "session_config_changed",
+        "session_id": id,
+        "permission_mode": sess.get("permission_mode").cloned().unwrap_or(Value::Null),
+        "model": sess.get("model").cloned().unwrap_or(Value::Null),
+        "plan_mode": sess.get("plan_mode").cloned().unwrap_or(Value::Null),
     }));
     Ok(Json(sess))
 }
@@ -1927,6 +1978,12 @@ struct ApprovalBody {
     decision: String,
     #[serde(default)]
     feedback: Option<String>,
+    /// Plan-review option label (multi-approach plans).
+    #[serde(default)]
+    selected_label: Option<String>,
+    /// "session" to remember the decision for the rest of the session.
+    #[serde(default)]
+    scope: Option<String>,
 }
 
 async fn post_approval(
@@ -1938,7 +1995,13 @@ async fn post_approval(
     check_auth(&state, &q)?;
     let v = state
         .backend
-        .approve(&id, &body.decision, body.feedback.clone())
+        .approve(
+            &id,
+            &body.decision,
+            body.feedback.clone(),
+            body.selected_label.clone(),
+            body.scope.clone(),
+        )
         .await
         .map_err(|_| StatusCode::BAD_REQUEST)?;
     state.publish(json!({
@@ -1946,7 +2009,178 @@ async fn post_approval(
         "approval_id": id,
         "decision": body.decision,
         "feedback": body.feedback,
+        "selected_label": body.selected_label,
     }));
+    Ok(Json(v))
+}
+
+#[derive(Deserialize)]
+struct PluginInstallBody {
+    source: String,
+    #[serde(default)]
+    marketplace: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct PluginEnableBody {
+    enabled: bool,
+}
+
+#[derive(Deserialize)]
+struct MarketplaceAddBody {
+    source: String,
+    #[serde(default)]
+    name: Option<String>,
+}
+
+async fn plugins_list(
+    State(state): State<HttpState>,
+    Query(q): Query<AuthQuery>,
+) -> Result<Json<Value>, StatusCode> {
+    check_auth(&state, &q)?;
+    let v = state
+        .backend
+        .plugin_rpc("plugins.list", json!({}))
+        .await
+        .map_err(backend_error_status)?;
+    Ok(Json(v))
+}
+
+async fn plugins_install(
+    State(state): State<HttpState>,
+    Query(q): Query<AuthQuery>,
+    Json(body): Json<PluginInstallBody>,
+) -> Result<Json<Value>, StatusCode> {
+    check_auth(&state, &q)?;
+    let v = state
+        .backend
+        .plugin_rpc(
+            "plugins.install",
+            json!({"source": body.source, "marketplace": body.marketplace}),
+        )
+        .await
+        .map_err(backend_error_status)?;
+    state.publish(json!({"type": "plugins.changed", "action": "install"}));
+    Ok(Json(v))
+}
+
+async fn plugin_update(
+    State(state): State<HttpState>,
+    Path(id): Path<String>,
+    Query(q): Query<AuthQuery>,
+) -> Result<Json<Value>, StatusCode> {
+    check_auth(&state, &q)?;
+    let v = state
+        .backend
+        .plugin_rpc("plugins.update", json!({"id": id}))
+        .await
+        .map_err(backend_error_status)?;
+    state.publish(json!({"type": "plugins.changed", "action": "update", "id": id}));
+    Ok(Json(v))
+}
+
+async fn plugin_set_enabled(
+    State(state): State<HttpState>,
+    Path(id): Path<String>,
+    Query(q): Query<AuthQuery>,
+    Json(body): Json<PluginEnableBody>,
+) -> Result<Json<Value>, StatusCode> {
+    check_auth(&state, &q)?;
+    let method = if body.enabled {
+        "plugins.enable"
+    } else {
+        "plugins.disable"
+    };
+    let v = state
+        .backend
+        .plugin_rpc(method, json!({"id": id}))
+        .await
+        .map_err(backend_error_status)?;
+    let action = if body.enabled { "enable" } else { "disable" };
+    state.publish(json!({
+        "type": "plugins.changed",
+        "action": action,
+        "id": id,
+    }));
+    Ok(Json(v))
+}
+
+async fn plugin_remove(
+    State(state): State<HttpState>,
+    Path(id): Path<String>,
+    Query(q): Query<AuthQuery>,
+) -> Result<Json<Value>, StatusCode> {
+    check_auth(&state, &q)?;
+    let v = state
+        .backend
+        .plugin_rpc("plugins.remove", json!({"id": id}))
+        .await
+        .map_err(backend_error_status)?;
+    state.publish(json!({"type": "plugins.changed", "action": "remove", "id": id}));
+    Ok(Json(v))
+}
+
+async fn marketplaces_list(
+    State(state): State<HttpState>,
+    Query(q): Query<AuthQuery>,
+) -> Result<Json<Value>, StatusCode> {
+    check_auth(&state, &q)?;
+    let v = state
+        .backend
+        .plugin_rpc("plugins.marketplaces.list", json!({}))
+        .await
+        .map_err(backend_error_status)?;
+    Ok(Json(v))
+}
+
+async fn marketplaces_add(
+    State(state): State<HttpState>,
+    Query(q): Query<AuthQuery>,
+    Json(body): Json<MarketplaceAddBody>,
+) -> Result<Json<Value>, StatusCode> {
+    check_auth(&state, &q)?;
+    let v = state
+        .backend
+        .plugin_rpc(
+            "plugins.marketplaces.add",
+            json!({"source": body.source, "name": body.name}),
+        )
+        .await
+        .map_err(backend_error_status)?;
+    state.publish(json!({"type": "plugins.changed", "action": "marketplace.add"}));
+    Ok(Json(v))
+}
+
+async fn marketplace_remove(
+    State(state): State<HttpState>,
+    Path(id): Path<String>,
+    Query(q): Query<AuthQuery>,
+) -> Result<Json<Value>, StatusCode> {
+    check_auth(&state, &q)?;
+    let v = state
+        .backend
+        .plugin_rpc("plugins.marketplaces.remove", json!({"id": id}))
+        .await
+        .map_err(backend_error_status)?;
+    state.publish(json!({"type": "plugins.changed", "action": "marketplace.remove", "id": id}));
+    Ok(Json(v))
+}
+
+async fn marketplace_browse(
+    State(state): State<HttpState>,
+    Query(q): Query<AuthQuery>,
+) -> Result<Json<Value>, StatusCode> {
+    check_auth(&state, &q)?;
+    let source = q
+        .extra
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let v = state
+        .backend
+        .plugin_rpc("plugins.marketplace", json!({"source": source}))
+        .await
+        .map_err(backend_error_status)?;
     Ok(Json(v))
 }
 
@@ -2028,6 +2262,7 @@ async fn fs_read(
         &state,
         &AuthQuery {
             token: path_q.token.clone(),
+            ..Default::default()
         },
     )?;
     match state.backend.fs_read(&path_q.path).await {
@@ -2055,7 +2290,13 @@ async fn files_list(
     State(state): State<HttpState>,
     Query(query): Query<FilesQuery>,
 ) -> Result<Json<Value>, StatusCode> {
-    check_auth(&state, &AuthQuery { token: query.token })?;
+    check_auth(
+        &state,
+        &AuthQuery {
+            token: query.token,
+            ..Default::default()
+        },
+    )?;
     state
         .backend
         .list_files(query.path.as_deref().unwrap_or("."))
@@ -2079,6 +2320,7 @@ async fn search(
         &state,
         &AuthQuery {
             token: q.token.clone(),
+            ..Default::default()
         },
     )?;
     Ok(Json(state.backend.search(&q.q).await))
@@ -2656,8 +2898,23 @@ async fn ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<HttpState>,
     Query(query): Query<WsQuery>,
+    headers: HeaderMap,
 ) -> Result<impl IntoResponse, StatusCode> {
-    check_auth(&state, &AuthQuery { token: query.token })?;
+    let token = query.token.or_else(|| {
+        headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split_once(' '))
+            .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
+            .map(|(_, token)| token.to_string())
+    });
+    check_auth(
+        &state,
+        &AuthQuery {
+            token,
+            ..Default::default()
+        },
+    )?;
     Ok(ws.on_upgrade(move |socket| ws_loop(socket, state, query.since, query.session_id)))
 }
 
@@ -2799,6 +3056,23 @@ pub fn router(state: HttpState) -> Router {
         .route("/api/v1/prompts", get(prompts))
         .route("/api/v1/questions", get(questions))
         .route("/api/v1/questions/{id}", post(answer_question))
+        .route("/api/v1/plugins", get(plugins_list))
+        .route("/api/v1/plugins/install", post(plugins_install))
+        .route(
+            "/api/v1/plugins/{id}",
+            patch(plugin_set_enabled)
+                .delete(plugin_remove)
+                .post(plugin_update),
+        )
+        .route(
+            "/api/v1/plugins/marketplaces",
+            get(marketplaces_list).post(marketplaces_add),
+        )
+        .route(
+            "/api/v1/plugins/marketplaces/{id}",
+            delete(marketplace_remove),
+        )
+        .route("/api/v1/plugins/marketplace", get(marketplace_browse))
         .route(
             "/api/v1/terminals",
             get(terminals_list).post(terminals_create),
@@ -3116,6 +3390,58 @@ mod security_tests {
             authorize_request(&state, &mut request),
             Err(StatusCode::UNAUTHORIZED)
         );
+    }
+
+    #[test]
+    fn rejects_cross_origin_browser_requests() {
+        let state = HttpState::new(Some("secret".into()));
+        let mut request = Request::builder()
+            .uri("/api/v1/sessions")
+            .header("origin", "https://evil.example")
+            .header("host", "127.0.0.1:7788")
+            .header("authorization", "Bearer secret")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert_eq!(
+            authorize_request(&state, &mut request),
+            Err(StatusCode::FORBIDDEN)
+        );
+    }
+
+    #[test]
+    fn allows_same_origin_browser_requests() {
+        let state = HttpState::new(Some("secret".into()));
+        let mut request = Request::builder()
+            .uri("/api/v1/sessions")
+            .header("origin", "http://127.0.0.1:7788")
+            .header("host", "127.0.0.1:7788")
+            .header("authorization", "Bearer secret")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert!(authorize_request(&state, &mut request).is_ok());
+    }
+
+    #[tokio::test]
+    async fn plugins_endpoints_fail_gracefully_without_live_backend() {
+        // MemoryBackend does not implement plugin_rpc; the routes must return a
+        // mapped error instead of panicking.
+        let backend = Arc::new(MemoryBackend::default());
+        let err = backend
+            .plugin_rpc("plugins.list", json!({}))
+            .await
+            .unwrap_err();
+        assert!(err.contains("not supported"));
+        // Unknown methods are rejected by the live backend whitelist.
+        let state = HttpState::new(None);
+        let v = marketplace_browse(
+            State(state.clone()),
+            Query(AuthQuery {
+                token: None,
+                extra: None,
+            }),
+        )
+        .await;
+        assert_eq!(v.map(|_| ()), Err(StatusCode::BAD_REQUEST));
     }
 
     #[test]
