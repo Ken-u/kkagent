@@ -894,6 +894,10 @@ Do not mention this reminder to the user.\n</system-reminder>"
                             session.consecutive_overflow_compacts = 0;
                             session.usage.record(&tu);
                             let snap = session.usage.snapshot();
+                            // LLM stream completed — refresh the workspace
+                            // registry heartbeat so this session is always
+                            // considered fresh between background ticks.
+                            session.refresh_heartbeat();
                             let _ = self
                                 .event_tx
                                 .send(AgentEvent::UsageUpdate {

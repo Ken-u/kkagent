@@ -13,7 +13,12 @@ use crate::session::store::{encode_work_dir_key, normalize_work_dir, workspace_r
 /// Suggested heartbeat write interval.
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 /// Sessions whose heartbeat is older than this are considered stale.
-pub const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(120);
+///
+/// Chosen to tolerate one missed heartbeat tick (30 s interval) with ample
+/// margin: a live session's background task refreshes every 30 s and the
+/// agent loop refreshes on every `MessageEnd`, so 90 s gives three missed
+/// ticks before a session is declared stale.
+pub const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(90);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionRegistration {
@@ -112,10 +117,12 @@ pub fn process_alive(pid: u32) -> bool {
     }
 }
 
+/// A session is considered active when its heartbeat is fresh, regardless of
+/// whether the owning process/PID is still alive. Relying solely on the PID
+/// is unreliable in long-running server mode where multiple sessions share
+/// the same process PID, and PID reuse by the OS can resurrect stale
+/// registrations. The heartbeat timestamp is the single source of truth.
 pub fn is_registration_active(reg: &SessionRegistration, now: DateTime<Utc>) -> bool {
-    if !process_alive(reg.pid) {
-        return false;
-    }
     let age = now.signed_duration_since(reg.heartbeat_at);
     age.to_std()
         .map(|d| d <= HEARTBEAT_TIMEOUT)
@@ -219,6 +226,12 @@ impl WorkspaceRegistryLease {
     pub fn start_in(registry_root: &Path, session_id: &str, working_dir: &Path) -> Option<Self> {
         let identity = resolve_workspace_identity(working_dir);
         let bucket = workspace_bucket_dir(registry_root, &identity);
+
+        // Best-effort cleanup of stale registrations left by sessions whose
+        // processes crashed without running Drop.  We only remove files whose
+        // heartbeat has expired; live peers are left untouched.
+        let _ = scan_active(registry_root, &identity, None);
+
         let file_path = registration_path(&bucket, session_id);
         let now = Utc::now();
         let reg = SessionRegistration {
@@ -274,6 +287,21 @@ impl WorkspaceRegistryLease {
 
     pub fn registry_root(&self) -> &Path {
         &self.registry_root
+    }
+
+    /// Immediately refresh this session's heartbeat timestamp.
+    ///
+    /// Called from the agent loop on `MessageEnd` so that a busy session
+    /// that just finished an LLM stream is always considered fresh, even if
+    /// the background 30 s tick hasn't fired yet.
+    pub fn touch_heartbeat(&self) {
+        if let Err(error) = touch_heartbeat(&self.file_path) {
+            tracing::debug!(
+                %error,
+                path = %self.file_path.display(),
+                "workspace registry manual heartbeat failed"
+            );
+        }
     }
 }
 
@@ -415,7 +443,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_pid_cleaned_on_scan() {
+    fn stale_heartbeat_cleaned_on_scan() {
         let root = temp_registry();
         let work = root.join("ws");
         fs::create_dir_all(&work).unwrap();
@@ -423,45 +451,55 @@ mod tests {
         let bucket = workspace_bucket_dir(&root, &identity);
         fs::create_dir_all(&bucket).unwrap();
         let path = registration_path(&bucket, "dead");
-        let now = Utc::now();
-        let mut child = {
-            #[cfg(unix)]
-            {
-                std::process::Command::new("true")
-                    .spawn()
-                    .expect("spawn short-lived process")
-            }
-            #[cfg(windows)]
-            {
-                std::process::Command::new("cmd")
-                    .args(["/C", "exit", "0"])
-                    .spawn()
-                    .expect("spawn short-lived process")
-            }
-            #[cfg(not(any(unix, windows)))]
-            {
-                panic!("unsupported platform for stale pid test");
-            }
-        };
-        let dead_pid = child.id();
-        let _ = child.wait();
-        // Give the kernel a moment; PID must not be alive for the stale check.
-        assert!(
-            !process_alive(dead_pid),
-            "expected exited child pid {dead_pid} to be dead"
-        );
+
+        // Simulate a session whose heartbeat is well past the timeout.
+        let stale_time = Utc::now() - chrono::Duration::seconds(300);
         let reg = SessionRegistration {
             session_id: "dead".into(),
-            pid: dead_pid,
+            pid: 42_000,
+            workspace_root: identity.to_string_lossy().into(),
+            started_at: stale_time,
+            heartbeat_at: stale_time,
+        };
+        write_json_atomic(&path, &reg).unwrap();
+        assert!(path.exists());
+
+        // scan_active should treat it as stale and remove the file.
+        let active = scan_active(&root, &identity, None);
+        assert!(active.is_empty());
+        assert!(!path.exists());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fresh_heartbeat_survives_scan() {
+        let root = temp_registry();
+        let work = root.join("ws");
+        fs::create_dir_all(&work).unwrap();
+        let identity = resolve_workspace_identity(&work);
+        let bucket = workspace_bucket_dir(&root, &identity);
+        fs::create_dir_all(&bucket).unwrap();
+        let path = registration_path(&bucket, "alive");
+
+        // A session with a recent heartbeat — even with a bogus PID —
+        // should survive because we only check the heartbeat timestamp.
+        let now = Utc::now();
+        let reg = SessionRegistration {
+            session_id: "alive".into(),
+            pid: 99_999,
             workspace_root: identity.to_string_lossy().into(),
             started_at: now,
             heartbeat_at: now,
         };
         write_json_atomic(&path, &reg).unwrap();
         assert!(path.exists());
+
         let active = scan_active(&root, &identity, None);
-        assert!(active.is_empty());
-        assert!(!path.exists());
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].session_id, "alive");
+        assert!(path.exists());
+
         let _ = fs::remove_dir_all(&root);
     }
 

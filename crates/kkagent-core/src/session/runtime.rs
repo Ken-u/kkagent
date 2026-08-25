@@ -1111,6 +1111,16 @@ impl Session {
         )
     }
 
+    /// Immediately refresh this session's heartbeat timestamp.
+    ///
+    /// Called by the agent loop after an LLM stream completes (`MessageEnd`)
+    /// so that a busy session is always considered fresh.
+    pub fn refresh_heartbeat(&self) {
+        if let Some(lease) = &self.workspace_registry {
+            lease.touch_heartbeat();
+        }
+    }
+
     pub fn resolve_tracked_path(&self, path_str: &str) -> PathBuf {
         crate::workspace_registry::resolve_tool_path(&self.working_dir, path_str)
     }
