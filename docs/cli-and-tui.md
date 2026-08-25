@@ -13,7 +13,7 @@
 | `-p, --prompt <text>` | 执行任务并把最终文本写到 stdout。 |
 | `--resume <id-or-prefix>` | 恢复已有会话。 |
 | `--connect <endpoint>` | 连接独立 Server，仅用于 TUI 或 prompt 模式。 |
-| `--dump-system-prompt` | 按当前工作区合成系统提示词并打印到 stdout 后退出；不请求模型，不落盘会话。不能与子命令或 `--prompt` 组合。 |
+| `--dump-system-prompt` | 按当前工作区合成系统提示词，并在末尾追加已注册的工具清单（名称 + 描述 + 是否 deferred），打印到 stdout 后退出；不请求模型，不落盘会话。不能与子命令或 `--prompt` 组合。 |
 | `--disable-sandbox` | 仅在当前进程完全关闭 Bash OS 沙箱和资源限制，不修改配置；仅建议用于受控容器或 VM。 |
 
 ## 子命令

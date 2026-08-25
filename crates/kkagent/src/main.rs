@@ -102,8 +102,9 @@ struct Cli {
     #[arg(long)]
     no_alt_screen: bool,
 
-    /// Print the fully composed system prompt for the current workspace and exit
-    /// (no model call, no session side effects)
+    /// Print the fully composed system prompt plus the registered tool
+    /// inventory for the current workspace and exit (no model call, no
+    /// session side effects)
     #[arg(long)]
     dump_system_prompt: bool,
 
@@ -2042,6 +2043,72 @@ async fn run_dump_system_prompt(config_path: Option<&Path>) -> Result<()> {
     print!("{}", session.effective_system_prompt());
     use std::io::Write;
     io::stdout().flush()?;
+
+    // Tool inventory for debugging: mirror `build_turn_tool_registry` (the
+    // main-session path) closely enough for offline inspection — built-ins,
+    // subagent/task tools, Goal / Skill / Web / Cron, MCP-bridged tools, then
+    // plugin overrides last. The managers below are throwaway instances: only
+    // name / description / disclosure are printed and every definition is
+    // static, so the output matches what a real turn would register.
+    let mut tools = kkagent_tools::ToolRegistry::new();
+    kkagent_tools::register_builtin_tools(&mut tools);
+    let subagent_mgr = Arc::new(kkagent_protocol::subagent::SubagentManager::new(4));
+    let launch: kkagent_tools::builtin::task::SubagentLaunchFn =
+        Arc::new(|_config: kkagent_protocol::subagent::SubagentConfig| {});
+    kkagent_tools::register_subagent_tools(&mut tools, subagent_mgr, launch, None);
+    tools.register(Arc::new(kkagent_tools::builtin::GoalTool::new(Arc::new(
+        kkagent_protocol::goal::GoalManager::new(),
+    ))));
+    tools.register(Arc::new(kkagent_tools::builtin::SkillTool::new(Arc::new(
+        skills,
+    ))));
+    let mut web_cfg = kkagent_tools::WebServicesConfig::from_app(&config);
+    let (svc_overrides, _svc_losers) = plugins.service_overrides().await;
+    web_cfg.merge_plugin_overrides(&kkagent_config::ServicesConfig {
+        web_search: svc_overrides.web_search,
+        web_fetch: svc_overrides.web_fetch,
+        moonshot_search: None,
+        moonshot_fetch: None,
+    });
+    if let Some(web) = kkagent_tools::builtin::WebTool::try_new(Arc::new(web_cfg)) {
+        tools.register(Arc::new(web));
+    }
+    tools.register(Arc::new(kkagent_tools::builtin::CronTool::new(Arc::new(
+        kkagent_tools::CronManager::default(),
+    ))));
+    let mcp_configs = combined_mcp_servers(&config, &plugins).await;
+    if !mcp_configs.is_empty() {
+        let mcp = Arc::new(McpManager::new(mcp_configs));
+        // connect_all already warns per-server on failure and keeps going;
+        // a total failure only means fewer MCP tools in the printed list.
+        let _ = mcp.connect_all().await;
+        register_mcp_tools(&mut tools, &mcp).await;
+    }
+    let overrides = plugins.tool_overrides().await;
+    if !overrides.is_empty() {
+        let policy = config.plugins.clone();
+        let skipped = kkagent_core::plugin_overrides::apply_plugin_tool_overrides(
+            &mut tools, &overrides, &plugins, &policy,
+        )
+        .await;
+        for (builtin, reason) in skipped {
+            eprintln!("warning: plugin tool override for `{builtin}` skipped: {reason}");
+        }
+    }
+
+    let defs = tools.tool_definitions();
+    println!("\n===== TOOLS ({} registered) =====", defs.len());
+    for def in &defs {
+        let deferred = matches!(def.disclosure, kkagent_tools::ToolDisclosure::Deferred);
+        println!(
+            "- {}{}: {}",
+            def.name,
+            if deferred { " [deferred]" } else { "" },
+            def.description
+        );
+    }
+    io::stdout().flush()?;
+
     // Ephemeral subagent scratch dir (SessionCreateSource::Subagent) — remove
     // it on every exit path so temp storage never accumulates.
     let _ = std::fs::remove_dir_all(session.session_dir());
