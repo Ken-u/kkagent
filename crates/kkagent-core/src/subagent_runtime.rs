@@ -148,7 +148,7 @@ fn run_subagent_mirrored_boxed(
                     parent_tool_call_id: m.parent_tool_call_id.clone(),
                     description: Some(sub_cfg.description.clone()),
                     model: Some(model.clone()),
-                    run_in_background: true,
+                    run_in_background: sub_cfg.run_in_background,
                 })
                 .await;
             let _ = m
@@ -162,31 +162,25 @@ fn run_subagent_mirrored_boxed(
 
         let mirror_for_drain = mirror.clone();
         let child_id = sub_cfg.agent_id.clone();
-        tokio::spawn(async move {
+        // Store the JoinHandle so we can await it before sending SubagentCompleted,
+        // preventing a race where the completion event arrives before the last
+        // content event has been drained.
+        let drain_handle: tokio::task::JoinHandle<()> = tokio::spawn(async move {
             while let Some(ev) = event_rx.recv().await {
                 if let Some(m) = &mirror_for_drain {
-                    // Mirror nested lifecycle/content under parent tool call.
-                    let nested = match &ev {
-                        AgentEvent::MessageDelta { .. }
-                        | AgentEvent::ThinkingDelta { .. }
-                        | AgentEvent::ToolCall { .. }
-                        | AgentEvent::ToolResult { .. }
-                        | AgentEvent::StatusUpdate { .. }
-                        | AgentEvent::Error { .. }
-                        | AgentEvent::TodoUpdated { .. } => Some(ev.clone()),
-                        _ => None,
-                    };
-                    if let Some(child_ev) = nested {
-                        let _ = m
-                            .parent_event_tx
-                            .send(AgentEvent::SubagentChildEvent {
-                                session_id: m.parent_session_id.clone(),
-                                subagent_id: child_id.clone(),
-                                parent_tool_call_id: m.parent_tool_call_id.clone(),
-                                event: Box::new(child_ev),
-                            })
-                            .await;
-                    }
+                    // Forward ALL events — both content events (MessageDelta, etc.)
+                    // and lifecycle events (SubagentSpawned, etc.) from grandchild
+                    // agents. The previous 7-type filter silently dropped all
+                    // grandchild lifecycle events, making 3-level nesting invisible.
+                    let _ = m
+                        .parent_event_tx
+                        .send(AgentEvent::SubagentChildEvent {
+                            session_id: m.parent_session_id.clone(),
+                            subagent_id: child_id.clone(),
+                            parent_tool_call_id: m.parent_tool_call_id.clone(),
+                            event: Box::new(ev),
+                        })
+                        .await;
                 }
             }
         });
@@ -219,6 +213,32 @@ fn run_subagent_mirrored_boxed(
         // Ephemeral subagent scratch dir (SessionCreateSource::Subagent) —
         // remove it on every exit path so temp storage never accumulates.
         let _ = std::fs::remove_dir_all(session.session_dir());
+
+        // --- Fix #2: drain all pending events before signalling completion.
+        //
+        // The drain task pumps child events to the parent's event channel.
+        // If we send `SubagentCompleted` immediately after `run_turn` returns,
+        // the drain task may still have buffered events in `event_rx`, causing
+        // content events to arrive *after* the completion event (TUI sees the
+        // child finish before its last messages).
+        //
+        // Dropping `agent` releases its `event_tx` clone, which closes the
+        // mpsc channel, causing the drain loop's `event_rx.recv()` to return
+        // `None` and exit. We then join the drain handle to guarantee all
+        // events have been forwarded before sending `SubagentCompleted`.
+        drop(agent);
+        let _ = drain_handle.await;
+
+        // --- Fix #5: attach token usage to the completion event.
+        let snap = session.usage.snapshot();
+        let usage = kkagent_protocol::TokenUsage {
+            input_tokens: snap.input_tokens,
+            output_tokens: snap.output_tokens,
+            cache_creation_input_tokens: snap.cache_creation_input_tokens,
+            cache_read_input_tokens: snap.cache_read_input_tokens,
+            input_includes_cache: snap.input_includes_cache,
+        };
+
         match run_result {
             Ok(()) => {
                 let result = extract_final_assistant_text(&session);
@@ -231,6 +251,7 @@ fn run_subagent_mirrored_boxed(
                             session_id: m.parent_session_id.clone(),
                             subagent_id: sub_cfg.agent_id.clone(),
                             result_summary: summary,
+                            usage: Some(usage),
                         })
                         .await;
                 }

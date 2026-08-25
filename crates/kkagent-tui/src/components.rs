@@ -204,6 +204,9 @@ pub fn render_ui(f: &mut Frame, state: &mut AppState, config: &AppConfig) {
             state.tool_output_expanded,
             &mut state.render_cache,
         );
+    } else if let Some(subagent_id) = state.active_subagent_view.clone() {
+        render_subagent_view(f, msg_area, state, &theme, &subagent_id);
+        render_scroll_hint(f, msg_area, state, &theme);
     } else {
         render_messages(f, msg_area, state, &theme);
         render_scroll_hint(f, msg_area, state, &theme);
@@ -426,6 +429,104 @@ fn input_inner_height(state: &AppState, terminal_width: u16) -> u16 {
     // the transcript, and the resulting squeeze causes visible vertical oscillation.
     let cap = if is_narrow(terminal_width) { 4 } else { 8 };
     rows.max(cursor_y.saturating_add(1)).clamp(1, cap)
+}
+
+/// Render a subagent's event log as a full transcript view, mirroring the
+/// main session's look (header, scrollable body, border). Activated when the
+/// user presses Enter in the `/agents` panel.
+fn render_subagent_view(
+    f: &mut Frame,
+    area: Rect,
+    state: &mut AppState,
+    theme: &Theme,
+    subagent_id: &str,
+) {
+    let entry = state
+        .subagents
+        .entries
+        .iter()
+        .find(|e| e.id == subagent_id)
+        .cloned();
+    let Some(entry) = entry else {
+        // Subagent no longer exists — show a placeholder.
+        let para = Paragraph::new("Subagent no longer available.")
+            .style(Style::default().fg(theme.text_muted));
+        f.render_widget(para, area);
+        return;
+    };
+
+    let width = area.width.max(1) as usize;
+
+    // Build a header line with the subagent's name, description, and status.
+    let mut lines: Vec<Line> = Vec::new();
+    let header = format!(
+        "🤖 {} — {} [{}]",
+        entry.name, entry.description, entry.status
+    );
+    lines.push(
+        Line::from(header).style(
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        ),
+    );
+    if let Some(r) = &entry.result_or_error {
+        lines.push(Line::from(""));
+        lines.push(Line::from(format!("Result: {}", r)));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from("── activity log ──").style(Style::default().fg(theme.text_muted)));
+
+    // Render the event log entries as wrapped lines.
+    for ev in &entry.events {
+        let ev_lines: Vec<String> = wrap_text(ev, width);
+        for l in ev_lines {
+            lines.push(Line::from(l));
+        }
+    }
+
+    if entry.events.is_empty() {
+        lines.push(Line::from("(no activity yet)").style(Style::default().fg(theme.text_muted)));
+    }
+
+    let content_height = lines.len() as u16;
+    let visible_height = area.height.max(1);
+    state.content_lines = content_height;
+    state.viewport_height = visible_height;
+
+    let max_scroll_up = content_height.saturating_sub(visible_height);
+    let scroll_offset = state.scroll_up.min(max_scroll_up);
+
+    let para = Paragraph::new(lines).scroll((scroll_offset, 0));
+    f.render_widget(para, area);
+}
+
+/// Simple text wrapper for subagent event log lines.
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    let mut result = Vec::new();
+    for line in text.lines() {
+        if line.chars().count() <= width {
+            result.push(line.to_string());
+        } else {
+            let mut current = String::new();
+            let mut len = 0;
+            for ch in line.chars() {
+                if len >= width {
+                    result.push(std::mem::take(&mut current));
+                    len = 0;
+                }
+                current.push(ch);
+                len += 1;
+            }
+            if !current.is_empty() {
+                result.push(current);
+            }
+        }
+    }
+    if result.is_empty() {
+        result.push(String::new());
+    }
+    result
 }
 
 fn render_messages(f: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) {

@@ -133,6 +133,8 @@ pub enum AgentEvent {
         session_id: String,
         subagent_id: String,
         result_summary: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        usage: Option<super::TokenUsage>,
     },
     SubagentFailed {
         session_id: String,

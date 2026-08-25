@@ -263,6 +263,10 @@ pub struct AppState {
     pub subagents: crate::subagents::SubagentStore,
     /// Overlay browser for subagent detail (`/agents`).
     pub subagents_panel: Option<crate::subagents::SubagentsPanelState>,
+    /// When set, the message area renders this subagent's event log instead of
+    /// the main session transcript. Activated by pressing Enter in the
+    /// `/agents` panel; deactivated by switching back to the main tab.
+    pub active_subagent_view: Option<String>,
     /// Toggleable full-screen BTW surface, advertised beside the git badge.
     pub btw: crate::panes::BtwPanelState,
     /// Active model alias (best-effort).
@@ -1151,6 +1155,7 @@ impl AppState {
             todos_expanded: false,
             subagents: crate::subagents::SubagentStore::default(),
             subagents_panel: None,
+            active_subagent_view: None,
             btw: crate::panes::BtwPanelState::default(),
             model_alias: None,
             stream_cursor: crate::streaming::StreamingCursor::default(),
@@ -3534,10 +3539,29 @@ impl TuiApp {
                     return Ok(());
                 }
                 KeyCode::Enter => {
-                    if let Some(ref mut p) = self.state.subagents_panel {
-                        if !self.state.subagents.entries.is_empty() {
-                            p.detail = !p.detail;
-                        }
+                    // Open the selected subagent as a viewable "session" tab.
+                    let entry = self
+                        .state
+                        .subagents
+                        .entries
+                        .get(self.state.subagents_panel.as_ref().map_or(0, |p| {
+                            p.selected
+                                .min(self.state.subagents.entries.len().saturating_sub(1))
+                        }))
+                        .cloned();
+                    if let Some(entry) = entry {
+                        // Close the overlay panel.
+                        self.state.subagents_panel = None;
+                        // Activate the subagent view: the message area will
+                        // render this subagent's event log instead of the main
+                        // session transcript.
+                        self.state.active_subagent_view = Some(entry.id.clone());
+                        // Add a tab for the subagent so the user can switch
+                        // between the main session and the subagent view.
+                        let title = format!("🤖 {}", entry.name);
+                        self.state
+                            .tab_strip
+                            .ensure_active(&format!("subagent:{}", entry.id), title);
                     }
                     return Ok(());
                 }
@@ -4059,6 +4083,13 @@ impl TuiApp {
             // Escape: dismiss overlays already handled above; here interrupt /
             // double-Esc history edit.
             KeyCode::Esc => {
+                // If we're viewing a subagent transcript, Esc returns to the
+                // main session view.
+                if self.state.active_subagent_view.is_some() {
+                    self.state.active_subagent_view = None;
+                    self.state.tab_strip.active = 0;
+                    return Ok(());
+                }
                 if self.state.status != SessionStatus::Idle {
                     if let Some(sid) = &self.state.session_id {
                         self.state.status = SessionStatus::Cancelling;
@@ -11974,13 +12005,22 @@ impl TuiApp {
                     AgentEvent::SubagentCompleted {
                         subagent_id,
                         result_summary,
+                        usage,
                         ..
                     } => {
-                        self.state.subagents.set_status(
-                            &subagent_id,
-                            "complete",
-                            Some(result_summary.chars().take(240).collect()),
-                        );
+                        let summary: String = if let Some(u) = &usage {
+                            format!(
+                                "{} (in={}, out={})",
+                                result_summary.chars().take(200).collect::<String>(),
+                                u.input_tokens,
+                                u.output_tokens
+                            )
+                        } else {
+                            result_summary.chars().take(240).collect()
+                        };
+                        self.state
+                            .subagents
+                            .set_status(&subagent_id, "complete", Some(summary));
                     }
                     AgentEvent::SubagentFailed {
                         subagent_id, error, ..

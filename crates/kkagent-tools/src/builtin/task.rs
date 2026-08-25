@@ -21,6 +21,7 @@ async fn spawn_subagent(
     input: Value,
     ctx: &ToolContext,
     resume_id: Option<String>,
+    run_in_background: bool,
 ) -> anyhow::Result<ToolOutput> {
     let desc = input
         .get("description")
@@ -63,6 +64,7 @@ async fn spawn_subagent(
                     subagents,
                     parent_session_id: Some(ctx.session_id.clone()),
                     parent_tool_call_id: ctx.tool_call_id.clone(),
+                    run_in_background,
                 };
                 if let Some(state) = subagent_mgr.get_state(&resume).await {
                     cfg.description = if desc == "Unnamed task" {
@@ -100,6 +102,7 @@ async fn spawn_subagent(
         profile: requested_profile,
         parent_session_id: Some(ctx.session_id.clone()),
         parent_tool_call_id: ctx.tool_call_id.clone(),
+        run_in_background,
     };
 
     match subagent_mgr.spawn(config.clone()).await {
@@ -393,6 +396,7 @@ re-prompt finished agents. After launching, collect results with TaskOutput.",
                     resume_input,
                     ctx,
                     Some(agent_id.clone()),
+                    true, // swarm resume is always fire-and-forget
                 )
                 .await?
                 {
@@ -423,8 +427,15 @@ re-prompt finished agents. After launching, collect results with TaskOutput.",
                     "profile": default_profile,
                     "model": default_model,
                 });
-                match spawn_subagent(&self.subagent_mgr, &self.launch, agent_input, ctx, None)
-                    .await?
+                match spawn_subagent(
+                    &self.subagent_mgr,
+                    &self.launch,
+                    agent_input,
+                    ctx,
+                    None,
+                    true,
+                )
+                .await?
                 {
                     out if out.is_error => {
                         return Ok(ToolOutput::error(format!(
@@ -465,7 +476,16 @@ re-prompt finished agents. After launching, collect results with TaskOutput.",
                 "profile": a.get("profile").cloned().unwrap_or(Value::String(default_profile.clone())),
                 "model": a.get("model").cloned().unwrap_or(Value::Null),
             });
-            match spawn_subagent(&self.subagent_mgr, &self.launch, agent_input, ctx, None).await? {
+            match spawn_subagent(
+                &self.subagent_mgr,
+                &self.launch,
+                agent_input,
+                ctx,
+                None,
+                true,
+            )
+            .await?
+            {
                 out if out.is_error => {
                     return Ok(ToolOutput::error(format!(
                         "Failed after launching {}: {}",
@@ -520,7 +540,15 @@ re-prompt finished agents. After launching, collect results with TaskOutput.",
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
-        let launched = spawn_subagent(&self.subagent_mgr, &self.launch, input, ctx, resume).await?;
+        let launched = spawn_subagent(
+            &self.subagent_mgr,
+            &self.launch,
+            input,
+            ctx,
+            resume,
+            background,
+        )
+        .await?;
         if launched.is_error || background {
             return Ok(launched);
         }
@@ -539,6 +567,9 @@ re-prompt finished agents. After launching, collect results with TaskOutput.",
             return Ok(launched);
         }
 
+        // Watch-based wait: react to state changes instantly instead of polling
+        // at 200 ms intervals.
+        let mut watch_rx = self.subagent_mgr.subscribe();
         loop {
             if ctx
                 .interrupted
@@ -573,7 +604,11 @@ re-prompt finished agents. After launching, collect results with TaskOutput.",
                 }
                 None => return Ok(ToolOutput::error(format!("Agent {id} disappeared"))),
                 _ => {
-                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    // Block until the manager bumps its revision (state change).
+                    if watch_rx.changed().await.is_err() {
+                        // Sender dropped — fall back to a short sleep.
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                    }
                 }
             }
         }

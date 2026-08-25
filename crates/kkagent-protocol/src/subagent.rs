@@ -33,6 +33,9 @@ pub struct SubagentConfig {
     pub parent_session_id: Option<String>,
     #[serde(default)]
     pub parent_tool_call_id: Option<String>,
+    /// Whether the agent was launched in background (fire-and-forget) mode.
+    #[serde(default)]
+    pub run_in_background: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -64,15 +67,20 @@ pub struct SubagentManager {
     aborts: Arc<Mutex<HashMap<String, AbortHandle>>>,
     max_concurrent: usize,
     persistence: Option<Arc<std::sync::Mutex<Connection>>>,
+    /// Monotonic counter bumped on every state change so subscribers can react
+    /// without polling at intervals.
+    revision: tokio::sync::watch::Sender<u64>,
 }
 
 impl SubagentManager {
     pub fn new(max_concurrent: usize) -> Self {
+        let (revision, _) = tokio::sync::watch::channel(0u64);
         Self {
             agents: Arc::new(Mutex::new(HashMap::new())),
             aborts: Arc::new(Mutex::new(HashMap::new())),
             max_concurrent,
             persistence: None,
+            revision,
         }
     }
 
@@ -148,6 +156,7 @@ impl SubagentManager {
             aborts: Arc::new(Mutex::new(HashMap::new())),
             max_concurrent,
             persistence: Some(connection),
+            revision: tokio::sync::watch::channel(0u64).0,
         })
     }
 
@@ -176,6 +185,7 @@ impl SubagentManager {
 
         self.persist_spawn(&config)?;
         agents.insert(config.agent_id.clone(), state);
+        self.notify();
         Ok(config.agent_id)
     }
 
@@ -219,6 +229,7 @@ impl SubagentManager {
         agent.error = None;
         drop(agents);
         self.persist_status(agent_id, "running", None, None, true)?;
+        self.notify();
         Ok(())
     }
 
@@ -239,6 +250,7 @@ impl SubagentManager {
         }
         self.aborts.lock().await.remove(agent_id);
         let _ = self.persist_status(agent_id, "complete", Some(&result), None, false);
+        self.notify();
     }
 
     pub async fn fail(&self, agent_id: &str, error: String) {
@@ -251,6 +263,7 @@ impl SubagentManager {
         }
         self.aborts.lock().await.remove(agent_id);
         let _ = self.persist_status(agent_id, "failed", None, Some(&error), false);
+        self.notify();
     }
 
     /// Mark cancelled and abort the running tokio task if present.
@@ -276,6 +289,7 @@ impl SubagentManager {
                     Some("Stopped by TaskStop"),
                     false,
                 );
+                self.notify();
                 Ok(snapshot)
             }
             other => Err(anyhow::anyhow!(
@@ -304,6 +318,19 @@ impl SubagentManager {
 
     pub async fn list_all(&self) -> Vec<SubagentState> {
         self.agents.lock().await.values().cloned().collect()
+    }
+
+    /// Subscribe to state-change notifications. The receiver receives a new
+    /// value every time a subagent transitions (spawn / complete / fail / stop /
+    /// resume), so callers can react instantly without 200 ms polling.
+    pub fn subscribe(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.revision.subscribe()
+    }
+
+    /// Bump the revision counter to notify subscribers.
+    fn notify(&self) {
+        // `send` errors only when all receivers are dropped — safe to ignore.
+        let _ = self.revision.send(self.revision.borrow().wrapping_add(1));
     }
 
     fn persist_spawn(&self, config: &SubagentConfig) -> anyhow::Result<()> {
@@ -409,6 +436,7 @@ mod tests {
             subagents: allowed_subagents_for("coder"),
             parent_session_id: Some("session".into()),
             parent_tool_call_id: None,
+            run_in_background: false,
         };
         {
             let manager = SubagentManager::new_persistent(2, &path).unwrap();
