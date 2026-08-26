@@ -687,6 +687,10 @@ impl Tool for AgentSwarmTool {
          detach and keep running — collect them later with TaskOutput / resume_agent_ids."
     }
 
+    fn disclosure(&self) -> crate::ToolDisclosure {
+        crate::ToolDisclosure::Deferred
+    }
+
     fn parameters_schema(&self) -> Value {
         serde_json::json!({
             "type": "object",
@@ -793,6 +797,12 @@ mod tests {
         }
 
         fn launcher(&self) -> SubagentLaunchFn {
+            self.launcher_with_delay(Duration::from_millis(20))
+        }
+
+        /// Launcher whose simulated runs finish after `delay` — use a
+        /// near-zero delay to stress simultaneous completions.
+        fn launcher_with_delay(&self, delay: Duration) -> SubagentLaunchFn {
             let manager = self.manager.clone();
             let launched = self.launched.clone();
             Arc::new(move |config: SubagentConfig| {
@@ -801,10 +811,96 @@ mod tests {
                 let id = config.agent_id.clone();
                 let result = format!("done: {}", config.prompt);
                 tokio::spawn(async move {
-                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    tokio::time::sleep(delay).await;
                     let _ = manager.complete(&id, result).await;
                 });
             })
+        }
+    }
+
+    #[tokio::test]
+    async fn swarm_handles_simultaneous_completions() {
+        // All children complete at the same instant — the watch channel only
+        // carries a revision counter, so batched wakes must not lose events.
+        let auto = AutoComplete::new(16);
+        let tool = AgentSwarmTool::new(
+            auto.manager.clone(),
+            auto.launcher_with_delay(Duration::from_millis(1)),
+            None,
+            kkagent_config::ToolsConfig::default(),
+        );
+
+        let items: Vec<String> = (0..12).map(|i| format!("item-{i}")).collect();
+        let output = tool
+            .execute(
+                serde_json::json!({
+                    "description": "burst completion",
+                    "prompt_template": "explore {{item}}",
+                    "items": items
+                }),
+                &context(),
+            )
+            .await
+            .unwrap();
+
+        assert!(!output.is_error);
+        assert!(output.content.contains("<summary>completed: 12</summary>"));
+        assert_eq!(output.content.matches("outcome=\"completed\"").count(), 12);
+    }
+
+    #[tokio::test]
+    async fn swarm_timeout_lists_only_still_running() {
+        // Half the children complete, half never do — the detach notice must
+        // carry exactly the still-running ids.
+        let manager = Arc::new(SubagentManager::new(8));
+        let launched = Arc::new(StdMutex::new(Vec::new()));
+        let captured = launched.clone();
+        let mgr = manager.clone();
+        let launch: SubagentLaunchFn = Arc::new(move |config: SubagentConfig| {
+            let idx = captured.lock().unwrap().len();
+            captured.lock().unwrap().push(config.clone());
+            // Items alternate: even-index children complete, odd ones hang.
+            if idx % 2 == 0 {
+                let id = config.agent_id.clone();
+                let mgr = mgr.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    let _ = mgr.complete(&id, "done".into()).await;
+                });
+            }
+        });
+        let tools_config = kkagent_config::ToolsConfig {
+            subagent_timeout_secs: Some(1),
+            ..kkagent_config::ToolsConfig::default()
+        };
+        let tool = AgentSwarmTool::new(manager, launch, None, tools_config);
+
+        let output = tool
+            .execute(
+                serde_json::json!({
+                    "description": "mixed swarm",
+                    "prompt_template": "explore {{item}}",
+                    "items": ["a", "b", "c", "d"]
+                }),
+                &context(),
+            )
+            .await
+            .unwrap();
+
+        assert!(!output.is_error);
+        assert!(output.content.contains("timed out"));
+        assert!(output.content.contains("2 subagent(s) detached"));
+        // The detached ids must be the two that never completed.
+        let running: Vec<String> = launched
+            .lock()
+            .unwrap()
+            .iter()
+            .enumerate()
+            .filter(|(idx, _)| idx % 2 == 1)
+            .map(|(_, c)| c.agent_id.clone())
+            .collect();
+        for id in running {
+            assert!(output.content.contains(&id), "missing id {id}");
         }
     }
 

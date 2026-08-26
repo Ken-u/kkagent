@@ -54,10 +54,28 @@ async fn spawn_subagent(
                     .as_ref()
                     .and_then(|state| state.subagents.clone())
                     .or_else(|| allowed_subagents_for(profile.as_deref().unwrap_or("general")));
+                // Resume continuity (kimi-code semantics): subagent sessions
+                // are ephemeral here, so carry the prior run's result into
+                // the re-prompt as context.
+                let prompt = previous
+                    .as_ref()
+                    .and_then(|state| state.result.clone())
+                    .map(|result| {
+                        let trimmed = result.trim();
+                        if trimmed.is_empty() {
+                            prompt.to_string()
+                        } else {
+                            format!(
+                                "Your previous run produced:\n{trimmed}\n\nContinue with \
+                                 this new instruction:\n{prompt}"
+                            )
+                        }
+                    })
+                    .unwrap_or_else(|| prompt.to_string());
                 let mut cfg = SubagentConfig {
                     agent_id: resume.clone(),
                     description: desc.to_string(),
-                    prompt: prompt.to_string(),
+                    prompt,
                     model,
                     working_dir: ctx.working_dir.to_string_lossy().to_string(),
                     profile,
@@ -897,6 +915,45 @@ mod tests {
         let error = tool.check_requested_profiles(&input).unwrap_err();
         assert!(error.contains("not in the allowed subagent allowlist"));
         assert!(launched.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn single_agent_timeout_detaches_instead_of_killing() {
+        let manager = Arc::new(SubagentManager::new(4));
+        // Launch fn that never completes the child (stays Running).
+        let launch: SubagentLaunchFn = Arc::new(|_cfg| {});
+        let tool = AgentTool::with_config(
+            manager.clone(),
+            launch,
+            None,
+            kkagent_config::ToolsConfig {
+                subagent_timeout_secs: Some(1),
+                ..kkagent_config::ToolsConfig::default()
+            },
+        );
+
+        let output = tool
+            .execute(
+                serde_json::json!({
+                    "description": "slow",
+                    "prompt": "never finishes"
+                }),
+                &context(),
+            )
+            .await
+            .unwrap();
+
+        assert!(!output.is_error);
+        assert!(output.content.contains("timed out"));
+        assert!(output.content.contains("detached"));
+        // The child is still Running — not killed.
+        let running = manager
+            .list_all()
+            .await
+            .iter()
+            .filter(|s| s.status == SubagentStatus::Running)
+            .count();
+        assert_eq!(running, 1);
     }
 
     #[tokio::test]

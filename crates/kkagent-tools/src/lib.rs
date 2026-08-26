@@ -482,6 +482,7 @@ mod disclosure_tests {
         // Web is registered unconditionally (fetch needs no provider config).
         let mut expected = [
             "Agent",
+            "AgentSwarm",
             "EnterPlanMode",
             "ExitPlanMode",
             "Web",
