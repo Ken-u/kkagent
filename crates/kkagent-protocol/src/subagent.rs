@@ -36,6 +36,11 @@ pub struct SubagentConfig {
     /// Whether the agent was launched in background (fire-and-forget) mode.
     #[serde(default)]
     pub run_in_background: bool,
+    /// Nesting depth below the root agent (root-launched subagents are 1).
+    /// Enforced against `[subagent] max_depth` to bound recursive delegation;
+    /// older persisted configs deserialize as 0 (treated as root-launched).
+    #[serde(default)]
+    pub depth: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -50,6 +55,12 @@ pub struct SubagentState {
     pub profile: Option<String>,
     #[serde(default)]
     pub subagents: Option<Vec<String>>,
+    /// Working directory the agent was launched with. Restored on resume so
+    /// a cross-session/cross-directory resume keeps operating where the
+    /// agent originally ran instead of the resume caller's cwd
+    /// (issues/subagent_issues.md #7).
+    #[serde(default)]
+    pub working_dir: Option<String>,
 }
 
 /// Kimi-compatible delegation policy for built-in profiles.
@@ -60,6 +71,28 @@ pub fn allowed_subagents_for(profile: &str) -> Option<Vec<String>> {
         "agent" | "general" => None,
         _ => None,
     }
+}
+
+/// Stamp the nesting `depth` on a child config ahead of launch.
+///
+/// Depth counts nesting levels below the root agent: the main agent is 0,
+/// its direct subagents 1, their subagents 2, and so on. Returns an error
+/// (without mutating the config) when `parent_depth + 1` would exceed
+/// `max_depth`, so callers can fail the launch loudly instead of dropping it.
+pub fn stamp_child_depth(
+    config: &mut SubagentConfig,
+    parent_depth: u32,
+    max_depth: u32,
+) -> Result<(), String> {
+    let child_depth = parent_depth + 1;
+    if child_depth > max_depth {
+        return Err(format!(
+            "subagent nesting limit reached (depth {child_depth} > max {max_depth}); \
+             finish the work directly instead of delegating further"
+        ));
+    }
+    config.depth = child_depth;
+    Ok(())
 }
 
 pub struct SubagentManager {
@@ -143,7 +176,8 @@ impl SubagentManager {
                     error: row.get(4)?,
                     turns_used: row.get(5)?,
                     profile: config.as_ref().and_then(|config| config.profile.clone()),
-                    subagents: config.and_then(|config| config.subagents),
+                    subagents: config.as_ref().and_then(|config| config.subagents.clone()),
+                    working_dir: config.map(|config| config.working_dir),
                 })
             })?;
             for row in rows {
@@ -181,6 +215,7 @@ impl SubagentManager {
             turns_used: 0,
             profile: config.profile.clone(),
             subagents: config.subagents.clone(),
+            working_dir: Some(config.working_dir.clone()),
         };
 
         self.persist_spawn(&config)?;
@@ -414,6 +449,58 @@ mod tests {
     }
 
     #[test]
+    fn subagent_config_depth_defaults_to_zero_and_roundtrips() {
+        let legacy: SubagentConfig = serde_json::from_value(serde_json::json!({
+            "agent_id": "legacy",
+            "description": "d",
+            "prompt": "p",
+            "model": null,
+            "working_dir": "."
+        }))
+        .unwrap();
+        assert_eq!(legacy.depth, 0);
+
+        let deep: SubagentConfig = serde_json::from_value(serde_json::json!({
+            "agent_id": "deep",
+            "description": "d",
+            "prompt": "p",
+            "model": null,
+            "working_dir": ".",
+            "depth": 3
+        }))
+        .unwrap();
+        assert_eq!(deep.depth, 3);
+        let round: SubagentConfig =
+            serde_json::from_value(serde_json::to_value(&deep).unwrap()).unwrap();
+        assert_eq!(round.depth, 3);
+    }
+
+    #[test]
+    fn stamp_child_depth_enforces_the_nesting_budget() {
+        let mut config = SubagentConfig {
+            agent_id: "child".into(),
+            description: "d".into(),
+            prompt: "p".into(),
+            model: None,
+            working_dir: ".".into(),
+            profile: None,
+            subagents: None,
+            parent_session_id: None,
+            parent_tool_call_id: None,
+            run_in_background: false,
+            depth: 0,
+        };
+        stamp_child_depth(&mut config, 0, 2).unwrap();
+        assert_eq!(config.depth, 1);
+        stamp_child_depth(&mut config, 1, 2).unwrap();
+        assert_eq!(config.depth, 2);
+        let err = stamp_child_depth(&mut config, 2, 2).unwrap_err();
+        assert!(err.contains("nesting limit"));
+        // Rejected launches must not mutate the config.
+        assert_eq!(config.depth, 2);
+    }
+
+    #[test]
     fn old_subagent_configs_default_to_no_explicit_allowlist() {
         let config: SubagentConfig = serde_json::from_value(serde_json::json!({
             "agent_id": "legacy",
@@ -447,6 +534,7 @@ mod tests {
             parent_session_id: Some("session".into()),
             parent_tool_call_id: None,
             run_in_background: false,
+            depth: 0,
         };
         {
             let manager = SubagentManager::new_persistent(2, &path).unwrap();

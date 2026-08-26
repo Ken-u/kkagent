@@ -10,7 +10,11 @@ use crate::builtin::bash::BackgroundShellManager;
 use crate::{Tool, ToolContext, ToolOutput};
 
 /// Fire-and-forget launcher: schedules the subagent and returns immediately.
-pub type SubagentLaunchFn = Arc<dyn Fn(SubagentConfig) + Send + Sync>;
+///
+/// The `Arc<AtomicBool>` is the parent's interrupt flag; the child session
+/// inherits it so root-level Esc cancels nested subagents (#5).
+pub type SubagentLaunchFn =
+    Arc<dyn Fn(SubagentConfig, Arc<std::sync::atomic::AtomicBool>) + Send + Sync>;
 
 const MAX_AGENT_SWARM_SUBAGENTS: usize = 128;
 const PROMPT_TEMPLATE_PLACEHOLDER: &str = "{{item}}";
@@ -54,6 +58,14 @@ async fn spawn_subagent(
                     .as_ref()
                     .and_then(|state| state.subagents.clone())
                     .or_else(|| allowed_subagents_for(profile.as_deref().unwrap_or("general")));
+                // Resume continuity (#7): keep operating in the directory the
+                // agent was originally launched with; only fall back to the
+                // caller's cwd when the persisted state lacks one (legacy).
+                let working_dir = previous
+                    .as_ref()
+                    .and_then(|state| state.working_dir.clone())
+                    .filter(|dir| !dir.trim().is_empty())
+                    .unwrap_or_else(|| ctx.working_dir.to_string_lossy().to_string());
                 // Resume continuity (kimi-code semantics): subagent sessions
                 // are ephemeral here, so carry the prior run's result into
                 // the re-prompt as context.
@@ -77,12 +89,13 @@ async fn spawn_subagent(
                     description: desc.to_string(),
                     prompt,
                     model,
-                    working_dir: ctx.working_dir.to_string_lossy().to_string(),
+                    working_dir,
                     profile,
                     subagents,
                     parent_session_id: Some(ctx.session_id.clone()),
                     parent_tool_call_id: ctx.tool_call_id.clone(),
                     run_in_background,
+                    depth: 0,
                 };
                 if let Some(state) = subagent_mgr.get_state(&resume).await {
                     cfg.description = if desc == "Unnamed task" {
@@ -91,7 +104,11 @@ async fn spawn_subagent(
                         desc.to_string()
                     };
                 }
-                (launch)(cfg);
+                let interrupt = ctx
+                    .interrupted
+                    .clone()
+                    .unwrap_or_else(|| Arc::new(std::sync::atomic::AtomicBool::new(false)));
+                (launch)(cfg, interrupt);
                 return Ok(ToolOutput::success(format!(
                     "Resumed subagent id={resume}. Use TaskOutput to fetch results."
                 )));
@@ -121,11 +138,16 @@ async fn spawn_subagent(
         parent_session_id: Some(ctx.session_id.clone()),
         parent_tool_call_id: ctx.tool_call_id.clone(),
         run_in_background,
+        depth: 0,
     };
 
     match subagent_mgr.spawn(config.clone()).await {
         Ok(agent_id) => {
-            (launch)(config);
+            let interrupt = ctx
+                .interrupted
+                .clone()
+                .unwrap_or_else(|| Arc::new(std::sync::atomic::AtomicBool::new(false)));
+            (launch)(config, interrupt);
             Ok(ToolOutput::success(format!(
                 "Subagent launched: {desc} (id={agent_id}). \
 Use TaskOutput with this id to fetch results when ready; use TaskList to see status."
@@ -237,6 +259,12 @@ impl TaskOutputTool {
     async fn stop(&self, id: &str) -> ToolOutput {
         if let Some(state) = self.subagent_mgr.get_state(id).await {
             let _ = self.subagent_mgr.stop(id).await;
+            // Aborting the run skips the runtime's unified exit path, so the
+            // worktree cleanup would otherwise be missed (#2 residual):
+            // dispose of it here using the persisted working_dir.
+            if let Some(dir) = state.working_dir.clone() {
+                crate::git_worktree::cleanup_worktree(std::path::Path::new(&dir)).await;
+            }
             return ToolOutput::success(format!(
                 "Stopped task {} ({})",
                 state.agent_id, state.description
@@ -826,10 +854,57 @@ mod tests {
     fn recording_launcher() -> (SubagentLaunchFn, Arc<StdMutex<Vec<SubagentConfig>>>) {
         let launched = Arc::new(StdMutex::new(Vec::new()));
         let captured = launched.clone();
-        let launch = Arc::new(move |config| {
+        let launch = Arc::new(move |config, _interrupt| {
             captured.lock().unwrap().push(config);
         });
         (launch, launched)
+    }
+
+    #[tokio::test]
+    async fn resume_restores_persisted_working_dir() {
+        // #7: a resumed agent must keep operating in its original working
+        // directory, not the resume caller's cwd.
+        let manager = Arc::new(SubagentManager::new(2));
+        manager
+            .spawn(SubagentConfig {
+                agent_id: "resumable".into(),
+                description: "original task".into(),
+                prompt: "p".into(),
+                model: None,
+                working_dir: "/original/workspace".into(),
+                profile: Some("coder".into()),
+                subagents: allowed_subagents_for("coder"),
+                parent_session_id: None,
+                parent_tool_call_id: None,
+                run_in_background: true,
+                depth: 0,
+            })
+            .await
+            .unwrap();
+        manager.complete("resumable", "done".into()).await;
+        // Simulate a resume issued from a different cwd.
+        let ctx = ToolContext {
+            working_dir: std::path::PathBuf::from("/caller/cwd"),
+            ..context()
+        };
+        let (launch, launched) = recording_launcher();
+        let tool = AgentTool::new(manager, launch);
+        let output = tool
+            .execute(
+                serde_json::json!({
+                    "description": "continue",
+                    "prompt": "keep going",
+                    "resume": "resumable",
+                    "run_in_background": true
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!output.is_error);
+        let configs = launched.lock().unwrap();
+        assert_eq!(configs.len(), 1);
+        assert_eq!(configs[0].working_dir, "/original/workspace");
     }
 
     #[tokio::test]
@@ -921,7 +996,7 @@ mod tests {
     async fn single_agent_timeout_detaches_instead_of_killing() {
         let manager = Arc::new(SubagentManager::new(4));
         // Launch fn that never completes the child (stays Running).
-        let launch: SubagentLaunchFn = Arc::new(|_cfg| {});
+        let launch: SubagentLaunchFn = Arc::new(|_cfg, _interrupt| {});
         let tool = AgentTool::with_config(
             manager.clone(),
             launch,

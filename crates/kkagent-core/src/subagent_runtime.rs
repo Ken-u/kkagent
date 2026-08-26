@@ -6,7 +6,7 @@ use tokio::task::AbortHandle;
 
 use kkagent_config::AppConfig;
 use kkagent_protocol::{
-    subagent::{allowed_subagents_for, SubagentConfig, SubagentManager},
+    subagent::{allowed_subagents_for, stamp_child_depth, SubagentConfig, SubagentManager},
     AgentEvent, PermissionMode,
 };
 use kkagent_tools::{
@@ -31,23 +31,38 @@ pub async fn run_subagent(
     sub_cfg: SubagentConfig,
     permission_mode: PermissionMode,
 ) -> anyhow::Result<String> {
-    run_subagent_mirrored(app_config, sub_cfg, permission_mode, None).await
+    let web = Arc::new(kkagent_tools::WebServicesConfig::from_app(
+        app_config.as_ref(),
+    ));
+    run_subagent_mirrored(app_config, web, sub_cfg, permission_mode, None, None).await
 }
 
 pub async fn run_subagent_mirrored(
     app_config: Arc<AppConfig>,
+    web: Arc<kkagent_tools::WebServicesConfig>,
     sub_cfg: SubagentConfig,
     permission_mode: PermissionMode,
     mirror: Option<SubagentMirrorContext>,
+    inherit_interrupt: Option<Arc<std::sync::atomic::AtomicBool>>,
 ) -> anyhow::Result<String> {
-    run_subagent_mirrored_boxed(app_config, sub_cfg, permission_mode, mirror).await
+    run_subagent_mirrored_boxed(
+        app_config,
+        web,
+        sub_cfg,
+        permission_mode,
+        mirror,
+        inherit_interrupt,
+    )
+    .await
 }
 
 fn run_subagent_mirrored_boxed(
     app_config: Arc<AppConfig>,
+    web: Arc<kkagent_tools::WebServicesConfig>,
     sub_cfg: SubagentConfig,
     permission_mode: PermissionMode,
     mirror: Option<SubagentMirrorContext>,
+    inherit_interrupt: Option<Arc<std::sync::atomic::AtomicBool>>,
 ) -> futures::future::BoxFuture<'static, anyhow::Result<String>> {
     Box::pin(async move {
         let model = sub_cfg
@@ -70,6 +85,12 @@ fn run_subagent_mirrored_boxed(
             permission_mode,
             model.clone(),
         );
+        // Interrupt propagation (#5): share the parent's interrupt flag so an
+        // Esc at any ancestor stops this subagent (and, via the same
+        // mechanism on its own children, the whole subtree) immediately.
+        if let Some(parent_flag) = inherit_interrupt {
+            session.inherit_interrupted(parent_flag);
+        }
         session.image_config = app_config.image.clone();
         session.attach_workspace_concurrency_guard();
         session.inject_workspace_instructions().await;
@@ -89,15 +110,33 @@ fn run_subagent_mirrored_boxed(
 
         let mut tools = ToolRegistry::new();
         register_core_tools(&mut tools);
-        let nested_manager = Arc::new(SubagentManager::new(4));
+        let nested_manager = Arc::new(SubagentManager::new(
+            app_config.subagent.effective_max_concurrent(),
+        ));
         let launch_manager = nested_manager.clone();
         let launch_config = app_config.clone();
         let launch_event_tx = event_tx.clone();
+        let launch_web = web.clone();
+        let max_depth = app_config.subagent.effective_max_depth();
+        let parent_depth = sub_cfg.depth;
         let nested_launch: kkagent_tools::builtin::task::SubagentLaunchFn =
-            Arc::new(move |config| {
+            Arc::new(move |mut config, interrupt| {
                 let manager = launch_manager.clone();
                 let app_config = launch_config.clone();
+                let web = launch_web.clone();
                 let agent_id = config.agent_id.clone();
+                // Depth budget, layer 2 (launch guard): stamp the child's
+                // nesting depth; when the budget is exhausted, fail loudly so
+                // the parent's TaskOutput surfaces the reason instead of
+                // waiting on an agent that will never run.
+                if let Err(reason) = stamp_child_depth(&mut config, parent_depth, max_depth) {
+                    tracing::warn!("Rejected nested subagent {agent_id}: {reason}");
+                    let manager = manager.clone();
+                    tokio::spawn(async move {
+                        manager.fail(&agent_id, reason).await;
+                    });
+                    return;
+                }
                 let abort_manager = manager.clone();
                 let abort_agent_id = agent_id.clone();
                 let nested_mirror = match (
@@ -116,9 +155,11 @@ fn run_subagent_mirrored_boxed(
                 let join = tokio::spawn(async move {
                     match run_subagent_mirrored_boxed(
                         app_config,
+                        web,
                         config,
                         PermissionMode::Auto,
                         nested_mirror,
+                        Some(interrupt),
                     )
                     .await
                     {
@@ -142,7 +183,17 @@ fn run_subagent_mirrored_boxed(
             allowed_subagents,
             app_config.tools.clone(),
         );
+        // Web access for subagents: registered from the same config snapshot
+        // as the parent turn (plugin overrides applied) and then kept only
+        // where the profile allowlist lists "Web" (explore/general/coder do).
+        if let Some(web_tool) = kkagent_tools::builtin::WebTool::try_new(web.clone()) {
+            tools.register(Arc::new(web_tool));
+        }
         retain_profile_tools(&mut tools, &profile);
+        // Depth budget, layer 1 (schema pruning): a subagent already at the
+        // depth cap cannot launch children within budget — remove the
+        // delegation tools entirely so its schema never offers them.
+        prune_delegation_tools_at_depth(&mut tools, sub_cfg.depth, max_depth);
 
         if let Some(m) = &mirror {
             let _ = m
@@ -246,7 +297,7 @@ fn run_subagent_mirrored_boxed(
             input_includes_cache: snap.input_includes_cache,
         };
 
-        match run_result {
+        let outcome = match run_result {
             Ok(()) => {
                 let result = extract_final_assistant_text(&session);
                 persist_subagent_output(&sub_cfg, &result).await;
@@ -277,7 +328,16 @@ fn run_subagent_mirrored_boxed(
                 }
                 Err(e)
             }
-        }
+        };
+
+        // Worktree lifecycle (issues/subagent_issues.md #2): now that the run
+        // has fully finished and its output/events were emitted, dispose of
+        // the disposable git worktree, if this run had one. Resumed agents
+        // get a fresh worktree (created from HEAD) on relaunch.
+        kkagent_tools::git_worktree::cleanup_worktree(std::path::Path::new(&sub_cfg.working_dir))
+            .await;
+
+        outcome
     })
 }
 
@@ -333,4 +393,84 @@ fn extract_final_assistant_text(session: &Session) -> String {
         }
     }
     "(subagent finished with no text output)".into()
+}
+
+/// Remove delegation tools when a subagent at `depth` has no remaining
+/// nesting budget under `max_depth` (any child it launches would exceed
+/// the cap). This is the schema-level layer of the depth budget; the
+/// launch-closure stamp is the runtime backstop.
+fn prune_delegation_tools_at_depth(tools: &mut ToolRegistry, depth: u32, max_depth: u32) {
+    if depth >= max_depth {
+        tools.remove("Agent");
+        tools.remove("AgentSwarm");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kkagent_tools::{Tool, ToolContext, ToolOutput, ToolRegistry};
+    use serde_json::Value;
+
+    struct StubTool(&'static str);
+
+    #[async_trait::async_trait]
+    impl Tool for StubTool {
+        fn name(&self) -> &str {
+            self.0
+        }
+
+        fn description(&self) -> &str {
+            "stub"
+        }
+
+        fn parameters_schema(&self) -> Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+
+        async fn execute(&self, _input: Value, _ctx: &ToolContext) -> anyhow::Result<ToolOutput> {
+            Ok(ToolOutput::success("stub"))
+        }
+    }
+
+    fn registry_with_delegation_tools() -> ToolRegistry {
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(StubTool("Agent")));
+        registry.register(Arc::new(StubTool("AgentSwarm")));
+        registry.register(Arc::new(StubTool("Read")));
+        registry
+    }
+
+    fn names(registry: &ToolRegistry) -> Vec<String> {
+        let mut names: Vec<String> = registry
+            .list()
+            .iter()
+            .map(|t| t.name().to_string())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn delegation_tools_survive_while_budget_remains() {
+        let mut registry = registry_with_delegation_tools();
+        // depth 1 with max_depth 2: may still launch depth-2 children.
+        prune_delegation_tools_at_depth(&mut registry, 1, 2);
+        assert_eq!(names(&registry), vec!["Agent", "AgentSwarm", "Read"]);
+    }
+
+    #[test]
+    fn delegation_tools_pruned_at_the_depth_cap() {
+        let mut registry = registry_with_delegation_tools();
+        // depth 2 with max_depth 2: any child would be depth 3 > cap.
+        prune_delegation_tools_at_depth(&mut registry, 2, 2);
+        assert_eq!(names(&registry), vec!["Read"]);
+    }
+
+    #[test]
+    fn max_depth_one_makes_every_subagent_a_leaf() {
+        let mut registry = registry_with_delegation_tools();
+        prune_delegation_tools_at_depth(&mut registry, 1, 1);
+        assert_eq!(names(&registry), vec!["Read"]);
+    }
 }

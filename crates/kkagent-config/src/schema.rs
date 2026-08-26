@@ -93,6 +93,52 @@ pub struct AppConfig {
     /// Plugin system behavior (`[plugins]`).
     #[serde(default)]
     pub plugins: PluginsConfig,
+    /// Subagent delegation limits (`[subagent]`).
+    #[serde(default)]
+    pub subagent: SubagentSettings,
+}
+
+/// Subagent delegation limits (`[subagent]` in config.toml).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubagentSettings {
+    /// Maximum subagent nesting depth below the root agent. `1` means
+    /// subagents cannot delegate further; clamped to `1..=4` at runtime.
+    /// Default `2` (main → L1 → L2, L2 being a leaf).
+    #[serde(default = "default_subagent_max_depth")]
+    pub max_depth: u32,
+    /// Maximum concurrently *running* subagents per manager (root session
+    /// and each nested subagent session). Default `4`.
+    #[serde(default = "default_subagent_max_concurrent")]
+    pub max_concurrent: usize,
+}
+
+fn default_subagent_max_depth() -> u32 {
+    2
+}
+
+fn default_subagent_max_concurrent() -> usize {
+    4
+}
+
+impl Default for SubagentSettings {
+    fn default() -> Self {
+        Self {
+            max_depth: default_subagent_max_depth(),
+            max_concurrent: default_subagent_max_concurrent(),
+        }
+    }
+}
+
+impl SubagentSettings {
+    /// Effective depth cap, clamped to a sane `1..=4` range.
+    pub fn effective_max_depth(&self) -> u32 {
+        self.max_depth.clamp(1, 4)
+    }
+
+    /// Effective concurrency cap, clamped to at least 1.
+    pub fn effective_max_concurrent(&self) -> usize {
+        self.max_concurrent.max(1)
+    }
 }
 
 /// Plugin system behavior (`[plugins]` in config.toml).

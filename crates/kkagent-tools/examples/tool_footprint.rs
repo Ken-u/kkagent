@@ -14,7 +14,7 @@ fn main() {
     register_core_tools(&mut r);
 
     let mgr = Arc::new(kkagent_protocol::subagent::SubagentManager::new(4));
-    let launch: builtin::task::SubagentLaunchFn = Arc::new(|_cfg| {});
+    let launch: builtin::task::SubagentLaunchFn = Arc::new(|_cfg, _interrupt| {});
     register_subagent_tools(
         &mut r,
         mgr,

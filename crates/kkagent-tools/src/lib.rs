@@ -336,9 +336,6 @@ impl ProfileToolSet {
         "Web",
         "Agent",
         "AgentSwarm",
-        "AskUserQuestion",
-        "EnterPlanMode",
-        "ExitPlanMode",
         "Goal",
     ];
 
@@ -348,8 +345,6 @@ impl ProfileToolSet {
         "Bash",
         "Cron",
         "Edit",
-        "EnterPlanMode",
-        "ExitPlanMode",
         "Glob",
         "Grep",
         "Read",
@@ -358,7 +353,6 @@ impl ProfileToolSet {
         "TaskOutput",
         "TodoList",
         "Web",
-        "AskUserQuestion",
     ];
 
     pub const EXPLORE: &'static [&'static str] =
@@ -390,10 +384,19 @@ mod profile_tool_tests {
         register_subagent_tools(
             &mut registry,
             Arc::new(SubagentManager::new(1)),
-            Arc::new(|_| {}),
+            Arc::new(|_, _interrupt| {}),
             kkagent_protocol::subagent::allowed_subagents_for(profile),
             kkagent_config::ToolsConfig::default(),
         );
+        // Mirror the subagent runtime path: Web is offered to subagents
+        // whenever web services are configured, then narrowed per profile.
+        if let Some(web) = builtin::WebTool::try_new(Arc::new(web_providers::WebServicesConfig {
+            search: None,
+            fetch: web_providers::WebFetchServiceConfig::default(),
+            migration_hint: None,
+        })) {
+            registry.register(Arc::new(web));
+        }
         retain_profile_tools(&mut registry, profile);
         registry
     }
@@ -413,10 +416,52 @@ mod profile_tool_tests {
 
         assert!(names.contains(&"Read"));
         assert!(names.contains(&"Grep"));
+        assert!(names.contains(&"Web"), "explore should keep web access");
         assert!(!names.contains(&"Write"));
         assert!(!names.contains(&"Edit"));
         assert!(!names.contains(&"Agent"));
         assert!(!names.contains(&"AgentSwarm"));
+    }
+
+    #[test]
+    fn general_profile_keeps_web_access() {
+        let registry = registry_for("general");
+        let names = names(&registry);
+
+        assert!(names.contains(&"Web"), "general should keep web access");
+        assert!(names.contains(&"Agent"));
+        // Subagents run headless under PermissionMode::Auto, which denies
+        // AskUserQuestion — it must not be offered to them at all
+        // (issues/subagent_ask.md).
+        assert!(!names.contains(&"AskUserQuestion"));
+    }
+
+    #[test]
+    fn coder_profile_has_no_ask_user_either() {
+        let registry = registry_for("coder");
+        let names = names(&registry);
+
+        assert!(!names.contains(&"AskUserQuestion"));
+    }
+
+    #[test]
+    fn subagent_profiles_have_no_plan_tools() {
+        // Subagents are headless: EnterPlanMode would lock the agent into a
+        // read-only guard it can never get user approval to exit, and
+        // ExitPlanMode is filtered out of non-plan-mode requests anyway
+        // (agent_loop tool_allowed) — both are dead/harmful schema entries.
+        for profile in ["general", "coder"] {
+            let registry = registry_for(profile);
+            let names = names(&registry);
+            assert!(
+                !names.contains(&"EnterPlanMode"),
+                "{profile} should not offer EnterPlanMode"
+            );
+            assert!(
+                !names.contains(&"ExitPlanMode"),
+                "{profile} should not offer ExitPlanMode"
+            );
+        }
     }
 
     #[test]
@@ -442,7 +487,7 @@ mod disclosure_tests {
         let mut registry = ToolRegistry::new();
         register_core_tools(&mut registry);
         let mgr = Arc::new(kkagent_protocol::subagent::SubagentManager::new(4));
-        let launch: builtin::task::SubagentLaunchFn = Arc::new(|_cfg| {});
+        let launch: builtin::task::SubagentLaunchFn = Arc::new(|_cfg, _interrupt| {});
         register_subagent_tools(
             &mut registry,
             mgr,

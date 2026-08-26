@@ -45,6 +45,12 @@ impl ToolRegistry {
             .retain(|name, _| allowed_names.iter().any(|allowed| name == allowed));
     }
 
+    /// Remove a tool by wire name (e.g. pruning delegation tools once the
+    /// subagent nesting budget is exhausted). Returns whether it existed.
+    pub fn remove(&mut self, name: &str) -> bool {
+        self.tools.remove(name).is_some()
+    }
+
     pub fn tool_definitions(&self) -> Vec<kkagent_protocol::tools::ToolDefinition> {
         self.tools
             .values()

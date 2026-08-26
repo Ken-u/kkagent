@@ -26,7 +26,7 @@ use kkagent_core::{
 use kkagent_di::ServiceContainer;
 use kkagent_llm::{ChatContent, ChatMessage};
 use kkagent_mcp::{register_mcp_tools, McpManager};
-use kkagent_protocol::subagent::SubagentManager;
+use kkagent_protocol::subagent::{stamp_child_depth, SubagentManager};
 use kkagent_protocol::{AgentEvent, Frame, PermissionMode, SessionStatus};
 use kkagent_rpc::{transport::memory::create_memory_pair, RpcClient, RpcServer};
 use kkagent_telemetry::{
@@ -2052,9 +2052,11 @@ async fn run_dump_system_prompt(config_path: Option<&Path>) -> Result<()> {
     // static, so the output matches what a real turn would register.
     let mut tools = kkagent_tools::ToolRegistry::new();
     kkagent_tools::register_builtin_tools(&mut tools);
-    let subagent_mgr = Arc::new(kkagent_protocol::subagent::SubagentManager::new(4));
+    let subagent_mgr = Arc::new(kkagent_protocol::subagent::SubagentManager::new(
+        config.subagent.effective_max_concurrent(),
+    ));
     let launch: kkagent_tools::builtin::task::SubagentLaunchFn =
-        Arc::new(|_config: kkagent_protocol::subagent::SubagentConfig| {});
+        Arc::new(|_config: kkagent_protocol::subagent::SubagentConfig, _interrupt| {});
     kkagent_tools::register_subagent_tools(
         &mut tools,
         subagent_mgr,
@@ -2296,21 +2298,31 @@ async fn recover_subagents(state: Arc<ServerState>) {
             return;
         }
     };
-    for config in configs {
+    for config in &configs {
         let agent_id = config.agent_id.clone();
         if let Err(error) = state.subagents.resume(&agent_id).await {
             tracing::error!("Failed to claim recovered subagent {agent_id}: {error}");
+            // Claim failed (e.g. concurrency cap) — this agent won't run, so
+            // its leftover worktree (if any) is an orphan. Clean it up.
+            kkagent_tools::git_worktree::cleanup_worktree(std::path::Path::new(
+                &config.working_dir,
+            ))
+            .await;
             continue;
         }
         let manager = state.subagents.clone();
         let app_config = state.config();
+        let web = state.web.read().await.clone();
         let abort_manager = manager.clone();
         let abort_agent_id = agent_id.clone();
+        let config = config.clone();
         let join = tokio::spawn(async move {
             match kkagent_core::run_subagent_mirrored(
                 app_config,
+                web,
                 config,
                 PermissionMode::Auto,
+                None,
                 None,
             )
             .await
@@ -2321,6 +2333,24 @@ async fn recover_subagents(state: Arc<ServerState>) {
         });
         let abort = join.abort_handle();
         abort_manager.set_abort_handle(&abort_agent_id, abort).await;
+    }
+
+    // Orphan worktree sweep (issues/subagent_issues.md #2 residual):
+    // agents killed by SIGKILL / power loss leave worktrees behind with no
+    // running process to clean them up. Sweep any worktree whose id isn't
+    // among the agents we just recovered (those are now actively running and
+    // will clean up their own worktree on exit).
+    if kkagent_tools::git_worktree::worktree_enabled() {
+        let alive_ids: Vec<String> = state
+            .subagents
+            .list_running()
+            .await
+            .into_iter()
+            .map(|s| s.agent_id)
+            .collect();
+        if let Ok(repo) = std::env::current_dir() {
+            kkagent_tools::git_worktree::sweep_orphan_worktrees(&repo, &alive_ids).await;
+        }
     }
 }
 
@@ -3878,48 +3908,67 @@ async fn build_turn_tool_registry(
 
     let subagents = state.subagents.clone();
     let config = state.config();
-    let launch: kkagent_tools::builtin::task::SubagentLaunchFn = Arc::new(move |sub_config| {
-        let manager = subagents.clone();
-        let app_config = config.clone();
-        let agent_id = sub_config.agent_id.clone();
-        let abort_manager = manager.clone();
-        let abort_agent_id = agent_id.clone();
-        let mirror = match (
-            sub_config.parent_session_id.clone(),
-            sub_config.parent_tool_call_id.clone(),
-        ) {
-            (Some(parent_session_id), Some(parent_tool_call_id)) => Some(SubagentMirrorContext {
-                parent_session_id,
-                parent_tool_call_id,
-                parent_event_tx: event_tx.clone(),
-            }),
-            _ => None,
-        };
-        let join = tokio::spawn(async move {
-            tracing::info!("Subagent {} starting: {}", agent_id, sub_config.description);
-            match kkagent_core::run_subagent_mirrored(
-                app_config,
-                sub_config,
-                PermissionMode::Auto,
-                mirror,
-            )
-            .await
-            {
-                Ok(result) => {
-                    tracing::info!("Subagent {} complete ({} chars)", agent_id, result.len());
-                    manager.complete(&agent_id, result).await;
-                }
-                Err(error) => {
-                    tracing::error!("Subagent {} failed: {}", agent_id, error);
-                    manager.fail(&agent_id, error.to_string()).await;
-                }
+    let max_depth = config.subagent.effective_max_depth();
+    let launch_web = state.web.read().await.clone();
+    let launch: kkagent_tools::builtin::task::SubagentLaunchFn =
+        Arc::new(move |mut sub_config, interrupt| {
+            let manager = subagents.clone();
+            let app_config = config.clone();
+            let web = launch_web.clone();
+            let agent_id = sub_config.agent_id.clone();
+            // Depth budget, layer 2 (root launch stamp): every root-launched
+            // subagent starts at depth 1; reject loudly if that already exceeds
+            // the configured cap (e.g. max_depth = 0 pre-clamp).
+            if let Err(reason) = stamp_child_depth(&mut sub_config, 0, max_depth) {
+                tracing::warn!("Rejected root subagent {agent_id}: {reason}");
+                let manager = manager.clone();
+                tokio::spawn(async move {
+                    manager.fail(&agent_id, reason).await;
+                });
+                return;
             }
+            let abort_manager = manager.clone();
+            let abort_agent_id = agent_id.clone();
+            let mirror = match (
+                sub_config.parent_session_id.clone(),
+                sub_config.parent_tool_call_id.clone(),
+            ) {
+                (Some(parent_session_id), Some(parent_tool_call_id)) => {
+                    Some(SubagentMirrorContext {
+                        parent_session_id,
+                        parent_tool_call_id,
+                        parent_event_tx: event_tx.clone(),
+                    })
+                }
+                _ => None,
+            };
+            let join = tokio::spawn(async move {
+                tracing::info!("Subagent {} starting: {}", agent_id, sub_config.description);
+                match kkagent_core::run_subagent_mirrored(
+                    app_config,
+                    web,
+                    sub_config,
+                    PermissionMode::Auto,
+                    mirror,
+                    Some(interrupt),
+                )
+                .await
+                {
+                    Ok(result) => {
+                        tracing::info!("Subagent {} complete ({} chars)", agent_id, result.len());
+                        manager.complete(&agent_id, result).await;
+                    }
+                    Err(error) => {
+                        tracing::error!("Subagent {} failed: {}", agent_id, error);
+                        manager.fail(&agent_id, error.to_string()).await;
+                    }
+                }
+            });
+            let abort = join.abort_handle();
+            tokio::spawn(async move {
+                abort_manager.set_abort_handle(&abort_agent_id, abort).await;
+            });
         });
-        let abort = join.abort_handle();
-        tokio::spawn(async move {
-            abort_manager.set_abort_handle(&abort_agent_id, abort).await;
-        });
-    });
     kkagent_tools::register_subagent_tools(
         &mut tools,
         state.subagents.clone(),

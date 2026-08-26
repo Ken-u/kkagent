@@ -280,6 +280,14 @@ impl Session {
         )
     }
 
+    /// Inherit the parent's interrupt flag so an Esc at the root propagates
+    /// into every nested subagent session (issues/subagent_issues.md #5).
+    /// The child shares the same `Arc<AtomicBool>`: parent interrupts
+    /// interrupt all descendants immediately.
+    pub fn inherit_interrupted(&mut self, parent: Arc<AtomicBool>) {
+        self.interrupted = parent;
+    }
+
     pub fn resume(
         id: String,
         working_dir: PathBuf,

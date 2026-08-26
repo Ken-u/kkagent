@@ -402,6 +402,7 @@ impl AgentSwarmTool {
                     // Swarm children are managed by the batch; on tool-side
                     // timeout / interrupt they detach instead of dying.
                     run_in_background: true,
+                    depth: 0,
                 },
                 agent_id: spec.agent_id.clone(),
                 retries: 0,
@@ -482,7 +483,11 @@ impl AgentSwarmTool {
                 match launch_result {
                     Ok(()) => {
                         let config = slot.config.clone();
-                        (self.launch)(config);
+                        let interrupt = ctx
+                            .interrupted
+                            .clone()
+                            .unwrap_or_else(|| Arc::new(std::sync::atomic::AtomicBool::new(false)));
+                        (self.launch)(config, interrupt);
                         slot.launched = true;
                         slot.agent_id = Some(slot.config.agent_id.clone());
                         launched_count += 1;
@@ -771,7 +776,7 @@ mod tests {
     fn recording_launcher() -> (SubagentLaunchFn, Arc<StdMutex<Vec<SubagentConfig>>>) {
         let launched = Arc::new(StdMutex::new(Vec::new()));
         let captured = launched.clone();
-        let launch = Arc::new(move |config: SubagentConfig| {
+        let launch = Arc::new(move |config: SubagentConfig, _interrupt| {
             // Simulate an instant successful run: Pending -> Complete.
             let manager = captured.clone();
             let id = config.agent_id.clone();
@@ -805,7 +810,7 @@ mod tests {
         fn launcher_with_delay(&self, delay: Duration) -> SubagentLaunchFn {
             let manager = self.manager.clone();
             let launched = self.launched.clone();
-            Arc::new(move |config: SubagentConfig| {
+            Arc::new(move |config: SubagentConfig, _interrupt| {
                 launched.lock().unwrap().push(config.clone());
                 let manager = manager.clone();
                 let id = config.agent_id.clone();
@@ -856,7 +861,7 @@ mod tests {
         let launched = Arc::new(StdMutex::new(Vec::new()));
         let captured = launched.clone();
         let mgr = manager.clone();
-        let launch: SubagentLaunchFn = Arc::new(move |config: SubagentConfig| {
+        let launch: SubagentLaunchFn = Arc::new(move |config: SubagentConfig, _interrupt| {
             let idx = captured.lock().unwrap().len();
             captured.lock().unwrap().push(config.clone());
             // Items alternate: even-index children complete, odd ones hang.
@@ -950,6 +955,7 @@ mod tests {
             parent_session_id: None,
             parent_tool_call_id: None,
             run_in_background: false,
+            depth: 0,
         };
         auto.manager.spawn(config).await.unwrap();
         auto.manager
@@ -1027,7 +1033,7 @@ mod tests {
         let manager = Arc::new(SubagentManager::new(8));
         let launched = Arc::new(StdMutex::new(Vec::new()));
         let captured = launched.clone();
-        let launch: SubagentLaunchFn = Arc::new(move |config: SubagentConfig| {
+        let launch: SubagentLaunchFn = Arc::new(move |config: SubagentConfig, _interrupt| {
             // Never completes — stays Running.
             captured.lock().unwrap().push(config);
         });
@@ -1069,7 +1075,7 @@ mod tests {
         let manager = Arc::new(SubagentManager::new(8));
         let launched = Arc::new(StdMutex::new(Vec::new()));
         let captured = launched.clone();
-        let launch: SubagentLaunchFn = Arc::new(move |config: SubagentConfig| {
+        let launch: SubagentLaunchFn = Arc::new(move |config: SubagentConfig, _interrupt| {
             // Never completes — stays Running.
             captured.lock().unwrap().push(config);
         });
