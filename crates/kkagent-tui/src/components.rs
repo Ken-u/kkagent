@@ -455,53 +455,54 @@ fn render_subagent_view(
         return;
     };
 
-    let width = area.width.max(1) as usize;
-
-    // Build a header line with the subagent's name, description, and status.
-    let mut lines: Vec<Line> = Vec::new();
-    let header = format!(
-        "🤖 {} — {} [{}]",
-        entry.name, entry.description, entry.status
-    );
-    lines.push(
-        Line::from(header).style(
+    // Session-style view: one-line context header (child identity + status)
+    // above the same transcript renderer the main session uses. The
+    // transcript itself is selected in `build_transcript_lines_range`.
+    let header_area = Rect { height: 1, ..area };
+    let status_color = match entry.status.as_str() {
+        "running" => theme.primary,
+        "complete" => theme.success,
+        _ => theme.error,
+    };
+    let header = Line::from(vec![
+        Span::styled("↳ ", Style::default().fg(theme.accent)),
+        Span::styled(
+            entry.name.clone(),
             Style::default()
                 .fg(theme.accent)
                 .add_modifier(Modifier::BOLD),
         ),
+        Span::styled(
+            format!(" · {}", entry.description),
+            Style::default().fg(theme.text_muted),
+        ),
+        Span::styled(
+            format!(" · {}", entry.status),
+            Style::default().fg(status_color),
+        ),
+        Span::styled(
+            "  (Esc 返回主会话 · Tab 切换)",
+            Style::default().fg(theme.text_dim),
+        ),
+    ]);
+    f.render_widget(
+        Paragraph::new(header).style(Style::default().bg(theme.border)),
+        header_area,
     );
-    if let Some(r) = &entry.result_or_error {
-        lines.push(Line::from(""));
-        lines.push(Line::from(format!("Result: {}", r)));
+
+    let body = Rect {
+        y: area.y + 1,
+        height: area.height.saturating_sub(1),
+        ..area
+    };
+    if body.height == 0 {
+        return;
     }
-    lines.push(Line::from(""));
-    lines.push(Line::from("── activity log ──").style(Style::default().fg(theme.text_muted)));
-
-    // Render the event log entries as wrapped lines.
-    for ev in &entry.events {
-        let ev_lines: Vec<String> = wrap_text(ev, width);
-        for l in ev_lines {
-            lines.push(Line::from(l));
-        }
-    }
-
-    if entry.events.is_empty() {
-        lines.push(Line::from("(no activity yet)").style(Style::default().fg(theme.text_muted)));
-    }
-
-    let content_height = lines.len() as u16;
-    let visible_height = area.height.max(1);
-    state.content_lines = content_height;
-    state.viewport_height = visible_height;
-
-    let max_scroll_up = content_height.saturating_sub(visible_height);
-    let scroll_offset = state.scroll_up.min(max_scroll_up);
-
-    let para = Paragraph::new(lines).scroll((scroll_offset, 0));
-    f.render_widget(para, area);
+    render_messages(f, body, state, theme);
 }
 
 /// Simple text wrapper for subagent event log lines.
+#[allow(dead_code)]
 fn wrap_text(text: &str, width: usize) -> Vec<String> {
     let mut result = Vec::new();
     for line in text.lines() {
@@ -681,7 +682,11 @@ fn active_assistant_message_index(state: &AppState) -> Option<usize> {
         .list_picker
         .as_ref()
         .is_some_and(|picker| picker.kind == crate::app::ListPickerKind::Session);
-    if browsing_sessions || state.plan_focus_active() || state.status == SessionStatus::Idle {
+    if browsing_sessions
+        || state.plan_focus_active()
+        || state.active_subagent_view.is_some()
+        || state.status == SessionStatus::Idle
+    {
         return None;
     }
     let index = state.active_assistant_message?;
@@ -739,6 +744,9 @@ fn transcript_layout_fingerprint(state: &AppState, width: u16) -> u64 {
         .as_ref()
         .is_some_and(|picker| picker.kind == crate::app::ListPickerKind::Session);
     browsing_sessions.hash(&mut hasher);
+    // Which subagent transcript the main pane shows changes the rendered
+    // content — it must be part of the cache key.
+    state.active_subagent_view.hash(&mut hasher);
     if !browsing_sessions && state.plan_focus_active() {
         if let Some(document) = &state.plan_document {
             document.path.hash(&mut hasher);
@@ -752,6 +760,14 @@ fn transcript_layout_fingerprint(state: &AppState, width: u16) -> u64 {
             .session_picker_preview
             .as_ref()
             .map(|preview| preview.messages.as_slice())
+            .unwrap_or(&state.messages)
+    } else if let Some(subagent_id) = &state.active_subagent_view {
+        state
+            .subagents
+            .entries
+            .iter()
+            .find(|e| e.id == *subagent_id)
+            .map(|e| e.transcript.as_slice())
             .unwrap_or(&state.messages)
     } else {
         &state.messages
@@ -987,12 +1003,20 @@ fn build_transcript_lines_range(
     }
 
     // While /sessions is open, the main pane shows the highlighted session's
-    // normal transcript (not a separate preview widget).
-    let browse_msgs = if browsing_sessions {
+    // normal transcript (not a separate preview widget). A subagent view does
+    // the same with the child's mirrored transcript.
+    let browse_msgs: Option<&[crate::app::DisplayMessage]> = if browsing_sessions {
         state
             .session_picker_preview
             .as_ref()
             .map(|p| p.messages.as_slice())
+    } else if let Some(subagent_id) = state.active_subagent_view.clone() {
+        state
+            .subagents
+            .entries
+            .iter()
+            .find(|e| e.id == subagent_id)
+            .map(|e| e.transcript.as_slice())
     } else {
         None
     };

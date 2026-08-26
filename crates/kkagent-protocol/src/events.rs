@@ -124,6 +124,9 @@ pub enum AgentEvent {
         description: Option<String>,
         model: Option<String>,
         run_in_background: bool,
+        /// Delegation prompt — seeds the session-style subagent transcript.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prompt: Option<String>,
     },
     SubagentStarted {
         session_id: String,

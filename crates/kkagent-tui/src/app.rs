@@ -1875,16 +1875,7 @@ impl TuiApp {
 
             if let Some(action) = self.state.pending_strip_action.take() {
                 redraw = true;
-                match action {
-                    StripAction::Switch(id) => {
-                        let _ = self.activate_workspace_target(&id).await;
-                    }
-                    StripAction::Cycle(dir) => {
-                        if self.can_cycle_fork_sessions() {
-                            let _ = self.cycle_workspace_session(dir).await;
-                        }
-                    }
-                }
+                self.apply_strip_action(action).await;
             }
 
             if !saw_event {
@@ -1959,6 +1950,13 @@ impl TuiApp {
                     self.state
                         .subagents
                         .prune_finished(std::time::Instant::now());
+                    // A pruned entry can leave the view dangling — fall back
+                    // to the main session transcript.
+                    if let Some(viewing) = self.state.active_subagent_view.clone() {
+                        if !self.state.subagents.entries.iter().any(|e| e.id == viewing) {
+                            self.state.active_subagent_view = None;
+                        }
+                    }
                 }
             }
             self.flush_preview_debounce();
@@ -3552,16 +3550,17 @@ impl TuiApp {
                     if let Some(entry) = entry {
                         // Close the overlay panel.
                         self.state.subagents_panel = None;
-                        // Activate the subagent view: the message area will
-                        // render this subagent's event log instead of the main
-                        // session transcript.
+                        // Activate the subagent view: the message area renders
+                        // this subagent's full transcript (same renderer as a
+                        // normal session). The footer strip keeps a `sub:`-id
+                        // pseudo-tab; Tab / mouse click switch back and forth.
                         self.state.active_subagent_view = Some(entry.id.clone());
-                        // Add a tab for the subagent so the user can switch
-                        // between the main session and the subagent view.
-                        let title = format!("🤖 {}", entry.name);
+                        self.state.follow_bottom = true;
+                        self.state.scroll_up = 0;
+                        let title = format!("↳ {}", entry.name);
                         self.state
                             .tab_strip
-                            .ensure_active(&format!("subagent:{}", entry.id), title);
+                            .ensure_active(&format!("sub:{}", entry.id), title);
                     }
                     return Ok(());
                 }
@@ -4087,7 +4086,10 @@ impl TuiApp {
                 // main session view.
                 if self.state.active_subagent_view.is_some() {
                     self.state.active_subagent_view = None;
-                    self.state.tab_strip.active = 0;
+                    self.state.follow_bottom = true;
+                    if let Some(current_id) = self.state.session_id.clone() {
+                        self.state.tab_strip.ensure_active(&current_id, "main");
+                    }
                     return Ok(());
                 }
                 if self.state.status != SessionStatus::Idle {
@@ -4132,6 +4134,13 @@ impl TuiApp {
             KeyCode::BackTab if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.cycle_workspace_session(-1).await?;
             }
+            // Shift-Tab with subagents and an empty input: cycle the
+            // [main, subagent…] tab chain (view-only switch).
+            KeyCode::BackTab
+                if !self.state.subagents.entries.is_empty() && self.state.input.is_empty() =>
+            {
+                self.cycle_subagent_tabs(-1);
+            }
             // Shift-Tab: toggle plan mode
             KeyCode::BackTab => {
                 let enabled = !self.state.plan_mode;
@@ -4154,6 +4163,15 @@ impl TuiApp {
                 self.submit_input().await?;
             }
             // Empty input Tab / ← →: cycle related sessions (/new or /fork group)
+            KeyCode::Tab
+                if !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::SHIFT)
+                    && !key.modifiers.contains(KeyModifiers::ALT)
+                    && !self.state.subagents.entries.is_empty()
+                    && self.state.input.is_empty() =>
+            {
+                self.cycle_subagent_tabs(1);
+            }
             KeyCode::Tab
                 if !key.modifiers.contains(KeyModifiers::CONTROL)
                     && !key.modifiers.contains(KeyModifiers::SHIFT)
@@ -8918,7 +8936,23 @@ impl TuiApp {
         for e in self.state.workspace_sessions.entries.iter() {
             self.state.tab_strip.ensure_tab(&e.id, e.title.clone());
         }
-        if current_open {
+
+        // Subagent pseudo-tabs ride the same footer strip with a `sub:` id
+        // prefix; clicking one switches the transcript view (see the
+        // pending_strip_action handler).
+        for entry in self.state.subagents.entries.clone() {
+            let id = format!("sub:{}", entry.id);
+            let title = format!("↳ {}", entry.name);
+            self.state.tab_strip.ensure_tab(&id, title);
+        }
+
+        // Active tab follows the view: the subagent's pseudo-tab while a
+        // subagent view is open, otherwise the current real session.
+        if let Some(sub_id) = self.state.active_subagent_view.clone() {
+            self.state
+                .tab_strip
+                .ensure_active(&format!("sub:{sub_id}"), "↳ subagent");
+        } else if current_open {
             let title = self
                 .state
                 .workspace_sessions
@@ -9098,6 +9132,61 @@ impl TuiApp {
             .and_then(|entry| entry.working_dir.clone());
         self.resume_session_in_workspace(id, working_dir.as_deref())
             .await
+    }
+
+    /// Apply a footer-strip action: `sub:` pseudo-tabs switch the subagent
+    /// transcript view; the current session's tab returns to the main view;
+    /// anything else resumes that workspace session.
+    async fn apply_strip_action(&mut self, action: StripAction) {
+        match action {
+            StripAction::Switch(id) => {
+                if let Some(sub_id) = id.strip_prefix("sub:") {
+                    // Subagent pseudo-tab: switch the transcript view.
+                    self.state.active_subagent_view = Some(sub_id.to_string());
+                    self.state.follow_bottom = true;
+                    self.state.scroll_up = 0;
+                } else if id == self.state.session_id.as_deref().unwrap_or("") {
+                    // Clicking the current session's tab returns to it.
+                    self.state.active_subagent_view = None;
+                } else {
+                    let _ = self.activate_workspace_target(&id).await;
+                }
+            }
+            StripAction::Cycle(dir) => {
+                if self.can_cycle_fork_sessions() {
+                    let _ = self.cycle_workspace_session(dir).await;
+                }
+            }
+        }
+    }
+
+    /// Cycle the tab chain [main session, subagent 1, subagent 2, …]. This is
+    /// the Tab/Shift-Tab path when subagents exist: it only changes which
+    /// transcript the main pane shows — no session resume happens.
+    fn cycle_subagent_tabs(&mut self, direction: i32) {
+        let chain: Vec<Option<String>> = std::iter::once(None)
+            .chain(
+                self.state
+                    .subagents
+                    .entries
+                    .iter()
+                    .map(|e| Some(e.id.clone())),
+            )
+            .collect::<Vec<Option<String>>>();
+        if chain.len() < 2 {
+            return;
+        }
+        let current = self
+            .state
+            .active_subagent_view
+            .clone()
+            .map(Some)
+            .unwrap_or(None);
+        let index = chain.iter().position(|c| *c == current).unwrap_or(0);
+        let next = (index as i64 + direction as i64).rem_euclid(chain.len() as i64) as usize;
+        self.state.active_subagent_view = chain[next].clone();
+        self.state.follow_bottom = true;
+        self.state.scroll_up = 0;
     }
 
     async fn cycle_attention_session(&mut self) -> anyhow::Result<()> {
@@ -9722,6 +9811,11 @@ impl TuiApp {
         let raw = self.state.input.take();
         if raw.is_empty() {
             return Ok(());
+        }
+        // Submitting a prompt always targets the main session — leave the
+        // subagent monitor view first.
+        if self.state.active_subagent_view.is_some() {
+            self.state.active_subagent_view = None;
         }
         // Clear the persisted draft — input has been submitted and must not
         // resurface when switching back to this session later (e.g. `/new`).
@@ -11987,15 +12081,21 @@ impl TuiApp {
                         subagent_id,
                         subagent_name,
                         description,
+                        prompt,
                         ..
                     } => {
-                        let desc = description.unwrap_or_default();
+                        let desc = description.clone().unwrap_or_default();
                         self.state.subagents.upsert_spawned(
-                            subagent_id,
-                            subagent_name,
+                            subagent_id.clone(),
+                            subagent_name.clone(),
                             desc,
                             "pending",
                         );
+                        if let Some(prompt) = prompt {
+                            self.state
+                                .subagents
+                                .seed_prompt(subagent_id.as_str(), prompt.as_str());
+                        }
                     }
                     AgentEvent::SubagentStarted { subagent_id, .. } => {
                         self.state
@@ -12033,31 +12133,40 @@ impl TuiApp {
                     }
                     AgentEvent::SubagentChildEvent {
                         subagent_id, event, ..
-                    } => match *event {
-                        AgentEvent::ToolCall {
-                            tool_name, input, ..
-                        } => {
-                            let line = crate::subagents::format_tool_activity(&tool_name, &input);
-                            self.state.subagents.note_child_event(&subagent_id, line);
+                    } => {
+                        // Full transcript replay for the session-style view.
+                        self.state.subagents.apply_child_event(&subagent_id, &event);
+                        // Compact one-line activity feed for the strip/detail.
+                        match event.as_ref() {
+                            AgentEvent::ToolCall {
+                                tool_name, input, ..
+                            } => {
+                                let line = crate::subagents::format_tool_activity(tool_name, input);
+                                self.state.subagents.note_child_event(&subagent_id, line);
+                            }
+                            AgentEvent::ToolResult {
+                                tool_name,
+                                is_error,
+                                ..
+                            } => {
+                                let mark = if *is_error { "failed" } else { "ok" };
+                                self.state.subagents.note_child_event(
+                                    &subagent_id,
+                                    format!("{tool_name} [{mark}]"),
+                                );
+                            }
+                            AgentEvent::Error { message, .. } => {
+                                self.state.subagents.note_child_event(
+                                    &subagent_id,
+                                    format!(
+                                        "error: {}",
+                                        message.chars().take(80).collect::<String>()
+                                    ),
+                                );
+                            }
+                            _ => {}
                         }
-                        AgentEvent::ToolResult {
-                            tool_name,
-                            is_error,
-                            ..
-                        } => {
-                            let mark = if is_error { "failed" } else { "ok" };
-                            self.state
-                                .subagents
-                                .note_child_event(&subagent_id, format!("{tool_name} [{mark}]"));
-                        }
-                        AgentEvent::Error { message, .. } => {
-                            self.state.subagents.note_child_event(
-                                &subagent_id,
-                                format!("error: {}", message.chars().take(80).collect::<String>()),
-                            );
-                        }
-                        _ => {}
-                    },
+                    }
                     AgentEvent::McpAuthRequired {
                         server_name,
                         authorization_url,
@@ -12306,7 +12415,7 @@ fn progress_bar(used: u64, max: u64, width: usize) -> String {
     out
 }
 
-fn summarize_tool_input(input: &serde_json::Value) -> String {
+pub(crate) fn summarize_tool_input(input: &serde_json::Value) -> String {
     // Prefer human-readable fields; keep enough text for full-width chips.
     for key in [
         "command",
@@ -13177,6 +13286,64 @@ mod app_state_tests {
         let rpc = kkagent_rpc::RpcClient::new(client_transport, event_tx);
         let client = kkagent_client::KkagentClient::new(rpc, event_rx);
         TuiApp::new(AppConfig::default(), client)
+    }
+
+    #[tokio::test]
+    async fn tab_cycles_through_main_and_subagents() {
+        let mut app = test_tui_app();
+        app.state.subagents.upsert_spawned(
+            "sub-1".into(),
+            "explore".into(),
+            "scan".into(),
+            "running",
+        );
+        app.state
+            .subagents
+            .upsert_spawned("sub-2".into(), "coder".into(), "fix".into(), "running");
+
+        // Start on the main session view.
+        assert_eq!(app.state.active_subagent_view, None);
+
+        // Tab: main -> sub-1 -> sub-2 -> main.
+        app.cycle_subagent_tabs(1);
+        assert_eq!(app.state.active_subagent_view.as_deref(), Some("sub-1"));
+        app.cycle_subagent_tabs(1);
+        assert_eq!(app.state.active_subagent_view.as_deref(), Some("sub-2"));
+        app.cycle_subagent_tabs(1);
+        assert_eq!(app.state.active_subagent_view, None);
+
+        // Shift-Tab wraps backwards: main -> sub-2 -> sub-1.
+        app.cycle_subagent_tabs(-1);
+        assert_eq!(app.state.active_subagent_view.as_deref(), Some("sub-2"));
+        app.cycle_subagent_tabs(-1);
+        assert_eq!(app.state.active_subagent_view.as_deref(), Some("sub-1"));
+
+        // Leaving the view via the main-session tab click resets cleanly.
+        app.state.active_subagent_view = None;
+        assert_eq!(app.state.active_subagent_view, None);
+    }
+
+    #[tokio::test]
+    async fn strip_switch_routes_subagent_pseudo_tabs() {
+        let mut app = test_tui_app();
+        app.state.subagents.upsert_spawned(
+            "sub-9".into(),
+            "explore".into(),
+            "scan".into(),
+            "running",
+        );
+
+        // `sub:` pseudo-tab activates the transcript view without any RPC.
+        app.apply_strip_action(StripAction::Switch("sub:sub-9".into()))
+            .await;
+        assert_eq!(app.state.active_subagent_view.as_deref(), Some("sub-9"));
+        assert!(app.state.follow_bottom);
+
+        // Clicking the current session's tab returns to the main view.
+        app.state.session_id = Some("sess-1".into());
+        app.apply_strip_action(StripAction::Switch("sess-1".into()))
+            .await;
+        assert_eq!(app.state.active_subagent_view, None);
     }
 
     #[tokio::test]

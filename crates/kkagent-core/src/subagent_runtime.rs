@@ -155,6 +155,7 @@ fn run_subagent_mirrored_boxed(
                     description: Some(sub_cfg.description.clone()),
                     model: Some(model.clone()),
                     run_in_background: sub_cfg.run_in_background,
+                    prompt: Some(sub_cfg.prompt.clone()),
                 })
                 .await;
             let _ = m

@@ -24,6 +24,12 @@ pub struct SubagentUiEntry {
     pub finished_at: Option<Instant>,
     pub events: VecDeque<String>,
     pub result_or_error: Option<String>,
+    /// Full conversation transcript rendered like a normal session view.
+    pub transcript: Vec<crate::app::DisplayMessage>,
+    /// Thinking text accumulated since the last assistant message flush.
+    pending_thinking: String,
+    /// Index of the streaming assistant message inside `transcript`.
+    active_assistant: Option<usize>,
 }
 
 impl SubagentUiEntry {
@@ -81,6 +87,120 @@ impl SubagentUiEntry {
             self.events.pop_front();
         }
     }
+
+    /// Fold a mirrored child-agent event into the full transcript so the
+    /// subagent view renders exactly like a normal session.
+    pub fn apply_child_event(&mut self, event: &kkagent_protocol::AgentEvent) {
+        use crate::app::{DisplayMessage, DisplayToolCall, MessageRole};
+        use kkagent_protocol::AgentEvent;
+
+        match event {
+            AgentEvent::ThinkingDelta { text, .. } => {
+                self.pending_thinking.push_str(text);
+            }
+            AgentEvent::MessageDelta { text, .. } => {
+                let pending_thinking = if self.pending_thinking.is_empty() {
+                    None
+                } else {
+                    Some(std::mem::take(&mut self.pending_thinking))
+                };
+                if let Some(message) = self
+                    .active_assistant
+                    .and_then(|index| self.transcript.get_mut(index))
+                    .filter(|message| message.role == MessageRole::Assistant)
+                {
+                    if message.thinking.is_none() {
+                        message.thinking = pending_thinking;
+                    }
+                    message.append_assistant_text(text);
+                    return;
+                }
+                let mut msg = DisplayMessage {
+                    role: MessageRole::Assistant,
+                    content: String::new(),
+                    thinking: pending_thinking,
+                    parts: Vec::new(),
+                    tool_calls: Vec::new(),
+                    delivery: crate::prompt_queue::DeliveryState::Sent,
+                    idempotency_key: None,
+                };
+                msg.append_assistant_text(text);
+                self.transcript.push(msg);
+                self.active_assistant = Some(self.transcript.len() - 1);
+            }
+            AgentEvent::ToolCall {
+                tool_call_id,
+                tool_name,
+                input,
+                ..
+            } => {
+                let pending_thinking = if self.pending_thinking.is_empty() {
+                    None
+                } else {
+                    Some(std::mem::take(&mut self.pending_thinking))
+                };
+                let tc = DisplayToolCall {
+                    id: tool_call_id.clone(),
+                    started_at: Some(Instant::now()),
+                    stopping: false,
+                    queued_behind: None,
+                    name: tool_name.clone(),
+                    input_summary: crate::app::summarize_tool_input(input),
+                    output: None,
+                    is_error: false,
+                    collapsed: true,
+                    user_overridden: false,
+                };
+                if let Some(message) = self
+                    .active_assistant
+                    .and_then(|index| self.transcript.get_mut(index))
+                    .filter(|message| message.role == MessageRole::Assistant)
+                {
+                    if message.thinking.is_none() {
+                        message.thinking = pending_thinking;
+                    }
+                    message.push_tool(tc);
+                    return;
+                }
+                let mut msg = DisplayMessage {
+                    role: MessageRole::Assistant,
+                    content: String::new(),
+                    thinking: pending_thinking,
+                    parts: Vec::new(),
+                    tool_calls: Vec::new(),
+                    delivery: crate::prompt_queue::DeliveryState::Sent,
+                    idempotency_key: None,
+                };
+                msg.push_tool(tc);
+                self.transcript.push(msg);
+                self.active_assistant = Some(self.transcript.len() - 1);
+            }
+            AgentEvent::ToolResult {
+                tool_call_id,
+                tool_name,
+                output,
+                is_error,
+                ..
+            } => {
+                if let Some(tc) =
+                    self.transcript.iter_mut().rev().find_map(|message| {
+                        message.find_tool_for_result_mut(tool_call_id, tool_name)
+                    })
+                {
+                    tc.output = Some(output.clone());
+                    tc.is_error = *is_error;
+                    if *is_error {
+                        tc.collapsed = false;
+                    }
+                }
+            }
+            AgentEvent::TurnEnd { .. } => {
+                // Turn boundary: the next assistant output starts a new bubble.
+                self.active_assistant = None;
+            }
+            _ => {}
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -129,6 +249,9 @@ impl SubagentStore {
             finished_at: None,
             events: VecDeque::new(),
             result_or_error: None,
+            transcript: Vec::new(),
+            pending_thinking: String::new(),
+            active_assistant: None,
         });
     }
 
@@ -161,6 +284,36 @@ impl SubagentStore {
                 entry.status = "running".into();
             }
             entry.push_event(line);
+        }
+    }
+
+    /// Fold a mirrored child event into the agent's full transcript.
+    pub fn apply_child_event(&mut self, id: &str, event: &kkagent_protocol::AgentEvent) {
+        if let Some(entry) = self.entries.iter_mut().find(|e| e.id == id) {
+            if entry.status == "pending" {
+                entry.status = "running".into();
+            }
+            entry.apply_child_event(event);
+        }
+    }
+
+    /// Seed the session-style transcript with the delegation prompt so the
+    /// subagent view opens on the "user" message that started the run.
+    pub fn seed_prompt(&mut self, id: &str, prompt: &str) {
+        use crate::app::{DisplayMessage, MessageRole};
+        let Some(entry) = self.entries.iter_mut().find(|e| e.id == id) else {
+            return;
+        };
+        if entry.transcript.is_empty() && !prompt.trim().is_empty() {
+            entry.transcript.push(DisplayMessage {
+                role: MessageRole::User,
+                content: prompt.to_string(),
+                thinking: None,
+                parts: Vec::new(),
+                tool_calls: Vec::new(),
+                delivery: crate::prompt_queue::DeliveryState::Sent,
+                idempotency_key: None,
+            });
         }
     }
 
@@ -277,6 +430,121 @@ mod tests {
         assert!(line.ends_with("s"));
     }
 
+    fn child_event(event: kkagent_protocol::AgentEvent) -> Box<kkagent_protocol::AgentEvent> {
+        Box::new(event)
+    }
+
+    #[test]
+    fn transcript_folds_child_events_like_a_session() {
+        use kkagent_protocol::AgentEvent;
+        let mut store = SubagentStore::default();
+        store.upsert_spawned("ag-1".into(), "explore".into(), "scan".into(), "pending");
+        store.seed_prompt("ag-1", "find all callers of foo()");
+
+        let sid = "parent".to_string();
+        store.apply_child_event(
+            "ag-1",
+            &AgentEvent::ThinkingDelta {
+                session_id: sid.clone(),
+                text: "pondering".into(),
+            },
+        );
+        store.apply_child_event(
+            "ag-1",
+            &AgentEvent::MessageDelta {
+                session_id: sid.clone(),
+                text: "Scanning files…".into(),
+            },
+        );
+        store.apply_child_event(
+            "ag-1",
+            &AgentEvent::ToolCall {
+                session_id: sid.clone(),
+                tool_call_id: "tc-1".into(),
+                tool_name: "Grep".into(),
+                input: serde_json::json!({"pattern": "foo\\("}),
+            },
+        );
+        store.apply_child_event(
+            "ag-1",
+            &AgentEvent::ToolResult {
+                session_id: sid.clone(),
+                tool_call_id: "tc-1".into(),
+                tool_name: "Grep".into(),
+                output: "3 matches".into(),
+                is_error: false,
+            },
+        );
+        store.apply_child_event(
+            "ag-1",
+            &AgentEvent::MessageDelta {
+                session_id: sid.clone(),
+                text: " found 3 call sites".into(),
+            },
+        );
+
+        let entry = &store.entries[0];
+        assert_eq!(
+            entry.transcript.len(),
+            2,
+            "user prompt + one assistant bubble"
+        );
+        let user = &entry.transcript[0];
+        assert!(user.content.contains("callers of foo()"));
+        let assistant = &entry.transcript[1];
+        assert!(assistant.content.contains("Scanning files…"));
+        assert!(assistant.content.contains("found 3 call sites"));
+        assert_eq!(assistant.thinking.as_deref(), Some("pondering"));
+        assert_eq!(assistant.parts.len(), 3, "text + tool + trailing text");
+        assert!(
+            matches!(&assistant.parts[0], crate::app::DisplayPart::Text(t) if t.contains("Scanning files…"))
+        );
+        assert!(matches!(
+            &assistant.parts[1],
+            crate::app::DisplayPart::Tool(_)
+        ));
+        assert!(
+            matches!(&assistant.parts[2], crate::app::DisplayPart::Text(t) if t.contains("found 3 call sites"))
+        );
+        let _ = child_event(AgentEvent::TurnEnd {
+            session_id: sid.clone(),
+        });
+    }
+
+    #[test]
+    fn tool_result_marks_error_and_expands() {
+        use kkagent_protocol::AgentEvent;
+        let mut store = SubagentStore::default();
+        store.upsert_spawned("ag-2".into(), "coder".into(), "fix".into(), "running");
+        store.apply_child_event(
+            "ag-2",
+            &AgentEvent::ToolCall {
+                session_id: "p".into(),
+                tool_call_id: "tc-9".into(),
+                tool_name: "Bash".into(),
+                input: serde_json::json!({"command": "make"}),
+            },
+        );
+        store.apply_child_event(
+            "ag-2",
+            &AgentEvent::ToolResult {
+                session_id: "p".into(),
+                tool_call_id: "tc-9".into(),
+                tool_name: "Bash".into(),
+                output: "error E0432".into(),
+                is_error: true,
+            },
+        );
+        let entry = &store.entries[0];
+        let assistant = &entry.transcript[0];
+        let crate::app::DisplayPart::Tool(tool) = &assistant.parts[0] else {
+            panic!("expected tool part");
+        };
+        assert!(tool.is_error);
+        assert_eq!(tool.output.as_deref(), Some("error E0432"));
+        assert!(!tool.collapsed, "failed tools auto-expand");
+    }
+
     #[test]
     fn finished_agents_leave_strip_after_grace() {
         let mut entry = SubagentUiEntry {
@@ -289,6 +557,9 @@ mod tests {
             finished_at: Some(Instant::now() - std::time::Duration::from_secs(20)),
             events: VecDeque::new(),
             result_or_error: None,
+            transcript: Vec::new(),
+            pending_thinking: String::new(),
+            active_assistant: None,
         };
         assert!(!entry.show_on_strip(Instant::now()));
         entry.finished_at = Some(Instant::now());
