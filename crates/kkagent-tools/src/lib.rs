@@ -294,13 +294,21 @@ pub fn register_subagent_tools(
     manager: std::sync::Arc<kkagent_protocol::subagent::SubagentManager>,
     launch: builtin::task::SubagentLaunchFn,
     allowed_subagents: Option<Vec<String>>,
+    tools_config: kkagent_config::ToolsConfig,
 ) {
     use std::sync::Arc;
 
-    registry.register(Arc::new(builtin::AgentTool::with_allowed_subagents(
+    registry.register(Arc::new(builtin::AgentTool::with_config(
+        manager.clone(),
+        launch.clone(),
+        allowed_subagents.clone(),
+        tools_config.clone(),
+    )));
+    registry.register(Arc::new(builtin::agent_swarm::AgentSwarmTool::new(
         manager.clone(),
         launch,
         allowed_subagents,
+        tools_config,
     )));
     registry.register(Arc::new(builtin::TaskOutputTool::new(manager)));
 }
@@ -327,6 +335,7 @@ impl ProfileToolSet {
         "Skill",
         "Web",
         "Agent",
+        "AgentSwarm",
         "AskUserQuestion",
         "EnterPlanMode",
         "ExitPlanMode",
@@ -335,6 +344,7 @@ impl ProfileToolSet {
 
     pub const CODER: &'static [&'static str] = &[
         "Agent",
+        "AgentSwarm",
         "Bash",
         "Cron",
         "Edit",
@@ -382,6 +392,7 @@ mod profile_tool_tests {
             Arc::new(SubagentManager::new(1)),
             Arc::new(|_| {}),
             kkagent_protocol::subagent::allowed_subagents_for(profile),
+            kkagent_config::ToolsConfig::default(),
         );
         retain_profile_tools(&mut registry, profile);
         registry
@@ -405,6 +416,7 @@ mod profile_tool_tests {
         assert!(!names.contains(&"Write"));
         assert!(!names.contains(&"Edit"));
         assert!(!names.contains(&"Agent"));
+        assert!(!names.contains(&"AgentSwarm"));
     }
 
     #[test]
@@ -415,6 +427,7 @@ mod profile_tool_tests {
         assert!(names.contains(&"Read"));
         assert!(names.contains(&"Edit"));
         assert!(names.contains(&"Agent"));
+        assert!(names.contains(&"AgentSwarm"));
         assert!(!names.contains(&"Write"));
     }
 }
@@ -430,7 +443,13 @@ mod disclosure_tests {
         register_core_tools(&mut registry);
         let mgr = Arc::new(kkagent_protocol::subagent::SubagentManager::new(4));
         let launch: builtin::task::SubagentLaunchFn = Arc::new(|_cfg| {});
-        register_subagent_tools(&mut registry, mgr, launch, None);
+        register_subagent_tools(
+            &mut registry,
+            mgr,
+            launch,
+            None,
+            kkagent_config::ToolsConfig::default(),
+        );
         let goal = Arc::new(kkagent_protocol::goal::GoalManager::new());
         registry.register(Arc::new(builtin::GoalTool::new(goal)));
         registry.register(Arc::new(builtin::SkillTool::new(Arc::new(

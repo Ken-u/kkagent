@@ -308,6 +308,7 @@ pub struct AgentTool {
     subagent_mgr: Arc<SubagentManager>,
     launch: SubagentLaunchFn,
     allowed_subagents: Option<Vec<String>>,
+    tools_config: kkagent_config::ToolsConfig,
     description: String,
 }
 
@@ -321,6 +322,20 @@ impl AgentTool {
         launch: SubagentLaunchFn,
         allowed_subagents: Option<Vec<String>>,
     ) -> Self {
+        Self::with_config(
+            subagent_mgr,
+            launch,
+            allowed_subagents,
+            kkagent_config::ToolsConfig::default(),
+        )
+    }
+
+    pub fn with_config(
+        subagent_mgr: Arc<SubagentManager>,
+        launch: SubagentLaunchFn,
+        allowed_subagents: Option<Vec<String>>,
+        tools_config: kkagent_config::ToolsConfig,
+    ) -> Self {
         let description = delegation_description(
             "Delegate a task to a subagent running in its own context. Single `prompt` = one agent \
 (sync, or `run_in_background=true` for async). `agents[]` = parallel fan-out with per-agent \
@@ -332,6 +347,7 @@ re-prompt finished agents. After launching, collect results with TaskOutput.",
             subagent_mgr,
             launch,
             allowed_subagents,
+            tools_config,
             description,
         }
     }
@@ -570,14 +586,31 @@ re-prompt finished agents. After launching, collect results with TaskOutput.",
         // Watch-based wait: react to state changes instantly instead of polling
         // at 200 ms intervals.
         let mut watch_rx = self.subagent_mgr.subscribe();
+        let deadline = self
+            .tools_config
+            .effective_subagent_timeout_secs()
+            .map(|secs| std::time::Instant::now() + Duration::from_secs(secs));
         loop {
+            // Interrupt / timeout detach: the child keeps running in the
+            // background (kimi-code semantics) — collect it later with
+            // TaskOutput, or resume it once finished.
             if ctx
                 .interrupted
                 .as_ref()
                 .is_some_and(|f| f.load(std::sync::atomic::Ordering::SeqCst))
             {
-                let _ = self.subagent_mgr.stop(&id).await;
-                return Ok(ToolOutput::error("Agent interrupted"));
+                return Ok(ToolOutput::success(
+                    "Agent interrupted by user. Subagent detached and still running \
+                     in the background — use TaskOutput to fetch its result later.",
+                ));
+            }
+            if let Some(dl) = deadline {
+                if std::time::Instant::now() >= dl {
+                    return Ok(ToolOutput::success(
+                        "Agent wait timed out. Subagent detached and still running \
+                         in the background — use TaskOutput to fetch its result later.",
+                    ));
+                }
             }
             match self.subagent_mgr.get_state(&id).await {
                 Some(state)
@@ -604,10 +637,22 @@ re-prompt finished agents. After launching, collect results with TaskOutput.",
                 }
                 None => return Ok(ToolOutput::error(format!("Agent {id} disappeared"))),
                 _ => {
-                    // Block until the manager bumps its revision (state change).
-                    if watch_rx.changed().await.is_err() {
-                        // Sender dropped — fall back to a short sleep.
-                        tokio::time::sleep(Duration::from_millis(200)).await;
+                    // Block until the manager bumps its revision (state change),
+                    // bounded by the remaining time to the deadline so the
+                    // timeout check above actually fires.
+                    let remaining = deadline
+                        .map(|dl| dl.saturating_duration_since(std::time::Instant::now()))
+                        .unwrap_or(Duration::from_secs(30));
+                    tokio::select! {
+                        changed = watch_rx.changed() => {
+                            if changed.is_err() {
+                                // Sender dropped — fall back to a short sleep.
+                                tokio::time::sleep(Duration::from_millis(200)).await;
+                            }
+                        }
+                        _ = tokio::time::sleep(remaining) => {
+                            // Re-loop so the deadline / interrupt checks run.
+                        }
                     }
                 }
             }
@@ -712,7 +757,7 @@ fn check_requested_profile(
     check_profile_allowed(profile, allowed_subagents)
 }
 
-fn check_profile_allowed(
+pub(crate) fn check_profile_allowed(
     requested_profile: &str,
     allowed_subagents: &Option<Vec<String>>,
 ) -> Result<(), String> {

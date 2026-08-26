@@ -1949,7 +1949,7 @@ Do not mention this reminder to the user.\n</system-reminder>"
                     }
                     pending_schema_loads.extend(applied.loaded);
                 }
-                if name == "Agent" && !output.is_error {
+                if (name == "Agent" || name == "AgentSwarm") && !output.is_error {
                     if let Some(reminder) =
                         session.swarm.enter(crate::swarm::SwarmModeTrigger::Tool)
                     {

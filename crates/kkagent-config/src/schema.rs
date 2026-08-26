@@ -675,6 +675,12 @@ pub struct ToolsConfig {
     /// Extra heavy directory names appended to the effective list.
     #[serde(default)]
     pub extra_heavy_dirs: Vec<String>,
+    /// Wall-clock timeout (seconds) for the synchronous wait of `Agent` /
+    /// `AgentSwarm` tool calls. `None` (default) waits indefinitely. When the
+    /// timeout fires the subagents are NOT killed — they detach and keep
+    /// running in the background, retrievable via `TaskOutput`.
+    #[serde(default)]
+    pub subagent_timeout_secs: Option<u64>,
 }
 
 impl Default for ToolsConfig {
@@ -686,6 +692,7 @@ impl Default for ToolsConfig {
             dynamically_loaded_tools: true,
             heavy_dirs: None,
             extra_heavy_dirs: Vec::new(),
+            subagent_timeout_secs: None,
         }
     }
 }
@@ -712,6 +719,21 @@ impl ToolsConfig {
             }
         }
         base
+    }
+
+    /// Effective wall-clock timeout for synchronous `Agent` / `AgentSwarm`
+    /// waits. `KKAGENT_SUBAGENT_TIMEOUT_SECS` env overrides the config value
+    /// (`0` disables the timeout). Returns `None` when unbounded.
+    pub fn effective_subagent_timeout_secs(&self) -> Option<u64> {
+        if let Ok(raw) = std::env::var("KKAGENT_SUBAGENT_TIMEOUT_SECS") {
+            let raw = raw.trim();
+            if !raw.is_empty() {
+                if let Ok(v) = raw.parse::<u64>() {
+                    return if v == 0 { None } else { Some(v) };
+                }
+            }
+        }
+        self.subagent_timeout_secs
     }
 
     /// Merge project-level `.kkagent/config.toml` `[tools]` overrides into

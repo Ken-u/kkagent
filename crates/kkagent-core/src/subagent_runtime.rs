@@ -135,7 +135,13 @@ fn run_subagent_mirrored_boxed(
             .subagents
             .clone()
             .or_else(|| allowed_subagents_for(&profile));
-        register_subagent_tools(&mut tools, nested_manager, nested_launch, allowed_subagents);
+        register_subagent_tools(
+            &mut tools,
+            nested_manager,
+            nested_launch,
+            allowed_subagents,
+            app_config.tools.clone(),
+        );
         retain_profile_tools(&mut tools, &profile);
 
         if let Some(m) = &mirror {

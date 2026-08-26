@@ -15,7 +15,13 @@ fn main() {
 
     let mgr = Arc::new(kkagent_protocol::subagent::SubagentManager::new(4));
     let launch: builtin::task::SubagentLaunchFn = Arc::new(|_cfg| {});
-    register_subagent_tools(&mut r, mgr, launch, None);
+    register_subagent_tools(
+        &mut r,
+        mgr,
+        launch,
+        None,
+        kkagent_config::ToolsConfig::default(),
+    );
 
     let goal = Arc::new(kkagent_protocol::goal::GoalManager::new());
     r.register(Arc::new(builtin::GoalTool::new(goal)));

@@ -1,3 +1,4 @@
+pub mod agent_swarm;
 pub mod ask_user;
 pub mod bash;
 pub mod cron;

@@ -222,8 +222,8 @@ impl SubagentManager {
         let agent = agents
             .get_mut(agent_id)
             .ok_or_else(|| anyhow::anyhow!("Unknown task_id: {agent_id}"))?;
-        if agent.status != SubagentStatus::Pending {
-            anyhow::bail!("Task {agent_id} is not pending");
+        if agent.status == SubagentStatus::Running {
+            anyhow::bail!("Task {agent_id} is already running");
         }
         agent.status = SubagentStatus::Running;
         agent.error = None;
@@ -329,8 +329,18 @@ impl SubagentManager {
 
     /// Bump the revision counter to notify subscribers.
     fn notify(&self) {
+        // Compute the next value in its own statement: the temporary `Ref`
+        // returned by `borrow()` holds the watch's internal read lock until
+        // the end of the full statement, and `send` takes the write lock —
+        // evaluating both in one expression self-deadlocks.
+        let next = self.revision.borrow().wrapping_add(1);
         // `send` errors only when all receivers are dropped — safe to ignore.
-        let _ = self.revision.send(self.revision.borrow().wrapping_add(1));
+        let _ = self.revision.send(next);
+    }
+
+    /// Configured ceiling on concurrently running subagents.
+    pub fn max_concurrent(&self) -> usize {
+        self.max_concurrent
     }
 
     fn persist_spawn(&self, config: &SubagentConfig) -> anyhow::Result<()> {

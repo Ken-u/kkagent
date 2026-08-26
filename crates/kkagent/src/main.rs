@@ -2055,7 +2055,13 @@ async fn run_dump_system_prompt(config_path: Option<&Path>) -> Result<()> {
     let subagent_mgr = Arc::new(kkagent_protocol::subagent::SubagentManager::new(4));
     let launch: kkagent_tools::builtin::task::SubagentLaunchFn =
         Arc::new(|_config: kkagent_protocol::subagent::SubagentConfig| {});
-    kkagent_tools::register_subagent_tools(&mut tools, subagent_mgr, launch, None);
+    kkagent_tools::register_subagent_tools(
+        &mut tools,
+        subagent_mgr,
+        launch,
+        None,
+        config.tools.clone(),
+    );
     tools.register(Arc::new(kkagent_tools::builtin::GoalTool::new(Arc::new(
         kkagent_protocol::goal::GoalManager::new(),
     ))));
@@ -3914,7 +3920,13 @@ async fn build_turn_tool_registry(
             abort_manager.set_abort_handle(&abort_agent_id, abort).await;
         });
     });
-    kkagent_tools::register_subagent_tools(&mut tools, state.subagents.clone(), launch, None);
+    kkagent_tools::register_subagent_tools(
+        &mut tools,
+        state.subagents.clone(),
+        launch,
+        None,
+        state.config().tools.clone(),
+    );
     tools.register(Arc::new(
         kkagent_tools::builtin::TaskOutputTool::with_bash_shells(
             state.subagents.clone(),
