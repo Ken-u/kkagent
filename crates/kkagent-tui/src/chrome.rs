@@ -49,6 +49,26 @@ impl SessionIndicator {
     }
 }
 
+/// Build one strip label for a session (or subagent pseudo-) entry.
+fn strip_label(e: &WorkspaceSessionEntry, is_active: bool, tick: usize) -> SessionRenderLabel {
+    let indicator = session_indicator(e, tick);
+    let indicator_text = indicator.text();
+    let title = truncate_cols(&e.title, SESSION_TITLE_MAX_COLS);
+    let body = if indicator_text.is_empty() {
+        title.clone()
+    } else {
+        format!("{indicator_text} {title}")
+    };
+    let text = if is_active { format!("[{body}]") } else { body };
+    SessionRenderLabel {
+        is_active,
+        indicator,
+        title,
+        text,
+        id: e.id.clone(),
+    }
+}
+
 fn session_indicator(entry: &WorkspaceSessionEntry, tick: usize) -> SessionIndicator {
     let frame = SESSION_SPINNER_FRAMES
         [(tick / crate::app::SPINNER_TICKS_PER_FRAME) % SESSION_SPINNER_FRAMES.len()];
@@ -207,6 +227,13 @@ pub struct WorkspaceSessionEntry {
 pub struct WorkspaceSessionStrip {
     pub entries: Vec<WorkspaceSessionEntry>,
     pub active: usize,
+    /// Transient subagent pseudo-entries (`sub:{id}`) appended after the real
+    /// sessions in the footer strip. Kept separate so session consumers
+    /// (resume, /sessions picker, cycling) never see them.
+    pub subagent_entries: Vec<WorkspaceSessionEntry>,
+    /// Focused pseudo-entry (index into `subagent_entries`) while a subagent
+    /// view is open — highlighted in yellow, main sessions stay unselected.
+    pub subagent_focus: Option<usize>,
 }
 
 impl WorkspaceSessionStrip {
@@ -277,43 +304,41 @@ impl WorkspaceSessionStrip {
         theme: &Theme,
         tick: usize,
     ) -> (Vec<Span<'static>>, Vec<SessionStripHit>) {
-        if self.entries.is_empty() || max_cols < 4 {
+        if (self.entries.is_empty() && self.subagent_entries.is_empty()) || max_cols < 4 {
             return (Vec::new(), Vec::new());
         }
-        let labels: Vec<SessionRenderLabel> = self
+        // Combined label list: real sessions first, subagent pseudo-entries
+        // after. While a subagent view is open, the main sessions render
+        // unselected and the focused pseudo-entry takes the bracket marker.
+        let mut labels: Vec<SessionRenderLabel> = self
             .entries
             .iter()
             .enumerate()
             .map(|(i, e)| {
-                let indicator = session_indicator(e, tick);
-                let indicator_text = indicator.text();
-                let title = truncate_cols(&e.title, SESSION_TITLE_MAX_COLS);
-                let body = if indicator_text.is_empty() {
-                    title.clone()
-                } else {
-                    format!("{indicator_text} {title}")
-                };
-                let text = if i == self.active {
-                    format!("[{body}]")
-                } else {
-                    body
-                };
-                SessionRenderLabel {
-                    is_active: i == self.active,
-                    indicator,
-                    title,
-                    text,
-                    id: e.id.clone(),
-                }
+                let is_active = self.subagent_focus.is_none() && i == self.active;
+                strip_label(e, is_active, tick)
             })
             .collect();
+        let main_len = labels.len();
+        for (i, e) in self.subagent_entries.iter().enumerate() {
+            let is_active = self.subagent_focus == Some(i);
+            let mut label = strip_label(e, is_active, tick);
+            // Pseudo-entries render their hit id as `sub:{id}` so clicks route
+            // to the subagent view switch instead of a session resume.
+            label.id = e.id.clone();
+            labels.push(label);
+        }
+        let anchor = match self.subagent_focus {
+            Some(focus) => main_len + focus,
+            None => self.active,
+        };
 
         let label_pairs: Vec<(bool, String)> = labels
             .iter()
             .map(|label| (label.is_active, label.text.clone()))
             .collect();
         let (start, end, left_overflow, right_overflow) =
-            visible_window(&label_pairs, self.active, max_cols);
+            visible_window(&label_pairs, anchor, max_cols);
 
         let mut spans = Vec::new();
         let mut hits = Vec::new();
@@ -323,8 +348,8 @@ impl WorkspaceSessionStrip {
             col += UnicodeWidthStr::width(s.as_str());
             spans.push(Span::styled(s, Style::default().fg(theme.text_muted)));
         }
-        for (i, label) in labels[start..end].iter().enumerate() {
-            if i > 0 {
+        for label in labels[start..end].iter() {
+            if col > 0 {
                 let sep = " · ".to_string();
                 col += UnicodeWidthStr::width(sep.as_str());
                 spans.push(Span::styled(sep, Style::default().fg(theme.text_muted)));
@@ -332,20 +357,17 @@ impl WorkspaceSessionStrip {
             let w = UnicodeWidthStr::width(label.text.as_str());
             hits.push(SessionStripHit {
                 session_id: label.id.clone(),
-                full_title: self
-                    .entries
-                    .iter()
-                    .find(|e| e.id == label.id)
-                    .map(|e| e.title.clone())
-                    .unwrap_or_else(|| label.id.clone()),
+                full_title: label.title.clone(),
                 x0: col,
                 x1: col + w,
             });
             col += w;
+            let is_sub = label.id.starts_with("sub:");
             let title_style = if label.is_active {
-                Style::default()
-                    .fg(theme.accent)
-                    .add_modifier(Modifier::BOLD)
+                // Selected subagent gets the amber-yellow highlight; a selected
+                // real session keeps the usual accent color.
+                let color = if is_sub { theme.warning } else { theme.accent };
+                Style::default().fg(color).add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(theme.text_dim)
             };
@@ -743,6 +765,54 @@ fn format_tokens(n: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn subagent_pseudo_entry_highlight_and_click_target() {
+        let theme = crate::theme::Theme::default();
+        let mut strip = WorkspaceSessionStrip::default();
+        strip.entries.push(WorkspaceSessionEntry {
+            id: "sess-1".into(),
+            title: "main session".into(),
+            status: SessionStatus::Idle,
+            dirty: false,
+            needs_attention: false,
+            working_dir: None,
+        });
+        strip.active = 0;
+        strip.subagent_entries.push(WorkspaceSessionEntry {
+            id: "sub:ag-1".into(),
+            title: "↳ explore".into(),
+            status: SessionStatus::ToolExecuting,
+            dirty: false,
+            needs_attention: false,
+            working_dir: None,
+        });
+
+        // No subagent view open: main session stays the active entry.
+        strip.subagent_focus = None;
+        let (spans, hits) = strip.render_spans_with_hits(80, &theme, 0);
+        let text: String = spans.iter().map(|s| s.content.clone()).collect::<String>();
+        assert!(text.contains("[main session]"));
+        assert!(!text.contains("[↳ explore]"));
+        // Both entries expose hit boxes; the pseudo-entry routes by its id.
+        assert!(hits.iter().any(|h| h.session_id == "sub:ag-1"));
+        assert!(hits.iter().any(|h| h.session_id == "sess-1"));
+
+        // Subagent view open: pseudo-entry takes the bracket marker, main
+        // session renders unselected.
+        strip.subagent_focus = Some(0);
+        let (spans, _hits) = strip.render_spans_with_hits(80, &theme, 0);
+        let text: String = spans.iter().map(|s| s.content.clone()).collect::<String>();
+        assert!(!text.contains("[main session]"));
+        // Running pseudo-entries carry a spinner inside the brackets.
+        assert!(text.contains("[") && text.contains("↳ explore]"));
+        // The focused pseudo-entry uses the amber/warning color on its title.
+        let focused = spans
+            .iter()
+            .find(|s| s.content.contains("explore"))
+            .expect("title span");
+        assert_eq!(focused.style.fg, Some(theme.warning));
+    }
 
     #[test]
     fn tab_scroll() {

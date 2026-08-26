@@ -2512,6 +2512,35 @@ fn sync_footer_session_entries(state: &mut AppState) {
         .iter()
         .position(|entry| entry.id == current_id)
         .unwrap_or(0);
+
+    // Subagent pseudo-entries: one `sub:{id}` per tracked child agent, status
+    // mapped from the UI entry. Focus follows the open subagent view so the
+    // strip highlights (amber) exactly what the main pane is showing.
+    state.workspace_sessions.subagent_entries = state
+        .subagents
+        .entries
+        .iter()
+        .map(|e| crate::chrome::WorkspaceSessionEntry {
+            id: format!("sub:{}", e.id),
+            title: format!("↳ {}", e.name),
+            status: match e.status.as_str() {
+                "running" | "pending" => SessionStatus::ToolExecuting,
+                "complete" => SessionStatus::Idle,
+                _ => SessionStatus::Cancelling,
+            },
+            dirty: false,
+            needs_attention: false,
+            working_dir: None,
+        })
+        .collect();
+    state.workspace_sessions.subagent_focus = state.active_subagent_view.as_ref().map(|viewing| {
+        state
+            .subagents
+            .entries
+            .iter()
+            .position(|e| e.id == *viewing)
+            .unwrap_or(0)
+    });
 }
 
 fn render_scroll_hint(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
