@@ -150,6 +150,9 @@ pub struct AppState {
     pub permission_mode: PermissionMode,
     pub plan_mode: bool,
     pub session_id: Option<String>,
+    /// Workspace where this TUI was launched. Unlike `working_dir`, this does
+    /// not change while viewing a cross-workspace session.
+    pub primary_workspace: std::path::PathBuf,
     /// Server-authoritative working directory for the active session.
     pub working_dir: std::path::PathBuf,
     pub mode: AppMode,
@@ -689,6 +692,8 @@ pub struct QuitDialogState {
 pub struct ResumeSwitchCtx {
     pub target: String,
     pub leaving_id: Option<String>,
+    /// A disposable blank session is removed only after the target has loaded.
+    pub discard_leaving_id: Option<String>,
     pub started_at: std::time::Instant,
 }
 
@@ -1093,6 +1098,7 @@ impl AppState {
             permission_mode,
             plan_mode,
             session_id: None,
+            primary_workspace: working_dir.clone(),
             working_dir: working_dir.clone(),
             mode: if plan_mode {
                 AppMode::Plan
@@ -2180,7 +2186,7 @@ impl TuiApp {
                     self.jobs.mark_done(channel, generation);
                     match result {
                         Ok(data) => {
-                            if let Err(e) = self.apply_session_resume_data(&query, data) {
+                            if let Err(e) = self.apply_session_resume_data(&query, data).await {
                                 self.clear_failed_resume(&query);
                                 self.jobs.push_error(
                                     Some(channel),
@@ -2559,7 +2565,7 @@ impl TuiApp {
         }
     }
 
-    /// Close the topmost transient UI (menus / pickers / search / shell).
+    /// Close the topmost transient UI (menus / pickers / agent views / search / shell).
     /// Returns true if something was dismissed. Does not touch the agent turn.
     fn dismiss_transient_ui(&mut self) -> bool {
         if self.state.quit_dialog.take().is_some() {
@@ -2570,6 +2576,21 @@ impl TuiApp {
             return true;
         }
         if self.state.session_delete_confirm.take().is_some() {
+            return true;
+        }
+        if self.state.subagents_panel.is_some() {
+            let showing_detail = self
+                .state
+                .subagents_panel
+                .as_ref()
+                .is_some_and(|panel| panel.detail);
+            if showing_detail {
+                if let Some(panel) = self.state.subagents_panel.as_mut() {
+                    panel.detail = false;
+                }
+            } else {
+                self.state.subagents_panel = None;
+            }
             return true;
         }
         if self.state.list_picker.is_some() {
@@ -2596,6 +2617,14 @@ impl TuiApp {
         if self.state.slash_menu.take().is_some() {
             return true;
         }
+        if self.state.active_subagent_view.take().is_some() {
+            self.state.follow_bottom = true;
+            self.state.scroll_up = 0;
+            if let Some(current_id) = self.state.session_id.clone() {
+                self.state.tab_strip.ensure_active(&current_id, "main");
+            }
+            return true;
+        }
         if self.state.mode == AppMode::Shell {
             self.state.mode = AppMode::Normal;
             return true;
@@ -2607,11 +2636,13 @@ impl TuiApp {
         self.state.quit_dialog.is_some()
             || self.state.plugin_prompt.is_some()
             || self.state.session_delete_confirm.is_some()
+            || self.state.subagents_panel.is_some()
             || self.state.list_picker.is_some()
             || self.state.tasks_panel.is_some()
             || self.state.search.active
             || self.state.file_menu.is_some()
             || self.state.slash_menu.is_some()
+            || self.state.active_subagent_view.is_some()
             || self.state.mode == AppMode::Shell
     }
 
@@ -3537,7 +3568,9 @@ impl TuiApp {
                     return Ok(());
                 }
                 KeyCode::Enter => {
-                    // Open the selected subagent as a viewable "session" tab.
+                    // Open the selected child transcript. The footer keeps a
+                    // single aggregate `agents` entry instead of one tab per
+                    // child.
                     let entry = self
                         .state
                         .subagents
@@ -3551,16 +3584,11 @@ impl TuiApp {
                         // Close the overlay panel.
                         self.state.subagents_panel = None;
                         // Activate the subagent view: the message area renders
-                        // this subagent's full transcript (same renderer as a
-                        // normal session). The footer strip keeps a `sub:`-id
-                        // pseudo-tab; Tab / mouse click switch back and forth.
+                        // this subagent's full transcript using the normal
+                        // transcript renderer.
                         self.state.active_subagent_view = Some(entry.id.clone());
                         self.state.follow_bottom = true;
                         self.state.scroll_up = 0;
-                        let title = format!("↳ {}", entry.name);
-                        self.state
-                            .tab_strip
-                            .ensure_active(&format!("sub:{}", entry.id), title);
                     }
                     return Ok(());
                 }
@@ -4082,16 +4110,6 @@ impl TuiApp {
             // Escape: dismiss overlays already handled above; here interrupt /
             // double-Esc history edit.
             KeyCode::Esc => {
-                // If we're viewing a subagent transcript, Esc returns to the
-                // main session view.
-                if self.state.active_subagent_view.is_some() {
-                    self.state.active_subagent_view = None;
-                    self.state.follow_bottom = true;
-                    if let Some(current_id) = self.state.session_id.clone() {
-                        self.state.tab_strip.ensure_active(&current_id, "main");
-                    }
-                    return Ok(());
-                }
                 if self.state.status != SessionStatus::Idle {
                     if let Some(sid) = &self.state.session_id {
                         self.state.status = SessionStatus::Cancelling;
@@ -4134,13 +4152,6 @@ impl TuiApp {
             KeyCode::BackTab if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.cycle_workspace_session(-1).await?;
             }
-            // Shift-Tab with subagents and an empty input: cycle the
-            // [main, subagent…] tab chain (view-only switch).
-            KeyCode::BackTab
-                if !self.state.subagents.entries.is_empty() && self.state.input.is_empty() =>
-            {
-                self.cycle_subagent_tabs(-1);
-            }
             // Shift-Tab: toggle plan mode
             KeyCode::BackTab => {
                 let enabled = !self.state.plan_mode;
@@ -4163,15 +4174,6 @@ impl TuiApp {
                 self.submit_input().await?;
             }
             // Empty input Tab / ← →: cycle related sessions (/new or /fork group)
-            KeyCode::Tab
-                if !key.modifiers.contains(KeyModifiers::CONTROL)
-                    && !key.modifiers.contains(KeyModifiers::SHIFT)
-                    && !key.modifiers.contains(KeyModifiers::ALT)
-                    && !self.state.subagents.entries.is_empty()
-                    && self.state.input.is_empty() =>
-            {
-                self.cycle_subagent_tabs(1);
-            }
             KeyCode::Tab
                 if !key.modifiers.contains(KeyModifiers::CONTROL)
                     && !key.modifiers.contains(KeyModifiers::SHIFT)
@@ -7803,6 +7805,22 @@ impl TuiApp {
         leaving_id
     }
 
+    fn disposable_current_session_id(&self, target: &str) -> Option<String> {
+        let session_id = self.state.session_id.as_ref()?;
+        if session_id == target
+            || self.state.status != SessionStatus::Idle
+            || !self.state.input.is_empty()
+            || !self.state.prompt_queue.is_empty()
+            || self.state.approval_pending.is_some()
+            || self.state.question_pending.is_some()
+            || !self.state.subagents.entries.is_empty()
+            || session_has_retained_io(&self.state.messages)
+        {
+            return None;
+        }
+        Some(session_id.clone())
+    }
+
     fn take_cached_session_runtime(
         &mut self,
         query: &str,
@@ -8036,15 +8054,24 @@ impl TuiApp {
             self.state.pending_resume_prefill = None;
         }
         let started_at = std::time::Instant::now();
+        let discard_leaving_id = self.disposable_current_session_id(query);
         let leaving_id = self.cache_active_session_state(query);
         if let Some((cached_id, cached)) = self.take_cached_session_runtime(query) {
             self.activate_cached_session(&cached_id, cached, started_at);
+            if let Some(discard_id) = discard_leaving_id {
+                if let Err(error) = self.discard_session_record(&discard_id).await {
+                    self.system_message(format!(
+                        "Switched sessions, but could not discard the empty session: {error}"
+                    ));
+                }
+            }
             return Ok(());
         }
 
         self.state.resume_switch = Some(ResumeSwitchCtx {
             target: query.to_string(),
             leaving_id,
+            discard_leaving_id,
             started_at,
         });
         // Keep showing the current transcript until the target loads.
@@ -8081,7 +8108,7 @@ impl TuiApp {
         }
     }
 
-    fn apply_session_resume_data(
+    async fn apply_session_resume_data(
         &mut self,
         query: &str,
         data: serde_json::Value,
@@ -8669,6 +8696,13 @@ impl TuiApp {
         self.sync_active_session_status();
         // Turn may have finished while detached; drain restored queue immediately.
         self.flush_prompt_queue_if_idle();
+        if let Some(discard_id) = ctx.and_then(|switch| switch.discard_leaving_id) {
+            if let Err(error) = self.discard_session_record(&discard_id).await {
+                self.system_message(format!(
+                    "Switched sessions, but could not discard the empty session: {error}"
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -8751,11 +8785,22 @@ impl TuiApp {
 
     async fn discard_session_record(&mut self, session_id: &str) -> anyhow::Result<()> {
         let params = serde_json::json!({"session_id": session_id});
-        let _ = self.client.rpc_call("sessions.delete", Some(params)).await;
+        self.client
+            .rpc_call("sessions.delete", Some(params))
+            .await?;
         self.state.tab_strip.tabs.retain(|t| t.id != session_id);
+        self.state
+            .workspace_sessions
+            .entries
+            .retain(|entry| entry.id != session_id);
+        self.state.open_session_group.retain(|id| id != session_id);
+        self.state.closed_tab_ids.insert(session_id.to_string());
+        self.state.parked_approvals.remove(session_id);
+        self.state.parked_questions.remove(session_id);
         self.state.session_views.remove(session_id);
         self.state.session_runtime_states.remove(session_id);
         self.drop_background_session_events(session_id);
+        crate::draft_store::clear_draft(session_id);
         if self.state.tab_strip.active >= self.state.tab_strip.tabs.len() {
             self.state.tab_strip.active = self.state.tab_strip.tabs.len().saturating_sub(1);
         }
@@ -8776,7 +8821,8 @@ impl TuiApp {
             return;
         };
 
-        let mut rows: Vec<(String, String, Option<String>)> = Vec::new();
+        let primary_workspace_key = normalized_workspace_key(&self.state.primary_workspace);
+        let mut rows: Vec<(String, String, Option<String>, bool)> = Vec::new();
         if let Some(sessions) = data.get("sessions").and_then(|v| v.as_array()) {
             for s in sessions {
                 let id = s
@@ -8810,7 +8856,12 @@ impl TuiApp {
                     .and_then(|v| v.as_str())
                     .filter(|dir| !dir.is_empty())
                     .map(|dir| dir.to_string());
-                rows.push((id, title, working_dir));
+                let primary_workspace = working_dir.as_deref().is_some_and(|dir| {
+                    dir == "."
+                        || normalized_workspace_key(std::path::Path::new(dir))
+                            == primary_workspace_key
+                });
+                rows.push((id, title, working_dir, primary_workspace));
             }
         }
 
@@ -8818,7 +8869,7 @@ impl TuiApp {
         // Skip when the current id was just closed (Ctrl-D) and the follow-up
         // session switch has not landed yet — it must not re-enter the strip.
         let current_open = !self.state.closed_tab_ids.contains(&current_id);
-        if current_open && !rows.iter().any(|(id, _, _)| id == &current_id) {
+        if current_open && !rows.iter().any(|(id, _, _, _)| id == &current_id) {
             // Prefer the tab title we already know (e.g. a `/title` set earlier),
             // so a transient missing-row does not revert to the first prompt.
             let existing_title = self
@@ -8859,7 +8910,9 @@ impl TuiApp {
                     &current_id,
                 )
             };
-            rows.push((current_id.clone(), title, None));
+            let primary_workspace =
+                normalized_workspace_key(&self.state.working_dir) == primary_workspace_key;
+            rows.push((current_id.clone(), title, None, primary_workspace));
         }
 
         // The footer is an open-tab strip: refreshes may update metadata and
@@ -8892,7 +8945,9 @@ impl TuiApp {
                 let dirty = tab.map(|t| t.dirty).unwrap_or(false);
                 let needs_attention = self.state.parked_approvals.contains_key(&id)
                     || self.state.parked_questions.contains_key(&id);
-                if let Some((_, title, working_dir)) = rows.iter().find(|(rid, _, _)| rid == &id) {
+                if let Some((_, title, working_dir, primary_workspace)) =
+                    rows.iter().find(|(rid, _, _, _)| rid == &id)
+                {
                     crate::chrome::WorkspaceSessionEntry {
                         id,
                         title: title.clone(),
@@ -8900,8 +8955,12 @@ impl TuiApp {
                         dirty,
                         needs_attention,
                         working_dir: working_dir.clone(),
+                        primary_workspace: *primary_workspace,
                     }
                 } else {
+                    let primary_workspace = id == current_id
+                        && normalized_workspace_key(&self.state.working_dir)
+                            == primary_workspace_key;
                     let title = tab
                         .map(|tab| tab.title.clone())
                         .filter(|title| !title.is_empty())
@@ -8919,6 +8978,7 @@ impl TuiApp {
                         dirty,
                         needs_attention,
                         working_dir: None,
+                        primary_workspace,
                     }
                 }
             })
@@ -8937,22 +8997,14 @@ impl TuiApp {
             self.state.tab_strip.ensure_tab(&e.id, e.title.clone());
         }
 
-        // Subagent pseudo-tabs ride the same footer strip with a `sub:` id
-        // prefix; clicking one switches the transcript view (see the
-        // pending_strip_action handler).
-        for entry in self.state.subagents.entries.clone() {
-            let id = format!("sub:{}", entry.id);
-            let title = format!("↳ {}", entry.name);
-            self.state.tab_strip.ensure_tab(&id, title);
-        }
+        // Child agents are represented by one aggregate footer entry and never
+        // enter the real-session tab model.
+        self.state
+            .tab_strip
+            .tabs
+            .retain(|tab| !tab.id.starts_with("sub:"));
 
-        // Active tab follows the view: the subagent's pseudo-tab while a
-        // subagent view is open, otherwise the current real session.
-        if let Some(sub_id) = self.state.active_subagent_view.clone() {
-            self.state
-                .tab_strip
-                .ensure_active(&format!("sub:{sub_id}"), "↳ subagent");
-        } else if current_open {
+        if current_open && self.state.active_subagent_view.is_none() {
             let title = self
                 .state
                 .workspace_sessions
@@ -8962,8 +9014,8 @@ impl TuiApp {
                 .map(|e| e.title.clone())
                 .or_else(|| {
                     rows.iter()
-                        .find(|(id, _, _)| id == &current_id)
-                        .map(|(_, title, _)| title.clone())
+                        .find(|(id, _, _, _)| id == &current_id)
+                        .map(|(_, title, _, _)| title.clone())
                 })
                 .unwrap_or_else(|| "main".into());
             self.state.tab_strip.ensure_active(&current_id, title);
@@ -9134,17 +9186,14 @@ impl TuiApp {
             .await
     }
 
-    /// Apply a footer-strip action: `sub:` pseudo-tabs switch the subagent
-    /// transcript view; the current session's tab returns to the main view;
-    /// anything else resumes that workspace session.
+    /// Apply a footer-strip action: the aggregate child-agent entry opens its
+    /// browser, the current session returns to the main view, and anything else
+    /// resumes that workspace session.
     async fn apply_strip_action(&mut self, action: StripAction) {
         match action {
             StripAction::Switch(id) => {
-                if let Some(sub_id) = id.strip_prefix("sub:") {
-                    // Subagent pseudo-tab: switch the transcript view.
-                    self.state.active_subagent_view = Some(sub_id.to_string());
-                    self.state.follow_bottom = true;
-                    self.state.scroll_up = 0;
+                if id == "agents" {
+                    self.open_agents_panel();
                 } else if id == self.state.session_id.as_deref().unwrap_or("") {
                     // Clicking the current session's tab returns to it.
                     self.state.active_subagent_view = None;
@@ -9158,35 +9207,6 @@ impl TuiApp {
                 }
             }
         }
-    }
-
-    /// Cycle the tab chain [main session, subagent 1, subagent 2, …]. This is
-    /// the Tab/Shift-Tab path when subagents exist: it only changes which
-    /// transcript the main pane shows — no session resume happens.
-    fn cycle_subagent_tabs(&mut self, direction: i32) {
-        let chain: Vec<Option<String>> = std::iter::once(None)
-            .chain(
-                self.state
-                    .subagents
-                    .entries
-                    .iter()
-                    .map(|e| Some(e.id.clone())),
-            )
-            .collect::<Vec<Option<String>>>();
-        if chain.len() < 2 {
-            return;
-        }
-        let current = self
-            .state
-            .active_subagent_view
-            .clone()
-            .map(Some)
-            .unwrap_or(None);
-        let index = chain.iter().position(|c| *c == current).unwrap_or(0);
-        let next = (index as i64 + direction as i64).rem_euclid(chain.len() as i64) as usize;
-        self.state.active_subagent_view = chain[next].clone();
-        self.state.follow_bottom = true;
-        self.state.scroll_up = 0;
     }
 
     async fn cycle_attention_session(&mut self) -> anyhow::Result<()> {
@@ -13289,42 +13309,7 @@ mod app_state_tests {
     }
 
     #[tokio::test]
-    async fn tab_cycles_through_main_and_subagents() {
-        let mut app = test_tui_app();
-        app.state.subagents.upsert_spawned(
-            "sub-1".into(),
-            "explore".into(),
-            "scan".into(),
-            "running",
-        );
-        app.state
-            .subagents
-            .upsert_spawned("sub-2".into(), "coder".into(), "fix".into(), "running");
-
-        // Start on the main session view.
-        assert_eq!(app.state.active_subagent_view, None);
-
-        // Tab: main -> sub-1 -> sub-2 -> main.
-        app.cycle_subagent_tabs(1);
-        assert_eq!(app.state.active_subagent_view.as_deref(), Some("sub-1"));
-        app.cycle_subagent_tabs(1);
-        assert_eq!(app.state.active_subagent_view.as_deref(), Some("sub-2"));
-        app.cycle_subagent_tabs(1);
-        assert_eq!(app.state.active_subagent_view, None);
-
-        // Shift-Tab wraps backwards: main -> sub-2 -> sub-1.
-        app.cycle_subagent_tabs(-1);
-        assert_eq!(app.state.active_subagent_view.as_deref(), Some("sub-2"));
-        app.cycle_subagent_tabs(-1);
-        assert_eq!(app.state.active_subagent_view.as_deref(), Some("sub-1"));
-
-        // Leaving the view via the main-session tab click resets cleanly.
-        app.state.active_subagent_view = None;
-        assert_eq!(app.state.active_subagent_view, None);
-    }
-
-    #[tokio::test]
-    async fn strip_switch_routes_subagent_pseudo_tabs() {
+    async fn strip_agent_group_opens_the_subagent_browser() {
         let mut app = test_tui_app();
         app.state.subagents.upsert_spawned(
             "sub-9".into(),
@@ -13333,17 +13318,93 @@ mod app_state_tests {
             "running",
         );
 
-        // `sub:` pseudo-tab activates the transcript view without any RPC.
-        app.apply_strip_action(StripAction::Switch("sub:sub-9".into()))
+        app.apply_strip_action(StripAction::Switch("agents".into()))
             .await;
-        assert_eq!(app.state.active_subagent_view.as_deref(), Some("sub-9"));
-        assert!(app.state.follow_bottom);
+        assert!(app.state.subagents_panel.is_some());
+        assert_eq!(app.state.active_subagent_view, None);
 
         // Clicking the current session's tab returns to the main view.
         app.state.session_id = Some("sess-1".into());
         app.apply_strip_action(StripAction::Switch("sess-1".into()))
             .await;
         assert_eq!(app.state.active_subagent_view, None);
+    }
+
+    #[tokio::test]
+    async fn successful_resume_permanently_discards_the_blank_session_it_replaces() {
+        use futures::FutureExt;
+
+        let (client_transport, server_transport) =
+            kkagent_rpc::transport::memory::create_memory_pair();
+        let (event_tx, event_rx) = tokio::sync::mpsc::channel(16);
+        let rpc = kkagent_rpc::RpcClient::new(client_transport, event_tx);
+        let client = kkagent_client::KkagentClient::new(rpc, event_rx);
+        let (deleted_tx, mut deleted_rx) = tokio::sync::mpsc::unbounded_channel();
+        let handler: kkagent_rpc::server::RequestHandler =
+            Arc::new(move |_id, method, params, _event_tx| {
+                let deleted_tx = deleted_tx.clone();
+                async move {
+                    match method.as_str() {
+                        "sessions.delete" => {
+                            deleted_tx.send(params.unwrap_or_default()).unwrap();
+                            Ok(serde_json::json!({"deleted": true}))
+                        }
+                        other => panic!("unexpected RPC method: {other}"),
+                    }
+                }
+                .boxed()
+            });
+        tokio::spawn(async move {
+            kkagent_rpc::RpcServer::new(handler)
+                .serve(server_transport)
+                .await;
+        });
+
+        let mut app = TuiApp::new(AppConfig::default(), client);
+        app.state.session_id = Some("blank-session".into());
+        app.state.tab_strip.ensure_active("blank-session", "main");
+        app.state.resume_switch = Some(ResumeSwitchCtx {
+            target: "kept-session".into(),
+            leaving_id: Some("blank-session".into()),
+            discard_leaving_id: app.disposable_current_session_id("kept-session"),
+            started_at: std::time::Instant::now(),
+        });
+
+        app.apply_session_resume_data(
+            "kept-session",
+            serde_json::json!({
+                "session_id": "kept-session",
+                "messages": [{"role": "user", "content": "existing work"}]
+            }),
+        )
+        .await
+        .unwrap();
+
+        let deleted = tokio::time::timeout(std::time::Duration::from_secs(1), deleted_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(deleted["session_id"], "blank-session");
+        assert_eq!(app.state.session_id.as_deref(), Some("kept-session"));
+        assert!(!app
+            .state
+            .tab_strip
+            .tabs
+            .iter()
+            .any(|tab| tab.id == "blank-session"));
+    }
+
+    #[tokio::test]
+    async fn edited_or_running_empty_session_is_not_disposable() {
+        let mut app = test_tui_app();
+        app.state.session_id = Some("blank-session".into());
+
+        app.state.input.set_text("unsent draft".into());
+        assert_eq!(app.disposable_current_session_id("target"), None);
+
+        app.state.input.clear();
+        app.state.status = SessionStatus::Thinking;
+        assert_eq!(app.disposable_current_session_id("target"), None);
     }
 
     #[tokio::test]
@@ -14101,6 +14162,7 @@ mod app_state_tests {
                 dirty: false,
                 needs_attention: false,
                 working_dir: None,
+                primary_workspace: true,
             }],
             Some("session-btw"),
         );
@@ -14321,6 +14383,7 @@ mod app_state_tests {
                     dirty: false,
                     needs_attention: false,
                     working_dir: None,
+                    primary_workspace: true,
                 },
                 crate::chrome::WorkspaceSessionEntry {
                     id: "fallback".into(),
@@ -14329,6 +14392,7 @@ mod app_state_tests {
                     dirty: false,
                     needs_attention: false,
                     working_dir: None,
+                    primary_workspace: true,
                 },
             ],
             Some("running"),
@@ -14861,6 +14925,7 @@ mod app_state_tests {
                 ]
             }),
         )
+        .await
         .unwrap();
 
         assert!(app.state.plan_focus_active());
@@ -14887,6 +14952,7 @@ mod app_state_tests {
                 "todos": []
             }),
         )
+        .await
         .unwrap();
 
         assert!(app.state.todos.is_empty());
@@ -14915,6 +14981,7 @@ mod app_state_tests {
                 }
             }),
         )
+        .await
         .unwrap();
 
         assert_eq!(app.state.status, SessionStatus::WaitingQuestion);
@@ -14955,6 +15022,7 @@ mod app_state_tests {
                 }
             }),
         )
+        .await
         .unwrap();
 
         assert_eq!(app.state.status, SessionStatus::ToolExecuting);
@@ -15001,6 +15069,7 @@ mod app_state_tests {
                 }]
             }),
         )
+        .await
         .unwrap();
 
         assert_eq!(app.state.prompt_queue.items.len(), 1);
@@ -15071,6 +15140,66 @@ mod app_state_tests {
             feedback_mode: false,
             feedback: String::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn esc_closes_agents_tasks_and_ps_surfaces_without_interrupting_main_loop() {
+        use futures::FutureExt;
+
+        let (client_transport, server_transport) =
+            kkagent_rpc::transport::memory::create_memory_pair();
+        let (event_tx, event_rx) = tokio::sync::mpsc::channel(16);
+        let rpc = kkagent_rpc::RpcClient::new(client_transport, event_tx);
+        let client = kkagent_client::KkagentClient::new(rpc, event_rx);
+        let (interrupt_tx, mut interrupt_rx) = tokio::sync::mpsc::unbounded_channel();
+        let handler: kkagent_rpc::server::RequestHandler =
+            Arc::new(move |_id, method, params, _event_tx| {
+                let interrupt_tx = interrupt_tx.clone();
+                async move {
+                    match method.as_str() {
+                        "session.interrupt" => {
+                            interrupt_tx.send(params.unwrap_or_default()).unwrap();
+                            Ok(serde_json::json!({"ok": true}))
+                        }
+                        other => panic!("unexpected RPC method: {other}"),
+                    }
+                }
+                .boxed()
+            });
+        tokio::spawn(async move {
+            kkagent_rpc::RpcServer::new(handler)
+                .serve(server_transport)
+                .await;
+        });
+
+        let mut app = TuiApp::new(AppConfig::default(), client);
+        app.state.session_id = Some("main-session".into());
+        app.state.status = SessionStatus::Thinking;
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+
+        app.state.subagents_panel = Some(crate::subagents::SubagentsPanelState {
+            selected: 0,
+            detail: false,
+        });
+        app.handle_key(esc).await.unwrap();
+        assert!(app.state.subagents_panel.is_none());
+        assert!(interrupt_rx.try_recv().is_err());
+
+        app.state.active_subagent_view = Some("child-agent".into());
+        app.handle_key(esc).await.unwrap();
+        assert!(app.state.active_subagent_view.is_none());
+        assert!(interrupt_rx.try_recv().is_err());
+
+        // `/tasks` and `/ps` are aliases backed by the same panel state.
+        app.state.tasks_panel = Some(TasksPanelState {
+            tasks: Vec::new(),
+            selected: 0,
+            detail: None,
+        });
+        app.handle_key(esc).await.unwrap();
+        assert!(app.state.tasks_panel.is_none());
+        assert!(interrupt_rx.try_recv().is_err());
+        assert_eq!(app.state.status, SessionStatus::Thinking);
     }
 
     #[tokio::test]

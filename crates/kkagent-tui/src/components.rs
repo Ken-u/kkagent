@@ -2493,6 +2493,7 @@ fn sync_footer_session_entries(state: &mut AppState) {
                 dirty: false,
                 needs_attention: false,
                 working_dir: None,
+                primary_workspace: true,
             });
     }
 
@@ -2513,34 +2514,41 @@ fn sync_footer_session_entries(state: &mut AppState) {
         .position(|entry| entry.id == current_id)
         .unwrap_or(0);
 
-    // Subagent pseudo-entries: one `sub:{id}` per tracked child agent, status
-    // mapped from the UI entry. Focus follows the open subagent view so the
-    // strip highlights (amber) exactly what the main pane is showing.
-    state.workspace_sessions.subagent_entries = state
+    // Child agents get one compact group entry. The existing `/agents` browser
+    // owns individual selection, keeping the session strip readable even for a
+    // large swarm.
+    let agent_count = state.subagents.entries.len();
+    let running_agents = state
         .subagents
         .entries
         .iter()
-        .map(|e| crate::chrome::WorkspaceSessionEntry {
-            id: format!("sub:{}", e.id),
-            title: format!("↳ {}", e.name),
-            status: match e.status.as_str() {
-                "running" | "pending" => SessionStatus::ToolExecuting,
-                "complete" => SessionStatus::Idle,
-                _ => SessionStatus::Cancelling,
+        .filter(|entry| entry.is_active())
+        .count();
+    let failed_agents = state
+        .subagents
+        .entries
+        .iter()
+        .filter(|entry| matches!(entry.status.as_str(), "failed" | "cancelled"))
+        .count();
+    state.workspace_sessions.agent_group_entry =
+        (agent_count > 0).then(|| crate::chrome::WorkspaceSessionEntry {
+            id: "agents".into(),
+            title: if running_agents > 0 {
+                format!("agents {running_agents}/{agent_count}")
+            } else {
+                format!("agents {agent_count}")
+            },
+            status: if running_agents > 0 {
+                SessionStatus::ToolExecuting
+            } else {
+                SessionStatus::Idle
             },
             dirty: false,
-            needs_attention: false,
+            needs_attention: failed_agents > 0,
             working_dir: None,
-        })
-        .collect();
-    state.workspace_sessions.subagent_focus = state.active_subagent_view.as_ref().map(|viewing| {
-        state
-            .subagents
-            .entries
-            .iter()
-            .position(|e| e.id == *viewing)
-            .unwrap_or(0)
-    });
+            primary_workspace: true,
+        });
+    state.workspace_sessions.agent_group_focused = state.active_subagent_view.is_some();
 }
 
 fn render_scroll_hint(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {

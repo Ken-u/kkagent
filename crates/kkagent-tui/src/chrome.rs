@@ -221,19 +221,20 @@ pub struct WorkspaceSessionEntry {
     /// resume request must pass this directory so the server-side check
     /// accepts cross-directory switches.
     pub working_dir: Option<String>,
+    /// Whether this session belongs to the workspace where this TUI was
+    /// launched. The footer keeps this group ahead of cross-workspace sessions.
+    pub primary_workspace: bool,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct WorkspaceSessionStrip {
     pub entries: Vec<WorkspaceSessionEntry>,
     pub active: usize,
-    /// Transient subagent pseudo-entries (`sub:{id}`) appended after the real
-    /// sessions in the footer strip. Kept separate so session consumers
-    /// (resume, /sessions picker, cycling) never see them.
-    pub subagent_entries: Vec<WorkspaceSessionEntry>,
-    /// Focused pseudo-entry (index into `subagent_entries`) while a subagent
-    /// view is open — highlighted in yellow, main sessions stay unselected.
-    pub subagent_focus: Option<usize>,
+    /// One compact entry for all child agents. Individual agents are selected
+    /// in the `/agents` browser instead of competing with sessions for width.
+    pub agent_group_entry: Option<WorkspaceSessionEntry>,
+    /// The group is focused while an individual child-agent transcript is open.
+    pub agent_group_focused: bool,
 }
 
 impl WorkspaceSessionStrip {
@@ -246,21 +247,39 @@ impl WorkspaceSessionStrip {
         active_id: Option<&str>,
     ) {
         if self.entries.is_empty() {
+            incoming.sort_by_key(|entry| !entry.primary_workspace);
             self.set_entries(incoming, active_id);
             return;
         }
+        let incoming_ids = incoming
+            .iter()
+            .map(|entry| entry.id.clone())
+            .collect::<Vec<_>>();
         let mut by_id: std::collections::HashMap<String, WorkspaceSessionEntry> =
             incoming.drain(..).map(|e| (e.id.clone(), e)).collect();
         let mut ordered = Vec::with_capacity(by_id.len());
-        for prev in &self.entries {
-            if let Some(e) = by_id.remove(&prev.id) {
-                ordered.push(e);
+        // Preserve existing order within each workspace group, but always keep
+        // the launch workspace ahead of sessions surfaced by another server
+        // client. This avoids periodic refreshes making tabs jump around.
+        for primary_workspace in [true, false] {
+            for prev in &self.entries {
+                if let Some(entry) = by_id.get(&prev.id) {
+                    if entry.primary_workspace == primary_workspace {
+                        ordered.push(by_id.remove(&prev.id).expect("entry still present"));
+                    }
+                }
+            }
+            // Brand-new sessions retain the server-provided order and join the
+            // end of their workspace group.
+            for id in &incoming_ids {
+                if let Some(entry) = by_id.get(id) {
+                    if entry.primary_workspace == primary_workspace {
+                        ordered.push(by_id.remove(id).expect("entry still present"));
+                    }
+                }
             }
         }
-        // Preserve relative order of brand-new ids as provided by the caller.
-        let mut rest: Vec<_> = by_id.into_values().collect();
-        rest.sort_by(|a, b| a.id.cmp(&b.id));
-        ordered.extend(rest);
+        debug_assert!(by_id.is_empty());
         self.set_entries(ordered, active_id);
     }
 
@@ -304,33 +323,28 @@ impl WorkspaceSessionStrip {
         theme: &Theme,
         tick: usize,
     ) -> (Vec<Span<'static>>, Vec<SessionStripHit>) {
-        if (self.entries.is_empty() && self.subagent_entries.is_empty()) || max_cols < 4 {
+        if (self.entries.is_empty() && self.agent_group_entry.is_none()) || max_cols < 4 {
             return (Vec::new(), Vec::new());
         }
-        // Combined label list: real sessions first, subagent pseudo-entries
-        // after. While a subagent view is open, the main sessions render
-        // unselected and the focused pseudo-entry takes the bracket marker.
+        // Real sessions stay at the first level. Child agents occupy one
+        // aggregate entry that opens the `/agents` browser.
         let mut labels: Vec<SessionRenderLabel> = self
             .entries
             .iter()
             .enumerate()
             .map(|(i, e)| {
-                let is_active = self.subagent_focus.is_none() && i == self.active;
+                let is_active = !self.agent_group_focused && i == self.active;
                 strip_label(e, is_active, tick)
             })
             .collect();
         let main_len = labels.len();
-        for (i, e) in self.subagent_entries.iter().enumerate() {
-            let is_active = self.subagent_focus == Some(i);
-            let mut label = strip_label(e, is_active, tick);
-            // Pseudo-entries render their hit id as `sub:{id}` so clicks route
-            // to the subagent view switch instead of a session resume.
-            label.id = e.id.clone();
-            labels.push(label);
+        if let Some(entry) = self.agent_group_entry.as_ref() {
+            labels.push(strip_label(entry, self.agent_group_focused, tick));
         }
-        let anchor = match self.subagent_focus {
-            Some(focus) => main_len + focus,
-            None => self.active,
+        let anchor = if self.agent_group_focused && self.agent_group_entry.is_some() {
+            main_len
+        } else {
+            self.active
         };
 
         let label_pairs: Vec<(bool, String)> = labels
@@ -362,11 +376,13 @@ impl WorkspaceSessionStrip {
                 x1: col + w,
             });
             col += w;
-            let is_sub = label.id.starts_with("sub:");
+            let is_agent_group = label.id == "agents";
             let title_style = if label.is_active {
-                // Selected subagent gets the amber-yellow highlight; a selected
-                // real session keeps the usual accent color.
-                let color = if is_sub { theme.warning } else { theme.accent };
+                let color = if is_agent_group {
+                    theme.warning
+                } else {
+                    theme.accent
+                };
                 Style::default().fg(color).add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(theme.text_dim)
@@ -767,7 +783,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn subagent_pseudo_entry_highlight_and_click_target() {
+    fn agent_group_entry_highlight_and_click_target() {
         let theme = crate::theme::Theme::default();
         let mut strip = WorkspaceSessionStrip::default();
         strip.entries.push(WorkspaceSessionEntry {
@@ -777,39 +793,37 @@ mod tests {
             dirty: false,
             needs_attention: false,
             working_dir: None,
+            primary_workspace: true,
         });
         strip.active = 0;
-        strip.subagent_entries.push(WorkspaceSessionEntry {
-            id: "sub:ag-1".into(),
-            title: "↳ explore".into(),
+        strip.agent_group_entry = Some(WorkspaceSessionEntry {
+            id: "agents".into(),
+            title: "agents 1/1".into(),
             status: SessionStatus::ToolExecuting,
             dirty: false,
             needs_attention: false,
             working_dir: None,
+            primary_workspace: true,
         });
 
-        // No subagent view open: main session stays the active entry.
-        strip.subagent_focus = None;
+        // No child transcript open: main session stays the active entry.
+        strip.agent_group_focused = false;
         let (spans, hits) = strip.render_spans_with_hits(80, &theme, 0);
         let text: String = spans.iter().map(|s| s.content.clone()).collect::<String>();
         assert!(text.contains("[main session]"));
-        assert!(!text.contains("[↳ explore]"));
-        // Both entries expose hit boxes; the pseudo-entry routes by its id.
-        assert!(hits.iter().any(|h| h.session_id == "sub:ag-1"));
+        assert!(!text.contains("[agents 1/1]"));
+        assert!(hits.iter().any(|h| h.session_id == "agents"));
         assert!(hits.iter().any(|h| h.session_id == "sess-1"));
 
-        // Subagent view open: pseudo-entry takes the bracket marker, main
-        // session renders unselected.
-        strip.subagent_focus = Some(0);
+        // Child transcript open: the aggregate entry takes the bracket marker.
+        strip.agent_group_focused = true;
         let (spans, _hits) = strip.render_spans_with_hits(80, &theme, 0);
         let text: String = spans.iter().map(|s| s.content.clone()).collect::<String>();
         assert!(!text.contains("[main session]"));
-        // Running pseudo-entries carry a spinner inside the brackets.
-        assert!(text.contains("[") && text.contains("↳ explore]"));
-        // The focused pseudo-entry uses the amber/warning color on its title.
+        assert!(text.contains("[") && text.contains("agents 1/1]"));
         let focused = spans
             .iter()
-            .find(|s| s.content.contains("explore"))
+            .find(|s| s.content.contains("agents"))
             .expect("title span");
         assert_eq!(focused.style.fg, Some(theme.warning));
     }
@@ -909,6 +923,7 @@ mod tests {
                 dirty: false,
                 needs_attention: false,
                 working_dir: None,
+                primary_workspace: true,
             });
         }
         strip.set_entries(entries, Some("id8"));
@@ -933,6 +948,7 @@ mod tests {
                     dirty: true,
                     needs_attention: false,
                     working_dir: None,
+                    primary_workspace: true,
                 },
                 WorkspaceSessionEntry {
                     id: "tool".into(),
@@ -941,6 +957,7 @@ mod tests {
                     dirty: true,
                     needs_attention: false,
                     working_dir: None,
+                    primary_workspace: true,
                 },
                 WorkspaceSessionEntry {
                     id: "idle".into(),
@@ -949,6 +966,7 @@ mod tests {
                     dirty: false,
                     needs_attention: false,
                     working_dir: None,
+                    primary_workspace: true,
                 },
             ],
             Some("thinking"),
@@ -992,6 +1010,7 @@ mod tests {
                 dirty: true,
                 needs_attention: false,
                 working_dir: None,
+                primary_workspace: true,
             }],
             Some("approval"),
         );
@@ -1016,6 +1035,7 @@ mod tests {
                     dirty: false,
                     needs_attention: false,
                     working_dir: None,
+                    primary_workspace: true,
                 },
                 WorkspaceSessionEntry {
                     id: "b".into(),
@@ -1024,6 +1044,7 @@ mod tests {
                     dirty: false,
                     needs_attention: false,
                     working_dir: None,
+                    primary_workspace: true,
                 },
                 WorkspaceSessionEntry {
                     id: "c".into(),
@@ -1032,6 +1053,7 @@ mod tests {
                     dirty: false,
                     needs_attention: false,
                     working_dir: None,
+                    primary_workspace: true,
                 },
             ],
             Some("b"),
@@ -1046,6 +1068,7 @@ mod tests {
                     dirty: true,
                     needs_attention: false,
                     working_dir: None,
+                    primary_workspace: true,
                 },
                 WorkspaceSessionEntry {
                     id: "a".into(),
@@ -1054,6 +1077,7 @@ mod tests {
                     dirty: false,
                     needs_attention: false,
                     working_dir: None,
+                    primary_workspace: true,
                 },
                 WorkspaceSessionEntry {
                     id: "d".into(),
@@ -1062,6 +1086,7 @@ mod tests {
                     dirty: false,
                     needs_attention: false,
                     working_dir: None,
+                    primary_workspace: true,
                 },
                 WorkspaceSessionEntry {
                     id: "b".into(),
@@ -1070,6 +1095,7 @@ mod tests {
                     dirty: false,
                     needs_attention: true,
                     working_dir: None,
+                    primary_workspace: true,
                 },
             ],
             Some("b"),
@@ -1092,6 +1118,7 @@ mod tests {
                 dirty: false,
                 needs_attention: false,
                 working_dir: None,
+                primary_workspace: true,
             }],
             Some("session"),
         );
@@ -1099,5 +1126,49 @@ mod tests {
         assert_eq!(strip.entries.len(), 1);
         assert_eq!(strip.entries[0].id, "session");
         assert!(strip.next_id().is_none());
+    }
+
+    #[test]
+    fn workspace_strip_keeps_primary_workspace_group_first_and_stable() {
+        let entry = |id: &str, primary_workspace: bool| WorkspaceSessionEntry {
+            id: id.into(),
+            title: id.into(),
+            status: SessionStatus::Idle,
+            dirty: false,
+            needs_attention: false,
+            working_dir: None,
+            primary_workspace,
+        };
+        let mut strip = WorkspaceSessionStrip::default();
+        strip.set_entries_stable(
+            vec![entry("other-a", false), entry("local-a", true)],
+            Some("local-a"),
+        );
+        assert_eq!(
+            strip
+                .entries
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            ["local-a", "other-a"]
+        );
+
+        strip.set_entries_stable(
+            vec![
+                entry("other-b", false),
+                entry("local-b", true),
+                entry("other-a", false),
+                entry("local-a", true),
+            ],
+            Some("local-a"),
+        );
+        assert_eq!(
+            strip
+                .entries
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            ["local-a", "local-b", "other-a", "other-b"]
+        );
     }
 }
