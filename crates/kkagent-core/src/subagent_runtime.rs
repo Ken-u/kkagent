@@ -65,19 +65,17 @@ fn run_subagent_mirrored_boxed(
     inherit_interrupt: Option<Arc<std::sync::atomic::AtomicBool>>,
 ) -> futures::future::BoxFuture<'static, anyhow::Result<String>> {
     Box::pin(async move {
-        let model = sub_cfg
-            .model
-            .clone()
-            .filter(|m| !m.is_empty())
-            .or_else(|| app_config.secondary_model.clone().filter(|m| !m.is_empty()))
-            .or_else(|| app_config.default_model_alias().map(|s| s.to_string()))
-            .unwrap_or_else(|| "default".into());
-
         let profile = sub_cfg
             .profile
             .as_deref()
             .unwrap_or("general")
             .to_lowercase();
+
+        let model = app_config.resolve_subagent_model(
+            &profile,
+            sub_cfg.model.as_deref(),
+            sub_cfg.parent_model.as_deref(),
+        );
 
         let mut session = Session::for_subagent(
             format!("sub-{}", sub_cfg.agent_id),

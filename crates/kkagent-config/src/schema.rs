@@ -11,9 +11,17 @@ pub struct AppConfig {
     /// normal per-step retry budget.
     #[serde(default)]
     pub fallback_model: Option<String>,
-    /// Optional secondary model alias for subagents / summarization.
+    /// Optional secondary model alias used as a global fallback for
+    /// subagents (after per-profile `[subagent.default_models]`) and as a
+    /// mid-priority compaction summarizer when `compaction_model` is unset.
     #[serde(default)]
     pub secondary_model: Option<String>,
+    /// Optional fast/cheap model alias targeted at subagents. The symbolic
+    /// token `fast` (in tool `model` overrides and
+    /// `[subagent.default_models]` values) resolves here first, then
+    /// `secondary_model`, then `default_model`.
+    #[serde(default)]
+    pub fast_model: Option<String>,
     /// Dedicated model alias for history compaction summaries. When set it
     /// takes precedence over `secondary_model`, the session model and
     /// `default_model` when resolving the compaction summarizer.
@@ -98,7 +106,8 @@ pub struct AppConfig {
     pub subagent: SubagentSettings,
 }
 
-/// Subagent delegation limits (`[subagent]` in config.toml).
+/// Subagent delegation limits and per-profile defaults (`[subagent]` in
+/// config.toml).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubagentSettings {
     /// Maximum subagent nesting depth below the root agent. `1` means
@@ -110,6 +119,20 @@ pub struct SubagentSettings {
     /// and each nested subagent session). Default `4`.
     #[serde(default = "default_subagent_max_concurrent")]
     pub max_concurrent: usize,
+    /// Per-profile default model aliases (`[subagent.default_models]`).
+    ///
+    /// Keys are profile names such as `explore`, `coder`, and `general`.
+    /// Lookup is case-insensitive; `agent` is treated as `general`. The
+    /// optional key `fallback` is used when the launched profile has no
+    /// dedicated entry.
+    ///
+    /// Values may be a real `[models]` alias, or one of the symbolic tokens
+    /// `current` (parent session model), `default` (top-level
+    /// `default_model`), `fast` (top-level `fast_model`, falling back to
+    /// `secondary_model` then `default_model`), or `secondary` (top-level
+    /// `secondary_model`, falling back to `default_model` when unset).
+    #[serde(default)]
+    pub default_models: HashMap<String, String>,
 }
 
 fn default_subagent_max_depth() -> u32 {
@@ -125,6 +148,7 @@ impl Default for SubagentSettings {
         Self {
             max_depth: default_subagent_max_depth(),
             max_concurrent: default_subagent_max_concurrent(),
+            default_models: HashMap::new(),
         }
     }
 }
@@ -139,6 +163,47 @@ impl SubagentSettings {
     pub fn effective_max_concurrent(&self) -> usize {
         self.max_concurrent.max(1)
     }
+
+    /// Resolve the configured default model alias for a subagent profile.
+    ///
+    /// Lookup order: exact profile key (case-insensitive; `agent` →
+    /// `general`) → catch-all key `fallback`. Empty strings are ignored.
+    /// Returned values may still be symbolic (`current` / `default` /
+    /// `secondary`) and need expansion via
+    /// [`AppConfig::expand_model_alias_token`].
+    pub fn model_for_profile(&self, profile: &str) -> Option<&str> {
+        let normalized = normalize_subagent_profile(profile);
+        lookup_profile_model(&self.default_models, &normalized)
+            .or_else(|| lookup_profile_model(&self.default_models, "fallback"))
+    }
+}
+
+/// Reserved model tokens usable in `[subagent.default_models]` values and
+/// tool `model` overrides. Tool schemas only expose `current` / `default` /
+/// `fast`; `secondary` remains accepted for config-level compatibility.
+pub fn is_symbolic_model_alias(token: &str) -> bool {
+    matches!(
+        token.trim().to_ascii_lowercase().as_str(),
+        "current" | "default" | "fast" | "secondary"
+    )
+}
+
+fn normalize_subagent_profile(profile: &str) -> String {
+    let key = profile.trim().to_ascii_lowercase();
+    if key == "agent" || key.is_empty() {
+        "general".into()
+    } else {
+        key
+    }
+}
+
+fn lookup_profile_model<'a>(models: &'a HashMap<String, String>, profile: &str) -> Option<&'a str> {
+    models
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(profile))
+        .map(|(_, value)| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
 }
 
 /// Plugin system behavior (`[plugins]` in config.toml).
@@ -1118,8 +1183,15 @@ impl AppConfig {
             anyhow::bail!("default_model {default_model} is not present in [models]");
         }
         if let Some(secondary) = self.secondary_model.as_deref() {
-            if !self.models.contains_key(secondary) {
+            let secondary = secondary.trim();
+            if !secondary.is_empty() && !self.models.contains_key(secondary) {
                 anyhow::bail!("secondary_model {secondary} is not present in [models]");
+            }
+        }
+        if let Some(fast) = self.fast_model.as_deref() {
+            let fast = fast.trim();
+            if !fast.is_empty() && !self.models.contains_key(fast) {
+                anyhow::bail!("fast_model {fast} is not present in [models]");
             }
         }
         if let Some(compaction) = self.compaction_model.as_deref() {
@@ -1130,6 +1202,37 @@ impl AppConfig {
         if let Some(fallback) = self.fallback_model.as_deref() {
             if !self.models.contains_key(fallback) {
                 anyhow::bail!("fallback_model {fallback} is not present in [models]");
+            }
+        }
+        for alias in self.models.keys() {
+            if is_symbolic_model_alias(alias) {
+                anyhow::bail!(
+                    "model alias '{alias}' collides with a reserved symbolic token \
+                     (current/default/fast/secondary); rename it in [models]"
+                );
+            }
+        }
+        let mut seen_profiles: Vec<String> = Vec::new();
+        for (profile, alias) in &self.subagent.default_models {
+            let alias = alias.trim();
+            if alias.is_empty() {
+                anyhow::bail!("subagent.default_models.{profile} must not be empty when set");
+            }
+            let normalized = normalize_subagent_profile(profile);
+            if let Some(existing) = seen_profiles.iter().find(|p| **p == normalized) {
+                anyhow::bail!(
+                    "subagent.default_models has case-insensitive duplicate keys: \
+                     '{existing}' and '{profile}' normalize to '{normalized}'"
+                );
+            }
+            seen_profiles.push(normalized);
+            if is_symbolic_model_alias(alias) {
+                continue;
+            }
+            if !self.models.contains_key(alias) {
+                anyhow::bail!(
+                    "subagent.default_models.{profile} = {alias} is not present in [models]"
+                );
             }
         }
         for root in &self.trusted_workspaces {
@@ -1195,8 +1298,93 @@ impl AppConfig {
         resolve_first_token_timeout(model, provider)
     }
 
+    /// The configured default model alias, trimmed; empty values are
+    /// treated as unset. This is the terminal fallback for every symbolic
+    /// model token.
     pub fn default_model_alias(&self) -> Option<&str> {
-        self.default_model.as_deref()
+        self.default_model
+            .as_deref()
+            .map(str::trim)
+            .filter(|alias| !alias.is_empty())
+    }
+
+    /// Expand a model token that may be a symbolic alias.
+    ///
+    /// - `current` → `current_model`, else `default_model`
+    /// - `default` → `default_model`
+    /// - `fast` → `fast_model`, else `secondary_model`, else `default_model`
+    /// - `secondary` → `secondary_model`, else `default_model`
+    /// - anything else → returned trimmed as-is
+    pub fn expand_model_alias_token(&self, token: &str, current_model: Option<&str>) -> String {
+        match token.trim().to_ascii_lowercase().as_str() {
+            "current" => current_model
+                .map(str::trim)
+                .filter(|model| !model.is_empty())
+                .map(|model| model.to_string())
+                .or_else(|| self.default_model_alias().map(|model| model.to_string()))
+                .unwrap_or_else(|| "default".into()),
+            "default" => self
+                .default_model_alias()
+                .map(|model| model.to_string())
+                .unwrap_or_else(|| "default".into()),
+            "fast" => self
+                .fast_model
+                .as_deref()
+                .map(str::trim)
+                .filter(|model| !model.is_empty())
+                .map(|model| model.to_string())
+                .or_else(|| {
+                    self.secondary_model
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|model| !model.is_empty())
+                        .map(|model| model.to_string())
+                })
+                .or_else(|| self.default_model_alias().map(|model| model.to_string()))
+                .unwrap_or_else(|| "default".into()),
+            "secondary" => self
+                .secondary_model
+                .as_deref()
+                .map(str::trim)
+                .filter(|model| !model.is_empty())
+                .map(|model| model.to_string())
+                .or_else(|| self.default_model_alias().map(|model| model.to_string()))
+                .unwrap_or_else(|| "default".into()),
+            _ => token.trim().to_string(),
+        }
+    }
+
+    /// Resolve the model alias a subagent should run with.
+    ///
+    /// Priority: explicit tool override → `[subagent.default_models]` for the
+    /// profile → global `secondary_model` → `default_model`. Symbolic tokens
+    /// (`current` / `default` / `secondary`) are expanded using
+    /// `current_model` (the parent session model).
+    pub fn resolve_subagent_model(
+        &self,
+        profile: &str,
+        explicit: Option<&str>,
+        current_model: Option<&str>,
+    ) -> String {
+        let token = explicit
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+            .map(|model| model.to_string())
+            .or_else(|| {
+                self.subagent
+                    .model_for_profile(profile)
+                    .map(|model| model.to_string())
+            })
+            .or_else(|| {
+                self.secondary_model
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|model| !model.is_empty())
+                    .map(|model| model.to_string())
+            })
+            .or_else(|| self.default_model_alias().map(|model| model.to_string()))
+            .unwrap_or_else(|| "default".into());
+        self.expand_model_alias_token(&token, current_model)
     }
 
     pub fn effective_permission_mode(&self) -> &str {
@@ -1363,6 +1551,290 @@ mod tests {
 
         config.compaction_model = Some("test/model".into());
         config.validate().unwrap();
+    }
+
+    #[test]
+    fn parses_and_validates_subagent_default_models() {
+        let settings: SubagentSettings = toml::from_str(
+            r#"
+max_depth = 3
+max_concurrent = 2
+
+[default_models]
+explore = "current"
+Coder = "secondary"
+fallback = "default"
+"#,
+        )
+        .unwrap();
+        assert_eq!(settings.max_depth, 3);
+        assert_eq!(settings.max_concurrent, 2);
+        assert_eq!(settings.model_for_profile("explore"), Some("current"));
+        assert_eq!(settings.model_for_profile("coder"), Some("secondary"));
+        assert_eq!(settings.model_for_profile("agent"), Some("default"));
+        assert_eq!(settings.model_for_profile("unknown"), Some("default"));
+
+        let mut config = valid_config();
+        config.subagent.default_models = settings.default_models.clone();
+        config.validate().unwrap();
+
+        config
+            .subagent
+            .default_models
+            .insert("explore".into(), "missing/model".into());
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("subagent.default_models.explore = missing/model"));
+    }
+
+    #[test]
+    fn resolve_subagent_model_priority() {
+        let mut config = valid_config();
+        config.secondary_model = Some("test/secondary".into());
+        config.models.insert(
+            "test/secondary".into(),
+            ModelConfig {
+                provider: "test".into(),
+                model: "secondary".into(),
+                max_context_size: Some(100_000),
+                max_output_size: Some(4_096),
+                capabilities: vec!["tool_use".into()],
+                display_name: None,
+                support_efforts: Vec::new(),
+                default_effort: None,
+                pricing: None,
+                experimental_adaptive_thinking: false,
+                experimental_vision_proxy: false,
+                experimental_visible_empty_retries: 0,
+                experimental_bad_toolcall_auto_retries: 0,
+                first_token_timeout_ms: None,
+            },
+        );
+        config.models.insert(
+            "test/explore".into(),
+            ModelConfig {
+                provider: "test".into(),
+                model: "explore".into(),
+                max_context_size: Some(100_000),
+                max_output_size: Some(4_096),
+                capabilities: vec!["tool_use".into()],
+                display_name: None,
+                support_efforts: Vec::new(),
+                default_effort: None,
+                pricing: None,
+                experimental_adaptive_thinking: false,
+                experimental_vision_proxy: false,
+                experimental_visible_empty_retries: 0,
+                experimental_bad_toolcall_auto_retries: 0,
+                first_token_timeout_ms: None,
+            },
+        );
+        config
+            .subagent
+            .default_models
+            .insert("explore".into(), "test/explore".into());
+
+        assert_eq!(
+            config.resolve_subagent_model("explore", Some("test/model"), None),
+            "test/model"
+        );
+        assert_eq!(
+            config.resolve_subagent_model("explore", None, None),
+            "test/explore"
+        );
+        assert_eq!(
+            config.resolve_subagent_model("coder", Some(""), None),
+            "test/secondary"
+        );
+        config.secondary_model = None;
+        assert_eq!(
+            config.resolve_subagent_model("coder", None, None),
+            "test/model"
+        );
+    }
+
+    #[test]
+    fn resolve_subagent_model_symbolic_aliases() {
+        let mut config = valid_config();
+        config.secondary_model = Some("test/secondary".into());
+        config.models.insert(
+            "test/secondary".into(),
+            ModelConfig {
+                provider: "test".into(),
+                model: "secondary".into(),
+                max_context_size: Some(100_000),
+                max_output_size: Some(4_096),
+                capabilities: vec!["tool_use".into()],
+                display_name: None,
+                support_efforts: Vec::new(),
+                default_effort: None,
+                pricing: None,
+                experimental_adaptive_thinking: false,
+                experimental_vision_proxy: false,
+                experimental_visible_empty_retries: 0,
+                experimental_bad_toolcall_auto_retries: 0,
+                first_token_timeout_ms: None,
+            },
+        );
+        config.models.insert(
+            "test/session".into(),
+            ModelConfig {
+                provider: "test".into(),
+                model: "session".into(),
+                max_context_size: Some(100_000),
+                max_output_size: Some(4_096),
+                capabilities: vec!["tool_use".into()],
+                display_name: None,
+                support_efforts: Vec::new(),
+                default_effort: None,
+                pricing: None,
+                experimental_adaptive_thinking: false,
+                experimental_vision_proxy: false,
+                experimental_visible_empty_retries: 0,
+                experimental_bad_toolcall_auto_retries: 0,
+                first_token_timeout_ms: None,
+            },
+        );
+        config
+            .subagent
+            .default_models
+            .insert("explore".into(), "current".into());
+        config
+            .subagent
+            .default_models
+            .insert("coder".into(), "default".into());
+        config
+            .subagent
+            .default_models
+            .insert("general".into(), "secondary".into());
+        config
+            .subagent
+            .default_models
+            .insert("fallback".into(), "fast".into());
+
+        assert_eq!(
+            config.resolve_subagent_model("explore", None, Some("test/session")),
+            "test/session"
+        );
+        assert_eq!(
+            config.resolve_subagent_model("explore", None, None),
+            "test/model"
+        );
+        assert_eq!(
+            config.resolve_subagent_model("coder", None, Some("test/session")),
+            "test/model"
+        );
+        assert_eq!(
+            config.resolve_subagent_model("general", None, Some("test/session")),
+            "test/secondary"
+        );
+        assert_eq!(
+            config.resolve_subagent_model("explore", Some("secondary"), Some("test/session")),
+            "test/secondary"
+        );
+        assert_eq!(
+            config.resolve_subagent_model("explore", Some("CURRENT"), Some("test/session")),
+            "test/session"
+        );
+        // `fast` falls back to secondary_model when fast_model is unset.
+        assert_eq!(
+            config.resolve_subagent_model("unknown-profile", None, None),
+            "test/secondary"
+        );
+        // Explicit `fast` follows the same chain: fast_model → secondary → default.
+        assert_eq!(
+            config.resolve_subagent_model("explore", Some("fast"), None),
+            "test/secondary"
+        );
+
+        config.fast_model = Some("test/fast".into());
+        assert_eq!(
+            config.resolve_subagent_model("unknown-profile", None, None),
+            "test/fast"
+        );
+        assert_eq!(
+            config.resolve_subagent_model("explore", Some("FAST"), None),
+            "test/fast"
+        );
+
+        config.secondary_model = None;
+        config.fast_model = None;
+        assert_eq!(
+            config.resolve_subagent_model("unknown-profile", None, None),
+            "test/model"
+        );
+    }
+
+    #[test]
+    fn validates_fast_model() {
+        let mut config = valid_config();
+        config.fast_model = Some("missing/fast".into());
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("fast_model missing/fast is not present"));
+    }
+
+    #[test]
+    fn validates_reserved_model_alias_names() {
+        let mut config = valid_config();
+        config.models.insert(
+            "current".into(),
+            config.models.get("test/model").cloned().unwrap(),
+        );
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("collides with a reserved symbolic token"));
+
+        let mut config = valid_config();
+        config.models.insert(
+            "Fast".into(),
+            config.models.get("test/model").cloned().unwrap(),
+        );
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("collides with a reserved symbolic token"));
+    }
+
+    #[test]
+    fn validates_default_models_case_duplicates() {
+        let mut config = valid_config();
+        config
+            .subagent
+            .default_models
+            .insert("general".into(), "current".into());
+        config
+            .subagent
+            .default_models
+            .insert("General".into(), "default".into());
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("case-insensitive duplicate keys"));
+
+        // `agent` normalizes to `general`, which must also collide.
+        let mut config = valid_config();
+        config
+            .subagent
+            .default_models
+            .insert("general".into(), "current".into());
+        config
+            .subagent
+            .default_models
+            .insert("agent".into(), "default".into());
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("case-insensitive duplicate keys"));
     }
 
     #[test]

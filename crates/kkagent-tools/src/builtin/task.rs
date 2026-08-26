@@ -96,6 +96,7 @@ async fn spawn_subagent(
                     parent_tool_call_id: ctx.tool_call_id.clone(),
                     run_in_background,
                     depth: 0,
+                    parent_model: ctx.model_alias.clone(),
                 };
                 if let Some(state) = subagent_mgr.get_state(&resume).await {
                     cfg.description = if desc == "Unnamed task" {
@@ -139,6 +140,7 @@ async fn spawn_subagent(
         parent_tool_call_id: ctx.tool_call_id.clone(),
         run_in_background,
         depth: 0,
+        parent_model: ctx.model_alias.clone(),
     };
 
     match subagent_mgr.spawn(config.clone()).await {
@@ -729,7 +731,11 @@ impl Tool for AgentTool {
                     "description": "Agent profile (default coder)"
                 },
                 "subagent_type": {"type": "string", "description": "Alias for profile"},
-                "model": {"type": "string"},
+                "model": {
+                    "type": "string",
+                    "enum": ["default", "fast", "current"],
+                    "description": "Model token: default = top-level default_model; fast = fast_model (falls back to secondary_model, then default_model); current = parent session model. Omit to use [subagent.default_models] for the profile"
+                },
                 "resume": {
                     "type": "string",
                     "description": "Optional agent id to resume instead of spawning a new one"
@@ -761,7 +767,11 @@ impl Tool for AgentTool {
                             "description": {"type": "string"},
                             "prompt": {"type": "string"},
                             "profile": {"type": "string"},
-                            "model": {"type": "string"}
+                            "model": {
+                                "type": "string",
+                                "enum": ["default", "fast", "current"],
+                                "description": "Per-agent model token (same semantics as top-level model)"
+                            }
                         },
                         "required": ["description", "prompt"]
                     }
@@ -848,6 +858,7 @@ mod tests {
             tool_call_id: Some("tool-call".into()),
             interrupted: None,
             tools_config: kkagent_config::ToolsConfig::default(),
+            model_alias: None,
         }
     }
 
@@ -878,6 +889,7 @@ mod tests {
                 parent_tool_call_id: None,
                 run_in_background: true,
                 depth: 0,
+                parent_model: None,
             })
             .await
             .unwrap();

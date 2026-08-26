@@ -21,7 +21,8 @@ kkagent config preset safe
 |---|---:|---:|---|
 | `default_model` | string | 必填 | 默认模型别名，必须存在于 `models`。 |
 | `fallback_model` | string | 无 | 全局 fallback 模型别名；主模型耗尽单步重试后使用，必须存在于 `models`。 |
-| `secondary_model` | string | 无 | 可选的辅助模型别名。 |
+| `secondary_model` | string | 无 | 全局辅助模型别名。子 Agent 在未配置 `[subagent.default_models]` 对应 profile、且工具调用未显式传 `model` 时回退到此模型；也用作未设置 `compaction_model` 时的压缩摘要候选。必须存在于 `models`。 |
+| `fast_model` | string | 无 | 快速/廉价模型别名。符号 `fast`（工具 `model` 参数与 `[subagent.default_models]` 值）优先解析到此模型；未配置时回退到 `secondary_model`，再回退到 `default_model`。必须存在于 `models`。 |
 | `compaction_model` | string | 无 | 专用于 `/compact` 历史压缩摘要的模型别名，必须存在于 `models`。设置后优先级最高，高于 `secondary_model`、session 当前模型和 `default_model`。也可用环境变量 `KKAGENT_COMPACTION_MODEL` 覆盖。 |
 | `default_permission_mode` | string | `manual` | `manual`、`yolo` 或 `auto`。 |
 | `default_plan_mode` | bool | `false` | 新会话是否以 Plan 模式开始。 |
@@ -146,6 +147,44 @@ TUI 使用 `/model` 切换到全局 `fallback_model` 时，会要求为本次会
 当 LLM 返回 429 且未提供 `Retry-After` 时，`rate_limit_retry_base_seconds` 控制指数退避的基础时间，默认依次等待 5、10、20 秒。若服务端提供等待时间，则优先使用服务端值（最长 300 秒）。
 
 `token_counting` 可取 `measured+estimated`、`measured` 或 `estimated`。上下文达到 `compact_trigger_ratio`（默认 85%）或逼近 `reserved_context_size` 预留时，`auto_compact` 会用 LLM 摘要压缩历史，并按 token 预算保留用户消息（头+尾）；assistant/tool 交换由摘要覆盖，避免 toolcall 配对 400。手动 `/compact` 在 turn 进行中会被拒绝。
+
+## 子 Agent（`[subagent]`）
+
+```toml
+[subagent]
+max_depth = 2
+max_concurrent = 4
+
+[subagent.default_models]
+explore = "current"
+coder = "default"
+general = "fast"
+# fallback = "default"  # 未单独列出的 profile 回退
+```
+
+| 字段 | 类型 | 默认值 | 说明 |
+|---|---:|---:|---|
+| `max_depth` | u32 | `2` | 子 Agent 嵌套深度上限（运行时夹到 `1..=4`）。`1` 表示子 Agent 不能再委派。 |
+| `max_concurrent` | usize | `4` | 每个 manager 同时运行的子 Agent 上限（至少为 1）。 |
+| `default_models` | map | `{}` | 按 profile 配置默认模型。内置 profile：`explore` / `coder` / `general`（`agent` 视为 `general`）。键名大小写不敏感；可选键 `fallback` 作为未单独配置 profile 的回退。 |
+
+`default_models` 的值可以是 `[models]` 中的真实别名，或以下符号别名（大小写不敏感）：
+
+| 符号 | 含义 |
+|---|---|
+| `current` | 父会话当前正在使用的模型（主模型失败切到 fallback 时为 fallback 模型）；不可用时回退到 `default_model`。 |
+| `default` | 顶层 `default_model`。 |
+| `fast` | 顶层 `fast_model`；未配置时回退 `secondary_model`，再回退 `default_model`。 |
+| `secondary` | 顶层 `secondary_model`；未配置时回退到 `default_model`。 |
+
+子 Agent 选用模型的优先级：工具调用显式 `model`（也可写上述符号）→ `[subagent.default_models]` 对应 profile → 顶层 `secondary_model` → `default_model`。
+
+工具 schema 中的 `model` 参数是静态枚举 `default` / `fast` / `current`，LLM 无需感知真实模型别名即可选择档位；`secondary` 与真实别名仅在配置文件中支持。枚举是静态的，不会随 `[models]` 变化导致模型缓存失效。
+
+校验规则：
+
+- `current` / `default` / `fast` / `secondary` 是保留符号，`[models]` 中的别名不能使用这些名字（含大小写变体），否则校验报错。
+- `[subagent.default_models]` 的键在归一化后（大小写折叠、`agent` → `general`）不得重复，否则校验报错。
 
 ## 后台任务
 

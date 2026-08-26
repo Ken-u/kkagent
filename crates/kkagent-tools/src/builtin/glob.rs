@@ -352,6 +352,7 @@ mod tests {
                     tool_call_id: None,
                     interrupted: None,
                     tools_config: kkagent_config::ToolsConfig::default(),
+                    model_alias: None,
                 },
             )
             .await
@@ -377,6 +378,7 @@ mod tests {
                     tool_call_id: None,
                     interrupted: None,
                     tools_config: kkagent_config::ToolsConfig::default(),
+                    model_alias: None,
                 },
             )
             .await
@@ -409,6 +411,7 @@ mod tests {
                     tool_call_id: None,
                     interrupted: None,
                     tools_config: kkagent_config::ToolsConfig::default(),
+                    model_alias: None,
                 },
             )
             .await
@@ -440,6 +443,7 @@ mod tests {
                     tool_call_id: None,
                     interrupted: None,
                     tools_config: kkagent_config::ToolsConfig::default(),
+                    model_alias: None,
                 },
             )
             .await
@@ -466,6 +470,7 @@ mod tests {
                     tool_call_id: None,
                     interrupted: None,
                     tools_config: kkagent_config::ToolsConfig::default(),
+                    model_alias: None,
                 },
             )
             .await

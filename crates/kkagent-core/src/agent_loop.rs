@@ -1458,7 +1458,15 @@ Do not mention this reminder to the user.\n</system-reminder>"
                 let prep = match decision {
                     PermissionDecision::Approve => {
                         if tc.name == "AskUserQuestion" {
-                            Prepared::Done(self.execute_tool(session, &tc.name, &tc.input).await)
+                            Prepared::Done(
+                                self.execute_tool(
+                                    session,
+                                    &tc.name,
+                                    &tc.input,
+                                    &active_model_alias,
+                                )
+                                .await,
+                            )
                         } else if tc.name == "ExitPlanMode" {
                             Prepared::Done(self.auto_exit_plan_mode(session, &tc.input).await)
                         } else {
@@ -1575,7 +1583,13 @@ Do not mention this reminder to the user.\n</system-reminder>"
                                     }
                                     if tc.name == "AskUserQuestion" {
                                         Prepared::Done(
-                                            self.execute_tool(session, &tc.name, &tc.input).await,
+                                            self.execute_tool(
+                                                session,
+                                                &tc.name,
+                                                &tc.input,
+                                                &active_model_alias,
+                                            )
+                                            .await,
                                         )
                                     } else {
                                         if tc.name == "Write" || tc.name == "Edit" {
@@ -1797,6 +1811,10 @@ Do not mention this reminder to the user.\n</system-reminder>"
                     let mut tools_config = self.config.tools.clone();
                     tools_config.merge_project_overrides(&session.working_dir);
                     let msg_count = session.messages.len();
+                    // Propagate the actually-active model (may be the fallback
+                    // mid-turn) so subagents with `model: "current"` inherit
+                    // what the parent is really running, not the session default.
+                    let model_alias = Some(active_model_alias.clone());
                     let task_id = tool_call_id.clone();
                     let task_name = name.clone();
                     tasks.push(ToolCallTask {
@@ -1813,6 +1831,7 @@ Do not mention this reminder to the user.\n</system-reminder>"
                             let tool_call_id = tool_call_id;
                             let tools_config = tools_config;
                             let msg_count = msg_count;
+                            let model_alias = model_alias;
                             async move {
                                 execute_tool_parallel(ParallelToolRequest {
                                     tools,
@@ -1827,6 +1846,7 @@ Do not mention this reminder to the user.\n</system-reminder>"
                                     interrupted,
                                     plan_file_path,
                                     tools_config,
+                                    model_alias,
                                 })
                                 .await
                             }
@@ -2629,6 +2649,7 @@ Do not mention this reminder to the user.\n</system-reminder>"
         session: &mut Session,
         name: &str,
         input: &serde_json::Value,
+        active_model_alias: &str,
     ) -> ToolOutput {
         if name == "AskUserQuestion" {
             return self.run_ask_user_question(session, input).await;
@@ -2656,6 +2677,7 @@ Do not mention this reminder to the user.\n</system-reminder>"
             interrupted: session.interrupted.clone(),
             plan_file_path: session.plan_file_path.clone(),
             tools_config: self.config.tools.clone(),
+            model_alias: Some(active_model_alias.to_string()),
         })
         .await
     }
@@ -3059,6 +3081,7 @@ struct ParallelToolRequest {
     interrupted: Arc<std::sync::atomic::AtomicBool>,
     plan_file_path: std::path::PathBuf,
     tools_config: kkagent_config::ToolsConfig,
+    model_alias: Option<String>,
 }
 
 async fn execute_tool_parallel(request: ParallelToolRequest) -> ToolOutput {
@@ -3075,6 +3098,7 @@ async fn execute_tool_parallel(request: ParallelToolRequest) -> ToolOutput {
         interrupted,
         plan_file_path,
         tools_config,
+        model_alias,
     } = request;
 
     let mut input = input;
@@ -3129,6 +3153,7 @@ async fn execute_tool_parallel(request: ParallelToolRequest) -> ToolOutput {
         tool_call_id,
         interrupted: Some(interrupted),
         tools_config,
+        model_alias,
     };
 
     match tool.execute(input, &ctx).await {

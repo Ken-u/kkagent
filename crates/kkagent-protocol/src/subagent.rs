@@ -41,6 +41,10 @@ pub struct SubagentConfig {
     /// older persisted configs deserialize as 0 (treated as root-launched).
     #[serde(default)]
     pub depth: u32,
+    /// Parent session model alias, used to expand the symbolic `current`
+    /// model token when resolving this subagent's model.
+    #[serde(default)]
+    pub parent_model: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -489,6 +493,7 @@ mod tests {
             parent_tool_call_id: None,
             run_in_background: false,
             depth: 0,
+            parent_model: None,
         };
         stamp_child_depth(&mut config, 0, 2).unwrap();
         assert_eq!(config.depth, 1);
@@ -535,6 +540,7 @@ mod tests {
             parent_tool_call_id: None,
             run_in_background: false,
             depth: 0,
+            parent_model: None,
         };
         {
             let manager = SubagentManager::new_persistent(2, &path).unwrap();

@@ -109,6 +109,8 @@ pub struct ToolContext {
     pub interrupted: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// Application-layer path-policy config (S1-4 / S2-6).
     pub tools_config: kkagent_config::ToolsConfig,
+    /// Active session model alias (for subagent `current` model resolution).
+    pub model_alias: Option<String>,
 }
 
 impl ToolContext {
