@@ -74,7 +74,7 @@ default_effort = "medium"
 # experimental_vision_proxy = true  # 让该模型为非 vision 主模型充当多模态读图代理
 ```
 
-`provider` 必须引用已有 Provider。`max_context_size` 和 `max_output_size` 参与上下文预算。`tool_use` 控制是否向模型发送工具定义；`image_in`、`video_in`、`audio_in` 声明多模态输入能力；`support_efforts` 和 `default_effort` 描述可用推理强度。
+`provider` 必须引用已有 Provider。`max_context_size` 和 `max_output_size` 参与上下文预算。`tool_use` 控制是否向模型发送工具定义；`image_in`、`video_in`、`audio_in` 声明多模态输入能力；`support_efforts` 和 `default_effort` 描述可用推理强度（`none`、`minimal`、`low`、`medium`、`high`、`xhigh`、`max`，如 GPT-5.6 支持 `none`/`low`/`medium`/`high`/`xhigh`/`max`）。`default_effort` 必须列在 `support_efforts` 中（若后者非空）。
 
 `first_token_timeout_ms` 控制流式请求等待第一个有效内容 chunk（文本 / thinking / tool_use）的超时。优先级为：模型级 → Provider 级 → 默认 `60000`（60 秒）。设为 `0` 表示禁用（退化为仅受 HTTP 总超时 300s 约束）。≥ 300s 的配置会被 clamp 到 290s。超时后请求中断；若配置了 `fallback_model`，Agent loop 会按既有重试策略切换。
 
@@ -104,6 +104,8 @@ enabled = true
 effort = "high"
 keep = "all"
 ```
+
+`effort` 可取 `none`、`minimal`、`low`、`medium`、`high`、`xhigh`、`max`（按模型支持情况）。优先级：运行时 `/effort` 命令（写入本字段）> 模型级 `default_effort` > 协议默认值。对 OpenAI Responses API 转发为 `reasoning.effort`，对 Chat Completions 转发为 `reasoning_effort`，对 Anthropic（需 `experimental_adaptive_thinking`）转发为 `output_config.effort`。未显式指定 effort 时，Responses API 按 `budget_tokens` 推导：≥16000 → `high`，≥4000 → `medium`，否则 `low`。
 
 `keep` 是 Provider 兼容字符串。并非所有端点都支持 thinking 与 tools 同时使用；遇到 400 响应时可先删除 `keep` 并关闭 thinking 验证。
 

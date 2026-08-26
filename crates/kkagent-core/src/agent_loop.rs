@@ -709,23 +709,40 @@ Do not mention this reminder to the user.\n</system-reminder>"
                 ));
                 break;
             }
-            let thinking = self.config.thinking.as_ref().and_then(|thinking_config| {
-                if thinking_config.enabled || active_capability.thinking {
+            // Thinking enablement: global `[thinking].enabled`, the model's
+            // `capabilities = ["thinking"]`, or a per-model `default_effort`
+            // (configuring one implies reasoning should be requested).
+            // Effort resolution: runtime/global `[thinking].effort` wins,
+            // then the per-model `default_effort`. The value is forwarded as
+            // OpenAI Responses `reasoning.effort`, Chat Completions
+            // `reasoning_effort`, and Anthropic adaptive `output_config.effort`.
+            // When nothing is configured it stays `None` and each protocol
+            // applies its own default (Responses derives it from
+            // `budget_tokens`).
+            let thinking = {
+                let thinking_config = self.config.thinking.as_ref();
+                let effort = thinking_config
+                    .and_then(|t| t.effort.clone())
+                    .or_else(|| model_config.default_effort.clone());
+                if thinking_config.is_some_and(|t| t.enabled)
+                    || active_capability.thinking
+                    || effort.is_some()
+                {
+                    let effort = if model_config.experimental_adaptive_thinking {
+                        // Anthropic adaptive thinking always needs an effort.
+                        Some(effort.unwrap_or_else(|| "high".into()))
+                    } else {
+                        effort
+                    };
                     Some(ThinkingParams {
                         budget_tokens: 10000,
                         adaptive: model_config.experimental_adaptive_thinking,
-                        effort: model_config.experimental_adaptive_thinking.then(|| {
-                            thinking_config
-                                .effort
-                                .clone()
-                                .or_else(|| model_config.default_effort.clone())
-                                .unwrap_or_else(|| "high".into())
-                        }),
+                        effort,
                     })
                 } else {
                     None
                 }
-            });
+            };
 
             // Non-vision primary model with a vision proxy configured: replace
             // image blocks with proxy-generated descriptions. The replacement is
@@ -5052,5 +5069,97 @@ mod retry_tests {
             first,
             openai_prompt_cache_key(&official, &plain, "gpt-test", "changed", &tools).unwrap()
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn model_default_effort_enables_thinking_without_global_config() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let captured: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured_server = Arc::clone(&captured);
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 16_384];
+            let count = socket.read(&mut request).await.unwrap();
+            let text = String::from_utf8_lossy(&request[..count]).to_string();
+            captured_server.lock().unwrap().push(text);
+            let body = "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\ndata: [DONE]\n";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let mut config = AppConfig {
+            default_model: Some("test/model".into()),
+            ..Default::default()
+        };
+        config.providers.insert(
+            "test".into(),
+            ProviderConfig {
+                provider_type: "openai-chat".into(),
+                api_key: Some("token".into()),
+                base_url: Some(base_url),
+                custom_headers: HashMap::new(),
+                oauth: None,
+                first_token_timeout_ms: None,
+            },
+        );
+        // No global `[thinking]` section and no `thinking` capability: the
+        // per-model `default_effort` alone must enable reasoning.
+        config.models.insert(
+            "test/model".into(),
+            ModelConfig {
+                provider: "test".into(),
+                model: "gpt-test".into(),
+                max_context_size: Some(1_000_000),
+                max_output_size: Some(1_000),
+                capabilities: vec!["tool_use".into()],
+                display_name: None,
+                support_efforts: vec!["none".into(), "low".into(), "medium".into()],
+                default_effort: Some("medium".into()),
+                pricing: None,
+                experimental_adaptive_thinking: false,
+                experimental_vision_proxy: false,
+                experimental_visible_empty_retries: 0,
+                experimental_bad_toolcall_auto_retries: 0,
+                first_token_timeout_ms: None,
+            },
+        );
+        let (event_tx, _) = mpsc::channel(64);
+        let loop_ = AgentLoop::new(
+            Arc::new(config),
+            Arc::new(ToolRegistry::new()),
+            Arc::new(Mutex::new(PermissionChain::new(
+                PermissionMode::Auto,
+                Vec::new(),
+            ))),
+            event_tx,
+            Arc::new(Mutex::new(HashMap::new())),
+        );
+        let workspace =
+            std::env::temp_dir().join(format!("kkagent-effort-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let mut session = Session::new(
+            "effort-test".into(),
+            workspace.clone(),
+            PermissionMode::Auto,
+            "test/model".into(),
+        );
+        session.add_user_message("hello".into());
+
+        loop_.run_turn(&mut session).await.unwrap();
+        server.await.unwrap();
+        let captured = captured.lock().unwrap();
+        let request = captured
+            .last()
+            .expect("server should have captured a request");
+        assert!(
+            request.contains("\"reasoning_effort\":\"medium\""),
+            "request should carry reasoning_effort=medium, got: {request}"
+        );
+        std::fs::remove_dir_all(workspace).unwrap();
     }
 }

@@ -84,6 +84,7 @@ Footer 第二行在 `context` 左侧显示当前有效沙箱模式：绿色 `●
 
 - 会话：`/new`、`/clear`、`/sessions`、`/resume`、`/compact`、`/undo`、`/title`、`/status`、`/usage`。
 - 模式：`/permission`、`/yolo`、`/auto`、`/plan`、`/model`、`/effort`、`/thinking`、`/provider`。
+- `/effort [off|on|none|minimal|low|medium|high|xhigh|max]`：查看或设置思考强度。带参数直接生效（`on` 等价 `high`）；无参数打开选择器，优先展示当前模型 `support_efforts` 声明的等级。写入 `[thinking].effort`，优先级高于模型级 `default_effort`。
 - 扩展：`/mcp`、`/skills`、`/plugins`（多级弹窗管理已安装插件、marketplace 与安装来源）、`/plugins marketplace [source]`、`/plugins install <id-or-source>`、`/plugins update|enable|disable|remove|info <id>`、`/plugins reload`、`/tasks`、`/agents`（子 agent 状态与活动日志；正文不再灌入子 agent 输出）、`/goal`、`/swarm`、`/web`、`/prompts`。
 - 工具：`/init`、`/config`、`/auth`、`/reload`（同步热重载 TUI + server 配置，含新增模型；MCP/hooks 仍可能需重启）、`/add-dir`、`/btw`、`/fork`、`/search`、`/copy`、`/debug`。
 - `/btw <question>`：打开全屏 BTW 侧问（不写入主会话），状态入口显示在 `git:<branch>` 所在的第一行，不作为 session 标签。`Ctrl+G` 隐藏或再次呼出 BTW，回答会在后台继续；再次执行带问题的 `/btw` 会删除旧 BTW，并从命令执行时的当前主 session 创建新的上下文快照。BTW 与主窗口共用 Markdown 和 thinking 折叠样式；空输入时按 `Ctrl+D` 可取消并彻底删除 BTW。

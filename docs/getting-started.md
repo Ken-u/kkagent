@@ -84,6 +84,9 @@ model = "upstream-model-id"
 max_context_size = 131072
 max_output_size = 8192
 capabilities = ["tool_use"]
+# 推理强度（可选）：配置 default_effort 后无需全局 [thinking] 段即可启用思考。
+# support_efforts = ["low", "medium", "high"]  # GPT-5.6: ["none", "low", "medium", "high", "xhigh", "max"]
+# default_effort = "medium"
 ```
 
 `default_model` 是 kkagent 内部别名，必须和 `[models."..."]` 的名称完全一致；`models.*.model` 才是发送给上游的真实模型 ID。

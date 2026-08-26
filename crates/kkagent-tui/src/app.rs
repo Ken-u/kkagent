@@ -5881,7 +5881,30 @@ impl TuiApp {
                 }
             })
             .unwrap_or_else(|| "off".into());
-        let levels = ["off", "low", "medium", "high"];
+        // Prefer the active model's declared `support_efforts` when present;
+        // GPT-5.6 exposes `none`/`minimal`/`low`/`medium`/`high`/`xhigh`
+        // (plus `max` on some variants), older catalogs only low..high.
+        let levels: Vec<String> = self
+            .state
+            .model_alias
+            .as_deref()
+            .and_then(|alias| self.config.resolve_model(alias))
+            .map(|(model_config, _)| {
+                if model_config.support_efforts.is_empty() {
+                    Vec::new()
+                } else {
+                    model_config.support_efforts.clone()
+                }
+            })
+            .filter(|levels| !levels.is_empty())
+            .unwrap_or_else(|| {
+                [
+                    "off", "none", "minimal", "low", "medium", "high", "xhigh", "max",
+                ]
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect()
+            });
         let mut selected = 0;
         let items: Vec<ListPickerItem> = levels
             .iter()
@@ -5890,16 +5913,20 @@ impl TuiApp {
                 if *level == current {
                     selected = i;
                 }
-                let detail = match *level {
+                let detail = match level.as_str() {
                     "off" => "disable thinking",
+                    "none" => "no reasoning tokens",
+                    "minimal" => "barely any reasoning",
                     "low" => "light reasoning",
                     "medium" => "balanced",
                     "high" => "deep reasoning",
+                    "xhigh" => "extra-deep reasoning (GPT-5.x)",
+                    "max" => "maximum reasoning (GPT-5.6)",
                     _ => "",
                 };
                 ListPickerItem {
-                    id: (*level).into(),
-                    label: (*level).into(),
+                    id: level.clone(),
+                    label: level.clone(),
                     detail: detail.into(),
                 }
             })
@@ -5916,7 +5943,8 @@ impl TuiApp {
     }
 
     fn apply_effort_level(&mut self, level: &str) {
-        match level {
+        let normalized = level.trim().to_lowercase();
+        match normalized.as_str() {
             "off" => {
                 if let Some(ref mut t) = self.config.thinking {
                     t.enabled = false;
@@ -5929,13 +5957,40 @@ impl TuiApp {
                 }
                 self.system_message("Thinking: off".into());
             }
-            "low" | "medium" | "high" => {
+            "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" => {
+                // Validate against the active model's `support_efforts` when
+                // declared, so users get feedback instead of a silent 400.
+                let supported = self
+                    .state
+                    .model_alias
+                    .as_deref()
+                    .and_then(|alias| self.config.resolve_model(alias))
+                    .map(|(model_config, _)| {
+                        model_config.support_efforts.is_empty()
+                            || model_config
+                                .support_efforts
+                                .iter()
+                                .any(|e| e.eq_ignore_ascii_case(&normalized))
+                    })
+                    .unwrap_or(true);
+                if !supported {
+                    self.system_message(format!(
+                        "Model does not support effort '{normalized}' (supported: {})",
+                        self.state
+                            .model_alias
+                            .as_deref()
+                            .and_then(|alias| self.config.resolve_model(alias))
+                            .map(|(m, _)| m.support_efforts.join(", "))
+                            .unwrap_or_default()
+                    ));
+                    return;
+                }
                 self.config.thinking = Some(kkagent_config::ThinkingConfig {
                     enabled: true,
-                    effort: Some(level.to_string()),
+                    effort: Some(normalized.clone()),
                     keep: None,
                 });
-                self.system_message(format!("Thinking: on ({level})"));
+                self.system_message(format!("Thinking: on ({normalized})"));
             }
             _ => self.system_message(format!("Unknown effort level: {level}")),
         }
@@ -10342,10 +10397,17 @@ impl TuiApp {
                     self.open_effort_picker();
                 } else {
                     let effort = args.to_lowercase();
+                    let effort = if effort == "on" {
+                        "high".to_string()
+                    } else {
+                        effort
+                    };
                     match effort.as_str() {
-                        "off" | "low" | "medium" | "high" => self.apply_effort_level(&effort),
-                        "on" => self.apply_effort_level("high"),
-                        _ => self.system_message("Usage: /effort [off|low|medium|high]".into()),
+                        "off" | "none" | "minimal" | "low" | "medium" | "high" | "xhigh"
+                        | "max" => self.apply_effort_level(&effort),
+                        _ => self.system_message(
+                            "Usage: /effort [off|none|minimal|low|medium|high|xhigh|max]".into(),
+                        ),
                     }
                 }
             }

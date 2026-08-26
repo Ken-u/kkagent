@@ -594,6 +594,14 @@ async fn chat_completions_stream(
         if let Some(key) = &request.prompt_cache_key {
             body["prompt_cache_key"] = json!(key);
         }
+        // Chat Completions reasoning models (OpenAI o-series, GPT-5.x and
+        // compatible gateways) accept `reasoning_effort`. Only forward an
+        // explicit effort; the legacy budget mapping stays Responses-only.
+        if let Some(thinking) = &request.thinking {
+            if let Some(effort) = &thinking.effort {
+                body["reasoning_effort"] = json!(effort);
+            }
+        }
     }
 
     let resp = client

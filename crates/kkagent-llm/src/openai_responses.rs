@@ -123,10 +123,23 @@ pub async fn openai_responses_stream(
         body["prompt_cache_key"] = json!(key);
     }
     if let Some(t) = &request.thinking {
+        // An explicit effort (config `[thinking].effort` or per-model
+        // `default_effort`, including GPT-5.6 levels like `none`, `minimal`,
+        // `xhigh`) is forwarded verbatim; otherwise derive one from the
+        // budget so providers see a valid `reasoning.effort` either way.
         body["reasoning"] = json!({
-            "effort": if t.budget_tokens >= 16_000 { "high" }
-                      else if t.budget_tokens >= 4_000 { "medium" }
-                      else { "low" }
+            "effort": match t.effort.as_deref() {
+                Some(explicit) => explicit.to_string(),
+                None => {
+                    if t.budget_tokens >= 16_000 {
+                        "high".to_string()
+                    } else if t.budget_tokens >= 4_000 {
+                        "medium".to_string()
+                    } else {
+                        "low".to_string()
+                    }
+                }
+            }
         });
     }
 
@@ -367,7 +380,7 @@ async fn flush_tools(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{ChatMessage, ToolDef};
+    use crate::types::{ChatMessage, ThinkingParams, ToolDef};
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
@@ -564,5 +577,76 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(rx.recv().await, Some(StreamEvent::TextDelta(text)) if text == "hello"));
+    }
+
+    #[tokio::test]
+    async fn explicit_effort_is_forwarded_verbatim() {
+        // Captures the request body and returns it once the client finishes.
+        async fn serve_capturing(
+            body: &'static str,
+        ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let captured_server = std::sync::Arc::clone(&captured);
+            tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                loop {
+                    let mut bytes = [0_u8; 4096];
+                    let count = socket.read(&mut bytes).await.unwrap();
+                    if count == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&bytes[..count]);
+                    if let Some(end) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&request[..end]).to_string();
+                        let length: usize = head
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().ok())?
+                            })
+                            .unwrap_or(0);
+                        if request.len() >= end + 4 + length {
+                            break;
+                        }
+                    }
+                }
+                captured_server
+                    .lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&request).to_string());
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            });
+            (format!("http://{address}"), captured)
+        }
+
+        let sse = concat!(
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":4,\"output_tokens\":2}}}\n"
+        );
+        let (base_url, captured) = serve_capturing(sse).await;
+        let mut request = request();
+        request.thinking = Some(ThinkingParams {
+            budget_tokens: 10000,
+            adaptive: false,
+            effort: Some("xhigh".into()),
+        });
+        let (tx, _rx) = mpsc::channel(8);
+        openai_responses_stream(&Client::new(), &base_url, "token", request, tx)
+            .await
+            .unwrap();
+        let requests = captured.lock().unwrap();
+        let body = requests.last().unwrap();
+        assert!(
+            body.contains("\"reasoning\":{\"effort\":\"xhigh\"}"),
+            "explicit effort must be forwarded verbatim, got: {body}"
+        );
     }
 }

@@ -492,6 +492,16 @@ pub fn declares_image_input(capabilities: &[String]) -> bool {
     })
 }
 
+/// Known reasoning effort levels. Covers OpenAI Responses/Chat Completions
+/// (`none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` on GPT-5.6)
+/// plus the Anthropic adaptive thinking vocabulary.
+pub fn is_known_effort(effort: &str) -> bool {
+    matches!(
+        effort.trim().to_lowercase().as_str(),
+        "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
+    )
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThinkingConfig {
     #[serde(default)]
@@ -1178,6 +1188,35 @@ impl AppConfig {
             if model.max_context_size == Some(0) || model.max_output_size == Some(0) {
                 anyhow::bail!("model {alias} token limits must be greater than zero");
             }
+            if let Some(effort) = model.default_effort.as_deref() {
+                let effort = effort.trim();
+                if effort.is_empty() {
+                    anyhow::bail!("model {alias} default_effort must not be empty");
+                }
+                if !is_known_effort(effort) {
+                    anyhow::bail!(
+                        "model {alias} default_effort '{effort}' is not a known reasoning effort (expected one of: none, minimal, low, medium, high, xhigh, max)"
+                    );
+                }
+                if !model.support_efforts.is_empty()
+                    && !model
+                        .support_efforts
+                        .iter()
+                        .any(|e| e.eq_ignore_ascii_case(effort))
+                {
+                    anyhow::bail!(
+                        "model {alias} default_effort '{effort}' is not listed in its support_efforts"
+                    );
+                }
+            }
+            for effort in &model.support_efforts {
+                let effort = effort.trim();
+                if !is_known_effort(effort) {
+                    anyhow::bail!(
+                        "model {alias} support_efforts contains unknown effort '{effort}' (expected one of: none, minimal, low, medium, high, xhigh, max)"
+                    );
+                }
+            }
         }
         if !self.models.contains_key(default_model) {
             anyhow::bail!("default_model {default_model} is not present in [models]");
@@ -1776,6 +1815,45 @@ fallback = "default"
             .unwrap_err()
             .to_string()
             .contains("fast_model missing/fast is not present"));
+    }
+
+    #[test]
+    fn validates_model_default_effort_against_known_and_supported_efforts() {
+        let mut config = valid_config();
+        // Unknown effort vocabulary is rejected.
+        config.models.get_mut("test/model").unwrap().default_effort = Some("ultra".into());
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("default_effort 'ultra' is not a known reasoning effort"));
+
+        // Effort outside the model's declared support_efforts is rejected.
+        let mut config = valid_config();
+        let model = config.models.get_mut("test/model").unwrap();
+        model.support_efforts = vec!["low".into(), "medium".into()];
+        model.default_effort = Some("xhigh".into());
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("default_effort 'xhigh' is not listed in its support_efforts"));
+
+        // An effort listed in support_efforts passes.
+        let mut config = valid_config();
+        let model = config.models.get_mut("test/model").unwrap();
+        model.support_efforts = vec!["none".into(), "low".into(), "medium".into()];
+        model.default_effort = Some("medium".into());
+        config.validate().unwrap();
+
+        // support_efforts itself is validated against the known vocabulary.
+        let mut config = valid_config();
+        config.models.get_mut("test/model").unwrap().support_efforts = vec!["turbo".into()];
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("support_efforts contains unknown effort 'turbo'"));
     }
 
     #[test]

@@ -35,6 +35,16 @@ pub fn builtin_catalog() -> Vec<ModelCapabilityEntry> {
             responses_api: true,
         },
         ModelCapabilityEntry {
+            id: "gpt-5.6".into(),
+            provider: "openai".into(),
+            context_window: 1_050_000,
+            max_output: 128_000,
+            tools: true,
+            vision: true,
+            thinking: true,
+            responses_api: true,
+        },
+        ModelCapabilityEntry {
             id: "o4-mini".into(),
             provider: "openai".into(),
             context_window: 200_000,
