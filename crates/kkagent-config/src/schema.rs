@@ -398,6 +398,12 @@ pub struct ProviderConfig {
     pub provider_type: String,
     #[serde(default)]
     pub api_key: Option<String>,
+    /// Name of an environment variable that holds the API key. When set and
+    /// the variable is present (non-empty), it takes precedence over the
+    /// inline `api_key` field — matching the behavior of web search/fetch
+    /// services. Useful for keeping secrets out of `config.toml`.
+    #[serde(default)]
+    pub api_key_env: Option<String>,
     #[serde(default)]
     pub base_url: Option<String>,
     #[serde(default)]
@@ -1479,6 +1485,7 @@ mod tests {
             ProviderConfig {
                 provider_type: "openai".into(),
                 api_key: None,
+                api_key_env: None,
                 base_url: Some("https://example.test".into()),
                 custom_headers: HashMap::new(),
                 oauth: None,
@@ -1528,6 +1535,7 @@ mod tests {
         let mut provider = ProviderConfig {
             provider_type: "openai".into(),
             api_key: None,
+            api_key_env: None,
             base_url: None,
             custom_headers: HashMap::new(),
             oauth: None,

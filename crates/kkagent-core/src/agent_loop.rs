@@ -3813,6 +3813,7 @@ mod retry_tests {
             ProviderConfig {
                 provider_type: "openai-chat".into(),
                 api_key: Some("token".into()),
+                api_key_env: None,
                 base_url: Some(base_url),
                 custom_headers: HashMap::new(),
                 oauth: None,
@@ -3938,6 +3939,7 @@ mod retry_tests {
             ProviderConfig {
                 provider_type: "openai-chat".into(),
                 api_key: Some("token".into()),
+                api_key_env: None,
                 base_url: Some(base_url),
                 custom_headers: HashMap::new(),
                 oauth: None,
@@ -4113,6 +4115,7 @@ mod retry_tests {
                 ProviderConfig {
                     provider_type: "openai-chat".into(),
                     api_key: Some("token".into()),
+                    api_key_env: None,
                     base_url: Some(base_url),
                     custom_headers: HashMap::new(),
                     oauth: None,
@@ -4217,6 +4220,7 @@ mod retry_tests {
             ProviderConfig {
                 provider_type: "openai-chat".into(),
                 api_key: Some("token".into()),
+                api_key_env: None,
                 base_url: Some(base_url),
                 custom_headers: HashMap::new(),
                 oauth: None,
@@ -4357,6 +4361,7 @@ mod retry_tests {
             ProviderConfig {
                 provider_type: "openai-chat".into(),
                 api_key: Some("token".into()),
+                api_key_env: None,
                 base_url: Some(base_url),
                 custom_headers: HashMap::new(),
                 oauth: None,
@@ -4452,6 +4457,7 @@ mod retry_tests {
             ProviderConfig {
                 provider_type: "openai-chat".into(),
                 api_key: Some("token".into()),
+                api_key_env: None,
                 base_url: Some(base_url),
                 custom_headers: HashMap::new(),
                 oauth: None,
@@ -4553,6 +4559,7 @@ mod retry_tests {
             ProviderConfig {
                 provider_type: "openai-chat".into(),
                 api_key: Some("token".into()),
+                api_key_env: None,
                 base_url: Some(base_url),
                 custom_headers: HashMap::new(),
                 oauth: None,
@@ -4661,6 +4668,7 @@ mod retry_tests {
             ProviderConfig {
                 provider_type: "openai-chat".into(),
                 api_key: Some("token".into()),
+                api_key_env: None,
                 base_url: Some(base_url),
                 custom_headers: HashMap::new(),
                 oauth: None,
@@ -4853,6 +4861,7 @@ mod retry_tests {
             ProviderConfig {
                 provider_type: "openai-chat".into(),
                 api_key: Some("token".into()),
+                api_key_env: None,
                 base_url: Some(format!("http://{addr}")),
                 custom_headers: HashMap::new(),
                 oauth: None,
@@ -5101,6 +5110,7 @@ mod retry_tests {
             ProviderConfig {
                 provider_type: "openai-chat".into(),
                 api_key: Some("token".into()),
+                api_key_env: None,
                 base_url: Some(base_url),
                 custom_headers: HashMap::new(),
                 oauth: None,

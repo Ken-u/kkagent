@@ -789,6 +789,7 @@ async fn provision_managed_kimi_config(
         kkagent_config::ProviderConfig {
             provider_type: "kimi".into(),
             api_key: None,
+            api_key_env: None,
             base_url: Some(base_url.into()),
             custom_headers: HashMap::new(),
             oauth: Some(kkagent_config::ProviderOAuthConfig {

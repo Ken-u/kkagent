@@ -288,6 +288,19 @@ fn apply_env_overrides(config: &mut AppConfig) {
     {
         config.image.read_byte_budget = value;
     }
+    // Resolve `api_key_env` first — when set and the environment variable is
+    // present (non-empty), it takes precedence over the inline `api_key`,
+    // matching the behavior of web search/fetch services.
+    for p in config.providers.values_mut() {
+        if let Some(name) = p.api_key_env.as_deref() {
+            if let Ok(v) = std::env::var(name) {
+                let v = v.trim();
+                if !v.is_empty() {
+                    p.api_key = Some(v.to_string());
+                }
+            }
+        }
+    }
     // Inject API keys into first matching provider if empty
     if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
         for p in config.providers.values_mut() {
@@ -498,5 +511,90 @@ mod persisted_approval_tests {
         assert_eq!(b.rules[0].pattern, "Bash:git push");
         assert_eq!(b.rules[0].decision, "allow");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod api_key_env_tests {
+    use super::*;
+    use crate::schema::{AppConfig, ProviderConfig};
+    use std::collections::HashMap;
+
+    fn make_config(api_key: Option<&str>, api_key_env: Option<&str>) -> AppConfig {
+        let mut providers = HashMap::new();
+        providers.insert(
+            "test".to_string(),
+            ProviderConfig {
+                provider_type: "openai".to_string(),
+                api_key: api_key.map(str::to_string),
+                api_key_env: api_key_env.map(str::to_string),
+                base_url: None,
+                custom_headers: HashMap::new(),
+                oauth: None,
+                first_token_timeout_ms: None,
+            },
+        );
+        AppConfig {
+            providers,
+            ..Default::default()
+        }
+    }
+
+    /// `api_key_env` wins over inline `api_key` when the variable is set.
+    #[test]
+    fn env_var_takes_precedence_over_inline() {
+        let name = format!(
+            "KKAGENT_TEST_KEY_ENV_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        std::env::set_var(&name, "secret-from-env");
+
+        let mut config = make_config(Some("inline-secret"), Some(&name));
+        apply_env_overrides(&mut config);
+
+        assert_eq!(
+            config.providers["test"].api_key.as_deref(),
+            Some("secret-from-env")
+        );
+
+        std::env::remove_var(&name);
+    }
+
+    /// Falls back to inline `api_key` when the env var is unset.
+    #[test]
+    fn falls_back_to_inline_when_env_absent() {
+        let mut config = make_config(Some("inline-secret"), Some("KKAGENT_TEST_KEY_NEVER_SET_42"));
+        apply_env_overrides(&mut config);
+
+        assert_eq!(
+            config.providers["test"].api_key.as_deref(),
+            Some("inline-secret")
+        );
+    }
+
+    /// Empty env var value is ignored, falling back to inline.
+    #[test]
+    fn empty_env_value_falls_back_to_inline() {
+        let name = format!(
+            "KKAGENT_TEST_KEY_EMPTY_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        std::env::set_var(&name, "   ");
+
+        let mut config = make_config(Some("inline-secret"), Some(&name));
+        apply_env_overrides(&mut config);
+
+        assert_eq!(
+            config.providers["test"].api_key.as_deref(),
+            Some("inline-secret")
+        );
+
+        std::env::remove_var(&name);
     }
 }

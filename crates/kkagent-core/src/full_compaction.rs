@@ -888,6 +888,7 @@ mod tests {
         let provider = ProviderConfig {
             provider_type: "openai".into(),
             api_key: None,
+            api_key_env: None,
             base_url: Some("https://example.test".into()),
             custom_headers: HashMap::new(),
             oauth: None,

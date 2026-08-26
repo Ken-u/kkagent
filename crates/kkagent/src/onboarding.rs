@@ -79,6 +79,7 @@ pub fn run_init(
         ProviderConfig {
             provider_type: provider_type(&provider).to_owned(),
             api_key,
+            api_key_env: None,
             base_url,
             custom_headers: HashMap::new(),
             oauth: None,
