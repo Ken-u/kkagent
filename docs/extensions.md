@@ -248,6 +248,19 @@ MCP 工具（`mcp__*` 命名空间）不属于内置工具：`toolOverrides` 的
 执行时模板中的 `{{args}}`（全部参数）和 `{{arg0}}`、`{{arg1}}`…（逐词）展开为用户
 输入，渲染结果作为普通用户消息提交给 agent。旧版纯命令名列表仍兼容，仅出现在补全中。
 
+### 插件外部子 Agent（ACP 与 internal）
+
+`subagents` 字段把外部能力注册为新的子 Agent 类型，kkagent 两种执行方式：
+`transport: "acp"`（外部 agent 进程，典型 Cursor CLI 的 `agent acp` 模式，stdio
+JSON-RPC 驱动）与 `transport: "internal"`（进程内 kk agent loop：kk 模型 + 工具
+allowlist + 插件私有 MCP，委派时懒加载、主会话零上下文成本，适合接入工具很多的
+wiki/知识库）。类型以限定名 `<plugin-id>.<name>` 进入 `Agent` 工具的 profile 枚举，
+同步委派、后台运行 + `TaskOutput` 轮询、取消均与内建子 agent 一致，事件镜像一致。
+字段参考与完整示例见
+[插件开发指南](plugin-development.md#外部子-agentacp-与-internal)、
+`plugins/official/kk-cursor-agent/`（acp）与 `plugins/official/kk-wiki-agent/`
+（internal）。
+
 
 ### 插件市场
 

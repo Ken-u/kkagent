@@ -4,6 +4,7 @@
 
 mod auth;
 mod builtins;
+pub mod client;
 mod fs;
 mod terminal;
 mod types;
@@ -21,6 +22,10 @@ use tokio::task::JoinSet;
 
 pub use auth::{auth_methods, AuthTokenStore};
 pub use builtins::builtin_command_list;
+pub use client::{
+    AcpClient, AcpClientOptions, ExternalProgress, InitializeResult, PermissionPolicy,
+    PromptOutcome, DEFAULT_REQUEST_TIMEOUT,
+};
 pub use types::*;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -58,6 +58,7 @@
 | `services` | object | — | 服务后端覆盖（`webSearch`/`webFetch`），见[服务覆盖（免 MCP）](#服务覆盖免-mcp) |
 | `slashCommands` | array | — | 命令定义列表，见 [Slash 命令](#slash-命令) |
 | `mcpServers` | object | — | 工具服务声明，键为 server 名，见下表 |
+| `subagents` | array | — | 外部子 Agent 类型声明，见[外部子 Agent（ACP）](#外部子-agentacp) |
 | `interface` | object | — | 展示元数据：`displayName`、`shortDescription`、`longDescription`、`developerName`、`websiteURL` |
 
 ### `mcpServers.<name>` 字段
@@ -190,6 +191,98 @@ provider 取值与 wire 格式要求见 [configuration.md 的 Web 搜索](config
   模型 + 工具。
 - 旧版纯字符串列表（`"slashCommands": ["foo"]`）仍可解析，但只会出现在补全里，
   执行时提示无模板，新插件应一律用完整定义。
+
+## 外部子 Agent（ACP 与 internal）
+
+通过 `subagents` 字段注册新的 `Agent` 工具子类型（profile）。两种 transport：
+
+- **`acp`** — 外部 agent 进程（如 Cursor CLI 的 `agent acp`），kkagent 以 ACP 客户端
+  身份通过 stdio JSON-RPC 驱动；
+- **`internal`** — 进程内 kk agent loop：使用 kk 内部模型与工具，可配置工具
+  allowlist，并挂载**插件私有的 MCP server**（委派时懒加载，主会话零上下文成本）。
+  适合"工具很多但不想常驻主会话"的场景（如接入自己的 wiki）。
+
+外部示例见 `plugins/official/kk-cursor-agent/`，internal 示例见
+`plugins/official/kk-wiki-agent/`。
+
+```json
+"subagents": [
+  {
+    "name": "cursor",
+    "transport": "acp",
+    "description": "Cursor CLI agent driven over ACP; good for codebase-indexed search and edits",
+    "promptPrefix": "You are running as a delegated subagent inside kkagent.",
+    "autoApprove": true,
+    "allowDelegation": false,
+    "timeoutSecs": 600,
+    "transportConfig": {
+      "command": ["agent", "acp"],
+      "mode": "agent",
+      "skipAuth": true
+    },
+    "env": {}
+  },
+  {
+    "name": "search",
+    "transport": "internal",
+    "description": "Wiki research subagent (kk model + Read/Grep + private wiki MCP)",
+    "systemPrompt": "Prefer the wiki MCP tools over guessing.",
+    "promptPrefix": "You are a wiki research assistant.",
+    "tools": ["Read", "Grep", "wiki_search"],
+    "mcpServers": {
+      "wiki": { "command": "npx", "args": ["-y", "@example/wiki-mcp"] }
+    }
+  }
+]
+```
+
+### 通用字段（两种 transport 共用）
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `name` | string | ✅ 类型名，注册为限定名 `<plugin-id>.<name>`（如 `kk-wiki-agent.search`） |
+| `transport` | string | ✅ `"acp"` 或 `"internal"` |
+| `description` | string | 一句话能力描述，展示在 Agent 工具的 profile 说明里 |
+| `promptPrefix` | string | 追加在委派 prompt 前的固定说明 |
+| `allowDelegation` | bool | 默认 `false`：该类型不能再委派 kkagent 内建子 agent（防递归失控） |
+
+### `acp` 专有字段
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `autoApprove` | bool | 默认 `true`：自动批准外部 agent 的工具权限请求（`session/request_permission`）；`false` 时一律拒绝 |
+| `timeoutSecs` | number | 单个 ACP 请求超时，默认 300 |
+| `env` | object | 注入外部进程的环境变量（如 `CURSOR_API_KEY`） |
+| `transportConfig.command` | string[] | 启动命令，默认 `["agent", "acp"]`（Cursor CLI）；换成任意 ACP agent 即可接入其它后端 |
+| `transportConfig.cwd` | string | 外部进程工作目录；缺省为委派时的会话工作目录 |
+| `transportConfig.mode` | string | ACP 会话模式（Cursor CLI：`agent` / `plan` / `ask`） |
+| `transportConfig.skipAuth` | bool | 跳过 ACP `authenticate` 步骤（凭据已由环境注入时使用） |
+
+### `internal` 专有字段
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `systemPrompt` | string | 子 agent 人设，追加在工作区指令与通用子 agent 框架之后 |
+| `tools` | string[] | **allowlist**：只保留列出的工具（core 工具、Web、私有 MCP 工具都参与过滤）；缺省 = 继承默认子 agent 工具集 |
+| `mcpServers` | object | 插件私有的 MCP server，**委派时懒加载**。server 运行时名 `plugin-<plugin-id>:<server>`，工具命名空间压缩为 `<plugin_id>_<server>`（如 `wiki_search`），与主会话插件 MCP 规则一致 |
+
+行为要点：
+
+- 委派方式与内建 profile 完全一致：模型调用 `Agent`，传
+  `subagent_type: "<plugin-id>.<name>"`；同步 / `run_in_background` + `TaskOutput`
+  轮询 / 取消都由现有 SubagentManager 状态机承载。
+- 两种 transport 的事件镜像一致：父 TUI 显示 Spawned → 流式输出 + 工具活动行 →
+  Completed 摘要（400 字）。
+- internal 型的模型走标准子 agent 模型解析（`model` 传符号 token 可覆盖），插件
+  不能指定原始模型 id。
+- **嵌套委派**：`allowDelegation: true` 的 internal 型可以通过 Agent 工具再委派
+  其它 profile（内建与插件类型均可）；嵌套深度沿用全局 `[subagent] max_depth`
+  预算，超限的孙代请求会被拒绝并计入 TaskOutput。默认 `false` 时委派工具以空白
+  名单注册，模型调用得到明确拒绝。
+- 插件类型对内建 profile 的可见性遵循原委派白名单；coder 等 profile 默认**看不见**
+  插件类型，只有根会话与 `general` 可以委派。
+- 多个插件声明同名限定名时先注册者生效，冲突写入诊断日志。
+- `acp` 型的 agent 需自行完成认证（`agent login` 或环境变量注入凭据），kkagent 不代管。
 
 ## 本地测试与调试
 

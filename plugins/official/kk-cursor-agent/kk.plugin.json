@@ -1,0 +1,28 @@
+{
+  "name": "kk-cursor-agent",
+  "version": "1.0.0",
+  "description": "External subagent type backed by the Cursor CLI over ACP (`agent acp`).",
+  "systemPrompt": "The kk-cursor-agent plugin contributes the `kk-cursor-agent.cursor` subagent profile for the Agent tool. Use it when the user explicitly asks to delegate work to Cursor, or when a task benefits from Cursor's codebase-indexed retrieval. External subagents run with auto-approved tool permissions in the current workspace.",
+  "interface": {
+    "displayName": "KK Cursor Agent",
+    "shortDescription": "Cursor CLI as an external subagent (ACP)",
+    "developerName": "kkagent"
+  },
+  "subagents": [
+    {
+      "name": "cursor",
+      "transport": "acp",
+      "description": "Cursor CLI agent driven over ACP (agent acp); good for codebase-indexed search and edits",
+      "promptPrefix": "You are running as a delegated subagent inside kkagent. Work only inside the provided working directory and return a concise final summary.",
+      "autoApprove": true,
+      "allowDelegation": false,
+      "timeoutSecs": 600,
+      "transportConfig": {
+        "command": ["agent", "acp"],
+        "mode": "agent",
+        "skipAuth": true
+      },
+      "env": {}
+    }
+  ]
+}

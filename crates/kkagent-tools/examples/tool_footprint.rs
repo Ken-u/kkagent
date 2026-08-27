@@ -21,6 +21,7 @@ fn main() {
         launch,
         None,
         kkagent_config::ToolsConfig::default(),
+        Vec::new(),
     );
 
     let goal = Arc::new(kkagent_protocol::goal::GoalManager::new());

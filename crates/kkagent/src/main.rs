@@ -2059,12 +2059,26 @@ async fn run_dump_system_prompt(config_path: Option<&Path>) -> Result<()> {
     ));
     let launch: kkagent_tools::builtin::task::SubagentLaunchFn =
         Arc::new(|_config: kkagent_protocol::subagent::SubagentConfig, _interrupt| {});
+    // Mirror the real-turn path: external plugin profiles participate in the
+    // Agent tool's profile enum so offline inspection matches what a live
+    // turn registers.
+    let external_subagents = plugins.external_subagents().await;
+    let external_profiles = &external_subagents.0;
+    for conflict in &external_subagents.1 {
+        eprintln!(
+            "warning: external subagent type `{conflict}` declared by multiple plugins; first wins"
+        );
+    }
     kkagent_tools::register_subagent_tools(
         &mut tools,
         subagent_mgr,
         launch,
         None,
         config.tools.clone(),
+        external_profiles
+            .iter()
+            .map(|(name, spec)| (name.clone(), spec.description.clone()))
+            .collect(),
     );
     tools.register(Arc::new(kkagent_tools::builtin::GoalTool::new(Arc::new(
         kkagent_protocol::goal::GoalManager::new(),
@@ -3912,22 +3926,96 @@ async fn build_turn_tool_registry(
     let config = state.config();
     let max_depth = config.subagent.effective_max_depth();
     let launch_web = state.web.read().await.clone();
+    // Plugin-contributed external subagent types (e.g. Cursor CLI over ACP).
+    // Qualified names are `<plugin>.<name>`; the launch closure dispatches on
+    // them before falling through to the built-in in-process agent loop.
+    let external_subagents = state.plugins.external_subagents().await;
+    let external_profiles = &external_subagents.0;
+    for conflict in &external_subagents.1 {
+        tracing::warn!(
+            "external subagent type `{conflict}` declared by multiple plugins; first wins"
+        );
+    }
+    let external_map: std::collections::HashMap<String, kkagent_core::plugin::PluginSubagentSpec> =
+        external_profiles.iter().cloned().collect();
+    // Self-referential launch slot: internal plugin subagents with
+    // `allowDelegation: true` re-enter this same closure for nested spawns,
+    // so depth stamping and profile dispatch stay uniform at any nesting.
+    let launch_slot: Arc<std::sync::OnceLock<kkagent_tools::builtin::task::SubagentLaunchFn>> =
+        Arc::new(std::sync::OnceLock::new());
+    let launch_slot_for_closure = launch_slot.clone();
     let launch: kkagent_tools::builtin::task::SubagentLaunchFn =
         Arc::new(move |mut sub_config, interrupt| {
             let manager = subagents.clone();
             let app_config = config.clone();
             let web = launch_web.clone();
             let agent_id = sub_config.agent_id.clone();
-            // Depth budget, layer 2 (root launch stamp): every root-launched
-            // subagent starts at depth 1; reject loudly if that already exceeds
-            // the configured cap (e.g. max_depth = 0 pre-clamp).
-            if let Err(reason) = stamp_child_depth(&mut sub_config, 0, max_depth) {
-                tracing::warn!("Rejected root subagent {agent_id}: {reason}");
-                let manager = manager.clone();
-                tokio::spawn(async move {
-                    manager.fail(&agent_id, reason).await;
-                });
-                return;
+            // Nested-launch handle: the slot is filled right after this
+            // closure is constructed, before any agent can run.
+            let launch_self = launch_slot_for_closure.get().cloned().unwrap_or_else(|| {
+                Arc::new(|_cfg: kkagent_protocol::subagent::SubagentConfig, _interrupt| {})
+            });
+            // External dispatch: profiles like `kk-cursor.cursor` run through
+            // the plugin-declared transport instead of the internal loop.
+            if let Some(profile) = sub_config.profile.clone() {
+                if let Some(spec) = external_map.get(profile.as_str()) {
+                    let spec = spec.clone();
+                    let mirror = Some(SubagentMirrorContext {
+                        parent_session_id: sub_config.parent_session_id.clone().unwrap_or_default(),
+                        parent_tool_call_id: sub_config
+                            .parent_tool_call_id
+                            .clone()
+                            .unwrap_or_default(),
+                        parent_event_tx: event_tx.clone(),
+                    });
+                    let run_ctx = kkagent_core::external_subagent::ExternalRunContext {
+                        app_config: app_config.clone(),
+                        web: web.clone(),
+                        permission_mode: kkagent_protocol::PermissionMode::Auto,
+                        interrupt: Some(interrupt.clone()),
+                        launch: Some(launch_self),
+                    };
+                    let ext_agent_id = agent_id.clone();
+                    let ext_manager = manager.clone();
+                    let join = tokio::spawn(async move {
+                        tracing::info!(
+                            "Plugin subagent {ext_agent_id} starting via {} ({})",
+                            spec.transport,
+                            sub_config.description
+                        );
+                        match kkagent_core::external_subagent::run_external_subagent(
+                            &spec, sub_config, mirror, run_ctx,
+                        )
+                        .await
+                        {
+                            Ok(result) => ext_manager.complete(&ext_agent_id, result).await,
+                            Err(error) => ext_manager.fail(&ext_agent_id, error.to_string()).await,
+                        }
+                    });
+                    let abort = join.abort_handle();
+                    let abort_manager = manager;
+                    let abort_agent_id = agent_id;
+                    tokio::spawn(async move {
+                        abort_manager.set_abort_handle(&abort_agent_id, abort).await;
+                    });
+                    return;
+                }
+            }
+            // Depth budget, layer 2 (root launch stamp): root-launched
+            // subagents (depth 0 from the Agent tool) start at depth 1;
+            // reject loudly if that already exceeds the configured cap
+            // (e.g. max_depth = 0 pre-clamp). Nested re-entries (internal
+            // plugin subagents with allowDelegation) arrive pre-stamped by
+            // their delegating runtime and skip this layer.
+            if sub_config.depth == 0 {
+                if let Err(reason) = stamp_child_depth(&mut sub_config, 0, max_depth) {
+                    tracing::warn!("Rejected root subagent {agent_id}: {reason}");
+                    let manager = manager.clone();
+                    tokio::spawn(async move {
+                        manager.fail(&agent_id, reason).await;
+                    });
+                    return;
+                }
             }
             let abort_manager = manager.clone();
             let abort_agent_id = agent_id.clone();
@@ -3971,12 +4059,19 @@ async fn build_turn_tool_registry(
                 abort_manager.set_abort_handle(&abort_agent_id, abort).await;
             });
         });
+    // Fill the self-reference slot now that the closure exists (before any
+    // subagent can run — registration happens synchronously below).
+    let _ = launch_slot.set(launch.clone());
     kkagent_tools::register_subagent_tools(
         &mut tools,
         state.subagents.clone(),
         launch,
         None,
         state.config().tools.clone(),
+        external_profiles
+            .iter()
+            .map(|(name, spec)| (name.clone(), spec.description.clone()))
+            .collect(),
     );
     tools.register(Arc::new(
         kkagent_tools::builtin::TaskOutputTool::with_bash_shells(

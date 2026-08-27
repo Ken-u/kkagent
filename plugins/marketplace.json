@@ -40,6 +40,26 @@
       "description": "Official example service-override plugin: points the built-in Web tool at Brave Search without MCP.",
       "keywords": ["override", "services", "web", "no-mcp", "example"],
       "source": "./official/kk-web-brave"
+    },
+    {
+      "id": "kk-cursor-agent",
+      "type": "plugin",
+      "tier": "official",
+      "displayName": "KK Cursor Agent",
+      "version": "1.0.0",
+      "description": "Official example external-subagent plugin: registers the Cursor CLI (`agent acp`, ACP) as a delegatable subagent type.",
+      "keywords": ["subagent", "acp", "cursor", "example"],
+      "source": "./official/kk-cursor-agent"
+    },
+    {
+      "id": "kk-wiki-agent",
+      "type": "plugin",
+      "tier": "official",
+      "displayName": "KK Wiki Agent",
+      "version": "1.0.0",
+      "description": "Official example internal-subagent plugin: kk model + tool allowlist + plugin-private lazy MCP for wiki lookup.",
+      "keywords": ["subagent", "internal", "mcp", "wiki", "example"],
+      "source": "./official/kk-wiki-agent"
     }
   ]
 }

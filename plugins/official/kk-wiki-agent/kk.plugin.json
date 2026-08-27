@@ -1,0 +1,28 @@
+{
+  "name": "kk-wiki-agent",
+  "version": "1.0.0",
+  "description": "Internal subagent type: wiki lookup through a plugin-private MCP server, lazy-loaded per delegation.",
+  "systemPrompt": "The kk-wiki-agent plugin contributes the `kk-wiki-agent.search` subagent profile for the Agent tool. Use it when the user asks about product knowledge, internal docs or the team wiki — delegate a focused query instead of loading wiki tools into the main session.",
+  "interface": {
+    "displayName": "KK Wiki Agent",
+    "shortDescription": "Wiki lookup subagent with private lazy MCP",
+    "developerName": "kkagent"
+  },
+  "subagents": [
+    {
+      "name": "search",
+      "transport": "internal",
+      "description": "Wiki research subagent (kk model + Read/Grep + private wiki MCP, lazy-loaded)",
+      "promptPrefix": "You are a wiki research assistant. Search the wiki tools for the requested topic and answer with concrete citations (page titles). If the wiki has no relevant page, say so plainly.",
+      "systemPrompt": "Prefer the wiki.* MCP tools over guessing. Summarize findings in <= 300 words.",
+      "tools": ["Read", "Grep", "wiki_search"],
+      "mcpServers": {
+        "wiki": {
+          "command": "npx",
+          "args": ["-y", "@example/wiki-mcp"],
+          "env": { "WIKI_BASE_URL": "https://wiki.example.com" }
+        }
+      }
+    }
+  ]
+}

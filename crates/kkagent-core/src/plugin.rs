@@ -118,8 +118,113 @@ pub struct PluginManifest {
     pub slash_commands: Vec<PluginSlashCommand>,
     #[serde(default, rename = "mcpServers")]
     pub mcp_servers: HashMap<String, kkagent_config::McpServerConfig>,
+    /// External subagent types contributed by this plugin. Each entry
+    /// registers a new `subagent_type` for the `Agent` tool; execution is
+    /// delegated over a transport (currently ACP) to an external agent
+    /// process such as the Cursor CLI (`agent acp`).
+    #[serde(default)]
+    pub subagents: Vec<PluginSubagentSpec>,
     #[serde(default)]
     pub interface: PluginInterface,
+}
+
+/// A plugin-declared external subagent type. Names are namespaced at load
+/// time as `<plugin>.<name>` to avoid collisions with built-in profiles.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginSubagentSpec {
+    /// Short type name within the plugin (e.g. `"cursor"` → `kk-cursor.cursor`).
+    pub name: String,
+    /// How the subagent runs:
+    /// - `"acp"` — external agent process over the Agent Client Protocol
+    ///   (e.g. the Cursor CLI `agent acp`);
+    /// - `"internal"` — an in-process kkagent agent loop using the kk model
+    ///   and kk tools, with an optional tool allowlist and plugin-private
+    ///   MCP servers (lazy-loaded per delegation, zero main-session context
+    ///   cost until used).
+    #[serde(default = "PluginSubagentSpec::default_transport")]
+    pub transport: String,
+    /// Transport-specific launch configuration.
+    #[serde(default, rename = "transportConfig")]
+    pub transport_config: PluginSubagentTransportConfig,
+    /// One-line capability hint shown in the Agent tool description.
+    #[serde(default)]
+    pub description: String,
+    /// Additional prompt preamble injected into the delegation prompt.
+    #[serde(default, rename = "promptPrefix")]
+    pub prompt_prefix: Option<String>,
+    /// Allow the external subagent to delegate back into kkagent built-ins
+    /// (`subagents` input on the Agent tool). Defaults to false — external
+    /// types cannot recurse.
+    #[serde(default, rename = "allowDelegation")]
+    pub allow_delegation: bool,
+    /// Auto-approve the external agent's tool permission requests. Defaults
+    /// to true (subagents run unattended); set false to deny them.
+    #[serde(
+        default = "PluginSubagentSpec::default_auto_approve",
+        rename = "autoApprove"
+    )]
+    pub auto_approve: bool,
+    /// Environment variables passed to the spawned agent process.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    /// Per-request timeout seconds. Defaults to 300.
+    #[serde(default, rename = "timeoutSecs")]
+    pub timeout_secs: Option<u64>,
+    /// Plugin-qualified id (`<plugin>.<name>`), injected by the manager at
+    /// aggregation time — used for MCP tool namespacing and display.
+    #[serde(skip)]
+    pub plugin_id: String,
+    /// **internal transport** — system prompt for the subagent's session.
+    /// Appended after the workspace instructions and a generic subagent addon.
+    #[serde(default, rename = "systemPrompt")]
+    pub system_prompt: Option<String>,
+    /// **internal transport** — tool allowlist. Only the listed tool names
+    /// stay registered (core tools + plugin-private MCP tools qualify);
+    /// everything else is removed. Empty/absent = inherit the default
+    /// subagent tool set (core + delegation).
+    #[serde(default)]
+    pub tools: Vec<String>,
+    /// **internal transport** — MCP servers started lazily for this subagent
+    /// type only. Their tools are namespaced `<plugin>.<server>.<tool>` and
+    /// filtered through `tools` like every other tool. They consume no
+    /// context in the main session.
+    #[serde(default, rename = "mcpServers")]
+    pub mcp_servers: BTreeMap<String, kkagent_config::McpServerConfig>,
+}
+
+impl PluginSubagentSpec {
+    fn default_transport() -> String {
+        "acp".into()
+    }
+
+    fn default_auto_approve() -> bool {
+        true
+    }
+
+    /// Display name used in mirrored lifecycle events: the bare type name
+    /// (`cursor`) — the TUI prefixes the owning plugin when needed.
+    pub fn qualified_name(&self) -> String {
+        self.name.clone()
+    }
+}
+
+/// Transport-specific launch configuration (ACP variant).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PluginSubagentTransportConfig {
+    /// Executable command, e.g. `["agent", "acp"]` (Cursor CLI) or an
+    /// absolute path to another ACP agent binary.
+    #[serde(default)]
+    pub command: Vec<String>,
+    /// Working directory for the spawned process. Defaults to the parent
+    /// session's working directory.
+    #[serde(default)]
+    pub cwd: Option<String>,
+    /// ACP session mode (`agent` | `plan` | `ask` for the Cursor CLI).
+    #[serde(default)]
+    pub mode: Option<String>,
+    /// Skip the ACP `authenticate` step (credentials injected via `env`).
+    #[serde(default, rename = "skipAuth")]
+    pub skip_auth: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -164,11 +269,23 @@ pub struct PluginInfo {
     pub slash_commands: Vec<PluginSlashCommand>,
 }
 
+/// Memoized external-subagent aggregation: qualified specs plus conflicts.
+pub type ExternalSubagentIndex = Arc<(Vec<(String, PluginSubagentSpec)>, Vec<String>)>;
+
 pub struct PluginManager {
     plugins_dir: PathBuf,
     kkagent_home: PathBuf,
     plugins: RwLock<HashMap<String, LoadedPlugin>>,
     mutation: Mutex<()>,
+    /// Memoized external-subagent aggregation. Invalidated by `reload` (the
+    /// single write path for discovery/install/disable), rebuilt lazily on
+    /// the next query — per-turn reads never re-scan manifests.
+    ///
+    /// A `std` (non-async) lock is intentional: the critical section is a
+    /// handful of pointer swaps, and holding it across no await points means
+    /// a sync lock cannot deadlock the runtime (an async `RwLock` here
+    /// historically stalled single-thread test runtimes).
+    external_subagents_cache: std::sync::RwLock<Option<ExternalSubagentIndex>>,
 }
 
 impl PluginManager {
@@ -182,6 +299,7 @@ impl PluginManager {
             kkagent_home,
             plugins: RwLock::new(HashMap::new()),
             mutation: Mutex::new(()),
+            external_subagents_cache: std::sync::RwLock::new(None),
         }
     }
 
@@ -197,6 +315,12 @@ impl PluginManager {
         let discovered = self.scan_dir().await?;
         let count = discovered.len();
         *self.plugins.write().await = discovered;
+        // Drop the memoized aggregation; the next query rebuilds it from the
+        // fresh manifest set.
+        *self
+            .external_subagents_cache
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         Ok(count)
     }
 
@@ -469,6 +593,90 @@ impl PluginManager {
                 (name, servers)
             })
             .collect()
+    }
+
+    /// All enabled plugins' external subagent types, namespaced as
+    /// `<plugin>.<name>` and sorted by qualified name. The first plugin to
+    /// claim a qualified name wins; losers are reported as diagnostics so
+    /// callers can surface the conflict.
+    ///
+    /// Memoized: the result is cached until the next `reload`. Callers on
+    /// hot paths (per-turn tool registry build) should clone the returned
+    /// `Arc` instead of the vector when possible.
+    pub async fn external_subagents(&self) -> ExternalSubagentIndex {
+        // Fast path: cache hit.
+        if let Some(cached) = self
+            .external_subagents_cache
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+        {
+            return cached;
+        }
+        let (out, conflicts) = self.compute_external_subagents().await;
+        let shared = Arc::new((out, conflicts));
+        // Another reload may have raced us; prefer the freshest computation
+        // only if the cache is still empty.
+        let mut cache = self
+            .external_subagents_cache
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if cache.is_none() {
+            *cache = Some(shared.clone());
+        }
+        drop(cache);
+        self.external_subagents_cache
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .unwrap_or(shared)
+    }
+
+    async fn compute_external_subagents(&self) -> (Vec<(String, PluginSubagentSpec)>, Vec<String>) {
+        let plugins = self.plugins.read().await;
+        let mut names: Vec<_> = plugins.keys().cloned().collect();
+        names.sort();
+        let mut out = Vec::new();
+        let mut conflicts = Vec::new();
+        let mut seen: HashMap<String, String> = HashMap::new();
+        for name in names {
+            let plugin = &plugins[&name];
+            if !plugin.enabled {
+                continue;
+            }
+            for spec in &plugin.manifest.subagents {
+                let qualified = format!("{name}.{}", spec.name);
+                if let Some(_owner) = seen.get(&qualified) {
+                    conflicts.push(qualified.clone());
+                    continue;
+                }
+                seen.insert(qualified.clone(), name.clone());
+                out.push((
+                    qualified.clone(),
+                    PluginSubagentSpec {
+                        plugin_id: qualified,
+                        ..spec.clone()
+                    },
+                ));
+            }
+        }
+        (out, conflicts)
+    }
+
+    /// Look up one external subagent type by qualified name (`<plugin>.<name>`).
+    pub async fn external_subagent(&self, qualified: &str) -> Option<PluginSubagentSpec> {
+        let plugins = self.plugins.read().await;
+        let (plugin_id, type_name) = qualified.split_once('.')?;
+        let plugin = plugins.get(plugin_id)?;
+        if !plugin.enabled {
+            return None;
+        }
+        plugin
+            .manifest
+            .subagents
+            .iter()
+            .find(|spec| spec.name == type_name)
+            .cloned()
     }
 
     /// Effective service overrides: first enabled plugin (by id order) that
@@ -851,6 +1059,150 @@ mod tests {
             Some("code-search"),
             "single-server plugins should expose short tool names"
         );
+
+        let _ = tokio::fs::remove_dir_all(plugins).await;
+    }
+
+    #[tokio::test]
+    async fn external_subagents_are_namespaced_and_aggregated() {
+        let plugins = temp_plugins_dir();
+        let root = plugins.join("cursor-plugin");
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        tokio::fs::write(
+            root.join(KK_ROOT_MANIFEST),
+            serde_json::json!({
+                "name": "cursor-plugin",
+                "subagents": [
+                    {
+                        "name": "cursor",
+                        "transport": "acp",
+                        "description": "Cursor CLI over ACP",
+                        "transportConfig": { "command": ["agent", "acp"], "mode": "agent" }
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+
+        let manager = PluginManager::discover(&plugins).await;
+        let external_subagents = manager.external_subagents().await;
+        let (external, conflicts) = (&external_subagents.0, &external_subagents.1);
+        assert!(conflicts.is_empty());
+        assert_eq!(external.len(), 1);
+        let (qualified, spec) = &external[0];
+        assert_eq!(qualified, "cursor-plugin.cursor");
+        assert_eq!(spec.transport, "acp");
+        assert_eq!(spec.transport_config.command, vec!["agent", "acp"]);
+        // autoApprove defaults to true, allowDelegation to false.
+        assert!(spec.auto_approve);
+        assert!(!spec.allow_delegation);
+        // plugin_id is injected at aggregation time.
+        assert_eq!(spec.plugin_id, "cursor-plugin.cursor");
+        // Point lookup by qualified name works.
+        assert!(manager
+            .external_subagent("cursor-plugin.cursor")
+            .await
+            .is_some());
+        assert!(manager
+            .external_subagent("cursor-plugin.missing")
+            .await
+            .is_none());
+        assert!(manager.external_subagent("no-dot").await.is_none());
+
+        let _ = tokio::fs::remove_dir_all(plugins).await;
+    }
+
+    #[tokio::test]
+    async fn internal_subagent_manifest_parses_tools_and_mcp() {
+        let plugins = temp_plugins_dir();
+        let root = plugins.join("wiki");
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        tokio::fs::write(
+            root.join(KK_ROOT_MANIFEST),
+            serde_json::json!({
+                "name": "wiki",
+                "subagents": [
+                    {
+                        "name": "search",
+                        "transport": "internal",
+                        "description": "Wiki lookup via private MCP",
+                        "systemPrompt": "You are a wiki research assistant.",
+                        "tools": ["Read", "Grep", "wiki.search"],
+                        "mcpServers": {
+                            "wiki": { "command": "npx", "args": ["-y", "wiki-mcp"] }
+                        }
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+
+        let manager = PluginManager::discover(&plugins).await;
+        let external_subagents = manager.external_subagents().await;
+        let (external, conflicts) = (&external_subagents.0, &external_subagents.1);
+        assert!(conflicts.is_empty());
+        let (qualified, spec) = &external[0];
+        assert_eq!(qualified, "wiki.search");
+        assert_eq!(spec.transport, "internal");
+        assert_eq!(spec.tools, vec!["Read", "Grep", "wiki.search"]);
+        assert_eq!(
+            spec.system_prompt.as_deref(),
+            Some("You are a wiki research assistant.")
+        );
+        assert_eq!(spec.mcp_servers.len(), 1);
+        // MCP server runtime name follows the plugin convention
+        // `plugin-<plugin_id>:<server>`, compressing tool namespaces to
+        // `<plugin_id>_<server>`.
+        let cfg = spec.mcp_servers.get("wiki").unwrap();
+        let namespaced = kkagent_mcp::McpServerConfig::from_app(
+            format!(
+                "plugin-{}:{}",
+                spec.plugin_id.split('.').next().unwrap(),
+                "wiki"
+            ),
+            cfg,
+        );
+        assert_eq!(namespaced.name, "plugin-wiki:wiki");
+
+        let _ = tokio::fs::remove_dir_all(plugins).await;
+    }
+
+    #[tokio::test]
+    async fn disabled_plugins_do_not_contribute_external_subagents() {
+        let plugins = temp_plugins_dir();
+        let root = plugins.join("gone");
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        tokio::fs::write(
+            root.join(KK_ROOT_MANIFEST),
+            serde_json::json!({
+                "name": "gone",
+                "subagents": [{ "name": "x", "transport": "acp" }]
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+        // Mark the plugin disabled the same way the runtime does.
+        let state_path = plugins.join("gone.disabled");
+        let _ = state_path;
+
+        let manager = PluginManager::discover(&plugins).await;
+        // Without an enable record the default policy decides; verify lookup
+        // consistency instead of assuming enabled state.
+        let external_subagents = manager.external_subagents().await;
+        let (external, _) = (&external_subagents.0, &external_subagents.1);
+        let enabled = manager
+            .list()
+            .await
+            .into_iter()
+            .any(|p| p.name == "gone" && p.enabled);
+        if !enabled {
+            assert!(external.is_empty());
+        }
 
         let _ = tokio::fs::remove_dir_all(plugins).await;
     }

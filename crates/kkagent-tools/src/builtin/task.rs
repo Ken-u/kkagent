@@ -358,9 +358,45 @@ pub struct AgentTool {
     allowed_subagents: Option<Vec<String>>,
     tools_config: kkagent_config::ToolsConfig,
     description: String,
+    /// Unmodified base description, kept so `with_external_profiles` can
+    /// rebuild the composed description when external profiles arrive later.
+    base_description: String,
+    /// Plugin-contributed external subagent types, qualified names
+    /// (`<plugin>.<name>`) with a one-line capability hint each.
+    external_profiles: Vec<(String, String)>,
 }
 
 impl AgentTool {
+    /// Built-in profile enum plus any plugin-contributed external types.
+    fn profile_enum(external: &[(String, String)]) -> Vec<String> {
+        let mut profiles = vec![
+            "general".to_string(),
+            "explore".to_string(),
+            "coder".to_string(),
+        ];
+        for (name, _) in external {
+            if !profiles.contains(name) {
+                profiles.push(name.clone());
+            }
+        }
+        profiles
+    }
+
+    /// Schema description for the profile field, documenting external types.
+    fn profile_description(external: &[(String, String)]) -> String {
+        if external.is_empty() {
+            return "Agent profile (default coder)".to_string();
+        }
+        let extras: Vec<String> = external
+            .iter()
+            .map(|(name, hint)| format!("`{name}` ({hint})"))
+            .collect();
+        format!(
+            "Agent profile (default coder). External plugin profiles: {}.",
+            extras.join("; ")
+        )
+    }
+
     pub fn new(subagent_mgr: Arc<SubagentManager>, launch: SubagentLaunchFn) -> Self {
         Self::with_allowed_subagents(subagent_mgr, launch, None)
     }
@@ -396,8 +432,29 @@ re-prompt finished agents. After launching, collect results with TaskOutput.",
             launch,
             allowed_subagents,
             tools_config,
+            base_description: description.clone(),
             description,
+            external_profiles: Vec::new(),
         }
+    }
+
+    /// Declare plugin-contributed external subagent types so they appear in
+    /// the tool schema and are accepted by the delegation allowlist. Call
+    /// before registering the tool in a registry.
+    pub fn with_external_profiles(mut self, profiles: Vec<(String, String)>) -> Self {
+        for (name, _) in &profiles {
+            if let Some(allowlist) = &mut self.allowed_subagents {
+                if !allowlist.iter().any(|a| a == name) {
+                    allowlist.push(name.clone());
+                }
+            }
+        }
+        self.external_profiles = profiles;
+        if !self.external_profiles.is_empty() {
+            self.description =
+                delegation_description(&self.base_description, self.allowed_subagents.as_deref());
+        }
+        self
     }
 
     fn default_profile_of(input: &Value) -> String {
@@ -727,8 +784,8 @@ impl Tool for AgentTool {
                 "prompt": {"type": "string", "description": "The detailed task for a single subagent"},
                 "profile": {
                     "type": "string",
-                    "enum": ["general", "explore", "coder"],
-                    "description": "Agent profile (default coder)"
+                    "enum": Self::profile_enum(&self.external_profiles),
+                    "description": Self::profile_description(&self.external_profiles)
                 },
                 "subagent_type": {"type": "string", "description": "Alias for profile"},
                 "model": {

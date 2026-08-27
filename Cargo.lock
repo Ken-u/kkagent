@@ -1545,6 +1545,7 @@ dependencies = [
  "futures",
  "hex",
  "image",
+ "kkagent-acp",
  "kkagent-config",
  "kkagent-llm",
  "kkagent-mcp",

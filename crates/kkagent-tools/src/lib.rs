@@ -291,21 +291,29 @@ pub fn register_core_tools(registry: &mut ToolRegistry) {
 }
 
 /// Register host-backed task and subagent tools with the caller's delegation policy.
+///
+/// `external_profiles` are plugin-contributed subagent types (qualified
+/// `<plugin>.<name>` plus a capability hint) surfaced in the Agent tool's
+/// profile enum and merged into the delegation allowlist.
 pub fn register_subagent_tools(
     registry: &mut ToolRegistry,
     manager: std::sync::Arc<kkagent_protocol::subagent::SubagentManager>,
     launch: builtin::task::SubagentLaunchFn,
     allowed_subagents: Option<Vec<String>>,
     tools_config: kkagent_config::ToolsConfig,
+    external_profiles: Vec<(String, String)>,
 ) {
     use std::sync::Arc;
 
-    registry.register(Arc::new(builtin::AgentTool::with_config(
-        manager.clone(),
-        launch.clone(),
-        allowed_subagents.clone(),
-        tools_config.clone(),
-    )));
+    registry.register(Arc::new(
+        builtin::AgentTool::with_config(
+            manager.clone(),
+            launch.clone(),
+            allowed_subagents.clone(),
+            tools_config.clone(),
+        )
+        .with_external_profiles(external_profiles.clone()),
+    ));
     registry.register(Arc::new(builtin::agent_swarm::AgentSwarmTool::new(
         manager.clone(),
         launch,
@@ -313,6 +321,24 @@ pub fn register_subagent_tools(
         tools_config,
     )));
     registry.register(Arc::new(builtin::TaskOutputTool::new(manager)));
+}
+
+/// Compatibility shim for callers without external plugin profiles.
+pub fn register_subagent_tools_basic(
+    registry: &mut ToolRegistry,
+    manager: std::sync::Arc<kkagent_protocol::subagent::SubagentManager>,
+    launch: builtin::task::SubagentLaunchFn,
+    allowed_subagents: Option<Vec<String>>,
+    tools_config: kkagent_config::ToolsConfig,
+) {
+    register_subagent_tools(
+        registry,
+        manager,
+        launch,
+        allowed_subagents,
+        tools_config,
+        Vec::new(),
+    )
 }
 
 /// Backward-compatible main-agent core registration.
@@ -389,6 +415,7 @@ mod profile_tool_tests {
             Arc::new(|_, _interrupt| {}),
             kkagent_protocol::subagent::allowed_subagents_for(profile),
             kkagent_config::ToolsConfig::default(),
+            Vec::new(),
         );
         // Mirror the subagent runtime path: Web is offered to subagents
         // whenever web services are configured, then narrowed per profile.
@@ -496,6 +523,7 @@ mod disclosure_tests {
             launch,
             None,
             kkagent_config::ToolsConfig::default(),
+            Vec::new(),
         );
         let goal = Arc::new(kkagent_protocol::goal::GoalManager::new());
         registry.register(Arc::new(builtin::GoalTool::new(goal)));

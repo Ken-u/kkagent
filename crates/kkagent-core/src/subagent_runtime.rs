@@ -180,6 +180,7 @@ fn run_subagent_mirrored_boxed(
             nested_launch,
             allowed_subagents,
             app_config.tools.clone(),
+            Vec::new(),
         );
         // Web access for subagents: registered from the same config snapshot
         // as the parent turn (plugin overrides applied) and then kept only
@@ -372,7 +373,7 @@ async fn persist_subagent_output(cfg: &SubagentConfig, result: &str) {
     let _ = tokio::fs::write(path, body).await;
 }
 
-fn extract_final_assistant_text(session: &Session) -> String {
+pub(crate) fn extract_final_assistant_text(session: &Session) -> String {
     for msg in session.messages.iter().rev() {
         if msg.role != "assistant" {
             continue;

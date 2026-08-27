@@ -27,6 +27,7 @@ image = { workspace = true }
 reqwest = { workspace = true }
 semver = { workspace = true }
 zip = { workspace = true }
+kkagent-acp = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
