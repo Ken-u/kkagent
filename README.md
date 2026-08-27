@@ -7,16 +7,58 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust: 1.88+](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org/)
 
-用 Rust 实现、面向生产使用的终端 Coding Agent，核心交互与运行时对齐 kimi-code CLI。
-TUI 与 Agent Server 可分离，中间走 RPC（默认进程内 memory transport；也支持独立 `server` 模式）。
+可后台持续运行、可恢复、原生跨平台的 Rust 终端 Coding Agent。
 
-- 低内存、高性能
-- 支持 Win / macOS / Linux（x86_64 / arm64）
-- 权限模式：`manual` / `yolo` / `auto` / `plan`
-- 内置工具：Read / Write / Edit / Grep / Glob / Bash / TodoList / Goal / Task / AskUser / SelectTools / Cron / Web / Media / Skill / Plan
-- 会话、事件、turn 队列和后台 Agent 任务统一持久化到 `~/.kkagent/transcripts.db`
-- Bash 系统隔离：Linux Bubblewrap、macOS Seatbelt、Windows Job Object
-- MCP / Skills / Hooks / 插件市场（配置驱动）
+kkagent 是一个用 Rust 实现的终端 Coding Agent，重点增强长任务运行、多会话协作、上下文恢复和本地安全控制。
+
+- **任务不中断**：按 `Ctrl+B` 离开 TUI，独立 Agent Server 与进行中的任务继续运行；再次执行 `kk` 自动恢复现场。
+- **主线不被打断**：通过会话标签、`/fork` 和 BTW 全屏侧问工作区并行探索不同问题。
+- **安全可控**：提供 `manual` / `auto` / `yolo` / `plan` 四种权限模式，以及系统级 Bash 沙箱。
+- **原生跨平台**：Rust 单二进制分发，无 Node.js 运行时依赖；支持 Windows / macOS / Linux（x86_64 / arm64）。
+- **可扩展**：内置 MCP、Skills、Hooks、Web UI、ACP 和插件市场，可用于交互开发、远程接入与 CI 自动化。
+
+<p align="center">
+  <img src="docs/output.gif" alt="kkagent 终端 Coding Agent 演示" width="800">
+</p>
+
+[快速安装](#快速安装) · [30 秒上手](#30-秒上手) · [功能亮点](#功能亮点) · [完整文档](#文档索引)
+
+## 为什么选择 kkagent
+
+| 你关心的问题 | kkagent 的处理方式 |
+|---|---|
+| 关闭 TUI 后任务会不会中断？ | 独立 Server 持续运行，重新执行 `kk` 自动恢复会话和进行中的任务。 |
+| 同时探索多个方向会不会弄乱上下文？ | 会话标签、`/fork` 与 BTW 侧问工作区相互隔离，主对话无需停下来。 |
+| Agent 执行命令是否安全？ | 四种权限模式、系统级 Bash 沙箱、隐私路径策略与审计记录共同控制风险。 |
+| 长会话或意外断线后能否继续？ | 会话、事件、turn 队列和后台任务写入 SQLite，支持重启、断线和压缩后的恢复。 |
+| 能否接入现有开发流程？ | 支持非交互模式、结构化输入输出、MCP、ACP、Web UI、插件与远程执行环境。 |
+
+### 功能亮点
+
+差异化能力主要集中在后台运行、会话导航和终端体验：
+
+| 功能 | 快捷键 / 命令 | 带来的体验 |
+|---|---|---|
+| 会话后台 detach | `Ctrl+B` | 退出 TUI 而不中断整个会话；后台 turn 继续运行，再次执行 `kk` 自动恢复。 |
+| 会话标签页 | 空输入时 `Tab` / `←` / `→` · `Ctrl+Shift+Tab` | 在 `/new`、`/fork` 派生的会话族之间快速切换，底部常驻会话条。 |
+| BTW 全屏侧问 | `/btw` · `Ctrl+G` | 从当前会话快照独立提问，不污染或阻塞主对话。 |
+| Todo 贴底面板 | 自动 | 任务状态常驻输入框上方，并按终端宽度自动折叠。 |
+| 会话记录搜索 | `Ctrl+F` | 对整个 transcript 全文搜索，快速定位历史结论。 |
+| Emacs 风格行编辑 | `Ctrl+K` / `Ctrl+W` / `Ctrl+Y` / `Ctrl+Z` / `Ctrl+Shift+Z` | kill line / kill word / yank / undo / redo。 |
+| 原生 scrollback | `--no-alt-screen` | 保留终端原生滚动缓冲，方便翻页、选择和复制。 |
+| 强制全量重绘 | `F5` | 修复 SSH / 老终端下的撕裂帧与幽灵字符。 |
+| 非交互编排 | `--max-turns` · `--input-format` | 限制任务轮数，并用 stream-json 驱动 Agent。 |
+| Shell 补全 | `kkagent completions` | 生成 bash / zsh / fish / PowerShell 补全脚本。 |
+
+此外还支持独立 Server 生命周期管理、运行中输入排队、大段粘贴自动折叠，以及鼠标滚动与拖拽复制。
+
+### 适合这些场景
+
+- 运行耗时较长的 Coding Agent 任务，希望离开终端后任务仍能继续。
+- 同时维护多个会话、分支或探索方向，又不希望上下文互相干扰。
+- 需要明确的权限审批、系统沙箱、凭据保护和审计轨迹。
+- 希望以单二进制方式部署到 Windows、macOS、Linux 或远程开发机。
+- 需要通过脚本、CI、Web UI、ACP、MCP 或插件扩展 Agent 工作流。
 
 ## 快速安装
 
@@ -30,7 +72,7 @@ curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/Ken-u/kk
 
 ```bash
 curl --proto '=https' --tlsv1.2 -fsSLO https://raw.githubusercontent.com/Ken-u/kkagent/main/install.sh
-KKAGENT_INSTALL_DIR="$HOME/bin" KKAGENT_VERSION=0.2.0 sh install.sh
+KKAGENT_INSTALL_DIR="$HOME/bin" KKAGENT_VERSION=<version> sh install.sh
 KKAGENT_TARGET=x86_64-unknown-linux-gnu sh install.sh
 ```
 
@@ -65,14 +107,16 @@ curl -fsSLO https://raw.githubusercontent.com/Ken-u/kkagent/main/install.ps1
 默认安装到 `%LOCALAPPDATA%\Programs\kkagent`，可通过环境变量覆盖：
 
 ```powershell
-$env:KKAGENT_INSTALL_DIR = "$env:USERPROFILE\bin"; .\install.ps1 -Version 0.2.0
+$env:KKAGENT_INSTALL_DIR = "$env:USERPROFILE\bin"; .\install.ps1 -Version <version>
 ```
 
 安装完成后可执行 `kkagent-update.ps1` 升级，并沿用原安装目录。
 
 ## 30 秒上手
 
-1. 初始化配置（交互式向导）：
+kkagent 支持 Anthropic、Kimi、OpenAI / OpenAI Responses、Google Gemini 以及 OpenAI 兼容端点，可同时配置多个模型并按会话切换。
+
+1. 初始化配置（交互式向导，也可在这里完成 Kimi 托管账号登录）：
 
 ```bash
 kkagent init
@@ -82,16 +126,24 @@ kkagent init
 
 ```toml
 default_model = "kimi-k2-0711-preview"
+
+[providers.kimi]
+type = "kimi"
+base_url = "https://api.moonshot.cn/v1"
+# 推荐：用环境变量引用密钥，避免明文提交
+api_key_env = "KIMI_API_KEY"
+
+[models."kimi-k2-0711-preview"]
+provider = "kimi"
+
 # 可选：主模型耗尽正常单步重试后切换到此模型
 # fallback_model = "backup-model"
 
-[providers.kimi]
-api_base = "https://api.moonshot.cn/v1"
-api_key = "sk-..."
-
 [permissions]
-default_mode = "manual"
+default_permission_mode = "manual"
 ```
+
+> 配置密钥更推荐通过环境变量（`api_key_env`）或 `kkagent auth login` 注入，避免在配置文件中明文保存 API Key。完整字段说明见[配置参考](#配置参考)与 `docs/configuration.md`。
 
 2. 启动 TUI：
 
@@ -117,18 +169,28 @@ kk -y -p "Read ./Cargo.toml and count workspace members"
 
 ## 核心特性
 
-- **原生 Rust**：单二进制、低内存、秒级启动，跨平台原生支持。
+- **原生 Rust**：单二进制分发，无 Node.js 运行时依赖，跨平台原生支持。
 - **Agent 运行时**：多轮对话、工具调用循环、自动上下文压缩、token 预算与 turn 预算管理。
-- **TUI / Server 分离**：默认 TUI 与 Agent Server 在同一进程内通过 memory transport 通信；可用 `kkagent server` 启动独立后台，通过 UDS / TCP 连接。
-- **权限模型**：
-  - `manual`：每次写操作、Bash 等需要人工确认。
-  - `auto`：仅写文件与危险命令需确认，只读操作自动通过。
-  - `yolo`：完全自动通过，适合受信任的 CI / 自动化场景。
-  - `plan`：先审阅计划再执行，默认只读倾向。
-- **沙箱隔离**：Bash 默认使用系统级沙箱（Linux Bubblewrap、macOS Seatbelt、Windows Job Object），支持只读 / 限制网络等策略。
-- **持久化**：会话、事件、turn 队列和后台 Agent 任务统一写入 `~/.kkagent/transcripts.db`，支持 `--resume` 恢复。
-- **MCP、Skills 与插件**：通过配置接入外部 MCP Server，用 Skill 封装常用提示词和工具组合；`/plugins` 从 marketplace 安装、更新和管理插件。
-- **可观测性**：结构化日志、HTTP 审计日志、telemetry 事件（可配置上报）。
+- **TUI / Server 分离**：默认使用进程内 memory transport，也可通过 UDS / TCP 连接独立 Server，并用 `Ctrl+B` 将整个会话留在后台运行。
+- **安全执行**：四种权限模式配合 Linux Bubblewrap、macOS Seatbelt、Windows Job Object，支持只读、限制网络与细粒度授权策略。
+- **可靠恢复**：会话、事件、turn 队列、后台任务与检查点持久化到 `~/.kkagent/transcripts.db`，支持 `--resume`、断线重连与跨重启恢复。
+- **多会话协作**：会话标签、`/new`、`/fork`、BTW 侧问、Todo 面板和 transcript 搜索共同服务长任务工作流。
+- **自动化与接入**：支持 headless / CI 结构化输入输出、Web UI、ACP，以及本地和 SSH 远程执行环境。
+- **可扩展工具系统**：内置文件、搜索、Shell、任务、计划、Web 和媒体工具，并支持 MCP、Skills、Hooks 与插件市场。
+- **可观测性**：结构化日志、HTTP 审计日志和可配置 telemetry 事件。
+
+<details>
+<summary><strong>运行时与工程实现细节</strong></summary>
+
+- **后台与多会话**：workspace session registry 与跨目录会话恢复；子 Agent 会话页签；AgentSwarm 并行子代理（超时 / 限流恢复、可后台化）；断线重连后恢复 BTW、prompt 队列、审批与 live stream。
+- **Web UI**：深色主题、Markdown 渲染、移动端侧栏、model picker、Timeline 逐轮 diff、plan review 与插件面板；支持通过 `--http` 热挂到已运行的 Server。
+- **工具系统**：渐进式工具披露、MCP schema 延迟通告、未知工具 BM25 模糊建议；针对超大 workspace 的流事件合并和 transcript 布局缓存；统一后台任务面板（`/tasks` + `/ps`）。
+- **LLM 工程**：Anthropic / DeepSeek prompt caching 与缓存命中率统计；`compaction_model`、per-model thinking effort、`api_key_env`、可配置重试退避、流式首 token 超时门控与跨 chunk UTF-8 重组。
+- **安全与沙箱**：S0–S2 隐私路径策略；声明式 toolchain sandbox profile；Once / Turn / Session / Workspace 授权范围；`shell -c` 绕过检测、always-approvals 持久化、凭据目录 deny 与安全审计轨迹。
+- **运行时可靠性**：磁盘持久化 turn 检查点；undo 跨重启与压缩存活；逐消息 transcript 持久化与孤儿 tool-use 修复；超大工具结果落盘和 trash 归档；malformed tool call 自动重试。
+- **上下文与隔离**：预算安全的 payload projector、`/compact` 自动压缩、`/context` 分项 token 透视；无原生依赖的 bash AST tokenizer/parser；子 Agent 独立 git worktree、跨会话写冲突告警与测试命令隔离。
+
+</details>
 
 ## 架构概览
 
@@ -222,8 +284,11 @@ plugin_marketplaces = [
 - [架构设计](docs/architecture.md)
 - [扩展机制](docs/extensions.md)
 - [运维与监控](docs/operations.md)
-- [Kimi Code 差异分析](docs/kimi-code-gap-analysis.md)
 - [开发与测试](docs/development.md)
+
+## 致谢
+
+本项目的交互设计与运行时模型参考了 [kimi-code](https://github.com/MoonshotAI/kimi-code) CLI，在此表示感谢。kkagent 使用 Rust 独立实现，并未复用其代码。
 
 ## 开发
 

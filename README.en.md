@@ -7,16 +7,58 @@ English | [简体中文](README.md)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust: 1.88+](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org/)
 
-A production-oriented terminal Coding Agent written in Rust. Core interaction and runtime are aligned with the kimi-code CLI.
-The TUI and Agent Server are decoupled and communicate over RPC (default: in-process memory transport; standalone `server` mode is also supported).
+A background-friendly, recoverable, cross-platform terminal Coding Agent written in Rust.
 
-- Low memory footprint and high performance
-- Supports Windows, macOS, and Linux (x86_64 / arm64)
-- Permission modes: `manual`, `yolo`, `auto`, `plan`
-- Built-in tools: Read, Write, Edit, Grep, Glob, Bash, TodoList, Goal, Task, AskUser, SelectTools, Cron, Web, Media, Skill, Plan
-- Sessions, events, turn queues, and background Agent tasks are persisted to `~/.kkagent/transcripts.db`
-- Bash sandboxing: Linux Bubblewrap, macOS Seatbelt, Windows Job Object
-- MCP / Skills / Hooks / plugin marketplaces (configuration-driven)
+kkagent focuses on long-running tasks, multi-session workflows, context recovery, and local security controls.
+
+- **Uninterrupted tasks**: press `Ctrl+B` to leave the TUI while a standalone Agent Server keeps running; the next `kk` automatically restores the session.
+- **Untangled parallel work**: session tabs, `/fork`, and the BTW full-screen side-question workspace let you explore different directions without disturbing the main thread.
+- **Safe and controllable**: four permission modes (`manual` / `auto` / `yolo` / `plan`) plus a system-level Bash sandbox.
+- **Native cross-platform**: a single Rust binary with no Node.js runtime; Windows, macOS, and Linux (x86_64 / arm64).
+- **Extensible**: built-in MCP, Skills, Hooks, Web UI, ACP, and plugin marketplaces for interactive development, remote access, and CI automation.
+
+<p align="center">
+  <img src="docs/output.gif" alt="kkagent terminal Coding Agent demo" width="800">
+</p>
+
+[Quick Install](#quick-install) · [30-Second Quickstart](#30-second-quickstart) · [Highlights](#highlights) · [Documentation](#documentation-index)
+
+## Why kkagent
+
+| Concern | How kkagent handles it |
+|---|---|
+| Will my task die if I close the TUI? | A standalone server keeps running; the next `kk` restores the session and in-flight work. |
+| Will parallel explorations tangle my context? | Session tabs, `/fork`, and BTW side-question workspaces stay isolated from the main conversation. |
+| Is it safe to let the Agent run commands? | Four permission modes, a system-level Bash sandbox, privacy path policies, and audit trails. |
+| Can I survive long sessions or disconnects? | Sessions, events, turn queues, and background tasks are persisted to SQLite with restart/disconnect/compaction recovery. |
+| Does it fit my existing workflow? | Non-interactive mode, structured I/O, MCP, ACP, Web UI, plugins, and remote execution environments. |
+
+### Highlights
+
+Differentiation focuses on background running, session navigation, and terminal experience:
+
+| Feature | Key / Command | Description |
+|---|---|---|
+| Session background detach | `Ctrl+B` | Quit the TUI without interrupting the session: the server and in-flight turns keep running, and the next `kk` automatically resumes. |
+| Session tabs | empty input `Tab` / `←` / `→`; `Ctrl+Shift+Tab` | Cycle across the session family created by `/new` and `/fork` (real resume), with a persistent session strip at the bottom. |
+| BTW full-screen side-question workspace | `/btw` · `Ctrl+G` | Fork a side question from a snapshot of the current session in a full-screen workspace; the main conversation stays untouched, and `Ctrl+G` toggles back anytime. |
+| Docked todo panel | automatic | The todo list stays docked above the input and folds to fit the terminal width. |
+| Transcript search | `Ctrl+F` | Full-text search across the entire transcript to locate past conclusions quickly. |
+| Emacs-style line editing | `Ctrl+K` / `Ctrl+W` / `Ctrl+Y` / `Ctrl+Z` / `Ctrl+Shift+Z` | Kill line / kill word / yank / undo / redo. |
+| Native scrollback | `--no-alt-screen` | Skip the alternate screen and keep the terminal's native scrollback for paging and copying. |
+| Forced full redraw | `F5` | Fix torn frames and ghost characters over SSH or older terminals. |
+| Non-interactive orchestration | `--max-turns` · `--input-format` | Cap the number of turns per task (exit code 3 when exceeded); drive the agent via stream-json input. |
+| Shell completions | `kkagent completions` | Generate completion scripts for bash / zsh / fish / PowerShell. |
+
+On top of that, kkagent also ships: system-level Bash sandboxing (Linux Bubblewrap / macOS Seatbelt / Windows Job Object), standalone server lifecycle management (`kkagent server stop` / `server status`), turn queueing (press `Enter` while running to queue input for the next turn), auto-folded large pastes, Emacs-style line editing, mouse wheel scrolling with click-and-drag selection copy, and `F5` forced full redraw for SSH or older terminals.
+
+### Use cases
+
+- Long-running Coding Agent tasks that should keep going after you leave the terminal.
+- Multiple sessions, branches, or exploration directions without cross-contaminating context.
+- Explicit permission approval, system sandboxing, credential protection, and audit trails.
+- Single-binary deployment on Windows, macOS, Linux, or remote development machines.
+- Scripted, CI, Web UI, ACP, MCP, or plugin-driven Agent workflows.
 
 ## Quick Install
 
@@ -30,7 +72,7 @@ The installer detects macOS/Linux and x86_64/arm64, downloads the latest Release
 
 ```bash
 curl --proto '=https' --tlsv1.2 -fsSLO https://raw.githubusercontent.com/Ken-u/kkagent/main/install.sh
-KKAGENT_INSTALL_DIR="$HOME/bin" KKAGENT_VERSION=0.2.0 sh install.sh
+KKAGENT_INSTALL_DIR="$HOME/bin" KKAGENT_VERSION=<version> sh install.sh
 KKAGENT_TARGET=x86_64-unknown-linux-gnu sh install.sh
 ```
 
@@ -65,14 +107,16 @@ curl -fsSLO https://raw.githubusercontent.com/Ken-u/kkagent/main/install.ps1
 The script installs to `%LOCALAPPDATA%\Programs\kkagent` by default. Override it with an environment variable:
 
 ```powershell
-$env:KKAGENT_INSTALL_DIR = "$env:USERPROFILE\bin"; .\install.ps1 -Version 0.2.0
+$env:KKAGENT_INSTALL_DIR = "$env:USERPROFILE\bin"; .\install.ps1 -Version <version>
 ```
 
 The installer also adds `kkagent-update.ps1`; run it later to upgrade in the original installation directory.
 
 ## 30-Second Quickstart
 
-1. Initialize the config (interactive wizard):
+kkagent supports Anthropic, Kimi, OpenAI / OpenAI Responses, Google Gemini, and OpenAI-compatible endpoints; configure multiple models and switch per session.
+
+1. Initialize the config (interactive wizard; Kimi hosted-account login is also available there):
 
 ```bash
 kkagent init
@@ -82,16 +126,24 @@ Or create `~/.kkagent/config.toml` manually:
 
 ```toml
 default_model = "kimi-k2-0711-preview"
+
+[providers.kimi]
+type = "kimi"
+base_url = "https://api.moonshot.cn/v1"
+# Recommended: reference the key via an env var instead of committing it
+api_key_env = "KIMI_API_KEY"
+
+[models."kimi-k2-0711-preview"]
+provider = "kimi"
+
 # Optional: use after the primary exhausts its normal per-step retries
 # fallback_model = "backup-model"
 
-[providers.kimi]
-api_base = "https://api.moonshot.cn/v1"
-api_key = "sk-..."
-
 [permissions]
-default_mode = "manual"
+default_permission_mode = "manual"
 ```
+
+> Prefer injecting keys via environment variables (`api_key_env`) or `kkagent auth login` instead of storing them in plain text. See [docs/configuration.md](docs/configuration.md) for all fields.
 
 2. Launch the TUI:
 
@@ -117,18 +169,28 @@ See [docs/cli-and-tui.md](docs/cli-and-tui.md) for more.
 
 ## Core Features
 
-- **Native Rust**: single binary, low memory, fast startup, native cross-platform support.
+- **Native Rust**: a single binary with no Node.js runtime dependency and native cross-platform support.
 - **Agent runtime**: multi-turn conversation, tool-call loop, automatic context compression, token budget and turn budget management.
-- **TUI / Server decoupling**: by default the TUI and Agent Server run in-process via memory transport; use `kkagent server` to start a standalone backend over UDS / TCP.
-- **Permission model**:
-  - `manual`: every write, Bash, or dangerous operation requires approval.
-  - `auto`: read-only and low-risk operations pass automatically; file writes and Bash still require approval.
-  - `yolo`: everything is auto-approved, suitable for trusted CI / automation environments.
-  - `plan`: the Agent drafts a plan first; the user reviews it before batch execution; read-only by default.
-- **Sandboxed execution**: Bash runs in a system-level sandbox (Linux Bubblewrap, macOS Seatbelt, Windows Job Object) with read-only / network-restricted policies.
-- **Persistence**: sessions, events, turn queues, and background Agent tasks are stored in `~/.kkagent/transcripts.db`; supports `--resume`.
-- **MCP, Skills, and plugins**: connect external MCP Servers via configuration, wrap common prompts and tool combinations as Skills, and install or update plugins from marketplaces with `/plugins`.
-- **Observability**: structured logging, HTTP audit logs, telemetry events (configurable upload).
+- **TUI / Server decoupling**: by default the TUI and Agent Server run in-process via memory transport; connect to a standalone server over UDS / TCP and use `Ctrl+B` to leave the session running in the background.
+- **Safe execution**: four permission modes plus Linux Bubblewrap, macOS Seatbelt, and Windows Job Object sandboxes with read-only and network-restricted policies.
+- **Reliable recovery**: sessions, events, turn queues, background tasks, and checkpoints are persisted to `~/.kkagent/transcripts.db`, supporting `--resume`, reconnects, and cross-restart recovery.
+- **Multi-session workflows**: session tabs, `/new`, `/fork`, BTW side questions, a docked todo panel, and transcript search for long-running tasks.
+- **Automation and integrations**: headless / CI structured I/O, Web UI, ACP, plus local and SSH remote execution environments.
+- **Extensible tool system**: built-in file, search, shell, task, plan, web, and media tools, with MCP, Skills, Hooks, and plugin marketplaces.
+- **Observability**: structured logging, HTTP audit logs, and configurable telemetry events.
+
+<details>
+<summary><strong>Runtime & engineering details</strong></summary>
+
+- **Background & multi-session**: workspace session registry with cross-directory resume; subagent session tabs; AgentSwarm parallel subagents (timeout / rate-limit recovery, backgroundable); reconnect restores BTW, prompt queues, approvals, and live streams.
+- **Web UI**: dark theme, Markdown rendering, mobile sidebar, model picker, per-turn Timeline diffs, plan review, and plugin panels; hot-attach to a running server via `--http`.
+- **Tool system**: progressive tool disclosure, deferred MCP schema advertisement, BM25 fuzzy suggestions for unknown tools; stream-event coalescing and transcript layout caching for very large workspaces; a unified background-task panel (`/tasks` + `/ps`).
+- **LLM engineering**: Anthropic / DeepSeek prompt caching with cache-hit stats; `compaction_model`, per-model thinking effort, `api_key_env`, configurable retry backoff, streaming first-token timeout gating, and cross-chunk UTF-8 reassembly.
+- **Security & sandboxing**: S0–S2 privacy path policies; declarative toolchain sandbox profiles; Once / Turn / Session / Workspace grant scopes; `shell -c` bypass detection, always-approvals persistence, credential-directory deny, and security audit trails.
+- **Runtime reliability**: disk-persisted turn checkpoints; undo across restarts and compaction; per-message transcript persistence with orphaned tool-use repair; oversized tool results spilled to disk with trash archiving; automatic retry of malformed tool calls.
+- **Context & isolation**: budget-safe payload projection, `/compact` auto-compaction, `/context` per-section token breakdown; a dependency-free bash AST tokenizer/parser; subagents in dedicated git worktrees with cross-session write-conflict warnings and test-command isolation.
+
+</details>
 
 ## Architecture Overview
 
@@ -222,8 +284,11 @@ plugin_marketplaces = [
 - [Architecture Design](docs/architecture.md)
 - [Extension Mechanisms](docs/extensions.md)
 - [Operations and Monitoring](docs/operations.md)
-- [Kimi Code Gap Analysis](docs/kimi-code-gap-analysis.md)
 - [Development and Testing](docs/development.md)
+
+## Acknowledgments
+
+kkagent's interaction design and runtime model draw inspiration from the [kimi-code](https://github.com/MoonshotAI/kimi-code) CLI. It is an independent Rust implementation and does not reuse kimi-code's code.
 
 ## Development
 

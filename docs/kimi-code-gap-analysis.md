@@ -1,5 +1,7 @@
 # kkagent 与 ref/kimi-code 差距分析
 
+> **历史文档**：本文写于项目早期（分析日期 2026-08-09），描述的是当时的骨架状态，不再反映当前功能与工程成熟度，仅作为设计演进的参考保留。当前能力以 [README](../README.md) 与 [docs/](.) 为准。
+>
 > 分析日期：2026-08-09  
 > 对比对象：当前仓库 `kkagent`（Rust） vs `ref/kimi-code`（Kimi Code CLI 原版，TypeScript）
 
