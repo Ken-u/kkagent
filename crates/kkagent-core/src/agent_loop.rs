@@ -532,8 +532,8 @@ impl AgentLoop {
         let all_defs = self.tools.tool_definitions();
 
         // Visibility-filtered defs drive both the announcement ledger and the
-        // SelectTools loadable set, so plan-gated or session-disabled tools
-        // are never announced by name either.
+        // SelectTools loadable set, so session-disabled tools are never
+        // announced by name either.
         let visible_defs: Vec<_> = all_defs
             .iter()
             .filter(|td| tool_allowed(session, &td.name))
@@ -3032,13 +3032,15 @@ fn tool_allowed(session: &Session, name: &str) -> bool {
     {
         return false;
     }
-    // Plan-mode tools are only visible while plan mode is active. Their
-    // execution layer already guards against misuse (permission.rs
-    // `plan_mode_guard`, plan.rs `plan_file_path` check); this gate only
-    // removes ~590 tokens of schema from ordinary (non-plan) requests.
-    if matches!(name, "WritePlan" | "ExitPlanMode") && !session.plan_mode {
-        return false;
-    }
+    // WritePlan / ExitPlanMode stay visible in every mode. Toggling them
+    // with plan mode rewrites the serialized tools[] prefix (and the OpenAI
+    // prompt_cache_key hashed from it), busting the provider prompt cache
+    // for the whole conversation for ~590 tokens of schema savings.
+    // Misuse outside plan mode is handled at execution time: permission.rs
+    // `plan_mode_guard`, plan.rs `plan_file_path` check, and the explicit
+    // not-in-plan-mode errors in auto/review_exit_plan_mode.
+    // Note: session tool_policy changes below rewrite the tools[] prefix
+    // the same way — treat mid-session policy changes as cache-busting.
     if !session.tool_policy.is_active(name) {
         // Always keep disclosure / interaction primitives available.
         if !matches!(
@@ -3056,6 +3058,14 @@ fn tool_allowed(session: &Session, name: &str) -> bool {
     true
 }
 
+/// OpenAI prompt cache key derived from model + system + serialized tools.
+///
+/// The tools hash is intentional: tool visibility must stay stable for the
+/// whole session (see `tool_allowed`), because any mid-session tools[]
+/// change both breaks the byte-for-byte prefix match and rotates this key
+/// onto a different cache shard. `prompt_cache_key` is shared by all
+/// sessions of the same account — heavy parallel traffic through one
+/// proxy account can evict entries independently of prefix stability.
 fn openai_prompt_cache_key(
     provider: &kkagent_config::ProviderConfig,
     capability: &ModelCapability,
@@ -5038,7 +5048,7 @@ mod retry_tests {
     }
 
     #[test]
-    fn plan_tools_are_gated_on_plan_mode() {
+    fn plan_tools_are_always_visible_for_cache_stability() {
         use super::*;
 
         let workspace =
@@ -5053,15 +5063,16 @@ mod retry_tests {
             "missing/model".into(),
         );
 
-        // Ordinary (non-plan) session: WritePlan / ExitPlanMode are hidden.
-        assert!(!tool_allowed(&session, "WritePlan"));
-        assert!(!tool_allowed(&session, "ExitPlanMode"));
-        // Primitives and cold tools stay visible.
+        // Ordinary (non-plan) session: WritePlan / ExitPlanMode stay visible.
+        // Toggling them with plan mode would rewrite the serialized tools[]
+        // prefix (and the OpenAI prompt_cache_key) and bust the prompt cache.
+        assert!(tool_allowed(&session, "WritePlan"));
+        assert!(tool_allowed(&session, "ExitPlanMode"));
         assert!(tool_allowed(&session, "Read"));
         assert!(tool_allowed(&session, "SelectTools"));
         assert!(tool_allowed(&session, "EnterPlanMode"));
 
-        // Entering plan mode makes the plan trio visible.
+        // Plan mode must not change tool visibility at all.
         session.set_plan_mode_persisted(true).unwrap();
         assert!(tool_allowed(&session, "WritePlan"));
         assert!(tool_allowed(&session, "ExitPlanMode"));
