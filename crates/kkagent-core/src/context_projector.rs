@@ -534,6 +534,76 @@ mod tests {
     }
 
     #[test]
+    fn strict_projection_still_shrinks_text_dense_history() {
+        let original = "dense text ".repeat(500);
+        let mut messages = vec![ChatMessage {
+            role: "user".into(),
+            content: vec![ChatContent::Text {
+                text: original.clone(),
+            }],
+            tools: None,
+        }];
+        messages.extend((0..20).map(|index| ChatMessage {
+            role: "user".into(),
+            content: vec![ChatContent::Text {
+                text: format!("later message {index}"),
+            }],
+            tools: None,
+        }));
+
+        let projected = project(&messages, &ProjectOptions::default());
+        let strict = project_strict(&messages, &ProjectOptions::default());
+        let ChatContent::Text { text: projected } = &projected[0].content[0] else {
+            panic!("expected text");
+        };
+        let ChatContent::Text { text: strict } = &strict[0].content[0] else {
+            panic!("expected text");
+        };
+        assert!(projected.len() < original.len());
+        assert!(strict.len() < projected.len());
+        assert!(strict.contains("truncated"));
+    }
+
+    #[test]
+    fn text_is_truncated_after_crossing_recent_window_boundary() {
+        let original = "boundary text ".repeat(500);
+        let mut messages = vec![ChatMessage {
+            role: "user".into(),
+            content: vec![ChatContent::Text {
+                text: original.clone(),
+            }],
+            tools: None,
+        }];
+        messages.extend((0..11).map(|index| ChatMessage {
+            role: "user".into(),
+            content: vec![ChatContent::Text {
+                text: format!("initial message {index}"),
+            }],
+            tools: None,
+        }));
+
+        let before = project(&messages, &ProjectOptions::default());
+        messages.push(ChatMessage {
+            role: "user".into(),
+            content: vec![ChatContent::Text {
+                text: "moves the old text out of the recent window".into(),
+            }],
+            tools: None,
+        });
+        let after = project(&messages, &ProjectOptions::default());
+
+        let ChatContent::Text { text: before } = &before[0].content[0] else {
+            panic!("expected text");
+        };
+        let ChatContent::Text { text: after } = &after[0].content[0] else {
+            panic!("expected text");
+        };
+        assert_eq!(before, &original);
+        assert!(after.len() < before.len());
+        assert!(after.contains("truncated"));
+    }
+
+    #[test]
     fn compaction_projection_can_truncate_tool_results() {
         let big = "x".repeat(5_000);
         let mut messages = vec![tool_result("summary-only", &big)];
