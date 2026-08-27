@@ -291,12 +291,38 @@ fn apply_env_overrides(config: &mut AppConfig) {
     // Resolve `api_key_env` first — when set and the environment variable is
     // present (non-empty), it takes precedence over the inline `api_key`,
     // matching the behavior of web search/fetch services.
-    for p in config.providers.values_mut() {
-        if let Some(name) = p.api_key_env.as_deref() {
-            if let Ok(v) = std::env::var(name) {
-                let v = v.trim();
-                if !v.is_empty() {
-                    p.api_key = Some(v.to_string());
+    for (name, p) in config.providers.iter_mut() {
+        for key in p.extra_fields.keys() {
+            tracing::warn!(
+                "providers.{name}: unknown configuration key {key:?} — likely a typo, or the \
+                 key belongs to the next TOML table (keys are assigned to the nearest \
+                 preceding table header)"
+            );
+        }
+        if let Some(env_name) = p.api_key_env.as_deref() {
+            match std::env::var(env_name) {
+                Ok(v) => {
+                    let v = v.trim();
+                    if v.is_empty() {
+                        tracing::warn!(
+                            "providers.{name}: api_key_env={env_name:?} is set but empty; \
+                             falling back to the inline api_key"
+                        );
+                    } else {
+                        p.api_key = Some(v.to_string());
+                    }
+                }
+                Err(std::env::VarError::NotPresent) => {
+                    tracing::warn!(
+                        "providers.{name}: api_key_env={env_name:?} is not set in the \
+                         environment; falling back to the inline api_key"
+                    );
+                }
+                Err(std::env::VarError::NotUnicode(_)) => {
+                    tracing::warn!(
+                        "providers.{name}: api_key_env={env_name:?} holds a non-UTF-8 value; \
+                         falling back to the inline api_key"
+                    );
                 }
             }
         }
@@ -532,6 +558,7 @@ mod api_key_env_tests {
                 custom_headers: HashMap::new(),
                 oauth: None,
                 first_token_timeout_ms: None,
+                extra_fields: Default::default(),
             },
         );
         AppConfig {
@@ -596,5 +623,44 @@ mod api_key_env_tests {
         );
 
         std::env::remove_var(&name);
+    }
+
+    /// Unknown keys inside a `[providers.*]` table are captured into
+    /// `extra_fields` instead of being silently dropped, so typos and keys
+    /// misplaced under the wrong TOML table header become visible.
+    #[test]
+    fn unknown_provider_key_is_captured() {
+        let raw = r#"
+[providers.oai]
+type = "openai"
+api_key = "k"
+api_key_envx = "OAI_API_KEY"
+"#;
+        let config: AppConfig = toml::from_str(raw).unwrap();
+        let provider = &config.providers["oai"];
+        assert!(provider.api_key_env.is_none());
+        assert_eq!(
+            provider.extra_fields.get("api_key_envx"),
+            Some(&toml::Value::String("OAI_API_KEY".into()))
+        );
+    }
+
+    /// A key physically placed after the *next* table header belongs to that
+    /// table — TOML semantics — and the provider must not see it.
+    #[test]
+    fn key_after_next_table_header_is_not_provider_field() {
+        let raw = r#"
+[providers.oai]
+type = "openai"
+api_key = "k"
+
+[models."oai/mini"]
+provider = "oai"
+model = "mini"
+api_key_env = "OAI_API_KEY"
+"#;
+        let config: AppConfig = toml::from_str(raw).unwrap();
+        assert!(config.providers["oai"].api_key_env.is_none());
+        assert!(config.providers["oai"].extra_fields.is_empty());
     }
 }

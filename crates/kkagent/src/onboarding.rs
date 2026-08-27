@@ -84,6 +84,7 @@ pub fn run_init(
             custom_headers: HashMap::new(),
             oauth: None,
             first_token_timeout_ms: None,
+            extra_fields: Default::default(),
         },
     );
     config.models.insert(
@@ -591,6 +592,49 @@ fn writable_probe(directory: &Path) -> Result<()> {
 }
 
 fn doctor_model(config: &AppConfig, checks: &mut Vec<JsonValue>) {
+    // Provider-level diagnostics: unknown keys (typo / key landed under the
+    // wrong TOML table) and `api_key_env` variables that fail to resolve.
+    for (name, provider) in &config.providers {
+        for key in provider.extra_fields.keys() {
+            checks.push(check(
+                "provider",
+                "warn",
+                format!(
+                    "providers.{name}: unknown configuration key {key:?} — likely a typo, or \
+                     the key belongs to the next TOML table (keys are assigned to the nearest \
+                     preceding table header)"
+                ),
+                Some("move the key under the intended [providers.*] header"),
+            ));
+        }
+        if let Some(env_name) = provider.api_key_env.as_deref() {
+            match std::env::var(env_name) {
+                Ok(value) if value.trim().is_empty() => checks.push(check(
+                    "provider",
+                    "warn",
+                    format!("providers.{name}: api_key_env={env_name:?} is set but empty"),
+                    Some("set a non-empty value for the variable"),
+                )),
+                Ok(_) => {}
+                Err(std::env::VarError::NotPresent) => checks.push(check(
+                    "provider",
+                    "warn",
+                    format!(
+                        "providers.{name}: api_key_env={env_name:?} is not set in the \
+                         environment"
+                    ),
+                    Some("export the variable before starting kkagent"),
+                )),
+                Err(std::env::VarError::NotUnicode(_)) => checks.push(check(
+                    "provider",
+                    "warn",
+                    format!("providers.{name}: api_key_env={env_name:?} holds a non-UTF-8 value"),
+                    Some("fix the value of the variable to be valid UTF-8"),
+                )),
+            }
+        }
+    }
+
     let Some(alias) = config.default_model.as_deref() else {
         return;
     };

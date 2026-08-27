@@ -893,6 +893,7 @@ mod tests {
             custom_headers: HashMap::new(),
             oauth: None,
             first_token_timeout_ms: None,
+            extra_fields: Default::default(),
         };
         config.providers.insert("test".into(), provider);
         for alias in ["default", "session", "secondary", "compaction"] {

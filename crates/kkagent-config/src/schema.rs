@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::toolchain::ToolchainConfig;
 
@@ -414,6 +414,13 @@ pub struct ProviderConfig {
     /// Model-level config wins; `0` disables. See [`resolve_first_token_timeout`].
     #[serde(default)]
     pub first_token_timeout_ms: Option<u64>,
+    /// Unknown keys captured for diagnostics. A key here almost always means
+    /// either a typo or — much more commonly — that the key physically belongs
+    /// to the *following* TOML table (TOML assigns keys to the nearest
+    /// preceding table header). `load_config` warns about these at startup
+    /// instead of silently ignoring them.
+    #[serde(default, flatten)]
+    pub extra_fields: BTreeMap<String, toml::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1497,6 +1504,7 @@ mod tests {
                 custom_headers: HashMap::new(),
                 oauth: None,
                 first_token_timeout_ms: None,
+                extra_fields: BTreeMap::new(),
             },
         );
         config.models.insert(
@@ -1547,6 +1555,7 @@ mod tests {
             custom_headers: HashMap::new(),
             oauth: None,
             first_token_timeout_ms: Some(30_000),
+            extra_fields: BTreeMap::new(),
         };
         assert_eq!(
             resolve_first_token_timeout(&model, &provider),

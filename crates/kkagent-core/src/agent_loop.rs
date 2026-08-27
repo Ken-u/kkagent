@@ -3849,6 +3849,7 @@ mod retry_tests {
                 custom_headers: HashMap::new(),
                 oauth: None,
                 first_token_timeout_ms: None,
+                extra_fields: Default::default(),
             },
         );
         config.models.insert(
@@ -3975,6 +3976,7 @@ mod retry_tests {
                 custom_headers: HashMap::new(),
                 oauth: None,
                 first_token_timeout_ms: None,
+                extra_fields: Default::default(),
             },
         );
         config.models.insert(
@@ -4151,6 +4153,7 @@ mod retry_tests {
                     custom_headers: HashMap::new(),
                     oauth: None,
                     first_token_timeout_ms: None,
+                    extra_fields: Default::default(),
                 },
             );
             config.models.insert(
@@ -4256,6 +4259,7 @@ mod retry_tests {
                 custom_headers: HashMap::new(),
                 oauth: None,
                 first_token_timeout_ms: None,
+                extra_fields: Default::default(),
             },
         );
         for alias in ["primary", "fallback"] {
@@ -4397,6 +4401,7 @@ mod retry_tests {
                 custom_headers: HashMap::new(),
                 oauth: None,
                 first_token_timeout_ms: None,
+                extra_fields: Default::default(),
             },
         );
         config.models.insert(
@@ -4493,6 +4498,7 @@ mod retry_tests {
                 custom_headers: HashMap::new(),
                 oauth: None,
                 first_token_timeout_ms: None,
+                extra_fields: Default::default(),
             },
         );
         config.models.insert(
@@ -4595,6 +4601,7 @@ mod retry_tests {
                 custom_headers: HashMap::new(),
                 oauth: None,
                 first_token_timeout_ms: None,
+                extra_fields: Default::default(),
             },
         );
         config.models.insert(
@@ -4704,6 +4711,7 @@ mod retry_tests {
                 custom_headers: HashMap::new(),
                 oauth: None,
                 first_token_timeout_ms: None,
+                extra_fields: Default::default(),
             },
         );
         config.models.insert(
@@ -4897,6 +4905,7 @@ mod retry_tests {
                 custom_headers: HashMap::new(),
                 oauth: None,
                 first_token_timeout_ms: None,
+                extra_fields: Default::default(),
             },
         );
         config.models.insert(
@@ -5146,6 +5155,7 @@ mod retry_tests {
                 custom_headers: HashMap::new(),
                 oauth: None,
                 first_token_timeout_ms: None,
+                extra_fields: Default::default(),
             },
         );
         // No global `[thinking]` section and no `thinking` capability: the
