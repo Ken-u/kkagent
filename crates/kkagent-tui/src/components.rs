@@ -697,10 +697,31 @@ fn active_assistant_message_index(state: &AppState) -> Option<usize> {
         .then_some(index)
 }
 
+/// Reasoning is treated as "live" only while it is still streaming. Once the
+/// buffered thinking has been flushed onto the active assistant message (the
+/// first body-text or tool-call delta does this) and no fresh deltas are
+/// buffered, the block folds back into the normal transcript rendering even
+/// though status remains `Thinking` while the answer itself streams.
 fn live_thinking_message_index(state: &AppState) -> Option<usize> {
-    (state.status == SessionStatus::Thinking)
-        .then(|| active_assistant_message_index(state))
-        .flatten()
+    if state.status != SessionStatus::Thinking {
+        return None;
+    }
+    let index = active_assistant_message_index(state)?;
+    let flushed_and_quiet = state
+        .messages
+        .get(index)
+        .is_some_and(|message| message.thinking.is_some() && state.thinking_text.is_empty());
+    (!flushed_and_quiet).then_some(index)
+}
+
+/// Whether the live status tail should draw the scrolling thinking body: the
+/// buffer holds un-flushed deltas, or the active assistant message has not
+/// received its flushed thinking block yet.
+fn live_thinking_body_visible(state: &AppState) -> bool {
+    !state.thinking_text.is_empty()
+        || active_assistant_message_index(state)
+            .and_then(|index| state.messages.get(index))
+            .is_none_or(|message| message.thinking.is_none())
 }
 
 fn selection_in_viewport(
@@ -929,23 +950,25 @@ fn build_transcript_status_lines(
                         .fg(theme.text_dim)
                         .add_modifier(Modifier::ITALIC),
                 )));
-                let mut tail: Vec<&str> =
-                    live_thinking_text(state).lines().rev().take(12).collect();
-                tail.reverse();
-                let mut body = Vec::new();
-                for line in tail {
-                    push_wrapped_indented_text(
-                        &mut body,
-                        line,
-                        width,
-                        2,
-                        Style::default().fg(theme.text_muted),
-                    );
+                if live_thinking_body_visible(state) {
+                    let mut tail: Vec<&str> =
+                        live_thinking_text(state).lines().rev().take(12).collect();
+                    tail.reverse();
+                    let mut body = Vec::new();
+                    for line in tail {
+                        push_wrapped_indented_text(
+                            &mut body,
+                            line,
+                            width,
+                            2,
+                            Style::default().fg(theme.text_muted),
+                        );
+                    }
+                    if body.len() > body_height {
+                        body.drain(..body.len() - body_height);
+                    }
+                    lines.extend(body);
                 }
-                if body.len() > body_height {
-                    body.drain(..body.len() - body_height);
-                }
-                lines.extend(body);
             }
         }
         SessionStatus::ToolExecuting => {
@@ -4951,7 +4974,7 @@ mod render_smoke {
     }
 
     #[test]
-    fn active_message_keeps_thinking_in_the_live_viewport() {
+    fn flushed_thinking_folds_back_into_transcript_while_answer_streams() {
         let mut state = AppState::new(PermissionMode::Manual, false);
         state.messages.push(DisplayMessage {
             role: MessageRole::User,
@@ -4965,7 +4988,7 @@ mod render_smoke {
         state.messages.push(DisplayMessage {
             role: MessageRole::Assistant,
             content: "answer".into(),
-            thinking: Some("moved thought".into()),
+            thinking: None,
             parts: vec![DisplayPart::Text("answer".into())],
             tool_calls: Vec::new(),
             delivery: crate::prompt_queue::DeliveryState::Sent,
@@ -4973,28 +4996,87 @@ mod render_smoke {
         });
         state.active_assistant_message = Some(1);
         state.status = SessionStatus::Thinking;
+        state.thinking_text = "moved thought".into();
 
-        let active_lines =
-            build_transcript_lines_range(&mut state, &Theme::default(), 80, Some(1..2), false);
-        let active_text = active_lines
-            .iter()
-            .map(Line::to_string)
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(active_text.contains("answer"));
-        assert!(!active_text.contains("moved thought"));
+        // Un-flushed reasoning streams only through the live status tail.
+        let streaming_text =
+            build_transcript_lines_range(&mut state, &Theme::default(), 80, Some(1..2), false)
+                .iter()
+                .map(Line::to_string)
+                .collect::<Vec<_>>()
+                .join("\n");
+        assert!(streaming_text.contains("answer"));
+        assert!(!streaming_text.contains("moved thought"));
         assert!(
             build_transcript_status_lines(&state, &Theme::default(), 80, 24)
                 .iter()
                 .any(|line| line.to_string().contains("moved thought"))
         );
 
-        state.status = SessionStatus::Idle;
-        let completed_lines =
-            build_transcript_lines_range(&mut state, &Theme::default(), 80, Some(1..2), false);
-        assert!(completed_lines
+        // The first body delta flushes the buffered reasoning onto the
+        // message: it folds back into the transcript right away even though
+        // status remains Thinking while the answer itself keeps streaming.
+        state.messages[1].thinking = Some("moved thought".into());
+        state.thinking_text.clear();
+        let folded_text =
+            build_transcript_lines_range(&mut state, &Theme::default(), 80, Some(1..2), false)
+                .iter()
+                .map(Line::to_string)
+                .collect::<Vec<_>>()
+                .join("\n");
+        assert!(folded_text.contains("answer"));
+        assert!(folded_text.contains("moved thought"));
+        let tail_lines = build_transcript_status_lines(&state, &Theme::default(), 80, 24);
+        assert!(!tail_lines
             .iter()
             .any(|line| line.to_string().contains("moved thought")));
+        assert!(tail_lines.iter().any(|line| line.to_string().contains("●")));
+
+        // Fresh interleaved reasoning deltas reopen the live tail: the new
+        // batch streams at the bottom while the folded block is hidden from
+        // the inline rendering again.
+        state.thinking_text = "second thought".into();
+        let interleaved_tail = build_transcript_status_lines(&state, &Theme::default(), 80, 24);
+        assert!(interleaved_tail
+            .iter()
+            .any(|line| line.to_string().contains("second thought")));
+        let interleaved_text =
+            build_transcript_lines_range(&mut state, &Theme::default(), 80, Some(1..2), false)
+                .iter()
+                .map(Line::to_string)
+                .collect::<Vec<_>>()
+                .join("\n");
+        assert!(!interleaved_text.contains("moved thought"));
+        assert!(!interleaved_text.contains("second thought"));
+
+        // The next body delta merges the buffered batch into the message
+        // (mirrors the MessageDelta handler) and the block folds back again.
+        state.messages[1].thinking = Some("moved thought\nsecond thought".into());
+        state.thinking_text.clear();
+        let merged_text =
+            build_transcript_lines_range(&mut state, &Theme::default(), 80, Some(1..2), false)
+                .iter()
+                .map(Line::to_string)
+                .collect::<Vec<_>>()
+                .join("\n");
+        assert!(merged_text.contains("moved thought"));
+        assert!(merged_text.contains("second thought"));
+        let merged_tail = build_transcript_status_lines(&state, &Theme::default(), 80, 24);
+        assert!(!merged_tail
+            .iter()
+            .any(|line| line.to_string().contains("second thought")));
+
+        // Once the turn ends the tail disappears entirely.
+        state.thinking_text.clear();
+        state.status = SessionStatus::Idle;
+        let completed_text =
+            build_transcript_lines_range(&mut state, &Theme::default(), 80, Some(1..2), false)
+                .iter()
+                .map(Line::to_string)
+                .collect::<Vec<_>>()
+                .join("\n");
+        assert!(completed_text.contains("moved thought"));
+        assert!(build_transcript_status_lines(&state, &Theme::default(), 80, 24).is_empty());
     }
 
     #[test]
@@ -5066,6 +5148,9 @@ mod render_smoke {
         ];
         state.active_assistant_message = Some(1);
         state.status = SessionStatus::Thinking;
+        // Reasoning still buffered (not yet flushed) keeps the flushed block
+        // out of the cached transcript until the turn ends.
+        state.thinking_text = "still streaming".into();
 
         let active_fingerprint = transcript_layout_fingerprint(&state, 80);
         terminal

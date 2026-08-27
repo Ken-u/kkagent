@@ -11796,11 +11796,7 @@ impl TuiApp {
                         self.state.scroll_up = 0;
                     }
                     AgentEvent::MessageDelta { text, .. } => {
-                        let pending_thinking = if !self.state.thinking_text.is_empty() {
-                            Some(std::mem::take(&mut self.state.thinking_text))
-                        } else {
-                            None
-                        };
+                        let pending_thinking = std::mem::take(&mut self.state.thinking_text);
 
                         if let Some(message) = self
                             .state
@@ -11808,8 +11804,16 @@ impl TuiApp {
                             .and_then(|index| self.state.messages.get_mut(index))
                             .filter(|message| message.role == MessageRole::Assistant)
                         {
-                            if message.thinking.is_none() {
-                                message.thinking = pending_thinking;
+                            if !pending_thinking.is_empty() {
+                                match message.thinking.as_mut() {
+                                    Some(existing) => {
+                                        if !existing.is_empty() && !existing.ends_with('\n') {
+                                            existing.push('\n');
+                                        }
+                                        existing.push_str(&pending_thinking);
+                                    }
+                                    None => message.thinking = Some(pending_thinking),
+                                }
                             }
                             message.append_assistant_text(&text);
                             return;
@@ -11817,7 +11821,7 @@ impl TuiApp {
                         let mut msg = DisplayMessage {
                             role: MessageRole::Assistant,
                             content: String::new(),
-                            thinking: pending_thinking,
+                            thinking: (!pending_thinking.is_empty()).then_some(pending_thinking),
                             parts: Vec::new(),
                             tool_calls: Vec::new(),
                             delivery: crate::prompt_queue::DeliveryState::Sent,
@@ -11839,11 +11843,7 @@ impl TuiApp {
                     } => {
                         self.state.last_tool_name = Some(tool_name.clone());
                         let summary = summarize_tool_input(&input);
-                        let pending_thinking = if !self.state.thinking_text.is_empty() {
-                            Some(std::mem::take(&mut self.state.thinking_text))
-                        } else {
-                            None
-                        };
+                        let pending_thinking = std::mem::take(&mut self.state.thinking_text);
                         let tc = DisplayToolCall {
                             id: tool_call_id,
                             started_at: Some(std::time::Instant::now()),
@@ -11862,8 +11862,16 @@ impl TuiApp {
                             .and_then(|index| self.state.messages.get_mut(index))
                             .filter(|message| message.role == MessageRole::Assistant)
                         {
-                            if message.thinking.is_none() {
-                                message.thinking = pending_thinking;
+                            if !pending_thinking.is_empty() {
+                                match message.thinking.as_mut() {
+                                    Some(existing) => {
+                                        if !existing.is_empty() && !existing.ends_with('\n') {
+                                            existing.push('\n');
+                                        }
+                                        existing.push_str(&pending_thinking);
+                                    }
+                                    None => message.thinking = Some(pending_thinking),
+                                }
                             }
                             message.push_tool(tc);
                             return;
@@ -11871,7 +11879,7 @@ impl TuiApp {
                         let mut msg = DisplayMessage {
                             role: MessageRole::Assistant,
                             content: String::new(),
-                            thinking: pending_thinking,
+                            thinking: (!pending_thinking.is_empty()).then_some(pending_thinking),
                             parts: Vec::new(),
                             tool_calls: Vec::new(),
                             delivery: crate::prompt_queue::DeliveryState::Sent,
