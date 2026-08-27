@@ -10,7 +10,8 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use crate::context_projector::{
-    build_compaction_digest, fold_old_media, project, repair_tool_exchanges, ProjectOptions,
+    build_compaction_digest, fold_old_media, project_for_compaction, repair_tool_exchanges,
+    ProjectOptions,
 };
 use crate::dynamic_tools::strip_dynamic_tool_context;
 use crate::token_counting::TokenCounter;
@@ -488,7 +489,7 @@ fn build_summarizer_messages(
     custom_instruction: Option<&str>,
 ) -> Vec<ChatMessage> {
     let stripped = strip_dynamic_tool_context(history);
-    let mut projected = project(&stripped, &ProjectOptions::default());
+    let mut projected = project_for_compaction(&stripped, &ProjectOptions::default());
     repair_tool_exchanges(&mut projected, true);
     let mut instruction = COMPACTION_INSTRUCTION.to_string();
     if let Some(extra) = custom_instruction.map(str::trim).filter(|s| !s.is_empty()) {

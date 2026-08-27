@@ -27,13 +27,35 @@ impl Default for ProjectOptions {
     }
 }
 
-/// Wire-safe projection: fold old tool results / long text while preserving recent turns.
+/// Wire-safe projection for normal model requests.
+///
+/// Historical tool results are deliberately kept byte-stable. Rewriting an
+/// already-sent `function_call_output` breaks provider prompt-cache prefixes.
+/// Context pressure is handled by explicit compaction instead.
 pub fn project(messages: &[ChatMessage], opts: &ProjectOptions) -> Vec<ChatMessage> {
     project_owned(messages.to_vec(), opts)
 }
 
 /// Project owned messages, moving the recent intact tail instead of cloning it.
 pub fn project_owned(messages: Vec<ChatMessage>, opts: &ProjectOptions) -> Vec<ChatMessage> {
+    project_owned_impl(messages, opts, false)
+}
+
+/// Projection for the separate compaction-summary request. This request does
+/// not extend the main conversation cache prefix, so folding tool results here
+/// is safe and keeps the summarizer payload bounded.
+pub(crate) fn project_for_compaction(
+    messages: &[ChatMessage],
+    opts: &ProjectOptions,
+) -> Vec<ChatMessage> {
+    project_owned_impl(messages.to_vec(), opts, true)
+}
+
+fn project_owned_impl(
+    messages: Vec<ChatMessage>,
+    opts: &ProjectOptions,
+    fold_tool_results: bool,
+) -> Vec<ChatMessage> {
     if messages.is_empty() {
         return Vec::new();
     }
@@ -42,7 +64,7 @@ pub fn project_owned(messages: Vec<ChatMessage>, opts: &ProjectOptions) -> Vec<C
     let mut out = Vec::with_capacity(messages.len());
     for (i, msg) in messages.into_iter().enumerate() {
         if i < split {
-            out.push(fold_message(&msg, opts, true));
+            out.push(fold_message(msg, opts, true, fold_tool_results));
         } else {
             out.push(msg);
         }
@@ -51,12 +73,13 @@ pub fn project_owned(messages: Vec<ChatMessage>, opts: &ProjectOptions) -> Vec<C
 }
 
 /// Aggressive projection used when still over budget after a soft project.
+/// Tool results remain stable here as well; if the request is still too large,
+/// the caller must compact the conversation rather than rewrite old outputs.
 pub fn project_strict(messages: &[ChatMessage], opts: &ProjectOptions) -> Vec<ChatMessage> {
     let mut strict = opts.clone();
     strict.keep_recent = opts.keep_recent.clamp(2, 6);
-    strict.tool_result_max_chars = 400;
     strict.text_max_chars = 1_500;
-    project(messages, &strict)
+    project_owned_impl(messages.to_vec(), &strict, false)
 }
 
 /// Replace older media with compact text markers while retaining the newest messages.
@@ -89,7 +112,12 @@ pub fn fold_old_media(messages: &mut [ChatMessage], keep_recent_messages: usize)
     folded
 }
 
-fn fold_message(msg: &ChatMessage, opts: &ProjectOptions, fold_hard: bool) -> ChatMessage {
+fn fold_message(
+    msg: ChatMessage,
+    opts: &ProjectOptions,
+    fold_hard: bool,
+    fold_tool_results: bool,
+) -> ChatMessage {
     let tool_max = if fold_hard {
         opts.tool_result_max_chars.min(600)
     } else {
@@ -103,14 +131,14 @@ fn fold_message(msg: &ChatMessage, opts: &ProjectOptions, fold_hard: bool) -> Ch
 
     let content: Vec<ChatContent> = msg
         .content
-        .iter()
+        .into_iter()
         .filter_map(|part| match part {
             ChatContent::Thinking { .. } if opts.strip_thinking && fold_hard => None,
             ChatContent::Thinking { thinking } => Some(ChatContent::Thinking {
-                thinking: truncate_chars(thinking, text_max / 2),
+                thinking: truncate_chars(&thinking, text_max / 2),
             }),
             ChatContent::Text { text } => Some(ChatContent::Text {
-                text: truncate_chars(text, text_max),
+                text: truncate_chars(&text, text_max),
             }),
             ChatContent::Image { media_type, data } if fold_hard => Some(ChatContent::Text {
                 text: format!(
@@ -118,10 +146,9 @@ fn fold_message(msg: &ChatMessage, opts: &ProjectOptions, fold_hard: bool) -> Ch
                     data.len().saturating_mul(3) / 4
                 ),
             }),
-            ChatContent::Image { media_type, data } => Some(ChatContent::Image {
-                media_type: media_type.clone(),
-                data: data.clone(),
-            }),
+            ChatContent::Image { media_type, data } => {
+                Some(ChatContent::Image { media_type, data })
+            }
             ChatContent::Video {
                 media_type,
                 filename,
@@ -134,36 +161,45 @@ fn fold_message(msg: &ChatMessage, opts: &ProjectOptions, fold_hard: bool) -> Ch
                 path,
                 filename,
             } => Some(ChatContent::Video {
-                media_type: media_type.clone(),
-                path: path.clone(),
-                filename: filename.clone(),
+                media_type,
+                path,
+                filename,
             }),
             ChatContent::ToolUse { id, name, input } => {
                 Some(ChatContent::ToolUse {
-                    id: id.clone(),
-                    name: name.clone(),
+                    id,
+                    name,
                     // Provider protocols require tool input to remain a JSON object.
                     // Truncating its serialized form into a string corrupts historical
                     // tool calls and makes the next request fail validation.
-                    input: input.clone(),
+                    input,
                 })
             }
             ChatContent::ToolResult {
                 tool_use_id,
                 content,
                 is_error,
+            } if fold_tool_results => Some(ChatContent::ToolResult {
+                tool_use_id,
+                content: truncate_chars(&content, tool_max),
+                is_error,
+            }),
+            ChatContent::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
             } => Some(ChatContent::ToolResult {
-                tool_use_id: tool_use_id.clone(),
-                content: truncate_chars(content, tool_max),
-                is_error: *is_error,
+                tool_use_id,
+                content,
+                is_error,
             }),
         })
         .collect();
 
     ChatMessage {
-        role: msg.role.clone(),
+        role: msg.role,
         content,
-        tools: msg.tools.clone(),
+        tools: msg.tools,
     }
 }
 
@@ -426,26 +462,95 @@ mod tests {
     }
 
     #[test]
-    fn project_truncates_old_tool_results() {
+    fn project_keeps_old_tool_results_byte_stable() {
         let big = "x".repeat(5_000);
-        let mut msgs = Vec::new();
-        for i in 0..20 {
-            msgs.push(tool_result(&format!("t{i}"), &big));
-        }
-        let opts = ProjectOptions::default();
-        let projected = project(&msgs, &opts);
-        assert_eq!(projected.len(), 20);
-        // Older results should be shorter than recent ones.
-        let old_len = match &projected[0].content[0] {
-            ChatContent::ToolResult { content, .. } => content.len(),
+        let mut messages = vec![tool_result("stable", &big)];
+        messages.extend((0..20).map(|index| ChatMessage {
+            role: "user".into(),
+            content: vec![ChatContent::Text {
+                text: format!("later message {index}"),
+            }],
+            tools: None,
+        }));
+
+        let projected = project(&messages, &ProjectOptions::default());
+        let ChatContent::ToolResult { content, .. } = &projected[0].content[0] else {
+            panic!("expected tool result");
+        };
+        assert_eq!(content, &big);
+    }
+
+    #[test]
+    fn appending_messages_does_not_rewrite_previous_tool_output() {
+        let original = "tool output\n".repeat(500);
+        let mut messages = vec![tool_result("stable", &original)];
+        messages.extend((0..11).map(|index| ChatMessage {
+            role: "user".into(),
+            content: vec![ChatContent::Text {
+                text: format!("initial message {index}"),
+            }],
+            tools: None,
+        }));
+
+        let before = project(&messages, &ProjectOptions::default());
+        messages.push(ChatMessage {
+            role: "user".into(),
+            content: vec![ChatContent::Text {
+                text: "moves the tool result out of the recent window".into(),
+            }],
+            tools: None,
+        });
+        let after = project(&messages, &ProjectOptions::default());
+
+        let before_content = match &before[0].content[0] {
+            ChatContent::ToolResult { content, .. } => content,
             _ => panic!("expected tool result"),
         };
-        let recent_len = match &projected[19].content[0] {
-            ChatContent::ToolResult { content, .. } => content.len(),
+        let after_content = match &after[0].content[0] {
+            ChatContent::ToolResult { content, .. } => content,
             _ => panic!("expected tool result"),
         };
-        assert!(old_len < recent_len);
-        assert!(old_len < 800);
+        assert_eq!(before_content, &original);
+        assert_eq!(after_content, before_content);
+    }
+
+    #[test]
+    fn strict_projection_keeps_tool_results_byte_stable() {
+        let original = "z".repeat(5_000);
+        let mut messages = vec![tool_result("stable", &original)];
+        messages.extend((0..20).map(|index| ChatMessage {
+            role: "user".into(),
+            content: vec![ChatContent::Text {
+                text: format!("later message {index}"),
+            }],
+            tools: None,
+        }));
+
+        let projected = project_strict(&messages, &ProjectOptions::default());
+        let ChatContent::ToolResult { content, .. } = &projected[0].content[0] else {
+            panic!("expected tool result");
+        };
+        assert_eq!(content, &original);
+    }
+
+    #[test]
+    fn compaction_projection_can_truncate_tool_results() {
+        let big = "x".repeat(5_000);
+        let mut messages = vec![tool_result("summary-only", &big)];
+        messages.extend((0..20).map(|index| ChatMessage {
+            role: "user".into(),
+            content: vec![ChatContent::Text {
+                text: format!("later message {index}"),
+            }],
+            tools: None,
+        }));
+
+        let projected = project_for_compaction(&messages, &ProjectOptions::default());
+        let ChatContent::ToolResult { content, .. } = &projected[0].content[0] else {
+            panic!("expected tool result");
+        };
+        assert!(content.len() < big.len());
+        assert!(content.contains("truncated"));
     }
 
     #[test]
