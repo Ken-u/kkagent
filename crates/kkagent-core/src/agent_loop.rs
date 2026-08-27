@@ -660,6 +660,13 @@ Do not mention this reminder to the user.\n</system-reminder>"
                 .map(|control| control.rate_limit_retry_base_seconds)
                 .unwrap_or(5),
         );
+        let retry_base = Duration::from_secs(
+            self.config
+                .loop_control
+                .as_ref()
+                .map(|control| control.retry_base_seconds)
+                .unwrap_or(1),
+        );
 
         let mut assistant_text = String::new();
         let mut thinking_text = String::new();
@@ -1149,6 +1156,7 @@ Do not mention this reminder to the user.\n</system-reminder>"
                     server_retry_after,
                     rate_limited,
                     rate_limit_retry_base,
+                    retry_base,
                 );
                 tracing::warn!(
                     retry_in_seconds = delay.as_secs_f64(),
@@ -3233,14 +3241,16 @@ fn retry_delay(
     server_retry_after: Option<Duration>,
     rate_limited: bool,
     rate_limit_base: Duration,
+    retry_base: Duration,
 ) -> Duration {
     server_retry_after.unwrap_or_else(|| {
         let exponent = attempt.saturating_sub(1).min(5);
-        if rate_limited {
-            rate_limit_base.saturating_mul(1_u32 << exponent)
+        let base = if rate_limited {
+            rate_limit_base
         } else {
-            Duration::from_millis(200_u64.saturating_mul(1_u64 << exponent))
-        }
+            retry_base
+        };
+        base.saturating_mul(1_u32 << exponent)
     })
 }
 
@@ -3399,20 +3409,41 @@ mod retry_tests {
 
     #[test]
     fn server_retry_after_overrides_exponential_backoff() {
-        let base = Duration::from_secs(5);
+        let rate_limit_base = Duration::from_secs(5);
+        let retry_base = Duration::from_millis(200);
         assert_eq!(
-            retry_delay(1, None, false, base),
+            retry_delay(1, None, false, rate_limit_base, retry_base),
             Duration::from_millis(200)
         );
         assert_eq!(
-            retry_delay(3, None, false, base),
+            retry_delay(3, None, false, rate_limit_base, retry_base),
             Duration::from_millis(800)
         );
-        assert_eq!(retry_delay(1, None, true, base), Duration::from_secs(5));
-        assert_eq!(retry_delay(2, None, true, base), Duration::from_secs(10));
-        assert_eq!(retry_delay(3, None, true, base), Duration::from_secs(20));
+        // The exponent is capped at 5, so delays top out at 32x the base.
         assert_eq!(
-            retry_delay(1, Some(Duration::from_secs(17)), true, base),
+            retry_delay(9, None, false, rate_limit_base, retry_base),
+            Duration::from_millis(6_400)
+        );
+        assert_eq!(
+            retry_delay(1, None, true, rate_limit_base, retry_base),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            retry_delay(2, None, true, rate_limit_base, retry_base),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            retry_delay(3, None, true, rate_limit_base, retry_base),
+            Duration::from_secs(20)
+        );
+        assert_eq!(
+            retry_delay(
+                1,
+                Some(Duration::from_secs(17)),
+                true,
+                rate_limit_base,
+                retry_base
+            ),
             Duration::from_secs(17)
         );
         assert_eq!(duration_ceil_seconds(Duration::from_millis(1)), 1);

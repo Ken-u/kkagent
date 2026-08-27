@@ -129,6 +129,7 @@ check_updates = true
 [loop_control]
 max_attempts_per_step = 10
 rate_limit_retry_base_seconds = 5
+retry_base_seconds = 1
 reserved_context_size = 50000
 max_steps_per_turn = 0
 auto_compact = true
@@ -147,6 +148,8 @@ token_counting = "measured+estimated"
 TUI 使用 `/model` 切换到全局 `fallback_model` 时，会要求为本次会话选择“禁用 fallback”或指定另一个 fallback 模型。该选择写入会话记录，恢复会话时继续生效；以后切换到其他主模型会恢复继承全局 fallback。
 
 当 LLM 返回 429 且未提供 `Retry-After` 时，`rate_limit_retry_base_seconds` 控制指数退避的基础时间，默认依次等待 5、10、20 秒。若服务端提供等待时间，则优先使用服务端值（最长 300 秒）。
+
+其余可重试失败（流式断连、空响应、5xx，以及自建推理服务常见的 KV-cache 容量准入拒绝——HTTP 400 报 `max_completion_tokens is too large`，其上限值随池子空闲动态变化，并非配置错误）统一走 `retry_base_seconds` 的指数退避，默认依次等待 1、2、4 秒（封顶 32 秒）。服务端提供的等待时间同样优先。遇到 KV 池拥塞报错时，优先调大 `max_attempts_per_step` 拉长总重试窗口，而不是调小 `max_output_size`。
 
 `token_counting` 可取 `measured+estimated`、`measured` 或 `estimated`。上下文达到 `compact_trigger_ratio`（默认 85%）或逼近 `reserved_context_size` 预留时，`auto_compact` 会用 LLM 摘要压缩历史，并按 token 预算保留用户消息（头+尾）；assistant/tool 交换由摘要覆盖，避免 toolcall 配对 400。手动 `/compact` 在 turn 进行中会被拒绝。
 

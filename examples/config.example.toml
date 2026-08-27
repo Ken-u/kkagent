@@ -71,6 +71,7 @@ display_name = "Default coding model"
 [loop_control]
 max_attempts_per_step = 10
 rate_limit_retry_base_seconds = 5 # 429 fallback: 5s, 10s, 20s...; Retry-After wins
+retry_base_seconds = 1 # other retryable failures: 1s, 2s, 4s... (32x cap); Retry-After wins
 reserved_context_size = 50000
 max_steps_per_turn = 0 # unset/0 means unlimited; positive values enforce a limit
 auto_compact = true

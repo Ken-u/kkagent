@@ -525,6 +525,9 @@ pub struct LoopControlConfig {
     /// Base delay for 429 responses without a server-provided retry hint.
     #[serde(default = "default_rate_limit_retry_base_seconds")]
     pub rate_limit_retry_base_seconds: u64,
+    /// Base delay for retryable LLM failures other than 429 responses.
+    #[serde(default = "default_retry_base_seconds")]
+    pub retry_base_seconds: u64,
     #[serde(default = "default_reserved_context")]
     pub reserved_context_size: u64,
     #[serde(default = "default_max_steps")]
@@ -554,6 +557,7 @@ impl Default for LoopControlConfig {
         Self {
             max_attempts_per_step: default_max_attempts(),
             rate_limit_retry_base_seconds: default_rate_limit_retry_base_seconds(),
+            retry_base_seconds: default_retry_base_seconds(),
             reserved_context_size: default_reserved_context(),
             max_steps_per_turn: default_max_steps(),
             auto_compact: true,
@@ -585,6 +589,9 @@ fn default_max_attempts() -> u32 {
 }
 fn default_rate_limit_retry_base_seconds() -> u64 {
     5
+}
+fn default_retry_base_seconds() -> u64 {
+    1
 }
 fn default_reserved_context() -> u64 {
     50000
