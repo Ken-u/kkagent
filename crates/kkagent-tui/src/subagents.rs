@@ -11,6 +11,12 @@ const MAX_EVENT_LOG: usize = 120;
 const MAX_STRIP_ROWS: usize = 3;
 /// Keep finished agents on the strip briefly so completion is visible.
 const FINISHED_STRIP_SECS: u64 = 8;
+/// A running/pending entry that has seen no events for this long is treated
+/// as lost (e.g. the SubagentCompleted event was dropped across a
+/// disconnect): it stops counting as active and leaves the strip. Long but
+/// legitimate delegations stay visible because any child event refreshes
+/// `last_event_at`.
+const STALE_ACTIVE_SECS: u64 = 30 * 60;
 
 #[derive(Debug, Clone)]
 pub struct SubagentUiEntry {
@@ -26,6 +32,9 @@ pub struct SubagentUiEntry {
     pub activity: String,
     pub started_at: Instant,
     pub finished_at: Option<Instant>,
+    /// Last time a child event / status change touched this entry; used by
+    /// the stale-active fallback in [`Self::is_active`].
+    last_event_at: Instant,
     pub events: VecDeque<String>,
     pub result_or_error: Option<String>,
     /// Full conversation transcript rendered like a normal session view.
@@ -38,7 +47,14 @@ pub struct SubagentUiEntry {
 
 impl SubagentUiEntry {
     pub fn is_active(&self) -> bool {
-        matches!(self.status.as_str(), "pending" | "running")
+        if !matches!(self.status.as_str(), "pending" | "running") {
+            return false;
+        }
+        // Stale-active fallback: a run that has gone silent far longer than
+        // any legitimate delegation is almost certainly lost (its terminal
+        // event was dropped, e.g. across a disconnect). Stop advertising it
+        // as active so the strip timer halts and the entry can age out.
+        self.last_event_at.elapsed().as_secs() < STALE_ACTIVE_SECS
     }
 
     pub fn show_on_strip(&self, now: Instant) -> bool {
@@ -86,6 +102,7 @@ impl SubagentUiEntry {
             return;
         }
         self.activity = truncate_chars(&line, 64);
+        self.last_event_at = Instant::now();
         self.events.push_back(line);
         while self.events.len() > MAX_EVENT_LOG {
             self.events.pop_front();
@@ -98,6 +115,7 @@ impl SubagentUiEntry {
         use crate::app::{DisplayMessage, DisplayToolCall, MessageRole};
         use kkagent_protocol::AgentEvent;
 
+        self.last_event_at = Instant::now();
         match event {
             AgentEvent::ThinkingDelta { text, .. } => {
                 self.pending_thinking.push_str(text);
@@ -237,6 +255,16 @@ impl SubagentStore {
             if model.is_some() {
                 existing.model = model.clone();
             }
+            // Resume snapshots can restore a terminal status directly; mark
+            // the finish time so the strip stops counting elapsed time and
+            // the entry leaves after the grace window.
+            if matches!(
+                existing.status.as_str(),
+                "complete" | "failed" | "cancelled"
+            ) && existing.finished_at.is_none()
+            {
+                existing.finished_at = Some(Instant::now());
+            }
             if existing.activity.is_empty() && !description.is_empty() {
                 existing.activity = truncate_chars(&description, 64);
             }
@@ -247,15 +275,21 @@ impl SubagentStore {
         } else {
             truncate_chars(&description, 64)
         };
+        // Resume snapshots can restore a terminal status directly; set the
+        // finish time so elapsed stops and the entry leaves the strip.
+        let status = status.into();
+        let finished_at =
+            matches!(status.as_str(), "complete" | "failed" | "cancelled").then(Instant::now);
         self.entries.push(SubagentUiEntry {
             id,
             name,
             description,
-            status: status.into(),
+            status,
             model,
             activity,
             started_at: Instant::now(),
-            finished_at: None,
+            finished_at,
+            last_event_at: Instant::now(),
             events: VecDeque::new(),
             result_or_error: None,
             transcript: Vec::new(),
@@ -269,6 +303,7 @@ impl SubagentStore {
             return;
         };
         entry.status = status.to_string();
+        entry.last_event_at = Instant::now();
         if matches!(status, "complete" | "failed" | "cancelled") {
             entry.finished_at = Some(Instant::now());
         }
@@ -604,6 +639,7 @@ mod tests {
             activity: "done".into(),
             started_at: Instant::now(),
             finished_at: Some(Instant::now() - std::time::Duration::from_secs(20)),
+            last_event_at: Instant::now(),
             events: VecDeque::new(),
             result_or_error: None,
             transcript: Vec::new(),
@@ -613,5 +649,57 @@ mod tests {
         assert!(!entry.show_on_strip(Instant::now()));
         entry.finished_at = Some(Instant::now());
         assert!(entry.show_on_strip(Instant::now()));
+    }
+
+    #[test]
+    fn resume_with_terminal_status_stops_the_timer() {
+        // Regression: a resume snapshot carrying status "complete" restored
+        // the entry without a finish time, leaving the strip timer counting
+        // forever even though nothing was running.
+        let mut store = SubagentStore::default();
+        store.upsert_spawned(
+            "abcdef12-7777".into(),
+            "delegate".into(),
+            "long task".into(),
+            "complete",
+            None,
+        );
+        assert_eq!(store.entries[0].status, "complete");
+        assert!(
+            store.entries[0].finished_at.is_some(),
+            "terminal status must set finished_at"
+        );
+        assert!(!store.entries[0].is_active());
+        // A fresh entry (no events) still shows on the strip inside the
+        // grace window, then ages out.
+        assert!(store.entries[0].show_on_strip(Instant::now()));
+    }
+
+    #[test]
+    fn silent_running_entry_is_not_active_after_stale_window() {
+        let mut entry = SubagentUiEntry {
+            id: "b".into(),
+            name: "delegate".into(),
+            description: "lost run".into(),
+            status: "running".into(),
+            model: None,
+            activity: "working…".into(),
+            started_at: Instant::now() - std::time::Duration::from_secs(STALE_ACTIVE_SECS + 60),
+            finished_at: None,
+            last_event_at: Instant::now() - std::time::Duration::from_secs(STALE_ACTIVE_SECS + 60),
+            events: VecDeque::new(),
+            result_or_error: None,
+            transcript: Vec::new(),
+            pending_thinking: String::new(),
+            active_assistant: None,
+        };
+        assert!(
+            !entry.is_active(),
+            "silence beyond the stale window must deactivate"
+        );
+        assert!(!entry.show_on_strip(Instant::now()));
+        // A fresh event (or terminal status) makes it visible again.
+        entry.push_event("still alive");
+        assert!(entry.is_active());
     }
 }
