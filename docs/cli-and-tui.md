@@ -58,6 +58,8 @@ kkagent --config ~/.kkagent/config.toml --dump-system-prompt > system-prompt.txt
 
 Footer 第二行在 `context` 左侧显示当前有效沙箱模式：绿色 `● sandbox:workspace` 表示工作区文件系统隔离，黄色 `● sandbox:process` 表示仅有进程/资源限制，红色 `● sandbox:off` 表示沙箱及资源限制均已关闭。配置为 `auto` 时显示当前平台解析后的实际模式。
 
+Footer 第一行的模型槽位跟随当前视图：切进子 agent 视图（`/agents` 选择或 Tab）时显示该子 agent 实际运行的模型（内建/internal 型为解析后的别名，ACP 插件型为外部 agent 名字），Esc 返回主会话后恢复主会话模型。
+
 ## TUI 快捷键
 
 | 按键 | 作用 |
