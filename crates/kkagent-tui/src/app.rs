@@ -3999,10 +3999,11 @@ impl TuiApp {
                 match paste_clipboard_into_workspace(&self.state.working_dir) {
                     Ok(Some(path)) => {
                         let mention = format!("@{}", path.to_string_lossy());
-                        self.state.input.insert_str(&mention);
+                        self.state.input.insert_image_mention(&mention);
                         self.state.refresh_slash_menu();
                         self.system_message(format!(
-                            "Attached clipboard image: {}",
+                            "Attached clipboard image as [Pasted Image #{}] -> {}",
+                            self.state.input.pastes.next_image_id().saturating_sub(1),
                             path.display()
                         ));
                     }
@@ -13088,7 +13089,7 @@ fn copy_to_clipboard_native(text: &str) -> anyhow::Result<()> {
 fn paste_clipboard_into_workspace(root: &std::path::Path) -> anyhow::Result<Option<PathBuf>> {
     let dir = root.join(".kkagent").join("attachments");
     std::fs::create_dir_all(&dir)?;
-    let path = dir.join(format!("pasted-{}.png", uuid::Uuid::new_v4()));
+    let path = dir.join(format!("{}.png", uuid::Uuid::new_v4()));
 
     let bytes = read_clipboard_png(&path)?;
     let Some(bytes) = bytes else {

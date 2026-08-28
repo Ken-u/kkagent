@@ -5,6 +5,7 @@ use std::collections::HashMap;
 const DEFAULT_CHAR_THRESHOLD: usize = 1000;
 const DEFAULT_LINE_THRESHOLD: usize = 15;
 const MARKER_PREFIX: &str = "[Pasted text #";
+const IMAGE_MARKER_PREFIX: &str = "[Pasted Image #";
 
 fn char_threshold() -> usize {
     std::env::var("KKAGENT_PASTE_CHAR_THRESHOLD")
@@ -112,15 +113,30 @@ fn find_next_marker(text: &str, from: usize) -> Option<(usize, usize, u32)> {
 #[derive(Debug, Default, Clone)]
 pub struct PastePlaceholders {
     entries: HashMap<u32, String>,
+    images: HashMap<u32, String>,
     next_id: u32,
+    next_image_id: u32,
 }
 
 impl PastePlaceholders {
     pub fn new() -> Self {
         Self {
             entries: HashMap::new(),
+            images: HashMap::new(),
             next_id: 1,
+            next_image_id: 1,
         }
+    }
+
+    /// Next id for an `[Image-N]` marker.
+    pub fn next_image_id(&self) -> u32 {
+        self.next_image_id
+    }
+
+    /// Store the `@path` an `[Image-N]` marker expands to on submit.
+    pub fn store_image(&mut self, id: u32, at_path: String) {
+        self.images.insert(id, at_path);
+        self.next_image_id = self.next_image_id.max(id).saturating_add(1);
     }
 
     /// Fold large paste into a marker, or return the original text when below threshold.
@@ -142,6 +158,11 @@ impl PastePlaceholders {
 
     /// Expand all known paste markers in `text` to their stored content.
     pub fn expand(&self, text: &str) -> String {
+        let expanded = self.expand_text_pastes(text);
+        self.expand_images(&expanded)
+    }
+
+    fn expand_text_pastes(&self, text: &str) -> String {
         let mut out = String::with_capacity(text.len());
         let mut last = 0;
         while let Some((start, end, id)) = find_next_marker(text, last) {
@@ -154,6 +175,58 @@ impl PastePlaceholders {
             last = end;
         }
         out.push_str(&text[last..]);
+        out
+    }
+
+    /// Expand `[Pasted Image #N]` markers into `@<path>` mentions so the media
+    /// pipeline picks them up on submit.
+    fn expand_images(&self, text: &str) -> String {
+        if self.images.is_empty() || !text.contains(IMAGE_MARKER_PREFIX) {
+            return text.to_string();
+        }
+        let mut out = String::with_capacity(text.len());
+        let bytes = text.as_bytes();
+        let mut last = 0;
+        let mut i = 0;
+        while i < text.len() {
+            let rest = &text[i..];
+            let Some(rel) = rest.find(IMAGE_MARKER_PREFIX) else {
+                break;
+            };
+            let start = i + rel;
+            let after_prefix = start + IMAGE_MARKER_PREFIX.len();
+            let Some((_, id_end)) = text[after_prefix..]
+                .char_indices()
+                .take_while(|(_, c)| c.is_ascii_digit())
+                .map(|(idx, c)| (idx, after_prefix + idx + c.len_utf8()))
+                .last()
+            else {
+                i = after_prefix;
+                continue;
+            };
+            if id_end >= bytes.len() || bytes[id_end] != b']' {
+                i = after_prefix;
+                continue;
+            }
+            let Ok(id) = text[after_prefix..id_end].parse::<u32>() else {
+                i = id_end;
+                continue;
+            };
+            match self.images.get(&id) {
+                Some(at_path) => {
+                    out.push_str(&text[last..start]);
+                    out.push('@');
+                    out.push_str(at_path);
+                    last = id_end + 1;
+                    i = last;
+                }
+                None => {
+                    // Unknown id: leave the marker as-is.
+                    i = id_end;
+                }
+            }
+        }
+        out.push_str(&text[last.min(bytes.len())..]);
         out
     }
 
@@ -177,6 +250,34 @@ impl PastePlaceholders {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_markers_expand_to_at_mentions() {
+        let mut p = PastePlaceholders::new();
+        p.store_image(1, ".kkagent/attachments/abc.png".into());
+        p.store_image(2, ".kkagent/attachments/def.png".into());
+        let text = "look at this [Pasted Image #1] and [Pasted Image #2] thanks";
+        assert_eq!(
+            p.expand(text),
+            "look at this @.kkagent/attachments/abc.png and @.kkagent/attachments/def.png thanks"
+        );
+    }
+
+    #[test]
+    fn unknown_image_marker_is_left_alone() {
+        let mut p = PastePlaceholders::new();
+        p.store_image(1, "a.png".into());
+        // Id 7 was never stored (e.g. from another session) — keep literal.
+        assert_eq!(
+            p.expand("see [Pasted Image #7] here"),
+            "see [Pasted Image #7] here"
+        );
+        // Malformed markers untouched.
+        assert_eq!(
+            p.expand("see [Pasted Image #x] and [Pasted Image #"),
+            "see [Pasted Image #x] and [Pasted Image #"
+        );
+    }
 
     #[test]
     fn folds_by_line_count() {

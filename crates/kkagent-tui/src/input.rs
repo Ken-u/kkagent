@@ -316,6 +316,16 @@ impl InputState {
         self.pastes.expand(text)
     }
 
+    /// Register a pasted image and insert its `[Image-N]` marker. The marker
+    /// expands back to `@<relative path>` on submit, so the composer stays
+    /// readable instead of showing the full attachments path.
+    pub fn insert_image_mention(&mut self, at_path: &str) {
+        let id = self.pastes.next_image_id();
+        self.pastes.store_image(id, at_path.to_string());
+        let marker = format!("[Pasted Image #{id}]");
+        self.replace_range(self.cursor, self.cursor, &marker);
+    }
+
     pub fn clear(&mut self) {
         if !self.text.is_empty() {
             self.push_undo();
