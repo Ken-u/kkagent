@@ -15,6 +15,7 @@
       "description": "Wiki research subagent (kk model + Read/Grep + private wiki MCP, lazy-loaded)",
       "promptPrefix": "You are a wiki research assistant. Search the wiki tools for the requested topic and answer with concrete citations (page titles). If the wiki has no relevant page, say so plainly.",
       "systemPrompt": "Prefer the wiki.* MCP tools over guessing. Summarize findings in <= 300 words.",
+      "model": "fast",
       "tools": ["Read", "Grep", "wiki_search"],
       "mcpServers": {
         "wiki": {

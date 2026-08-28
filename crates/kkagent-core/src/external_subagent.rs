@@ -130,6 +130,22 @@ async fn run_acp_subagent(
     result
 }
 
+/// The model string mirrored in `SubagentSpawned` for plugin subagents:
+/// the external agent name for ACP transports (the agent picks its own
+/// model internally), or the request's model token for internal runs —
+/// the internal loop re-resolves and reports the real alias separately.
+fn display_model(spec: &PluginSubagentSpec, sub_cfg: &SubagentConfig) -> String {
+    if spec.transport.eq_ignore_ascii_case("internal") {
+        sub_cfg
+            .model
+            .clone()
+            .filter(|m| !m.trim().is_empty())
+            .unwrap_or_else(|| spec.qualified_name())
+    } else {
+        spec.qualified_name()
+    }
+}
+
 /// Handshake → session → prompt over an already-spawned client. Split out so
 /// tests can drive a stub client.
 async fn run_on_client(
@@ -148,7 +164,11 @@ async fn run_on_client(
                 subagent_name: spec.qualified_name(),
                 parent_tool_call_id: m.parent_tool_call_id.clone(),
                 description: Some(sub_cfg.description.clone()),
-                model: sub_cfg.model.clone(),
+                // ACP agents pick their own model internally; surface the
+                // agent name in the model slot so the TUI status bar shows
+                // which external agent is running. Internal transport
+                // reports its resolved kk model instead.
+                model: Some(display_model(spec, sub_cfg)),
                 run_in_background: sub_cfg.run_in_background,
                 prompt: Some(sub_cfg.prompt.clone()),
             })
@@ -324,6 +344,7 @@ mod tests {
             env: Default::default(),
             timeout_secs: None,
             system_prompt: None,
+            model: None,
             tools: Vec::new(),
             mcp_servers: Default::default(),
         }
@@ -351,6 +372,25 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(resolve_command(&custom), vec!["/opt/acp-agent".to_string()]);
+    }
+
+    #[test]
+    fn display_model_reports_agent_name_for_acp_and_token_for_internal() {
+        // ACP: the external agent name occupies the model slot (its model
+        // is chosen inside the agent process).
+        let acp_spec = spec();
+        assert_eq!(display_model(&acp_spec, &test_config("hi")), "cursor");
+        // Internal: forward the request's model token unless empty, then
+        // fall back to the agent name.
+        let mut internal_spec = spec();
+        internal_spec.transport = "internal".into();
+        let with_token = test_config("do it");
+        let mut with_token = with_token.clone();
+        with_token.model = Some("fast".into());
+        assert_eq!(display_model(&internal_spec, &with_token), "fast");
+        let mut no_token = test_config("do it");
+        no_token.model = None;
+        assert_eq!(display_model(&internal_spec, &no_token), "cursor");
     }
 
     #[test]

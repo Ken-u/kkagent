@@ -4348,6 +4348,9 @@ struct PendingSubagentUi {
     status: String,
     detail: Option<String>,
     recent_child_events: Vec<String>,
+    /// Model shown for this subagent — resolved alias for internal runs,
+    /// external agent name for ACP.
+    model: Option<String>,
 }
 
 impl ActiveBtwSession {
@@ -4969,6 +4972,7 @@ impl ServerState {
                 "status": item.status,
                 "detail": item.detail,
                 "recent_child_events": item.recent_child_events,
+                "model": item.model,
             }))
             .collect::<Vec<_>>()))
     }
@@ -5161,6 +5165,7 @@ impl ServerState {
                 subagent_name,
                 parent_tool_call_id,
                 description,
+                model,
                 ..
             } => {
                 self.upsert_pending_subagent(
@@ -5173,6 +5178,7 @@ impl ServerState {
                         status: "pending".into(),
                         detail: None,
                         recent_child_events: Vec::new(),
+                        model: model.clone(),
                     },
                 )
                 .await;

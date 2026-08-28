@@ -189,9 +189,9 @@ pub fn render_ui(f: &mut Frame, state: &mut AppState, config: &AppConfig) {
     state.status_bar.plan_mode = state.plan_mode;
     state.status_bar.status = state.status;
     state.status_bar.tokens = state.approx_tokens;
-    state.status_bar.model = state.model_alias.clone();
     state.status_bar.session_id = state.session_id.clone();
     state.status_bar.cwd = Some(state.working_dir.to_string_lossy().into_owned());
+    state.status_bar.model = active_subagent_model(state).or_else(|| state.model_alias.clone());
 
     if state.mode == AppMode::Btw {
         state.transcript_area = Rect::default();
@@ -2729,7 +2729,32 @@ fn spans_to_string_approx(spans: &[Span]) -> String {
     spans.iter().map(|s| s.content.as_ref()).collect()
 }
 
+/// The model of the subagent whose view is currently active (resolved
+/// alias for internal/built-in runs, external agent name for ACP), if any.
+fn active_subagent_model(state: &AppState) -> Option<String> {
+    state
+        .active_subagent_view
+        .as_ref()
+        .and_then(|id| state.subagents.entries.iter().find(|e| e.id == *id))
+        .and_then(|entry| entry.model.clone())
+}
+
 fn model_label(state: &AppState, config: &AppConfig) -> String {
+    // While a subagent view is active the footer reports that agent's
+    // model; entries without model info fall back to the agent name so the
+    // user still sees which agent they are looking at.
+    if let Some(id) = state.active_subagent_view.as_ref() {
+        if let Some(entry) = state.subagents.entries.iter().find(|e| e.id == *id) {
+            let label = match entry.model.as_deref() {
+                Some(model) => config
+                    .resolve_model(model)
+                    .map(|(m, _)| m.display_name.clone().unwrap_or_else(|| m.model.clone()))
+                    .unwrap_or_else(|| model.to_string()),
+                None => entry.name.clone(),
+            };
+            return label;
+        }
+    }
     let alias = state
         .model_alias
         .as_deref()

@@ -18,6 +18,10 @@ pub struct SubagentUiEntry {
     pub name: String,
     pub description: String,
     pub status: String,
+    /// Model the subagent runs with — resolved alias for internal/built-in
+    /// runs, or the external agent name for ACP delegations. Shown in the
+    /// status bar while the subagent view is active.
+    pub model: Option<String>,
     /// Latest short activity (tool name / summary).
     pub activity: String,
     pub started_at: Instant,
@@ -222,6 +226,7 @@ impl SubagentStore {
         name: String,
         description: String,
         status: impl Into<String>,
+        model: Option<String>,
     ) {
         if let Some(existing) = self.entries.iter_mut().find(|e| e.id == id) {
             existing.name = name;
@@ -229,6 +234,9 @@ impl SubagentStore {
                 existing.description = description.clone();
             }
             existing.status = status.into();
+            if model.is_some() {
+                existing.model = model.clone();
+            }
             if existing.activity.is_empty() && !description.is_empty() {
                 existing.activity = truncate_chars(&description, 64);
             }
@@ -244,6 +252,7 @@ impl SubagentStore {
             name,
             description,
             status: status.into(),
+            model,
             activity,
             started_at: Instant::now(),
             finished_at: None,
@@ -422,12 +431,45 @@ mod tests {
             "explore".into(),
             "scan workspace".into(),
             "running",
+            Some("test/explore".into()),
         );
         store.note_child_event("abcdef12-9999", "Read src/main.rs".into());
         let line = store.entries[0].strip_line(Instant::now());
         assert!(line.contains("Agent explore(abcdef12)"));
         assert!(line.contains("Read src/main.rs"));
         assert!(line.ends_with("s"));
+    }
+
+    #[test]
+    fn upsert_spawned_stores_and_updates_model() {
+        let mut store = SubagentStore::default();
+        // First spawn records the model.
+        store.upsert_spawned(
+            "ag-m1".into(),
+            "kk-wiki-agent.search".into(),
+            "wiki lookup".into(),
+            "pending",
+            Some("test/fast".into()),
+        );
+        assert_eq!(store.entries[0].model.as_deref(), Some("test/fast"));
+        // A later re-spawn without a model keeps the previous value.
+        store.upsert_spawned(
+            "ag-m1".into(),
+            "kk-wiki-agent.search".into(),
+            "wiki lookup".into(),
+            "running",
+            None,
+        );
+        assert_eq!(store.entries[0].model.as_deref(), Some("test/fast"));
+        // ACP entries carry the agent name as their display "model".
+        store.upsert_spawned(
+            "ag-m2".into(),
+            "cursor".into(),
+            "delegate to cursor".into(),
+            "pending",
+            Some("cursor".into()),
+        );
+        assert_eq!(store.entries[1].model.as_deref(), Some("cursor"));
     }
 
     fn child_event(event: kkagent_protocol::AgentEvent) -> Box<kkagent_protocol::AgentEvent> {
@@ -438,7 +480,13 @@ mod tests {
     fn transcript_folds_child_events_like_a_session() {
         use kkagent_protocol::AgentEvent;
         let mut store = SubagentStore::default();
-        store.upsert_spawned("ag-1".into(), "explore".into(), "scan".into(), "pending");
+        store.upsert_spawned(
+            "ag-1".into(),
+            "explore".into(),
+            "scan".into(),
+            "pending",
+            None,
+        );
         store.seed_prompt("ag-1", "find all callers of foo()");
 
         let sid = "parent".to_string();
@@ -515,7 +563,7 @@ mod tests {
     fn tool_result_marks_error_and_expands() {
         use kkagent_protocol::AgentEvent;
         let mut store = SubagentStore::default();
-        store.upsert_spawned("ag-2".into(), "coder".into(), "fix".into(), "running");
+        store.upsert_spawned("ag-2".into(), "coder".into(), "fix".into(), "running", None);
         store.apply_child_event(
             "ag-2",
             &AgentEvent::ToolCall {
@@ -552,6 +600,7 @@ mod tests {
             name: "x".into(),
             description: String::new(),
             status: "complete".into(),
+            model: None,
             activity: "done".into(),
             started_at: Instant::now(),
             finished_at: Some(Instant::now() - std::time::Duration::from_secs(20)),

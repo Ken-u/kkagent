@@ -178,6 +178,14 @@ pub struct PluginSubagentSpec {
     /// Appended after the workspace instructions and a generic subagent addon.
     #[serde(default, rename = "systemPrompt")]
     pub system_prompt: Option<String>,
+    /// **internal transport** — model alias bound at declaration time
+    /// (`"default"` / `"fast"` / `"current"` / `"secondary"`). A valid
+    /// binding wins over the Agent tool's `model` token; anything else
+    /// (including raw model ids) is rejected with a load-time diagnostic
+    /// and standard resolution applies. ACP transports pick their own
+    /// model and ignore this field.
+    #[serde(default)]
+    pub model: Option<String>,
     /// **internal transport** — tool allowlist. Only the listed tool names
     /// stay registered (core tools + plugin-private MCP tools qualify);
     /// everything else is removed. Empty/absent = inherit the default
@@ -199,6 +207,24 @@ impl PluginSubagentSpec {
 
     fn default_auto_approve() -> bool {
         true
+    }
+
+    /// Symbolic model alias tokens accepted by the `model` field.
+    /// Expansion follows the standard token machinery
+    /// (`expand_model_alias_token`); raw model ids are not accepted.
+    pub const MODEL_ALIASES: [&'static str; 4] = ["default", "fast", "current", "secondary"];
+
+    /// The declared model alias, trimmed and lowercased, if it is one of
+    /// [`MODEL_ALIASES`](Self::MODEL_ALIASES). Anything else (raw model
+    /// ids, typos) yields `None` — binding at declaration time is
+    /// alias-only by design.
+    pub fn model_alias(&self) -> Option<String> {
+        self.model
+            .as_deref()
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+            .map(str::to_ascii_lowercase)
+            .filter(|m| Self::MODEL_ALIASES.contains(&m.as_str()))
     }
 
     /// Display name used in mirrored lifecycle events: the bare type name
@@ -466,6 +492,36 @@ impl PluginManager {
                     severity: "warning".into(),
                     message: format!("mcpServers.{name}: {error}"),
                 }),
+            }
+        }
+
+        // Subagent model bindings: aliases only, internal transport only.
+        for (idx, spec) in manifest.subagents.iter().enumerate() {
+            let Some(declared) = spec
+                .model
+                .as_deref()
+                .map(str::trim)
+                .filter(|m| !m.is_empty())
+            else {
+                continue;
+            };
+            let subject = format!("subagents[{idx}] ({})", spec.name);
+            if !spec.transport.eq_ignore_ascii_case("internal") {
+                diagnostics.push(PluginDiagnostic {
+                    severity: "warning".into(),
+                    message: format!(
+                        "{subject}: model \"{declared}\" is ignored — model binding only \
+                         applies to transport \"internal\""
+                    ),
+                });
+            } else if spec.model_alias().is_none() {
+                diagnostics.push(PluginDiagnostic {
+                    severity: "warning".into(),
+                    message: format!(
+                        "{subject}: model \"{declared}\" is not a supported alias \
+                         (default|fast|current|secondary); ignored"
+                    ),
+                });
             }
         }
 
@@ -1132,7 +1188,8 @@ mod tests {
                         "tools": ["Read", "Grep", "wiki.search"],
                         "mcpServers": {
                             "wiki": { "command": "npx", "args": ["-y", "wiki-mcp"] }
-                        }
+                        },
+                        "model": "FAST"
                     }
                 ]
             })
@@ -1154,6 +1211,16 @@ mod tests {
             Some("You are a wiki research assistant.")
         );
         assert_eq!(spec.mcp_servers.len(), 1);
+        // Model binding: aliases are case-insensitive; "FAST" normalizes to
+        // "fast" and produces no load-time diagnostic.
+        assert_eq!(spec.model_alias().as_deref(), Some("fast"));
+        assert!(manager
+            .list()
+            .await
+            .into_iter()
+            .find(|p| p.name == "wiki")
+            .map(|p| p.diagnostics.is_empty())
+            .unwrap_or(false));
         // MCP server runtime name follows the plugin convention
         // `plugin-<plugin_id>:<server>`, compressing tool namespaces to
         // `<plugin_id>_<server>`.
@@ -1167,6 +1234,83 @@ mod tests {
             cfg,
         );
         assert_eq!(namespaced.name, "plugin-wiki:wiki");
+
+        let _ = tokio::fs::remove_dir_all(plugins).await;
+    }
+
+    #[tokio::test]
+    async fn subagent_model_binding_diagnostics() {
+        let plugins = temp_plugins_dir();
+        let root = plugins.join("models");
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        tokio::fs::write(
+            root.join(KK_ROOT_MANIFEST),
+            serde_json::json!({
+                "name": "models",
+                "subagents": [
+                    {
+                        "name": "raw-id",
+                        "transport": "internal",
+                        "model": "test/model"
+                    },
+                    {
+                        "name": "acp-bound",
+                        "transport": "acp",
+                        "model": "fast"
+                    },
+                    {
+                        "name": "valid",
+                        "transport": "internal",
+                        "model": " secondary "
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+
+        let manager = PluginManager::discover(&plugins).await;
+        let external = manager.external_subagents().await;
+        let by_name = |name: &str| {
+            external
+                .0
+                .iter()
+                .find(|(qualified, _)| qualified == &format!("models.{name}"))
+                .map(|(_, spec)| spec.clone())
+                .unwrap()
+        };
+
+        // Raw model ids are not a binding — alias-only by design.
+        assert_eq!(by_name("raw-id").model_alias(), None);
+        assert_eq!(by_name("acp-bound").model_alias(), Some("fast".into()));
+        // Whitespace is trimmed.
+        assert_eq!(by_name("valid").model_alias(), Some("secondary".into()));
+
+        let diagnostics = manager
+            .list()
+            .await
+            .into_iter()
+            .find(|p| p.name == "models")
+            .map(|p| p.diagnostics)
+            .unwrap_or_default();
+        let messages: Vec<&str> = diagnostics.iter().map(|d| d.message.as_str()).collect();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("raw-id") && m.contains("not a supported alias")),
+            "raw model id should warn: {messages:?}"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("acp-bound") && m.contains("ignored")),
+            "model on acp transport should warn: {messages:?}"
+        );
+        assert!(
+            !messages.iter().any(|m| m.contains("valid")),
+            "valid alias binding should not warn: {messages:?}"
+        );
 
         let _ = tokio::fs::remove_dir_all(plugins).await;
     }

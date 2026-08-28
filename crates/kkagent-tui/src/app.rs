@@ -8537,9 +8537,13 @@ impl TuiApp {
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
+                let model = item
+                    .get("model")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
                 self.state
                     .subagents
-                    .upsert_spawned(id.clone(), name, desc, status);
+                    .upsert_spawned(id.clone(), name, desc, status, model);
                 if let Some(detail) = item.get("detail").and_then(|v| v.as_str()) {
                     if !detail.is_empty() {
                         self.state
@@ -12172,6 +12176,7 @@ impl TuiApp {
                         subagent_name,
                         description,
                         prompt,
+                        model,
                         ..
                     } => {
                         let desc = description.clone().unwrap_or_default();
@@ -12180,6 +12185,7 @@ impl TuiApp {
                             subagent_name.clone(),
                             desc,
                             "pending",
+                            model.clone(),
                         );
                         if let Some(prompt) = prompt {
                             self.state
@@ -13386,6 +13392,7 @@ mod app_state_tests {
             "explore".into(),
             "scan".into(),
             "running",
+            Some("test/explore".into()),
         );
 
         app.apply_strip_action(StripAction::Switch("agents".into()))

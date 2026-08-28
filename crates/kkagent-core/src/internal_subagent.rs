@@ -5,6 +5,9 @@
 //! subagent can:
 //!
 //! - carry its own **system prompt** (`spec.system_prompt`);
+//! - **bind a model alias at declaration time** (`spec.model`) — one of
+//!   `default` / `fast` / `current` / `secondary`, expanded like every
+//!   other symbolic token and overriding the delegation request's `model`;
 //! - restrict its tool set to an **allowlist** (`spec.tools`) — core tools,
 //!   the Web tool and plugin-private MCP tools all qualify for filtering;
 //! - run **plugin-private MCP servers** (`spec.mcp_servers`), started lazily
@@ -33,6 +36,25 @@ use crate::subagent_runtime::{extract_final_assistant_text, SubagentMirrorContex
 /// more; sits between explore's 16 and coder's 32).
 const MAX_ROUNDS: u32 = 24;
 
+/// Resolve the model an internal plugin subagent runs with.
+///
+/// A valid declaration-time alias binding (`spec.model`, one of
+/// `default`/`fast`/`current`/`secondary`) wins over the delegation
+/// request's `model` token; without a binding the standard subagent chain
+/// applies (request token → `[subagent.default_models]` for `general` →
+/// global `secondary_model` → `default_model`).
+pub fn resolve_internal_subagent_model(
+    spec: &PluginSubagentSpec,
+    app_config: &kkagent_config::AppConfig,
+    request_model: Option<&str>,
+    parent_model: Option<&str>,
+) -> String {
+    match spec.model_alias() {
+        Some(alias) => app_config.expand_model_alias_token(&alias, parent_model),
+        None => app_config.resolve_subagent_model("general", request_model, parent_model),
+    }
+}
+
 /// Run an internal plugin subagent to completion, returning final text.
 pub async fn run_internal_subagent(
     spec: &PluginSubagentSpec,
@@ -42,11 +64,15 @@ pub async fn run_internal_subagent(
 ) -> anyhow::Result<String> {
     let app_config = ctx.app_config;
 
-    // Model: same resolution as built-in profiles — the request's symbolic
-    // model token wins, else the `general` profile default. Plugins cannot
-    // pin raw model ids.
-    let model = app_config.resolve_subagent_model(
-        "general",
+    // Model: a plugin-declared alias (`model` in the manifest, internal
+    // transport only) is a declaration-time binding and wins over the
+    // request's symbolic token; without one, resolution is the standard
+    // chain (explicit token → `[subagent.default_models]` general →
+    // secondary → default). Plugins cannot pin raw model ids — only the
+    // aliases default/fast/current/secondary survive validation.
+    let model = resolve_internal_subagent_model(
+        spec,
+        &app_config,
         sub_cfg.model.as_deref(),
         sub_cfg.parent_model.as_deref(),
     );
@@ -267,5 +293,134 @@ task with the tools available to you and return a concise final summary.",
             }
             Err(anyhow::anyhow!("internal plugin subagent failed: {e}"))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spec_with_model(model: Option<&str>) -> PluginSubagentSpec {
+        serde_json::from_value(serde_json::json!({
+            "name": "search",
+            "transport": "internal",
+            "model": model
+        }))
+        .unwrap()
+    }
+
+    fn app_config_with_models(
+        default: &str,
+        fast: Option<&str>,
+        secondary: Option<&str>,
+    ) -> kkagent_config::AppConfig {
+        kkagent_config::AppConfig {
+            default_model: Some(default.to_string()),
+            fast_model: fast.map(str::to_string),
+            secondary_model: secondary.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn model_alias_accepts_case_insensitive_aliases_only() {
+        assert_eq!(
+            spec_with_model(Some("fast")).model_alias().as_deref(),
+            Some("fast")
+        );
+        assert_eq!(
+            spec_with_model(Some("CURRENT")).model_alias().as_deref(),
+            Some("current")
+        );
+        assert_eq!(
+            spec_with_model(Some(" secondary "))
+                .model_alias()
+                .as_deref(),
+            Some("secondary")
+        );
+        assert_eq!(spec_with_model(Some("test/model")).model_alias(), None);
+        assert_eq!(spec_with_model(Some("")).model_alias(), None);
+        assert_eq!(spec_with_model(None).model_alias(), None);
+    }
+
+    #[test]
+    fn declared_alias_overrides_request_token() {
+        let config =
+            app_config_with_models("test/default", Some("test/fast"), Some("test/secondary"));
+        // Declaration pins `fast` even though the request asks `current`.
+        let model = resolve_internal_subagent_model(
+            &spec_with_model(Some("fast")),
+            &config,
+            Some("current"),
+            Some("test/session-model"),
+        );
+        assert_eq!(model, "test/fast");
+    }
+
+    #[test]
+    fn declared_current_tracks_parent_session_model() {
+        let config = app_config_with_models("test/default", None, None);
+        let model = resolve_internal_subagent_model(
+            &spec_with_model(Some("current")),
+            &config,
+            Some("default"),
+            Some("test/session-model"),
+        );
+        assert_eq!(model, "test/session-model");
+        // Without a parent model, `current` falls back to `default`.
+        let model =
+            resolve_internal_subagent_model(&spec_with_model(Some("current")), &config, None, None);
+        assert_eq!(model, "test/default");
+    }
+
+    #[test]
+    fn declared_secondary_and_default_fall_back_sensibly() {
+        let config = app_config_with_models("test/default", None, None);
+        assert_eq!(
+            resolve_internal_subagent_model(
+                &spec_with_model(Some("secondary")),
+                &config,
+                None,
+                None
+            ),
+            "test/default"
+        );
+        assert_eq!(
+            resolve_internal_subagent_model(
+                &spec_with_model(Some("default")),
+                &config,
+                Some("fast"),
+                None
+            ),
+            "test/default"
+        );
+    }
+
+    #[test]
+    fn raw_model_id_is_ignored_and_standard_resolution_applies() {
+        let config =
+            app_config_with_models("test/default", Some("test/fast"), Some("test/secondary"));
+        // `model_alias()` filters raw ids out, so the request's `current`
+        // token resolves normally (to the parent session model).
+        let model = resolve_internal_subagent_model(
+            &spec_with_model(Some("test/model")),
+            &config,
+            Some("current"),
+            Some("test/session-model"),
+        );
+        assert_eq!(model, "test/session-model");
+    }
+
+    #[test]
+    fn without_binding_standard_resolution_applies() {
+        let config =
+            app_config_with_models("test/default", Some("test/fast"), Some("test/secondary"));
+        let model = resolve_internal_subagent_model(
+            &spec_with_model(None),
+            &config,
+            Some("fast"),
+            Some("test/session-model"),
+        );
+        assert_eq!(model, "test/fast");
     }
 }
