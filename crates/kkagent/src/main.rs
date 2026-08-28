@@ -308,6 +308,12 @@ async fn main() -> Result<()> {
     }
 
     let is_tui = cli.command.is_none() && cli.prompt.is_none();
+
+    // Detect an unusable kkagent home (e.g. `~/.kkagent` being a regular file)
+    // before logging/diagnostics try to write into it, so the user gets one
+    // clear, actionable error instead of cryptic OS errors like `File exists`.
+    kkagent_config::validate_config_dir()?;
+
     init_logging(is_tui)?;
 
     let mut diagnostics = RunDiagnostics::start(runtime_mode(&cli))?;

@@ -39,6 +39,65 @@ pub fn default_config_dir() -> PathBuf {
         .join(".kkagent")
 }
 
+/// Verify the kkagent home path is usable: it must either not exist yet (it
+/// will be created on demand) or be a directory. A regular file named
+/// `.kkagent` (or a `KKAGENT_HOME` pointing at a file) makes every later
+/// write fail with obscure `File exists` / `Not a directory` OS errors, so we
+/// detect it up front and tell the user how to fix it.
+pub fn validate_config_dir() -> Result<()> {
+    validate_config_dir_at(&default_config_dir())
+}
+
+fn validate_config_dir_at(dir: &Path) -> Result<()> {
+    let meta = match std::fs::symlink_metadata(dir) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(anyhow::Error::new(error)
+                .context(format!("cannot inspect kkagent home {}", dir.display())));
+        }
+    };
+    // Follow symlinks: a symlink to a real directory is fine; a dangling one
+    // or one pointing at a file is reported like any other non-directory.
+    let is_dir = if meta.file_type().is_symlink() {
+        std::fs::metadata(dir)
+            .map(|followed| followed.is_dir())
+            .unwrap_or(false)
+    } else {
+        meta.is_dir()
+    };
+    if is_dir {
+        return Ok(());
+    }
+    let kind = if meta.file_type().is_symlink() {
+        "a symlink that does not point to a directory"
+    } else {
+        "a regular file"
+    };
+    let mut hints = vec![format!(
+        "  - move the file out of the way, e.g.:  mv {} {}.bak",
+        dir.display(),
+        dir.display()
+    )];
+    if std::env::var_os("KKAGENT_HOME").is_some() {
+        hints.insert(
+            0,
+            "  - fix or unset KKAGENT_HOME so it points to a directory".to_string(),
+        );
+    }
+    hints
+        .push("  - or relocate the kkagent home:  export KKAGENT_HOME=~/.kkagent-home".to_string());
+    anyhow::bail!(
+        "kkagent home {} is {}, not a directory.\n\
+         kkagent stores its config, sessions, and logs under this directory and cannot run \
+         while the path is occupied by a file.\n\
+         Fix options:\n{}",
+        dir.display(),
+        kind,
+        hints.join("\n")
+    );
+}
+
 pub fn default_config_path() -> PathBuf {
     default_config_dir().join("config.toml")
 }
@@ -411,6 +470,9 @@ fn env_positive_usize(name: &str) -> Option<usize> {
 }
 
 pub fn ensure_config_dir() -> Result<PathBuf> {
+    // Fail with an actionable message when e.g. `~/.kkagent` is a regular
+    // file, instead of a cryptic `File exists` from `create_dir_all`.
+    validate_config_dir()?;
     let dir = default_config_dir();
     if !dir.exists() {
         std::fs::create_dir_all(&dir)?;
@@ -537,6 +599,95 @@ mod persisted_approval_tests {
         assert_eq!(b.rules[0].pattern, "Bash:git push");
         assert_eq!(b.rules[0].decision, "allow");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod validate_config_dir_tests {
+    use super::*;
+
+    fn temp_root(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "kkagent-validate-{}-{}",
+            tag,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn missing_path_is_ok() {
+        let root = temp_root("missing");
+        let target = root.join(".kkagent");
+        assert!(validate_config_dir_at(&target).is_ok());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn directory_is_ok() {
+        let root = temp_root("dir");
+        let target = root.join(".kkagent");
+        std::fs::create_dir_all(&target).unwrap();
+        assert!(validate_config_dir_at(&target).is_ok());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The customer-reported case: `~/.kkagent` exists but is a regular file.
+    #[test]
+    fn regular_file_is_rejected_with_actionable_error() {
+        let root = temp_root("file");
+        let target = root.join(".kkagent");
+        std::fs::write(&target, "stray file").unwrap();
+
+        let err = validate_config_dir_at(&target).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("not a directory"), "message: {msg}");
+        assert!(
+            msg.contains(target.display().to_string().as_str()),
+            "message: {msg}"
+        );
+        // Must tell the user how to fix it, not just that it failed.
+        assert!(msg.contains("mv"), "message: {msg}");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_to_directory_is_ok() {
+        let root = temp_root("symlink-dir");
+        let real = root.join("real-home");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = root.join(".kkagent");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(validate_config_dir_at(&link).is_ok());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_to_file_is_rejected() {
+        let root = temp_root("symlink-file");
+        let file = root.join("stray.txt");
+        std::fs::write(&file, "x").unwrap();
+        let link = root.join(".kkagent");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        assert!(validate_config_dir_at(&link).is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_symlink_is_rejected() {
+        let root = temp_root("symlink-dangling");
+        let link = root.join(".kkagent");
+        std::os::unix::fs::symlink(root.join("does-not-exist"), &link).unwrap();
+        assert!(validate_config_dir_at(&link).is_err());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
 
