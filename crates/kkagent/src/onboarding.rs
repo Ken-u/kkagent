@@ -342,9 +342,15 @@ pub async fn run_doctor(configured_path: Option<&Path>, as_json: bool, live: boo
         )),
     }
 
+    #[cfg(unix)]
+    if let Some(config) = &config {
+        doctor_config_perms(&path, config, &mut checks);
+    }
+
     if let Some(config) = &config {
         doctor_model(config, &mut checks);
         doctor_sandbox(config, &mut checks);
+        doctor_mcp(config, &mut checks);
         if live {
             checks.push(probe_provider(config).await);
         }
@@ -740,6 +746,118 @@ fn doctor_toolchain(config: &AppConfig, checks: &mut Vec<JsonValue>) {
     checks.push(check("toolchain", status, report, hint.map(String::as_str)));
 }
 
+fn doctor_mcp(config: &AppConfig, checks: &mut Vec<JsonValue>) {
+    if config.mcp_servers.is_empty() {
+        checks.push(check("mcp", "ok", "no MCP servers configured", None));
+        return;
+    }
+
+    let mut servers: Vec<(&String, &kkagent_config::McpServerConfig)> =
+        config.mcp_servers.iter().collect();
+    servers.sort_by_key(|(name, _)| *name);
+
+    for (name, server) in servers {
+        let check_name = format!("mcp:{name}");
+        let transport = server
+            .transport_type
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .unwrap_or_else(|| {
+                if server.url.is_some() {
+                    "http"
+                } else {
+                    "stdio"
+                }
+            });
+
+        match transport {
+            "stdio" => {
+                let cmd = server.command.as_deref().unwrap_or("").trim();
+                let found = if cmd.chars().any(std::path::is_separator) {
+                    Path::new(cmd).exists()
+                } else if !cmd.is_empty() {
+                    find_on_path(cmd).is_some()
+                } else {
+                    false
+                };
+
+                if found {
+                    checks.push(check(
+                        &check_name,
+                        "ok",
+                        format!("command \"{cmd}\" resolves"),
+                        None,
+                    ));
+                } else {
+                    checks.push(check(
+                        &check_name,
+                        "warn",
+                        format!("mcp_servers.{name}: stdio command \"{cmd}\" was not found"),
+                        Some("install it, fix the command, or disable the server"),
+                    ));
+                }
+            }
+            "sse" | "http" | "streamable-http" => {
+                let raw_url = server.url.as_deref().unwrap_or("").trim();
+                if let Some(host) = kkagent_config::extract_http_url_host(raw_url) {
+                    checks.push(check(
+                        &check_name,
+                        "ok",
+                        format!("remote host \"{host}\""),
+                        None,
+                    ));
+                } else {
+                    checks.push(check(
+                        &check_name,
+                        "fail",
+                        format!(
+                            "mcp_servers.{name}: url must start with http:// or https:// (got \"{raw_url}\")"
+                        ),
+                        Some("set url to start with http:// or https://"),
+                    ));
+                }
+            }
+            other => {
+                checks.push(check(
+                    &check_name,
+                    "fail",
+                    format!("mcp_servers.{name}: unsupported transport \"{other}\""),
+                    Some("use stdio, sse, http, or streamable-http"),
+                ));
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn loose_config_perms(mode: u32) -> bool {
+    mode & 0o077 != 0
+}
+
+#[cfg(unix)]
+fn doctor_config_perms(path: &Path, config: &AppConfig, checks: &mut Vec<JsonValue>) {
+    use std::os::unix::fs::PermissionsExt;
+    let Ok(meta) = std::fs::metadata(path) else {
+        return;
+    };
+    let mode = meta.permissions().mode() & 0o777;
+    let has_inline_api_key = config
+        .providers
+        .values()
+        .any(|p| p.api_key.as_deref().is_some_and(|k| !k.is_empty()));
+    if loose_config_perms(mode) && has_inline_api_key {
+        checks.push(check(
+            "config-perms",
+            "warn",
+            format!(
+                "config.toml contains an inline api_key and is group/world-readable (mode 0o{mode:o})"
+            ),
+            Some("chmod 600 the file, or switch the provider to api_key_env"),
+        ));
+    }
+}
+
 /// Best-effort on-disk size of `path` (depth-limited, non-fatal on errors).
 fn dir_size_approx(path: &Path) -> u64 {
     fn walk(path: &Path, depth: u32, total: &mut u64) {
@@ -857,5 +975,165 @@ mod tests {
         redact_json(&mut value, None);
         assert_eq!(value["providers"]["x"]["api_key"], "<redacted>");
         assert_eq!(value["providers"]["x"]["base_url"], "safe");
+    }
+
+    #[test]
+    fn doctor_mcp_empty_servers() {
+        let config = AppConfig::default();
+        let mut checks = Vec::new();
+        doctor_mcp(&config, &mut checks);
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0]["name"], "mcp");
+        assert_eq!(checks[0]["status"], "ok");
+        assert_eq!(checks[0]["message"], "no MCP servers configured");
+    }
+
+    #[test]
+    fn doctor_mcp_stdio_missing_command() {
+        let mut config = AppConfig::default();
+        config.mcp_servers.insert(
+            "test_stdio_missing".into(),
+            kkagent_config::McpServerConfig {
+                transport_type: Some("stdio".into()),
+                command: Some("kkagent-no-such-bin-xyz".into()),
+                ..Default::default()
+            },
+        );
+        let mut checks = Vec::new();
+        doctor_mcp(&config, &mut checks);
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0]["name"], "mcp:test_stdio_missing");
+        assert_eq!(checks[0]["status"], "warn");
+        assert!(checks[0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("stdio command \"kkagent-no-such-bin-xyz\" was not found"));
+        assert_eq!(
+            checks[0]["fix"].as_str(),
+            Some("install it, fix the command, or disable the server")
+        );
+    }
+
+    #[test]
+    fn doctor_mcp_stdio_existing_command_path() {
+        let exe = std::env::current_exe().unwrap();
+        let mut config = AppConfig::default();
+        config.mcp_servers.insert(
+            "test_stdio_ok".into(),
+            kkagent_config::McpServerConfig {
+                command: Some(exe.to_string_lossy().to_string()),
+                ..Default::default()
+            },
+        );
+        let mut checks = Vec::new();
+        doctor_mcp(&config, &mut checks);
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0]["name"], "mcp:test_stdio_ok");
+        assert_eq!(checks[0]["status"], "ok");
+        assert!(checks[0]["message"].as_str().unwrap().contains("resolves"));
+    }
+
+    #[test]
+    fn doctor_mcp_remote_bad_scheme() {
+        let mut config = AppConfig::default();
+        config.mcp_servers.insert(
+            "test_bad_remote".into(),
+            kkagent_config::McpServerConfig {
+                transport_type: Some("http".into()),
+                url: Some("file:///bad/path".into()),
+                ..Default::default()
+            },
+        );
+        let mut checks = Vec::new();
+        doctor_mcp(&config, &mut checks);
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0]["name"], "mcp:test_bad_remote");
+        assert_eq!(checks[0]["status"], "fail");
+        assert_eq!(
+            checks[0]["fix"].as_str(),
+            Some("set url to start with http:// or https://")
+        );
+    }
+
+    #[test]
+    fn doctor_mcp_remote_good_scheme() {
+        let mut config = AppConfig::default();
+        config.mcp_servers.insert(
+            "test_good_remote".into(),
+            kkagent_config::McpServerConfig {
+                transport_type: Some("sse".into()),
+                url: Some("https://example.com/sse".into()),
+                ..Default::default()
+            },
+        );
+        let mut checks = Vec::new();
+        doctor_mcp(&config, &mut checks);
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0]["name"], "mcp:test_good_remote");
+        assert_eq!(checks[0]["status"], "ok");
+        assert!(checks[0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("example.com"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_loose_config_perms() {
+        assert!(!loose_config_perms(0o600));
+        assert!(loose_config_perms(0o644));
+        assert!(loose_config_perms(0o640));
+        assert!(!loose_config_perms(0o400));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn doctor_config_perms_warns_on_loose_perms_with_api_key() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp_dir =
+            std::env::temp_dir().join(format!("kkagent-test-perms-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let file_path = temp_dir.join("config.toml");
+        std::fs::write(&file_path, "test").unwrap();
+        std::fs::set_permissions(&file_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let mut config = AppConfig::default();
+        config.providers.insert(
+            "openai".into(),
+            kkagent_config::ProviderConfig {
+                provider_type: "openai".into(),
+                api_key: Some("sk-secret-key".into()),
+                ..Default::default()
+            },
+        );
+
+        let mut checks = Vec::new();
+        doctor_config_perms(&file_path, &config, &mut checks);
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0]["name"], "config-perms");
+        assert_eq!(checks[0]["status"], "warn");
+        assert!(checks[0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("is group/world-readable (mode 0o644)"));
+        assert_eq!(
+            checks[0]["fix"].as_str(),
+            Some("chmod 600 the file, or switch the provider to api_key_env")
+        );
+
+        // No warning if chmod 600
+        std::fs::set_permissions(&file_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let mut checks_safe = Vec::new();
+        doctor_config_perms(&file_path, &config, &mut checks_safe);
+        assert!(checks_safe.is_empty());
+
+        // No warning if no api_key
+        std::fs::set_permissions(&file_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let config_no_key = AppConfig::default();
+        let mut checks_no_key = Vec::new();
+        doctor_config_perms(&file_path, &config_no_key, &mut checks_no_key);
+        assert!(checks_no_key.is_empty());
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

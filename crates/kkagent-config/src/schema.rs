@@ -392,7 +392,7 @@ fn default_image_read_byte_budget() -> usize {
     256 * 1024
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ProviderConfig {
     #[serde(rename = "type")]
     pub provider_type: String,
@@ -1027,7 +1027,7 @@ pub struct ServiceEndpoint {
     pub api_key: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct McpServerConfig {
     /// Transport: `stdio` (default), `sse`, `http`, or `streamable-http`.
     #[serde(default, rename = "type", alias = "transport")]
@@ -1310,16 +1310,37 @@ impl AppConfig {
             anyhow::bail!("image.read_byte_budget must be between 1 and 20971520 bytes");
         }
         for (name, server) in &self.mcp_servers {
-            match server.transport_type.as_deref().unwrap_or("stdio") {
+            if server.timeout_ms == Some(0) {
+                anyhow::bail!("MCP server {name} timeout_ms must be greater than zero");
+            }
+            let transport = server
+                .transport_type
+                .as_deref()
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .unwrap_or_else(|| {
+                    if server.url.is_some() {
+                        "http"
+                    } else {
+                        "stdio"
+                    }
+                });
+            match transport {
                 "stdio" if server.command.as_deref().unwrap_or("").trim().is_empty() => {
                     anyhow::bail!("MCP server {name} requires command for stdio transport")
                 }
-                "sse" | "http" | "streamable-http"
-                    if server.url.as_deref().unwrap_or("").trim().is_empty() =>
-                {
-                    anyhow::bail!("MCP server {name} requires url for remote transport")
+                "sse" | "http" | "streamable-http" => {
+                    let url = server.url.as_deref().unwrap_or("").trim();
+                    if url.is_empty() {
+                        anyhow::bail!("MCP server {name} requires url for remote transport");
+                    }
+                    if !is_valid_http_url(url) {
+                        anyhow::bail!(
+                            "MCP server {name} url must start with http:// or https:// (got \"{url}\")"
+                        );
+                    }
                 }
-                "stdio" | "sse" | "http" | "streamable-http" => {}
+                "stdio" => {}
                 other => anyhow::bail!("MCP server {name} has unsupported transport {other}"),
             }
         }
@@ -1481,6 +1502,32 @@ impl AppConfig {
         if let Some(server) = self.mcp_servers.get_mut(name) {
             server.enabled = Some(!disabled);
         }
+    }
+}
+
+/// Validate whether `url` is an absolute HTTP or HTTPS URL with a non-empty host.
+pub fn is_valid_http_url(url: &str) -> bool {
+    extract_http_url_host(url).is_some()
+}
+
+/// Extract the host part if `url` starts with http:// or https:// and has a non-empty host.
+pub fn extract_http_url_host(url: &str) -> Option<&str> {
+    let lower = url.to_ascii_lowercase();
+    let rest = if lower.starts_with("http://") {
+        &url["http://".len()..]
+    } else if lower.starts_with("https://") {
+        &url["https://".len()..]
+    } else {
+        return None;
+    };
+    if rest.is_empty() {
+        return None;
+    }
+    let host = rest.split('/').next().unwrap_or("");
+    if host.is_empty() {
+        None
+    } else {
+        Some(host)
     }
 }
 
@@ -2160,5 +2207,105 @@ plugin_marketplaces = [
         assert!(declares_image_input(&["multimodal".into()]));
         assert!(!declares_image_input(&["tool_use".into()]));
         assert!(!declares_image_input(&[]));
+    }
+
+    #[test]
+    fn validates_mcp_remote_url_scheme() {
+        // Missing scheme
+        let mut config = valid_config();
+        config.mcp_servers.insert(
+            "remote_no_scheme".into(),
+            McpServerConfig {
+                transport_type: Some("sse".into()),
+                url: Some("localhost:8080/mcp".into()),
+                ..Default::default()
+            },
+        );
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains(
+            "MCP server remote_no_scheme url must start with http:// or https:// (got \"localhost:8080/mcp\")"
+        ));
+
+        // file:// scheme rejected
+        let mut config = valid_config();
+        config.mcp_servers.insert(
+            "remote_file".into(),
+            McpServerConfig {
+                transport_type: Some("http".into()),
+                url: Some("file:///path/to/server".into()),
+                ..Default::default()
+            },
+        );
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains(
+            "MCP server remote_file url must start with http:// or https:// (got \"file:///path/to/server\")"
+        ));
+
+        // Implicit http when transport_type is None but url is Some
+        let mut config = valid_config();
+        config.mcp_servers.insert(
+            "remote_implicit_bad".into(),
+            McpServerConfig {
+                transport_type: None,
+                url: Some("ftp://example.com".into()),
+                ..Default::default()
+            },
+        );
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains(
+            "MCP server remote_implicit_bad url must start with http:// or https:// (got \"ftp://example.com\")"
+        ));
+
+        // http://host/mcp accepted
+        let mut config = valid_config();
+        config.mcp_servers.insert(
+            "remote_http".into(),
+            McpServerConfig {
+                transport_type: Some("streamable-http".into()),
+                url: Some("http://host/mcp".into()),
+                ..Default::default()
+            },
+        );
+        assert!(config.validate().is_ok());
+
+        // https://host accepted
+        let mut config = valid_config();
+        config.mcp_servers.insert(
+            "remote_https".into(),
+            McpServerConfig {
+                transport_type: None,
+                url: Some("https://host".into()),
+                ..Default::default()
+            },
+        );
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn validates_mcp_timeout_ms() {
+        let mut config = valid_config();
+        config.mcp_servers.insert(
+            "srv".into(),
+            McpServerConfig {
+                command: Some("echo".into()),
+                timeout_ms: Some(0),
+                ..Default::default()
+            },
+        );
+        let err = config.validate().unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("MCP server srv timeout_ms must be greater than zero"));
+
+        let mut config = valid_config();
+        config.mcp_servers.insert(
+            "srv".into(),
+            McpServerConfig {
+                command: Some("echo".into()),
+                timeout_ms: Some(1),
+                ..Default::default()
+            },
+        );
+        assert!(config.validate().is_ok());
     }
 }

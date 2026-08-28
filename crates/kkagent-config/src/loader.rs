@@ -239,6 +239,13 @@ pub fn load_config(path: Option<&Path>) -> Result<AppConfig> {
         None => default_config_path(),
     };
 
+    if config_path.is_dir() {
+        anyhow::bail!(
+            "config path {} is a directory — pass the config file itself (e.g. ~/.kkagent/config.toml), not the directory",
+            config_path.display()
+        );
+    }
+
     let mut config = if !config_path.exists() {
         tracing::info!("Config file not found at {:?}, using defaults", config_path);
         AppConfig::default()
@@ -687,6 +694,18 @@ mod validate_config_dir_tests {
         let link = root.join(".kkagent");
         std::os::unix::fs::symlink(root.join("does-not-exist"), &link).unwrap();
         assert!(validate_config_dir_at(&link).is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn load_config_rejects_directory_path() {
+        let root = temp_root("load-dir");
+        let err = load_config(Some(&root)).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("is a directory"),
+            "unexpected error message: {msg}"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }
