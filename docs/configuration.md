@@ -117,11 +117,14 @@ high_contrast = false
 reduce_motion = false
 check_updates = true
 # experimental_smart_at_complete = true  # 递归模糊 `@` 补全；默认关闭，按级目录补全
+mouse_mode = "capture"                   # 实验性："capture"（默认）或 "off"
 ```
 
 `check_updates` 默认启用：TUI 首屏不会等待网络，而是在后台查询 `Ken-u/kkagent` 的最新 GitHub Release；成功结果缓存 24 小时，失败结果一小时后重试。发现新版本时只显示 Release 链接和 `kkagent-update`（Windows 为 `kkagent-update.ps1`）提示，不会自动下载或替换程序。设为 `false` 可完全关闭检查。
 
 `@` 路径补全默认只列出**当前一级**目录/文件（输入前缀过滤，选中目录后以 `/` 结尾并继续下一级）。需要原来的递归模糊搜索时，设置 `experimental_smart_at_complete = true`。
+
+`mouse_mode`（实验性）控制 TUI 是否接管鼠标滚轮：`capture`（默认）在应用内滚动聊天记录并支持拖选；`off` 完全关闭鼠标上报，滚轮交给终端原生处理。适用于部分 Windows SSH 客户端（老版 Xshell / PuTTY / SecureCRT 等）对 SGR 鼠标协议支持不全的场景——它们会把滚轮误解为方向键序列，导致在输入框里上下翻历史而不是滚动内容。环境变量 `KKAGENT_MOUSE_MODE=off` 可临时覆盖此配置（`off`/`none`/`alternate-scroll` 均视为关闭）。
 
 ## Agent 循环
 

@@ -34,6 +34,20 @@ impl MouseMode {
         Self::parse(&std::env::var("KKAGENT_MOUSE_MODE").unwrap_or_default())
     }
 
+    /// Resolve the effective mode: `KKAGENT_MOUSE_MODE` wins over the
+    /// experimental `[mouse_mode]` config value (empty env = use config).
+    pub fn resolve(config_value: Option<&str>) -> Self {
+        if let Ok(env) = std::env::var("KKAGENT_MOUSE_MODE") {
+            if !env.trim().is_empty() {
+                return Self::parse(&env);
+            }
+        }
+        match config_value {
+            Some(v) if !v.trim().is_empty() => Self::parse(v),
+            _ => Self::Capture,
+        }
+    }
+
     pub fn enable(self, out: &mut impl Write) -> io::Result<()> {
         match self {
             Self::Capture => execute!(out, EnableMouseCapture),
@@ -59,5 +73,27 @@ mod tests {
         assert_eq!(MouseMode::parse("sgr"), MouseMode::Capture);
         assert_eq!(MouseMode::parse("off"), MouseMode::Off);
         assert_eq!(MouseMode::parse("alternate-scroll"), MouseMode::Off);
+    }
+
+    #[test]
+    fn resolve_config_value_without_env() {
+        // Tests may run with KKAGENT_MOUSE_MODE set; guard the assertions.
+        std::env::remove_var("KKAGENT_MOUSE_MODE");
+        assert_eq!(MouseMode::resolve(None), MouseMode::Capture);
+        assert_eq!(MouseMode::resolve(Some("off")), MouseMode::Off);
+        assert_eq!(MouseMode::resolve(Some("capture")), MouseMode::Capture);
+        assert_eq!(MouseMode::resolve(Some("")), MouseMode::Capture);
+    }
+
+    #[test]
+    fn env_overrides_config() {
+        std::env::set_var("KKAGENT_MOUSE_MODE", "off");
+        assert_eq!(MouseMode::resolve(Some("capture")), MouseMode::Off);
+        std::env::set_var("KKAGENT_MOUSE_MODE", "capture");
+        assert_eq!(MouseMode::resolve(Some("off")), MouseMode::Capture);
+        // Empty env value falls back to config.
+        std::env::set_var("KKAGENT_MOUSE_MODE", "");
+        assert_eq!(MouseMode::resolve(Some("off")), MouseMode::Off);
+        std::env::remove_var("KKAGENT_MOUSE_MODE");
     }
 }

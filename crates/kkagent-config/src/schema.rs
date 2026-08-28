@@ -54,6 +54,13 @@ pub struct AppConfig {
     pub plugin_marketplaces: Vec<PluginMarketplaceSpec>,
     #[serde(default)]
     pub telemetry: bool,
+    /// Experimental TUI mouse-reporting mode: `capture` (default — the app
+    /// owns the wheel for in-transcript scrolling) or `off` (terminal-native
+    /// scrollback; for SSH clients that mishandle SGR mouse reporting and
+    /// turn the wheel into arrow keys, which recall input history instead).
+    /// `KKAGENT_MOUSE_MODE=off` overrides this at runtime.
+    #[serde(default, alias = "mouse_capture")]
+    pub mouse_mode: Option<String>,
     /// Trusted workspace roots (absolute paths). Empty = trust cwd implicitly.
     #[serde(default)]
     pub trusted_workspaces: Vec<String>,

@@ -1523,13 +1523,14 @@ impl TuiApp {
             .parse()
             .unwrap_or(PermissionMode::Manual);
         let plan_mode = config.default_plan_mode;
+        let mouse_mode = MouseMode::resolve(config.mouse_mode.as_deref());
 
         Self {
             config,
             config_path: kkagent_config::default_config_path(),
             client,
             state: AppState::new(permission_mode, plan_mode),
-            mouse_mode: MouseMode::from_env(),
+            mouse_mode,
             jobs: crate::async_jobs::AsyncJobHub::new(),
             use_alt_screen: true,
             remote_connection: false,
