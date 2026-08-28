@@ -85,6 +85,16 @@ impl InputState {
     pub fn backspace(&mut self) {
         if self.cursor > 0 {
             self.push_undo();
+            // Deleting a folded paste / image marker removes it whole —
+            // chipping away "[Pasted text #1 +15 lines]" char by char is
+            // pointless and would leave an orphaned entry behind.
+            if let Some((start, end, id)) = self.pastes.marker_at_cursor(&self.text, self.cursor) {
+                self.pastes.forget(id);
+                self.text.replace_range(start..end, "");
+                self.cursor = start;
+                self.last_was_kill = false;
+                return;
+            }
             let start = self.text[..self.cursor]
                 .char_indices()
                 .last()
@@ -436,6 +446,39 @@ mod tests {
         s.delete();
         assert_eq!(s.text, "ab");
         assert_eq!(s.cursor, 2);
+    }
+
+    #[test]
+    fn backspace_removes_image_marker_whole() {
+        let mut s = InputState::new();
+        s.insert_image_mention(".kkagent/attachments/abc.png");
+        assert_eq!(s.text, "[Pasted Image #1]");
+        // Cursor sits after the marker; one backspace clears it entirely.
+        s.backspace();
+        assert_eq!(s.text, "");
+        assert_eq!(s.cursor, 0);
+        // The stored mapping is gone with the marker.
+        assert_eq!(s.expand_pastes("[Pasted Image #1]"), "[Pasted Image #1]");
+    }
+
+    #[test]
+    fn backspace_removes_text_paste_marker_whole() {
+        let mut s = InputState::new();
+        s.insert_paste(&"x\n".repeat(20), true);
+        assert!(s.text.starts_with("[Pasted text #1"));
+        let len_before = s.text.len();
+        s.backspace();
+        assert_eq!(s.text, "");
+        assert_eq!(len_before, "[Pasted text #1 +20 lines]".len());
+    }
+
+    #[test]
+    fn backspace_still_deletes_single_char_outside_markers() {
+        let mut s = InputState::new();
+        s.insert_image_mention(".kkagent/attachments/a.png");
+        s.insert_str(" tail");
+        s.backspace(); // removes 'l'
+        assert!(s.text.ends_with(" tai"));
     }
 
     #[test]

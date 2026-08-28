@@ -47,16 +47,21 @@ pub fn build_pasted_text_placeholder(paste_id: u32, text: &str) -> String {
     }
 }
 
-/// Find next `[Pasted text #N …]` marker starting at or after `from`.
-/// Returns (start, end, id).
-fn find_next_marker(text: &str, from: usize) -> Option<(usize, usize, u32)> {
+/// Find next `[Pasted text #N …]` / `[Pasted Image #N]` marker starting at or
+/// after `from`. Returns (start, end, id).
+fn find_next_marker(text: &str, from: usize, image: bool) -> Option<(usize, usize, u32)> {
+    let prefix = if image {
+        IMAGE_MARKER_PREFIX
+    } else {
+        MARKER_PREFIX
+    };
     let bytes = text.as_bytes();
     let mut i = from;
     while i < text.len() {
         let rest = &text[i..];
-        let rel = rest.find(MARKER_PREFIX)?;
+        let rel = rest.find(prefix)?;
         let start = i + rel;
-        let after_hash = start + MARKER_PREFIX.len();
+        let after_hash = start + prefix.len();
         if after_hash >= text.len() {
             return None;
         }
@@ -78,8 +83,9 @@ fn find_next_marker(text: &str, from: usize) -> Option<(usize, usize, u32)> {
             continue;
         };
         let mut j = id_end;
-        // Optional ` +N lines` / ` +N line`
-        if text[j..].starts_with(" +") {
+        // Optional ` +N lines` / ` +N line` (text pastes only; image markers
+        // close right after the id).
+        if !image && text[j..].starts_with(" +") {
             let num_start = j + 2;
             let num_end = text[num_start..]
                 .char_indices()
@@ -165,7 +171,7 @@ impl PastePlaceholders {
     fn expand_text_pastes(&self, text: &str) -> String {
         let mut out = String::with_capacity(text.len());
         let mut last = 0;
-        while let Some((start, end, id)) = find_next_marker(text, last) {
+        while let Some((start, end, id)) = find_next_marker(text, last, false) {
             out.push_str(&text[last..start]);
             if let Some(full) = self.entries.get(&id) {
                 out.push_str(full);
@@ -230,12 +236,28 @@ impl PastePlaceholders {
         out
     }
 
+    /// Drop the stored payload for `id` (marker deleted from the composer).
+    pub fn forget(&mut self, id: u32) {
+        self.entries.remove(&id);
+        self.images.remove(&id);
+    }
+
     /// If `cursor` sits inside a paste marker that we know, return (start, end, id).
     pub fn marker_at_cursor(&self, text: &str, cursor: usize) -> Option<(usize, usize, u32)> {
+        self.marker_at_cursor_in(text, cursor, &self.entries)
+            .or_else(|| self.marker_at_cursor_in(text, cursor, &self.images))
+    }
+
+    fn marker_at_cursor_in(
+        &self,
+        text: &str,
+        cursor: usize,
+        table: &HashMap<u32, String>,
+    ) -> Option<(usize, usize, u32)> {
         let cursor = cursor.min(text.len());
         let mut from = 0;
-        while let Some((start, end, id)) = find_next_marker(text, from) {
-            if cursor >= start && cursor <= end && self.entries.contains_key(&id) {
+        while let Some((start, end, id)) = find_next_marker(text, from, self.image_mode(table)) {
+            if cursor >= start && cursor <= end && table.contains_key(&id) {
                 return Some((start, end, id));
             }
             if start >= cursor {
@@ -244,6 +266,12 @@ impl PastePlaceholders {
             from = end;
         }
         None
+    }
+
+    /// Which marker flavor `table` backs: text pastes use `[Pasted text #n]`,
+    /// images use `[Pasted Image #n]`.
+    fn image_mode(&self, table: &HashMap<u32, String>) -> bool {
+        std::ptr::eq(table, &self.images)
     }
 }
 
@@ -306,6 +334,28 @@ mod tests {
         let start = text.find('[').unwrap();
         assert!(p.marker_at_cursor(&text, start + 3).is_some());
         assert!(p.marker_at_cursor(&text, 0).is_none());
+    }
+
+    #[test]
+    fn marker_at_cursor_detects_image_markers() {
+        let mut p = PastePlaceholders::new();
+        p.store_image(1, ".kkagent/attachments/abc.png".into());
+        let text = "look [Pasted Image #1] here";
+        let start = text.find('[').unwrap();
+        let end = text.find(']').unwrap() + 1;
+        // Anywhere inside / at either edge of the marker counts.
+        assert!(p.marker_at_cursor(text, start + 2).is_some());
+        assert!(p.marker_at_cursor(text, start).is_some());
+        assert!(p.marker_at_cursor(text, end).is_some());
+        assert!(p.marker_at_cursor(text, 0).is_none());
+        assert!(p.marker_at_cursor(text, text.len()).is_none());
+    }
+
+    #[test]
+    fn image_marker_without_stored_id_is_not_detected() {
+        let p = PastePlaceholders::new();
+        let text = "see [Pasted Image #9] here";
+        assert!(p.marker_at_cursor(text, 8).is_none());
     }
 
     #[test]
