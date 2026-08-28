@@ -12532,11 +12532,20 @@ pub(crate) fn summarize_tool_input(input: &serde_json::Value) -> String {
             }
         }
     }
-    serde_json::to_string(input)
-        .unwrap_or_default()
-        .chars()
-        .take(512)
-        .collect()
+    // Null / empty containers render as nothing: ACP-delegated tool cards
+    // carry `input: null` (the protocol only exposes titles, not argument
+    // details), and serializing that fallback produced literal "null"
+    // chips like "Read File null".
+    match input {
+        serde_json::Value::Null => String::new(),
+        serde_json::Value::Array(items) if items.is_empty() => String::new(),
+        serde_json::Value::Object(fields) if fields.is_empty() => String::new(),
+        other => serde_json::to_string(other)
+            .unwrap_or_default()
+            .chars()
+            .take(512)
+            .collect(),
+    }
 }
 
 fn pending_approval_from_request(
@@ -16547,6 +16556,27 @@ mod app_state_tests {
         );
         // prev_content_lines still updated for continuity.
         assert_eq!(state.prev_content_lines, Some(35));
+    }
+
+    #[test]
+    fn summarize_tool_input_null_renders_empty_not_literal_null() {
+        use serde_json::json;
+        // ACP-delegated tool cards carry `input: null`; the summary used to
+        // fall through to serde serialization and produce the string "null",
+        // showing up as chips like "Read File null".
+        assert_eq!(summarize_tool_input(&serde_json::Value::Null), "");
+        assert_eq!(summarize_tool_input(&json!({})), "");
+        assert_eq!(summarize_tool_input(&json!([])), "");
+        // Non-empty payloads keep the JSON fallback.
+        assert_eq!(
+            summarize_tool_input(&json!({"custom": 1})),
+            r#"{"custom":1}"#
+        );
+        // Known keys still win.
+        assert_eq!(
+            summarize_tool_input(&json!({"path": "src/main.rs"})),
+            "src/main.rs"
+        );
     }
 
     #[test]

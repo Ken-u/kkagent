@@ -25,6 +25,14 @@ impl ToolRenderRegistry {
     fn chip_text(tc: &DisplayToolCall) -> String {
         let input_summary = crate::sanitize::sanitize_text(&tc.input_summary);
         let input_summary = input_summary.as_ref();
+        // ACP-delegated cards may carry no argument summary at all; avoid
+        // dangling whitespace like "Read File " in that case.
+        if input_summary.is_empty() {
+            return match tc.name.as_str() {
+                "Bash" => "$ (no input)".into(),
+                other => other.to_string(),
+            };
+        }
         match tc.name.as_str() {
             "Bash" => format!("$ {input_summary}"),
             "Read" | "Write" | "Edit" => format!("{} {input_summary}", tc.name),

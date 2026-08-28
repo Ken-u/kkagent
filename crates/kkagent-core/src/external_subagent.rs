@@ -251,32 +251,47 @@ async fn run_prompt(
                     ExternalProgress::ToolCall {
                         tool_call_id,
                         title,
+                        tool_kind,
                         status,
-                        ..
-                    } => match status.as_deref() {
-                        // Terminal statuses close the tool card with a state line.
-                        Some("completed") => AgentEvent::ToolResult {
-                            session_id: sub_cfg.agent_id.clone(),
-                            tool_call_id,
-                            tool_name: title,
-                            output: "[ok]".into(),
-                            is_error: false,
-                        },
-                        Some("failed") => AgentEvent::ToolResult {
-                            session_id: sub_cfg.agent_id.clone(),
-                            tool_call_id,
-                            tool_name: title,
-                            output: "[failed]".into(),
-                            is_error: true,
-                        },
-                        // "pending"/"in_progress"/None: open (or refresh) the card.
-                        _ => AgentEvent::ToolCall {
-                            session_id: sub_cfg.agent_id.clone(),
-                            tool_call_id,
-                            tool_name: title,
-                            input: serde_json::Value::Null,
-                        },
-                    },
+                    } => {
+                        // Cursor sometimes emits tool_call updates without a
+                        // title (notably bare "completed" updates). Fall back
+                        // to the ACP kind ("read"/"edit"/…), else a generic
+                        // label, so the card never renders a blank name.
+                        let label = if title.trim().is_empty() {
+                            tool_kind
+                                .as_deref()
+                                .filter(|k| !k.trim().is_empty())
+                                .unwrap_or("tool")
+                                .to_string()
+                        } else {
+                            title
+                        };
+                        match status.as_deref() {
+                            // Terminal statuses close the tool card with a state line.
+                            Some("completed") => AgentEvent::ToolResult {
+                                session_id: sub_cfg.agent_id.clone(),
+                                tool_call_id,
+                                tool_name: label,
+                                output: "[ok]".into(),
+                                is_error: false,
+                            },
+                            Some("failed") => AgentEvent::ToolResult {
+                                session_id: sub_cfg.agent_id.clone(),
+                                tool_call_id,
+                                tool_name: label,
+                                output: "[failed]".into(),
+                                is_error: true,
+                            },
+                            // "pending"/"in_progress"/None: open (or refresh) the card.
+                            _ => AgentEvent::ToolCall {
+                                session_id: sub_cfg.agent_id.clone(),
+                                tool_call_id,
+                                tool_name: label,
+                                input: serde_json::Value::Null,
+                            },
+                        }
+                    }
                     ExternalProgress::Plan { .. } | ExternalProgress::Unknown { .. } => continue,
                 };
                 m.parent_event_tx
