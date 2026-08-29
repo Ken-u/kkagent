@@ -2829,6 +2829,14 @@ impl TuiApp {
             let load_earlier = *scroll_delta > 0;
             self.state.scroll_lines(*scroll_delta);
             *scroll_delta = 0;
+            // A scroll rewrites the whole transcript while the terminal's
+            // physical cells may already have diverged from ratatui's buffer
+            // model (torn wide-char writes over SSH, stale diff skips). A
+            // sparse diff then leaves ghost text that only F5 could heal.
+            // Repaint fully on every scroll instead — scrolls happen at human
+            // speed, so the extra full-frame write is cheap and turns the
+            // F5-recovery path into an automatic one.
+            self.force_full_redraw = true;
             // While dragging, remap focus to the same screen cell under a new scroll.
             if self.state.selection_dragging {
                 self.update_selection_focus_from_last_mouse();
