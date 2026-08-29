@@ -12156,7 +12156,12 @@ impl TuiApp {
                         }
                         self.state.collapse_completed_turn_tools();
                         self.state.status = SessionStatus::Idle;
-                        // Soft bell when the window may not be focused (best-effort).
+                        let test_summary = recent_test_summary(&self.state.messages);
+                        // Soft bell plus an OSC 9 text notification (iTerm2,
+                        // WezTerm, kitty, Windows Terminal, …) when the window
+                        // may not be focused (best-effort). Terminals without
+                        // OSC 9 support swallow the sequence silently, so this
+                        // stays side-effect free elsewhere.
                         if std::env::var("KKAGENT_NOTIFY")
                             .map(|v| v != "0" && v != "off")
                             .unwrap_or(true)
@@ -12165,11 +12170,12 @@ impl TuiApp {
                                 std::io::stdout(),
                                 crossterm::event::EnableBracketedPaste
                             );
-                            print!("\x07");
+                            let prompt = notification_prompt(&self.state.messages);
+                            print!("\x07\x1b]9;完成: {prompt}\x07");
                             let _ = std::io::Write::flush(&mut std::io::stdout());
                         }
                         // Optional turn completion summary from recent bash/test tools.
-                        if let Some(summary) = recent_test_summary(&self.state.messages) {
+                        if let Some(summary) = test_summary {
                             self.system_message(format!("{summary} · /changes for file edits"));
                         }
                         self.flush_prompt_queue_if_idle();
@@ -12414,6 +12420,30 @@ fn recent_test_summary(messages: &[DisplayMessage]) -> Option<String> {
         }
     }
     None
+}
+
+/// Single-line, length-capped prompt text for the OSC 9 notification.
+/// Falls back to a generic label when no delivered user turn exists.
+fn notification_prompt(messages: &[DisplayMessage]) -> String {
+    const MAX_NOTIFY_CHARS: usize = 30;
+    let mut prompt = messages
+        .iter()
+        .rev()
+        .find(|m| {
+            m.role == MessageRole::User && m.delivery != crate::prompt_queue::DeliveryState::Queued
+        })
+        .map(|m| m.content.clone())
+        .unwrap_or_else(|| "turn completed".to_string());
+    if let Some(first_line) = prompt.lines().next() {
+        prompt = first_line.to_string();
+    }
+    if prompt.chars().count() > MAX_NOTIFY_CHARS {
+        prompt = format!(
+            "{}…",
+            prompt.chars().take(MAX_NOTIFY_CHARS).collect::<String>()
+        );
+    }
+    crate::sanitize::sanitize_text(&prompt).replace(['\n', '\r'], " ")
 }
 
 fn parse_permission_mode_str(raw: &str) -> Option<PermissionMode> {
@@ -13891,6 +13921,66 @@ mod app_state_tests {
             .jobs
             .pending
             .contains_key(&crate::async_jobs::JobChannel::SessionHistory));
+    }
+
+    #[tokio::test]
+    async fn applied_scroll_forces_a_full_redraw() {
+        // Ghost-text healing: every applied scroll must schedule a full
+        // repaint (the F5 path) so terminal-side divergence never lingers
+        // behind a sparse diff.
+        let mut app = test_tui_app();
+        let mut scroll_delta = 0;
+
+        app.flush_pending_scroll(&mut scroll_delta);
+        assert!(!app.force_full_redraw, "no scroll -> no forced repaint");
+
+        scroll_delta = -2;
+        app.flush_pending_scroll(&mut scroll_delta);
+        assert!(app.force_full_redraw);
+        assert_eq!(scroll_delta, 0);
+    }
+
+    fn user_msg(content: &str, delivery: crate::prompt_queue::DeliveryState) -> DisplayMessage {
+        DisplayMessage {
+            role: MessageRole::User,
+            content: content.to_string(),
+            thinking: None,
+            parts: Vec::new(),
+            tool_calls: Vec::new(),
+            delivery,
+            idempotency_key: None,
+        }
+    }
+
+    #[test]
+    fn notification_prompt_uses_last_delivered_user_input() {
+        let messages = vec![
+            user_msg("first request", crate::prompt_queue::DeliveryState::Sent),
+            user_msg("second request", crate::prompt_queue::DeliveryState::Sent),
+        ];
+        assert_eq!(notification_prompt(&messages), "second request");
+    }
+
+    #[test]
+    fn notification_prompt_takes_first_line_caps_and_sanitizes() {
+        let messages = vec![user_msg(
+            "fix the bug \u{1b}]9;evil\u{7} and a very long tail that must be cut off",
+            crate::prompt_queue::DeliveryState::Sent,
+        )];
+        let out = notification_prompt(&messages);
+        assert!(!out.contains('\u{1b}'));
+        assert!(!out.contains("evil"));
+        assert!(out.chars().count() <= 31, "30 chars + ellipsis, got {out}");
+        assert!(out.ends_with('…'));
+
+        // Queued (not yet delivered) prompts are ignored.
+        let queued = vec![user_msg(
+            "queued only",
+            crate::prompt_queue::DeliveryState::Queued,
+        )];
+        assert_eq!(notification_prompt(&queued), "turn completed");
+
+        assert_eq!(notification_prompt(&[]), "turn completed");
     }
 
     #[tokio::test]
