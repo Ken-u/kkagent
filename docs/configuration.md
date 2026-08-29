@@ -444,6 +444,7 @@ client_label = "kkagent"
 | `KKAGENT_HTTP_TERMINAL_TOKEN` | read + terminal token。 |
 | `KKAGENT_ALLOW_IN_MEMORY_TRANSCRIPTS` | 显式允许 transcript 非持久化降级；readiness 会保持失败。 |
 | `KKAGENT_TELEMETRY_ENDPOINT`、`KKAGENT_TELEMETRY_CLOUD` | 云遥测地址和开关。 |
+| `KKAGENT_NOTIFY` | TUI 任务完成提醒：响铃 + `OSC 9` 文本通知（iTerm2 / WezTerm / kitty / Windows Terminal 等会弹出系统通知，内容为 `完成: <用户上一条输入的首行，30 字符内>`；无已发送输入时为 `turn completed`）。设为 `0` 或 `off` 关闭，默认开启。不支持该序列的终端会静默忽略。 |
 | `RUST_LOG` | 日志过滤器。 |
 
 完整可复制模板见 [`examples/config.example.toml`](../examples/config.example.toml)。
