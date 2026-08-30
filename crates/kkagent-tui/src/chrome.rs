@@ -668,6 +668,15 @@ pub struct StatusBarModel {
     pub cwd: Option<String>,
     /// Non-blocking busy / error / MCP notice for the footer tip slot.
     pub activity: Option<String>,
+    /// Active session goal snapshot (None = no goal).
+    pub goal: Option<GoalIndicator>,
+}
+
+/// Compact goal indicator for the footer status line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GoalIndicator {
+    pub status: String,
+    pub description: String,
 }
 
 impl Default for StatusBarModel {
@@ -682,6 +691,7 @@ impl Default for StatusBarModel {
             cache_hit: None,
             cwd: None,
             activity: None,
+            goal: None,
         }
     }
 }
@@ -726,6 +736,22 @@ impl StatusBarModel {
             spans.push(Span::styled(
                 format!("│ cache {:.0}% ", c * 100.0),
                 Style::default().fg(theme.text_muted),
+            ));
+        }
+        if let Some(ref goal) = self.goal {
+            let color = match goal.status.as_str() {
+                "active" => theme.accent,
+                "paused" => theme.warning,
+                "blocked" => theme.error,
+                _ => theme.text_muted,
+            };
+            let label = match goal.status.as_str() {
+                "active" => "goal".to_string(),
+                other => format!("goal:{other}"),
+            };
+            spans.push(Span::styled(
+                format!("│ {} {} ", label, truncate_cols(&goal.description, 24)),
+                Style::default().fg(color),
             ));
         }
         if let Some(ref cwd) = self.cwd {

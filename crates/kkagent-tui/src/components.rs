@@ -2270,6 +2270,25 @@ fn render_footer(
         }),
     ));
 
+    if let Some(ref goal) = state.status_bar.goal {
+        left.push(Span::raw("  "));
+        let color = match goal.status.as_str() {
+            "active" => theme.accent,
+            "paused" => theme.warning,
+            "blocked" => theme.error,
+            _ => theme.text_muted,
+        };
+        let label = if goal.status == "active" {
+            "goal".to_string()
+        } else {
+            format!("goal:{}", goal.status)
+        };
+        left.push(Span::styled(
+            format!("{label} {}", truncate_display_width(&goal.description, 24)),
+            Style::default().fg(color),
+        ));
+    }
+
     let plan_review_hidden = state
         .approval_pending
         .as_ref()
@@ -2392,6 +2411,14 @@ fn render_narrow_footer(
         status_parts.push("plan".to_string());
     }
     status_parts.push(model_label(state, config));
+    if let Some(ref goal) = state.status_bar.goal {
+        let label = if goal.status == "active" {
+            format!("goal {}", goal.description)
+        } else {
+            format!("goal:{} {}", goal.status, goal.description)
+        };
+        status_parts.push(label);
+    }
     if let Some(activity) = state.status_bar.activity.as_ref() {
         status_parts.push(activity.clone());
     } else if state.quit_confirm {

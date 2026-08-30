@@ -5020,6 +5020,15 @@ impl ServerState {
         if let Some(queue) = self.prompt_queue_for_session(session_id).await {
             extra.insert("prompt_queue".into(), queue);
         }
+        if let Some(goal) = self.goal_for(session_id).await.get_goal().await {
+            extra.insert(
+                "goal".into(),
+                serde_json::json!({
+                    "status": goal.status,
+                    "description": goal.description,
+                }),
+            );
+        }
         if let Some(subagents) = self.pending_subagents_for_session(session_id).await {
             extra.insert("pending_subagents".into(), subagents);
         }
@@ -8214,20 +8223,45 @@ async fn handle_rpc_call(
                         goal.untrusted_objective_xml(),
                         kkagent_protocol::goal::GOAL_CONTINUATION_PROMPT
                     );
-                    {
+                    // The session may be checked out of `sessions` mid-turn
+                    // (owned by the agent loop). Fall back to steering the
+                    // running turn instead of failing with "Session not
+                    // found" — the goal prompt is applied at the next model
+                    // step and the turn keeps running.
+                    let delivered = {
                         let mut sessions = state.sessions.lock().await;
-                        if let Some(session) = sessions.get_mut(&session_id) {
-                            session.add_user_message(prompt);
-                        } else {
-                            return Err((-32602, format!("Session not found: {session_id}")));
+                        match sessions.get_mut(&session_id) {
+                            Some(session) => {
+                                session.add_user_message(prompt);
+                                true
+                            }
+                            None => {
+                                drop(sessions);
+                                let mailbox =
+                                    state.steer_mailboxes.lock().await.get(&session_id).cloned();
+                                match mailbox {
+                                    Some(mailbox) => mailbox
+                                        .try_push(SteerInput {
+                                            text: prompt,
+                                            images: Vec::new(),
+                                        })
+                                        .is_ok(),
+                                    None => false,
+                                }
+                            }
                         }
+                    };
+                    if !delivered {
+                        return Err((-32602, format!("Session not found: {session_id}")));
                     }
-                    let turn_permit = state
-                        .turn_locks
-                        .try_acquire(&session_id)
-                        .await
-                        .map_err(|e| (-32000, e))?;
-                    spawn_session_agent_turn(state.clone(), session_id, turn_permit).await?;
+                    let turn_permit = state.turn_locks.try_acquire(&session_id).await;
+                    // Session was idle: run the goal turn immediately.
+                    // Mid-turn acquisition fails, but the steer above already
+                    // delivered the goal prompt into the running turn's
+                    // mailbox.
+                    if let Ok(turn_permit) = turn_permit {
+                        spawn_session_agent_turn(state.clone(), session_id, turn_permit).await?;
+                    }
                     Ok(body)
                 }
                 other => Err((-32602, format!("Unknown goal action: {other}"))),

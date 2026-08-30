@@ -274,6 +274,9 @@ pub struct AppState {
     pub btw: crate::panes::BtwPanelState,
     /// Active model alias (best-effort).
     pub model_alias: Option<String>,
+    /// Current session goal snapshot (None = no goal). Drives the footer
+    /// goal indicator; updated from GoalUpdated events + resume payloads.
+    pub goal: Option<crate::chrome::GoalIndicator>,
     /// Streaming cursor for live assistant deltas.
     pub stream_cursor: crate::streaming::StreamingCursor,
     /// Multi-session tab strip (chrome).
@@ -422,6 +425,7 @@ pub struct SessionRuntimeState {
     pub todos: Vec<TodoItem>,
     pub subagents: crate::subagents::SubagentStore,
     pub model_alias: Option<String>,
+    pub goal: Option<crate::chrome::GoalIndicator>,
     pub last_tool_name: Option<String>,
     pub plan_document: Option<PlanDocument>,
     pub plan_scroll_to_top: bool,
@@ -466,6 +470,7 @@ impl SessionRuntimeState {
             todos: state.todos.clone(),
             subagents: state.subagents.clone(),
             model_alias: state.model_alias.clone(),
+            goal: state.goal.clone(),
             last_tool_name: state.last_tool_name.clone(),
             plan_document: state.plan_document.clone(),
             plan_scroll_to_top: state.plan_scroll_to_top,
@@ -499,6 +504,7 @@ impl SessionRuntimeState {
         state.todos = self.todos;
         state.subagents = self.subagents;
         state.model_alias = self.model_alias;
+        state.goal = self.goal;
         state.last_tool_name = self.last_tool_name;
         state.plan_document = self.plan_document;
         state.plan_scroll_to_top = self.plan_scroll_to_top;
@@ -1164,6 +1170,7 @@ impl AppState {
             active_subagent_view: None,
             btw: crate::panes::BtwPanelState::default(),
             model_alias: None,
+            goal: None,
             stream_cursor: crate::streaming::StreamingCursor::default(),
             tab_strip: TabStrip::default(),
             status_bar: StatusBarModel {
@@ -8244,6 +8251,7 @@ impl TuiApp {
         self.state.messages.clear();
         self.state.active_assistant_message = None;
         self.state.todos.clear();
+        self.state.goal = None;
         self.state.subagents = crate::subagents::SubagentStore::default();
         self.state.subagents_panel = None;
         self.state.todos_expanded = false;
@@ -8443,6 +8451,23 @@ impl TuiApp {
                     self.state.mode = AppMode::Btw;
                 }
             }
+        }
+        if let Some(goal) = data.get("goal") {
+            self.state.goal = goal.as_object().and_then(|g| {
+                let description = g.get("description")?.as_str()?.to_string();
+                if description.is_empty() {
+                    return None;
+                }
+                Some(crate::chrome::GoalIndicator {
+                    status: g
+                        .get("status")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("active")
+                        .to_string(),
+                    description,
+                })
+            });
+            self.state.status_bar.goal = self.state.goal.clone();
         }
         if let Some(queue) = data.get("prompt_queue") {
             let items = queue
@@ -9610,6 +9635,7 @@ impl TuiApp {
                     self.state.messages.clear();
                     self.state.active_assistant_message = None;
                     self.state.todos.clear();
+                    self.state.goal = None;
                     self.state.subagents = crate::subagents::SubagentStore::default();
                     self.state.subagents_panel = None;
                     self.state.status = SessionStatus::Idle;
@@ -9677,6 +9703,7 @@ impl TuiApp {
                         self.state.messages.clear();
                         self.state.active_assistant_message = None;
                         self.state.todos.clear();
+                        self.state.goal = None;
                         self.state.subagents = crate::subagents::SubagentStore::default();
                         self.state.subagents_panel = None;
                         self.state.status = SessionStatus::Idle;
@@ -10261,6 +10288,7 @@ impl TuiApp {
                 self.state.messages.clear();
                 self.state.active_assistant_message = None;
                 self.state.todos.clear();
+                self.state.goal = None;
                 self.state.subagents = crate::subagents::SubagentStore::default();
                 self.state.subagents_panel = None;
                 self.state.todos_expanded = false;
@@ -12128,6 +12156,21 @@ impl TuiApp {
                             let preview: String = objective.chars().take(80).collect();
                             self.system_message(format!("Goal {change} ({status}): {preview}"));
                         }
+                        self.state.goal = goal.as_ref().and_then(|g| {
+                            let description = g.get("description")?.as_str()?.to_string();
+                            if description.is_empty() {
+                                return None;
+                            }
+                            Some(crate::chrome::GoalIndicator {
+                                status: g
+                                    .get("status")
+                                    .and_then(|s| s.as_str())
+                                    .unwrap_or("active")
+                                    .to_string(),
+                                description,
+                            })
+                        });
+                        self.state.status_bar.goal = self.state.goal.clone();
                     }
                     AgentEvent::TurnEnd { .. } => {
                         self.clear_pending_interactions();
