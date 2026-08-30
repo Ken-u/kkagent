@@ -678,6 +678,14 @@ Do not mention this reminder to the user.\n</system-reminder>"
         let mut active_model_alias = model_alias.clone();
         let fallback_model_alias = session.resolve_fallback_model(&self.config);
         let mut using_fallback = false;
+        // True once the fallback has been tried; prevents ping-ponging between
+        // primary and fallback forever — after switching back to the primary
+        // once, its next failure is terminal.
+        let mut fallback_used = false;
+        // True after a mid-step switch back to the primary following a failed
+        // fallback round; if that final primary round succeeds, the session
+        // model is restored to the primary.
+        let mut switched_back = false;
         let mut visible_empty_retry_limit = primary_model_config.experimental_visible_empty_retries;
         let mut visible_empty_retries = 0_u32;
         let mut bad_toolcall_retry_limit =
@@ -1182,7 +1190,46 @@ Do not mention this reminder to the user.\n</system-reminder>"
                 }
                 continue;
             }
-            if failed && empty && !using_fallback {
+            if failed && empty && using_fallback {
+                // The fallback also exhausted its retry budget: switch back to
+                // the primary model for one final round before giving up. The
+                // session model stays on the fallback so later turns resume
+                // there instead of re-failing the primary every round.
+                let reason = last_stream_error
+                    .clone()
+                    .unwrap_or_else(|| "LLM returned an empty or incomplete stream".into());
+                tracing::warn!(
+                    fallback_model = %active_model_alias,
+                    primary_model = %model_alias,
+                    attempts = max_attempts,
+                    %reason,
+                    "Fallback model exhausted retries; switching back to primary model"
+                );
+                retry_notice_count += 1;
+                send_llm_retry_notice(
+                    &self.event_tx,
+                    &session_id,
+                    retry_notice_count,
+                    format!(
+                        "Fallback model {active_model_alias} failed after {max_attempts} attempt(s); switching back to primary {model_alias}: {reason}"
+                    ),
+                    Duration::ZERO,
+                    Duration::ZERO,
+                    true,
+                )
+                .await;
+                active_model_alias.clone_from(&model_alias);
+                using_fallback = false;
+                switched_back = true;
+                failure_retries = 0;
+                visible_empty_retries = 0;
+                visible_empty_retry_limit = primary_model_config.experimental_visible_empty_retries;
+                bad_toolcall_retries = 0;
+                bad_toolcall_retry_limit =
+                    primary_model_config.experimental_bad_toolcall_auto_retries;
+                continue;
+            }
+            if failed && empty && !using_fallback && !fallback_used {
                 if let Some(fallback_alias) = fallback_model_alias.as_ref() {
                     let reason = last_stream_error
                         .clone()
@@ -1209,6 +1256,11 @@ Do not mention this reminder to the user.\n</system-reminder>"
                     .await;
                     active_model_alias.clone_from(fallback_alias);
                     using_fallback = true;
+                    fallback_used = true;
+                    // Persist the fallback onto the session so subsequent turn
+                    // steps (incl. goal-mode auto-continuations) keep using it
+                    // instead of re-failing the primary model every round.
+                    session.set_model_alias(fallback_alias.clone());
                     failure_retries = 0;
                     visible_empty_retries = 0;
                     visible_empty_retry_limit = self
@@ -1290,6 +1342,14 @@ Do not mention this reminder to the user.\n</system-reminder>"
 
         if let Some(error) = terminal_stream_error {
             anyhow::bail!(error);
+        }
+
+        // The switch back to the primary succeeded: persist the primary as
+        // the session model again so later turns resume on it. A step that
+        // succeeds on the fallback (without a switch-back) keeps the
+        // fallback persisted.
+        if switched_back {
+            session.set_model_alias(&model_alias);
         }
 
         tracing::info!(
@@ -4222,7 +4282,9 @@ mod retry_tests {
             .collect::<Vec<_>>();
         assert_eq!(retry_reasons.len(), 3);
         assert!(retry_reasons[1].contains("switching to fallback fallback"));
-        assert_eq!(session.get_model_alias(), "primary");
+        // The fallback recovered on its own retry, so the session model stays
+        // on the fallback (the user's "switch and keep using it" semantics).
+        assert_eq!(session.get_model_alias(), "fallback");
         assert!(session.messages.iter().any(|message| {
             message.content.iter().any(
                 |content| matches!(content, ChatContent::Text { text } if text == "fallback recovered"),
@@ -4233,10 +4295,12 @@ mod retry_tests {
 
     #[tokio::test]
     async fn returns_error_only_after_fallback_also_fails() {
+        // primary (1 attempt) -> fallback (1 attempt) -> primary final round
+        // (1 attempt) -> terminal error.
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base_url = format!("http://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move {
-            for body in ["primary failed", "fallback failed"] {
+            for body in ["primary failed", "fallback failed", "primary failed again"] {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let mut request = [0_u8; 8192];
                 let _ = socket.read(&mut request).await.unwrap();
@@ -4317,7 +4381,161 @@ mod retry_tests {
 
         let error = loop_.run_turn(&mut session).await.unwrap_err();
         server.await.unwrap();
-        assert!(error.to_string().contains("fallback failed"));
+        assert!(error.to_string().contains("primary failed again"));
+        // The session model stays on the fallback even after the final
+        // primary round fails, so a later resume/continue skips the dead
+        // primary's retry delay.
+        assert_eq!(session.get_model_alias(), "fallback");
+        std::fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[tokio::test]
+    async fn switches_back_to_primary_after_fallback_exhausts() {
+        // primary (1 attempt, fails) -> fallback (1 attempt, fails) ->
+        // primary final round (1 attempt, recovers): the turn still succeeds.
+        let primary_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let primary_url = format!("http://{}", primary_listener.local_addr().unwrap());
+        let primary_server = tokio::spawn(async move {
+            for attempt in 1..=2 {
+                let (mut socket, _) = primary_listener.accept().await.unwrap();
+                let mut request = [0_u8; 8192];
+                let _ = socket.read(&mut request).await.unwrap();
+                if attempt == 1 {
+                    let body = "primary unavailable";
+                    let response = format!(
+                        "HTTP/1.1 503 Service Unavailable\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    socket.write_all(response.as_bytes()).await.unwrap();
+                } else {
+                    let body =
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"primary recovered\"}}]}\n\
+                                data: [DONE]\n";
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    socket.write_all(response.as_bytes()).await.unwrap();
+                }
+            }
+        });
+
+        let fallback_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let fallback_url = format!("http://{}", fallback_listener.local_addr().unwrap());
+        let fallback_server = tokio::spawn(async move {
+            let (mut socket, _) = fallback_listener.accept().await.unwrap();
+            let mut request = [0_u8; 8192];
+            let _ = socket.read(&mut request).await.unwrap();
+            let body = "fallback unavailable";
+            let response = format!(
+                "HTTP/1.1 503 Service Unavailable\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let mut config = AppConfig {
+            default_model: Some("primary".into()),
+            fallback_model: Some("fallback".into()),
+            loop_control: Some(LoopControlConfig {
+                max_attempts_per_step: 1,
+                rate_limit_retry_base_seconds: 0,
+                reserved_context_size: 1_000,
+                max_steps_per_turn: 1,
+                auto_compact: false,
+                compact_keep_last: 4,
+                token_counting: "estimated".into(),
+                ..Default::default()
+            }),
+            ..AppConfig::default()
+        };
+        for (name, base_url) in [("primary", primary_url), ("fallback", fallback_url)] {
+            config.providers.insert(
+                name.into(),
+                ProviderConfig {
+                    provider_type: "openai-chat".into(),
+                    api_key: Some("token".into()),
+                    api_key_env: None,
+                    base_url: Some(base_url),
+                    custom_headers: HashMap::new(),
+                    oauth: None,
+                    first_token_timeout_ms: None,
+                    extra_fields: Default::default(),
+                },
+            );
+            config.models.insert(
+                name.into(),
+                ModelConfig {
+                    provider: name.into(),
+                    model: format!("{name}-model"),
+                    max_context_size: Some(16_000),
+                    max_output_size: Some(1_000),
+                    capabilities: Vec::new(),
+                    display_name: None,
+                    support_efforts: Vec::new(),
+                    default_effort: None,
+                    pricing: None,
+                    experimental_adaptive_thinking: false,
+                    experimental_vision_proxy: false,
+                    experimental_visible_empty_retries: 0,
+                    experimental_bad_toolcall_auto_retries: 0,
+                    first_token_timeout_ms: None,
+                },
+            );
+        }
+
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let loop_ = AgentLoop::new(
+            Arc::new(config),
+            Arc::new(ToolRegistry::new()),
+            Arc::new(Mutex::new(PermissionChain::new(
+                PermissionMode::Auto,
+                Vec::new(),
+            ))),
+            event_tx,
+            Arc::new(Mutex::new(HashMap::new())),
+        );
+        let workspace =
+            std::env::temp_dir().join(format!("kkagent-fallback-recover-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let mut session = Session::new(
+            "fallback-recover-test".into(),
+            workspace.clone(),
+            PermissionMode::Auto,
+            "primary".into(),
+        );
+        session.add_user_message("recover on the final primary round".into());
+
+        loop_.run_turn(&mut session).await.unwrap();
+        primary_server.await.unwrap();
+        fallback_server.await.unwrap();
+
+        let mut saw_switch_back_notice = false;
+        let mut saw_error = false;
+        let mut saw_text = false;
+        while let Ok(event) = event_rx.try_recv() {
+            match event {
+                AgentEvent::LlmRetry { reason, .. }
+                    if reason.contains("switching back to primary") =>
+                {
+                    saw_switch_back_notice = true;
+                }
+                AgentEvent::Error { .. } => saw_error = true,
+                AgentEvent::MessageDelta { text, .. } if text.contains("primary recovered") => {
+                    saw_text = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            saw_switch_back_notice,
+            "expected a switch-back-to-primary notice"
+        );
+        assert!(!saw_error, "turn should succeed after the primary recovers");
+        assert!(saw_text, "expected the recovered text from the primary");
+        // The switch-back also persists: the primary that just succeeded
+        // becomes the session model for later turns.
+        assert_eq!(session.get_model_alias(), "primary");
         std::fs::remove_dir_all(workspace).unwrap();
     }
 
