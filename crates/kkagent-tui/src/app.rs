@@ -12348,6 +12348,18 @@ impl TuiApp {
                             self.state.active_assistant_message = None;
                             self.state.follow_bottom = true;
                             self.state.scroll_up = 0;
+                            // Compaction rewrote the history, so the last LLM
+                            // call's usage no longer describes the context.
+                            // Re-estimate with the same chars/4 heuristic the
+                            // footer fallback uses; the next real LLM call
+                            // overwrites this with provider-authoritative
+                            // numbers.
+                            self.state.approx_tokens = self
+                                .state
+                                .messages
+                                .iter()
+                                .map(|m| m.content.len() as u64 / 4)
+                                .sum::<u64>();
                             self.system_message(format!(
                                 "Compacted: {deleted} removed · kept {kept_user_message_count} recent user msgs (file undo/checkpoints may be limited after compact)"
                             ));
@@ -16833,6 +16845,60 @@ mod app_state_tests {
         assert!(app.state.usage_turns.is_empty());
         assert!(app.state.last_step_usage.is_none());
         assert!(app.state.context_breakdown.is_none());
+    }
+
+    #[tokio::test]
+    async fn compact_completed_reestimates_context_tokens() {
+        let (client_transport, server_transport) =
+            kkagent_rpc::transport::memory::create_memory_pair();
+        let (event_tx, event_rx) = tokio::sync::mpsc::channel(16);
+        let rpc = kkagent_rpc::RpcClient::new(client_transport, event_tx);
+        let client = kkagent_client::KkagentClient::new(rpc, event_rx);
+        let handler: kkagent_rpc::server::RequestHandler = {
+            use futures::FutureExt;
+            Arc::new(|_id, _method, _params, _event_tx| {
+                async move { Err::<serde_json::Value, _>((-32000, "unused".into())) }.boxed()
+            })
+        };
+        tokio::spawn(async move {
+            kkagent_rpc::RpcServer::new(handler)
+                .serve(server_transport)
+                .await;
+        });
+        let mut app = TuiApp::new(AppConfig::default(), client);
+        app.state.session_id = Some("s".into());
+        // Stale pre-compaction usage from the last LLM call: the footer
+        // context indicator must not keep showing this after compact.
+        app.state.approx_tokens = 123_456;
+
+        // Compacted transcript: one kept user message with short text.
+        let messages = vec![serde_json::json!({
+            "role": "user",
+            "content": [{"type": "text", "text": "kept after compact"}],
+        })];
+
+        app.handle_server_event(Frame::Event {
+            event: "agent".into(),
+            scope: None,
+            data: serde_json::to_value(AgentEvent::CompactCompleted {
+                session_id: "s".into(),
+                deleted: 9,
+                kept_user_message_count: 1,
+                messages,
+                error: None,
+            })
+            .unwrap(),
+        });
+
+        let expected = "kept after compact".len() as u64 / 4;
+        assert_ne!(
+            app.state.approx_tokens, 123_456,
+            "compact must replace the stale pre-compaction usage"
+        );
+        assert_eq!(
+            app.state.approx_tokens, expected,
+            "must re-estimate from the surviving transcript, not the stale usage"
+        );
     }
 
     #[test]
