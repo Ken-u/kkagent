@@ -4776,6 +4776,17 @@ impl TuiApp {
                     self.state.messages = transcript_messages_to_display(msgs);
                     self.state.apply_tool_output_mode();
                     self.state.active_assistant_message = None;
+                    // Undo rewrote the history, so the last LLM call's usage
+                    // no longer describes the context. Re-estimate with the
+                    // same chars/4 heuristic the footer fallback uses; the
+                    // next real LLM call overwrites this with
+                    // provider-authoritative numbers.
+                    self.state.approx_tokens = self
+                        .state
+                        .messages
+                        .iter()
+                        .map(|m| m.content.len() as u64 / 4)
+                        .sum::<u64>();
                 }
                 self.state.thinking_text.clear();
                 self.state.follow_bottom = true;
@@ -16898,6 +16909,53 @@ mod app_state_tests {
         assert_eq!(
             app.state.approx_tokens, expected,
             "must re-estimate from the surviving transcript, not the stale usage"
+        );
+    }
+
+    #[tokio::test]
+    async fn undo_turns_reestimates_context_tokens() {
+        let (client_transport, server_transport) =
+            kkagent_rpc::transport::memory::create_memory_pair();
+        let (event_tx, event_rx) = tokio::sync::mpsc::channel(16);
+        let rpc = kkagent_rpc::RpcClient::new(client_transport, event_tx);
+        let client = kkagent_client::KkagentClient::new(rpc, event_rx);
+        // session.undo returns the surviving transcript.
+        let response = serde_json::json!({
+            "undone": 2,
+            "messages": [{
+                "role": "user",
+                "content": [{"type": "text", "text": "kept after undo"}],
+            }],
+        });
+        let handler: kkagent_rpc::server::RequestHandler = {
+            use futures::FutureExt;
+            Arc::new(move |_id, method, _params, _event_tx| {
+                assert_eq!(method, "session.undo");
+                let response = response.clone();
+                async move { Ok(response) }.boxed()
+            })
+        };
+        tokio::spawn(async move {
+            kkagent_rpc::RpcServer::new(handler)
+                .serve(server_transport)
+                .await;
+        });
+        let mut app = TuiApp::new(AppConfig::default(), client);
+        app.state.session_id = Some("s".into());
+        app.state.status = SessionStatus::Idle;
+        // Stale pre-undo usage: undo must not keep showing this.
+        app.state.approx_tokens = 98_765;
+
+        app.undo_turns(2).await.unwrap();
+
+        let expected = "kept after undo".len() as u64 / 4;
+        assert_ne!(
+            app.state.approx_tokens, 98_765,
+            "undo must replace the stale pre-undo usage"
+        );
+        assert_eq!(
+            app.state.approx_tokens, expected,
+            "must re-estimate from the surviving transcript"
         );
     }
 
