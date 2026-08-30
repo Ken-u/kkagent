@@ -75,18 +75,19 @@ mod tests {
         assert_eq!(MouseMode::parse("alternate-scroll"), MouseMode::Off);
     }
 
+    // One combined test: both scenarios mutate the process-wide
+    // KKAGENT_MOUSE_MODE, and parallel Rust tests share one process —
+    // separate tests raced on the variable and failed intermittently.
     #[test]
-    fn resolve_config_value_without_env() {
-        // Tests may run with KKAGENT_MOUSE_MODE set; guard the assertions.
+    fn resolve_config_and_env_precedence() {
+        // No env: config wins (tests may inherit a set variable; guard first).
         std::env::remove_var("KKAGENT_MOUSE_MODE");
         assert_eq!(MouseMode::resolve(None), MouseMode::Capture);
         assert_eq!(MouseMode::resolve(Some("off")), MouseMode::Off);
         assert_eq!(MouseMode::resolve(Some("capture")), MouseMode::Capture);
         assert_eq!(MouseMode::resolve(Some("")), MouseMode::Capture);
-    }
 
-    #[test]
-    fn env_overrides_config() {
+        // Env overrides config.
         std::env::set_var("KKAGENT_MOUSE_MODE", "off");
         assert_eq!(MouseMode::resolve(Some("capture")), MouseMode::Off);
         std::env::set_var("KKAGENT_MOUSE_MODE", "capture");
