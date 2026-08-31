@@ -1,3 +1,4 @@
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::paste_placeholders::PastePlaceholders;
@@ -16,6 +17,10 @@ pub struct InputState {
     pub paste: PasteBurst,
     /// Kimi-style folded paste payloads keyed by marker id.
     pub pastes: PastePlaceholders,
+    /// 鼠标选区，归一化后的 `(start, end)` 字节区间（半开区间）。
+    pub selection: Option<(usize, usize)>,
+    /// 拖拽选区的锚点字节；`None` 表示当前没有在拖拽。
+    pub selection_anchor: Option<usize>,
     last_was_kill: bool,
 }
 
@@ -35,6 +40,8 @@ impl Clone for InputState {
             undo: UndoStack::new(64),
             paste: PasteBurst::new(),
             pastes: self.pastes.clone(),
+            selection: self.selection,
+            selection_anchor: self.selection_anchor,
             last_was_kill: false,
         }
     }
@@ -50,6 +57,8 @@ impl InputState {
             undo: UndoStack::new(64),
             paste: PasteBurst::new(),
             pastes: PastePlaceholders::new(),
+            selection: None,
+            selection_anchor: None,
             last_was_kill: false,
         }
     }
@@ -59,6 +68,107 @@ impl InputState {
             text: self.text.clone(),
             cursor: self.cursor,
         }
+    }
+
+    /// Clamp a byte offset onto UTF-8 boundaries and the text length.
+    fn clamp_boundary(text: &str, at: usize) -> usize {
+        let mut at = at.min(text.len());
+        while at > 0 && !text.is_char_boundary(at) {
+            at -= 1;
+        }
+        at
+    }
+
+    /// Move the caret without touching the selection (clicks start a fresh
+    /// selection immediately afterwards).
+    pub fn move_cursor_to(&mut self, at: usize) {
+        self.cursor = Self::clamp_boundary(&self.text, at);
+    }
+
+    /// Start a mouse selection: drop any old selection, park the anchor and
+    /// place the caret at the click position.
+    pub fn begin_selection(&mut self, at: usize) {
+        let at = Self::clamp_boundary(&self.text, at);
+        self.selection_anchor = Some(at);
+        self.selection = Some((at, at));
+        self.cursor = at;
+    }
+
+    /// Extend the drag selection to `at` (anchor stays fixed).
+    pub fn update_selection(&mut self, at: usize) {
+        let Some(anchor) = self.selection_anchor else {
+            return;
+        };
+        let at = Self::clamp_boundary(&self.text, at);
+        self.selection = Some((anchor.min(at), anchor.max(at)));
+        self.cursor = at;
+    }
+
+    /// Finish a drag: keep the selection when non-empty, otherwise leave just
+    /// the caret at the click position (plain click behavior).
+    pub fn end_selection(&mut self) {
+        self.selection_anchor = None;
+        if let Some((s, e)) = self.selection {
+            if s >= e {
+                self.selection = None;
+                self.cursor = s;
+            }
+        }
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.selection = None;
+        self.selection_anchor = None;
+    }
+
+    pub fn selection_active(&self) -> bool {
+        self.selection.is_some_and(|(s, e)| s < e)
+    }
+
+    /// Copyable plain text of the active selection (`None` when empty).
+    pub fn selected_text(&self) -> Option<String> {
+        let (s, e) = self.selection?;
+        (s < e).then(|| self.text[s..e].to_string())
+    }
+
+    /// Double click: select the word / CJK token under the byte offset.
+    pub fn select_word_at(&mut self, at: usize) {
+        let at = Self::clamp_boundary(&self.text, at);
+        let (start, end) = word_boundaries(&self.text, at);
+        self.selection = Some((start, end));
+        self.selection_anchor = None;
+        self.cursor = end;
+    }
+
+    /// Triple click: select the whole logical line under the byte offset.
+    pub fn select_line_at(&mut self, at: usize) {
+        let at = Self::clamp_boundary(&self.text, at);
+        let start = self.text[..at].rfind('\n').map(|i| i + 1).unwrap_or(0);
+        let end = self.text[at..]
+            .find('\n')
+            .map(|i| at + i)
+            .unwrap_or(self.text.len());
+        self.selection = Some((start, end));
+        self.selection_anchor = None;
+        self.cursor = end;
+    }
+
+    /// Replace the active selection, moving the caret to the seam. Returns the
+    /// number of bytes removed (0 when nothing was selected).
+    fn delete_selection(&mut self) -> usize {
+        let Some((s, e)) = self.selection else {
+            return 0;
+        };
+        self.selection_anchor = None;
+        if s >= e {
+            self.selection = None;
+            return 0;
+        }
+        let removed = e - s;
+        self.text.replace_range(s..e, "");
+        self.cursor = s;
+        self.selection = None;
+        removed
     }
 
     fn push_undo(&mut self) {
@@ -71,18 +181,26 @@ impl InputState {
         if s.is_empty() {
             return;
         }
+        self.delete_selection();
         self.push_undo();
         self.text.insert_str(self.cursor, s);
         self.cursor += s.len();
     }
 
     pub fn insert_char(&mut self, c: char) {
+        self.delete_selection();
         self.push_undo();
         self.text.insert(self.cursor, c);
         self.cursor += c.len_utf8();
     }
 
     pub fn backspace(&mut self) {
+        if self.selection_active() {
+            self.push_undo();
+            self.delete_selection();
+            self.last_was_kill = false;
+            return;
+        }
         if self.cursor > 0 {
             self.push_undo();
             // Deleting a folded paste / image marker removes it whole —
@@ -107,6 +225,12 @@ impl InputState {
     }
 
     pub fn delete(&mut self) {
+        if self.selection_active() {
+            self.push_undo();
+            self.delete_selection();
+            self.last_was_kill = false;
+            return;
+        }
         if self.cursor < self.text.len() {
             self.push_undo();
             let next = self.text[self.cursor..]
@@ -195,6 +319,12 @@ impl InputState {
 
     /// Kill from cursor to end of line (Ctrl-K).
     pub fn kill_line(&mut self) {
+        if self.selection_active() {
+            self.push_undo();
+            self.delete_selection();
+            self.last_was_kill = false;
+            return;
+        }
         let end = {
             let (line_start, _) = self.current_line_start_and_col();
             self.text[line_start..]
@@ -221,6 +351,12 @@ impl InputState {
 
     /// Kill previous word (Ctrl-W).
     pub fn kill_word(&mut self) {
+        if self.selection_active() {
+            self.push_undo();
+            self.delete_selection();
+            self.last_was_kill = false;
+            return;
+        }
         let start = move_word_left(&self.text, self.cursor);
         if start >= self.cursor {
             return;
@@ -235,6 +371,7 @@ impl InputState {
 
     pub fn yank(&mut self) {
         if let Some(text) = self.kill_ring.yank() {
+            self.delete_selection();
             self.push_undo();
             self.text.insert_str(self.cursor, &text);
             self.cursor += text.len();
@@ -247,6 +384,7 @@ impl InputState {
         if let Some(prev) = self.undo.undo(current) {
             self.text = prev.text;
             self.cursor = prev.cursor.min(self.text.len());
+            self.clear_selection();
             self.last_was_kill = false;
             true
         } else {
@@ -259,6 +397,7 @@ impl InputState {
         if let Some(next) = self.undo.redo(current) {
             self.text = next.text;
             self.cursor = next.cursor.min(self.text.len());
+            self.clear_selection();
             self.last_was_kill = false;
             true
         } else {
@@ -337,6 +476,7 @@ impl InputState {
     }
 
     pub fn clear(&mut self) {
+        self.clear_selection();
         if !self.text.is_empty() {
             self.push_undo();
         }
@@ -347,6 +487,7 @@ impl InputState {
     }
 
     pub fn set_text(&mut self, text: String) {
+        self.clear_selection();
         self.push_undo();
         self.cursor = text.len();
         self.text = text;
@@ -356,6 +497,7 @@ impl InputState {
 
     /// Replace `text[start..end]` with `insert` and place cursor after the insert.
     pub fn replace_range(&mut self, start: usize, end: usize, insert: &str) {
+        self.clear_selection();
         let start = start.min(self.text.len());
         let mut end = end.min(self.text.len()).max(start);
         while end < self.text.len() && !self.text.is_char_boundary(end) {
@@ -373,6 +515,7 @@ impl InputState {
     }
 
     pub fn take(&mut self) -> String {
+        self.clear_selection();
         let text = std::mem::take(&mut self.text);
         self.cursor = 0;
         self.horizontal_scroll = 0;
@@ -410,6 +553,31 @@ fn byte_offset_at_col(text: &str, line_start: usize, target_col: usize) -> usize
         }
     }
     text.len()
+}
+
+/// UAX #29 词边界（双击选词）。标点 / 空白 / emoji 只选中所在的单个字素，
+/// 与 transcript 选择行为保持一致。
+fn word_boundaries(text: &str, at: usize) -> (usize, usize) {
+    let clicked = text
+        .grapheme_indices(true)
+        .find(|(start, g)| at >= *start && at < *start + g.len())
+        .map(|(byte, _)| byte)
+        .unwrap_or(at.min(text.len()));
+    let word = text
+        .split_word_bound_indices()
+        .find(|(start, seg)| clicked >= *start && clicked < *start + seg.len());
+    match word {
+        Some((start, seg)) if seg.chars().any(|c| c.is_alphanumeric() || c == '_') => {
+            (start, start + seg.len())
+        }
+        _ => {
+            let (start, g) = text
+                .grapheme_indices(true)
+                .find(|(start, g)| clicked >= *start && clicked < *start + g.len())
+                .unwrap_or((clicked, ""));
+            (start, start + g.len())
+        }
+    }
 }
 
 #[cfg(test)]
@@ -514,5 +682,108 @@ mod tests {
         assert!(s.expand_paste_marker_at_cursor());
         assert!(s.text.contains("alpha"));
         assert!(!s.text.contains("[Pasted text"));
+    }
+
+    #[test]
+    fn mouse_drag_selects_and_copies() {
+        let mut s = InputState::new();
+        s.set_text("hello 世界 wide".to_string());
+        let wide = s.text.find("wide").unwrap();
+        s.begin_selection(0);
+        assert!(!s.selection_active());
+        s.update_selection(wide);
+        assert!(s.selection_active());
+        assert_eq!(s.selected_text().as_deref(), Some("hello 世界 "));
+        s.end_selection();
+        assert!(s.selection_active());
+        // 反向拖拽也能归一化
+        s.begin_selection(wide);
+        s.update_selection(1);
+        s.end_selection();
+        assert_eq!(s.selected_text().as_deref(), Some("ello 世界 "));
+        // 纯点击（无拖动）不留选区
+        s.begin_selection(2);
+        s.end_selection();
+        assert!(!s.selection_active());
+        assert_eq!(s.cursor, 2);
+    }
+
+    #[test]
+    fn typing_replaces_selection() {
+        let mut s = InputState::new();
+        s.set_text("hello world".to_string());
+        s.begin_selection(6);
+        s.update_selection(11);
+        s.end_selection();
+        s.insert_char('X');
+        assert_eq!(s.text, "hello X");
+        assert_eq!(s.cursor, 7);
+        assert!(!s.selection_active());
+    }
+
+    #[test]
+    fn editing_clears_selection() {
+        let mut s = InputState::new();
+        s.set_text("hello world".to_string());
+        s.begin_selection(0);
+        s.update_selection(5);
+        s.end_selection();
+        // 选中态下 backspace 只删除选区本身
+        s.backspace();
+        assert_eq!(s.text, " world");
+        assert_eq!(s.cursor, 0);
+        s.set_text("hello world".to_string());
+        s.begin_selection(3);
+        s.update_selection(8);
+        s.end_selection();
+        s.clear();
+        assert!(s.text.is_empty());
+        assert!(!s.selection_active());
+    }
+
+    #[test]
+    fn double_click_selects_word_cjk_punct() {
+        let mut s = InputState::new();
+        s.set_text("can't stop 你好，世界".to_string());
+        let stop = s.text.find("stop").unwrap();
+        s.select_word_at(stop + 1);
+        assert_eq!(s.selected_text().as_deref(), Some("stop"));
+
+        let comma = s.text.find('，').unwrap();
+        s.select_word_at(comma);
+        assert_eq!(s.selected_text().as_deref(), Some("，"));
+
+        let shi = s.text.rfind('世').unwrap();
+        s.select_word_at(shi);
+        // UAX #29 将每个 CJK 表意字视作独立 token，与 transcript 选词一致。
+        assert_eq!(s.selected_text().as_deref(), Some("世"));
+    }
+
+    #[test]
+    fn triple_click_selects_logical_line() {
+        let mut s = InputState::new();
+        s.set_text("alpha\nbeta\ngamma".to_string());
+        let beta = s.text.find("beta").unwrap();
+        s.select_line_at(beta + 1);
+        assert_eq!(s.selected_text().as_deref(), Some("beta"));
+        // 首行 / 末行
+        s.select_line_at(0);
+        assert_eq!(s.selected_text().as_deref(), Some("alpha"));
+        let gamma = s.text.rfind("gamma").unwrap();
+        s.select_line_at(gamma);
+        assert_eq!(s.selected_text().as_deref(), Some("gamma"));
+    }
+
+    #[test]
+    fn yank_replaces_selection() {
+        let mut s = InputState::new();
+        s.set_text("hello world".to_string());
+        s.cursor = 5;
+        s.kill_line(); // kill " world"
+        s.begin_selection(1);
+        s.update_selection(3);
+        s.end_selection(); // 选中 "el"
+        s.yank();
+        assert_eq!(s.text, "h worldlo");
     }
 }

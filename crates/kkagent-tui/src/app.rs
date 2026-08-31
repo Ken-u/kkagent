@@ -205,6 +205,16 @@ pub struct AppState {
     pub last_mouse: Option<(u16, u16)>,
     /// Recent click history for double/triple click word/line selection.
     pub click_history: Vec<ClickRecord>,
+    /// Composer content geometry from the last frame, for mouse → byte mapping.
+    pub input_area: ratatui::layout::Rect,
+    /// Composer content width in columns (inner width minus mode prefix).
+    pub input_content_width: u16,
+    /// Vertical scroll applied to the composer content in the last frame.
+    pub input_scroll: u16,
+    /// True while a composer mouse drag-select is in progress.
+    pub input_dragging: bool,
+    /// Last composer click (byte, time, count) for double/triple click detection.
+    pub composer_click: Option<(usize, std::time::Instant, u8)>,
     pub approx_tokens: u64,
     pub approval_pending: Option<PendingApproval>,
     /// True while BTW hid a visible approval modal on entry so it can be
@@ -1136,6 +1146,11 @@ impl AppState {
             selection_dragging: false,
             last_mouse: None,
             click_history: Vec::new(),
+            input_area: ratatui::layout::Rect::default(),
+            input_content_width: 0,
+            input_scroll: 0,
+            input_dragging: false,
+            composer_click: None,
             approx_tokens: 0,
             approval_pending: None,
             btw_hid_approval: false,
@@ -2965,6 +2980,27 @@ impl TuiApp {
         )
     }
 
+    /// Copy the composer's own selection to the clipboard with a toast.
+    fn copy_composer_selection(&mut self) {
+        let Some(text) = self.state.input.selected_text() else {
+            return;
+        };
+        let (message, ok) = match copy_to_clipboard(&text) {
+            Ok(()) => {
+                let n = text.chars().count();
+                (format!("Copied {n} chars."), true)
+            }
+            Err(e) => (format!("Copy failed: {e}"), false),
+        };
+        self.state.copy_toast = Some(CopyToast {
+            message,
+            until: std::time::Instant::now() + std::time::Duration::from_millis(1500),
+        });
+        if ok {
+            self.state.input.clear_selection();
+        }
+    }
+
     fn selection_copy_text(&self) -> Option<String> {
         let sel = self.state.selection?;
         let text = crate::selection::extract_text(&self.state.select_rows, sel);
@@ -3006,6 +3042,7 @@ impl TuiApp {
     ) -> bool {
         let previous_hover = self.state.strip_hover_title.clone();
         let previous_selection = self.state.selection;
+        let previous_input_selection = self.state.input.selection;
         self.state.last_mouse = Some((mouse.column, mouse.row));
 
         let over_strip = self.mouse_over_session_strip(&mouse);
@@ -3048,7 +3085,18 @@ impl TuiApp {
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 self.flush_pending_scroll(scroll_delta);
-                if let Some(pos) = self.mouse_to_cell(&mouse) {
+                if let Some(byte) = self.mouse_to_composer_byte(&mouse) {
+                    // Composer click: a transcript selection loses its meaning.
+                    self.clear_selection();
+                    match self.classify_composer_click(byte) {
+                        2 => self.state.input.select_word_at(byte),
+                        3 => self.state.input.select_line_at(byte),
+                        _ => self.state.input.begin_selection(byte),
+                    }
+                    self.state.input_dragging = true;
+                } else if let Some(pos) = self.mouse_to_cell(&mouse) {
+                    // Clicking the transcript drops the composer selection.
+                    self.state.input.clear_selection();
                     if self.toggle_clicked_tool_output(pos.line) {
                         self.state.pending_tool_click_anchor = Some((
                             pos.line,
@@ -3066,8 +3114,14 @@ impl TuiApp {
                         count,
                     }];
                 } else {
-                    // Click outside transcript clears selection.
+                    // Click outside transcript clears selections.
                     self.clear_selection();
+                    self.state.input.clear_selection();
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) if self.state.input_dragging => {
+                if let Some(byte) = self.mouse_to_composer_byte(&mouse) {
+                    self.state.input.update_selection(byte);
                 }
             }
             MouseEventKind::Drag(MouseButton::Left) if self.state.selection_dragging => {
@@ -3079,6 +3133,11 @@ impl TuiApp {
                         sel.focus = pos;
                     }
                 }
+            }
+            MouseEventKind::Up(MouseButton::Left) if self.state.input_dragging => {
+                // A non-empty selection survives; a plain click leaves just the caret.
+                self.state.input.end_selection();
+                self.state.input_dragging = false;
             }
             MouseEventKind::Up(MouseButton::Left) if self.state.selection_dragging => {
                 let click_count = self
@@ -3119,9 +3178,54 @@ impl TuiApp {
             MouseEventKind::Drag(MouseButton::Left) => {
                 previous_hover != self.state.strip_hover_title
                     || previous_selection != self.state.selection
+                    || previous_input_selection != self.state.input.selection
             }
             _ => true,
         }
+    }
+
+    /// Map a mouse event to a composer byte offset, if inside the composer
+    /// content area. Rows scrolled out of view (via `input_scroll`) and clicks
+    /// in the border/prefix chrome are ignored.
+    fn mouse_to_composer_byte(&self, mouse: &crossterm::event::MouseEvent) -> Option<usize> {
+        let area = self.state.input_area;
+        if area.width == 0 || area.height == 0 {
+            return None;
+        }
+        if mouse.column < area.x
+            || mouse.row < area.y
+            || mouse.column >= area.x.saturating_add(area.width)
+            || mouse.row >= area.y.saturating_add(area.height)
+        {
+            return None;
+        }
+        let row = mouse.row.saturating_sub(area.y) + self.state.input_scroll;
+        let col = mouse.column.saturating_sub(area.x);
+        crate::components::byte_at_visual_cell(
+            &self.state.input.text,
+            self.state.input_content_width as usize,
+            row,
+            col,
+        )
+    }
+
+    /// Classify a composer click as single/double/triple based on the previous
+    /// click's byte position and recency.
+    fn classify_composer_click(&mut self, byte: usize) -> u8 {
+        const MULTI_CLICK_MS: u64 = 500;
+        let now = std::time::Instant::now();
+        let count = match self.state.composer_click {
+            Some((at, when, count))
+                if at.abs_diff(byte) <= 4
+                    && count < 3
+                    && now.duration_since(when).as_millis() <= MULTI_CLICK_MS as u128 =>
+            {
+                count + 1
+            }
+            _ => 1,
+        };
+        self.state.composer_click = Some((byte, now, count));
+        count
     }
 
     fn mouse_over_session_strip(&self, mouse: &crossterm::event::MouseEvent) -> bool {
@@ -3329,14 +3433,29 @@ impl TuiApp {
             self.state.quit_confirm = false;
             return Ok(());
         }
+        // Same for a composer selection: Esc folds the selection without
+        // falling through to interrupt / quit.
+        if matches!(key.code, KeyCode::Esc) && self.state.input.selection_active() {
+            self.state.input.clear_selection();
+            self.state.pending_esc_ms = None;
+            self.state.quit_confirm = false;
+            return Ok(());
+        }
 
         // Platform copy shortcut with a non-empty selection copies; otherwise
         // fall through to interrupt / quit. macOS prefers ⌘C but also accepts
         // Ctrl+C (stock Terminal.app does not forward ⌘C); other platforms
-        // use Ctrl+C.
-        if crate::platform_keys::is_copy_shortcut(&key) && self.copy_selection_or_msg() {
-            self.state.quit_confirm = false;
-            return Ok(());
+        // use Ctrl+C. The composer's own selection wins when active.
+        if crate::platform_keys::is_copy_shortcut(&key) {
+            if self.state.input.selection_active() {
+                self.copy_composer_selection();
+                self.state.quit_confirm = false;
+                return Ok(());
+            }
+            if self.copy_selection_or_msg() {
+                self.state.quit_confirm = false;
+                return Ok(());
+            }
         }
 
         // A plan review is a blocking approval, but Esc should only fold its modal.
@@ -4003,6 +4122,22 @@ impl TuiApp {
                 }
                 _ => {}
             }
+        }
+
+        // Caret movement collapses an active composer selection (mouse
+        // selection has no shift-extend keyboard equivalent in most terminals).
+        if self.state.input.selection_active()
+            && matches!(
+                key.code,
+                KeyCode::Left
+                    | KeyCode::Right
+                    | KeyCode::Up
+                    | KeyCode::Down
+                    | KeyCode::Home
+                    | KeyCode::End
+            )
+        {
+            self.state.input.clear_selection();
         }
 
         match key.code {
@@ -13835,6 +13970,71 @@ mod app_state_tests {
         );
         assert_eq!(app.selection_copy_text().as_deref(), Some("hello world"));
         assert_eq!(app.state.click_history.last().unwrap().count, 3);
+    }
+
+    #[tokio::test]
+    async fn composer_mouse_drag_selects_and_double_click_selects_word() {
+        let mut app = test_tui_app();
+        app.state.input.set_text("hello composer world".into());
+        // Fake composer geometry from a rendered frame: content at row 5,
+        // wide enough that no soft-wrap happens (ASCII → col == byte).
+        app.state.input_area = ratatui::layout::Rect::new(0, 5, 40, 3);
+        app.state.input_content_width = 40;
+        app.state.input_scroll = 0;
+        let mouse = |kind, column, row| crossterm::event::MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        let mut scroll_delta = 0;
+
+        // Drag across "composer" (bytes 6..14).
+        app.collect_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), 6, 5),
+            &mut scroll_delta,
+        );
+        app.collect_mouse(
+            mouse(MouseEventKind::Drag(MouseButton::Left), 14, 5),
+            &mut scroll_delta,
+        );
+        app.collect_mouse(
+            mouse(MouseEventKind::Up(MouseButton::Left), 14, 5),
+            &mut scroll_delta,
+        );
+        assert_eq!(app.state.input.selected_text().as_deref(), Some("composer"));
+        assert!(!app.state.selection_dragging);
+
+        // Double click selects the word under the pointer.
+        app.collect_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), 16, 5),
+            &mut scroll_delta,
+        );
+        app.collect_mouse(
+            mouse(MouseEventKind::Up(MouseButton::Left), 16, 5),
+            &mut scroll_delta,
+        );
+        app.collect_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), 16, 5),
+            &mut scroll_delta,
+        );
+        app.collect_mouse(
+            mouse(MouseEventKind::Up(MouseButton::Left), 16, 5),
+            &mut scroll_delta,
+        );
+        assert_eq!(app.state.input.selected_text().as_deref(), Some("world"));
+
+        // A plain click collapses to just the caret.
+        app.collect_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), 2, 5),
+            &mut scroll_delta,
+        );
+        app.collect_mouse(
+            mouse(MouseEventKind::Up(MouseButton::Left), 2, 5),
+            &mut scroll_delta,
+        );
+        assert!(!app.state.input.selection_active());
+        assert_eq!(app.state.input.cursor, 2);
     }
 
     #[test]

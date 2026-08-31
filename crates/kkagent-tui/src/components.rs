@@ -1990,7 +1990,7 @@ fn truncate_display_width(s: &str, max_width: usize) -> String {
     out
 }
 
-fn render_input(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+fn render_input(f: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) {
     let border = match state.mode {
         AppMode::Shell => theme.shell_mode,
         AppMode::Plan => theme.plan_mode,
@@ -2057,6 +2057,9 @@ fn render_input(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let content_width = (inner.width as usize).saturating_sub(prefix_w).max(1);
     let indent = " ".repeat(prefix_w);
 
+    // Mouse selection state is byte offsets into `state.input.text`.
+    let sel = state.input.selection.filter(|(s, e)| s < e);
+
     // Soft-wrap each logical line; prefix only the first visual row of the buffer.
     let mut visual: Vec<Line> = Vec::new();
     for (li, logical) in input_logical_lines(&state.input.text)
@@ -2096,17 +2099,161 @@ fn render_input(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         ]));
     }
 
+    // Highlight the active selection across visual rows. Byte offsets map
+    // 1:1 onto visual rows because `soft_wrap_line` never drops characters.
+    if let Some((sel_start, sel_end)) = sel {
+        let sel_style = crate::selection::selection_style();
+        let mut byte = 0usize; // byte offset where the current visual row starts
+        let mut row = 0u16;
+        for logical in input_logical_lines(&state.input.text) {
+            let line_start = byte;
+            let mut consumed = 0usize;
+            for chunk in soft_wrap_line(logical, content_width) {
+                let chunk_start = line_start + consumed;
+                let chunk_end = chunk_start + chunk.len();
+                if sel_end > chunk_start && sel_start < chunk_end {
+                    if let Some(line) = visual.get_mut(row as usize) {
+                        highlight_byte_span(
+                            line,
+                            chunk_start.max(sel_start),
+                            chunk_end.min(sel_end),
+                            sel_style,
+                        );
+                    }
+                }
+                consumed += chunk.len();
+                row += 1;
+            }
+            // Skip the '\n' that joins this logical line to the next one.
+            byte = line_start + consumed + 1;
+            row += 1;
+        }
+    }
+
     let view_h = inner.height.max(1);
     let scroll = (cursor_y + 1).saturating_sub(view_h);
 
     let paragraph = Paragraph::new(Text::from(visual)).scroll((scroll, 0));
     f.render_widget(paragraph, inner);
 
-    let abs_x = inner.x + cursor_x;
-    let abs_y = inner.y + cursor_y.saturating_sub(scroll);
-    if abs_x < inner.x + inner.width && abs_y < inner.y + inner.height {
-        f.set_cursor_position((abs_x, abs_y));
+    // Remember the content geometry so mouse events can map clicks back to
+    // composer bytes (row within the visual layout + content column).
+    state.input_area = inner;
+    state.input_content_width = content_width as u16;
+    state.input_scroll = scroll;
+
+    // A visible selection hides the terminal caret (focus follows the caret,
+    // which would otherwise render at the selection focus and look wrong).
+    if !state.input.selection_active() {
+        let abs_x = inner.x + cursor_x;
+        let abs_y = inner.y + cursor_y.saturating_sub(scroll);
+        if abs_x < inner.x + inner.width && abs_y < inner.y + inner.height {
+            f.set_cursor_position((abs_x, abs_y));
+        }
     }
+}
+
+/// Highlight `text[start_byte..end_byte]` inside a rendered input row,
+/// splitting spans on the byte range (merged with the selection style).
+/// The leading chrome span (mode prefix / continuation indent) is not part of
+/// the selection byte space.
+fn highlight_byte_span(line: &mut Line<'static>, start: usize, end: usize, sel: Style) {
+    let mut out: Vec<Span<'static>> = Vec::with_capacity(line.spans.len() + 2);
+    let mut spans = line.spans.drain(..);
+    // Translate text-space targets into line-space (skip leading chrome).
+    let chrome = match spans.next() {
+        Some(chrome) => {
+            let len = chrome.content.len();
+            out.push(chrome);
+            len
+        }
+        None => 0,
+    };
+    let (start, end) = (start + chrome, end + chrome);
+    let mut byte = chrome;
+    for span in spans {
+        let span_end = byte + span.content.len();
+        if span_end <= start || byte >= end {
+            byte = span_end;
+            out.push(span);
+            continue;
+        }
+        let style = span.style;
+        let content = span.content;
+        // Portion before the selection.
+        if start > byte {
+            let head = content[..start - byte].to_string();
+            out.push(Span::styled(head, style));
+        }
+        // Selected portion.
+        let sel_from = start.max(byte);
+        let sel_to = end.min(span_end);
+        if sel_to > sel_from {
+            let mid = content[sel_from - byte..sel_to - byte].to_string();
+            let mut merged = style;
+            if let Some(bg) = sel.bg {
+                merged = merged.bg(bg);
+            }
+            if let Some(fg) = sel.fg {
+                merged = merged.fg(fg);
+            }
+            out.push(Span::styled(mid, merged));
+        }
+        // Portion after the selection.
+        if span_end > end {
+            let tail = content[end - byte..].to_string();
+            out.push(Span::styled(tail, style));
+        }
+        byte = span_end;
+    }
+    line.spans = out;
+}
+
+/// Visual-row layout of the composer: `(visual_row, byte_start, byte_end)` per
+/// row, excluding prefix/indent chrome. Built with the same soft-wrap pass the
+/// renderer uses, so mouse clicks can map cells back to byte offsets.
+pub struct InputLayoutRow {
+    pub row: u16,
+    pub start: usize,
+    pub end: usize,
+}
+
+pub fn input_layout(text: &str, content_width: usize) -> Vec<InputLayoutRow> {
+    let width = content_width.max(1);
+    let mut out = Vec::new();
+    let mut byte = 0usize;
+    for logical in input_logical_lines(text) {
+        let line_start = byte;
+        let mut consumed = 0usize;
+        for chunk in soft_wrap_line(logical, width) {
+            out.push(InputLayoutRow {
+                row: out.len() as u16,
+                start: line_start + consumed,
+                end: line_start + consumed + chunk.len(),
+            });
+            consumed += chunk.len();
+        }
+        // Skip the '\n' that joins this logical line to the next one.
+        byte = line_start + consumed + 1;
+    }
+    out
+}
+
+/// Map a click (row, display column) inside the composer content area to a
+/// byte offset in `text`. Columns past the end of a row snap to its last
+/// boundary so clicks on empty space park the caret at the row end.
+pub fn byte_at_visual_cell(text: &str, content_width: usize, row: u16, col: u16) -> Option<usize> {
+    let layout = input_layout(text, content_width);
+    let target = layout.iter().find(|l| l.row == row)?;
+    let segment = text.get(target.start..target.end)?;
+    let mut col_seen = 0usize;
+    for (i, c) in segment.char_indices() {
+        if col_seen >= col as usize {
+            return Some(target.start + i);
+        }
+        col_seen += c.width().unwrap_or(0);
+    }
+    Some(target.end)
 }
 
 /// Compute (x, y) relative to the input inner area for the cursor, with soft-wrap.
@@ -5445,5 +5592,94 @@ mod render_smoke {
         assert_eq!(input_visual_row_count(text, 40), 2);
         let (x, y) = cursor_position(text, text.len(), 40, 2);
         assert_eq!((x, y), (2, 1));
+    }
+
+    #[test]
+    fn input_layout_covers_every_byte_exactly_once() {
+        let text = "hello\n你好 world\n";
+        let width = 4;
+        let layout = input_layout(text, width);
+        let total_rows = input_visual_row_count(text, width) as usize;
+        assert_eq!(layout.len(), total_rows);
+        // Byte ranges tile the text (every non-'\n' byte exactly once) and
+        // row numbers are dense.
+        let mut covered = String::new();
+        for r in &layout {
+            covered.push_str(&text[r.start..r.end]);
+        }
+        assert_eq!(covered, text.replace('\n', ""));
+        for (i, r) in layout.iter().enumerate() {
+            assert_eq!(r.row, i as u16);
+        }
+    }
+
+    #[test]
+    fn click_maps_to_byte_at_visual_cell() {
+        let text = "hello\n你好 world";
+        let width = 20;
+        // Row 0 is "hello": clicking at col 0 → 'h', col 2 → 'l', col 99 → end of row.
+        assert_eq!(byte_at_visual_cell(text, width, 0, 0), Some(0));
+        assert_eq!(byte_at_visual_cell(text, width, 0, 2), Some(2));
+        assert_eq!(byte_at_visual_cell(text, width, 0, 99), Some(5));
+        // Row 1 starts after '\n' (byte 6); clicking 你 (col 0..2) → byte 6.
+        assert_eq!(byte_at_visual_cell(text, width, 1, 0), Some(6));
+        assert_eq!(byte_at_visual_cell(text, width, 1, 1), Some(9));
+        assert_eq!(byte_at_visual_cell(text, width, 1, 2), Some(9));
+        // Clicks beyond the last row snap nowhere useful — but the last row
+        // still resolves to its end.
+        assert_eq!(byte_at_visual_cell(text, width, 2, 0), None);
+        let wide_end = text.len();
+        assert_eq!(byte_at_visual_cell(text, width, 1, 99), Some(wide_end));
+    }
+
+    #[test]
+    fn click_mapping_roundtrips_with_wrap() {
+        let text = "abcdefghijklmnopqrstuvwxyz";
+        let width = 10; // 3 visual rows
+                        // Every byte offset lands back on itself when clicking its own cell.
+        for (expected_byte, ch) in text.char_indices() {
+            let layout = input_layout(text, width);
+            let row = layout
+                .iter()
+                .find(|r| r.start <= expected_byte && expected_byte < r.end)
+                .unwrap();
+            let col: usize = text[row.start..expected_byte]
+                .chars()
+                .map(|c| c.width().unwrap_or(0))
+                .sum();
+            assert_eq!(
+                byte_at_visual_cell(text, width, row.row, col as u16),
+                Some(expected_byte),
+                "char {ch}"
+            );
+        }
+    }
+
+    #[test]
+    fn highlight_byte_span_splits_prefix_and_text() {
+        use ratatui::style::{Color, Style};
+        // Row layout mirrors render_input: prefix span + text span.
+        let mut line = ratatui::text::Line::from(vec![
+            ratatui::text::Span::styled("> ", Style::default().fg(Color::Red)),
+            ratatui::text::Span::styled("hello world", Style::default()),
+        ]);
+        let sel = Style::default().bg(Color::Blue);
+        // Bytes are measured on the text content (prefix excluded by callers):
+        // select "lo wo" (bytes 3..8 of "hello world").
+        highlight_byte_span(&mut line, 3, 8, sel);
+        let texts: Vec<&str> = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(texts, vec!["> ", "hel", "lo wo", "rld"]);
+        assert_eq!(line.spans[2].style.bg, Some(Color::Blue));
+        assert_eq!(line.spans[0].style.bg, None);
+        assert_eq!(line.spans[1].style.bg, None);
+        assert_eq!(line.spans[3].style.bg, None);
+        // Full-range selection keeps the prefix span intact.
+        let mut line = ratatui::text::Line::from(vec![
+            ratatui::text::Span::raw("  "),
+            ratatui::text::Span::raw("abc"),
+        ]);
+        highlight_byte_span(&mut line, 0, 3, sel);
+        assert_eq!(line.spans.len(), 2);
+        assert_eq!(line.spans[1].style.bg, Some(Color::Blue));
     }
 }
