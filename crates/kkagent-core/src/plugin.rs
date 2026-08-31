@@ -228,8 +228,20 @@ impl PluginSubagentSpec {
     }
 
     /// Display name used in mirrored lifecycle events: the bare type name
-    /// (`cursor`) — the TUI prefixes the owning plugin when needed.
+    /// (`cursor`) — the TUI prefixes the owning plugin when needed. When the
+    /// manifest uses the generic name `delegate`, the agent identity is
+    /// derived from the owning plugin instead (`codex-agent.delegate` →
+    /// `codex`, `kk-cursor-agent.delegate` → `cursor`) so the TUI names the
+    /// actual agent rather than a nondescript "delegate".
     pub fn qualified_name(&self) -> String {
+        if self.name.eq_ignore_ascii_case("delegate") {
+            let plugin = self.plugin_id.split('.').next().unwrap_or("");
+            let plugin = plugin.strip_prefix("kk-").unwrap_or(plugin);
+            let plugin = plugin.strip_suffix("-agent").unwrap_or(plugin);
+            if !plugin.is_empty() {
+                return plugin.to_string();
+            }
+        }
         self.name.clone()
     }
 }
@@ -1062,6 +1074,48 @@ async fn resolve_plugin_path(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn spec_with(plugin_id: &str, name: &str) -> PluginSubagentSpec {
+        let spec: PluginSubagentSpec = serde_json::from_value(serde_json::json!({
+            "name": name,
+            "transport": "acp",
+            "description": "test"
+        }))
+        .unwrap();
+        PluginSubagentSpec {
+            plugin_id: plugin_id.into(),
+            ..spec
+        }
+    }
+
+    #[test]
+    fn qualified_name_derives_agent_identity_from_generic_delegate() {
+        // Generic `delegate` subagent names take the agent identity from the
+        // owning plugin so the TUI shows "codex" / "cursor", not "delegate".
+        assert_eq!(
+            spec_with("codex-agent.delegate", "delegate").qualified_name(),
+            "codex"
+        );
+        assert_eq!(
+            spec_with("cursor-agent.delegate", "delegate").qualified_name(),
+            "cursor"
+        );
+        assert_eq!(
+            spec_with("kk-cursor-agent.delegate", "delegate").qualified_name(),
+            "cursor"
+        );
+        // Non-generic names and plugins without an agent-suffix stay verbatim.
+        assert_eq!(
+            spec_with("kk-wiki-agent.search", "search").qualified_name(),
+            "search"
+        );
+        assert_eq!(
+            spec_with("web-search.delegate", "delegate").qualified_name(),
+            "web-search"
+        );
+        // Un-aggregated spec (no plugin id): fall back to the manifest name.
+        assert_eq!(spec_with("", "delegate").qualified_name(), "delegate");
+    }
 
     fn temp_plugins_dir() -> PathBuf {
         std::env::temp_dir().join(format!("kkagent-plugin-{}", uuid::Uuid::new_v4()))

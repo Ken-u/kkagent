@@ -207,7 +207,7 @@ task with the tools available to you and return a concise final summary.",
             .send(kkagent_protocol::AgentEvent::SubagentSpawned {
                 session_id: m.parent_session_id.clone(),
                 subagent_id: sub_cfg.agent_id.clone(),
-                subagent_name: spec.name.clone(),
+                subagent_name: spec.qualified_name(),
                 parent_tool_call_id: m.parent_tool_call_id.clone(),
                 description: Some(sub_cfg.description.clone()),
                 model: Some(model.clone()),
