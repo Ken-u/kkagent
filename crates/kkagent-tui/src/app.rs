@@ -4617,6 +4617,13 @@ impl TuiApp {
                     self.state.follow_bottom = true;
                 }
             }
+            // 输入非空时 Home / End 在编辑器内移动光标：开头 / 末尾
+            KeyCode::Home => {
+                self.state.input.move_buffer_home();
+            }
+            KeyCode::End => {
+                self.state.input.move_buffer_end();
+            }
             _ => {}
         }
         Ok(())

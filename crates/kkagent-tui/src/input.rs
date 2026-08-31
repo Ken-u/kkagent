@@ -317,6 +317,18 @@ impl InputState {
         self.last_was_kill = false;
     }
 
+    /// Home 键：回到整个输入的开头（多行时也与 Ctrl-A 的行内跳转区分开）
+    pub fn move_buffer_home(&mut self) {
+        self.cursor = 0;
+        self.last_was_kill = false;
+    }
+
+    /// End 键：跳到整个输入的末尾
+    pub fn move_buffer_end(&mut self) {
+        self.cursor = self.text.len();
+        self.last_was_kill = false;
+    }
+
     /// Kill from cursor to end of line (Ctrl-K).
     pub fn kill_line(&mut self) {
         if self.selection_active() {
@@ -604,6 +616,30 @@ mod tests {
         assert_eq!(s.cursor, 3);
         s.move_down();
         assert_eq!(s.cursor, 7);
+    }
+
+    #[test]
+    fn home_end_jump_to_buffer_edges() {
+        let mut s = InputState::new();
+        s.set_text("hello".to_string());
+        s.move_left();
+        s.move_buffer_home();
+        assert_eq!(s.cursor, 0);
+        s.move_buffer_end();
+        assert_eq!(s.cursor, s.text.len());
+
+        // 多行时 Home/End 仍指向整段输入的开头/末尾（区别于 Ctrl-A/E 的行内跳转）
+        s.set_text("ab\ncdef".to_string());
+        s.move_buffer_end();
+        assert_eq!(s.cursor, s.text.len());
+        s.move_buffer_home();
+        assert_eq!(s.cursor, 0);
+        // Ctrl-A/E 的行级行为不受影响
+        s.cursor = s.text.find('d').unwrap();
+        s.move_home();
+        assert_eq!(s.cursor, 3);
+        s.move_end();
+        assert_eq!(s.cursor, s.text.len());
     }
 
     #[test]
