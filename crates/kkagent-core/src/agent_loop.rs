@@ -391,7 +391,8 @@ impl AgentLoop {
                     }
                     TurnStep::Continue
                         if self.max_rounds > 0
-                            && completed_rounds.saturating_add(1) >= self.max_rounds =>
+                            && completed_rounds.saturating_add(1) >= self.max_rounds
+                            && !session.take_pending_final_response() =>
                     {
                         tracing::warn!("Agent turn limit reached for session {}", session.id);
                         self.finish_turn(session, true).await?;
@@ -2062,6 +2063,31 @@ Do not mention this reminder to the user.\n</system-reminder>"
                     }
                 }
 
+                // Goal lifecycle: mirror every successful Goal mutation to
+                // clients so the TUI/indicator reflects complete/blocked/
+                // paused immediately (not only at turn end accounting).
+                if name == "Goal" && !output.is_error {
+                    let change = match (
+                        input
+                            .as_ref()
+                            .and_then(|v| v.get("action"))
+                            .and_then(|v| v.as_str()),
+                        input
+                            .as_ref()
+                            .and_then(|v| v.get("status"))
+                            .and_then(|v| v.as_str()),
+                    ) {
+                        (Some("create"), _) => "created",
+                        (Some("update"), Some("active")) => "resumed",
+                        (Some("update"), Some(status)) => status,
+                        (Some("budget"), _) => "budget_updated",
+                        _ => "",
+                    };
+                    if !change.is_empty() {
+                        self.emit_goal_updated(session, change).await;
+                    }
+                }
+
                 if !output.is_error {
                     if name == "Read" {
                         if let Some(path_str) = input
@@ -2244,6 +2270,7 @@ Do not mention this reminder to the user.\n</system-reminder>"
             self.persist_step(session);
 
             // Steer / delivery messages land after tool results (next model turn).
+            let has_deliveries = !deliveries.is_empty();
             for msg in deliveries {
                 session.add_user_message(msg);
             }
@@ -2261,6 +2288,15 @@ Do not mention this reminder to the user.\n</system-reminder>"
             }
 
             if tool_results.iter().any(|(_, o)| o.stop_turn) {
+                // A stop that also queued a delivery (e.g. Goal complete's
+                // "summarize outcomes") must not swallow the summary: grant
+                // exactly one extra model pass so the message gets answered,
+                // then honor the stop the next time it is requested.
+                if has_deliveries && !session.take_pending_final_response() {
+                    session.pending_final_response = true;
+                    return Ok(TurnStep::Continue);
+                }
+                session.pending_final_response = false;
                 self.finish_turn(session, true).await?;
                 return Ok(TurnStep::Done);
             }
@@ -2358,7 +2394,9 @@ Do not mention this reminder to the user.\n</system-reminder>"
                             .await;
                         self.emit_goal_updated(session, "budget_blocked").await;
                     } else {
-                        self.emit_goal_updated(session, "account_usage").await;
+                        // Routine per-turn usage accounting — clients keep
+                        // their snapshot fresh but don't announce it.
+                        self.emit_goal_updated(session, "turn_usage").await;
                     }
                 }
             }

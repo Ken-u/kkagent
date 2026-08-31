@@ -1582,15 +1582,13 @@ async fn run_print_goal(client: &mut KkagentClient, session_id: &str, args: &str
                                 _ => exit_codes::SUCCESS_COMPLETE,
                             });
                         }
-                        if goal.is_none() && (change == "cancelled" || change.contains("complete"))
-                        {
+                        // Only user-initiated cancellation ends the run here;
+                        // goal-tool completion still owes a final summary turn
+                        // (TurnEnd below handles the exit once it lands).
+                        if goal.is_none() && change == "cancelled" {
                             println!();
                             println!("{}", serde_json::to_string_pretty(&last_summary)?);
-                            return Ok(if change == "cancelled" {
-                                exit_codes::CANCELLED
-                            } else {
-                                exit_codes::SUCCESS_COMPLETE
-                            });
+                            return Ok(exit_codes::CANCELLED);
                         }
                     }
                     AgentEvent::TurnEnd { .. } => {

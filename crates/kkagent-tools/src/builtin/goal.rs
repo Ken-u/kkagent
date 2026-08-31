@@ -94,22 +94,29 @@ impl GoalTool {
                     .map(|g| serde_json::to_string_pretty(&g).unwrap_or_default())
                     .unwrap_or_else(|| "Goal completed.".into());
                 ToolOutput::success(body)
+                    .with_data(serde_json::json!({"goal_status": "complete"}))
                     .with_delivery(
-                        "Goal marked complete and cleared. Summarize outcomes for the user and stop autonomous goal work.",
+                        "Goal marked complete and cleared. Write a short final summary of the outcome for the user now, then stop.",
                     )
                     .with_stop_turn()
             }
             "blocked" => {
                 self.goal_mgr.block_goal("blocked").await;
                 ToolOutput::success("Goal blocked.")
+                    .with_data(serde_json::json!({"goal_status": "blocked"}))
                     .with_delivery(
-                        "Goal marked blocked. Explain the blocker and wait for user direction.",
+                        "Goal marked blocked. Explain the blocker in one short message and stop; wait for user direction.",
                     )
                     .with_stop_turn()
             }
             "paused" => {
                 self.goal_mgr.pause_goal().await;
-                ToolOutput::success("Goal paused.").with_stop_turn()
+                ToolOutput::success("Goal paused.")
+                    .with_data(serde_json::json!({"goal_status": "paused"}))
+                    .with_delivery(
+                        "Goal paused. Confirm the pause to the user in one short message, then stop.",
+                    )
+                    .with_stop_turn()
             }
             "active" => {
                 self.goal_mgr.resume_goal().await;

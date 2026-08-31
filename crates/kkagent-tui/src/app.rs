@@ -10509,10 +10509,13 @@ impl TuiApp {
                             )
                             .await
                         {
-                            Ok(body) => self.system_message(format!(
-                                "Goal {sub}: {}",
-                                serde_json::to_string_pretty(&body).unwrap_or_default()
-                            )),
+                            Ok(_) => {
+                                self.system_message(match sub {
+                                    "pause" => "Goal paused".into(),
+                                    "resume" => "Goal resumed".into(),
+                                    _ => "Goal cancelled".into(),
+                                });
+                            }
                             Err(e) => self.system_message(format!("Goal {sub} failed: {e}")),
                         }
                     }
@@ -12151,21 +12154,31 @@ impl TuiApp {
                         }
                     }
                     AgentEvent::GoalUpdated { goal, change, .. } => {
-                        let status = goal
-                            .as_ref()
-                            .and_then(|g| g.get("status"))
-                            .and_then(|s| s.as_str())
-                            .unwrap_or("none");
-                        let objective = goal
-                            .as_ref()
-                            .and_then(|g| g.get("description"))
-                            .and_then(|s| s.as_str())
-                            .unwrap_or("");
-                        if objective.is_empty() {
-                            self.system_message(format!("Goal {change} ({status})"));
-                        } else {
-                            let preview: String = objective.chars().take(80).collect();
-                            self.system_message(format!("Goal {change} ({status}): {preview}"));
+                        // Routine per-turn accounting and budget tweaks only
+                        // refresh the footer indicator, no transcript noise.
+                        if change != "turn_usage" && change != "budget_updated" {
+                            let message = if change == "complete" {
+                                // Terminal goal was cleared after the update.
+                                "Goal completed ✓".to_string()
+                            } else if change == "budget_blocked" {
+                                "Goal blocked: budget reached".to_string()
+                            } else if change == "created" {
+                                match goal
+                                    .as_ref()
+                                    .and_then(|g| g.get("description"))
+                                    .and_then(|s| s.as_str())
+                                {
+                                    Some(objective) if !objective.is_empty() => {
+                                        let preview: String = objective.chars().take(80).collect();
+                                        format!("Goal: {preview}")
+                                    }
+                                    _ => "Goal created".to_string(),
+                                }
+                            } else {
+                                // paused / resumed / blocked / cancelled
+                                format!("Goal {change}")
+                            };
+                            self.system_message(message);
                         }
                         self.state.goal = goal.as_ref().and_then(|g| {
                             let description = g.get("description")?.as_str()?.to_string();

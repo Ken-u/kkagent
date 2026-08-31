@@ -241,6 +241,10 @@ pub struct Session {
     pub bash_concurrent_checked: bool,
     /// Paths last Read (or successfully written) → full-content SHA-256 hex.
     pub read_file_hashes: HashMap<String, String>,
+    /// A tool asked to stop the turn but also queued a delivery message the
+    /// model has not seen answered yet (e.g. Goal complete → summarize).
+    /// The agent loop grants exactly one extra model pass before ending.
+    pub pending_final_response: bool,
 }
 
 impl Session {
@@ -286,6 +290,12 @@ impl Session {
     /// interrupt all descendants immediately.
     pub fn inherit_interrupted(&mut self, parent: Arc<AtomicBool>) {
         self.interrupted = parent;
+    }
+
+    /// Consume the deferred final-response request (one extra model pass so a
+    /// tool delivery like "Goal completed — summarize" actually gets answered).
+    pub fn take_pending_final_response(&mut self) -> bool {
+        std::mem::take(&mut self.pending_final_response)
     }
 
     pub fn resume(
@@ -428,6 +438,7 @@ impl Session {
             concurrent_write_warned: false,
             bash_concurrent_checked: false,
             read_file_hashes: HashMap::new(),
+            pending_final_response: false,
         }
     }
 
