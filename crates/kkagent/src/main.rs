@@ -4294,6 +4294,10 @@ struct ServerState {
     /// In-memory completion-judge records per session (TUI fetches via events;
     /// this archive exists for future RPC/history queries). Capped, oldest evicted.
     goal_judge_records: Mutex<HashMap<String, Vec<kkagent_core::goal_judge::GoalJudgeRecord>>>,
+    /// Latest per-session usage totals (from UsageUpdate events) so a
+    /// reattached TUI can rebuild `/usage` without replaying the stream.
+    /// Subagent completion usage is folded in here too.
+    session_usage: Mutex<HashMap<String, kkagent_protocol::ModelUsageEntry>>,
     /// Pending cron-fire XML injections for the next turn.
     cron_fires: Arc<Mutex<Vec<String>>>,
     hooks: Arc<kkagent_mcp::HookManager>,
@@ -4630,6 +4634,59 @@ impl SessionTurnLocks {
 
     async fn active_count(&self) -> usize {
         self.active_session_ids().await.len()
+    }
+}
+
+/// Deliver a steer input to a session's mailbox, tolerating the window where
+/// the turn permit is held but steer admission is (still or briefly) closed:
+/// a new turn is starting up — it reopens the mailbox inside
+/// `spawn_session_agent_turn` before its first model step — or the previous
+/// turn is mid-teardown. Degrading to `session.prompt` inside that window
+/// cannot work: the starting turn holds the permit for its entire duration,
+/// so the prompt fallback fails with -32001 "busy with another turn" and the
+/// steer is lost. Retry admission while the session is busy instead; a
+/// requeued steer is injected before the turn's next model step
+/// (`drain_steers_into_messages`). When no permit is held the session is
+/// idle and the input degrades immediately so the prompt path takes over.
+///
+/// Returns `Ok(())` when the input was admitted to the mailbox (steered),
+/// or `Err(input)` to degrade to the prompt path.
+async fn push_steer_tolerating_turn_start(
+    mailbox: &SessionSteerMailbox,
+    turn_locks: &SessionTurnLocks,
+    session_id: &str,
+    mut input: SteerInput,
+    grace: Duration,
+) -> Result<(), SteerInput> {
+    let deadline = std::time::Instant::now() + grace;
+    let mut retried = false;
+    loop {
+        match mailbox.try_push(input.clone()) {
+            Ok(()) => {
+                if retried {
+                    tracing::info!(
+                        "steer admission reopened after retry for session {session_id}; \
+                         input queued for the next model step"
+                    );
+                }
+                return Ok(());
+            }
+            Err(pending) => {
+                input = pending;
+            }
+        }
+        if !turn_locks.is_busy(session_id).await {
+            return Err(input);
+        }
+        retried = true;
+        if std::time::Instant::now() >= deadline {
+            tracing::warn!(
+                "steer admission stayed closed for {grace:?} while session {session_id} \
+                 was busy; degrading to prompt (input may fail with busy)"
+            );
+            return Err(input);
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
 
@@ -5074,6 +5131,64 @@ impl ServerState {
 
     async fn note_agent_event_for_resume(&self, evt: &AgentEvent) {
         match evt {
+            AgentEvent::UsageUpdate {
+                session_id,
+                usage,
+                by_model,
+                ..
+            } => {
+                // Keep a server-side snapshot so a reattached TUI can rebuild
+                // /usage session totals without replaying the event stream.
+                let mut map = self.session_usage.lock().await;
+                let entry = map.entry(session_id.clone()).or_default();
+                entry.input_tokens = entry.input_tokens.saturating_add(usage.input_tokens);
+                entry.output_tokens = entry.output_tokens.saturating_add(usage.output_tokens);
+                entry.cache_creation_input_tokens = entry
+                    .cache_creation_input_tokens
+                    .saturating_add(usage.cache_creation_input_tokens);
+                entry.cache_read_input_tokens = entry
+                    .cache_read_input_tokens
+                    .saturating_add(usage.cache_read_input_tokens);
+                if usage.input_includes_cache.is_some() {
+                    entry.input_includes_cache = usage.input_includes_cache;
+                }
+                // The authoritative per-model breakdown replaces the folded one.
+                if !by_model.is_empty() {
+                    *entry = by_model.iter().fold(
+                        kkagent_protocol::ModelUsageEntry::default(),
+                        |mut acc, e| {
+                            acc.calls += e.calls;
+                            acc.input_tokens += e.input_tokens;
+                            acc.output_tokens += e.output_tokens;
+                            acc.cache_creation_input_tokens += e.cache_creation_input_tokens;
+                            acc.cache_read_input_tokens += e.cache_read_input_tokens;
+                            if e.input_includes_cache.is_some() {
+                                acc.input_includes_cache = e.input_includes_cache;
+                            }
+                            acc
+                        },
+                    );
+                }
+            }
+            AgentEvent::SubagentCompleted {
+                session_id,
+                usage: Some(usage),
+                ..
+            } => {
+                let mut map = self.session_usage.lock().await;
+                let entry = map.entry(session_id.clone()).or_default();
+                entry.input_tokens = entry.input_tokens.saturating_add(usage.input_tokens);
+                entry.output_tokens = entry.output_tokens.saturating_add(usage.output_tokens);
+                entry.cache_creation_input_tokens = entry
+                    .cache_creation_input_tokens
+                    .saturating_add(usage.cache_creation_input_tokens);
+                entry.cache_read_input_tokens = entry
+                    .cache_read_input_tokens
+                    .saturating_add(usage.cache_read_input_tokens);
+                if usage.input_includes_cache.is_some() {
+                    entry.input_includes_cache = usage.input_includes_cache;
+                }
+            }
             AgentEvent::QuestionAsked {
                 session_id,
                 question,
@@ -5673,6 +5788,8 @@ async fn build_server_state_with_shutdown(
         Mutex::new(HashMap::new());
     let goal_judge_records: Mutex<HashMap<String, Vec<kkagent_core::goal_judge::GoalJudgeRecord>>> =
         Mutex::new(HashMap::new());
+    let session_usage: Mutex<HashMap<String, kkagent_protocol::ModelUsageEntry>> =
+        Mutex::new(HashMap::new());
     // Web backends: user config + plugin service overrides. The lock is
     // written here at startup and by `rebuild_web_services` on plugin changes.
     let mut web_cfg = kkagent_tools::WebServicesConfig::from_app(&config);
@@ -5790,6 +5907,7 @@ async fn build_server_state_with_shutdown(
         cron_fires,
         goal_managers,
         goal_judge_records,
+        session_usage,
         hooks,
         skills,
         web,
@@ -6893,6 +7011,14 @@ async fn handle_rpc_call(
                 .and_then(|v| v.as_i64())
                 .unwrap_or(30)
                 .clamp(1, 365);
+            // Optional live per-session snapshot (rebuilt from UsageUpdate /
+            // SubagentCompleted events server-side) so a reattached TUI can
+            // restore its /usage totals without replaying the stream.
+            let session = params
+                .as_ref()
+                .and_then(|p| p.get("session_id"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
             // The sink lives in this (server) process; fall back to a direct
             // read of the shared DB for embedded/in-memory edge cases.
             let store = kkagent_core::usage_store::global_snapshot().or_else(|| {
@@ -6910,13 +7036,21 @@ async fn handle_rpc_call(
                     "by_day": [],
                 }));
             };
-            Ok(serde_json::json!({
+            let mut response = serde_json::json!({
                 "days": days,
                 "available": true,
                 "by_model": store.totals_by_model(days).unwrap_or_default(),
                 "by_location": store.totals_by_location(days).unwrap_or_default(),
                 "by_day": store.totals_by_day(days).unwrap_or_default(),
-            }))
+            });
+            if let Some(session_id) = session {
+                let snapshot = state.session_usage.lock().await.get(&session_id).cloned();
+                response["session"] = match snapshot {
+                    Some(entry) => serde_json::to_value(entry).unwrap_or_default(),
+                    None => serde_json::Value::Null,
+                };
+            }
+            Ok(response)
         }
         "workspace.trust" => {
             let value = params.ok_or_else(|| (-32602, "Missing workspace trust".to_string()))?;
@@ -8045,7 +8179,15 @@ async fn handle_rpc_call(
                     .get(&session_id)
                     .cloned()
                     .ok_or_else(|| (-32602, format!("Session not found: {session_id}")))?;
-                match mailbox.try_push(SteerInput { text, images }) {
+                match push_steer_tolerating_turn_start(
+                    &mailbox,
+                    &state.turn_locks,
+                    &session_id,
+                    SteerInput { text, images },
+                    TURN_PERMIT_GRACE,
+                )
+                .await
+                {
                     Ok(()) => {
                         let _ = rpc_event_tx
                             .send(Frame::Event {
@@ -8392,12 +8534,23 @@ async fn handle_rpc_call(
                                 let mailbox =
                                     state.steer_mailboxes.lock().await.get(&session_id).cloned();
                                 match mailbox {
-                                    Some(mailbox) => mailbox
-                                        .try_push(SteerInput {
-                                            text: prompt,
-                                            images: Vec::new(),
-                                        })
-                                        .is_ok(),
+                                    Some(mailbox) => {
+                                        match push_steer_tolerating_turn_start(
+                                            &mailbox,
+                                            &state.turn_locks,
+                                            &session_id,
+                                            SteerInput {
+                                                text: prompt,
+                                                images: Vec::new(),
+                                            },
+                                            TURN_PERMIT_GRACE,
+                                        )
+                                        .await
+                                        {
+                                            Ok(()) => true,
+                                            Err(_) => false,
+                                        }
+                                    }
                                     None => false,
                                 }
                             }
@@ -11822,6 +11975,96 @@ mod runtime_http_tests {
             messages.len(),
             3,
             "no repair when tool_use already answered"
+        );
+    }
+}
+
+#[cfg(test)]
+mod steer_admission_tests {
+    use super::*;
+
+    fn input(text: &str) -> SteerInput {
+        SteerInput {
+            text: text.into(),
+            images: Vec::new(),
+        }
+    }
+
+    /// The core regression: a steer that arrives while a turn permit is held
+    /// but steer admission is still closed (the new turn has not reached its
+    /// `start_turn()` yet) must be retried until the turn reopens admission —
+    /// not degraded to `session.prompt`, which would fail with -32001
+    /// "busy with another turn" and lose the input.
+    #[tokio::test]
+    async fn steer_waits_for_a_starting_turn_to_reopen_admission() {
+        let mailbox = SessionSteerMailbox::default();
+        let locks = SessionTurnLocks::default();
+        // Simulate the starting turn: permit acquired (busy) but the mailbox
+        // is still closed. Admission reopens shortly after.
+        let _permit = locks.try_acquire("s1").await.unwrap();
+        assert!(locks.is_busy("s1").await);
+
+        let opener_mailbox = mailbox.clone();
+        let opener = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            opener_mailbox.start_turn();
+        });
+        let steered = push_steer_tolerating_turn_start(
+            &mailbox,
+            &locks,
+            "s1",
+            input("mid-start steer"),
+            TURN_PERMIT_GRACE,
+        )
+        .await;
+        opener.await.unwrap();
+
+        assert!(
+            steered.is_ok(),
+            "steer must land in the mailbox once the starting turn reopens admission"
+        );
+    }
+
+    /// Idle sessions (no permit held) keep the Kimi-compatible degrade: the
+    /// steer becomes a normal new-turn prompt instead of blocking.
+    #[tokio::test]
+    async fn steer_degrades_to_prompt_when_session_is_idle() {
+        let mailbox = SessionSteerMailbox::default();
+        let locks = SessionTurnLocks::default();
+        assert!(!locks.is_busy("s1").await);
+        let result = push_steer_tolerating_turn_start(
+            &mailbox,
+            &locks,
+            "s1",
+            input("late steer"),
+            TURN_PERMIT_GRACE,
+        )
+        .await;
+        assert_eq!(
+            result.unwrap_err().text,
+            "late steer",
+            "idle session must degrade immediately so the prompt path takes over"
+        );
+    }
+
+    /// If the permit is held but admission never reopens within the grace
+    /// window, the input still degrades instead of hanging forever.
+    #[tokio::test]
+    async fn steer_gives_up_after_the_grace_window() {
+        let mailbox = SessionSteerMailbox::default();
+        let locks = SessionTurnLocks::default();
+        let _permit = locks.try_acquire("s1").await.unwrap();
+        let result = push_steer_tolerating_turn_start(
+            &mailbox,
+            &locks,
+            "s1",
+            input("stuck steer"),
+            Duration::from_millis(60),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "grace expiry must degrade to the prompt path"
         );
     }
 }

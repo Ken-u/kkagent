@@ -6702,8 +6702,48 @@ impl TuiApp {
         self.render_usage_history_items(&value);
     }
 
-    /// Render the `usage.history` payload (or an equivalent direct-DB read)
-    /// into the Token History picker: one section per window with per-model
+    /// Fetch the server-side per-session usage snapshot over RPC and fold it
+    /// into `usage_session` / `usage_by_model` (called right after the totals
+    /// were reset during a session resume/reattach).
+    async fn restore_session_usage_snapshot(&mut self, session_id: &str) {
+        let Ok(value) = self
+            .client
+            .rpc_call(
+                "usage.history",
+                Some(serde_json::json!({ "days": 30, "session_id": session_id })),
+            )
+            .await
+        else {
+            return; // Older server or degraded mode: keep zeroed totals.
+        };
+        let Some(entry) = value.get("session").filter(|v| !v.is_null()) else {
+            return; // No usage recorded for this session yet.
+        };
+        let Ok(parsed) = serde_json::from_value::<kkagent_protocol::ModelUsageEntry>(entry.clone())
+        else {
+            return;
+        };
+        let s = &mut self.state.usage_session;
+        s.input_tokens = parsed.input_tokens;
+        s.output_tokens = parsed.output_tokens;
+        s.cache_creation_tokens = parsed.cache_creation_input_tokens;
+        s.cache_read_tokens = parsed.cache_read_input_tokens;
+        s.input_includes_cache = parsed.input_includes_cache;
+        if parsed.calls > 0 {
+            self.state
+                .usage_by_model
+                .insert((parsed.model.clone(), "main".into()), parsed.clone());
+        }
+        self.state.last_step_usage = Some(kkagent_protocol::TokenUsage::from_buckets(
+            parsed.input_tokens,
+            parsed.output_tokens,
+            parsed.cache_creation_input_tokens,
+            parsed.cache_read_input_tokens,
+            parsed.input_includes_cache,
+        ));
+    }
+
+    /// Render the `usage.history` payload into the Token History picker: one section per window with per-model
     /// then per-site rows.
     fn render_usage_history_items(&mut self, payload: &serde_json::Value) {
         use std::fmt::Write as _;
@@ -8640,6 +8680,10 @@ impl TuiApp {
         self.state.plan_scroll_to_top = false;
         self.state.turn_started_at = None;
         self.state.reset_context_usage_stats();
+        // Reattach: rebuild /usage totals from the server-side snapshot so
+        // restarting the TUI does not zero the session numbers (the usage
+        // stream only updates incrementally from here on).
+        self.restore_session_usage_snapshot(&sid).await;
         self.state.approval_queue.clear();
         self.state.prompt_queue = crate::prompt_queue::PromptQueue::default();
         self.state.scroll_up = 0;
@@ -14041,6 +14085,9 @@ mod app_state_tests {
                             deleted_tx.send(params.unwrap_or_default()).unwrap();
                             Ok(serde_json::json!({"deleted": true}))
                         }
+                        "usage.history" => {
+                            Ok(serde_json::json!({"days": 30, "available": false}))
+                        }
                         other => panic!("unexpected RPC method: {other}"),
                     }
                 }
@@ -15155,6 +15202,9 @@ mod app_state_tests {
                             Ok(serde_json::json!({"ok": true}))
                         }
                         "sessions.list" => Ok(serde_json::json!({"sessions": []})),
+                        "usage.history" => {
+                            Ok(serde_json::json!({"days": 30, "available": false}))
+                        }
                         other => panic!("unexpected RPC method: {other}"),
                     }
                 }
@@ -15978,6 +16028,9 @@ mod app_state_tests {
                         "session.interrupt" => {
                             interrupt_tx.send(params.unwrap_or_default()).unwrap();
                             Ok(serde_json::json!({"ok": true}))
+                        }
+                        "usage.history" => {
+                            Ok(serde_json::json!({"days": 30, "available": false}))
                         }
                         other => panic!("unexpected RPC method: {other}"),
                     }
@@ -17147,6 +17200,9 @@ mod app_state_tests {
                             Ok(serde_json::json!({"ok": true}))
                         }
                         "session.set_prompt_queue" => Ok(serde_json::json!({"ok": true})),
+                        "usage.history" => {
+                            Ok(serde_json::json!({"days": 30, "available": false}))
+                        }
                         other => panic!("unexpected RPC method: {other}"),
                     }
                 }
@@ -17200,6 +17256,9 @@ mod app_state_tests {
                             Ok(serde_json::json!({"active": true, "sessions": ["running"]}))
                         }
                         "session.set_prompt_queue" => Ok(serde_json::json!({"ok": true})),
+                        "usage.history" => {
+                            Ok(serde_json::json!({"days": 30, "available": false}))
+                        }
                         other => panic!("unexpected RPC method: {other}"),
                     }
                 }
@@ -17364,6 +17423,9 @@ mod app_state_tests {
                     match method.as_str() {
                         "sessions.create" => Ok(serde_json::json!({"session_id": "fresh"})),
                         "sessions.list" => Ok(serde_json::json!({"sessions": []})),
+                        "usage.history" => {
+                            Ok(serde_json::json!({"days": 30, "available": false}))
+                        }
                         other => panic!("unexpected RPC method: {other}"),
                     }
                 }
