@@ -83,6 +83,10 @@ pub enum JobPayload {
         session_id: String,
         idempotency_key: String,
         as_steer: bool,
+        /// Original text — lets the TUI re-queue the input when the send
+        /// fails with a transient busy error instead of losing it.
+        text: String,
+        images: Vec<(String, String)>,
         result: Result<(), String>,
     },
     LocalShell {
@@ -601,6 +605,8 @@ impl AsyncJobHub {
         let tx = self.tx.clone();
         let sid = session_id.clone();
         let key = idempotency_key.clone();
+        let payload_text = text.clone();
+        let payload_images = images.clone();
         let method = if as_steer {
             "session.steer"
         } else {
@@ -629,6 +635,8 @@ impl AsyncJobHub {
                     session_id: sid,
                     idempotency_key: key,
                     as_steer,
+                    text: payload_text,
+                    images: payload_images,
                     result,
                 },
             });

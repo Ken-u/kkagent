@@ -1948,6 +1948,11 @@ impl TuiApp {
                 if let Some(sid) = self.state.session_id.clone() {
                     persist_composer_draft(&sid, &self.state.input);
                 }
+                // Safety net for queued steers that lost the race against a
+                // goal-continuation step boundary (transient Idle while the
+                // turn still holds its permit): retry the flush now that
+                // later events may have arrived.
+                self.retry_queued_prompts_if_idle();
             }
 
             redraw |= self.drain_job_results().await;
@@ -2314,6 +2319,8 @@ impl TuiApp {
                     session_id,
                     idempotency_key,
                     as_steer,
+                    text,
+                    images,
                     result,
                 } => {
                     self.jobs.mark_done(channel, generation);
@@ -2346,6 +2353,27 @@ impl TuiApp {
                         Err(err) => {
                             if !as_steer {
                                 self.jobs.mcp.waiting_for_prompt = false;
+                            }
+                            // A steer that lost the race against a starting /
+                            // finishing turn reports transient "busy". Re-queue
+                            // it so the input is not lost; the queue retry tick
+                            // sends it as soon as the turn actually ends (or as
+                            // a steer once the reopened mailbox admits it).
+                            let busy_retry = as_steer && err.contains("busy with another turn");
+                            if busy_retry {
+                                self.requeue_failed_prompt(
+                                    &session_id,
+                                    text,
+                                    images,
+                                    is_current,
+                                    &idempotency_key,
+                                );
+                                self.jobs.mark_done(channel, generation);
+                                self.jobs.push_info(
+                                    "Steer arrived as the turn was switching steps — \
+                                     requeued and will be delivered shortly.",
+                                );
+                                continue;
                             }
                             let failed_text = if is_current {
                                 if !as_steer {
@@ -10557,6 +10585,52 @@ impl TuiApp {
         Ok(())
     }
 
+    /// Re-queue a failed steer/prompt send for later delivery (transient busy).
+    /// Keeps the original text/images and marks the displayed user message as
+    /// queued again so the queue pane reflects reality.
+    fn requeue_failed_prompt(
+        &mut self,
+        session_id: &str,
+        text: String,
+        images: Vec<(String, String)>,
+        is_current: bool,
+        idempotency_key: &str,
+    ) {
+        let queued = crate::prompt_queue::QueuedPrompt {
+            id: uuid::Uuid::new_v4().to_string(),
+            session_id: session_id.to_string(),
+            text: text.clone(),
+            images,
+            as_steer: true,
+        };
+        if is_current {
+            self.state.prompt_queue.items.insert(0, queued);
+            for msg in self.state.messages.iter_mut().filter(|m| {
+                m.role == MessageRole::User && m.idempotency_key.as_deref() == Some(idempotency_key)
+            }) {
+                msg.delivery = crate::prompt_queue::DeliveryState::Queued;
+            }
+        } else if let Some(runtime) = self.state.session_runtime_states.get_mut(session_id) {
+            runtime.prompt_queue.items.insert(0, queued);
+            for msg in runtime.messages.iter_mut().filter(|m| {
+                m.role == MessageRole::User && m.idempotency_key.as_deref() == Some(idempotency_key)
+            }) {
+                msg.delivery = crate::prompt_queue::DeliveryState::Queued;
+            }
+        }
+        self.enqueue_prompt_queue_sync();
+    }
+
+    /// Periodic safety net: a queued steer may have lost the race against a
+    /// goal-continuation step boundary (the turn publishes a transient Idle
+    /// between steps while still holding its permit). When that happened the
+    /// queue flush failed; retry here while the session looks idle.
+    fn retry_queued_prompts_if_idle(&mut self) {
+        if !self.state.prompt_queue.is_empty() {
+            self.flush_prompt_queue_if_idle();
+        }
+    }
+
     fn flush_prompt_queue_if_idle(&mut self) {
         if !matches!(self.state.status, SessionStatus::Idle) {
             return;
@@ -10592,8 +10666,16 @@ impl TuiApp {
             });
         }
         self.state.status = SessionStatus::Thinking;
-        self.jobs
-            .spawn_prompt(self.client.requester(), sid, item.text, item.images, idem);
+        if item.as_steer {
+            // A steer-marked queue item flushed on a transient Idle (e.g. a
+            // goal-continuation step boundary still holding its permit) must
+            // go through the steer path, not be forced into a new turn.
+            self.jobs
+                .spawn_steer(self.client.requester(), sid, item.text, item.images, idem);
+        } else {
+            self.jobs
+                .spawn_prompt(self.client.requester(), sid, item.text, item.images, idem);
+        }
         self.enqueue_prompt_queue_sync();
     }
 
@@ -14085,9 +14167,7 @@ mod app_state_tests {
                             deleted_tx.send(params.unwrap_or_default()).unwrap();
                             Ok(serde_json::json!({"deleted": true}))
                         }
-                        "usage.history" => {
-                            Ok(serde_json::json!({"days": 30, "available": false}))
-                        }
+                        "usage.history" => Ok(serde_json::json!({"days": 30, "available": false})),
                         other => panic!("unexpected RPC method: {other}"),
                     }
                 }
@@ -15202,9 +15282,7 @@ mod app_state_tests {
                             Ok(serde_json::json!({"ok": true}))
                         }
                         "sessions.list" => Ok(serde_json::json!({"sessions": []})),
-                        "usage.history" => {
-                            Ok(serde_json::json!({"days": 30, "available": false}))
-                        }
+                        "usage.history" => Ok(serde_json::json!({"days": 30, "available": false})),
                         other => panic!("unexpected RPC method: {other}"),
                     }
                 }
@@ -16029,9 +16107,7 @@ mod app_state_tests {
                             interrupt_tx.send(params.unwrap_or_default()).unwrap();
                             Ok(serde_json::json!({"ok": true}))
                         }
-                        "usage.history" => {
-                            Ok(serde_json::json!({"days": 30, "available": false}))
-                        }
+                        "usage.history" => Ok(serde_json::json!({"days": 30, "available": false})),
                         other => panic!("unexpected RPC method: {other}"),
                     }
                 }
@@ -17200,9 +17276,7 @@ mod app_state_tests {
                             Ok(serde_json::json!({"ok": true}))
                         }
                         "session.set_prompt_queue" => Ok(serde_json::json!({"ok": true})),
-                        "usage.history" => {
-                            Ok(serde_json::json!({"days": 30, "available": false}))
-                        }
+                        "usage.history" => Ok(serde_json::json!({"days": 30, "available": false})),
                         other => panic!("unexpected RPC method: {other}"),
                     }
                 }
@@ -17256,9 +17330,7 @@ mod app_state_tests {
                             Ok(serde_json::json!({"active": true, "sessions": ["running"]}))
                         }
                         "session.set_prompt_queue" => Ok(serde_json::json!({"ok": true})),
-                        "usage.history" => {
-                            Ok(serde_json::json!({"days": 30, "available": false}))
-                        }
+                        "usage.history" => Ok(serde_json::json!({"days": 30, "available": false})),
                         other => panic!("unexpected RPC method: {other}"),
                     }
                 }
@@ -17423,9 +17495,7 @@ mod app_state_tests {
                     match method.as_str() {
                         "sessions.create" => Ok(serde_json::json!({"session_id": "fresh"})),
                         "sessions.list" => Ok(serde_json::json!({"sessions": []})),
-                        "usage.history" => {
-                            Ok(serde_json::json!({"days": 30, "available": false}))
-                        }
+                        "usage.history" => Ok(serde_json::json!({"days": 30, "available": false})),
                         other => panic!("unexpected RPC method: {other}"),
                     }
                 }
