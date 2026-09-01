@@ -13,6 +13,7 @@ pub mod external_subagent;
 pub mod file_conflict;
 pub mod full_compaction;
 pub mod git_context;
+pub mod goal_judge;
 pub mod internal_subagent;
 pub mod legacy_migrate;
 pub mod media_pipeline;

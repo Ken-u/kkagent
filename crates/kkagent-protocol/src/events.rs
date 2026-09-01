@@ -115,6 +115,19 @@ pub enum AgentEvent {
         budget: Option<serde_json::Value>,
         change: String,
     },
+    /// Completion-judge verdict for a model-reported goal completion.
+    /// Emitted only when `[goal] judge_enabled` is on.
+    GoalJudge {
+        session_id: String,
+        /// "approve" | "reject" | "failopen"
+        verdict: String,
+        #[serde(default)]
+        gaps: Vec<String>,
+        /// Judge's one-or-two sentence rationale.
+        summary: String,
+        /// Model alias the judge ran on.
+        model: String,
+    },
     /// Subagent lifecycle mirrored onto the parent session/TUI.
     SubagentSpawned {
         session_id: String,
@@ -247,6 +260,7 @@ impl AgentEvent {
             | Self::PlanFileUpdated { session_id, .. }
             | Self::TodoUpdated { session_id, .. }
             | Self::GoalUpdated { session_id, .. }
+            | Self::GoalJudge { session_id, .. }
             | Self::SubagentSpawned { session_id, .. }
             | Self::SubagentStarted { session_id, .. }
             | Self::SubagentCompleted { session_id, .. }

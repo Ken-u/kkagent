@@ -4084,7 +4084,10 @@ async fn build_turn_tool_registry(
         ),
     ));
     let goal_mgr = state.goal_for(session_id).await;
-    tools.register(Arc::new(kkagent_tools::builtin::GoalTool::new(goal_mgr)));
+    tools.register(Arc::new(
+        kkagent_tools::builtin::GoalTool::new(goal_mgr)
+            .with_judge_enabled(state.config().goal.judge_enabled),
+    ));
     tools.register(Arc::new(kkagent_tools::builtin::SkillTool::new(
         state.skills.clone(),
     )));
@@ -4255,6 +4258,9 @@ struct ServerState {
     cron: Arc<kkagent_tools::CronManager>,
     /// Per-session goal state (isolated; each persisted under the session's wire dir).
     goal_managers: Mutex<HashMap<String, Arc<kkagent_protocol::goal::GoalManager>>>,
+    /// In-memory completion-judge records per session (TUI fetches via events;
+    /// this archive exists for future RPC/history queries). Capped, oldest evicted.
+    goal_judge_records: Mutex<HashMap<String, Vec<kkagent_core::goal_judge::GoalJudgeRecord>>>,
     /// Pending cron-fire XML injections for the next turn.
     cron_fires: Arc<Mutex<Vec<String>>>,
     hooks: Arc<kkagent_mcp::HookManager>,
@@ -5623,6 +5629,8 @@ async fn build_server_state_with_shutdown(
     let cron = Arc::new(cron);
     let goal_managers: Mutex<HashMap<String, Arc<kkagent_protocol::goal::GoalManager>>> =
         Mutex::new(HashMap::new());
+    let goal_judge_records: Mutex<HashMap<String, Vec<kkagent_core::goal_judge::GoalJudgeRecord>>> =
+        Mutex::new(HashMap::new());
     // Web backends: user config + plugin service overrides. The lock is
     // written here at startup and by `rebuild_web_services` on plugin changes.
     let mut web_cfg = kkagent_tools::WebServicesConfig::from_app(&config);
@@ -5733,6 +5741,7 @@ async fn build_server_state_with_shutdown(
         cron,
         cron_fires,
         goal_managers,
+        goal_judge_records,
         hooks,
         skills,
         web,
@@ -6110,6 +6119,27 @@ async fn spawn_session_agent_turn(
                 }
             }
             event_state.note_agent_event_for_resume(&evt).await;
+            // Archive completion-judge verdicts per session (capped, oldest evicted).
+            if let AgentEvent::GoalJudge {
+                session_id: judge_sid,
+                verdict,
+                gaps,
+                summary,
+                model,
+            } = &evt
+            {
+                const MAX_JUDGE_RECORDS: usize = 50;
+                let mut records = event_state.goal_judge_records.lock().await;
+                let entry = records.entry(judge_sid.clone()).or_default();
+                entry.push(kkagent_core::goal_judge::GoalJudgeRecord {
+                    verdict: verdict.clone(),
+                    gaps: gaps.clone(),
+                    summary: summary.clone(),
+                    model: model.clone(),
+                });
+                let excess = entry.len().saturating_sub(MAX_JUDGE_RECORDS);
+                entry.drain(..excess);
+            }
             // Fan-out to every attached TUI. Never stop draining when a client
             // disconnects — otherwise detach/reattach leaves Thinking stuck and
             // interrupt status updates never reach the new connection.
@@ -7230,6 +7260,7 @@ async fn handle_rpc_call(
             state.steer_mailboxes.lock().await.remove(&session_id);
             state.active_btw_sessions.lock().await.remove(&session_id);
             state.drop_goal(&session_id).await;
+            state.goal_judge_records.lock().await.remove(&session_id);
             if let Some(session) = removed {
                 session.services.on_close(SessionCloseReason::Exit).await;
             }

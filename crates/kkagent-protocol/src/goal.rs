@@ -240,6 +240,9 @@ struct GoalInner {
     /// Accumulated wall-clock while active intervals run; paused/blocked do not advance.
     active_since: Option<std::time::Instant>,
     journal: Vec<GoalOp>,
+    /// Completion-judge reject counter. In-memory only: restarting clears it.
+    /// Only incremented when `[goal] judge_enabled` is on.
+    judge_rejects: u32,
 }
 
 /// On-disk snapshot of a session goal (atomic tmp+rename writes).
@@ -263,6 +266,7 @@ impl GoalManager {
                 current: None,
                 active_since: None,
                 journal: Vec::new(),
+                judge_rejects: 0,
             })),
             persist_path: None,
         }
@@ -275,6 +279,7 @@ impl GoalManager {
                 current: None,
                 active_since: None,
                 journal: Vec::new(),
+                judge_rejects: 0,
             })),
             persist_path: Some(path.clone()),
         };
@@ -350,6 +355,7 @@ impl GoalManager {
         });
         guard.current = Some(goal.clone());
         guard.active_since = Some(std::time::Instant::now());
+        guard.judge_rejects = 0;
         self.persist(&guard).await;
         goal
     }
@@ -400,6 +406,18 @@ impl GoalManager {
             Some(goal) => goal.status == GoalStatus::Active && !goal.is_budget_exhausted(),
             None => false,
         }
+    }
+
+    /// Increment the completion-judge reject counter and return the new value.
+    /// The counter resets whenever a goal is created/replaced/resumed.
+    pub async fn record_judge_reject(&self) -> u32 {
+        let mut guard = self.inner.lock().await;
+        guard.judge_rejects = guard.judge_rejects.saturating_add(1);
+        guard.judge_rejects
+    }
+
+    pub async fn judge_rejects(&self) -> u32 {
+        self.inner.lock().await.judge_rejects
     }
 
     /// Mark complete then clear current goal (transient complete, kimi-aligned).
@@ -504,6 +522,7 @@ impl GoalManager {
             goal.terminal_reason = None;
             goal.updated_at = Utc::now().to_rfc3339();
             guard.active_since = Some(std::time::Instant::now());
+            guard.judge_rejects = 0;
             let op = GoalOp::Update {
                 goal_id: Some(goal.goal_id.clone()),
                 status: Some(GoalStatus::Active),

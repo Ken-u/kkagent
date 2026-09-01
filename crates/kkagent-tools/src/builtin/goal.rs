@@ -7,13 +7,26 @@ use crate::{Tool, ToolContext, ToolOutput};
 
 /// Unified goal tool (`Goal`) — subsumes the former CreateGoal / GetGoal /
 /// UpdateGoal / SetGoalBudget quartet behind a single `action` parameter.
+///
+/// `judge_enabled` switches the `complete` action: off (default) keeps the
+/// legacy immediate-complete behavior; on turns the claim into a
+/// `pending_verification` stub that the agent loop's judge gate resolves.
 pub struct GoalTool {
     goal_mgr: Arc<GoalManager>,
+    judge_enabled: bool,
 }
 
 impl GoalTool {
     pub fn new(goal_mgr: Arc<GoalManager>) -> Self {
-        Self { goal_mgr }
+        Self {
+            goal_mgr,
+            judge_enabled: false,
+        }
+    }
+
+    pub fn with_judge_enabled(mut self, judge_enabled: bool) -> Self {
+        self.judge_enabled = judge_enabled;
+        self
     }
 
     async fn create(&self, input: &Value) -> ToolOutput {
@@ -89,6 +102,18 @@ impl GoalTool {
 
         match status {
             "complete" => {
+                if self.judge_enabled {
+                    // Claim only: the agent loop's judge gate runs an
+                    // independent review and resolves this into either the
+                    // legacy complete output (approved) or a reject feedback
+                    // (turn continues).
+                    return ToolOutput::success(
+                        "Completion claim submitted. An independent judge agent will review \
+                         the transcript evidence against the goal; do not repeat the claim — \
+                         continue with any remaining work while the review runs.",
+                    )
+                    .with_data(serde_json::json!({"goal_status": "pending_verification"}));
+                }
                 let finished = self.goal_mgr.complete_goal("completed").await;
                 let body = finished
                     .map(|g| serde_json::to_string_pretty(&g).unwrap_or_default())
@@ -370,5 +395,70 @@ mod tests {
             .await
             .unwrap();
         assert!(out.is_error);
+    }
+
+    #[tokio::test]
+    async fn judge_disabled_keeps_legacy_complete() {
+        let mgr = Arc::new(GoalManager::new());
+        let tool = GoalTool::new(mgr.clone());
+        tool.execute(
+            serde_json::json!({"action": "create", "objective": "done deal"}),
+            &context(),
+        )
+        .await
+        .unwrap();
+
+        let out = tool
+            .execute(
+                serde_json::json!({"action": "update", "status": "complete"}),
+                &context(),
+            )
+            .await
+            .unwrap();
+        assert!(!out.is_error);
+        assert!(out.stop_turn, "legacy complete stops the turn");
+        assert!(out.delivery.is_some());
+        assert_eq!(
+            out.data
+                .as_ref()
+                .and_then(|d| d.get("goal_status"))
+                .and_then(|v| v.as_str()),
+            Some("complete")
+        );
+        assert!(mgr.get_goal().await.is_none(), "goal cleared immediately");
+    }
+
+    #[tokio::test]
+    async fn judge_enabled_defers_completion_to_a_claim() {
+        let mgr = Arc::new(GoalManager::new());
+        let tool = GoalTool::new(mgr.clone()).with_judge_enabled(true);
+        tool.execute(
+            serde_json::json!({"action": "create", "objective": "needs review"}),
+            &context(),
+        )
+        .await
+        .unwrap();
+
+        let out = tool
+            .execute(
+                serde_json::json!({"action": "update", "status": "complete"}),
+                &context(),
+            )
+            .await
+            .unwrap();
+        assert!(!out.is_error);
+        assert!(!out.stop_turn, "claim must not stop the turn");
+        assert!(out.delivery.is_none());
+        assert_eq!(
+            out.data
+                .as_ref()
+                .and_then(|d| d.get("goal_status"))
+                .and_then(|v| v.as_str()),
+            Some("pending_verification")
+        );
+        assert!(
+            mgr.get_goal().await.is_some(),
+            "goal stays active until the judge approves"
+        );
     }
 }

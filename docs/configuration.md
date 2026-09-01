@@ -33,6 +33,21 @@ kkagent config preset safe
 | `telemetry` | bool | `false` | 是否启用云遥测发送。 |
 | `trusted_workspaces` | string[] | `[]` | 预配置的绝对工作区；TUI 也会通过首次进入信任弹窗维护配置旁的 trust sidecar。为空时，非交互 Server 仍只隐式信任启动目录。 |
 
+## Goal（`[goal]`）
+
+Goal 模式（`/goal`）的完成判定裁判。**默认关闭**——关闭时模型自报 `Goal` 工具 `update complete` 直接生效（旧行为），不产生任何额外模型调用。
+
+| 字段 | 类型 | 默认值 | 说明 |
+|---|---:|---:|---|
+| `judge_enabled` | bool | `false` | 开启后，模型自报 goal 完成会先交给**独立裁判 agent** 审查：裁判使用独立模型与受限工具集（`GoalJudge` + `Read`），基于 objective、completionCriterion 与 transcript 证据做出 approve/reject 裁决（通过 `GoalJudge` toolcall 标记）。approve 才真正完成；reject 会把具体缺口注入给工作模型继续推进，连续 `judge_max_rejects` 次拒绝后 goal 转 blocked 并停下向用户说明。 |
+| `judge_model` | string | 无 | 裁判使用的模型别名，必须存在于 `models`。未配置时回退到压缩摘要模型链：`compaction_model` > `secondary_model` > 会话当前模型 > `default_model`。 |
+| `judge_max_rejects` | int | `2` | 允许的最大拒绝次数；达到后 goal 转 `blocked`（可 `/goal resume` 重置计数）。 |
+| `judge_timeout_secs` | int | `120` | 单次裁判 agent 运行的墙钟超时。 |
+
+**Fail-open 语义**：裁判超时、未通过 toolcall 给出裁决、或运行出错时，视为裁判不可用，完成申报按原样接受（同时向客户端发 `GoalJudge` 事件、verdict 为 `failopen`）——裁判故障不会卡死 goal 模式。
+
+**TUI**：开启后每次裁决会出现在会话消息流中；点击 footer 第一行的 `goal` 指示器可查看本会话的完整裁决记录（verdict、缺口、依据、所用模型）。
+
 ## Provider
 
 ```toml

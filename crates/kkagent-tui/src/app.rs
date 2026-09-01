@@ -287,6 +287,13 @@ pub struct AppState {
     /// Current session goal snapshot (None = no goal). Drives the footer
     /// goal indicator; updated from GoalUpdated events + resume payloads.
     pub goal: Option<crate::chrome::GoalIndicator>,
+    /// Completion-judge verdicts for the current session (newest last).
+    pub goal_judge_records: Vec<crate::goal_judge_view::GoalJudgeRecordView>,
+    /// Whether the judge-records popup is open.
+    pub goal_judge_panel_open: bool,
+    /// Click hit-rect of the footer goal chip: (row, start_col, end_col).
+    /// Refreshed every footer render; None when no chip is drawn.
+    pub footer_goal_chip: Option<(u16, u16, u16)>,
     /// Streaming cursor for live assistant deltas.
     pub stream_cursor: crate::streaming::StreamingCursor,
     /// Multi-session tab strip (chrome).
@@ -1186,6 +1193,9 @@ impl AppState {
             btw: crate::panes::BtwPanelState::default(),
             model_alias: None,
             goal: None,
+            goal_judge_records: Vec::new(),
+            goal_judge_panel_open: false,
+            footer_goal_chip: None,
             stream_cursor: crate::streaming::StreamingCursor::default(),
             tab_strip: TabStrip::default(),
             status_bar: StatusBarModel {
@@ -3085,6 +3095,17 @@ impl TuiApp {
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 self.flush_pending_scroll(scroll_delta);
+                // Goal chip click: toggle the judge-records popup.
+                if let Some((row, x0, x1)) = self.state.footer_goal_chip {
+                    if mouse.row == row && mouse.column >= x0 && mouse.column <= x1 {
+                        self.state.goal_judge_panel_open = !self.state.goal_judge_panel_open;
+                        self.clear_selection();
+                        return true;
+                    }
+                }
+                if self.state.goal_judge_panel_open {
+                    self.state.goal_judge_panel_open = false;
+                }
                 if let Some(byte) = self.mouse_to_composer_byte(&mouse) {
                     // Composer click: a transcript selection loses its meaning.
                     self.clear_selection();
@@ -3345,6 +3366,17 @@ impl TuiApp {
                 _ => {}
             }
             return Ok(());
+        }
+
+        // Goal judge records popup: Esc (or any dismiss) closes it first.
+        if self.state.goal_judge_panel_open {
+            match key.code {
+                KeyCode::Esc | KeyCode::Enter => {
+                    self.state.goal_judge_panel_open = false;
+                    return Ok(());
+                }
+                _ => {}
+            }
         }
 
         // Ctrl+B: background detach (standalone / --connect only)
@@ -12337,6 +12369,42 @@ impl TuiApp {
                             })
                         });
                         self.state.status_bar.goal = self.state.goal.clone();
+                    }
+                    AgentEvent::GoalJudge {
+                        verdict,
+                        gaps,
+                        summary,
+                        model,
+                        ..
+                    } => {
+                        self.state.goal_judge_records.push(
+                            crate::goal_judge_view::GoalJudgeRecordView {
+                                verdict: verdict.clone(),
+                                gaps: gaps.clone(),
+                                summary: summary.clone(),
+                                model: model.clone(),
+                            },
+                        );
+                        let message = match verdict.as_str() {
+                            "approve" => "Goal judge: completion approved ✓".to_string(),
+                            "reject" => format!(
+                                "Goal judge: completion rejected ✗ — {}",
+                                if gaps.is_empty() {
+                                    summary.clone()
+                                } else {
+                                    gaps.join("; ")
+                                }
+                            ),
+                            _ => format!(
+                                "Goal judge unavailable, accepting claim ({})",
+                                if summary.is_empty() {
+                                    "no detail"
+                                } else {
+                                    &summary
+                                }
+                            ),
+                        };
+                        self.system_message(message);
                     }
                     AgentEvent::TurnEnd { .. } => {
                         self.clear_pending_interactions();

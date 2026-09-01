@@ -27,6 +27,10 @@ pub struct AppConfig {
     /// `default_model` when resolving the compaction summarizer.
     #[serde(default)]
     pub compaction_model: Option<String>,
+    /// Goal-mode settings (completion judge etc.). Defaults keep the legacy
+    /// behavior: goal `complete` claims are accepted without review.
+    #[serde(default)]
+    pub goal: GoalConfig,
     #[serde(default)]
     pub default_permission_mode: Option<String>,
     #[serde(default)]
@@ -530,6 +534,44 @@ pub struct ThinkingConfig {
     pub effort: Option<String>,
     #[serde(default)]
     pub keep: Option<String>,
+}
+
+fn default_goal_judge_max_rejects() -> u32 {
+    2
+}
+
+fn default_goal_judge_timeout_secs() -> u64 {
+    120
+}
+
+/// Goal-mode configuration. With `judge_enabled = false` (the default) the
+/// completion judge is bypassed entirely and a model `Goal update complete`
+/// behaves exactly as before — accepted immediately with the summary pass.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GoalConfig {
+    /// Review model-reported goal completion with an independent judge agent
+    /// before accepting it. Off by default (legacy behavior).
+    pub judge_enabled: bool,
+    /// Model alias for the judge agent. Empty/None falls back to the
+    /// compaction resolution chain (`compaction_model` > `secondary_model` >
+    /// session model > `default_model`).
+    pub judge_model: Option<String>,
+    /// Rejects tolerated before the goal is blocked instead of continued.
+    pub judge_max_rejects: u32,
+    /// Wall-clock timeout for a single judge agent run, in seconds.
+    pub judge_timeout_secs: u64,
+}
+
+impl Default for GoalConfig {
+    fn default() -> Self {
+        Self {
+            judge_enabled: false,
+            judge_model: None,
+            judge_max_rejects: default_goal_judge_max_rejects(),
+            judge_timeout_secs: default_goal_judge_timeout_secs(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -2088,6 +2088,9 @@ Do not mention this reminder to the user.\n</system-reminder>"
                     ) {
                         (Some("create"), _) => "created",
                         (Some("update"), Some("active")) => "resumed",
+                        // A completion *claim* (judge mode) is not a state
+                        // change; the judge gate emits the real transition.
+                        (Some("update"), Some("complete")) => "",
                         (Some("update"), Some(status)) => status,
                         (Some("budget"), _) => "budget_updated",
                         _ => "",
@@ -2247,6 +2250,12 @@ Do not mention this reminder to the user.\n</system-reminder>"
                 }
             }
 
+            // Completion-judge gate: resolve a pending `Goal update complete`
+            // claim (only produced when `[goal] judge_enabled` is on) by
+            // running the independent judge agent. Rewrites the tool result
+            // in place; with the judge disabled this is a no-op.
+            self.run_goal_judge_gate(session, &mut tool_results).await;
+
             let mut result_content = Vec::new();
             let mut deliveries = Vec::new();
             for (id, output) in &tool_results {
@@ -2319,6 +2328,188 @@ Do not mention this reminder to the user.\n</system-reminder>"
         }
         self.finish_turn(session, true).await?;
         Ok(TurnStep::Done)
+    }
+
+    /// Resolve a pending `Goal update complete` claim (only produced when
+    /// `[goal] judge_enabled` is on) by running the independent judge agent.
+    ///
+    /// Failure semantics are fail-open: with the judge disabled, when no goal
+    /// is active, on interrupt, or when the judge itself fails, the claim is
+    /// accepted and the legacy complete output is produced. When the judge
+    /// rejects, the claim's tool result is rewritten into gap feedback so the
+    /// working model continues; after `judge_max_rejects` rejections the goal
+    /// is blocked instead.
+    async fn run_goal_judge_gate(
+        &self,
+        session: &mut Session,
+        tool_results: &mut [(String, ToolOutput)],
+    ) {
+        const PENDING: &str = "pending_verification";
+        let Some(index) = tool_results.iter().position(|(_, output)| {
+            output
+                .data
+                .as_ref()
+                .and_then(|d| d.get("goal_status"))
+                .and_then(|v| v.as_str())
+                == Some(PENDING)
+        }) else {
+            return;
+        };
+
+        let goal_state = match &self.goal_mgr {
+            Some(goal_mgr) => goal_mgr.get_goal().await,
+            None => None,
+        };
+        let Some(goal) = goal_state.filter(|g| {
+            g.status == kkagent_protocol::goal::GoalStatus::Active && !session.is_interrupted()
+        }) else {
+            // Fail open: no judgeable goal context — accept the claim as-is.
+            self.resolve_judge_claim(
+                session,
+                tool_results,
+                index,
+                &crate::goal_judge::GoalJudgeRecord {
+                    verdict: "failopen".into(),
+                    gaps: Vec::new(),
+                    summary: "judge skipped (no active goal or interrupted)".into(),
+                    model: String::new(),
+                },
+                true,
+            )
+            .await;
+            return;
+        };
+
+        let evidence_tail: Vec<ChatMessage> = {
+            let messages = session.build_messages();
+            let skip = messages
+                .len()
+                .saturating_sub(crate::goal_judge::EVIDENCE_TAIL_MESSAGES * 2);
+            messages.into_iter().skip(skip).collect()
+        };
+        let working_dir = session.working_dir.clone();
+        let config = self.config.clone();
+        let session_id = session.id.clone();
+
+        let judge_result =
+            crate::goal_judge::run_goal_judge(config, working_dir, &goal, &evidence_tail).await;
+        let record = match judge_result {
+            Ok(record) => record,
+            Err(reason) => {
+                tracing::warn!("goal judge failed, accepting claim: {reason}");
+                crate::goal_judge::GoalJudgeRecord {
+                    verdict: "failopen".into(),
+                    gaps: Vec::new(),
+                    summary: reason,
+                    model: String::new(),
+                }
+            }
+        };
+        let _ = self
+            .event_tx
+            .send(AgentEvent::GoalJudge {
+                session_id,
+                verdict: record.verdict.clone(),
+                gaps: record.gaps.clone(),
+                summary: record.summary.clone(),
+                model: record.model.clone(),
+            })
+            .await;
+
+        let approved = record.verdict != "reject";
+        let max_rejects = self.config.goal.judge_max_rejects.max(1);
+        let rejects = if approved {
+            0
+        } else if let Some(goal_mgr) = &self.goal_mgr {
+            goal_mgr.record_judge_reject().await
+        } else {
+            0
+        };
+        let exhausted = !approved && rejects >= max_rejects;
+
+        // Exhausted rejections produce a blocked notice (stop_turn), not the
+        // approved-complete output — the goal is blocked, not completed.
+        self.resolve_judge_claim(session, tool_results, index, &record, approved)
+            .await;
+        if exhausted {
+            if let Some((_, output)) = tool_results.get_mut(index) {
+                *output = ToolOutput::success(format!(
+                    "Independent review rejected the completion claim {rejects} times. \
+                     The goal is now blocked. Explain the reviewer's gaps and the current \
+                     progress in one short message, then stop; the user can adjust the goal \
+                     and resume it."
+                ))
+                .with_data(serde_json::json!({"goal_status": "blocked"}))
+                .with_delivery(
+                    "Goal blocked after repeated review rejections. Explain the reviewer's gaps and the current progress in one short message, then stop.",
+                )
+                .with_stop_turn();
+            }
+            if let Some(goal_mgr) = &self.goal_mgr {
+                goal_mgr
+                    .block_goal(&format!(
+                        "completion rejected {rejects} times by independent review"
+                    ))
+                    .await;
+            }
+            self.emit_goal_updated(session, "blocked").await;
+        }
+    }
+
+    /// Rewrite the pending-verification tool result into its final form.
+    /// `accept` produces the legacy complete output (with the summary-pass
+    /// delivery); otherwise the result becomes reject feedback the working
+    /// model must act on, and the turn continues.
+    async fn resolve_judge_claim(
+        &self,
+        session: &Session,
+        tool_results: &mut [(String, ToolOutput)],
+        index: usize,
+        record: &crate::goal_judge::GoalJudgeRecord,
+        accept: bool,
+    ) {
+        let session_id = session.id.clone();
+        let Some((_, output)) = tool_results.get_mut(index) else {
+            return;
+        };
+        if accept {
+            // Actually complete the goal (clears current) — rewriting the
+            // tool output alone would leave the goal Active and the goal
+            // continuation loop would spin another turn.
+            if let Some(goal_mgr) = &self.goal_mgr {
+                goal_mgr.complete_goal("completed").await;
+            }
+            *output = ToolOutput::success(
+                "Goal marked complete after independent review. Write a short final summary \
+                 of the outcome for the user now, then stop.",
+            )
+            .with_data(serde_json::json!({"goal_status": "complete"}))
+            .with_delivery(
+                "Goal marked complete and cleared. Write a short final summary of the outcome for the user now, then stop.",
+            )
+            .with_stop_turn();
+            if record.verdict != "failopen" {
+                tracing::info!(
+                    "Goal completion approved by judge for session {}",
+                    session_id
+                );
+            }
+            self.emit_goal_updated(session, "complete").await;
+        } else {
+            let mut feedback = String::from(
+                "Completion rejected by independent review. The goal is NOT complete. \
+                 Address every gap below with real work and evidence, then claim completion \
+                 again when done:\n",
+            );
+            for (n, gap) in record.gaps.iter().enumerate() {
+                feedback.push_str(&format!("{}. {gap}\n", n + 1));
+            }
+            if !record.summary.is_empty() {
+                feedback.push_str(&format!("Reviewer rationale: {}", record.summary));
+            }
+            *output = ToolOutput::success(feedback)
+                .with_data(serde_json::json!({"goal_status": "judge_rejected"}));
+        }
     }
 
     async fn sync_requested_plan_mode(&self, session: &mut Session) -> anyhow::Result<()> {
@@ -4894,6 +5085,437 @@ mod retry_tests {
                 .iter()
                 .any(|content| matches!(content, ChatContent::Text { text } if text == "final"))
         }));
+        std::fs::remove_dir_all(workspace).unwrap();
+    }
+
+    /// Shared harness for judge-gate integration tests: the mock server
+    /// distinguishes judge requests from worker requests by whether the wire
+    /// `tools[]` includes `GoalJudge`.
+    fn judge_test_config(base_url: String, judge_enabled: bool, max_rejects: u32) -> AppConfig {
+        let mut config = AppConfig {
+            default_model: Some("test/model".into()),
+            loop_control: Some(LoopControlConfig {
+                max_attempts_per_step: 1,
+                reserved_context_size: 1_000,
+                max_steps_per_turn: 12,
+                auto_compact: false,
+                compact_keep_last: 4,
+                token_counting: "estimated".into(),
+                ..Default::default()
+            }),
+            ..AppConfig::default()
+        };
+        config.goal.judge_enabled = judge_enabled;
+        config.goal.judge_max_rejects = max_rejects;
+        config.goal.judge_timeout_secs = 20;
+        config.providers.insert(
+            "test".into(),
+            ProviderConfig {
+                provider_type: "openai-chat".into(),
+                api_key: Some("token".into()),
+                api_key_env: None,
+                base_url: Some(base_url),
+                custom_headers: HashMap::new(),
+                oauth: None,
+                first_token_timeout_ms: None,
+                extra_fields: Default::default(),
+            },
+        );
+        config.models.insert(
+            "test/model".into(),
+            ModelConfig {
+                provider: "test".into(),
+                model: "test-model".into(),
+                max_context_size: Some(64_000),
+                max_output_size: Some(1_000),
+                capabilities: Vec::new(),
+                display_name: None,
+                support_efforts: Vec::new(),
+                default_effort: None,
+                pricing: None,
+                experimental_adaptive_thinking: false,
+                experimental_vision_proxy: false,
+                experimental_visible_empty_retries: 0,
+                experimental_bad_toolcall_auto_retries: 0,
+                first_token_timeout_ms: None,
+            },
+        );
+        config
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn judge_gate_rejects_then_approves_completion_claims() {
+        use kkagent_protocol::goal::GoalBudget;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            // Worker step 1: claims completion via Goal update complete.
+            // Judge request 1: rejects with gaps.
+            // Worker step 2: claims completion again.
+            // Judge request 2: approves.
+            // Worker step 3: final summary text (delivery pass).
+            for step in 0..5 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                loop {
+                    let mut chunk = [0_u8; 16_384];
+                    let read = socket.read(&mut chunk).await.unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&chunk[..read]);
+                    let Some(header_end) = request.windows(4).position(|w| w == b"\r\n\r\n") else {
+                        continue;
+                    };
+                    let headers = String::from_utf8_lossy(&request[..header_end]);
+                    let content_len = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .and_then(|value| value.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    if request.len() >= header_end + 4 + content_len {
+                        break;
+                    }
+                }
+                let request = String::from_utf8_lossy(&request);
+                let is_judge = request.contains("\"GoalJudge\"");
+                let body = if is_judge {
+                    if step == 1 {
+                        // Judge #1: reject with gaps.
+                        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"j1\",\"function\":{\"name\":\"GoalJudge\",\"arguments\":\"{\\\"action\\\":\\\"reject\\\",\\\"gaps\\\":[\\\"test suite never ran\\\"],\\\"summary\\\":\\\"no test output in evidence\\\"}\"}}]}}]}\n\
+                         data: [DONE]\n"
+                    } else {
+                        // Judge #2 (step 3): approve.
+                        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"j2\",\"function\":{\"name\":\"GoalJudge\",\"arguments\":\"{\\\"action\\\":\\\"approve\\\",\\\"summary\\\":\\\"evidence covers the objective\\\"}\"}}]}}]}\n\
+                         data: [DONE]\n"
+                    }
+                } else if step == 0 || step == 2 {
+                    // Worker claims completion.
+                    "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c\",\"function\":{\"name\":\"Goal\",\"arguments\":\"{\\\"action\\\":\\\"update\\\",\\\"status\\\":\\\"complete\\\"}\"}}]}}]}\n\
+                     data: [DONE]\n"
+                } else {
+                    // Final summary after the approved stop_turn delivery.
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"final\"}}]}\n\
+                     data: [DONE]\n"
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+
+        let goal_mgr = Arc::new(kkagent_protocol::goal::GoalManager::new());
+        goal_mgr
+            .create_goal("make the tests pass", GoalBudget::default())
+            .await;
+        let config = judge_test_config(base_url, true, 2);
+
+        // The worker registry must NOT advertise GoalJudge — only the judge
+        // agent's requests carry that tool, which is how the mock tells
+        // judge requests from worker requests. GoalTool gets the same
+        // judge_enabled as the config so `complete` produces the claim.
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(
+            kkagent_tools::builtin::GoalTool::new(goal_mgr.clone())
+                .with_judge_enabled(config.goal.judge_enabled),
+        ));
+        let (event_tx, mut event_rx) = mpsc::channel(128);
+        let loop_ = AgentLoop::new(
+            Arc::new(config),
+            Arc::new(tools),
+            Arc::new(Mutex::new(PermissionChain::new(
+                PermissionMode::Auto,
+                Vec::new(),
+            ))),
+            event_tx,
+            Arc::new(Mutex::new(HashMap::new())),
+        )
+        .with_goal_manager(goal_mgr.clone());
+
+        let workspace =
+            std::env::temp_dir().join(format!("kkagent-judge-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let mut session = Session::new(
+            "judge-test".into(),
+            workspace.clone(),
+            PermissionMode::Auto,
+            "test/model".into(),
+        );
+        session.add_user_message("run the tests".into());
+
+        let events = tokio::spawn(async move {
+            let mut judge_events = Vec::new();
+            while let Some(evt) = event_rx.recv().await {
+                if let AgentEvent::GoalJudge { verdict, .. } = evt {
+                    judge_events.push(verdict);
+                }
+            }
+            judge_events
+        });
+
+        loop_.run_turn(&mut session).await.unwrap();
+        drop(loop_); // close event_tx so the collector task can finish
+        server.await.unwrap();
+        let judge_events = events.await.unwrap();
+        assert_eq!(judge_events, vec!["reject", "approve"]);
+
+        // The reject feedback reached the working model between the claims.
+        assert!(session.messages.iter().any(|m| {
+            m.content.iter().any(|c| {
+                matches!(
+                    c,
+                    ChatContent::ToolResult { content, .. }
+                        if content.contains("test suite never ran")
+                )
+            })
+        }));
+        // The claim no longer sits pending; goal completed and cleared.
+        assert!(!session.messages.iter().any(|m| {
+            m.content.iter().any(|c| {
+                matches!(
+                    c,
+                    ChatContent::ToolResult { content, .. }
+                        if content.contains("pending_verification")
+                )
+            })
+        }));
+        assert!(goal_mgr.get_goal().await.is_none());
+        // Summary pass output.
+        assert!(session.messages.iter().any(|message| {
+            message
+                .content
+                .iter()
+                .any(|content| matches!(content, ChatContent::Text { text } if text == "final"))
+        }));
+        std::fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn judge_gate_blocks_after_reaching_the_reject_limit() {
+        use kkagent_protocol::goal::GoalBudget;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            // conn0: worker claim → judge (conn1) rejects → max_rejects=1
+            // exhausted → goal blocked + stop_turn/delivery →
+            // conn2: worker writes the blocked notice. 3 connections total.
+            for step in 0..3 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                loop {
+                    let mut chunk = [0_u8; 16_384];
+                    let read = socket.read(&mut chunk).await.unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&chunk[..read]);
+                    let Some(header_end) = request.windows(4).position(|w| w == b"\r\n\r\n") else {
+                        continue;
+                    };
+                    let headers = String::from_utf8_lossy(&request[..header_end]);
+                    let content_len = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .and_then(|value| value.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    if request.len() >= header_end + 4 + content_len {
+                        break;
+                    }
+                }
+                let request = String::from_utf8_lossy(&request);
+                let is_judge = request.contains("\"GoalJudge\"");
+                let body = if is_judge {
+                    "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"j\",\"function\":{\"name\":\"GoalJudge\",\"arguments\":\"{\\\"action\\\":\\\"reject\\\",\\\"gaps\\\":[\\\"still no evidence\\\"]}\"}}]}}]}\n\
+                     data: [DONE]\n"
+                } else if step == 0 {
+                    "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c\",\"function\":{\"name\":\"Goal\",\"arguments\":\"{\\\"action\\\":\\\"update\\\",\\\"status\\\":\\\"complete\\\"}\"}}]}}]}\n\
+                     data: [DONE]\n"
+                } else {
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"blocked notice\"}}]}\n\
+                     data: [DONE]\n"
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+
+        let goal_mgr = Arc::new(kkagent_protocol::goal::GoalManager::new());
+        goal_mgr
+            .create_goal("impossible goal", GoalBudget::default())
+            .await;
+        let config = judge_test_config(base_url, true, 1);
+
+        // The worker registry must NOT advertise GoalJudge — only the judge
+        // agent's requests carry that tool, which is how the mock tells
+        // judge requests from worker requests.
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(
+            kkagent_tools::builtin::GoalTool::new(goal_mgr.clone())
+                .with_judge_enabled(config.goal.judge_enabled),
+        ));
+        let (event_tx, mut event_rx) = mpsc::channel(128);
+        let loop_ = AgentLoop::new(
+            Arc::new(config),
+            Arc::new(tools),
+            Arc::new(Mutex::new(PermissionChain::new(
+                PermissionMode::Auto,
+                Vec::new(),
+            ))),
+            event_tx,
+            Arc::new(Mutex::new(HashMap::new())),
+        )
+        .with_goal_manager(goal_mgr.clone());
+
+        let workspace =
+            std::env::temp_dir().join(format!("kkagent-judge-cap-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let mut session = Session::new(
+            "judge-cap-test".into(),
+            workspace.clone(),
+            PermissionMode::Auto,
+            "test/model".into(),
+        );
+        session.add_user_message("do the impossible".into());
+
+        let events = tokio::spawn(async move {
+            let mut judge_events = Vec::new();
+            while let Some(evt) = event_rx.recv().await {
+                if let AgentEvent::GoalJudge { verdict, .. } = evt {
+                    judge_events.push(verdict);
+                }
+            }
+            judge_events
+        });
+
+        loop_.run_turn(&mut session).await.unwrap();
+        drop(loop_); // close event_tx so the collector task can finish
+        server.await.unwrap();
+        let judge_events = events.await.unwrap();
+        assert_eq!(judge_events, vec!["reject"]);
+
+        let goal = goal_mgr
+            .get_goal()
+            .await
+            .expect("blocked goal stays current");
+        assert_eq!(goal.status, kkagent_protocol::goal::GoalStatus::Blocked);
+        assert_eq!(goal_mgr.judge_rejects().await, 1);
+        std::fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn judge_disabled_completes_directly_without_a_judge_call() {
+        use kkagent_protocol::goal::GoalBudget;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            // Step 1: claim; Step 2: summary. No judge request must arrive.
+            for step in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                loop {
+                    let mut chunk = [0_u8; 16_384];
+                    let read = socket.read(&mut chunk).await.unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&chunk[..read]);
+                    let Some(header_end) = request.windows(4).position(|w| w == b"\r\n\r\n") else {
+                        continue;
+                    };
+                    let headers = String::from_utf8_lossy(&request[..header_end]);
+                    let content_len = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .and_then(|value| value.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    if request.len() >= header_end + 4 + content_len {
+                        break;
+                    }
+                }
+                let body = if step == 0 {
+                    "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c\",\"function\":{\"name\":\"Goal\",\"arguments\":\"{\\\"action\\\":\\\"update\\\",\\\"status\\\":\\\"complete\\\"}\"}}]}}]}\n\
+                     data: [DONE]\n"
+                } else {
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"final\"}}]}\n\
+                     data: [DONE]\n"
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+
+        let goal_mgr = Arc::new(kkagent_protocol::goal::GoalManager::new());
+        goal_mgr
+            .create_goal("quick goal", GoalBudget::default())
+            .await;
+        let config = judge_test_config(base_url, false, 2);
+
+        let mut tools = ToolRegistry::new();
+        tools.register(Arc::new(kkagent_tools::builtin::GoalTool::new(
+            goal_mgr.clone(),
+        )));
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let loop_ = AgentLoop::new(
+            Arc::new(config),
+            Arc::new(tools),
+            Arc::new(Mutex::new(PermissionChain::new(
+                PermissionMode::Auto,
+                Vec::new(),
+            ))),
+            event_tx,
+            Arc::new(Mutex::new(HashMap::new())),
+        )
+        .with_goal_manager(goal_mgr.clone());
+
+        let workspace =
+            std::env::temp_dir().join(format!("kkagent-nojudge-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let mut session = Session::new(
+            "nojudge-test".into(),
+            workspace.clone(),
+            PermissionMode::Auto,
+            "test/model".into(),
+        );
+        session.add_user_message("go".into());
+
+        let events = tokio::spawn(async move {
+            let mut judge_events = Vec::new();
+            while let Some(evt) = event_rx.recv().await {
+                if let AgentEvent::GoalJudge { .. } = evt {
+                    judge_events.push(());
+                }
+            }
+            judge_events
+        });
+
+        loop_.run_turn(&mut session).await.unwrap();
+        drop(loop_); // close event_tx so the collector task can finish
+        server.await.unwrap();
+        assert!(events.await.unwrap().is_empty(), "no judge must run");
+        assert!(
+            goal_mgr.get_goal().await.is_none(),
+            "legacy direct complete"
+        );
         std::fs::remove_dir_all(workspace).unwrap();
     }
 

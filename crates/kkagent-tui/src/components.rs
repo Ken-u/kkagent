@@ -236,6 +236,8 @@ pub fn render_ui(f: &mut Frame, state: &mut AppState, config: &AppConfig) {
         render_approval_panel(f, size, approval, &theme);
     } else if let Some(ref mut question) = state.question_pending {
         render_question_panel(f, size, question, &theme);
+    } else if state.goal_judge_panel_open {
+        crate::goal_judge_view::render_judge_panel(f, size, &state.goal_judge_records, &theme);
     }
 
     if state.plugin_prompt.is_some() {
@@ -2430,10 +2432,20 @@ fn render_footer(
         } else {
             format!("goal:{}", goal.status)
         };
-        left.push(Span::styled(
-            format!("{label} {}", truncate_display_width(&goal.description, 24)),
-            Style::default().fg(color),
+        // Record the chip's column span for click routing. The chip starts
+        // after the "  " separator; measure everything rendered so far.
+        let prefix: String = spans_to_string_approx(&left);
+        let prefix_w = UnicodeWidthStr::width(prefix.as_str()) as u16;
+        let chip_text = format!("{label} {}", truncate_display_width(&goal.description, 24));
+        let chip_w = UnicodeWidthStr::width(chip_text.as_str()) as u16;
+        state.footer_goal_chip = Some((
+            area.y,
+            area.x.saturating_add(prefix_w),
+            area.x.saturating_add(prefix_w).saturating_add(chip_w),
         ));
+        left.push(Span::styled(chip_text, Style::default().fg(color)));
+    } else {
+        state.footer_goal_chip = None;
     }
 
     let plan_review_hidden = state
