@@ -383,6 +383,11 @@ impl AgentLoop {
                                     "<system-reminder>\n{}\n</system-reminder>",
                                     kkagent_protocol::goal::GOAL_CONTINUATION_PROMPT
                                 ));
+                                // The step that just "finished" closed the steer
+                                // mailbox via finish_turn, but this loop is about
+                                // to run another model step — reopen admission so
+                                // steers still land before the next model call.
+                                session.steer_mailbox.start_turn();
                                 completed_rounds = 0;
                                 continue;
                             }
@@ -409,6 +414,10 @@ impl AgentLoop {
 {}\n</system-reminder>",
                                     kkagent_protocol::goal::GOAL_CONTINUATION_PROMPT
                                 ));
+                                // Same as the normal goal continuation: finish_turn
+                                // already closed the steer mailbox, reopen it for the
+                                // continuation steps that follow.
+                                session.steer_mailbox.start_turn();
                                 completed_rounds = 0;
                                 continue;
                             }
@@ -4709,6 +4718,181 @@ mod retry_tests {
                 .content
                 .iter()
                 .any(|content| matches!(content, ChatContent::Text { text } if text == "guided"))
+        }));
+        std::fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[tokio::test]
+    async fn steer_during_goal_continuation_lands_before_the_next_model_step() {
+        use kkagent_protocol::goal::GoalBudget;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let workspace =
+            std::env::temp_dir().join(format!("kkagent-goal-steer-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let mut session = Session::new(
+            "goal-steer-test".into(),
+            workspace.clone(),
+            PermissionMode::Auto,
+            "test/model".into(),
+        );
+        session.add_user_message("start work".into());
+        let mailbox = session.steer_mailbox.clone();
+        let goal_mgr = Arc::new(kkagent_protocol::goal::GoalManager::new());
+        goal_mgr
+            .create_goal("keep going", GoalBudget::default())
+            .await;
+
+        let server_goal = goal_mgr.clone();
+        let push_mailbox = mailbox.clone();
+        let server = tokio::spawn(async move {
+            for step in 0..4 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                loop {
+                    let mut chunk = [0_u8; 8_192];
+                    let read = socket.read(&mut chunk).await.unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&chunk[..read]);
+                    let Some(header_end) = request.windows(4).position(|w| w == b"\r\n\r\n") else {
+                        continue;
+                    };
+                    let headers = String::from_utf8_lossy(&request[..header_end]);
+                    let content_len = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .and_then(|value| value.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    if request.len() >= header_end + 4 + content_len {
+                        break;
+                    }
+                }
+                let request = String::from_utf8_lossy(&request);
+                let answer = match step {
+                    0 => "initial",
+                    1 => {
+                        // The continuation reopened steer admission: a steer
+                        // pushed while the continuation step's request is in
+                        // flight must be accepted and injected before the next
+                        // model step.
+                        let deadline =
+                            tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+                        let pushed = loop {
+                            match push_mailbox.try_push(crate::session::SteerInput {
+                                text: "goal steer".into(),
+                                images: Vec::new(),
+                            }) {
+                                Ok(()) => break true,
+                                Err(_) if tokio::time::Instant::now() > deadline => break false,
+                                Err(_) => {
+                                    tokio::time::sleep(std::time::Duration::from_millis(1)).await
+                                }
+                            }
+                        };
+                        assert!(
+                            pushed,
+                            "steer admission must be reopened during goal continuations"
+                        );
+                        "working"
+                    }
+                    2 => {
+                        assert!(
+                            request.contains("goal steer"),
+                            "the steer sent during the goal continuation must be \
+                             injected before the next model step"
+                        );
+                        "working"
+                    }
+                    3 => {
+                        server_goal.complete_goal("done").await;
+                        "final"
+                    }
+                    _ => unreachable!("mock server only serves 4 steps"),
+                };
+                let body = format!(
+                    "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{answer}\"}}}}]}}\n\
+                     data: [DONE]\n"
+                );
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+
+        let mut config = AppConfig {
+            default_model: Some("test/model".into()),
+            loop_control: Some(LoopControlConfig {
+                max_attempts_per_step: 1,
+                reserved_context_size: 1_000,
+                max_steps_per_turn: 8,
+                auto_compact: false,
+                compact_keep_last: 4,
+                token_counting: "estimated".into(),
+                ..Default::default()
+            }),
+            ..AppConfig::default()
+        };
+        config.providers.insert(
+            "test".into(),
+            ProviderConfig {
+                provider_type: "openai-chat".into(),
+                api_key: Some("token".into()),
+                api_key_env: None,
+                base_url: Some(base_url),
+                custom_headers: HashMap::new(),
+                oauth: None,
+                first_token_timeout_ms: None,
+                extra_fields: Default::default(),
+            },
+        );
+        config.models.insert(
+            "test/model".into(),
+            ModelConfig {
+                provider: "test".into(),
+                model: "test-model".into(),
+                max_context_size: Some(16_000),
+                max_output_size: Some(1_000),
+                capabilities: Vec::new(),
+                display_name: None,
+                support_efforts: Vec::new(),
+                default_effort: None,
+                pricing: None,
+                experimental_adaptive_thinking: false,
+                experimental_vision_proxy: false,
+                experimental_visible_empty_retries: 0,
+                experimental_bad_toolcall_auto_retries: 0,
+                first_token_timeout_ms: None,
+            },
+        );
+        let (event_tx, _) = mpsc::channel(64);
+        let loop_ = AgentLoop::new(
+            Arc::new(config),
+            Arc::new(ToolRegistry::new()),
+            Arc::new(Mutex::new(PermissionChain::new(
+                PermissionMode::Auto,
+                Vec::new(),
+            ))),
+            event_tx,
+            Arc::new(Mutex::new(HashMap::new())),
+        )
+        .with_goal_manager(goal_mgr);
+
+        loop_.run_turn(&mut session).await.unwrap();
+        server.await.unwrap();
+        assert!(!session.steer_mailbox.is_active());
+        assert!(session.messages.iter().any(|message| {
+            message
+                .content
+                .iter()
+                .any(|content| matches!(content, ChatContent::Text { text } if text == "final"))
         }));
         std::fs::remove_dir_all(workspace).unwrap();
     }
