@@ -78,6 +78,9 @@ pub enum AgentEvent {
         /// Cumulative turn count after this request (session totals).
         #[serde(default)]
         turns: u64,
+        /// Cumulative per-model/per-location usage after this request.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        by_model: Vec<super::ModelUsageEntry>,
     },
     ApprovalRequested {
         session_id: String,
@@ -151,6 +154,9 @@ pub enum AgentEvent {
         result_summary: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         usage: Option<super::TokenUsage>,
+        /// Model alias the subagent ran on (absent for external agents).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
     },
     SubagentFailed {
         session_id: String,

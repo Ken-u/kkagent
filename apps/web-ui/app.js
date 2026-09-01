@@ -3358,7 +3358,12 @@ if (moreBtn && sessionMenu) {
     if (!btn) return;
     closeSessionMenu();
     const action = btn.dataset.action;
-    if (action === "rename") {
+    if (action === "usage-dashboard") {
+      const qs = new URLSearchParams();
+      if (base) qs.set("base", base);
+      if (token) qs.set("token", token);
+      location.href = `/ui/usage${qs.toString() ? `?${qs}` : ""}`;
+    } else if (action === "rename") {
       sessionTitle?.focus();
       sessionTitle?.select();
     } else if (action === "fork") await forkCurrentSession();

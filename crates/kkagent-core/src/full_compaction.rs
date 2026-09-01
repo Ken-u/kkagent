@@ -6,6 +6,7 @@
 
 use kkagent_config::AppConfig;
 use kkagent_llm::{create_provider, ChatContent, ChatMessage, LlmRequest, StreamEvent, ToolDef};
+use kkagent_protocol::TokenUsage;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -15,6 +16,7 @@ use crate::context_projector::{
 };
 use crate::dynamic_tools::strip_dynamic_tool_context;
 use crate::token_counting::TokenCounter;
+use crate::usage::usage_location;
 
 /// Fraction of the model context window that triggers auto-compaction.
 pub const DEFAULT_TRIGGER_RATIO: f64 = 0.85;
@@ -532,13 +534,15 @@ pub fn resolve_compaction_model_alias(
 }
 
 /// LLM summary with overflow shrink + empty/truncated retry. Never panics.
-/// Falls back to local digest when the model is unavailable.
+/// Falls back to a local digest when the model is unavailable. The extra
+/// return values are the dropped-message count and, when an LLM call
+/// succeeded, the `(model alias, token usage)` of the summarizer call.
 pub async fn summarize_history_with_llm(
     config: Arc<AppConfig>,
     history: &[ChatMessage],
     custom_instruction: Option<&str>,
     session_model_alias: Option<&str>,
-) -> (String, usize) {
+) -> (String, usize, Option<(String, TokenUsage)>) {
     let mut history_for_model = history.to_vec();
     let mut dropped_count = 0usize;
     let mut media_strip_attempted = false;
@@ -547,16 +551,18 @@ pub async fn summarize_history_with_llm(
 
     let alias = resolve_compaction_model_alias(&config, session_model_alias);
     let Some(alias) = alias else {
-        return (local_digest_summary(history), 0);
+        return (local_digest_summary(history), 0, None);
     };
     let Some((model_cfg, provider_cfg)) = config.resolve_model(&alias) else {
-        return (local_digest_summary(history), 0);
+        return (local_digest_summary(history), 0, None);
     };
 
     loop {
         let messages = build_summarizer_messages(&history_for_model, custom_instruction);
         match stream_summary(provider_cfg, model_cfg, messages).await {
-            Ok(text) if !text.trim().is_empty() => return (text, dropped_count),
+            Ok((text, usage)) if !text.trim().is_empty() => {
+                return (text, dropped_count, Some((alias, usage)));
+            }
             Ok(_) => {
                 empty_shrink += 1;
                 if empty_shrink > 5 || history_for_model.len() <= 1 {
@@ -596,7 +602,7 @@ pub async fn summarize_history_with_llm(
         }
     }
 
-    (local_digest_summary(history), dropped_count)
+    (local_digest_summary(history), dropped_count, None)
 }
 
 fn local_digest_summary(history: &[ChatMessage]) -> String {
@@ -610,7 +616,7 @@ async fn stream_summary(
     provider_cfg: &kkagent_config::ProviderConfig,
     model_cfg: &kkagent_config::ModelConfig,
     messages: Vec<ChatMessage>,
-) -> Result<String, String> {
+) -> Result<(String, TokenUsage), String> {
     let provider = create_provider(provider_cfg, model_cfg).map_err(|e| e.to_string())?;
     let (tx, mut rx) = mpsc::channel(64);
     let request = LlmRequest {
@@ -631,12 +637,28 @@ async fn stream_summary(
         }
     });
     let mut out = String::new();
+    let mut usage = TokenUsage {
+        input_tokens: 0,
+        output_tokens: 0,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0,
+        input_includes_cache: None,
+    };
     let mut complete = false;
     let collected = tokio::time::timeout(std::time::Duration::from_secs(90), async {
         while let Some(ev) = rx.recv().await {
             match ev {
                 StreamEvent::TextDelta(t) => out.push_str(&t),
-                StreamEvent::MessageEnd { .. } => {
+                StreamEvent::MessageEnd {
+                    usage: step_usage, ..
+                } => {
+                    usage = TokenUsage {
+                        input_tokens: step_usage.input_tokens,
+                        output_tokens: step_usage.output_tokens,
+                        cache_creation_input_tokens: step_usage.cache_creation_input_tokens,
+                        cache_read_input_tokens: step_usage.cache_read_input_tokens,
+                        input_includes_cache: step_usage.input_includes_cache,
+                    };
                     complete = true;
                     break;
                 }
@@ -650,19 +672,22 @@ async fn stream_summary(
     .await;
     handle.abort();
     match collected {
-        Ok(Ok(())) if complete && !out.trim().is_empty() => Ok(out),
+        Ok(Ok(())) if complete && !out.trim().is_empty() => Ok((out, usage)),
         Ok(Ok(())) => Err("empty or incomplete compaction summary".into()),
         Ok(Err(e)) => Err(e),
         Err(_) => Err("compaction summary timed out".into()),
     }
 }
 
-/// Run full KeepUsers compaction (LLM when possible).
+/// Run full KeepUsers compaction (LLM when possible). When `usage` is given,
+/// the summarizer call's tokens are attributed to `(alias, "compaction")` in
+/// that usage tracker.
 pub async fn compact_full_async(
     config: Arc<AppConfig>,
     messages: &mut Vec<ChatMessage>,
     custom_instruction: Option<&str>,
     session_model_alias: Option<&str>,
+    usage: Option<&mut crate::usage::UsageService>,
 ) -> CompactionResult {
     if messages.is_empty() {
         return CompactionResult {
@@ -674,8 +699,11 @@ pub async fn compact_full_async(
             summary: String::new(),
         };
     }
-    let (raw, summarizer_dropped) =
+    let (raw, summarizer_dropped, summarizer_usage) =
         summarize_history_with_llm(config, messages, custom_instruction, session_model_alias).await;
+    if let (Some(usage), Some((alias, step))) = (usage, summarizer_usage) {
+        usage.record_labeled(&step, &alias, usage_location::COMPACTION);
+    }
     let mut result = apply_compaction(messages, &raw);
     result.summarizer_dropped_count = summarizer_dropped;
     result

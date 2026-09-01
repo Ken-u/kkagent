@@ -1456,6 +1456,47 @@ async fn readiness(State(state): State<HttpState>) -> impl IntoResponse {
     }
 }
 
+/// `GET /api/v1/usage/tokens?days=30` — durable cross-session token usage.
+///
+/// Reads the per-day aggregates (`usage_daily`): rows are kept forever, so
+/// windows beyond the 30-day `usage_events` retention still resolve. The
+/// response carries chart-ready day totals plus model/location breakdowns
+/// and, within the retention window, per-session drill-down.
+async fn usage_tokens(Query(params): Query<UsageQueryParams>) -> impl IntoResponse {
+    let days = params.days.unwrap_or(30).clamp(1, 365);
+    let Some(store) = kkagent_core::usage_store::global_snapshot() else {
+        return Json(json!({
+            "days": days,
+            "available": false,
+            "note": "usage history is not installed (in-memory/degraded mode)",
+            "by_day": [],
+            "by_model": [],
+            "by_location": [],
+            "by_session": [],
+        }));
+    };
+    let retention = kkagent_core::usage_store::EVENT_RETENTION_DAYS;
+    // Aggregates carry no session id; the drill-down query reads the
+    // retention-bounded event table instead.
+    let by_session = store
+        .sessions_from_events(days.min(retention))
+        .unwrap_or_default();
+    Json(json!({
+        "days": days,
+        "available": true,
+        "event_retention_days": retention,
+        "by_day": store.totals_by_day(days).unwrap_or_default(),
+        "by_model": store.totals_by_model(days).unwrap_or_default(),
+        "by_location": store.totals_by_location(days).unwrap_or_default(),
+        "by_session": by_session,
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+struct UsageQueryParams {
+    days: Option<i64>,
+}
+
 async fn metrics(State(state): State<HttpState>) -> impl IntoResponse {
     let history_len = state
         .event_history
@@ -2847,6 +2888,23 @@ async fn web_ui_app_js() -> impl IntoResponse {
     )
 }
 
+async fn web_ui_usage_html() -> impl IntoResponse {
+    (
+        [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        WEB_UI_USAGE_HTML,
+    )
+}
+
+async fn web_ui_usage_js() -> impl IntoResponse {
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )],
+        WEB_UI_USAGE_JS,
+    )
+}
+
 async fn debug_panel(State(state): State<HttpState>) -> impl IntoResponse {
     let sessions = state.backend.list_sessions().await;
     let health = state.backend.health().await;
@@ -2868,6 +2926,8 @@ pre{{background:#1b1b1b;padding:12px;overflow:auto;border-radius:8px}}</style></
 
 const WEB_UI_HTML: &str = include_str!("../../../apps/web-ui/index.html");
 const WEB_UI_JS: &str = include_str!("../../../apps/web-ui/app.js");
+const WEB_UI_USAGE_HTML: &str = include_str!("../../../apps/web-ui/usage.html");
+const WEB_UI_USAGE_JS: &str = include_str!("../../../apps/web-ui/usage.js");
 
 async fn delete_session(
     State(state): State<HttpState>,
@@ -3023,6 +3083,7 @@ pub fn router(state: HttpState) -> Router {
         .route("/api/v1/health", get(health))
         .route("/api/v1/ready", get(readiness))
         .route("/api/v1/metrics", get(metrics))
+        .route("/api/v1/usage/tokens", get(usage_tokens))
         .route("/api/v1/events", get(events_history))
         .route("/api/v1/turns/{id}", get(turn_status).delete(cancel_turn))
         .route("/api/v1/sessions", get(list_sessions).post(create_session))
@@ -3087,6 +3148,9 @@ pub fn router(state: HttpState) -> Router {
         .route("/ui", get(web_ui_index))
         .route("/ui/", get(web_ui_index))
         .route("/ui/app.js", get(web_ui_app_js))
+        .route("/ui/usage", get(web_ui_usage_html))
+        .route("/ui/usage/", get(web_ui_usage_html))
+        .route("/ui/usage.js", get(web_ui_usage_js))
         .route("/debug", get(debug_panel))
         .route("/api/v1/sessions/{id}/timeline", get(session_timeline))
         // A 100 MiB source image expands by roughly 4/3 when base64 encoded.

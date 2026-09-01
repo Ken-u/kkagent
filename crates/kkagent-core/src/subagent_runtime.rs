@@ -288,13 +288,13 @@ fn run_subagent_mirrored_boxed(
 
         // --- Fix #5: attach token usage to the completion event.
         let snap = session.usage.snapshot();
-        let usage = kkagent_protocol::TokenUsage {
-            input_tokens: snap.input_tokens,
-            output_tokens: snap.output_tokens,
-            cache_creation_input_tokens: snap.cache_creation_input_tokens,
-            cache_read_input_tokens: snap.cache_read_input_tokens,
-            input_includes_cache: snap.input_includes_cache,
-        };
+        let usage = kkagent_protocol::TokenUsage::from_buckets(
+            snap.input_tokens,
+            snap.output_tokens,
+            snap.cache_creation_input_tokens,
+            snap.cache_read_input_tokens,
+            snap.input_includes_cache,
+        );
 
         let outcome = match run_result {
             Ok(()) => {
@@ -309,6 +309,7 @@ fn run_subagent_mirrored_boxed(
                             subagent_id: sub_cfg.agent_id.clone(),
                             result_summary: summary,
                             usage: Some(usage),
+                            model: Some(model.clone()),
                         })
                         .await;
                 }

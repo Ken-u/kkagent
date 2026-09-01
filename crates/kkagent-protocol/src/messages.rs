@@ -85,6 +85,23 @@ impl TokenUsage {
         }
     }
 
+    /// Build from provider-style token buckets (same semantics as the fields).
+    pub fn from_buckets(
+        input_tokens: u64,
+        output_tokens: u64,
+        cache_creation_input_tokens: u64,
+        cache_read_input_tokens: u64,
+        input_includes_cache: Option<bool>,
+    ) -> Self {
+        Self {
+            input_tokens,
+            output_tokens,
+            cache_creation_input_tokens,
+            cache_read_input_tokens,
+            input_includes_cache,
+        }
+    }
+
     /// Approximate context size after this call: the prompt actually sent plus
     /// the generated output (which becomes input for the next call).
     pub fn context_size(&self) -> u64 {
@@ -107,6 +124,52 @@ impl TokenUsage {
             self.cache_read_input_tokens,
             self.input_includes_cache,
         )
+    }
+}
+
+/// Cumulative token usage of one model at one call site ("location") within
+/// a session — powers the `/usage` per-model breakdown.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ModelUsageEntry {
+    /// Model alias as configured (e.g. `oai/glm-5.3`), or the provider model
+    /// name when no alias is known.
+    pub model: String,
+    /// Where the calls happened: `main` (conversation), `compaction`
+    /// (auto/overflow summaries), `judge` (goal completion judge), or
+    /// `subagent` (delegated agent runs).
+    pub location: String,
+    /// Number of recorded LLM calls.
+    pub calls: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    #[serde(default)]
+    pub cache_creation_input_tokens: u64,
+    #[serde(default)]
+    pub cache_read_input_tokens: u64,
+    /// Provider semantics of `input_tokens`; same meaning as `TokenUsage`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_includes_cache: Option<bool>,
+}
+
+impl ModelUsageEntry {
+    /// Provider-normalized effective input (cache buckets folded in).
+    pub fn total_input_tokens(&self) -> u64 {
+        let includes = match self.input_includes_cache {
+            Some(flag) => flag,
+            None => self.cache_creation_input_tokens == 0,
+        };
+        if includes {
+            self.input_tokens
+        } else {
+            self.input_tokens
+                .saturating_add(self.cache_creation_input_tokens)
+                .saturating_add(self.cache_read_input_tokens)
+        }
+    }
+
+    /// Approximate total: effective input + output.
+    pub fn total_tokens(&self) -> u64 {
+        self.total_input_tokens().saturating_add(self.output_tokens)
     }
 }
 

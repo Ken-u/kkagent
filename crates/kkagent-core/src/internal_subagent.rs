@@ -275,6 +275,7 @@ task with the tools available to you and return a concise final summary.",
                         subagent_id: sub_cfg.agent_id.clone(),
                         result_summary: summary,
                         usage: None,
+                        model: Some(session.get_model_alias()),
                     })
                     .await;
             }

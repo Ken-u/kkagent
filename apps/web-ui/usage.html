@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>kkagent · Token Usage</title>
+<style>
+  :root {
+    --bg: #0f1117;
+    --panel: #171a23;
+    --border: #2a2f3d;
+    --text: #e6e9f0;
+    --muted: #8a91a5;
+    --accent: #5b8cff;
+    --accent2: #38c9b0;
+    --accent3: #e0a24a;
+    --accent4: #c96bd8;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+      "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  }
+  header {
+    display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+    padding: 14px 20px; border-bottom: 1px solid var(--border);
+  }
+  header h1 { font-size: 16px; margin: 0; font-weight: 600; }
+  header .spacer { flex: 1; }
+  select, button {
+    background: var(--panel); color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 5px 10px; font-size: 13px; cursor: pointer;
+  }
+  button:hover, select:hover { border-color: var(--accent); }
+  main { padding: 18px 20px 40px; max-width: 1100px; margin: 0 auto; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; margin-bottom: 18px; }
+  .card {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    padding: 12px 14px;
+  }
+  .card .label { color: var(--muted); font-size: 12px; }
+  .card .value { font-size: 22px; font-weight: 600; margin-top: 2px; }
+  .card .sub { color: var(--muted); font-size: 11px; margin-top: 2px; }
+  .panel {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    padding: 14px 16px; margin-bottom: 18px;
+  }
+  .panel h2 { font-size: 13px; margin: 0 0 10px; color: var(--muted); font-weight: 600;
+    text-transform: uppercase; letter-spacing: 0.04em; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); }
+  th { color: var(--muted); font-weight: 500; font-size: 12px; }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  tr:last-child td { border-bottom: none; }
+  .bar-cell { position: relative; min-width: 160px; }
+  .bar-cell .bar {
+    position: absolute; inset: 4px auto 4px 0; height: calc(100% - 8px);
+    background: color-mix(in srgb, var(--accent) 30%, transparent);
+    border-radius: 3px; z-index: 0;
+  }
+  .bar-cell span { position: relative; z-index: 1; padding-left: 6px; }
+  #chart svg { width: 100%; height: auto; display: block; }
+  .legend { display: flex; gap: 14px; flex-wrap: wrap; margin-top: 8px; font-size: 12px; color: var(--muted); }
+  .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 5px; }
+  .error { color: #ff7a7a; padding: 10px 0; }
+  .empty { color: var(--muted); padding: 24px 0; text-align: center; }
+  a.back { color: var(--muted); text-decoration: none; font-size: 13px; }
+  a.back:hover { color: var(--accent); }
+  #authOverlay {
+    position: fixed; inset: 0; background: rgba(15,17,23,0.95); display: none;
+    align-items: center; justify-content: center; flex-direction: column; gap: 12px;
+  }
+  #authOverlay input {
+    background: var(--panel); border: 1px solid var(--border); color: var(--text);
+    border-radius: 6px; padding: 8px 10px; width: 320px;
+  }
+</style>
+</head>
+<body>
+<div id="authOverlay">
+  <div>需要访问令牌（Bearer token）</div>
+  <input id="tokenInput" type="password" placeholder="粘贴 token 后回车">
+  <div style="color:var(--muted);font-size:12px">也可通过 /ui/usage?token=... 传入</div>
+</div>
+<header>
+  <h1>Token 用量统计</h1>
+  <select id="range">
+    <option value="7">近 7 天</option>
+    <option value="30" selected>近 30 天</option>
+  </select>
+  <button id="refresh">刷新</button>
+  <span id="updated" style="color:var(--muted);font-size:12px"></span>
+  <span class="spacer"></span>
+  <a class="back" href="./">← 返回会话</a>
+</header>
+<main>
+  <div class="cards" id="cards"></div>
+  <div class="panel" id="chart">
+    <h2>每日 Token 消耗</h2>
+    <div id="chartBody"></div>
+    <div class="legend" id="chartLegend"></div>
+  </div>
+  <div class="panel">
+    <h2>按模型</h2>
+    <table id="byModel"><thead><tr>
+      <th>模型</th><th class="num">调用</th><th class="num">输入</th>
+      <th class="num">输出</th><th class="num">合计</th><th class="bar-cell">占比</th>
+    </tr></thead><tbody></tbody></table>
+  </div>
+  <div class="panel">
+    <h2>按用途</h2>
+    <table id="byLocation"><thead><tr>
+      <th>用途</th><th class="num">调用</th><th class="num">输入</th>
+      <th class="num">输出</th><th class="num">合计</th><th class="bar-cell">占比</th>
+    </tr></thead><tbody></tbody></table>
+  </div>
+  <div class="panel" id="sessionPanel">
+    <h2>按会话（仅保留期内的明细）</h2>
+    <table id="bySession"><thead><tr>
+      <th>会话</th><th class="num">调用</th><th class="num">输入</th>
+      <th class="num">输出</th><th class="num">合计</th>
+    </tr></thead><tbody></tbody></table>
+  </div>
+</main>
+<script src="usage.js"></script>
+</body>
+</html>

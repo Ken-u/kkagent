@@ -934,8 +934,13 @@ Do not mention this reminder to the user.\n</system-reminder>"
                                 .record_measured(tu.total_input_tokens(), tu.output_tokens);
                             // Successful generate — overflow compact loop can reset.
                             session.consecutive_overflow_compacts = 0;
-                            session.usage.record(&tu);
+                            session.usage.record_labeled(
+                                &tu,
+                                &active_model_alias,
+                                crate::usage::usage_location::MAIN,
+                            );
                             let snap = session.usage.snapshot();
+                            let by_model = session.usage.by_model_entries();
                             // LLM stream completed — refresh the workspace
                             // registry heartbeat so this session is always
                             // considered fresh between background ticks.
@@ -948,6 +953,7 @@ Do not mention this reminder to the user.\n</system-reminder>"
                                     context: session.usage.last_context.clone(),
                                     steps: snap.steps,
                                     turns: snap.turns,
+                                    by_model,
                                 })
                                 .await;
                         }
@@ -2373,6 +2379,7 @@ Do not mention this reminder to the user.\n</system-reminder>"
                     gaps: Vec::new(),
                     summary: "judge skipped (no active goal or interrupted)".into(),
                     model: String::new(),
+                    usage: None,
                 },
                 true,
             )
@@ -2402,9 +2409,16 @@ Do not mention this reminder to the user.\n</system-reminder>"
                     gaps: Vec::new(),
                     summary: reason,
                     model: String::new(),
+                    usage: None,
                 }
             }
         };
+        // Attribute the judge turn's tokens to (judge alias, "judge").
+        if let (Some(usage), false) = (&record.usage, record.model.is_empty()) {
+            session
+                .usage
+                .record_labeled(usage, &record.model, crate::usage::usage_location::JUDGE);
+        }
         let _ = self
             .event_tx
             .send(AgentEvent::GoalJudge {
@@ -2705,6 +2719,7 @@ Do not mention this reminder to the user.\n</system-reminder>"
             &mut session.messages,
             None,
             Some(&session_model_alias),
+            Some(&mut session.usage),
         )
         .await;
         session.transcript_rewrite_required = true;

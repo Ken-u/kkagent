@@ -42,6 +42,7 @@ pub mod transcript;
 pub mod trash;
 pub mod undo_service;
 pub mod usage;
+pub mod usage_store;
 pub mod vision_proxy;
 pub mod workspace_registry;
 
@@ -94,6 +95,7 @@ pub use transcript::{
 pub use trash::{archive_session_to_trash, TrashSummary};
 pub use undo_service::{UndoResult, UndoService};
 pub use usage::UsageService;
+pub use usage_store::{UsageEvent, UsageStore};
 pub use workspace_registry::{
     list_active_peers_default, resolve_workspace_identity, SessionRegistration,
     WorkspaceRegistryLease,

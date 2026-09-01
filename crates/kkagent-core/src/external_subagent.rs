@@ -192,6 +192,7 @@ async fn run_on_client(
                 // Match the built-in path: first 400 chars as the preview.
                 result_summary: text.chars().take(400).collect(),
                 usage: None, // ACP does not expose token usage
+                model: sub_cfg.model.clone(),
             },
             Err(error) => AgentEvent::SubagentFailed {
                 session_id: m.parent_session_id.clone(),

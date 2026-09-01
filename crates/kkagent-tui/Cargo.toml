@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 kkagent-protocol = { workspace = true }
+kkagent-core = { workspace = true }
 kkagent-client = { workspace = true }
 kkagent-config = { workspace = true }
 tokio = { workspace = true }

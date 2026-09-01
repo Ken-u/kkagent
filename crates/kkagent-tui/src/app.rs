@@ -13,6 +13,7 @@ use kkagent_client::{KkagentClient, RpcConnectionState};
 use kkagent_config::AppConfig;
 use kkagent_protocol::{AgentEvent, Frame, PermissionMode, SessionStatus};
 use ratatui::{backend::CrosstermBackend, Terminal};
+use std::collections::BTreeMap;
 use std::io;
 use std::path::PathBuf;
 
@@ -376,6 +377,9 @@ pub struct AppState {
     pub last_switch_metrics: Option<SessionSwitchMetrics>,
     /// Cumulative token usage for the active session (server-authoritative).
     pub usage_session: SessionUsageTotals,
+    /// Server-authoritative per-model/per-location cumulative usage for the
+    /// active session, keyed by `(model, location)`.
+    pub usage_by_model: BTreeMap<(String, String), kkagent_protocol::ModelUsageEntry>,
     /// Recent per-turn usage samples for `/usage`.
     pub usage_turns: Vec<TurnUsageSample>,
     /// Most recent single LLM call's usage (context-size anchor + cache stats
@@ -454,6 +458,7 @@ pub struct SessionRuntimeState {
     pub history_total: Option<usize>,
     pub prompt_queue: crate::prompt_queue::PromptQueue,
     pub usage_session: SessionUsageTotals,
+    pub usage_by_model: BTreeMap<(String, String), kkagent_protocol::ModelUsageEntry>,
     pub usage_turns: Vec<TurnUsageSample>,
     /// Most recent single LLM call's usage (server-authoritative snapshot
     /// `last_step_usage`); powers the "Latest request" section in `/usage`.
@@ -499,6 +504,7 @@ impl SessionRuntimeState {
             history_total: state.history_total,
             prompt_queue: state.prompt_queue.clone(),
             usage_session: state.usage_session.clone(),
+            usage_by_model: state.usage_by_model.clone(),
             usage_turns: state.usage_turns.clone(),
             last_step_usage: state.last_step_usage.clone(),
             context_breakdown: state.context_breakdown.clone(),
@@ -534,6 +540,7 @@ impl SessionRuntimeState {
         state.history_total = self.history_total;
         state.prompt_queue = self.prompt_queue;
         state.usage_session = self.usage_session;
+        state.usage_by_model = self.usage_by_model;
         state.usage_turns = self.usage_turns;
         state.last_step_usage = self.last_step_usage;
         state.context_breakdown = self.context_breakdown;
@@ -635,6 +642,8 @@ pub enum ListPickerKind {
     Usage,
     /// Per-turn usage detail (submenu of `/usage`).
     UsageTurns,
+    /// Cross-session token history from the durable store (submenu of `/usage`).
+    UsageHistory,
     /// Slash command catalogue (`/help`).
     Help,
     /// Prompt templates (`/prompts`).
@@ -1239,6 +1248,7 @@ impl AppState {
             queue_when_busy: true,
             last_switch_metrics: None,
             usage_session: SessionUsageTotals::default(),
+            usage_by_model: BTreeMap::new(),
             usage_turns: Vec::new(),
             last_step_usage: None,
             context_breakdown: None,
@@ -1357,6 +1367,7 @@ impl AppState {
         self.approx_tokens = 0;
         self.tokens_at_turn_start = 0;
         self.usage_session = SessionUsageTotals::default();
+        self.usage_by_model.clear();
         self.usage_turns.clear();
         self.last_step_usage = None;
         self.context_breakdown = None;
@@ -5170,11 +5181,20 @@ impl TuiApp {
                 if item.id == "__turns__" {
                     self.state.list_picker_stack.push(picker);
                     self.open_usage_turns_picker();
+                } else if item.id == "__history__" {
+                    self.state.list_picker_stack.push(picker);
+                    self.open_usage_history_picker();
                 } else if let Some(prev) = self.state.list_picker_stack.pop() {
                     self.state.list_picker = Some(prev);
                 }
             }
             ListPickerKind::UsageTurns => {
+                // Enter = same as Esc: back to the /usage panel.
+                if let Some(prev) = self.state.list_picker_stack.pop() {
+                    self.state.list_picker = Some(prev);
+                }
+            }
+            ListPickerKind::UsageHistory => {
                 // Enter = same as Esc: back to the /usage panel.
                 if let Some(prev) = self.state.list_picker_stack.pop() {
                     self.state.list_picker = Some(prev);
@@ -6470,6 +6490,40 @@ impl TuiApp {
                 },
                 detail: format!("${cost:.4}"),
             },
+        ];
+        // Per-model/per-location breakdown, sorted by total tokens desc.
+        if !self.state.usage_by_model.is_empty() {
+            items.push(ListPickerItem {
+                id: "sep_models".into(),
+                label: "── By Model ──".into(),
+                detail: String::new(),
+            });
+            let mut rows: Vec<&kkagent_protocol::ModelUsageEntry> =
+                self.state.usage_by_model.values().collect();
+            rows.sort_by_key(|e| std::cmp::Reverse(e.total_tokens()));
+            for entry in rows {
+                let hit = kkagent_protocol::cache_hit_ratio_ex(
+                    entry.input_tokens,
+                    entry.cache_creation_input_tokens,
+                    entry.cache_read_input_tokens,
+                    entry.input_includes_cache,
+                );
+                items.push(ListPickerItem {
+                    id: format!("model-{}-{}", entry.model, entry.location),
+                    label: format!("{} @ {}", entry.model, entry.location),
+                    detail: format!(
+                        "{} calls · in={:>9} out={:>8} total={:>9}{}",
+                        entry.calls,
+                        fmt_thousands(entry.total_input_tokens()),
+                        fmt_thousands(entry.output_tokens),
+                        fmt_thousands(entry.total_tokens()),
+                        hit.map(|h| format!(" · hit={:.0}%", h * 100.0))
+                            .unwrap_or_default(),
+                    ),
+                });
+            }
+        }
+        items.extend([
             ListPickerItem {
                 id: "sep_latest".into(),
                 label: "── Latest Request ──".into(),
@@ -6506,7 +6560,7 @@ impl TuiApp {
                 label: "Turns".into(),
                 detail: u.turns.to_string(),
             },
-        ];
+        ]);
         // Hide the cache-write row when the provider did not report writes.
         if !cache_creation_is_real_semantics(u) {
             items.retain(|item| item.id != "cache_c");
@@ -6586,9 +6640,100 @@ impl TuiApp {
             label: "Recent Turns →".into(),
             detail: "(Enter to view)".into(),
         });
+        items.push(ListPickerItem {
+            id: "__history__".into(),
+            label: "Token History (all sessions) →".into(),
+            detail: "(Enter to view: 7/30-day cross-session totals)".into(),
+        });
         self.replace_list_picker(ListPickerState {
             kind: ListPickerKind::Usage,
             title: " /usage ".into(),
+            items,
+            selected: 0,
+            filter: String::new(),
+            all_items: Vec::new(),
+        });
+    }
+
+    /// Cross-session token history from the durable `usage_daily` table:
+    /// day-level totals plus per-model / per-location breakdowns for a
+    /// 7- or 30-day window. Survives session archival and deletion.
+    fn open_usage_history_picker(&mut self) {
+        use std::fmt::Write as _;
+        let mut items = Vec::new();
+        let store_read = kkagent_core::usage_store::global_snapshot();
+        let Some(store) = store_read else {
+            items.push(ListPickerItem {
+                id: "unavailable".into(),
+                label: "Usage history unavailable".into(),
+                detail: "(server running in in-memory mode)".into(),
+            });
+            self.replace_list_picker(ListPickerState {
+                kind: ListPickerKind::UsageHistory,
+                title: " /usage · Token History ".into(),
+                items,
+                selected: 0,
+                filter: String::new(),
+                all_items: Vec::new(),
+            });
+            return;
+        };
+        for days in [7i64, 30] {
+            let by_model = store.totals_by_model(days).unwrap_or_default();
+            let by_location = store.totals_by_location(days).unwrap_or_default();
+            let total: u64 = by_model
+                .iter()
+                .map(|e| e.input_tokens.saturating_add(e.output_tokens))
+                .sum();
+            let mut header = format!("{}d total in+out: {}", days, fmt_thousands(total));
+            let _ = write!(
+                header,
+                " · calls: {}",
+                fmt_thousands(by_model.iter().map(|e| e.calls).sum())
+            );
+            items.push(ListPickerItem {
+                id: format!("sep-{days}d"),
+                label: format!("── Last {days} Days ──"),
+                detail: header,
+            });
+            if by_model.is_empty() {
+                items.push(ListPickerItem {
+                    id: format!("empty-{days}d"),
+                    label: "No data in this window".into(),
+                    detail: String::new(),
+                });
+                continue;
+            }
+            for entry in &by_model {
+                items.push(ListPickerItem {
+                    id: format!("m-{days}-{}", entry.model),
+                    label: format!("{} · model", entry.model),
+                    detail: format!(
+                        "calls={} in={} out={} total={}",
+                        entry.calls,
+                        fmt_thousands(entry.total_input_tokens()),
+                        fmt_thousands(entry.output_tokens),
+                        fmt_thousands(entry.total_tokens()),
+                    ),
+                });
+            }
+            for entry in &by_location {
+                items.push(ListPickerItem {
+                    id: format!("l-{days}-{}", entry.location),
+                    label: format!("{} · site", entry.location),
+                    detail: format!(
+                        "calls={} in={} out={} total={}",
+                        entry.calls,
+                        fmt_thousands(entry.total_input_tokens()),
+                        fmt_thousands(entry.output_tokens),
+                        fmt_thousands(entry.total_tokens()),
+                    ),
+                });
+            }
+        }
+        self.replace_list_picker(ListPickerState {
+            kind: ListPickerKind::UsageHistory,
+            title: " /usage · Token History ".into(),
             items,
             selected: 0,
             filter: String::new(),
@@ -12290,6 +12435,7 @@ impl TuiApp {
                         context,
                         steps,
                         turns,
+                        by_model,
                         ..
                     } => {
                         // `usage` is per-call; session totals accumulate across
@@ -12319,6 +12465,13 @@ impl TuiApp {
                         }
                         s.steps = steps;
                         s.turns = turns;
+                        // Server-authoritative per-model/per-location totals
+                        // replace the local copy wholesale.
+                        self.state.usage_by_model =
+                            by_model.into_iter().fold(BTreeMap::new(), |mut acc, e| {
+                                acc.insert((e.model.clone(), e.location.clone()), e);
+                                acc
+                            });
                         if let Some(ctx) = context {
                             self.state.context_breakdown = Some(ctx);
                         }
@@ -12538,8 +12691,40 @@ impl TuiApp {
                         subagent_id,
                         result_summary,
                         usage,
+                        model,
                         ..
                     } => {
+                        // Attribute the delegated run's tokens to
+                        // (model, "subagent") in the session breakdown.
+                        if let (Some(u), Some(model)) = (&usage, &model) {
+                            let entry = self
+                                .state
+                                .usage_by_model
+                                .entry((model.clone(), "subagent".into()))
+                                .or_insert_with(|| kkagent_protocol::ModelUsageEntry {
+                                    model: model.clone(),
+                                    location: "subagent".into(),
+                                    calls: 0,
+                                    input_tokens: 0,
+                                    output_tokens: 0,
+                                    cache_creation_input_tokens: 0,
+                                    cache_read_input_tokens: 0,
+                                    input_includes_cache: u.input_includes_cache,
+                                });
+                            entry.calls = entry.calls.saturating_add(1);
+                            entry.input_tokens = entry.input_tokens.saturating_add(u.input_tokens);
+                            entry.output_tokens =
+                                entry.output_tokens.saturating_add(u.output_tokens);
+                            entry.cache_creation_input_tokens = entry
+                                .cache_creation_input_tokens
+                                .saturating_add(u.cache_creation_input_tokens);
+                            entry.cache_read_input_tokens = entry
+                                .cache_read_input_tokens
+                                .saturating_add(u.cache_read_input_tokens);
+                            if u.input_includes_cache.is_some() {
+                                entry.input_includes_cache = u.input_includes_cache;
+                            }
+                        }
                         let summary: String = if let Some(u) = &usage {
                             format!(
                                 "{} (in={}, out={})",
@@ -15051,6 +15236,7 @@ mod app_state_tests {
                 context: None,
                 steps: 3,
                 turns: 1,
+                by_model: Vec::new(),
             })
             .unwrap(),
         });

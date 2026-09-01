@@ -1,8 +1,22 @@
 //! Session usage tracker (tokens / cache / steps).
 
-use kkagent_protocol::TokenUsage;
+use std::collections::BTreeMap;
+
+use kkagent_protocol::{ModelUsageEntry, TokenUsage};
 
 pub use kkagent_protocol::cache_hit_ratio_ex;
+
+/// Well-known call-site labels for [`UsageService::record_labeled`].
+pub mod usage_location {
+    /// Primary conversation turns (any model, incl. mid-turn fallback switches).
+    pub const MAIN: &str = "main";
+    /// Auto/overflow compaction summary calls.
+    pub const COMPACTION: &str = "compaction";
+    /// Goal completion judge runs.
+    pub const JUDGE: &str = "judge";
+    /// Delegated subagent runs (incl. their nested turns).
+    pub const SUBAGENT: &str = "subagent";
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct UsageSnapshot {
@@ -38,6 +52,8 @@ pub struct UsageService {
     pub last_step: UsageSnapshot,
     /// Last estimated context breakdown attached by the agent loop.
     pub last_context: Option<kkagent_protocol::ContextBreakdownInfo>,
+    /// Cumulative usage keyed by `(model alias, call site)`.
+    by_model: BTreeMap<(String, String), ModelUsageEntry>,
     /// Cumulative provider-normalized tokens (effective input + output).
     total_consumed: u64,
     /// `total_consumed` baseline captured at the current turn start; goal
@@ -54,6 +70,13 @@ impl UsageService {
     }
 
     pub fn record(&mut self, usage: &TokenUsage) {
+        self.record_labeled(usage, "", "");
+    }
+
+    /// Record a call's usage and attribute it to `model` at `location`.
+    /// Empty `model`/`location` are displayed as `"?"` in the breakdown and
+    /// skipped in event payloads only when the whole entry would be empty.
+    pub fn record_labeled(&mut self, usage: &TokenUsage, model: &str, location: &str) {
         self.last_step = UsageSnapshot {
             input_tokens: usage.input_tokens,
             output_tokens: usage.output_tokens,
@@ -85,6 +108,47 @@ impl UsageService {
                 .total_input_tokens()
                 .saturating_add(usage.output_tokens),
         );
+        if model.is_empty() && location.is_empty() {
+            return;
+        }
+        let entry = self
+            .by_model
+            .entry((model.to_string(), location.to_string()))
+            .or_default();
+        entry.model = model.to_string();
+        entry.location = location.to_string();
+        entry.calls = entry.calls.saturating_add(1);
+        entry.input_tokens = entry.input_tokens.saturating_add(usage.input_tokens);
+        entry.output_tokens = entry.output_tokens.saturating_add(usage.output_tokens);
+        entry.cache_creation_input_tokens = entry
+            .cache_creation_input_tokens
+            .saturating_add(usage.cache_creation_input_tokens);
+        entry.cache_read_input_tokens = entry
+            .cache_read_input_tokens
+            .saturating_add(usage.cache_read_input_tokens);
+        if usage.input_includes_cache.is_some() {
+            entry.input_includes_cache = usage.input_includes_cache;
+        }
+        // Durable cross-session history (no-op when the global sink is not
+        // installed or running under `cargo test`). The usage service does
+        // not know its owning session id; the TUI/RPC layer tags events by
+        // session, while the history tables only aggregate by day.
+        crate::usage_store::try_record(crate::usage_store::UsageEvent {
+            ts: crate::audit::now_rfc3339(),
+            day: crate::usage_store::local_day_string(),
+            session_id: String::new(),
+            model: model.to_string(),
+            location: location.to_string(),
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            cache_creation_input_tokens: usage.cache_creation_input_tokens,
+            cache_read_input_tokens: usage.cache_read_input_tokens,
+        });
+    }
+
+    /// Sorted snapshot of the per-model/per-location breakdown.
+    pub fn by_model_entries(&self) -> Vec<ModelUsageEntry> {
+        self.by_model.values().cloned().collect()
     }
 
     /// Provider semantics of the recorded input totals; `None` = unknown
@@ -129,6 +193,74 @@ mod tests {
         });
         assert_eq!(u.session.total_tokens(), 15);
         assert!((u.session.cache_hit_ratio(Some(true)).unwrap() - 0.4).abs() < 0.01);
+    }
+
+    #[test]
+    fn labeled_records_group_by_model_and_location() {
+        let mut u = UsageService::new();
+        u.record_labeled(
+            &TokenUsage {
+                input_tokens: 100,
+                output_tokens: 10,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+                input_includes_cache: Some(true),
+            },
+            "oai/glm-5.3",
+            usage_location::MAIN,
+        );
+        u.record_labeled(
+            &TokenUsage {
+                input_tokens: 50,
+                output_tokens: 5,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+                input_includes_cache: Some(true),
+            },
+            "oai/glm-5.3",
+            usage_location::MAIN,
+        );
+        u.record_labeled(
+            &TokenUsage {
+                input_tokens: 2000,
+                output_tokens: 300,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+                input_includes_cache: Some(true),
+            },
+            "glm-5.3-flash",
+            usage_location::COMPACTION,
+        );
+        u.record_labeled(
+            &TokenUsage {
+                input_tokens: 700,
+                output_tokens: 900,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+                input_includes_cache: Some(true),
+            },
+            "glm-5.3-flash",
+            usage_location::SUBAGENT,
+        );
+        let entries = u.by_model_entries();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].model, "glm-5.3-flash");
+        assert_eq!(entries[0].location, usage_location::COMPACTION);
+        assert_eq!(entries[0].calls, 1);
+        assert_eq!(entries[0].total_tokens(), 2300);
+        assert_eq!(entries[1].location, usage_location::SUBAGENT);
+        assert_eq!(entries[2].model, "oai/glm-5.3");
+        assert_eq!(entries[2].calls, 2);
+        assert_eq!(entries[2].total_input_tokens(), 150);
+        // Plain `record` (no labels) never lands in the breakdown.
+        u.record(&TokenUsage {
+            input_tokens: 1,
+            output_tokens: 1,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            input_includes_cache: None,
+        });
+        assert_eq!(u.by_model_entries().len(), 3);
     }
 
     #[test]

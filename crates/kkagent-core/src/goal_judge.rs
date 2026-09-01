@@ -38,6 +38,8 @@ pub struct GoalJudgeRecord {
     pub summary: String,
     /// Model alias the judge ran on.
     pub model: String,
+    /// Token usage of the whole judge turn (all steps aggregated).
+    pub usage: Option<kkagent_protocol::TokenUsage>,
 }
 
 /// Maximum evidence message count handed to the judge.
@@ -205,12 +207,27 @@ pub async fn run_goal_judge(
 
     let verdict = verdict_slot.lock().unwrap().take();
     match verdict {
-        Some(v) => Ok(GoalJudgeRecord {
-            verdict: v.verdict,
-            gaps: v.gaps,
-            summary: v.summary,
-            model: alias,
-        }),
+        Some(v) => {
+            let snap = session.usage.snapshot();
+            let usage = if snap.steps > 0 {
+                Some(kkagent_protocol::TokenUsage::from_buckets(
+                    snap.input_tokens,
+                    snap.output_tokens,
+                    snap.cache_creation_input_tokens,
+                    snap.cache_read_input_tokens,
+                    snap.input_includes_cache,
+                ))
+            } else {
+                None
+            };
+            Ok(GoalJudgeRecord {
+                verdict: v.verdict,
+                gaps: v.gaps,
+                summary: v.summary,
+                model: alias,
+                usage,
+            })
+        }
         None => Err("judge agent ended without a GoalJudge verdict".into()),
     }
 }

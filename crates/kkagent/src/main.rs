@@ -5557,6 +5557,15 @@ async fn build_server_state_with_shutdown(
         .unwrap_or_else(|| kkagent_config::default_config_dir().join("transcripts.db"));
     let (shared_sqlite, persistence_durable, persistence_error) =
         open_transcript_with_policy(&transcript_path, allow_in_memory)?;
+    // Durable cross-session token usage history shares the transcript DB
+    // (same WAL connection pool; one more table pair, no extra file).
+    match kkagent_core::UsageStore::from_shared(shared_sqlite.clone()) {
+        Ok(usage_store) => {
+            kkagent_core::usage_store::set_global(usage_store);
+            kkagent_core::usage_store::cleanup_expired_global();
+        }
+        Err(error) => tracing::warn!("usage history unavailable: {error:#}"),
+    }
     // One Connection for transcript + durable HTTP + subagents (avoid triple open/busy_timeout).
     let transcript = TranscriptDb::from_shared(shared_sqlite.clone())?;
     let db_for_tool_results = TranscriptDb::from_shared(shared_sqlite.clone())?;
@@ -6175,6 +6184,7 @@ async fn spawn_session_agent_turn(
                     gaps: gaps.clone(),
                     summary: summary.clone(),
                     model: model.clone(),
+                    usage: None,
                 });
                 let excess = entry.len().saturating_sub(MAX_JUDGE_RECORDS);
                 entry.drain(..excess);
@@ -9748,11 +9758,14 @@ async fn handle_rpc_call(
                 let mut messages = messages;
 
                 // LLM summary can take a while — do not hold the RPC handler.
+                // The spawned task does not own the live session, so the
+                // summarizer usage cannot be folded into its tracker here.
                 let result = kkagent_core::compact_full_async(
                     state_clone.config(),
                     &mut messages,
                     instruction.as_deref(),
                     session_model_alias.as_deref(),
+                    None,
                 )
                 .await;
 
