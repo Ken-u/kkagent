@@ -5183,7 +5183,7 @@ impl TuiApp {
                     self.open_usage_turns_picker();
                 } else if item.id == "__history__" {
                     self.state.list_picker_stack.push(picker);
-                    self.open_usage_history_picker();
+                    self.open_usage_history_picker().await;
                 } else if let Some(prev) = self.state.list_picker_stack.pop() {
                     self.state.list_picker = Some(prev);
                 }
@@ -6658,39 +6658,78 @@ impl TuiApp {
     /// Cross-session token history from the durable `usage_daily` table:
     /// day-level totals plus per-model / per-location breakdowns for a
     /// 7- or 30-day window. Survives session archival and deletion.
-    fn open_usage_history_picker(&mut self) {
-        use std::fmt::Write as _;
-        let mut items = Vec::new();
-        let store_read = kkagent_core::usage_store::global_snapshot();
-        let Some(store) = store_read else {
-            items.push(ListPickerItem {
-                id: "unavailable".into(),
-                label: "Usage history unavailable".into(),
-                detail: "(server running in in-memory mode)".into(),
-            });
+    /// The data lives in the server process, so this goes through the
+    /// `usage.history` RPC — the TUI never touches the SQLite file.
+    async fn open_usage_history_picker(&mut self) {
+        let value = match self
+            .client
+            .rpc_call("usage.history", Some(serde_json::json!({ "days": 30 })))
+            .await
+        {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::warn!("usage.history RPC failed: {error:#}");
+                self.replace_list_picker(ListPickerState {
+                    kind: ListPickerKind::UsageHistory,
+                    title: " /usage · Token History ".into(),
+                    items: vec![ListPickerItem {
+                        id: "unavailable".into(),
+                        label: "Usage history unavailable".into(),
+                        detail: format!("RPC error: {error}"),
+                    }],
+                    selected: 0,
+                    filter: String::new(),
+                    all_items: Vec::new(),
+                });
+                return;
+            }
+        };
+        if value.get("available") != Some(&serde_json::Value::Bool(true)) {
             self.replace_list_picker(ListPickerState {
                 kind: ListPickerKind::UsageHistory,
                 title: " /usage · Token History ".into(),
-                items,
+                items: vec![ListPickerItem {
+                    id: "unavailable".into(),
+                    label: "Usage history unavailable".into(),
+                    detail: "(server running without durable storage)".into(),
+                }],
                 selected: 0,
                 filter: String::new(),
                 all_items: Vec::new(),
             });
             return;
-        };
+        }
+        self.render_usage_history_items(&value);
+    }
+
+    /// Render the `usage.history` payload (or an equivalent direct-DB read)
+    /// into the Token History picker: one section per window with per-model
+    /// then per-site rows.
+    fn render_usage_history_items(&mut self, payload: &serde_json::Value) {
+        use std::fmt::Write as _;
+        let mut items = Vec::new();
         for days in [7i64, 30] {
-            let by_model = store.totals_by_model(days).unwrap_or_default();
-            let by_location = store.totals_by_location(days).unwrap_or_default();
+            let Some(by_model) = payload["by_model"].as_array() else {
+                continue;
+            };
+            let by_location = payload["by_location"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            let by_model = by_model.clone();
             let total: u64 = by_model
                 .iter()
-                .map(|e| e.input_tokens.saturating_add(e.output_tokens))
+                .map(|e| {
+                    e["input_tokens"].as_u64().unwrap_or(0)
+                        + e["output_tokens"].as_u64().unwrap_or(0)
+                })
+                .sum();
+            let calls: u64 = by_model
+                .iter()
+                .map(|e| e["calls"].as_u64().unwrap_or(0))
                 .sum();
             let mut header = format!("{}d total in+out: {}", days, fmt_thousands(total));
-            let _ = write!(
-                header,
-                " · calls: {}",
-                fmt_thousands(by_model.iter().map(|e| e.calls).sum())
-            );
+            let _ = write!(header, " · calls: {}", fmt_thousands(calls));
             items.push(ListPickerItem {
                 id: format!("sep-{days}d"),
                 label: format!("── Last {days} Days ──"),
@@ -6705,28 +6744,38 @@ impl TuiApp {
                 continue;
             }
             for entry in &by_model {
+                let input = entry["input_tokens"].as_u64().unwrap_or(0);
+                let output = entry["output_tokens"].as_u64().unwrap_or(0);
+                let cc = entry["cache_creation_input_tokens"].as_u64().unwrap_or(0);
+                let cr = entry["cache_read_input_tokens"].as_u64().unwrap_or(0);
+                let effective_in = if cc > 0 { input + cc + cr } else { input };
                 items.push(ListPickerItem {
-                    id: format!("m-{days}-{}", entry.model),
-                    label: format!("{} · model", entry.model),
+                    id: format!("m-{days}-{}", entry["model"].as_str().unwrap_or("?")),
+                    label: format!("{} · model", entry["model"].as_str().unwrap_or("?")),
                     detail: format!(
                         "calls={} in={} out={} total={}",
-                        entry.calls,
-                        fmt_thousands(entry.total_input_tokens()),
-                        fmt_thousands(entry.output_tokens),
-                        fmt_thousands(entry.total_tokens()),
+                        entry["calls"].as_u64().unwrap_or(0),
+                        fmt_thousands(effective_in),
+                        fmt_thousands(output),
+                        fmt_thousands(effective_in.saturating_add(output)),
                     ),
                 });
             }
             for entry in &by_location {
+                let input = entry["input_tokens"].as_u64().unwrap_or(0);
+                let output = entry["output_tokens"].as_u64().unwrap_or(0);
+                let cc = entry["cache_creation_input_tokens"].as_u64().unwrap_or(0);
+                let cr = entry["cache_read_input_tokens"].as_u64().unwrap_or(0);
+                let effective_in = if cc > 0 { input + cc + cr } else { input };
                 items.push(ListPickerItem {
-                    id: format!("l-{days}-{}", entry.location),
-                    label: format!("{} · site", entry.location),
+                    id: format!("l-{days}-{}", entry["location"].as_str().unwrap_or("?")),
+                    label: format!("{} · site", entry["location"].as_str().unwrap_or("?")),
                     detail: format!(
                         "calls={} in={} out={} total={}",
-                        entry.calls,
-                        fmt_thousands(entry.total_input_tokens()),
-                        fmt_thousands(entry.output_tokens),
-                        fmt_thousands(entry.total_tokens()),
+                        entry["calls"].as_u64().unwrap_or(0),
+                        fmt_thousands(effective_in),
+                        fmt_thousands(output),
+                        fmt_thousands(effective_in.saturating_add(output)),
                     ),
                 });
             }

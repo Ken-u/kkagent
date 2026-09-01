@@ -6886,6 +6886,38 @@ async fn handle_rpc_call(
             Ok(serde_json::json!({"ok": true}))
         }
         "config.reload" => reload_server_config_from_disk(state).await,
+        "usage.history" => {
+            let days = params
+                .as_ref()
+                .and_then(|p| p.get("days"))
+                .and_then(|v| v.as_i64())
+                .unwrap_or(30)
+                .clamp(1, 365);
+            // The sink lives in this (server) process; fall back to a direct
+            // read of the shared DB for embedded/in-memory edge cases.
+            let store = kkagent_core::usage_store::global_snapshot().or_else(|| {
+                let path = kkagent_config::default_config_dir().join("transcripts.db");
+                kkagent_core::open_shared_sqlite(&path)
+                    .ok()
+                    .and_then(|shared| kkagent_core::UsageStore::from_shared(shared).ok())
+            });
+            let Some(store) = store else {
+                return Ok(serde_json::json!({
+                    "days": days,
+                    "available": false,
+                    "by_model": [],
+                    "by_location": [],
+                    "by_day": [],
+                }));
+            };
+            Ok(serde_json::json!({
+                "days": days,
+                "available": true,
+                "by_model": store.totals_by_model(days).unwrap_or_default(),
+                "by_location": store.totals_by_location(days).unwrap_or_default(),
+                "by_day": store.totals_by_day(days).unwrap_or_default(),
+            }))
+        }
         "workspace.trust" => {
             let value = params.ok_or_else(|| (-32602, "Missing workspace trust".to_string()))?;
             let trust: kkagent_config::WorkspaceTrust = serde_json::from_value(value)
