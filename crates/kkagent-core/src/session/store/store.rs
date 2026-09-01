@@ -92,21 +92,24 @@ impl SessionStore {
             anyhow::bail!("session already exists: {id}");
         }
         std::fs::create_dir_all(&dir)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
-        }
-        let meta = SessionMetadataService::create_new(&dir, id, &work)?;
-        append_session_index_entry(
-            &self.home_dir,
-            &SessionIndexEntry {
-                session_id: id.to_string(),
-                session_dir: dir.to_string_lossy().into(),
-                work_dir: work.to_string_lossy().into(),
-            },
-        )?;
-        Ok(summary_from_meta(id, &dir, &work, meta.read()))
+        let result = (|| {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+            }
+            let meta = SessionMetadataService::create_new(&dir, id, &work)?;
+            append_session_index_entry(
+                &self.home_dir,
+                &SessionIndexEntry {
+                    session_id: id.to_string(),
+                    session_dir: dir.to_string_lossy().into(),
+                    work_dir: work.to_string_lossy().into(),
+                },
+            )?;
+            Ok(summary_from_meta(id, &dir, &work, meta.read()))
+        })();
+        cleanup_failed_session_dir(&dir, result)
     }
 
     pub fn get(&self, id: &str) -> anyhow::Result<SessionSummary> {
@@ -312,48 +315,51 @@ impl SessionStore {
         if target_dir.exists() {
             anyhow::bail!("session already exists: {target_id}");
         }
-        copy_dir_recursive(&source_dir, &target_dir)?;
-        // Drop non-forkable files
-        let _ = std::fs::remove_file(target_dir.join("upcoming-goals.json"));
-        let _ = std::fs::remove_file(target_dir.join("goal.json"));
+        let result = (|| {
+            copy_dir_recursive(&source_dir, &target_dir)?;
+            // Drop non-forkable files
+            let _ = std::fs::remove_file(target_dir.join("upcoming-goals.json"));
+            let _ = std::fs::remove_file(target_dir.join("goal.json"));
 
-        let mut meta = SessionMetadataService::load_or_create(&target_dir, target_id, &work)?;
-        meta.update(
-            SessionMetaPatch {
-                forked_from: Some(Some(source_id.to_string())),
-                title: Some(title.map(|t| t.to_string()).or_else(|| {
-                    Some(format!(
-                        "fork of {}",
-                        meta.read().title.as_deref().unwrap_or(source_id)
-                    ))
-                })),
-                is_custom_title: Some(title.is_some()),
-                archived: Some(false),
-                ..Default::default()
-            },
-            true,
-        )?;
+            let mut meta = SessionMetadataService::load_or_create(&target_dir, target_id, &work)?;
+            meta.update(
+                SessionMetaPatch {
+                    forked_from: Some(Some(source_id.to_string())),
+                    title: Some(title.map(|t| t.to_string()).or_else(|| {
+                        Some(format!(
+                            "fork of {}",
+                            meta.read().title.as_deref().unwrap_or(source_id)
+                        ))
+                    })),
+                    is_custom_title: Some(title.is_some()),
+                    archived: Some(false),
+                    ..Default::default()
+                },
+                true,
+            )?;
 
-        if let Some(idx) = turn_index {
-            truncate_transcript_at_turn(&target_dir, idx)?;
-        } else if let Some(limit) = message_limit {
-            truncate_transcript_at_message_limit(&target_dir, limit)?;
-        }
+            if let Some(idx) = turn_index {
+                truncate_transcript_at_turn(&target_dir, idx)?;
+            } else if let Some(limit) = message_limit {
+                truncate_transcript_at_message_limit(&target_dir, limit)?;
+            }
 
-        append_session_index_entry(
-            &self.home_dir,
-            &SessionIndexEntry {
-                session_id: target_id.to_string(),
-                session_dir: target_dir.to_string_lossy().into(),
-                work_dir: work.to_string_lossy().into(),
-            },
-        )?;
-        Ok(summary_from_meta(
-            target_id,
-            &target_dir,
-            &work,
-            meta.read(),
-        ))
+            append_session_index_entry(
+                &self.home_dir,
+                &SessionIndexEntry {
+                    session_id: target_id.to_string(),
+                    session_dir: target_dir.to_string_lossy().into(),
+                    work_dir: work.to_string_lossy().into(),
+                },
+            )?;
+            Ok(summary_from_meta(
+                target_id,
+                &target_dir,
+                &work,
+                meta.read(),
+            ))
+        })();
+        cleanup_failed_session_dir(&target_dir, result)
     }
 
     fn find_entry(&self, id: &str) -> anyhow::Result<Option<SessionIndexEntry>> {
@@ -415,6 +421,19 @@ fn summary_from_meta(id: &str, dir: &Path, work: &Path, meta: &SessionMeta) -> S
     }
 }
 
+fn cleanup_failed_session_dir<T>(dir: &Path, result: anyhow::Result<T>) -> anyhow::Result<T> {
+    if result.is_err() && dir.exists() {
+        if let Err(cleanup_error) = std::fs::remove_dir_all(dir) {
+            tracing::warn!(
+                path = %dir.display(),
+                %cleanup_error,
+                "failed to clean up incomplete session directory"
+            );
+        }
+    }
+    result
+}
+
 fn copy_dir_recursive(src: &Path, dst: &Path) -> anyhow::Result<()> {
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)? {
@@ -473,6 +492,46 @@ fn truncate_transcript_at_turn(session_dir: &Path, turn_index: usize) -> anyhow:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn create_rolls_back_directory_when_index_append_fails() {
+        let home = std::env::temp_dir().join(format!("kkagent-store-{}", uuid::Uuid::new_v4()));
+        let store = SessionStore::new(&home);
+        let work = home.join("proj");
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::create_dir_all(home.join("session_index.jsonl")).unwrap();
+        let session_dir = store.session_dir_for("rollback", &work).unwrap();
+
+        assert!(store.create("rollback", &work).is_err());
+        assert!(
+            !session_dir.exists(),
+            "failed create left an unindexed session directory"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn fork_rolls_back_target_when_copied_metadata_is_invalid() {
+        let home = std::env::temp_dir().join(format!("kkagent-store-{}", uuid::Uuid::new_v4()));
+        let store = SessionStore::new(&home);
+        let work = home.join("proj");
+        std::fs::create_dir_all(&work).unwrap();
+        let source = store.create("source", &work).unwrap();
+        std::fs::write(
+            Path::new(&source.session_dir).join("state.json"),
+            "not json",
+        )
+        .unwrap();
+        let target_dir = store.session_dir_for("target", &work).unwrap();
+
+        assert!(store.fork("source", "target", None, None).is_err());
+        assert!(
+            !target_dir.exists(),
+            "failed fork left a partial target directory"
+        );
+        assert!(Path::new(&source.session_dir).is_dir());
+        let _ = std::fs::remove_dir_all(&home);
+    }
 
     #[test]
     fn create_list_fork_archive() {

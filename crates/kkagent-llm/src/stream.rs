@@ -213,7 +213,7 @@ pub async fn anthropic_stream(
             if line.is_empty() || line.starts_with(':') {
                 continue;
             }
-            if let Some(data) = line.strip_prefix("data: ") {
+            if let Some(data) = sse_data_payload(line) {
                 if data == "[DONE]" {
                     if completed {
                         return Ok(());
@@ -254,6 +254,14 @@ pub async fn anthropic_stream(
     } else {
         anyhow::bail!("Anthropic stream connection closed before message_stop")
     }
+}
+
+/// Parse the payload of an SSE `data:` line. Per the WHATWG SSE spec the
+/// field name is followed by an optional single space; some providers emit
+/// `data:{...}` without it, and that line is valid and must not be dropped.
+pub(crate) fn sse_data_payload(line: &str) -> Option<&str> {
+    line.strip_prefix("data:")
+        .map(|rest| rest.strip_prefix(' ').unwrap_or(rest))
 }
 
 /// Append a raw byte chunk to the accumulator and return as much valid UTF-8
@@ -638,7 +646,7 @@ async fn chat_completions_stream(
             if line.is_empty() || line.starts_with(':') {
                 continue;
             }
-            let Some(data) = line.strip_prefix("data: ") else {
+            let Some(data) = sse_data_payload(line) else {
                 continue;
             };
             if data == "[DONE]" {
@@ -906,7 +914,7 @@ pub async fn google_stream(
             if line.is_empty() || line.starts_with(':') {
                 continue;
             }
-            let Some(data) = line.strip_prefix("data: ") else {
+            let Some(data) = sse_data_payload(line) else {
                 continue;
             };
             let event = serde_json::from_str::<serde_json::Value>(data)
@@ -1144,7 +1152,7 @@ async fn upload_kimi_video(
 mod tests {
     use super::{
         anthropic_stream, api_endpoint, drain_utf8, google_stream, kimi_stream, openai_stream,
-        push_strict_provider_message, update_openai_usage,
+        push_strict_provider_message, sse_data_payload, update_openai_usage,
     };
     use crate::types::{
         ChatContent, ChatMessage, LlmRequest, StreamEvent, ThinkingParams, ToolDef,
@@ -1704,6 +1712,15 @@ mod tests {
             body["messages"][0]["content"][0]["cache_control"]["type"],
             "ephemeral"
         );
+    }
+
+    #[test]
+    fn sse_data_payload_accepts_spec_compliant_spacing() {
+        assert_eq!(sse_data_payload("data: x"), Some("x"));
+        assert_eq!(sse_data_payload("data:x"), Some("x"));
+        assert_eq!(sse_data_payload("data:  two"), Some(" two"));
+        assert_eq!(sse_data_payload("data:"), Some(""));
+        assert_eq!(sse_data_payload("event: x"), None);
     }
 
     #[tokio::test]

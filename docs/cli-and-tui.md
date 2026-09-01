@@ -88,6 +88,7 @@ Footer 第一行的模型槽位跟随当前视图：切进子 agent 视图（`/a
 - 模式：`/permission`、`/yolo`、`/auto`、`/plan`、`/model`、`/effort`、`/thinking`、`/provider`。
 - `/effort [off|on|none|minimal|low|medium|high|xhigh|max]`：查看或设置思考强度。带参数直接生效（`on` 等价 `high`）；无参数打开选择器，优先展示当前模型 `support_efforts` 声明的等级。写入 `[thinking].effort`，优先级高于模型级 `default_effort`。
 - 扩展：`/mcp`、`/skills`、`/plugins`（多级弹窗管理已安装插件、marketplace 与安装来源）、`/plugins marketplace [source]`、`/plugins install <id-or-source>`、`/plugins update|enable|disable|remove|info <id>`、`/plugins reload`、`/tasks`、`/agents`（子 agent 状态与活动日志；正文不再灌入子 agent 输出）、`/goal`、`/swarm`、`/web`、`/prompts`。
+- `/goal <objective>`：创建目标；`/goal status|pause|resume|cancel` 管理状态；`/goal budget <turns|tokens|milliseconds|seconds|minutes|hours> <正整数|off>` 调整或清除单项硬预算。
 - 工具：`/init`、`/config`、`/auth`、`/reload`（同步热重载 TUI + server 配置，含新增模型；MCP/hooks 仍可能需重启）、`/add-dir`、`/btw`、`/fork`、`/search`、`/copy`、`/debug`。
 - `/btw <question>`：打开全屏 BTW 侧问（不写入主会话），状态入口显示在 `git:<branch>` 所在的第一行，不作为 session 标签。`Ctrl+G` 隐藏或再次呼出 BTW，回答会在后台继续；再次执行带问题的 `/btw` 会删除旧 BTW，并从命令执行时的当前主 session 创建新的上下文快照。BTW 与主窗口共用 Markdown 和 thinking 折叠样式；空输入时按 `Ctrl+D` 可取消并彻底删除 BTW。
 - `/fork [title]`：派生当前会话副本，仍停留在原会话；仅当存在 fork 族时，footer context 栏显示可切换会话，空输入下 `Tab` / `←` / `→` 循环切换。

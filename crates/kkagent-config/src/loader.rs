@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 use crate::AppConfig;
 
@@ -9,6 +10,12 @@ use crate::AppConfig;
 /// hatch: once set it cannot be reset, so a stray call in production code
 /// would be obvious (and `#[doc(hidden)]` keeps it out of the public surface).
 static CONFIG_DIR_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
+
+/// Values injected from the last workspace `.env` load. Tracking the previous
+/// injected value lets `/reload` refresh changed entries and remove deleted
+/// ones without overwriting a value that another part of the process
+/// deliberately changed in the meantime.
+static WORKSPACE_DOTENV_STATE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
 
 /// Redirect the default config/session home for the current process.
 /// Used by test harnesses to keep `cargo test` from touching the real
@@ -286,45 +293,88 @@ pub fn load_config(path: Option<&Path>) -> Result<AppConfig> {
 }
 
 /// Load only kkagent/model-provider variables from `<cwd>/.env` without
-/// overriding variables already supplied by the parent process.
+/// overriding variables supplied by the parent process. Values previously
+/// injected by this function are refreshed on subsequent loads, so `/reload`
+/// observes edits and removals instead of retaining stale workspace secrets.
 pub fn load_workspace_dotenv() -> Result<Option<PathBuf>> {
     let path = std::env::current_dir()?.join(".env");
-    if !path.is_file() {
-        return Ok(None);
-    }
-    // Older kkagent workspaces sometimes used `.env` as a TOML config file.
-    // Keep accepting `--config .env` without trying to interpret TOML tables as
-    // dotenv declarations.
-    let content = std::fs::read_to_string(&path)
-        .with_context(|| format!("Failed to read workspace environment: {path:?}"))?;
-    if content
-        .lines()
-        .map(str::trim)
-        .any(|line| line.starts_with('['))
-    {
-        return Ok(Some(path));
-    }
-    for item in dotenvy::from_read_iter(content.as_bytes()) {
-        let (name, value) = item?;
-        if recognized_env_key(&name) && std::env::var_os(&name).is_none() {
-            std::env::set_var(name, value);
+    load_workspace_dotenv_at(&path)
+}
+
+fn load_workspace_dotenv_at(path: &Path) -> Result<Option<PathBuf>> {
+    let mut parsed = HashMap::new();
+    if path.is_file() {
+        // Older kkagent workspaces sometimes used `.env` as a TOML config file.
+        // Keep accepting `--config .env` without trying to interpret TOML tables as
+        // dotenv declarations.
+        let content = std::fs::read_to_string(path)
+            .with_context(|| format!("Failed to read workspace environment: {path:?}"))?;
+        if content
+            .lines()
+            .map(str::trim)
+            .any(|line| line.starts_with('['))
+        {
+            refresh_workspace_dotenv(HashMap::new());
+            return Ok(Some(path.to_path_buf()));
+        }
+        for item in dotenvy::from_read_iter(content.as_bytes()) {
+            let (name, value) = item?;
+            if recognized_env_key(&name) {
+                parsed.insert(name, value);
+            }
         }
     }
-    Ok(Some(path))
+
+    refresh_workspace_dotenv(parsed);
+    Ok(path.is_file().then(|| path.to_path_buf()))
+}
+
+fn refresh_workspace_dotenv(parsed: HashMap<String, String>) {
+    let state = WORKSPACE_DOTENV_STATE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut state = state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    for (name, previous) in std::mem::take(&mut *state) {
+        if std::env::var_os(&name).as_deref() == Some(previous.as_ref()) {
+            std::env::remove_var(&name);
+        }
+    }
+
+    for (name, value) in parsed {
+        if std::env::var_os(&name).is_none() {
+            std::env::set_var(&name, &value);
+            state.insert(name, value);
+        }
+    }
 }
 
 fn recognized_env_key(name: &str) -> bool {
-    name.starts_with("KKAGENT_")
-        || matches!(
-            name,
-            "ANTHROPIC_API_KEY"
-                | "OPENAI_API_KEY"
-                | "KIMI_API_KEY"
-                | "KIMI_IMAGE_MAX_EDGE_PX"
-                | "KIMI_IMAGE_READ_BYTE_BUDGET"
-                | "GOOGLE_API_KEY"
-                | "MOONSHOT_API_KEY"
-        )
+    #[cfg(test)]
+    if name.starts_with("KKAGENT_TEST_DOTENV_") {
+        return true;
+    }
+
+    matches!(
+        name,
+        "KKAGENT_DEFAULT_MODEL"
+            | "KKAGENT_SECONDARY_MODEL"
+            | "KKAGENT_COMPACTION_MODEL"
+            | "KKAGENT_IMAGE_MAX_EDGE_PX"
+            | "KKAGENT_IMAGE_READ_BYTE_BUDGET"
+            | "KKAGENT_WEB_SEARCH_URL"
+            | "KKAGENT_WEB_SEARCH_KEY"
+            | "KKAGENT_WEB_SEARCH_PROVIDER"
+            | "KKAGENT_MOONSHOT_SEARCH_URL"
+            | "KKAGENT_MOONSHOT_SEARCH_KEY"
+            | "ANTHROPIC_API_KEY"
+            | "OPENAI_API_KEY"
+            | "KIMI_API_KEY"
+            | "KIMI_IMAGE_MAX_EDGE_PX"
+            | "KIMI_IMAGE_READ_BYTE_BUDGET"
+            | "GOOGLE_API_KEY"
+            | "MOONSHOT_API_KEY"
+    )
 }
 
 /// Apply KKAGENT_* / common env overrides (kimi-compatible subset).
@@ -539,6 +589,136 @@ pub fn load_active_session() -> Option<String> {
 /// Clear a stale or intentionally discarded active-session marker.
 pub fn clear_active_session() {
     remove_active_session_file(&active_session_path())
+}
+
+#[cfg(test)]
+mod workspace_dotenv_tests {
+    use super::*;
+
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn test_guard() -> std::sync::MutexGuard<'static, ()> {
+        TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn temp_path(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "kkagent-dotenv-{tag}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ))
+    }
+
+    fn unique_env(tag: &str) -> String {
+        format!(
+            "KKAGENT_TEST_DOTENV_{tag}_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        )
+    }
+
+    #[test]
+    fn reload_refreshes_and_removes_injected_values() {
+        let _guard = test_guard();
+        let root = temp_path("refresh");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join(".env");
+        let name = unique_env("REFRESH");
+
+        std::fs::write(&path, format!("{name}=first\n")).unwrap();
+        load_workspace_dotenv_at(&path).unwrap();
+        assert_eq!(std::env::var(&name).as_deref(), Ok("first"));
+
+        std::fs::write(&path, format!("{name}=second\n")).unwrap();
+        load_workspace_dotenv_at(&path).unwrap();
+        assert_eq!(std::env::var(&name).as_deref(), Ok("second"));
+
+        std::fs::remove_file(&path).unwrap();
+        assert!(load_workspace_dotenv_at(&path).unwrap().is_none());
+        assert!(std::env::var_os(&name).is_none());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn workspace_dotenv_rejects_process_level_security_overrides() {
+        let _guard = test_guard();
+        let root = temp_path("security");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join(".env");
+        let forbidden = [
+            "KKAGENT_HOME",
+            "KKAGENT_HTTP_TOKEN",
+            "KKAGENT_PERMISSION_MODE",
+            "KKAGENT_ALLOW_IN_MEMORY_TRANSCRIPTS",
+            "KKAGENT_PLUGIN_MARKETPLACE_URL",
+        ];
+        for name in forbidden {
+            std::env::remove_var(name);
+        }
+        std::fs::write(
+            &path,
+            forbidden
+                .iter()
+                .map(|name| format!("{name}=workspace-controlled"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+
+        load_workspace_dotenv_at(&path).unwrap();
+        for name in forbidden {
+            assert!(
+                std::env::var_os(name).is_none(),
+                "workspace .env unexpectedly set {name}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn parent_environment_keeps_precedence() {
+        let _guard = test_guard();
+        let root = temp_path("parent");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join(".env");
+        let name = unique_env("PARENT");
+        std::env::set_var(&name, "from-parent");
+
+        std::fs::write(&path, format!("{name}=from-dotenv\n")).unwrap();
+        load_workspace_dotenv_at(&path).unwrap();
+        assert_eq!(std::env::var(&name).as_deref(), Ok("from-parent"));
+
+        std::env::remove_var(&name);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn reload_does_not_undo_external_runtime_change() {
+        let _guard = test_guard();
+        let root = temp_path("runtime");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join(".env");
+        let name = unique_env("RUNTIME");
+
+        std::fs::write(&path, format!("{name}=from-dotenv\n")).unwrap();
+        load_workspace_dotenv_at(&path).unwrap();
+        std::env::set_var(&name, "changed-elsewhere");
+
+        std::fs::remove_file(&path).unwrap();
+        load_workspace_dotenv_at(&path).unwrap();
+        assert_eq!(std::env::var(&name).as_deref(), Ok("changed-elsewhere"));
+
+        std::env::remove_var(&name);
+        let _ = std::fs::remove_dir_all(root);
+    }
 }
 
 #[cfg(test)]

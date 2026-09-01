@@ -40,6 +40,54 @@ pub struct GoalBudget {
     pub wall_clock_budget_ms: Option<u64>,
 }
 
+impl GoalBudget {
+    /// Update one budget dimension from a CLI/RPC unit. `None` clears that
+    /// dimension. Integer values are converted with checked arithmetic so a
+    /// user-facing `/goal budget` command cannot silently wrap.
+    pub fn set_unit(&mut self, unit: &str, value: Option<u64>) -> Result<(), String> {
+        if value == Some(0) {
+            return Err("budget value must be positive or cleared".into());
+        }
+        match unit {
+            "turn" | "turns" => {
+                self.turn_budget = value
+                    .map(|value| {
+                        u32::try_from(value)
+                            .map_err(|_| "turn budget exceeds 4294967295".to_string())
+                    })
+                    .transpose()?;
+            }
+            "token" | "tokens" => self.token_budget = value,
+            "millisecond" | "milliseconds" | "wall_clock" => self.wall_clock_budget_ms = value,
+            "second" | "seconds" => {
+                self.wall_clock_budget_ms = checked_budget_millis(value, 1_000)?
+            }
+            "minute" | "minutes" => {
+                self.wall_clock_budget_ms = checked_budget_millis(value, 60_000)?
+            }
+            "hour" | "hours" => {
+                self.wall_clock_budget_ms = checked_budget_millis(value, 3_600_000)?
+            }
+            _ => {
+                return Err(format!(
+                    "unknown budget unit {unit:?}; use turns, tokens, milliseconds, seconds, minutes, or hours"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn checked_budget_millis(value: Option<u64>, scale: u64) -> Result<Option<u64>, String> {
+    value
+        .map(|value| {
+            value
+                .checked_mul(scale)
+                .ok_or_else(|| "wall-clock budget is too large".to_string())
+        })
+        .transpose()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct GoalBudgetReport {
     pub turn_budget: Option<u32>,
@@ -222,9 +270,9 @@ pub const GOAL_FORK_CLEARED_REMINDER: &str = "This fork does not have a current 
 Ignore earlier active-goal reminders from the source session. Handle requests normally unless the user \
 starts a new goal.";
 
-pub const GOAL_BUDGET_STOP_REMINDER: &str = "The goal's hard budget was reached and the goal is now blocked; \
-the user can resume it with /goal resume. Stop immediately. Do not call any more tools. Write a brief final \
-status message summarizing the progress so far.";
+pub const GOAL_BUDGET_STOP_REMINDER: &str = "The goal's hard budget was reached and the goal is now blocked. \
+Increase or clear the exhausted budget before resuming, or replace the goal. Stop immediately. Do not call \
+any more tools. Write a brief final status message summarizing the progress so far.";
 
 /// Headless /goal exit codes (kimi-aligned subset).
 pub mod exit_codes {
@@ -512,12 +560,21 @@ impl GoalManager {
         self.persist(&guard).await;
     }
 
-    pub async fn resume_goal(&self) {
+    pub async fn resume_goal(&self) -> bool {
         let mut guard = self.inner.lock().await;
         let Some(mut goal) = guard.current.take() else {
-            return;
+            return false;
         };
+        if goal.status == GoalStatus::Active {
+            guard.current = Some(goal);
+            return true;
+        }
         if matches!(goal.status, GoalStatus::Paused | GoalStatus::Blocked) {
+            goal.wall_clock_ms = Self::live_wall_clock(&goal, guard.active_since);
+            if goal.is_budget_exhausted() {
+                guard.current = Some(goal);
+                return false;
+            }
             goal.status = GoalStatus::Active;
             goal.terminal_reason = None;
             goal.updated_at = Utc::now().to_rfc3339();
@@ -534,9 +591,12 @@ impl GoalManager {
                 time: goal.updated_at.clone(),
             };
             guard.journal.push(op);
+            guard.current = Some(goal);
+            self.persist(&guard).await;
+            return true;
         }
         guard.current = Some(goal);
-        self.persist(&guard).await;
+        false
     }
 
     pub async fn cancel_goal(&self) -> Option<Goal> {
@@ -672,6 +732,22 @@ async fn write_goal_file(path: &Path, goal: Option<&Goal>) -> std::io::Result<()
 mod tests {
     use super::*;
 
+    #[test]
+    fn budget_units_use_checked_conversion_and_support_clear() {
+        let mut budget = GoalBudget::default();
+        budget.set_unit("turns", Some(5)).unwrap();
+        budget.set_unit("seconds", Some(2)).unwrap();
+        assert_eq!(budget.turn_budget, Some(5));
+        assert_eq!(budget.wall_clock_budget_ms, Some(2_000));
+
+        budget.set_unit("turns", None).unwrap();
+        assert_eq!(budget.turn_budget, None);
+        assert!(budget.set_unit("turns", Some(u32::MAX as u64 + 1)).is_err());
+        assert!(budget.set_unit("hours", Some(u64::MAX)).is_err());
+        assert!(budget.set_unit("tokens", Some(0)).is_err());
+        assert!(budget.set_unit("fortnights", Some(1)).is_err());
+    }
+
     #[tokio::test]
     async fn budget_exhaustion_blocks_not_fails() {
         let mgr = GoalManager::new();
@@ -716,7 +792,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(40)).await;
         let still = mgr.get_goal().await.unwrap().wall_clock_ms;
         assert_eq!(still, paused_ms);
-        mgr.resume_goal().await;
+        assert!(mgr.resume_goal().await);
         tokio::time::sleep(std::time::Duration::from_millis(30)).await;
         let after = mgr.get_goal().await.unwrap().wall_clock_ms;
         assert!(after >= paused_ms + 20);
@@ -758,11 +834,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exhausted_goal_requires_budget_change_before_resume() {
+        let mgr = GoalManager::new();
+        mgr.create_goal(
+            "budgeted",
+            GoalBudget {
+                turn_budget: Some(1),
+                ..Default::default()
+            },
+        )
+        .await;
+        mgr.record_turn(1).await;
+        mgr.block_goal("budget").await;
+
+        assert!(!mgr.resume_goal().await);
+        assert_eq!(mgr.get_goal().await.unwrap().status, GoalStatus::Blocked);
+
+        mgr.update_budget(GoalBudget {
+            turn_budget: Some(2),
+            ..Default::default()
+        })
+        .await;
+        assert!(mgr.resume_goal().await);
+        assert_eq!(mgr.get_goal().await.unwrap().status, GoalStatus::Active);
+    }
+
+    #[tokio::test]
     async fn resume_from_blocked() {
         let mgr = GoalManager::new();
         mgr.create_goal("b", GoalBudget::default()).await;
         mgr.block_goal("wait").await;
-        mgr.resume_goal().await;
+        assert!(mgr.resume_goal().await);
         assert_eq!(mgr.get_goal().await.unwrap().status, GoalStatus::Active);
         assert!(mgr.should_continue().await);
     }

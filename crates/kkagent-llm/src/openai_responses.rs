@@ -173,7 +173,7 @@ pub async fn openai_responses_stream(
             if line.is_empty() || line.starts_with(':') {
                 continue;
             }
-            let Some(data) = line.strip_prefix("data: ") else {
+            let Some(data) = crate::stream::sse_data_payload(line) else {
                 continue;
             };
             if data == "[DONE]" {
@@ -451,6 +451,26 @@ mod tests {
             socket.write_all(response.as_bytes()).await.unwrap();
         });
         format!("http://{address}")
+    }
+
+    #[tokio::test]
+    async fn accepts_data_lines_without_space_after_colon() {
+        let sse = concat!(
+            "data:{\"type\":\"response.output_text.delta\",\"delta\":\"no-space\"}\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":4,\"output_tokens\":2}}}\n"
+        );
+        let base_url = serve_sse(sse).await;
+        let (tx, mut rx) = mpsc::channel(8);
+        openai_responses_stream(&Client::new(), &base_url, "token", request(), tx)
+            .await
+            .unwrap();
+        let mut text = String::new();
+        while let Ok(event) = rx.try_recv() {
+            if let StreamEvent::TextDelta(delta) = event {
+                text.push_str(&delta);
+            }
+        }
+        assert_eq!(text, "no-space");
     }
 
     #[tokio::test]

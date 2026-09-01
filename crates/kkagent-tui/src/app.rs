@@ -10693,6 +10693,49 @@ impl TuiApp {
                             Err(e) => self.system_message(format!("Goal {sub} failed: {e}")),
                         }
                     }
+                    "budget" => {
+                        let mut budget_parts = rest.split_whitespace();
+                        let unit = budget_parts.next().unwrap_or("");
+                        let raw_value = budget_parts.next().unwrap_or("");
+                        if unit.is_empty() || raw_value.is_empty() || budget_parts.next().is_some()
+                        {
+                            self.system_message(
+                                "Usage: /goal budget <turns|tokens|milliseconds|seconds|minutes|hours> <positive-integer|off>"
+                                    .into(),
+                            );
+                            return Ok(());
+                        }
+                        let value = if raw_value.eq_ignore_ascii_case("off")
+                            || raw_value.eq_ignore_ascii_case("none")
+                        {
+                            serde_json::Value::Null
+                        } else if let Ok(value) = raw_value.parse::<u64>() {
+                            serde_json::json!(value)
+                        } else {
+                            self.system_message(
+                                "Goal budget value must be a positive integer or off.".into(),
+                            );
+                            return Ok(());
+                        };
+                        match self
+                            .client
+                            .rpc_call(
+                                "session.goal",
+                                Some(serde_json::json!({
+                                    "session_id": session_id,
+                                    "action": "budget",
+                                    "unit": unit,
+                                    "value": value,
+                                })),
+                            )
+                            .await
+                        {
+                            Ok(body) => self.system_message(
+                                serde_json::to_string_pretty(&body).unwrap_or_default(),
+                            ),
+                            Err(e) => self.system_message(format!("Goal budget failed: {e}")),
+                        }
+                    }
                     "replace" => {
                         if rest.is_empty() {
                             self.system_message("Usage: /goal replace <objective>".into());

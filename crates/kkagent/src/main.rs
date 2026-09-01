@@ -1537,6 +1537,39 @@ async fn run_print_goal(client: &mut KkagentClient, session_id: &str, args: &str
             println!("{}", serde_json::to_string_pretty(&body)?);
             return Ok(exit_codes::CANCELLED);
         }
+        "budget" => {
+            let mut budget_parts = rest.split_whitespace();
+            let unit = budget_parts.next().unwrap_or("");
+            let raw_value = budget_parts.next().unwrap_or("");
+            if unit.is_empty() || raw_value.is_empty() || budget_parts.next().is_some() {
+                anyhow::bail!(
+                    "Usage: /goal budget <turns|tokens|milliseconds|seconds|minutes|hours> <positive-integer|off>"
+                );
+            }
+            let value = if raw_value.eq_ignore_ascii_case("off")
+                || raw_value.eq_ignore_ascii_case("none")
+            {
+                serde_json::Value::Null
+            } else {
+                serde_json::json!(raw_value
+                    .parse::<u64>()
+                    .with_context(|| { "goal budget value must be a positive integer or off" })?)
+            };
+            let body = requester
+                .rpc_call(
+                    "session.goal",
+                    Some(serde_json::json!({
+                        "session_id": session_id,
+                        "action": "budget",
+                        "unit": unit,
+                        "value": value,
+                    })),
+                )
+                .await
+                .map_err(|error| anyhow::anyhow!("{error}"))?;
+            println!("{}", serde_json::to_string_pretty(&body)?);
+            return Ok(exit_codes::SUCCESS_COMPLETE);
+        }
         "replace" => {
             if rest.is_empty() {
                 anyhow::bail!("Usage: /goal replace <objective>");
@@ -5652,7 +5685,13 @@ async fn build_server_state_with_shutdown(
         let task = tokio::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(15)).await;
-                let due = cron_bg.take_due().await;
+                let due = match cron_bg.take_due().await {
+                    Ok(due) => due,
+                    Err(error) => {
+                        tracing::warn!("cron dispatch skipped: {error:#}");
+                        continue;
+                    }
+                };
                 for (id, prompt, recurring) in due {
                     let xml = kkagent_tools::render_cron_fire_xml(
                         &id,
@@ -8133,6 +8172,14 @@ async fn handle_rpc_call(
                 .unwrap_or("")
                 .trim()
                 .to_string();
+            let budget_unit = params
+                .as_ref()
+                .and_then(|p| p.get("unit"))
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string);
+            let budget_value = params.as_ref().and_then(|p| p.get("value"));
 
             async fn goal_snapshot(mgr: &kkagent_protocol::goal::GoalManager) -> serde_json::Value {
                 match mgr.snapshot_with_budget().await {
@@ -8171,7 +8218,13 @@ async fn handle_rpc_call(
                     Ok(body)
                 }
                 "resume" => {
-                    goal_mgr.resume_goal().await;
+                    if !goal_mgr.resume_goal().await {
+                        return Err((
+                            -32000,
+                            "Goal could not be resumed. It may already be active, missing, or still have an exhausted budget; increase/clear the budget or replace the goal first."
+                                .into(),
+                        ));
+                    }
                     let body = goal_snapshot(&goal_mgr).await;
                     let should_prompt = goal_mgr.should_continue().await;
                     publish_goal(session_id.clone(), &body, "resumed");
@@ -8198,6 +8251,34 @@ async fn handle_rpc_call(
                             Err(err) => tracing::warn!("goal resume turn skipped: {err}"),
                         }
                     }
+                    Ok(body)
+                }
+                "budget" => {
+                    let unit = budget_unit
+                        .as_deref()
+                        .ok_or_else(|| (-32602, "budget unit is required".into()))?;
+                    let value = match budget_value {
+                        Some(value) if value.is_null() => None,
+                        Some(value) => {
+                            Some(value.as_u64().filter(|value| *value > 0).ok_or_else(|| {
+                                (
+                                    -32602,
+                                    "budget value must be a positive integer or null".into(),
+                                )
+                            })?)
+                        }
+                        None => return Err((-32602, "budget value is required".into())),
+                    };
+                    let Some(goal) = goal_mgr.get_goal().await else {
+                        return Err((-32000, "No active goal.".into()));
+                    };
+                    let mut budget = goal.budget;
+                    budget
+                        .set_unit(unit, value)
+                        .map_err(|error| (-32602, error))?;
+                    goal_mgr.update_budget(budget).await;
+                    let body = goal_snapshot(&goal_mgr).await;
+                    publish_goal(session_id, &body, "budget_updated");
                     Ok(body)
                 }
                 "cancel" => {

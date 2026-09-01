@@ -144,8 +144,13 @@ impl GoalTool {
                     .with_stop_turn()
             }
             "active" => {
-                self.goal_mgr.resume_goal().await;
-                ToolOutput::success("Goal resumed.")
+                if self.goal_mgr.resume_goal().await {
+                    ToolOutput::success("Goal resumed.")
+                } else {
+                    ToolOutput::error(
+                        "Goal could not be resumed. It may already be active, missing, or still have an exhausted budget; increase/clear the budget or replace the goal first.",
+                    )
+                }
             }
             // Legacy alias kept for old transcripts.
             "failed" => {
@@ -154,7 +159,7 @@ impl GoalTool {
                     .with_stop_turn()
             }
             _ => ToolOutput::error(format!(
-                "Unknown status: {status}. Use active, complete, or blocked."
+                "Unknown status: {status}. Use active, paused, complete, or blocked."
             )),
         }
     }
@@ -169,49 +174,125 @@ impl GoalTool {
             .get("unit")
             .or_else(|| input.get("budget_unit"))
             .and_then(|v| v.as_str());
-        if let (Some(unit), Some(value)) = (unit, input.get("value").and_then(|v| v.as_f64())) {
-            if !value.is_finite() || value <= 0.0 {
-                return ToolOutput::error("value must be a finite positive number");
-            }
+        let raw_value = input.get("value");
+        if unit.is_some() != raw_value.is_some() {
+            return ToolOutput::error("unit and value must be provided together");
+        }
+        if let (Some(unit), Some(raw_value)) = (unit, raw_value) {
             match unit {
-                "turns" | "turn" => budget.turn_budget = Some(value.round() as u32),
-                "tokens" | "token" => budget.token_budget = Some(value.round() as u64),
-                "milliseconds" | "wall_clock" => {
-                    budget.wall_clock_budget_ms = Some(value.round() as u64)
+                "turns" | "turn" => {
+                    let Some(value) = json_positive_u32(raw_value) else {
+                        return ToolOutput::error(
+                            "turn budget must be a positive number that rounds to at most 4294967295",
+                        );
+                    };
+                    budget.turn_budget = Some(value);
                 }
-                "seconds" => budget.wall_clock_budget_ms = Some((value * 1000.0).round() as u64),
-                "minutes" => budget.wall_clock_budget_ms = Some((value * 60_000.0).round() as u64),
-                "hours" => budget.wall_clock_budget_ms = Some((value * 3_600_000.0).round() as u64),
+                "tokens" | "token" => {
+                    let Some(value) = json_positive_u64(raw_value) else {
+                        return ToolOutput::error(
+                            "token budget must be a positive number that fits in u64",
+                        );
+                    };
+                    budget.token_budget = Some(value);
+                }
+                "milliseconds" | "wall_clock" => {
+                    let Some(value) = json_positive_u64(raw_value) else {
+                        return ToolOutput::error(
+                            "wall-clock budget must be a positive number that rounds to at least 1 millisecond and fits in u64",
+                        );
+                    };
+                    budget.wall_clock_budget_ms = Some(value);
+                }
+                "seconds" => {
+                    let Some(value) = json_scaled_positive_millis(raw_value, 1_000) else {
+                        return ToolOutput::error(
+                            "seconds budget must be positive, round to at least 1 millisecond, and fit in u64",
+                        );
+                    };
+                    budget.wall_clock_budget_ms = Some(value);
+                }
+                "minutes" => {
+                    let Some(value) = json_scaled_positive_millis(raw_value, 60_000) else {
+                        return ToolOutput::error(
+                            "minutes budget must be positive, round to at least 1 millisecond, and fit in u64",
+                        );
+                    };
+                    budget.wall_clock_budget_ms = Some(value);
+                }
+                "hours" => {
+                    let Some(value) = json_scaled_positive_millis(raw_value, 3_600_000) else {
+                        return ToolOutput::error(
+                            "hours budget must be positive, round to at least 1 millisecond, and fit in u64",
+                        );
+                    };
+                    budget.wall_clock_budget_ms = Some(value);
+                }
                 other => {
                     return ToolOutput::error(format!("Unknown budget unit: {other}"));
                 }
             }
         } else {
+            let has_legacy_field = ["turn_budget", "token_budget", "wall_clock_budget_ms"]
+                .iter()
+                .any(|key| input.get(key).is_some());
+            if !has_legacy_field {
+                return ToolOutput::error(
+                    "provide unit and value together, or at least one legacy budget field",
+                );
+            }
             // Legacy multi-field form
             if input
                 .as_object()
                 .map(|o| o.contains_key("turn_budget"))
                 .unwrap_or(false)
             {
-                budget.turn_budget = input
-                    .get("turn_budget")
-                    .and_then(|v| v.as_u64())
-                    .map(|v| v as u32);
+                let raw = input.get("turn_budget").expect("checked key presence");
+                if raw.is_null() {
+                    budget.turn_budget = None;
+                } else if let Some(value) = raw
+                    .as_u64()
+                    .filter(|value| *value > 0)
+                    .and_then(|v| u32::try_from(v).ok())
+                {
+                    budget.turn_budget = Some(value);
+                } else {
+                    return ToolOutput::error(
+                        "turn_budget must be null or an integer between 1 and 4294967295",
+                    );
+                }
             }
             if input
                 .as_object()
                 .map(|o| o.contains_key("token_budget"))
                 .unwrap_or(false)
             {
-                budget.token_budget = input.get("token_budget").and_then(|v| v.as_u64());
+                let raw = input.get("token_budget").expect("checked key presence");
+                if raw.is_null() {
+                    budget.token_budget = None;
+                } else if let Some(value) = raw.as_u64().filter(|value| *value > 0) {
+                    budget.token_budget = Some(value);
+                } else {
+                    return ToolOutput::error("token_budget must be null or a positive integer");
+                }
             }
             if input
                 .as_object()
                 .map(|o| o.contains_key("wall_clock_budget_ms"))
                 .unwrap_or(false)
             {
-                budget.wall_clock_budget_ms =
-                    input.get("wall_clock_budget_ms").and_then(|v| v.as_u64());
+                let raw = input
+                    .get("wall_clock_budget_ms")
+                    .expect("checked key presence");
+                if raw.is_null() {
+                    budget.wall_clock_budget_ms = None;
+                } else if let Some(value) = raw.as_u64().filter(|value| *value > 0) {
+                    budget.wall_clock_budget_ms = Some(value);
+                } else {
+                    return ToolOutput::error(
+                        "wall_clock_budget_ms must be null or a positive integer",
+                    );
+                }
             }
         }
 
@@ -226,6 +307,37 @@ impl GoalTool {
             .unwrap_or_default(),
         )
     }
+}
+
+fn json_positive_u32(value: &Value) -> Option<u32> {
+    if let Some(value) = value.as_u64() {
+        return u32::try_from(value).ok().filter(|value| *value > 0);
+    }
+    rounded_positive_u32(value.as_f64()?)
+}
+
+fn json_positive_u64(value: &Value) -> Option<u64> {
+    if let Some(value) = value.as_u64() {
+        return (value > 0).then_some(value);
+    }
+    rounded_positive_u64(value.as_f64()?)
+}
+
+fn json_scaled_positive_millis(value: &Value, scale: u64) -> Option<u64> {
+    if let Some(value) = value.as_u64() {
+        return value.checked_mul(scale).filter(|value| *value > 0);
+    }
+    rounded_positive_u64(value.as_f64()? * scale as f64)
+}
+
+fn rounded_positive_u32(value: f64) -> Option<u32> {
+    let rounded = value.round();
+    (rounded >= 1.0 && rounded <= u32::MAX as f64).then_some(rounded as u32)
+}
+
+fn rounded_positive_u64(value: f64) -> Option<u64> {
+    let rounded = value.round();
+    (rounded >= 1.0 && rounded < u64::MAX as f64).then_some(rounded as u64)
 }
 
 #[async_trait]
@@ -395,6 +507,104 @@ mod tests {
             .await
             .unwrap();
         assert!(out.is_error);
+    }
+
+    #[tokio::test]
+    async fn rejects_budget_values_that_round_or_overflow_to_zero() {
+        let mgr = Arc::new(GoalManager::new());
+        mgr.create_goal("budget validation", GoalBudget::default())
+            .await;
+        let tool = GoalTool::new(mgr.clone());
+
+        for input in [
+            serde_json::json!({"action": "budget", "unit": "turns", "value": 0.1}),
+            serde_json::json!({"action": "budget", "unit": "turns", "value": 4294967296_u64}),
+            serde_json::json!({"action": "budget", "turn_budget": 4294967296_u64}),
+        ] {
+            let out = tool.execute(input, &context()).await.unwrap();
+            assert!(out.is_error, "unexpected success: {}", out.content);
+        }
+        assert_eq!(mgr.get_goal().await.unwrap().budget, GoalBudget::default());
+    }
+
+    #[tokio::test]
+    async fn preserves_exact_integer_budget_boundaries() {
+        let mgr = Arc::new(GoalManager::new());
+        mgr.create_goal("budget boundaries", GoalBudget::default())
+            .await;
+        let tool = GoalTool::new(mgr.clone());
+
+        let out = tool
+            .execute(
+                serde_json::json!({"action": "budget", "unit": "tokens", "value": u64::MAX}),
+                &context(),
+            )
+            .await
+            .unwrap();
+        assert!(!out.is_error, "unexpected error: {}", out.content);
+        assert_eq!(
+            mgr.get_goal().await.unwrap().budget.token_budget,
+            Some(u64::MAX)
+        );
+
+        let out = tool
+            .execute(
+                serde_json::json!({"action": "budget", "unit": "seconds", "value": u64::MAX}),
+                &context(),
+            )
+            .await
+            .unwrap();
+        assert!(out.is_error);
+    }
+
+    #[tokio::test]
+    async fn rejects_partial_or_invalid_budget_updates() {
+        let mgr = Arc::new(GoalManager::new());
+        mgr.create_goal("budget validation", GoalBudget::default())
+            .await;
+        let tool = GoalTool::new(mgr.clone());
+
+        for input in [
+            serde_json::json!({"action": "budget", "unit": "turns"}),
+            serde_json::json!({"action": "budget", "value": 2}),
+            serde_json::json!({"action": "budget"}),
+            serde_json::json!({"action": "budget", "turn_budget": 0}),
+            serde_json::json!({"action": "budget", "token_budget": "many"}),
+            serde_json::json!({"action": "budget", "wall_clock_budget_ms": -1}),
+        ] {
+            let out = tool.execute(input, &context()).await.unwrap();
+            assert!(out.is_error, "unexpected success: {}", out.content);
+        }
+        assert_eq!(mgr.get_goal().await.unwrap().budget, GoalBudget::default());
+    }
+
+    #[tokio::test]
+    async fn resume_reports_exhausted_budget_instead_of_fake_success() {
+        let mgr = Arc::new(GoalManager::new());
+        mgr.create_goal(
+            "budgeted",
+            GoalBudget {
+                turn_budget: Some(1),
+                ..Default::default()
+            },
+        )
+        .await;
+        mgr.record_turn(1).await;
+        mgr.block_goal("budget").await;
+        let tool = GoalTool::new(mgr.clone());
+
+        let out = tool
+            .execute(
+                serde_json::json!({"action": "update", "status": "active"}),
+                &context(),
+            )
+            .await
+            .unwrap();
+        assert!(out.is_error);
+        assert_eq!(
+            mgr.get_goal().await.unwrap().status,
+            kkagent_protocol::goal::GoalStatus::Blocked
+        );
     }
 
     #[tokio::test]

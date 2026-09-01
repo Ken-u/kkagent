@@ -28,6 +28,7 @@ fn default_recurring() -> bool {
 
 pub struct CronManager {
     jobs: Mutex<HashMap<String, CronJob>>,
+    mutation: Mutex<()>,
     persist_path: Option<PathBuf>,
 }
 
@@ -35,6 +36,7 @@ impl CronManager {
     pub fn new() -> Self {
         Self {
             jobs: Mutex::new(HashMap::new()),
+            mutation: Mutex::new(()),
             persist_path: None,
         }
     }
@@ -43,6 +45,7 @@ impl CronManager {
     pub async fn with_persist(path: PathBuf) -> Self {
         let mgr = Self {
             jobs: Mutex::new(HashMap::new()),
+            mutation: Mutex::new(()),
             persist_path: Some(path.clone()),
         };
         if let Err(e) = mgr.load_from_disk(&path).await {
@@ -107,45 +110,57 @@ impl CronManager {
             enabled: true,
             recurring,
         };
+        let _mutation = self.mutation.lock().await;
         {
             let mut jobs = self.jobs.lock().await;
             if jobs.len() >= 50 {
                 anyhow::bail!("session cron job limit reached (50)");
             }
-            jobs.insert(id, job.clone());
+            jobs.insert(id.clone(), job.clone());
         }
         if let Err(e) = self.save_to_disk().await {
-            tracing::warn!("Cron persist failed: {}", e);
+            self.jobs.lock().await.remove(&id);
+            return Err(e.context("cron job creation rolled back: persist failed"));
         }
         Ok(job)
     }
 
-    pub async fn delete(&self, id: &str) -> bool {
-        let removed = self.jobs.lock().await.remove(id).is_some();
-        if removed {
-            if let Err(e) = self.save_to_disk().await {
-                tracing::warn!("Cron persist failed: {}", e);
-            }
+    /// Delete by id. `Ok(false)` means the id was unknown; an error means the
+    /// delete could not be persisted and the job was restored.
+    pub async fn delete(&self, id: &str) -> anyhow::Result<bool> {
+        let _mutation = self.mutation.lock().await;
+        let removed = self.jobs.lock().await.remove(id);
+        let Some(job) = removed else {
+            return Ok(false);
+        };
+        if let Err(e) = self.save_to_disk().await {
+            self.jobs.lock().await.insert(id.to_string(), job);
+            return Err(e.context("cron job deletion rolled back: persist failed"));
         }
-        removed
+        Ok(true)
     }
 
-    /// Return due job prompts and advance/disable them.
-    pub async fn take_due(&self) -> Vec<(String, String, bool)> {
+    /// Return due job prompts and advance/disable them. When persisting fails,
+    /// schedule mutations are rolled back and nothing is returned, so a
+    /// restart cannot fire the same prompts again.
+    pub async fn take_due(&self) -> anyhow::Result<Vec<(String, String, bool)>> {
+        let _mutation = self.mutation.lock().await;
         let now = Utc::now();
         let mut jobs = self.jobs.lock().await;
         let mut due = Vec::new();
         let mut remove = Vec::new();
+        let mut previous = Vec::new();
         for (id, job) in jobs.iter_mut() {
             if job.enabled && job.next_run <= now {
                 due.push((id.clone(), job.prompt.clone(), job.recurring));
+                previous.push((id.clone(), job.clone()));
                 if !job.recurring || looks_like_delay(&job.expression_or_delay) {
                     job.enabled = false;
                     remove.push(id.clone());
-                } else if let Ok(next) = parse_next_run_after(&job.expression_or_delay, now) {
-                    // Light jitter (±3 minutes) to avoid thundering herd.
-                    let jitter = (id.as_bytes().iter().map(|b| *b as i64).sum::<i64>() % 7) - 3;
-                    job.next_run = next + Duration::minutes(jitter);
+                } else if let Ok(next) =
+                    parse_next_run_with_jitter(&job.expression_or_delay, now, id)
+                {
+                    job.next_run = next;
                 } else {
                     let jitter = (id.as_bytes().iter().map(|b| *b as i64).sum::<i64>() % 7) - 3;
                     job.next_run = now + Duration::hours(1) + Duration::minutes(jitter);
@@ -158,10 +173,14 @@ impl CronManager {
         drop(jobs);
         if !due.is_empty() {
             if let Err(e) = self.save_to_disk().await {
-                tracing::warn!("Cron persist failed: {}", e);
+                let mut jobs = self.jobs.lock().await;
+                for (id, job) in previous {
+                    jobs.insert(id, job);
+                }
+                return Err(e.context("cron dispatch rolled back: persist failed"));
             }
         }
-        due
+        Ok(due)
     }
 }
 
@@ -213,7 +232,10 @@ fn parse_next_run_after(expr: &str, after: DateTime<Utc>) -> anyhow::Result<Date
     let e = expr.trim().to_lowercase();
     if looks_like_delay(&e) {
         let token = e.strip_prefix("in ").unwrap_or(&e);
-        return Ok(after + parse_duration_token(token.trim()));
+        let duration = parse_duration_token(token.trim())?;
+        return after
+            .checked_add_signed(duration)
+            .ok_or_else(|| anyhow::anyhow!("delay `{expr}` is too large"));
     }
     // 5-field cron → prepend seconds for `cron` crate
     let schedule_src = if e.split_whitespace().count() == 5 {
@@ -230,21 +252,49 @@ fn parse_next_run_after(expr: &str, after: DateTime<Utc>) -> anyhow::Result<Date
         .ok_or_else(|| anyhow::anyhow!("cron expression `{expr}` has no future fire time"))
 }
 
-fn parse_duration_token(s: &str) -> Duration {
+fn parse_next_run_with_jitter(
+    expr: &str,
+    after: DateTime<Utc>,
+    job_id: &str,
+) -> anyhow::Result<DateTime<Utc>> {
+    let jitter_minutes = (job_id
+        .as_bytes()
+        .iter()
+        .map(|byte| *byte as i64)
+        .sum::<i64>()
+        % 7)
+        - 3;
+    let jitter = Duration::minutes(jitter_minutes);
+    let schedule_after = after
+        .checked_sub_signed(jitter)
+        .ok_or_else(|| anyhow::anyhow!("cron jitter is out of range"))?;
+    let base = parse_next_run_after(expr, schedule_after)?;
+    let next = base
+        .checked_add_signed(jitter)
+        .ok_or_else(|| anyhow::anyhow!("cron jitter is out of range"))?;
+    if next <= after {
+        anyhow::bail!("jittered cron fire time is not in the future")
+    }
+    Ok(next)
+}
+
+fn parse_duration_token(s: &str) -> anyhow::Result<Duration> {
     let s = s.trim();
-    if let Some(n) = s.strip_suffix('s') {
-        return Duration::seconds(n.trim().parse().unwrap_or(60));
+    let (number, unit) = s.split_at(s.len().saturating_sub(1));
+    let value = number.parse::<i64>().map_err(|_| {
+        anyhow::anyhow!("invalid delay `{s}`; use a positive integer plus s, m, h, or d")
+    })?;
+    if value <= 0 {
+        anyhow::bail!("delay must be greater than zero")
     }
-    if let Some(n) = s.strip_suffix('m') {
-        return Duration::minutes(n.trim().parse().unwrap_or(1));
-    }
-    if let Some(n) = s.strip_suffix('h') {
-        return Duration::hours(n.trim().parse().unwrap_or(1));
-    }
-    if let Some(n) = s.strip_suffix('d') {
-        return Duration::days(n.trim().parse().unwrap_or(1));
-    }
-    Duration::minutes(5)
+    let duration = match unit {
+        "s" => Duration::try_seconds(value),
+        "m" => Duration::try_minutes(value),
+        "h" => Duration::try_hours(value),
+        "d" => Duration::try_days(value),
+        _ => None,
+    };
+    duration.ok_or_else(|| anyhow::anyhow!("invalid or too-large delay `{s}`"))
 }
 
 /// Unified cron tool (`Cron`) — subsumes the former CronCreate / CronList /
@@ -314,10 +364,10 @@ impl CronTool {
         if id.is_empty() {
             return ToolOutput::error("Missing id");
         }
-        if self.mgr.delete(id).await {
-            ToolOutput::success(format!("Deleted cron job {}", id))
-        } else {
-            ToolOutput::error(format!("Unknown cron id {}", id))
+        match self.mgr.delete(id).await {
+            Ok(true) => ToolOutput::success(format!("Deleted cron job {}", id)),
+            Ok(false) => ToolOutput::error(format!("Unknown cron id {}", id)),
+            Err(error) => ToolOutput::error(error.to_string()),
         }
     }
 }
@@ -377,6 +427,66 @@ Subsumes the former CronCreate / CronList / CronDelete tools."
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delay_parser_rejects_invalid_non_positive_and_huge_values() {
+        let now = Utc::now();
+        for expr in ["in nonsense", "0s", "-1m", "in 999999999999999999999d"] {
+            assert!(
+                parse_next_run_after(expr, now).is_err(),
+                "unexpectedly accepted {expr}"
+            );
+        }
+        assert_eq!(
+            parse_next_run_after("in 2m", now).unwrap(),
+            now + Duration::minutes(2)
+        );
+    }
+
+    #[test]
+    fn negative_jitter_never_schedules_in_the_past() {
+        let now = "2026-01-01T00:00:30Z".parse::<DateTime<Utc>>().unwrap();
+        // Byte sum 0 mod 7 gives the maximum negative jitter (-3 minutes).
+        let id = "bbbbbbb";
+        let next = parse_next_run_with_jitter("* * * * *", now, id).unwrap();
+        assert!(
+            next > now,
+            "jittered next run was not in the future: {next}"
+        );
+        assert_eq!(
+            next,
+            "2026-01-01T00:01:00Z".parse::<DateTime<Utc>>().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn create_delete_roll_back_when_persist_fails() {
+        let dir = std::env::temp_dir().join(format!("kkagent-cron-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cron.json");
+        let mgr = CronManager::with_persist(path.clone()).await;
+        mgr.create("in 5m".into(), "seed".into(), false)
+            .await
+            .unwrap();
+        // Make the persistence target unwritable: replace the file with a
+        // directory so the atomic rename always fails.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir_all(&path).unwrap();
+
+        assert!(mgr
+            .create("in 5m".into(), "should roll back".into(), false)
+            .await
+            .is_err());
+        assert_eq!(mgr.list().await.len(), 1);
+
+        let job_id = mgr.list().await[0].id.clone();
+        assert!(mgr.delete(&job_id).await.is_err());
+        assert_eq!(mgr.list().await.len(), 1);
+
+        std::fs::remove_dir_all(&path).unwrap();
+        drop(mgr);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[tokio::test]
     async fn persist_roundtrip() {
