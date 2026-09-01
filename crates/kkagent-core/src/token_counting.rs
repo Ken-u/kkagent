@@ -111,6 +111,43 @@ impl TokenCounter {
             + 32
     }
 
+    /// Strategy-aware request size for compaction decisions.
+    ///
+    /// [`Self::request_size`] is a pure chars/4 heuristic. That undercounts
+    /// CJK-heavy conversations by ~3-4x (Chinese is ~1-1.5 chars per token),
+    /// so auto-compaction keyed on it never reaches the trigger ratio even
+    /// when the provider-measured usage (what the TUI footer shows) is far
+    /// past it. This method folds the last measured request size into the
+    /// estimate according to the configured strategy, so `measured+estimated`
+    /// (the default) and `measured` strategies compact on the same numbers
+    /// the user sees.
+    pub fn request_size_for_compaction(
+        &self,
+        system: &str,
+        tools: &[ToolDef],
+        messages: &[ChatMessage],
+    ) -> u64 {
+        let estimate = self.request_size(system, tools, messages);
+        match self.strategy {
+            TokenCountingStrategy::Estimated => estimate,
+            // No measurement yet (fresh session): fall back to the estimate
+            // so the very first oversized turn can still compact.
+            TokenCountingStrategy::Measured if self.latest_measured == 0 => estimate,
+            TokenCountingStrategy::Measured => self.latest_measured,
+            TokenCountingStrategy::MeasuredPlusEstimated => estimate.max(self.latest_measured),
+        }
+    }
+
+    /// Clamp the stale measured anchor after history was discarded (e.g. a
+    /// compaction rewrote the transcript). The old measurement no longer
+    /// describes any request, and keeping it would make the next compaction
+    /// decision re-fire immediately on the shrunk transcript.
+    pub fn clamp_measured_to(&mut self, estimate: u64) {
+        if self.latest_measured > estimate {
+            self.latest_measured = estimate;
+        }
+    }
+
     pub fn context_size(&self, messages: &[ChatMessage]) -> ContextSize {
         let estimated = Self::estimate_messages(messages);
         let measured = self.latest_measured;
@@ -173,5 +210,48 @@ mod tests {
         let c = TokenCounter::new(TokenCountingStrategy::Estimated);
         assert!(c.needs_compaction(1000, 200, 900));
         assert!(!c.needs_compaction(1000, 200, 500));
+    }
+
+    #[test]
+    fn compaction_size_uses_measured_floor_for_measured_strategies() {
+        let msgs = vec![ChatMessage {
+            role: "user".into(),
+            content: vec![ChatContent::Text {
+                // ~3k-token estimate via chars/4; far below the measurement.
+                text: "a".repeat(12_000),
+            }],
+            tools: None,
+        }];
+        let mut c = TokenCounter::new(TokenCountingStrategy::MeasuredPlusEstimated);
+        c.record_measured(90_000, 10);
+        assert_eq!(
+            c.request_size_for_compaction("", &[], &msgs),
+            90_000,
+            "measured+estimated must not let the chars/4 heuristic hide real usage"
+        );
+        // Measured-only strategy follows the measurement, with an estimate
+        // fallback before the first response arrives.
+        let mut measured = TokenCounter::new(TokenCountingStrategy::Measured);
+        assert!(
+            measured.request_size_for_compaction("", &[], &msgs) > 0,
+            "fresh session falls back to the estimate"
+        );
+        measured.record_measured(90_000, 10);
+        assert_eq!(measured.request_size_for_compaction("", &[], &msgs), 90_000);
+        // Estimated strategy stays pure heuristic.
+        let mut est = TokenCounter::new(TokenCountingStrategy::Estimated);
+        est.record_measured(90_000, 10);
+        assert!(est.request_size_for_compaction("", &[], &msgs) < 5_000);
+    }
+
+    #[test]
+    fn clamp_measured_prevents_recompaction_after_history_drop() {
+        let mut c = TokenCounter::new(TokenCountingStrategy::MeasuredPlusEstimated);
+        c.record_measured(90_000, 10);
+        c.clamp_measured_to(20_000);
+        assert_eq!(c.latest_measured(), 20_000);
+        // Clamping never raises the anchor.
+        c.clamp_measured_to(40_000);
+        assert_eq!(c.latest_measured(), 20_000);
     }
 }

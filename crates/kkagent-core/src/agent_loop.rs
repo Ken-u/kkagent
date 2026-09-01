@@ -2671,7 +2671,7 @@ Do not mention this reminder to the user.\n</system-reminder>"
         let projected = project_owned(session.build_messages(), &ProjectOptions::default());
         let used = session
             .token_counter
-            .request_size(system, tools, &projected);
+            .request_size_for_compaction(system, tools, &projected);
 
         // Nothing new since last compact — avoid nesting summaries.
         if !force {
@@ -2717,6 +2717,10 @@ Do not mention this reminder to the user.\n</system-reminder>"
         let after = session
             .token_counter
             .request_size(system, tools, &session.build_messages());
+        // The pre-compaction measurement no longer describes any request;
+        // clamp it so the next compaction decision does not re-fire on the
+        // shrunk transcript before a fresh measurement arrives.
+        session.token_counter.clamp_measured_to(after);
         session.last_compacted_tokens = Some(after);
         tracing::info!(
             "Compacted session {}: kept_users={} summarizer_dropped={} est_tokens {}→{}",
@@ -2781,11 +2785,15 @@ Do not mention this reminder to the user.\n</system-reminder>"
         let _ = crate::context_memory::fold_vacuous(&mut session.messages);
         let projected = crate::context_memory::fold_loop_events_owned(session.build_messages());
         let mut messages = project_owned(projected, &opts);
-        let mut req = session.token_counter.request_size(system, tools, &messages);
+        let mut req = session
+            .token_counter
+            .request_size_for_compaction(system, tools, &messages);
 
         if policy.should_compact(max_context, req) {
             messages = project_strict(&session.build_messages(), &opts);
-            req = session.token_counter.request_size(system, tools, &messages);
+            req = session
+                .token_counter
+                .request_size_for_compaction(system, tools, &messages);
         }
 
         // Sync fallback if still over budget (e.g. LLM compact unavailable).
@@ -2809,6 +2817,7 @@ Do not mention this reminder to the user.\n</system-reminder>"
                 session
                     .token_counter
                     .request_size(system, tools, &session.build_messages());
+            session.token_counter.clamp_measured_to(after);
             session.last_compacted_tokens = Some(after);
             tracing::info!(
                 "Auto-compacted session {} (local digest): kept_users={} est_tokens={}->{}",
