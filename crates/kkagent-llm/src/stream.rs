@@ -593,7 +593,10 @@ async fn chat_completions_stream(
             body["thinking"] = json!({"type": "enabled"});
         }
     } else if let Some(max_tokens) = request.max_tokens {
-        body["max_tokens"] = json!(max_tokens.min(16_384));
+        // Cap at the catalog's per-model ceiling; unknown models pass the
+        // configured value through and let the server validate it.
+        let cap = crate::catalog::max_output_cap(&request.model, u64::from(u32::MAX));
+        body["max_tokens"] = json!(u64::from(max_tokens).min(cap));
     }
     if !tools.is_empty() {
         body["tools"] = json!(tools);
@@ -2165,6 +2168,43 @@ mod tests {
         assert_eq!(
             ended,
             std::collections::HashSet::from(["a".into(), "b".into()])
+        );
+    }
+
+    #[tokio::test]
+    async fn openai_max_tokens_capped_by_catalog_entry() {
+        let sse = "data: [DONE]\n";
+        let (base_url, captured) = serve_once("200 OK", "text/event-stream", sse).await;
+        let mut request = request();
+        request.model = "gpt-4.1".into();
+        request.max_tokens = Some(100_000);
+        let (tx, _rx) = mpsc::channel(8);
+        openai_stream(&Client::new(), &base_url, "token", request, tx)
+            .await
+            .unwrap();
+        let captured = captured.await.unwrap();
+        let body: serde_json::Value = serde_json::from_str(&captured.body).unwrap();
+        assert_eq!(
+            body["max_tokens"], 32_768,
+            "gpt-4.1 max_tokens must be capped at the catalog ceiling, not 16_384"
+        );
+    }
+
+    #[tokio::test]
+    async fn openai_max_tokens_unknown_model_passes_configured_value() {
+        let sse = "data: [DONE]\n";
+        let (base_url, captured) = serve_once("200 OK", "text/event-stream", sse).await;
+        let mut request = request();
+        request.max_tokens = Some(50_000);
+        let (tx, _rx) = mpsc::channel(8);
+        openai_stream(&Client::new(), &base_url, "token", request, tx)
+            .await
+            .unwrap();
+        let captured = captured.await.unwrap();
+        let body: serde_json::Value = serde_json::from_str(&captured.body).unwrap();
+        assert_eq!(
+            body["max_tokens"], 50_000,
+            "unknown model must pass the configured value through"
         );
     }
 }

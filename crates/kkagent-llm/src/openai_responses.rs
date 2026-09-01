@@ -111,7 +111,10 @@ pub async fn openai_responses_stream(
         "stream": true,
     });
     if let Some(max_tokens) = request.max_tokens {
-        body["max_output_tokens"] = json!(max_tokens.min(100_000));
+        // Cap at the catalog's per-model ceiling (gpt-5.6 allows 128k);
+        // unknown models keep the 100k OpenAI default as safety net.
+        let cap = crate::catalog::max_output_cap(&request.model, 100_000);
+        body["max_output_tokens"] = json!(u64::from(max_tokens).min(cap));
     }
     if let Some(sys) = &request.system {
         body["instructions"] = json!(sys);
@@ -453,6 +456,52 @@ mod tests {
         format!("http://{address}")
     }
 
+    // Captures the full request body and returns it once the client finishes.
+    async fn serve_capturing(
+        body: &'static str,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured_server = std::sync::Arc::clone(&captured);
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            loop {
+                let mut bytes = [0_u8; 4096];
+                let count = socket.read(&mut bytes).await.unwrap();
+                if count == 0 {
+                    break;
+                }
+                request.extend_from_slice(&bytes[..count]);
+                if let Some(end) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&request[..end]).to_string();
+                    let length: usize = head
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())?
+                        })
+                        .unwrap_or(0);
+                    if request.len() >= end + 4 + length {
+                        break;
+                    }
+                }
+            }
+            captured_server
+                .lock()
+                .unwrap()
+                .push(String::from_utf8_lossy(&request).to_string());
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+        (format!("http://{address}"), captured)
+    }
+
     #[tokio::test]
     async fn accepts_data_lines_without_space_after_colon() {
         let sse = concat!(
@@ -601,52 +650,6 @@ mod tests {
 
     #[tokio::test]
     async fn explicit_effort_is_forwarded_verbatim() {
-        // Captures the request body and returns it once the client finishes.
-        async fn serve_capturing(
-            body: &'static str,
-        ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let address = listener.local_addr().unwrap();
-            let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-            let captured_server = std::sync::Arc::clone(&captured);
-            tokio::spawn(async move {
-                let (mut socket, _) = listener.accept().await.unwrap();
-                let mut request = Vec::new();
-                loop {
-                    let mut bytes = [0_u8; 4096];
-                    let count = socket.read(&mut bytes).await.unwrap();
-                    if count == 0 {
-                        break;
-                    }
-                    request.extend_from_slice(&bytes[..count]);
-                    if let Some(end) = request.windows(4).position(|part| part == b"\r\n\r\n") {
-                        let head = String::from_utf8_lossy(&request[..end]).to_string();
-                        let length: usize = head
-                            .lines()
-                            .find_map(|line| {
-                                let (name, value) = line.split_once(':')?;
-                                name.eq_ignore_ascii_case("content-length")
-                                    .then(|| value.trim().parse::<usize>().ok())?
-                            })
-                            .unwrap_or(0);
-                        if request.len() >= end + 4 + length {
-                            break;
-                        }
-                    }
-                }
-                captured_server
-                    .lock()
-                    .unwrap()
-                    .push(String::from_utf8_lossy(&request).to_string());
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                socket.write_all(response.as_bytes()).await.unwrap();
-            });
-            (format!("http://{address}"), captured)
-        }
-
         let sse = concat!(
             "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n",
             "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":4,\"output_tokens\":2}}}\n"
@@ -667,6 +670,49 @@ mod tests {
         assert!(
             body.contains("\"reasoning\":{\"effort\":\"xhigh\"}"),
             "explicit effort must be forwarded verbatim, got: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn max_output_tokens_capped_by_catalog_entry() {
+        let sse = concat!(
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":4,\"output_tokens\":2}}}\n"
+        );
+        let (base_url, captured) = serve_capturing(sse).await;
+        let mut request = request();
+        request.model = "gpt-5.6".into();
+        request.max_tokens = Some(200_000);
+        let (tx, _rx) = mpsc::channel(8);
+        openai_responses_stream(&Client::new(), &base_url, "token", request, tx)
+            .await
+            .unwrap();
+        let requests = captured.lock().unwrap();
+        let body = requests.last().unwrap();
+        assert!(
+            body.contains("\"max_output_tokens\":128000"),
+            "gpt-5.6 max_output_tokens must be capped at the catalog ceiling (128k), got: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn max_output_tokens_unknown_model_keeps_default_cap() {
+        let sse = concat!(
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":4,\"output_tokens\":2}}}\n"
+        );
+        let (base_url, captured) = serve_capturing(sse).await;
+        let mut request = request();
+        request.max_tokens = Some(200_000);
+        let (tx, _rx) = mpsc::channel(8);
+        openai_responses_stream(&Client::new(), &base_url, "token", request, tx)
+            .await
+            .unwrap();
+        let requests = captured.lock().unwrap();
+        let body = requests.last().unwrap();
+        assert!(
+            body.contains("\"max_output_tokens\":100000"),
+            "unknown model must keep the 100k default cap, got: {body}"
         );
     }
 }

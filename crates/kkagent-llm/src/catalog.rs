@@ -121,6 +121,15 @@ pub fn prefers_responses_api(model: &str) -> bool {
     })
 }
 
+/// Ceiling for request-level max output tokens: the catalog's per-model
+/// `max_output` when the model is known, otherwise `unknown_model_cap`
+/// (callers pick a sensible default or pass the configured value through).
+pub fn max_output_cap(model: &str, unknown_model_cap: u64) -> u64 {
+    lookup(model)
+        .map(|e| e.max_output)
+        .unwrap_or(unknown_model_cap)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -129,5 +138,12 @@ mod tests {
     fn finds_o4() {
         assert!(prefers_responses_api("o4-mini"));
         assert!(lookup("gpt-4.1").unwrap().tools);
+    }
+
+    #[test]
+    fn max_output_cap_uses_catalog_then_fallback() {
+        assert_eq!(max_output_cap("gpt-5.6", 100_000), 128_000);
+        assert_eq!(max_output_cap("gpt-4.1", 16_384), 32_768);
+        assert_eq!(max_output_cap("totally-unknown-model", 16_384), 16_384);
     }
 }
