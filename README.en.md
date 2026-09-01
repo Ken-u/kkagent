@@ -42,6 +42,7 @@ Differentiation focuses on background running, session navigation, and terminal 
 | Session background detach | `Ctrl+B` | Quit the TUI without interrupting the session: the server and in-flight turns keep running, and the next `kk` automatically resumes. |
 | Session tabs | empty input `Tab` / `←` / `→`; `Ctrl+Shift+Tab` | Cycle across the session family created by `/new` and `/fork` (real resume), with a persistent session strip at the bottom. |
 | BTW full-screen side-question workspace | `/btw` · `Ctrl+G` | Fork a side question from a snapshot of the current session in a full-screen workspace; the main conversation stays untouched, and `Ctrl+G` toggles back anytime. |
+| Goal mode | `/goal <objective>` · `/goal status/pause/resume/cancel` | Give the agent an objective it pushes across turns: a persistent footer goal indicator, mid-turn goal injection into a running turn, and an optional independent judge agent that reviews completion claims — rejections feed the gaps back so work continues instead of stopping short. |
 | Docked todo panel | automatic | The todo list stays docked above the input and folds to fit the terminal width. |
 | Transcript search | `Ctrl+F` | Full-text search across the entire transcript to locate past conclusions quickly. |
 | Emacs-style line editing | `Ctrl+K` / `Ctrl+W` / `Ctrl+Y` / `Ctrl+Z` / `Ctrl+Shift+Z` | Kill line / kill word / yank / undo / redo. |
@@ -50,7 +51,7 @@ Differentiation focuses on background running, session navigation, and terminal 
 | Non-interactive orchestration | `--max-turns` · `--input-format` | Cap the number of turns per task (exit code 3 when exceeded); drive the agent via stream-json input. |
 | Shell completions | `kkagent completions` | Generate completion scripts for bash / zsh / fish / PowerShell. |
 
-On top of that, kkagent also ships: system-level Bash sandboxing (Linux Bubblewrap / macOS Seatbelt / Windows Job Object), standalone server lifecycle management (`kkagent server stop` / `server status`), turn queueing (press `Enter` while running to queue input for the next turn), auto-folded large pastes, Emacs-style line editing, mouse wheel scrolling with click-and-drag selection copy, and `F5` forced full redraw for SSH or older terminals.
+On top of that, kkagent also ships: system-level Bash sandboxing (Linux Bubblewrap / macOS Seatbelt / Windows Job Object), standalone server lifecycle management (`kkagent server stop` / `server status`), turn queueing (press `Enter` while running to queue input for the next turn), auto-folded large pastes, Emacs-style line editing, mouse wheel scrolling with drag selection copy (double/triple-click word/line selection), and `F5` forced full redraw for SSH or older terminals.
 
 ### Use cases
 
@@ -176,19 +177,22 @@ See [docs/cli-and-tui.md](docs/cli-and-tui.md) for more.
 - **Reliable recovery**: sessions, events, turn queues, background tasks, and checkpoints are persisted to `~/.kkagent/transcripts.db`, supporting `--resume`, reconnects, and cross-restart recovery.
 - **Multi-session workflows**: session tabs, `/new`, `/fork`, BTW side questions, a docked todo panel, and transcript search for long-running tasks.
 - **Automation and integrations**: headless / CI structured I/O, Web UI, ACP, plus local and SSH remote execution environments.
-- **Extensible tool system**: built-in file, search, shell, task, plan, web, and media tools, with MCP, Skills, Hooks, and plugin marketplaces.
+- **Extensible tool system**: built-in file, search, shell, task, plan, web, and media tools, with MCP, Skills, Hooks, and plugin marketplaces; plugins can also declare custom subagent types with dedicated model bindings.
 - **Observability**: structured logging, HTTP audit logs, and configurable telemetry events.
 
 <details>
 <summary><strong>Runtime & engineering details</strong></summary>
 
 - **Background & multi-session**: workspace session registry with cross-directory resume; subagent session tabs; AgentSwarm parallel subagents (timeout / rate-limit recovery, backgroundable); reconnect restores BTW, prompt queues, approvals, and live streams.
+- **Goal runtime**: a goal state machine (active/paused/blocked/complete) with turns/tokens/wall-clock budgets and automatic turn-boundary continuation; an optional completion-judge agent (`[goal] judge_enabled`) — an independent model marks approve/reject via a `GoalJudge` toolcall, repeated rejections block the goal, and judge failures fail open; judge records are viewable by clicking the footer goal indicator.
+- **Plugins & subagents**: multi-source plugin marketplaces (GitHub / GitBucket-compatible forges, `tree/<ref>/<dir>` subdirectory sources); plugins can declare custom subagent types (ACP external + internal, with a cached profile registry) and dedicated model bindings; `kkagent doctor` ships fail-fast / hygiene checks.
 - **Web UI**: dark theme, Markdown rendering, mobile sidebar, model picker, per-turn Timeline diffs, plan review, and plugin panels; hot-attach to a running server via `--http`.
 - **Tool system**: progressive tool disclosure, deferred MCP schema advertisement, BM25 fuzzy suggestions for unknown tools; stream-event coalescing and transcript layout caching for very large workspaces; a unified background-task panel (`/tasks` + `/ps`).
 - **LLM engineering**: Anthropic / DeepSeek prompt caching with cache-hit stats; `compaction_model`, per-model thinking effort, `api_key_env`, configurable retry backoff, streaming first-token timeout gating, and cross-chunk UTF-8 reassembly.
 - **Security & sandboxing**: S0–S2 privacy path policies; declarative toolchain sandbox profiles; Once / Turn / Session / Workspace grant scopes; `shell -c` bypass detection, always-approvals persistence, credential-directory deny, and security audit trails.
 - **Runtime reliability**: disk-persisted turn checkpoints; undo across restarts and compaction; per-message transcript persistence with orphaned tool-use repair; oversized tool results spilled to disk with trash archiving; automatic retry of malformed tool calls.
 - **Context & isolation**: budget-safe payload projection, `/compact` auto-compaction, `/context` per-section token breakdown; a dependency-free bash AST tokenizer/parser; subagents in dedicated git worktrees with cross-session write-conflict warnings and test-command isolation.
+- **Terminal experience details**: clipboard image pastes fold into compact `[Pasted Image #n]` markers; completion notifications (OSC 9) carry the sanitized prompt; experimental `mouse_mode = "off"` for SSH clients that mishandle mouse reporting.
 
 </details>
 
@@ -222,12 +226,12 @@ The workspace contains 16 crates:
 | File I/O | `Read` / `Write` / `Edit` / `Glob` | Read, write, line-level edit, batch file discovery. |
 | Search | `Grep` | Regex search with context and multi-file filtering. |
 | Execution | `Bash` | Sandboxed command execution with permission policies and background shells. |
-| Task management | `TodoList` / `Goal` / `Task` | TODO tracking, multi-turn goals, background sub-Agent tasks. |
+| Task management | `TodoList` / `Goal` / `Agent` / `TaskOutput` | TODO tracking, multi-turn goals (optional completion judge), subagent delegation, and background task management. |
 | Interaction | `AskUserQuestion` / `SelectTools` | User confirmation and tool selection. |
 | Context | `Skill` | Load and execute skill templates. |
 | Planning | `Plan` | Tools related to plan mode. |
-| Scheduling | `CronCreate` / `CronDelete` / `CronList` | Schedule prompts for future execution. |
-| Web / Media | `Web` / `Media` | Web fetching and media file reading. |
+| Scheduling | `Cron` (action=create/list/delete) | Schedule prompts for future execution. |
+| Web / Media | `Web` (action=search/fetch) / `ReadMediaFile` | Web search & fetch, media file reading. |
 
 Tool declarations and permission policies are managed centrally by `kkagent-tools`; new tools automatically enter the permission evaluation flow.
 

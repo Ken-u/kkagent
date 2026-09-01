@@ -42,6 +42,7 @@ kkagent 是一个用 Rust 实现的终端 Coding Agent，重点增强长任务�
 | 会话后台 detach | `Ctrl+B` | 退出 TUI 而不中断整个会话；后台 turn 继续运行，再次执行 `kk` 自动恢复。 |
 | 会话标签页 | 空输入时 `Tab` / `←` / `→` · `Ctrl+Shift+Tab` | 在 `/new`、`/fork` 派生的会话族之间快速切换，底部常驻会话条。 |
 | BTW 全屏侧问 | `/btw` · `Ctrl+G` | 从当前会话快照独立提问，不污染或阻塞主对话。 |
+| Goal 目标模式 | `/goal <objective>` · `/goal status/pause/resume/cancel` | 给 Agent 一个可跨多轮持续推进的目标：footer 常驻 goal 指示器，运行中的 turn 也能即时注入新目标；可选开启独立裁判 agent 审查"完成"申报，未达标时带着缺口继续推进，防止草率收工。 |
 | Todo 贴底面板 | 自动 | 任务状态常驻输入框上方，并按终端宽度自动折叠。 |
 | 会话记录搜索 | `Ctrl+F` | 对整个 transcript 全文搜索，快速定位历史结论。 |
 | Emacs 风格行编辑 | `Ctrl+K` / `Ctrl+W` / `Ctrl+Y` / `Ctrl+Z` / `Ctrl+Shift+Z` | kill line / kill word / yank / undo / redo。 |
@@ -50,7 +51,7 @@ kkagent 是一个用 Rust 实现的终端 Coding Agent，重点增强长任务�
 | 非交互编排 | `--max-turns` · `--input-format` | 限制任务轮数，并用 stream-json 驱动 Agent。 |
 | Shell 补全 | `kkagent completions` | 生成 bash / zsh / fish / PowerShell 补全脚本。 |
 
-此外还支持独立 Server 生命周期管理、运行中输入排队、大段粘贴自动折叠，以及鼠标滚动与拖拽复制。
+此外还支持独立 Server 生命周期管理、运行中输入排队、大段粘贴自动折叠，以及鼠标滚动、拖拽选择复制（含双击/三击按词/按行选取）。
 
 ### 适合这些场景
 
@@ -176,19 +177,22 @@ kk -y -p "Read ./Cargo.toml and count workspace members"
 - **可靠恢复**：会话、事件、turn 队列、后台任务与检查点持久化到 `~/.kkagent/transcripts.db`，支持 `--resume`、断线重连与跨重启恢复。
 - **多会话协作**：会话标签、`/new`、`/fork`、BTW 侧问、Todo 面板和 transcript 搜索共同服务长任务工作流。
 - **自动化与接入**：支持 headless / CI 结构化输入输出、Web UI、ACP，以及本地和 SSH 远程执行环境。
-- **可扩展工具系统**：内置文件、搜索、Shell、任务、计划、Web 和媒体工具，并支持 MCP、Skills、Hooks 与插件市场。
+- **可扩展工具系统**：内置文件、搜索、Shell、任务、计划、Web 和媒体工具，并支持 MCP、Skills、Hooks 与插件市场；插件还可声明自定义子 Agent 类型与模型绑定。
 - **可观测性**：结构化日志、HTTP 审计日志和可配置 telemetry 事件。
 
 <details>
 <summary><strong>运行时与工程实现细节</strong></summary>
 
 - **后台与多会话**：workspace session registry 与跨目录会话恢复；子 Agent 会话页签；AgentSwarm 并行子代理（超时 / 限流恢复、可后台化）；断线重连后恢复 BTW、prompt 队列、审批与 live stream。
+- **Goal 目标运行时**：目标状态机（active/paused/blocked/complete）与 turns/tokens/wall-clock 三维预算；turn 边界自动续跑；可选完成判定裁判 agent（`[goal] judge_enabled`）——独立模型通过 `GoalJudge` toolcall 标记 approve/reject，拒绝达到上限转 blocked，裁判故障自动 fail-open；裁决记录可在 TUI 点击 footer goal 指示器查看。
+- **插件与子 Agent**：插件市场多源安装（GitHub / GitBucket 兼容 forge、`tree/<ref>/<dir>` 子目录源）；插件可声明自定义子 Agent 类型（ACP 外部 + 内部，带缓存 profile registry）与专属模型绑定；`kkagent doctor` 提供 fail-fast / 卫生检查。
 - **Web UI**：深色主题、Markdown 渲染、移动端侧栏、model picker、Timeline 逐轮 diff、plan review 与插件面板；支持通过 `--http` 热挂到已运行的 Server。
 - **工具系统**：渐进式工具披露、MCP schema 延迟通告、未知工具 BM25 模糊建议；针对超大 workspace 的流事件合并和 transcript 布局缓存；统一后台任务面板（`/tasks` + `/ps`）。
 - **LLM 工程**：Anthropic / DeepSeek prompt caching 与缓存命中率统计；`compaction_model`、per-model thinking effort、`api_key_env`、可配置重试退避、流式首 token 超时门控与跨 chunk UTF-8 重组。
 - **安全与沙箱**：S0–S2 隐私路径策略；声明式 toolchain sandbox profile；Once / Turn / Session / Workspace 授权范围；`shell -c` 绕过检测、always-approvals 持久化、凭据目录 deny 与安全审计轨迹。
 - **运行时可靠性**：磁盘持久化 turn 检查点；undo 跨重启与压缩存活；逐消息 transcript 持久化与孤儿 tool-use 修复；超大工具结果落盘和 trash 归档；malformed tool call 自动重试。
 - **上下文与隔离**：预算安全的 payload projector、`/compact` 自动压缩、`/context` 分项 token 透视；无原生依赖的 bash AST tokenizer/parser；子 Agent 独立 git worktree、跨会话写冲突告警与测试命令隔离。
+- **终端体验细节**：剪贴板图片粘贴折叠为 `[Pasted Image #n]` 标记；完成通知（OSC 9）附带净化后的 prompt；实验性 `mouse_mode = "off"` 兼容不支持鼠标上报的 SSH 客户端。
 
 </details>
 
@@ -222,7 +226,7 @@ Workspace 包含 16 个 crate：
 | 文件读写 | `Read` / `Write` / `Edit` / `Glob` | 读取、写入、行级编辑、批量查找。 |
 | 搜索 | `Grep` | 正则搜索，支持上下文与多文件过滤。 |
 | 执行 | `Bash` | 带沙箱与权限策略的命令执行，支持后台 shell。 |
-| 任务管理 | `TodoList` / `Goal` / `Agent` / `TaskOutput` | TODO 追踪、多轮目标、子代理委派与后台任务管理。 |
+| 任务管理 | `TodoList` / `Goal` / `Agent` / `TaskOutput` | TODO 追踪、多轮目标（可选完成判定裁判）、子代理委派与后台任务管理。 |
 | 交互 | `AskUserQuestion` / `SelectTools` | 用户确认、工具选择。 |
 | 上下文 | `Skill` | 加载并执行 skill 模板。 |
 | 计划 | `Plan` | 计划模式相关工具。 |
