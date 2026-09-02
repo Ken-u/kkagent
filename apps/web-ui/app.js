@@ -1,9 +1,14 @@
 const params = new URLSearchParams(location.search);
 const base = params.get("base") || "";
 
-let token = params.get("token") || localStorage.getItem("kkagent_token") || "";
+let token = params.get("token")
+  || sessionStorage.getItem("kkagent_token")
+  || localStorage.getItem("kkagent_token")
+  || "";
 if (params.get("token")) {
-  localStorage.setItem("kkagent_token", token);
+  // URL-injected tokens live for the tab only (they may have been shared or
+  // logged); the "remember" checkbox governs device-level persistence.
+  sessionStorage.setItem("kkagent_token", token);
   params.delete("token");
   const rest = params.toString();
   history.replaceState(null, "", location.pathname + (rest ? `?${rest}` : ""));
@@ -221,6 +226,17 @@ function visibleUserText(text) {
   return stripHarness(text);
 }
 
+function skillActivatedNote(event) {
+  const name = String(event.skill_name || "").trim();
+  const args = String(event.skill_args || "").trim();
+  const trigger = String(event.trigger || "").trim();
+  const title = name ? `技能 ${name} 已激活` : "技能已激活";
+  const details = [];
+  if (args) details.push(`参数: ${args}`);
+  if (trigger && trigger !== "user-slash") details.push(`触发: ${trigger}`);
+  return details.length ? `${title}（${details.join(" · ")}）` : title;
+}
+
 function toolKind(name) {
   const lower = String(name || "").toLowerCase();
   return TOOL_KINDS[lower] || { verb: lower.replace(/_/g, " ") || "工具", arg: null };
@@ -277,15 +293,15 @@ function highlightJson(value) {
 
 function highlightCode(code) {
   const rules = [
-    { regex: /(\/\/.*)/g, color: "#8b949e" },
-    { regex: /(\/\*[\s\S]*?\*\/)/g, color: "#8b949e" },
-    { regex: /\b(function|return|const|let|var|if|else|for|while|async|await|class|import|from|export|new|try|catch|throw|true|false|null|undefined)\b/g, color: "#ff7b72" },
-    { regex: /\b(\d+)\b/g, color: "#79c0ff" },
-    { regex: /("[^"]*"|'[^']*'|`[^`]*`)/g, color: "#a5d6ff" },
+    { regex: /(\/\/.*)/g, cls: "hl-com" },
+    { regex: /(\/\*[\s\S]*?\*\/)/g, cls: "hl-com" },
+    { regex: /\b(function|return|const|let|var|if|else|for|while|async|await|class|import|from|export|new|try|catch|throw|true|false|null|undefined)\b/g, cls: "hl-kw" },
+    { regex: /\b(\d+)\b/g, cls: "hl-num" },
+    { regex: /("[^"]*"|'[^']*'|`[^`]*`)/g, cls: "hl-str" },
   ];
   let html = code;
-  for (const { regex, color } of rules) {
-    html = html.replace(regex, (match) => `<span style="color:${color}">${match}</span>`);
+  for (const { regex, cls } of rules) {
+    html = html.replace(regex, (match) => `<span class="${cls}">${match}</span>`);
   }
   return html;
 }
@@ -443,7 +459,13 @@ function copyText(text) {
 
 function flashBtn(btn, iconKey) {
   btn.innerHTML = ICONS.check;
-  setTimeout(() => (btn.innerHTML = ICONS[iconKey]), 1500);
+  // Guard the restore timer so rapid re-clicks cannot have an earlier
+  // timeout swap the check icon back mid-flash.
+  if (btn.dataset.flashTimer) clearTimeout(Number(btn.dataset.flashTimer));
+  btn.dataset.flashTimer = String(setTimeout(() => {
+    delete btn.dataset.flashTimer;
+    btn.innerHTML = ICONS[iconKey];
+  }, 1500));
 }
 
 function renderToolCall(tool) {
@@ -1100,10 +1122,28 @@ function ensurePanel(id, title) {
     el.id = id;
     el.className = "side-panel";
     el.innerHTML = `<header class="side-panel-header">${escapeHtml(title)}<button type="button" class="side-panel-close" aria-label="关闭">×</button></header><div class="side-panel-body"></div>`;
-    el.querySelector(".side-panel-close").onclick = () => { el.classList.remove("open"); };
+    el.querySelector(".side-panel-close").onclick = () => {
+      el.dataset.dismissed = "1";
+      el.classList.remove("open");
+    };
     document.getElementById("log")?.parentElement?.appendChild(el);
   }
   return el;
+}
+
+function openPanel(el) {
+  delete el.dataset.dismissed;
+  el.classList.add("open");
+}
+
+// Re-render a panel's content without force-reopening it after the user
+// dismissed it (background events must not fight the user over visibility).
+function refreshPanel(el, render) {
+  const wasOpen = el.classList.contains("open");
+  const dismissed = el.dataset.dismissed === "1";
+  render();
+  if (dismissed && !wasOpen) el.classList.remove("open");
+  else el.classList.add("open");
 }
 
 function ensureTodoPopover() {
@@ -1164,8 +1204,9 @@ function renderPlanPanel(plan) {
   if (!plan || (!plan.content && !plan.path)) return;
   const el = ensurePanel("planPanel", "当前计划");
   const body = el.querySelector(".side-panel-body");
-  body.innerHTML = `${plan.path ? `<div class="plan-path">${escapeHtml(plan.path)}</div>` : ""}<div class="plan-content">${markdownToHtml(plan.content || "")}</div>`;
-  el.classList.add("open");
+  refreshPanel(el, () => {
+    body.innerHTML = `${plan.path ? `<div class="plan-path">${escapeHtml(plan.path)}</div>` : ""}<div class="plan-content">${markdownToHtml(plan.content || "")}</div>`;
+  });
 }
 
 function renderSubagents(view) {
@@ -1177,11 +1218,17 @@ function renderSubagents(view) {
     .map((a) => {
       const dot = a.status === "done" ? "●" : a.status === "failed" ? "✕" : "◐";
       const cls = a.status === "failed" ? "sub-failed" : a.status === "done" ? "sub-done" : "sub-running";
-      return `<li class="${cls}"><span>${dot}</span><div><div class="sub-desc">${escapeHtml(a.description || a.id)}</div>${a.detail ? `<div class="sub-detail">${escapeHtml(a.detail.slice(-200))}</div>` : ""}</div></li>`;
+      // Full output stays available behind a collapsible (the raw detail was
+      // previously truncated to 200 chars with no way to see the rest).
+      const detailHtml = a.detail
+        ? `<details class="sub-detail-wrap"><summary class="sub-detail-summary">输出详情</summary><pre class="sub-detail">${escapeHtml(a.detail)}</pre></details>`
+        : "";
+      return `<li class="${cls}"><span>${dot}</span><div><div class="sub-desc">${escapeHtml(a.description || a.id)}</div>${detailHtml}</div></li>`;
     })
     .join("");
-  body.innerHTML = `<ul class="subagent-list">${rows}</ul>`;
-  el.classList.add("open");
+  refreshPanel(el, () => {
+    body.innerHTML = `<ul class="subagent-list">${rows}</ul>`;
+  });
 }
 
 function cloneLive(live) {
@@ -1530,8 +1577,16 @@ function applyEventToView(sessionId, event) {
     return;
   }
   if (type === "skill_activated") {
-    view.systemNotes = view.systemNotes || [];
-    view.systemNotes.push(`技能 ${event.skill_name || ""} 已激活`);
+    // Feedback for `<kimi-skill-loaded>` injections: the transcript strips the
+    // block, so surface the activation as a local system note instead.
+    appendSessionMessage(
+      sessionId,
+      "system",
+      skillActivatedNote(event),
+      new Date().toISOString(),
+      [],
+      { localOnly: true },
+    );
     return;
   }
   if (type === "mcp_auth_required") {
@@ -1553,7 +1608,9 @@ function applyEventToView(sessionId, event) {
   }
   if (type === "subagent_spawned" || type === "subagent_started") {
     view.subagents = view.subagents || new Map();
-    const key = event.subagent_id || event.agent_id || event.id || String(view.subagents.size);
+    // Monotonic fallback key: `size` can collide after removals.
+    view.subagentSeq = (view.subagentSeq || view.subagents.size) + 1;
+    const key = event.subagent_id || event.agent_id || event.id || `agent-${view.subagentSeq}`;
     view.subagents.set(key, {
       id: key,
       description: event.description || event.subagent_name || "",
@@ -1566,38 +1623,52 @@ function applyEventToView(sessionId, event) {
   if (type === "subagent_child_event") {
     view.subagents = view.subagents || new Map();
     const key = event.subagent_id || event.agent_id || event.id;
-    if (!key) return;
-    const entry = view.subagents.get(key) || { id: key, description: "", status: "running", detail: "" };
+    // Single-agent sessions may omit the id entirely: fold child events into
+    // the lone running entry (or create one) instead of dropping them —
+    // otherwise the row would stay "running" forever.
+    const resolvedKey = key || (view.subagents.size === 1 ? [...view.subagents.keys()][0] : `agent-unknown-${view.subagents.size}`);
+    const entry = view.subagents.get(resolvedKey) || { id: resolvedKey, description: event.subagent_name || "", status: "running", detail: "" };
     const child = event.event || {};
     if (child.type === "message_delta" && child.text) {
-      entry.detail = (entry.detail + child.text).slice(-500);
+      // Keep the full stream (capped at 8k to bound memory) — the panel
+      // collapses long output behind a details toggle.
+      entry.detail = (entry.detail + child.text).slice(-8000);
     } else if (child.type === "status_update" && child.status) {
       entry.detail = child.status;
     }
-    view.subagents.set(key, entry);
+    view.subagents.set(resolvedKey, entry);
     if (sessionId === state.sessionId) renderSubagents(view);
     return;
   }
   if (type === "subagent_completed" || type === "subagent_failed") {
     view.subagents = view.subagents || new Map();
     const key = event.subagent_id || event.agent_id || event.id;
-    if (key) {
-      const entry = view.subagents.get(key) || { id: key, description: "", status: "running", detail: "" };
+    // Same fallback as child events so completion can never strand a row.
+    const resolvedKey = key || (view.subagents.size === 1 ? [...view.subagents.keys()][0] : null);
+    if (resolvedKey) {
+      const entry = view.subagents.get(resolvedKey) || { id: resolvedKey, description: "", status: "running", detail: "" };
       entry.status = type === "subagent_completed" ? "done" : "failed";
       entry.detail = type === "subagent_failed" ? event.error || "failed" : entry.detail;
-      view.subagents.set(key, entry);
+      view.subagents.set(resolvedKey, entry);
       if (sessionId === state.sessionId) renderSubagents(view);
     }
     return;
   }
   if (type === "steer_input") {
-    view.steerNotes = view.steerNotes || [];
-    view.steerNotes.push(event.text || "");
+    // The transcript may not contain steer text (it is injected mid-turn), so
+    // acknowledge it as a local system note like the composer does on submit.
+    const text = String(event.text || "").trim();
+    if (text) {
+      appendSessionMessage(sessionId, "system", `已收到引导输入：${text}`, new Date().toISOString(), [], { localOnly: true });
+    }
     return;
   }
   if (type === "llm_retry") {
-    view.retryNotes = view.retryNotes || [];
-    view.retryNotes.push(`第 ${event.retry_number || "?"} 次重试${event.reason ? `：${event.reason}` : ""}`);
+    // Transient visibility for provider retries (mirrors btw_retry): without
+    // this a retrying turn looks frozen to the user.
+    if (sessionId === state.sessionId) {
+      showNotice(`模型请求重试（第 ${event.retry_number || "?"} 次）${event.reason ? `：${event.reason}` : ""}`, [{ label: "知道了", onclick: () => hideNotice() }]);
+    }
     return;
   }
   if (type === "btw_retry") {
@@ -2025,7 +2096,17 @@ function renderModelSelect() {
   modelSelect.innerHTML = names.length
     ? names.map((name) => `<option value="${escapeHtml(name)}">${escapeHtml(name)}</option>`).join("")
     : '<option value="">模型</option>';
-  modelSelect.value = state.model || current || names[0] || "";
+  // If the active model is missing from the catalog (e.g. it was renamed or
+  // filtered out), keep showing it rather than an empty select — but tell the
+  // user it is no longer offered.
+  const desired = state.model || current || names[0] || "";
+  if (desired && !names.includes(desired)) {
+    const opt = document.createElement("option");
+    opt.value = desired;
+    opt.textContent = `${desired}（不在模型列表中）`;
+    modelSelect.appendChild(opt);
+  }
+  modelSelect.value = desired;
 }
 
 async function loadModels() {
@@ -2110,7 +2191,10 @@ function showTokenPrompt(message) {
     const value = input.value.trim();
     if (!value) return;
     token = value;
-    localStorage.setItem("kkagent_token", token);
+    sessionStorage.setItem("kkagent_token", token);
+    const remember = document.getElementById("tokenRemember");
+    if (remember && remember.checked) localStorage.setItem("kkagent_token", token);
+    else localStorage.removeItem("kkagent_token");
     document.getElementById("tokenGate").style.display = "none";
     boot();
   };
@@ -2690,9 +2774,16 @@ document.getElementById("searchBox").oninput = (e) => {
     try {
       const body = await api(`/api/v1/search?q=${encodeURIComponent(q)}`);
       sessionsEl.innerHTML = "";
-      for (const hit of body.hits || []) {
+      const hits = body.hits || [];
+      if (!hits.length) {
+        const empty = document.createElement("div");
+        empty.className = "session";
+        empty.innerHTML = '<div class="session-meta">无匹配结果。</div>';
+        sessionsEl.appendChild(empty);
+      }
+      for (const hit of hits) {
         const div = document.createElement("div");
-        div.className = "session";
+        div.className = "session" + (hit.session_id === state.sessionId ? " active" : "");
         div.innerHTML = `
           <div class="session-title">${escapeHtml(hit.title || hit.session_id?.slice(0, 8) || "?")}</div>
           <div class="session-meta">${escapeHtml(hit.preview || "")}</div>
@@ -3433,6 +3524,27 @@ if (todoBtn) {
     el.classList.add("open");
   };
 }
+const subagentsBtn = document.getElementById("subagentsBtn");
+if (subagentsBtn) {
+  subagentsBtn.onclick = () => {
+    const el = ensurePanel("subagentPanel", "子代理");
+    if (el.classList.contains("open")) {
+      el.dataset.dismissed = "1";
+      el.classList.remove("open");
+      return;
+    }
+    // Reopen re-renders the current session's agents; without subagents the
+    // panel shows an explicit empty state instead of stale DOM.
+    const view = state.sessionId ? viewOf(state.sessionId) : null;
+    if (view && view.subagents && view.subagents.size) {
+      renderSubagents(view);
+      openPanel(el);
+    } else {
+      el.querySelector(".side-panel-body").innerHTML = '<div class="plugin-empty">当前会话暂无子代理。</div>';
+      openPanel(el);
+    }
+  };
+}
 // Stop is handled by the send button morphing into a stop button while
 // running (see setRunning / composer submit handler).
 
@@ -3488,6 +3600,7 @@ async function boot() {
     else showWelcome();
   } catch (err) {
     if (err.unauthorized) {
+      sessionStorage.removeItem("kkagent_token");
       localStorage.removeItem("kkagent_token");
       showTokenPrompt("token 无效或已过期，请重新输入");
       return;

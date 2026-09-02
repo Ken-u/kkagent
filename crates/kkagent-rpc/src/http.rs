@@ -1920,7 +1920,16 @@ async fn post_message(
             if let (Some(store), Some(task_id)) = (&state.persistence, task_id.as_deref()) {
                 let _ = store.finish_turn(task_id, "failed", Some(&error));
             }
-            Err(StatusCode::NOT_FOUND)
+            // Distinguish "unknown session" from "known session but busy":
+            // conflating both into 404 made mid-turn submissions look like the
+            // session had vanished.
+            if error.contains("not found") {
+                Err(StatusCode::NOT_FOUND)
+            } else if error.contains("busy with another turn") {
+                Err(StatusCode::CONFLICT)
+            } else {
+                Err(StatusCode::BAD_REQUEST)
+            }
         }
     }
 }

@@ -3261,6 +3261,55 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
             return Err("message text must not be empty".into());
         }
         ensure_session_loaded(&self.state, id).await?;
+        // While a turn is running, deliver the input as a steer (mirrors the
+        // native `session.steer` path and the WebUI's expectation that sending
+        // mid-turn steers the agent). Previously this failed with
+        // "busy with another turn", which the HTTP layer surfaced as a
+        // misleading 404 and the message was lost.
+        if task_id.is_none() && self.state.turn_locks.is_busy(id).await {
+            let steer_images = images
+                .iter()
+                .map(|image| (image.media_type.clone(), image.data.clone()))
+                .collect();
+            let mailbox = {
+                let mailboxes = self.state.steer_mailboxes.lock().await;
+                mailboxes
+                    .get(id)
+                    .cloned()
+                    .ok_or_else(|| format!("session not found: {id}"))?
+            };
+            if push_steer_tolerating_turn_start(
+                &mailbox,
+                &self.state.turn_locks,
+                id,
+                SteerInput {
+                    text: text.to_string(),
+                    images: steer_images,
+                },
+                TURN_PERMIT_GRACE,
+            )
+            .await
+            .is_ok()
+            {
+                self.state.publish_rpc_event(Frame::Event {
+                    event: "agent".into(),
+                    scope: None,
+                    data: serde_json::to_value(AgentEvent::SteerInput {
+                        session_id: id.to_string(),
+                        text: text.to_string(),
+                        idempotency_key: None,
+                    })
+                    .unwrap_or_default(),
+                });
+                return Ok(serde_json::json!({
+                    "ok": true,
+                    "steered": true,
+                    "session_id": id,
+                }));
+            }
+            // Idle again (the turn finished while we raced admission):
+            // fall through and start a fresh turn below.
+        }
         // An interrupt completes asynchronously. Match the native RPC prompt
         // path and briefly wait for the cancelled turn to release ownership,
         // instead of rejecting a prompt submitted immediately after Stop.
@@ -6526,17 +6575,62 @@ async fn spawn_session_agent_turn(
             return;
         }
 
-        if let Err(e) = agent_loop.run_turn(&mut session).await {
-            tracing::error!("Agent loop error: {}", e);
-            let _ = agent_event_tx
-                .send(AgentEvent::Error {
-                    session_id: sid.clone(),
-                    message: e.to_string(),
+        let mut run_turn_count = 0usize;
+        loop {
+            if let Err(e) = agent_loop.run_turn(&mut session).await {
+                tracing::error!("Agent loop error: {}", e);
+                let _ = agent_event_tx
+                    .send(AgentEvent::Error {
+                        session_id: sid.clone(),
+                        message: e.to_string(),
+                    })
+                    .await;
+            }
+            run_turn_count += 1;
+            // Steers that arrived while the turn was finishing must stay part
+            // of this turn — a steer is injected after tool execution, never
+            // silently demoted to a new turn. Two teardown races are covered:
+            //   1. The steer already landed in the mailbox → drain + rerun.
+            //   2. The steer is in flight (mailbox closed, permit still held):
+            //      its rejected push knocked; reopen admission, let the client
+            //      retry loop land it, then drain + rerun. Turns without a
+            //      knock finish immediately — no teardown delay.
+            // A hard cap guards against pathological client spam.
+            let mut steers_applied = session
+                .close_and_apply_steers()
+                .map_err(|error| {
+                    tracing::error!("Failed to preserve pending steer input: {error}");
                 })
-                .await;
-        }
-        if let Err(error) = session.close_and_apply_steers() {
-            tracing::error!("Failed to preserve pending steer input: {error}");
+                .unwrap_or(0);
+            if steers_applied == 0 && run_turn_count < 32 {
+                let mailbox = state_clone.steer_mailboxes.lock().await.get(&sid).cloned();
+                if let Some(mailbox) = mailbox {
+                    if mailbox.take_knock() {
+                        // An in-flight steer was rejected while the mailbox was
+                        // closed. Reopen admission so the client's retry loop
+                        // (still running: the permit is held) lands it…
+                        mailbox.start_turn();
+                        // …and wait briefly for the push to arrive.
+                        let deadline = std::time::Instant::now() + Duration::from_millis(300);
+                        while mailbox.is_empty() && std::time::Instant::now() < deadline {
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                        steers_applied = session
+                            .close_and_apply_steers()
+                            .map_err(|error| {
+                                tracing::error!("Failed to preserve pending steer input: {error}");
+                            })
+                            .unwrap_or(0);
+                    }
+                }
+            }
+            if steers_applied > 0 && run_turn_count < 32 {
+                tracing::info!(
+                    "Continuing turn for {steers_applied} steer(s) that arrived during teardown"
+                );
+                continue;
+            }
+            break;
         }
 
         {

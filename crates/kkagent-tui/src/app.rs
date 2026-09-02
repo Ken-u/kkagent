@@ -2371,8 +2371,15 @@ impl TuiApp {
                                 self.jobs.mark_done(channel, generation);
                                 self.jobs.push_info(
                                     "Steer arrived as the turn was switching steps — \
-                                     requeued and will be delivered shortly.",
+                                     delivering it now as a new turn.",
                                 );
+                                // The usual reason a steer hits "busy" is that
+                                // the turn just finished (mailbox closed first,
+                                // permit released after). Deliver immediately
+                                // instead of waiting for the periodic tick, so
+                                // the input starts its own turn right away
+                                // instead of visibly bouncing to the queue.
+                                self.flush_prompt_queue_if_idle();
                                 continue;
                             }
                             let failed_text = if is_current {

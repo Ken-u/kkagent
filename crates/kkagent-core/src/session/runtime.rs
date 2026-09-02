@@ -94,6 +94,11 @@ impl SessionFallbackModel {
 struct SteerMailboxState {
     active: bool,
     pending: VecDeque<SteerInput>,
+    /// Set when a push was rejected because the mailbox was closed. Lets a
+    /// finishing turn notice "a steer tried to land during teardown" without
+    /// polling: the turn-end loop drains and continues, keeping the input
+    /// inside the turn instead of demoting it to a new turn.
+    knocked: bool,
 }
 
 /// Session-scoped steer buffer shared by the RPC server and the active agent loop.
@@ -108,20 +113,35 @@ pub struct SessionSteerMailbox {
 
 impl SessionSteerMailbox {
     pub fn start_turn(&self) {
-        self.lock().active = true;
+        let mut state = self.lock();
+        state.active = true;
+        state.knocked = false;
     }
 
     pub fn try_push(&self, input: SteerInput) -> Result<(), SteerInput> {
         let mut state = self.lock();
         if !state.active {
+            state.knocked = true;
             return Err(input);
         }
         state.pending.push_back(input);
         Ok(())
     }
 
+    /// Take the `knocked` latch, resetting it. True when a push was rejected
+    /// since the last drain — meaning an in-flight steer tried to land while
+    /// the mailbox was closed and is still retrying (the permit is held).
+    pub fn take_knock(&self) -> bool {
+        std::mem::replace(&mut self.lock().knocked, false)
+    }
+
     pub fn drain(&self) -> Vec<SteerInput> {
         self.lock().pending.drain(..).collect()
+    }
+
+    /// True when no steer input is buffered.
+    pub fn is_empty(&self) -> bool {
+        self.lock().pending.is_empty()
     }
 
     /// Close an empty active turn, or atomically take pending steers while keeping

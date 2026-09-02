@@ -560,6 +560,10 @@
     }
 
     .code-block { position: relative; }
+    .code-block .hl-com { color: #8b949e; }
+    .code-block .hl-kw { color: #ff7b72; }
+    .code-block .hl-num { color: #79c0ff; }
+    .code-block .hl-str { color: #a5d6ff; }
     .code-copy {
       position: absolute;
       top: 8px; right: 8px;
@@ -1117,7 +1121,10 @@
     .subagent-list .sub-done { opacity: 0.6; }
     .subagent-list .sub-failed { color: var(--danger, #e0503f); }
     .sub-desc { font-weight: 600; }
-    .sub-detail { color: var(--text-secondary); font-size: 12px; max-height: 3em; overflow: hidden; }
+    .sub-detail-wrap { margin-top: 4px; }
+    .sub-detail-summary { color: var(--accent); font-size: 12px; cursor: pointer; user-select: none; }
+    .sub-detail-wrap .sub-detail { margin: 6px 0 0; }
+    .sub-detail { color: var(--text-secondary); font-size: 12px; max-height: 12em; overflow: auto; white-space: pre-wrap; word-break: break-word; font-family: var(--mono, monospace); }
 
     .plugin-list, .plugin-mkt-list { list-style: none; margin: 0 0 12px; padding: 0; display: flex; flex-direction: column; gap: 8px; }
     .plugin-item { display: flex; justify-content: space-between; gap: 10px; border: 1px solid var(--border); border-radius: var(--radius); padding: 10px 12px; }
@@ -1147,6 +1154,9 @@
         <input id="tokenInput" placeholder="粘贴 token…" autocomplete="off" />
         <button type="submit" class="btn-primary">连接</button>
       </form>
+      <label style="display: flex; gap: 6px; align-items: center; margin-top: 10px; font-size: 13px; color: var(--text-secondary); cursor: pointer;">
+        <input type="checkbox" id="tokenRemember" checked /> 在此设备记住 token
+      </label>
       <div id="tokenHint"></div>
     </div>
   </div>
@@ -1214,6 +1224,7 @@
       <div class="composer-toolbar" id="composerToolbar">
         <button type="button" id="planBtn" class="btn-secondary" title="Plan 模式">Plan</button>
         <button type="button" id="todoBtn" class="btn-secondary" title="任务清单">任务</button>
+        <button type="button" id="subagentsBtn" class="btn-secondary" title="子代理">子代理</button>
       </div>
       <form id="composer">
         <div class="composer-left">
