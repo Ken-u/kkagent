@@ -290,6 +290,9 @@ pub struct AppState {
     pub goal: Option<crate::chrome::GoalIndicator>,
     /// Completion-judge verdicts for the current session (newest last).
     pub goal_judge_records: Vec<crate::goal_judge_view::GoalJudgeRecordView>,
+    pub judge_chat_log: Vec<crate::goal_judge_view::JudgeChatEntry>,
+    pub judge_chat_input: String,
+    pub judge_chat_pending: bool,
     /// Whether the judge-records popup is open.
     pub goal_judge_panel_open: bool,
     /// Click hit-rect of the footer goal chip: (row, start_col, end_col).
@@ -1203,6 +1206,9 @@ impl AppState {
             model_alias: None,
             goal: None,
             goal_judge_records: Vec::new(),
+            judge_chat_log: Vec::new(),
+            judge_chat_input: String::new(),
+            judge_chat_pending: false,
             goal_judge_panel_open: false,
             footer_goal_chip: None,
             stream_cursor: crate::streaming::StreamingCursor::default(),
@@ -3414,11 +3420,33 @@ impl TuiApp {
             return Ok(());
         }
 
-        // Goal judge records popup: Esc (or any dismiss) closes it first.
+        // Ctrl+J: toggle the judge discussion window (goal chip alternative).
+        if key.code == KeyCode::Char('j') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.state.goal_judge_panel_open = !self.state.goal_judge_panel_open;
+            self.clear_selection();
+            return Ok(());
+        }
+
+        // Goal judge window: capture all keys while open (chat composer).
         if self.state.goal_judge_panel_open {
             match key.code {
-                KeyCode::Esc | KeyCode::Enter => {
+                KeyCode::Esc => {
                     self.state.goal_judge_panel_open = false;
+                    return Ok(());
+                }
+                KeyCode::Enter if !key.modifiers.contains(KeyModifiers::SHIFT) => {
+                    self.submit_judge_chat().await?;
+                    return Ok(());
+                }
+                KeyCode::Backspace => {
+                    self.state.judge_chat_input.pop();
+                    return Ok(());
+                }
+                KeyCode::Char(c)
+                    if !key.modifiers.contains(KeyModifiers::CONTROL)
+                        && !key.modifiers.contains(KeyModifiers::ALT) =>
+                {
+                    self.state.judge_chat_input.push(c);
                     return Ok(());
                 }
                 _ => {}
@@ -10194,6 +10222,53 @@ impl TuiApp {
         self.submit_input_with_delivery().await
     }
 
+    /// Submit the judge-window composer to the `discuss` RPC. The reply is
+    /// rendered by the `GoalJudgeChat` event handler (this only awaits the
+    /// ack/error), so a reply never renders twice.
+    async fn submit_judge_chat(&mut self) -> anyhow::Result<()> {
+        let text = std::mem::take(&mut self.state.judge_chat_input)
+            .trim()
+            .to_string();
+        if text.is_empty() {
+            return Ok(());
+        }
+        let Some(session_id) = self.state.session_id.clone() else {
+            self.state
+                .judge_chat_log
+                .push(crate::goal_judge_view::JudgeChatEntry::Error(
+                    "No active session.".into(),
+                ));
+            return Ok(());
+        };
+        self.state
+            .judge_chat_log
+            .push(crate::goal_judge_view::JudgeChatEntry::User(text.clone()));
+        self.state.judge_chat_pending = true;
+        let result = self
+            .client
+            .rpc_call(
+                "session.goal",
+                Some(serde_json::json!({
+                    "session_id": session_id,
+                    "action": "discuss",
+                    "text": text,
+                })),
+            )
+            .await;
+        match result {
+            Ok(_) => Ok(()),
+            Err(error) => {
+                self.state.judge_chat_pending = false;
+                self.state
+                    .judge_chat_log
+                    .push(crate::goal_judge_view::JudgeChatEntry::Error(format!(
+                        "{error}"
+                    )));
+                Ok(())
+            }
+        }
+    }
+
     async fn submit_btw_input(&mut self) -> anyhow::Result<()> {
         let raw = self.state.input.take();
         let question = self.state.input.expand_pastes(&raw).trim().to_string();
@@ -12835,6 +12910,29 @@ impl TuiApp {
                             ),
                         };
                         self.system_message(message);
+                    }
+                    AgentEvent::GoalJudgeChat {
+                        text,
+                        criterion_note,
+                        ..
+                    } => {
+                        // Replies land in the judge window when it is open;
+                        // otherwise fall back to a system message.
+                        if self.state.goal_judge_panel_open {
+                            self.state.judge_chat_log.push(
+                                crate::goal_judge_view::JudgeChatEntry::Judge {
+                                    text: text.clone(),
+                                    note: criterion_note.clone(),
+                                },
+                            );
+                            self.state.judge_chat_pending = false;
+                        } else {
+                            let mut message = format!("Goal judge: {text}");
+                            if let Some(note) = criterion_note {
+                                message.push_str(&format!("\n[criterion updated: {note}]"));
+                            }
+                            self.system_message(message);
+                        }
                     }
                     AgentEvent::TurnEnd { .. } => {
                         self.clear_pending_interactions();

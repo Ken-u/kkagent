@@ -131,6 +131,16 @@ pub enum AgentEvent {
         /// Model alias the judge ran on.
         model: String,
     },
+    /// One judge-discussion exchange (user message answered by the judge
+    /// persona). Emitted by the `session.goal` `discuss` action.
+    GoalJudgeChat {
+        session_id: String,
+        /// Judge's conversational reply.
+        text: String,
+        /// Short note when the judge recorded a new acceptance criterion.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        criterion_note: Option<String>,
+    },
     /// Subagent lifecycle mirrored onto the parent session/TUI.
     SubagentSpawned {
         session_id: String,
@@ -267,6 +277,7 @@ impl AgentEvent {
             | Self::TodoUpdated { session_id, .. }
             | Self::GoalUpdated { session_id, .. }
             | Self::GoalJudge { session_id, .. }
+            | Self::GoalJudgeChat { session_id, .. }
             | Self::SubagentSpawned { session_id, .. }
             | Self::SubagentStarted { session_id, .. }
             | Self::SubagentCompleted { session_id, .. }

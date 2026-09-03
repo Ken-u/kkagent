@@ -123,8 +123,151 @@ Use `reject` with concrete `gaps` listing what is missing or unverified."
     }
 }
 
+/// Criterion update recorded by the judge agent via [`GoalCriterionTool`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CriterionUpdate {
+    /// Full replacement text of the acceptance criterion.
+    pub criterion: String,
+    /// Short change summary for the user.
+    pub note: String,
+}
+
+/// Tool the completion-judge agent uses to persist an acceptance criterion
+/// agreed during a discussion turn. Mirrors [`GoalJudgeTool`]: writes a shared
+/// slot and stops the judge turn.
+pub struct GoalCriterionTool {
+    slot: Arc<Mutex<Option<CriterionUpdate>>>,
+}
+
+impl GoalCriterionTool {
+    pub fn new(slot: Arc<Mutex<Option<CriterionUpdate>>>) -> Self {
+        Self { slot }
+    }
+}
+
+#[async_trait]
+impl Tool for GoalCriterionTool {
+    fn name(&self) -> &str {
+        "GoalCriterion"
+    }
+
+    fn description(&self) -> &str {
+        "Record the acceptance criterion you and the user agreed on for the goal under \
+discussion. Call exactly once per turn, when the discussion settles. \
+`criterion` is the full replacement text (not a diff); `note` is a one-sentence \
+change summary shown to the user."
+    }
+
+    fn disclosure(&self) -> crate::ToolDisclosure {
+        crate::ToolDisclosure::Inline
+    }
+
+    fn parameters_schema(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "criterion": {
+                    "type": "string",
+                    "description": "Full replacement text of the acceptance criterion"
+                },
+                "note": {
+                    "type": "string",
+                    "description": "One-sentence summary of what changed for the user"
+                }
+            },
+            "required": ["criterion"]
+        })
+    }
+
+    async fn execute(&self, input: Value, _ctx: &ToolContext) -> anyhow::Result<ToolOutput> {
+        let criterion = input
+            .get("criterion")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|c| !c.is_empty());
+        let Some(criterion) = criterion else {
+            return Ok(ToolOutput::error(
+                "criterion is required (full replacement text)",
+            ));
+        };
+        let note = input
+            .get("note")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+            .unwrap_or("criterion updated")
+            .to_string();
+
+        *self.slot.lock().unwrap() = Some(CriterionUpdate {
+            criterion: criterion.to_string(),
+            note: note.clone(),
+        });
+
+        Ok(ToolOutput::success(format!("Acceptance criterion recorded: {note}")).with_stop_turn())
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    fn context() -> ToolContext {
+        ToolContext {
+            working_dir: std::env::temp_dir(),
+            session_id: "judge-session".into(),
+            turn_id: "t".into(),
+            plan_file_path: None,
+            image: kkagent_config::ImageConfig::default(),
+            tool_call_id: None,
+            interrupted: None,
+            tools_config: kkagent_config::ToolsConfig::default(),
+            model_alias: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn records_criterion_updates_and_rejects_empty() {
+        let slot: Arc<Mutex<Option<CriterionUpdate>>> = Arc::new(Mutex::new(None));
+        let tool = GoalCriterionTool::new(slot.clone());
+
+        let out = tool
+            .execute(serde_json::json!({"criterion": "   "}), &context())
+            .await
+            .unwrap();
+        assert!(out.is_error);
+        assert!(slot.lock().unwrap().is_none());
+
+        let out = tool
+            .execute(
+                serde_json::json!({
+                    "criterion": "cargo test green AND clippy clean",
+                    "note": "added clippy requirement"
+                }),
+                &context(),
+            )
+            .await
+            .unwrap();
+        assert!(!out.is_error);
+        assert!(out.stop_turn);
+        let update = slot.lock().unwrap().take().unwrap();
+        assert_eq!(update.criterion, "cargo test green AND clippy clean");
+        assert_eq!(update.note, "added clippy requirement");
+
+        // Missing note falls back to a default.
+        let out = tool
+            .execute(serde_json::json!({"criterion": "docs build"}), &context())
+            .await
+            .unwrap();
+        assert!(!out.is_error);
+        let update = slot.lock().unwrap().take().unwrap();
+        assert_eq!(update.criterion, "docs build");
+        assert_eq!(update.note, "criterion updated");
+    }
+}
+
+/// Verdict-review tests (GoalJudge tool), separate from the criterion tests.
+#[cfg(test)]
+mod verdict_tests {
     use super::*;
 
     fn context() -> ToolContext {

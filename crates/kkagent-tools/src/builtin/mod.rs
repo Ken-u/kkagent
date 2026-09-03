@@ -24,7 +24,7 @@ pub use cron::{CronManager, CronTool};
 pub use edit::EditTool;
 pub use glob::GlobTool;
 pub use goal::GoalTool;
-pub use goal_judge::{GoalJudgeTool, JudgeVerdict};
+pub use goal_judge::{CriterionUpdate, GoalCriterionTool, GoalJudgeTool, JudgeVerdict};
 pub use grep::GrepTool;
 pub use media::ReadMediaFileTool;
 pub use plan::{EnterPlanModeTool, ExitPlanModeTool};

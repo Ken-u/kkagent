@@ -1589,6 +1589,24 @@ async fn run_print_goal(client: &mut KkagentClient, session_id: &str, args: &str
             println!("{}", serde_json::to_string_pretty(&body)?);
             return Ok(exit_codes::SUCCESS_COMPLETE);
         }
+        "discuss" => {
+            if rest.is_empty() {
+                anyhow::bail!("Usage: /goal discuss <message>");
+            }
+            let body = requester
+                .rpc_call(
+                    "session.goal",
+                    Some(serde_json::json!({
+                        "session_id": session_id,
+                        "action": "discuss",
+                        "text": rest,
+                    })),
+                )
+                .await
+                .map_err(|error| anyhow::anyhow!("{error}"))?;
+            println!("{}", serde_json::to_string_pretty(&body)?);
+            return Ok(exit_codes::SUCCESS_COMPLETE);
+        }
         "replace" => {
             if rest.is_empty() {
                 anyhow::bail!("Usage: /goal replace <objective>");
@@ -4362,6 +4380,11 @@ struct ServerState {
     /// In-memory completion-judge records per session (TUI fetches via events;
     /// this archive exists for future RPC/history queries). Capped, oldest evicted.
     goal_judge_records: Mutex<HashMap<String, Vec<kkagent_core::goal_judge::GoalJudgeRecord>>>,
+    /// Judge-discussion history per session, as (role, text) exchanges with
+    /// role "user" | "judge". In-memory; cleared with the goal (replace/cancel).
+    judge_chat_history: Mutex<HashMap<String, Vec<(String, String)>>>,
+    /// Serializes judge discussion/verdict turns per session (one persona).
+    judge_chat_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// Latest per-session usage totals (from UsageUpdate events) so a
     /// reattached TUI can rebuild `/usage` without replaying the stream.
     /// Subagent completion usage is folded in here too.
@@ -5856,6 +5879,10 @@ async fn build_server_state_with_shutdown(
         Mutex::new(HashMap::new());
     let goal_judge_records: Mutex<HashMap<String, Vec<kkagent_core::goal_judge::GoalJudgeRecord>>> =
         Mutex::new(HashMap::new());
+    let judge_chat_history: Mutex<HashMap<String, Vec<(String, String)>>> =
+        Mutex::new(HashMap::new());
+    let judge_chat_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>> =
+        Mutex::new(HashMap::new());
     let session_usage: Mutex<HashMap<String, kkagent_protocol::ModelUsageEntry>> =
         Mutex::new(HashMap::new());
     // Web backends: user config + plugin service overrides. The lock is
@@ -5975,6 +6002,8 @@ async fn build_server_state_with_shutdown(
         cron_fires,
         goal_managers,
         goal_judge_records,
+        judge_chat_history,
+        judge_chat_locks,
         session_usage,
         hooks,
         skills,
@@ -7589,6 +7618,8 @@ async fn handle_rpc_call(
             state.active_btw_sessions.lock().await.remove(&session_id);
             state.drop_goal(&session_id).await;
             state.goal_judge_records.lock().await.remove(&session_id);
+            state.judge_chat_history.lock().await.remove(&session_id);
+            state.judge_chat_locks.lock().await.remove(&session_id);
             if let Some(session) = removed {
                 session.services.on_close(SessionCloseReason::Exit).await;
             }
@@ -8580,6 +8611,7 @@ async fn handle_rpc_call(
                 }
                 "cancel" => {
                     let _ = goal_mgr.cancel_goal().await;
+                    state.judge_chat_history.lock().await.remove(&session_id);
                     let body = goal_snapshot(&goal_mgr).await;
                     publish_goal(session_id.clone(), &body, "cancelled");
                     {
@@ -8617,6 +8649,80 @@ async fn handle_rpc_call(
                     publish_goal(session_id.clone(), &body, "criterion_updated");
                     Ok(body)
                 }
+                "discuss" => {
+                    let text = params
+                        .as_ref()
+                        .and_then(|p| p.get("text"))
+                        .and_then(|v| v.as_str())
+                        .map(str::trim)
+                        .filter(|t| !t.is_empty())
+                        .ok_or_else(|| (-32602, "discuss text is required".into()))?
+                        .to_string();
+                    if !state.config().goal.judge_enabled {
+                        return Err((
+                            -32000,
+                            "Judge discussion requires [goal] judge_enabled = true.".into(),
+                        ));
+                    }
+                    let working_dir = {
+                        let sessions = state.sessions.lock().await;
+                        sessions
+                            .get(&session_id)
+                            .map(|s| s.working_dir.clone())
+                            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
+                    };
+                    let judge_lock = {
+                        let mut locks = state.judge_chat_locks.lock().await;
+                        locks
+                            .entry(session_id.clone())
+                            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                            .clone()
+                    };
+                    // One judge persona: discussion and verdict turns
+                    // serialize on this lock. The verdict gate takes it via
+                    // try-lock elsewhere; here we queue behind any verdict.
+                    let _permit = judge_lock.lock().await;
+                    let mut history = {
+                        let mut all = state.judge_chat_history.lock().await;
+                        all.entry(session_id.clone()).or_default().clone()
+                    };
+                    // Cap the rendered history to the last 20 exchanges.
+                    if history.len() > 20 {
+                        let skip = history.len() - 20;
+                        history = history.split_off(skip);
+                    }
+                    let record = kkagent_core::goal_judge::run_goal_judge_discussion(
+                        state.config(),
+                        working_dir,
+                        &goal_mgr,
+                        &history,
+                        &text,
+                    )
+                    .await
+                    .map_err(|error| (-32000, error))?;
+                    {
+                        let mut all = state.judge_chat_history.lock().await;
+                        let entries = all.entry(session_id.clone()).or_default();
+                        entries.push(("user".to_string(), text.clone()));
+                        entries.push(("judge".to_string(), record.reply.clone()));
+                    }
+                    let reply = record.reply.clone();
+                    state.publish_rpc_event(Frame::Event {
+                        event: "agent".into(),
+                        scope: None,
+                        data: serde_json::to_value(AgentEvent::GoalJudgeChat {
+                            session_id: session_id.clone(),
+                            text: reply,
+                            criterion_note: record.criterion_note.clone(),
+                        })
+                        .unwrap_or_default(),
+                    });
+                    Ok(serde_json::json!({
+                        "reply": record.reply,
+                        "criterion_note": record.criterion_note,
+                        "criterion_updated": record.criterion_updated,
+                    }))
+                }
                 "create" | "replace" | "start" => {
                     if objective.is_empty() {
                         return Err((-32602, "objective is required".into()));
@@ -8649,6 +8755,8 @@ async fn handle_rpc_call(
                     };
                     let body = goal_snapshot(&goal_mgr).await;
                     publish_goal(session_id.clone(), &body, "created");
+                    // A new goal starts with a fresh judge discussion.
+                    state.judge_chat_history.lock().await.remove(&session_id);
                     let prompt = format!(
                         "Pursue this goal until complete or blocked.\n\n{}\n\n{}",
                         goal.untrusted_objective_xml(),

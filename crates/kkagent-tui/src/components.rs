@@ -237,7 +237,15 @@ pub fn render_ui(f: &mut Frame, state: &mut AppState, config: &AppConfig) {
     } else if let Some(ref mut question) = state.question_pending {
         render_question_panel(f, size, question, &theme);
     } else if state.goal_judge_panel_open {
-        crate::goal_judge_view::render_judge_panel(f, size, &state.goal_judge_records, &theme);
+        crate::goal_judge_view::render_judge_panel(
+            f,
+            size,
+            &state.goal_judge_records,
+            &state.judge_chat_log,
+            &state.judge_chat_input,
+            state.judge_chat_pending,
+            &theme,
+        );
     }
 
     if state.plugin_prompt.is_some() {
