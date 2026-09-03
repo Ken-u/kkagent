@@ -8,6 +8,18 @@ use ratatui::Frame;
 
 use crate::theme::Theme;
 
+/// Shared window chrome for full-area panes and popups: all borders in
+/// `theme.border` plus the given title (titles are passed pre-padded, e.g.
+/// `" activity "`, by call-site convention). Every window that should look
+/// like the BTW workspace goes through this helper so the styling only
+/// exists once.
+pub fn window_block(title: impl Into<String>, theme: &Theme) -> Block<'static> {
+    Block::default()
+        .borders(Borders::ALL)
+        .title(title.into())
+        .border_style(Style::default().fg(theme.border))
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ActivityPane {
     pub lines: Vec<String>,
@@ -181,10 +193,7 @@ pub fn render_activity(f: &mut Frame, area: Rect, pane: &ActivityPane, theme: &T
             })
             .collect()
     };
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(" activity ")
-        .border_style(Style::default().fg(theme.border));
+    let block = window_block(" activity ", theme);
     f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
@@ -311,10 +320,7 @@ pub fn render_btw(
     } else {
         format!(" BTW · {source} ")
     };
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(title)
-        .border_style(Style::default().fg(theme.border));
+    let block = window_block(title, theme);
     let inner_height = area.height.saturating_sub(2);
     let content_lines = lines.len();
     let paragraph = Paragraph::new(lines).block(block);
@@ -403,10 +409,10 @@ pub fn render_queue(f: &mut Frame, area: Rect, pane: &QueuePane, theme: &Theme) 
             })
             .collect()
     };
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(format!(" queue · {} · Ctrl-S steer ", pane.items.len()))
-        .border_style(Style::default().fg(theme.border));
+    let block = window_block(
+        format!(" queue · {} · Ctrl-S steer ", pane.items.len()),
+        theme,
+    );
     f.render_widget(Paragraph::new(lines).block(block), area);
 }
 

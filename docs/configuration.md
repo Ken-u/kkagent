@@ -133,6 +133,23 @@ reduce_motion = false
 check_updates = true
 # experimental_smart_at_complete = true  # 递归模糊 `@` 补全；默认关闭，按级目录补全
 mouse_mode = "capture"                   # 实验性："capture"（默认）或 "off"
+
+[ui.theme]
+# 逐色覆盖 TUI 调色板，值为 `#RGB` / `#RRGGBB` 十六进制；未设置或写错的项保持默认色。
+# border = "#5A5A5A"     # 窗口/输入框边框（BTW、goal judge、各面板共用）
+# accent = "#5BC0BE"     # BTW / judge 输入框前缀与边框、强调色
+# primary = "#4FA8FF"    # 链接、标题、主要高亮
+# error = "#E85454"      # 错误 / reject
+# success = "#4EC87E"    # 成功 / approve
+# warning = "#E8A838"    # 警告、yolo 徽标、queued
+
+[ui.theme.goal_judge]
+# 只作用于 goal judge 窗口（Ctrl+J 面板及其输入框）；未设置的项继承上面的全局色。
+# border = "#E8A838"     # 窗口边框与输入框边框
+# accent = "#E8A838"     # `judge >` 前缀、`judge ›` 回复标记、approve 标签、criterion 更新提示
+# primary = "#4FA8FF"    # `you ›` 用户消息标记
+# error = "#E85454"      # 错误与 reject 标签
+# text_muted = "#6B6B6B" # 空态提示与 "judge thinking…" 状态
 ```
 
 `check_updates` 默认启用：TUI 首屏不会等待网络，而是在后台查询 `Ken-u/kkagent` 的最新 GitHub Release；成功结果缓存 24 小时，失败结果一小时后重试。发现新版本时只显示 Release 链接和 `kkagent-update`（Windows 为 `kkagent-update.ps1`）提示，不会自动下载或替换程序。设为 `false` 可完全关闭检查。

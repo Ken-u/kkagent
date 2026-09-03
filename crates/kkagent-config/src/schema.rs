@@ -351,6 +351,11 @@ pub struct UiConfig {
     /// High-contrast theme preference (text/symbols over color alone).
     #[serde(default)]
     pub high_contrast: bool,
+    /// Per-color TUI palette overrides (`[ui.theme]`). Values are `#RGB` /
+    /// `#RRGGBB` hex colors; unset or invalid entries keep the built-in
+    /// kimi-dark palette.
+    #[serde(default)]
+    pub theme: UiThemeConfig,
     /// Reduce spinner / animation updates.
     #[serde(default)]
     pub reduce_motion: bool,
@@ -370,12 +375,90 @@ impl Default for UiConfig {
     fn default() -> Self {
         Self {
             high_contrast: false,
+            theme: UiThemeConfig::default(),
             reduce_motion: false,
             check_updates: true,
             experimental_smart_at_complete: false,
             keybindings: HashMap::new(),
         }
     }
+}
+
+/// Optional TUI color overrides (`[ui.theme]`). Field names mirror
+/// `kkagent_tui::theme::Theme`; see that crate for where each color shows up.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UiThemeConfig {
+    /// Links / headers / primary highlights.
+    #[serde(default)]
+    pub primary: Option<String>,
+    /// BTW & goal-judge composer, accents, stream cursor.
+    #[serde(default)]
+    pub accent: Option<String>,
+    /// Default message body text.
+    #[serde(default)]
+    pub text: Option<String>,
+    /// Bold-emphasis text (inline code headers etc.).
+    #[serde(default)]
+    pub text_strong: Option<String>,
+    /// Dimmed secondary text.
+    #[serde(default)]
+    pub text_dim: Option<String>,
+    /// Muted hints / placeholders / timestamps.
+    #[serde(default)]
+    pub text_muted: Option<String>,
+    /// Window + input borders (BTW, goal judge, panels) at rest.
+    #[serde(default)]
+    pub border: Option<String>,
+    /// Focused borders (menus, pickers, search).
+    #[serde(default)]
+    pub border_focus: Option<String>,
+    /// Success / completed states.
+    #[serde(default)]
+    pub success: Option<String>,
+    /// Warnings, yolo badge, queued markers.
+    #[serde(default)]
+    pub warning: Option<String>,
+    /// Errors / reject verdicts.
+    #[serde(default)]
+    pub error: Option<String>,
+    /// Background fill for popups.
+    #[serde(default)]
+    pub background: Option<String>,
+    /// User message marker (kimi yellow).
+    #[serde(default)]
+    pub role_user: Option<String>,
+    /// Shell-mode input border & prefix.
+    #[serde(default)]
+    pub shell_mode: Option<String>,
+    /// Plan-mode input border & prefix.
+    #[serde(default)]
+    pub plan_mode: Option<String>,
+    /// Colors scoped to the goal judge window (Ctrl+J panel + its composer).
+    /// Unset entries inherit the global `[ui.theme]` values.
+    #[serde(default)]
+    pub goal_judge: UiGoalJudgeThemeConfig,
+}
+
+/// Optional per-window overrides for the goal judge window
+/// (`[ui.theme.goal_judge]`). Only the colors that window actually renders
+/// are exposed; anything unset falls back to `[ui.theme]` / the default.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UiGoalJudgeThemeConfig {
+    /// Judge window border and composer border.
+    #[serde(default)]
+    pub border: Option<String>,
+    /// `judge >` prefix, `judge ›` reply marker, approve label, criterion notes.
+    #[serde(default)]
+    pub accent: Option<String>,
+    /// `you ›` marker for user messages.
+    #[serde(default)]
+    pub primary: Option<String>,
+    /// Errors and the reject verdict label.
+    #[serde(default)]
+    pub error: Option<String>,
+    /// Empty-state hints and the "judge thinking…" status.
+    #[serde(default)]
+    pub text_muted: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

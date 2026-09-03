@@ -57,49 +57,27 @@ impl GoalJudgeRecordView {
     }
 }
 
-/// Render the centered judge window (records + discussion composer). Returns
-/// the panel rect so the caller can route clicks / close keys while open.
+/// Render the full-screen judge window (records + discussion log). It fills
+/// the whole message area exactly like the BTW workspace and shares the
+/// standard `window_block` chrome. The composer lives in the main input box
+/// below (`judge > ` prefix, accent border) while the panel is open; typing
+/// goes to the `session.goal` `discuss` RPC and replies stream back as
+/// `AgentEvent::GoalJudgeChat`.
 pub fn render_judge_panel(
     f: &mut Frame,
     area: Rect,
     records: &[GoalJudgeRecordView],
     chat: &[JudgeChatEntry],
-    chat_input: &str,
     chat_pending: bool,
     theme: &Theme,
 ) {
-    let width = area.width.saturating_sub(10).clamp(40, 76);
-    let height = area.height.saturating_sub(6).clamp(9, 24);
-    let x = area.x + (area.width.saturating_sub(width)) / 2;
-    let y = area.y + (area.height.saturating_sub(height)) / 2;
-    let rect = Rect::new(x, y, width, height);
-
-    f.render_widget(Clear, rect);
-    let block = ratatui::widgets::Block::default()
-        .borders(ratatui::widgets::Borders::ALL)
-        .title(" Goal judge · discuss acceptance criteria (esc closes, enter sends) ")
-        .border_style(Style::default().fg(theme.accent));
-    let inner = block.inner(rect);
-
-    // Bottom composer line(s) + status line; log gets the rest.
-    let wrap_width = width.saturating_sub(2) as usize;
-    let input_rows = chat_input
-        .chars()
-        .count()
-        .checked_div(wrap_width)
-        .map(|rows| (rows + 1).min(3))
-        .unwrap_or(1);
-    let composer_height = (1 + input_rows as u16).min(4).min(inner.height);
-    let status_height = 1.min(inner.height.saturating_sub(composer_height));
-    let log_height = inner.height.saturating_sub(composer_height + status_height);
-    let log_rect = Rect::new(inner.x, inner.y, inner.width, log_height);
-    let status_rect = Rect::new(inner.x, inner.y + log_height, inner.width, status_height);
-    let composer_rect = Rect::new(
-        inner.x,
-        inner.y + log_height + status_height,
-        inner.width,
-        composer_height,
+    f.render_widget(Clear, area);
+    let block = crate::panes::window_block(
+        " Goal judge · discuss acceptance criteria (esc closes, enter sends) ",
+        theme,
     );
+    f.render_widget(&block, area);
+    let inner = block.inner(area);
 
     let mut lines: Vec<Line> = Vec::new();
     if records.is_empty() && chat.is_empty() {
@@ -185,16 +163,15 @@ pub fn render_judge_panel(
             }
         }
     }
+    if chat_pending {
+        if !lines.is_empty() {
+            lines.push(Line::from(Span::raw("")));
+        }
+        lines.push(Line::from(Span::styled(
+            "● judge thinking…",
+            Style::default().fg(theme.text_muted),
+        )));
+    }
     let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
-    f.render_widget(paragraph, log_rect);
-
-    let status = if chat_pending {
-        Span::styled(" judge thinking…", Style::default().fg(theme.text_muted))
-    } else {
-        Span::raw("")
-    };
-    f.render_widget(Paragraph::new(Line::from(status)), status_rect);
-
-    let composer = Paragraph::new(format!("> {chat_input}")).style(Style::default().fg(theme.text));
-    f.render_widget(composer, composer_rect);
+    f.render_widget(paragraph, inner);
 }

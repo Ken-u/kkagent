@@ -84,7 +84,10 @@ fn wrapped_text_height(lines: &[Line<'_>], width: u16) -> u16 {
 }
 
 pub fn render_ui(f: &mut Frame, state: &mut AppState, config: &AppConfig) {
-    let theme = Theme::default();
+    let theme = Theme::from_ui(&config.ui);
+    // The goal judge window (panel + composer while open) honors
+    // `[ui.theme.goal_judge]` overrides on top of the global palette.
+    let judge_theme = Theme::from_ui_with_goal_judge(&config.ui);
     let size = f.area();
 
     // Reserve space for slash / list picker popup above the input box
@@ -225,7 +228,16 @@ pub fn render_ui(f: &mut Frame, state: &mut AppState, config: &AppConfig) {
             &theme,
         );
     }
-    render_input(f, input_area, state, &theme);
+    render_input(
+        f,
+        input_area,
+        state,
+        if state.goal_judge_panel_open {
+            &judge_theme
+        } else {
+            &theme
+        },
+    );
     render_footer(f, footer_area, state, config, &theme);
 
     if let Some(ref mut approval) = state
@@ -239,12 +251,11 @@ pub fn render_ui(f: &mut Frame, state: &mut AppState, config: &AppConfig) {
     } else if state.goal_judge_panel_open {
         crate::goal_judge_view::render_judge_panel(
             f,
-            size,
+            msg_area,
             &state.goal_judge_records,
             &state.judge_chat_log,
-            &state.judge_chat_input,
             state.judge_chat_pending,
-            &theme,
+            &judge_theme,
         );
     }
 
@@ -2001,57 +2012,97 @@ fn truncate_display_width(s: &str, max_width: usize) -> String {
 }
 
 fn render_input(f: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) {
-    let border = match state.mode {
-        AppMode::Shell => theme.shell_mode,
-        AppMode::Plan => theme.plan_mode,
-        AppMode::Btw => theme.accent,
-        AppMode::Normal => {
-            if matches!(
-                state.status,
-                SessionStatus::Thinking
-                    | SessionStatus::ToolExecuting
-                    | SessionStatus::WaitingApproval
-            ) {
-                theme.primary
-            } else {
-                theme.border
+    // While the goal judge window is open it owns the composer, BTW-style:
+    // accent border, dedicated prefix, and the judge chat buffer as text.
+    let judge_mode = state.goal_judge_panel_open;
+    let border = if judge_mode {
+        theme.accent
+    } else {
+        match state.mode {
+            AppMode::Shell => theme.shell_mode,
+            AppMode::Plan => theme.plan_mode,
+            AppMode::Btw => theme.accent,
+            AppMode::Normal => {
+                if matches!(
+                    state.status,
+                    SessionStatus::Thinking
+                        | SessionStatus::ToolExecuting
+                        | SessionStatus::WaitingApproval
+                ) {
+                    theme.primary
+                } else {
+                    theme.border
+                }
             }
         }
     };
 
-    let (prefix, prefix_style) = match state.mode {
-        AppMode::Shell => (
-            "! ",
-            Style::default()
-                .fg(theme.shell_mode)
-                .add_modifier(Modifier::BOLD),
-        ),
-        AppMode::Plan => (
-            "plan > ",
-            Style::default()
-                .fg(theme.plan_mode)
-                .add_modifier(Modifier::BOLD),
-        ),
-        AppMode::Btw => (
-            "btw > ",
+    let (prefix, prefix_style) = if judge_mode {
+        (
+            "judge > ",
             Style::default()
                 .fg(theme.accent)
                 .add_modifier(Modifier::BOLD),
-        ),
-        AppMode::Normal => ("> ", Style::default().fg(theme.text)),
+        )
+    } else {
+        match state.mode {
+            AppMode::Shell => (
+                "! ",
+                Style::default()
+                    .fg(theme.shell_mode)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            AppMode::Plan => (
+                "plan > ",
+                Style::default()
+                    .fg(theme.plan_mode)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            AppMode::Btw => (
+                "btw > ",
+                Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            AppMode::Normal => ("> ", Style::default().fg(theme.text)),
+        }
     };
 
-    let title = match state.mode {
-        AppMode::Shell => " shell ",
-        AppMode::Plan => " plan ",
-        AppMode::Btw if state.btw.streaming => " BTW · answering… ",
-        AppMode::Btw => " BTW question ",
-        AppMode::Normal => match state.status {
-            SessionStatus::Thinking => " thinking… ",
-            SessionStatus::ToolExecuting => " running… ",
-            SessionStatus::WaitingApproval => " approval ",
-            _ => " message ",
-        },
+    let title: String = if judge_mode {
+        if state.judge_chat_pending {
+            " Goal judge · thinking… "
+        } else {
+            " Goal judge "
+        }
+        .into()
+    } else {
+        match state.mode {
+            AppMode::Shell => " shell ",
+            AppMode::Plan => " plan ",
+            AppMode::Btw if state.btw.streaming => " BTW · answering… ",
+            AppMode::Btw => " BTW question ",
+            AppMode::Normal => match state.status {
+                SessionStatus::Thinking => " thinking… ",
+                SessionStatus::ToolExecuting => " running… ",
+                SessionStatus::WaitingApproval => " approval ",
+                _ => " message ",
+            },
+        }
+        .into()
+    };
+
+    let (text, cursor_byte, sel) = if judge_mode {
+        (
+            state.judge_chat_input.as_str(),
+            state.judge_chat_input.len(),
+            None,
+        )
+    } else {
+        (
+            state.input.text.as_str(),
+            state.input.cursor,
+            state.input.selection.filter(|(s, e)| s < e),
+        )
     };
 
     let block = Block::default()
@@ -2067,15 +2118,12 @@ fn render_input(f: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) 
     let content_width = (inner.width as usize).saturating_sub(prefix_w).max(1);
     let indent = " ".repeat(prefix_w);
 
-    // Mouse selection state is byte offsets into `state.input.text`.
-    let sel = state.input.selection.filter(|(s, e)| s < e);
+    // Mouse selection state is byte offsets into the composer text (only the
+    // shared editor supports selections; the judge buffer has none).
 
     // Soft-wrap each logical line; prefix only the first visual row of the buffer.
     let mut visual: Vec<Line> = Vec::new();
-    for (li, logical) in input_logical_lines(&state.input.text)
-        .into_iter()
-        .enumerate()
-    {
+    for (li, logical) in input_logical_lines(text).into_iter().enumerate() {
         let chunks = soft_wrap_line(logical, content_width);
         for (ci, chunk) in chunks.into_iter().enumerate() {
             if li == 0 && ci == 0 {
@@ -2095,12 +2143,7 @@ fn render_input(f: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) 
         visual.push(Line::from(vec![Span::styled(prefix, prefix_style)]));
     }
 
-    let (cursor_x, cursor_y) = cursor_position(
-        &state.input.text,
-        state.input.cursor,
-        content_width,
-        prefix_w as u16,
-    );
+    let (cursor_x, cursor_y) = cursor_position(text, cursor_byte, content_width, prefix_w as u16);
     // Exact wrap boundary can place the cursor on a fresh visual row — pad so it paints.
     while (visual.len() as u16) <= cursor_y {
         visual.push(Line::from(vec![
@@ -2115,7 +2158,7 @@ fn render_input(f: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) 
         let sel_style = crate::selection::selection_style();
         let mut byte = 0usize; // byte offset where the current visual row starts
         let mut row = 0u16;
-        for logical in input_logical_lines(&state.input.text) {
+        for logical in input_logical_lines(text) {
             let line_start = byte;
             let mut consumed = 0usize;
             for chunk in soft_wrap_line(logical, content_width) {
@@ -2154,7 +2197,7 @@ fn render_input(f: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) 
 
     // A visible selection hides the terminal caret (focus follows the caret,
     // which would otherwise render at the selection focus and look wrong).
-    if !state.input.selection_active() {
+    if judge_mode || !state.input.selection_active() {
         let abs_x = inner.x + cursor_x;
         let abs_y = inner.y + cursor_y.saturating_sub(scroll);
         if abs_x < inner.x + inner.width && abs_y < inner.y + inner.height {
@@ -3085,10 +3128,7 @@ fn render_slash_menu(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
 
     f.render_widget(Clear, area);
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.border))
-        .title(" / ");
+    let block = panes::window_block(" / ", theme);
 
     let mut lines: Vec<Line> = Vec::new();
     if menu.items.is_empty() {
@@ -3389,10 +3429,7 @@ fn render_list_picker(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme
     let inner = area.inner(Margin::new(1, 1));
     f.render_widget(Clear, area);
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.border))
-        .title(picker.title.as_str());
+    let block = panes::window_block(picker.title.as_str(), theme);
 
     let mut lines: Vec<Line> = Vec::new();
 
@@ -3497,10 +3534,7 @@ fn render_tasks_panel(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme
     }
 
     f.render_widget(Clear, panel_area);
-    let block = Block::default()
-        .title(" background processes ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.border));
+    let block = panes::window_block(" background processes ", theme);
 
     let inner = panel_area.inner(Margin::new(1, 1));
     let mut lines: Vec<Line> = Vec::new();
@@ -3625,10 +3659,10 @@ fn render_task_detail(f: &mut Frame, area: Rect, detail: &TaskDetailState, theme
             None => detail.status.clone(),
         }
     };
-    let block = Block::default()
-        .title(format!(" task {} · {} ", detail.task_id, status_label))
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.border));
+    let block = panes::window_block(
+        format!(" task {} · {} ", detail.task_id, status_label),
+        theme,
+    );
 
     let inner = panel_area.inner(Margin::new(1, 1));
     // Fixed header + footer, scrolling output between them.
@@ -3697,10 +3731,7 @@ fn render_subagents_panel(f: &mut Frame, area: Rect, state: &AppState, theme: &T
     } else {
         " subagents "
     };
-    let block = Block::default()
-        .title(title)
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.border));
+    let block = panes::window_block(title, theme);
     let inner = panel_area.inner(Margin::new(1, 1));
     let mut lines: Vec<Line> = Vec::new();
     let now = std::time::Instant::now();
