@@ -5,6 +5,129 @@
 > v3 修订:裁决轮证据机制与裁判会话隔离原则吸收了外部评审(Codex,2026-09)对
 > 成本模型、注入面与 overclaim 洗白风险的结论,见"详细设计 §6"与"备选方案 4"。
 
+## 实现流程总览(ASCII,对应当前代码)
+
+整条链路分两条线:**裁决线**(worker 申报 complete 触发)与**讨论线**(用户 Ctrl+J 触发),
+共用 criterion 与同一 judge 人格(alias 取自 `[goal] judge` 配置)。
+
+```text
+                         [1] goal 创建
+  用户 ──/goal <objective>──> Goal 工具 create ──> GoalManager: goal = Active
+                                                       |
+                                                       | completion_criterion: Option<String>
+                                                       v
+  ===========================================================|============================
+                         [2] worker turn 循环                |
+  -----------------------------------------------------------+---------------------------
+        每个 turn 边界注入 reminder: objective + criterion (untrusted_ 转义)
+                                                             |
+                              worker 自报完成: Goal update complete
+                                                             |
+                                                             v
+                              tool result 被标记 goal_status = "pending_verification"
+                                                             |
+                                                             v
+        +----------------------------------------------------+---------------------------+
+        | [3] 裁决门  agent_loop.rs:2348  run_goal_judge_gate                             |
+        +--+------------------------------------------------------------------------------+
+           |
+           +-- 无活动 goal / turn 被中断 --------------------------> accepted_unreviewed
+           |        (fail-open: 放行自报, 但记录为"未经审查", 不算 judge 批准)
+           |
+           +-- 有活动 goal:
+                  |
+                  v
+          取转录尾部窗口 (约最近 40 条消息)
+                  |
+                  v
+          build_evidence_digest  (goal_judge.rs:151, 确定性账本, 零 LLM)
+            命令 argv / 执行状态(退出码/超时/取消/拒绝) / 文件写入清单 /
+            tool 错误数 / coverage_complete(尾部截断标记)
+                  |
+                  v
+          run_goal_judge  (goal_judge.rs:436)
+            - 独立短命 judge 会话 (Session::for_subagent, 裁决完即弃)
+            - 工具: GoalJudge(裁决槽) + Read + ReadMediaFile(看截图/效果图)
+            - prompt: 裁判政策 + objective + criterion 快照 + evidence digest
+            - 模型: [goal] judge alias, 超时 judge_timeout_secs
+                  |
+                  +--- 超时 / 报错 / 没有 GoalJudge toolcall ---> accepted_unreviewed
+                  |                                               (fail-open, 同上)
+                  |
+                  +--- GoalJudge toolcall 给出裁决
+                          |
+            +-------------+----------------+
+            v                               v
+         approve                         reject (+ gaps)
+            |                               |
+            v                               v
+    complete_goal()              工具结果改写为 reject 反馈
+    goal = completed             (gaps 文本给 worker), turn 继续
+    turn 正常结束                         |
+            |                    rejects >= judge_max_rejects ?
+            |                       | yes              | no
+            |                       v                  v
+            |                 goal = blocked       worker 继续修复
+            |                 stop_turn + 提示
+            |                 (用户可调整 goal 后 resume)
+            |
+            +--- 每个 verdict 都发 AgentEvent::GoalJudge --> TUI 记录 + judge 窗口展示
+
+  ============================================================|============================
+                         [4] 讨论线 (judge 对话窗口)           |
+  ------------------------------------------------------------+---------------------------
+
+  用户 Ctrl+J (或点 footer goal chip)
+      |
+      v
+  TUI 全屏 judge 窗口 (goal_judge_view::render_judge_panel)
+  + 底部主输入框变为 "judge > " (accent 边框)
+      |
+      | 用户输入, Enter
+      v
+  RPC session.goal { action: "discuss", text }   (main.rs:8652)
+      |  - 校验 [goal] judge_enabled + 有活动 goal
+      |  - 取 per-session judge 锁 (讨论轮与裁决轮串行, 一个人格)
+      v
+  run_goal_judge_discussion  (goal_judge.rs:624)
+      - 工具: GoalCriterion(口径落盘槽) + Read + ReadMediaFile
+      - prompt: 历史讨论(user/judge 交替, 存于 server 状态) + goal + criterion + 本条消息
+      |
+      +--- 超时/报错 ---> 仅向用户报错, 不触碰 goal 状态
+      |
+      +--- JudgeChatRecord { reply, criterion_note, criterion_updated }
+      |        |
+      |        +--> GoalCriterion toolcall? --> set_completion_criterion()
+      |                                          立即写盘生效:
+      |                                          * worker 下个 turn 的 reminder
+      |                                          * 之后每次裁决的 criterion 快照
+      v
+  AgentEvent::GoalJudgeChat --> TUI 窗口追加 "judge ›" 回复
+                                 (+ "[criterion updated: ...]" 高亮)
+
+  [5] 手动通道: /goal criterion <text> --> 同一个 set_completion_criterion (绕过裁判直写)
+```
+
+### 要点对照(关键代码位置)
+
+| 环节 | 位置 |
+| --- | --- |
+| 裁决门拦截 `pending_verification` | `agent_loop.rs:2348` `run_goal_judge_gate` |
+| 证据账本 digest(确定性,零 LLM) | `goal_judge.rs:151` `build_evidence_digest` |
+| 裁决轮(短命会话,GoalJudge+Read) | `goal_judge.rs:436` `run_goal_judge` |
+| 讨论轮(GoalCriterion+Read,历史在 server) | `goal_judge.rs:624` `run_goal_judge_discussion` |
+| judge 锁(讨论/裁决串行) | `main.rs:8674` |
+| fail-open → `accepted_unreviewed` | `agent_loop.rs:2372,2406` |
+| reject 上限 → goal blocked | `agent_loop.rs:2445-2473` |
+| TUI 全屏窗口 + `judge >` 输入框 | `goal_judge_view.rs` + `components.rs render_input` |
+
+### 与设计稿的差异
+
+§1 的持久裁判会话(`JudgeConversation`,跨消息复用同一 Session)尚未落地:
+当前每条讨论消息 / 每轮裁决仍新建短命会话,讨论历史以 `(user, judge)` 交替记录
+在 server 内存(`main.rs` `goal_judge_chat_history`)并随 prompt 重放。criterion 落盘、
+judge 锁、digest 账本、`accepted_unreviewed` 语义均已按设计实现。
+
 ## 背景与动机
 
 Goal 裁判模式(`[goal] judge_enabled = true`)的裁判目前是**一次性短命智能体**:

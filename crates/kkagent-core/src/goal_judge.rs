@@ -2,9 +2,9 @@
 //!
 //! When `[goal] judge_enabled` is on, a model-reported `Goal update complete`
 //! is not trusted directly: [`run_goal_judge`] spins up a short-lived judge
-//! agent (own scratch session, own model, `GoalJudge` + `Read` tools only)
-//! that reviews the objective against transcript evidence and marks its
-//! verdict via a `GoalJudge` toolcall.
+//! agent (own scratch session, own model, `GoalJudge` + `Read` +
+//! `ReadMediaFile` tools only) that reviews the objective against transcript
+//! evidence and marks its verdict via a `GoalJudge` toolcall.
 //!
 //! Failure semantics are fail-open on purpose: a judge turn that ends without
 //! a toolcall, times out, or errors returns `Err` and the caller accepts the
@@ -19,7 +19,7 @@ use kkagent_llm::ChatMessage;
 use kkagent_protocol::goal::Goal;
 use kkagent_protocol::PermissionMode;
 use kkagent_tools::builtin::goal_judge::{CriterionUpdate, JudgeVerdict};
-use kkagent_tools::builtin::{GoalCriterionTool, GoalJudgeTool, ReadTool};
+use kkagent_tools::builtin::{GoalCriterionTool, GoalJudgeTool, ReadMediaFileTool, ReadTool};
 use kkagent_tools::ToolRegistry;
 
 use crate::agent_loop::AgentLoop;
@@ -388,7 +388,9 @@ passed.\n\
         "Objective:\n{}\n{criterion}\n\n\
 Evidence digest (runtime-extracted facts + verbatim excerpts; most recent activity last):\n\n\
 {ledger}\n\nVerbatim command-output excerpts:\n{excerpts}\n\
-You may Read repository files yourself to verify final state. \
+You may Read repository files yourself to verify final state, and use \
+ReadMediaFile to inspect image artifacts (screenshots, mockups, rendered charts) \
+when the objective involves visual output. \
 When done, call the GoalJudge tool exactly once with your verdict.",
         goal.untrusted_objective_xml(),
     );
@@ -446,6 +448,8 @@ pub async fn run_goal_judge(
     let mut tools = ToolRegistry::new();
     tools.register(Arc::new(GoalJudgeTool::new(verdict_slot.clone())));
     tools.register(Arc::new(ReadTool));
+    // Screenshots / mockups are legitimate evidence for visual objectives.
+    tools.register(Arc::new(ReadMediaFileTool));
 
     let (event_tx, _event_rx) = tokio::sync::mpsc::channel(16);
     let judge_loop = AgentLoop::new(
@@ -639,6 +643,9 @@ pub async fn run_goal_judge_discussion(
     let mut tools = ToolRegistry::new();
     tools.register(Arc::new(GoalCriterionTool::new(criterion_slot.clone())));
     tools.register(Arc::new(ReadTool));
+    // Visual acceptance criteria are common ("the chart must look like X");
+    // let the judge look at image artifacts while discussing.
+    tools.register(Arc::new(ReadMediaFileTool));
 
     let (event_tx, _event_rx) = tokio::sync::mpsc::channel(16);
     let judge_loop = AgentLoop::new(
