@@ -10,7 +10,7 @@ pub use catalog::{
     builtin_catalog, lookup as lookup_model, prefers_responses_api, ModelCapabilityEntry,
 };
 pub use http_error::{
-    response_error, stream_error_event, FirstTokenTimeoutError, LlmHttpError,
+    reqwest_error, response_error, stream_error_event, FirstTokenTimeoutError, LlmHttpError,
     FIRST_TOKEN_TIMEOUT_MARKER,
 };
 pub use openai_responses::openai_responses_stream;

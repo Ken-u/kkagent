@@ -178,7 +178,8 @@ pub async fn anthropic_stream(
         .timeout(std::time::Duration::from_secs(300))
         .body(body.to_string())
         .send()
-        .await?;
+        .await
+        .map_err(crate::http_error::reqwest_error)?;
 
     tracing::debug!("LLM response status: {}", resp.status());
 
@@ -623,7 +624,8 @@ async fn chat_completions_stream(
         .timeout(std::time::Duration::from_secs(300))
         .body(body.to_string())
         .send()
-        .await?;
+        .await
+        .map_err(crate::http_error::reqwest_error)?;
 
     if !resp.status().is_success() {
         return Err(crate::response_error(resp).await);
@@ -893,7 +895,8 @@ pub async fn google_stream(
         .timeout(std::time::Duration::from_secs(300))
         .body(body.to_string())
         .send()
-        .await?;
+        .await
+        .map_err(crate::http_error::reqwest_error)?;
 
     if !resp.status().is_success() {
         return Err(crate::response_error(resp).await);
@@ -1138,11 +1141,15 @@ async fn upload_kimi_video(
                 .part("file", part),
         )
         .send()
-        .await?;
+        .await
+        .map_err(crate::http_error::reqwest_error)?;
     if !response.status().is_success() {
         return Err(crate::response_error(response).await);
     }
-    let body = response.text().await?;
+    let body = response
+        .text()
+        .await
+        .map_err(crate::http_error::reqwest_error)?;
     serde_json::from_str::<serde_json::Value>(&body)?
         .get("id")
         .and_then(|id| id.as_str())

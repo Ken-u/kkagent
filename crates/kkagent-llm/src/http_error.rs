@@ -1,3 +1,4 @@
+use std::error::Error as StdError;
 use std::time::{Duration, SystemTime};
 
 use reqwest::{header::HeaderMap, Response, StatusCode};
@@ -36,6 +37,51 @@ impl FirstTokenTimeoutError {
     pub fn is_retryable(&self) -> bool {
         true
     }
+}
+
+/// Flatten a `reqwest::Error` into a single message that keeps the status,
+/// error-kind flags and the full source chain. The bare Display text (e.g.
+/// "error decoding response body") hides whether the response body was bad
+/// JSON or the connection was cut mid-stream, so we unwrap it here.
+pub fn detailed_reqwest_error(error: &reqwest::Error) -> String {
+    let mut message = error.to_string();
+    let mut details = Vec::new();
+    if let Some(url) = error.url() {
+        details.push(format!("url={url}"));
+    }
+    if let Some(status) = error.status() {
+        details.push(format!("status={status}"));
+    }
+    let kinds = [
+        (error.is_decode(), "decode"),
+        (error.is_body(), "body"),
+        (error.is_request(), "request"),
+        (error.is_connect(), "connect"),
+        (error.is_timeout(), "timeout"),
+    ];
+    details.extend(
+        kinds
+            .into_iter()
+            .filter(|(flag, _)| *flag)
+            .map(|(_, label)| format!("kind={label}")),
+    );
+    if !details.is_empty() {
+        message.push_str(&format!(" [{}]", details.join(", ")));
+    }
+    let mut source = StdError::source(error);
+    while let Some(err) = source {
+        message.push_str(&format!(": {err}"));
+        source = err.source();
+    }
+    message
+}
+
+/// Convert a `reqwest::Error` into an `anyhow::Error` carrying the flattened
+/// detail chain, and log it so transport failures stay visible in traces.
+pub fn reqwest_error(error: reqwest::Error) -> anyhow::Error {
+    let detail = detailed_reqwest_error(&error);
+    tracing::warn!("LLM transport error: {detail}");
+    anyhow::anyhow!(detail)
 }
 
 pub async fn response_error(response: Response) -> anyhow::Error {
@@ -255,5 +301,84 @@ mod tests {
             crate::types::StreamEvent::Error(message)
                 if message.contains(FIRST_TOKEN_TIMEOUT_MARKER)
         ));
+    }
+
+    #[test]
+    fn detailed_reqwest_error_keeps_source_chain() {
+        // Spin up a minimal server that advertises a chunked body but closes
+        // the connection mid-transfer, producing a real reqwest decode error.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = std::thread::spawn(move || {
+            let mut conn = listener.accept().unwrap().0;
+            let mut buf = [0u8; 1024];
+            let _ = std::io::Read::read(&mut conn, &mut buf);
+            let response = b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhell";
+            let _ = std::io::Write::write_all(&mut conn, response);
+        });
+
+        let error: Option<reqwest::Error> = rt.block_on(async move {
+            let client = reqwest::Client::new();
+            client
+                .get(format!("http://{addr}/"))
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .err()
+        });
+        server.join().unwrap();
+
+        let error = error.expect("truncated chunked body should yield a decode error");
+        let message = detailed_reqwest_error(&error);
+        assert!(message.contains("kind=decode"), "{message}");
+        // The flattened source chain must explain *why* decoding failed
+        // (incomplete message body), which the bare Display text hides.
+        assert!(
+            message.contains("error decoding response body") || message.contains("body"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn reqwest_error_wraps_detail() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = std::thread::spawn(move || {
+            let mut conn = listener.accept().unwrap().0;
+            let mut buf = [0u8; 1024];
+            let _ = std::io::Read::read(&mut conn, &mut buf);
+            let response = b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhell";
+            let _ = std::io::Write::write_all(&mut conn, response);
+        });
+
+        let message = rt.block_on(async move {
+            let client = reqwest::Client::new();
+            match client
+                .get(format!("http://{addr}/"))
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+            {
+                Ok(_) => unreachable!("truncated chunked body should fail"),
+                Err(error) => reqwest_error(error).to_string(),
+            }
+        });
+        server.join().unwrap();
+
+        assert!(message.contains("kind=decode"), "{message}");
     }
 }

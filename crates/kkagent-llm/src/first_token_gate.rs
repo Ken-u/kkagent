@@ -10,7 +10,7 @@ use std::time::Instant;
 
 use futures_util::StreamExt;
 
-use crate::http_error::FirstTokenTimeoutError;
+use crate::http_error::{reqwest_error, FirstTokenTimeoutError};
 
 /// Tracks whether the first meaningful stream chunk has arrived under an
 /// optional deadline.
@@ -54,11 +54,7 @@ impl FirstTokenGate {
         S: StreamExt<Item = Result<B, reqwest::Error>> + Unpin,
     {
         if self.received || self.deadline.is_none() {
-            return stream
-                .next()
-                .await
-                .transpose()
-                .map_err(|error| anyhow::anyhow!(error));
+            return stream.next().await.transpose().map_err(reqwest_error);
         }
         let deadline = self.deadline.expect("deadline checked above");
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -71,7 +67,7 @@ impl FirstTokenGate {
         }
         match tokio::time::timeout(remaining, stream.next()).await {
             Ok(Some(Ok(chunk))) => Ok(Some(chunk)),
-            Ok(Some(Err(error))) => Err(anyhow::anyhow!(error)),
+            Ok(Some(Err(error))) => Err(reqwest_error(error)),
             Ok(None) => Ok(None),
             Err(_) => Err(FirstTokenTimeoutError {
                 timeout_ms: self.timeout_ms,

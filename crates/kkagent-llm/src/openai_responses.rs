@@ -154,7 +154,8 @@ pub async fn openai_responses_stream(
         .timeout(std::time::Duration::from_secs(300))
         .body(body.to_string())
         .send()
-        .await?;
+        .await
+        .map_err(crate::http_error::reqwest_error)?;
 
     if !resp.status().is_success() {
         return Err(crate::response_error(resp).await);
