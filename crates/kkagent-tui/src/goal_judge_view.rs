@@ -15,7 +15,7 @@ use crate::theme::Theme;
 /// One judge verdict as delivered by `AgentEvent::GoalJudge`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GoalJudgeRecordView {
-    /// "approve" | "reject" | "failopen"
+    /// "approve" | "reject" | "accepted_unreviewed"
     pub verdict: String,
     pub gaps: Vec<String>,
     pub summary: String,

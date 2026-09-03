@@ -12900,8 +12900,18 @@ impl TuiApp {
                                     gaps.join("; ")
                                 }
                             ),
+                            "accepted_unreviewed" => format!(
+                                "Goal judge unavailable, claim accepted UNREVIEWED ({}; \
+                                 this is not a judge approval)",
+                                if summary.is_empty() {
+                                    "no detail"
+                                } else {
+                                    &summary
+                                }
+                            ),
                             _ => format!(
-                                "Goal judge unavailable, accepting claim ({})",
+                                "Goal judge: {} — {}",
+                                verdict,
                                 if summary.is_empty() {
                                     "no detail"
                                 } else {

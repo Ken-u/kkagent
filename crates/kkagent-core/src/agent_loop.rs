@@ -2369,13 +2369,14 @@ Do not mention this reminder to the user.\n</system-reminder>"
         let Some(goal) = goal_state.filter(|g| {
             g.status == kkagent_protocol::goal::GoalStatus::Active && !session.is_interrupted()
         }) else {
-            // Fail open: no judgeable goal context — accept the claim as-is.
+            // Fail open: no judgeable goal context — accept the claim as-is
+            // (recorded as unreviewed, never as a judge approval).
             self.resolve_judge_claim(
                 session,
                 tool_results,
                 index,
                 &crate::goal_judge::GoalJudgeRecord {
-                    verdict: "failopen".into(),
+                    verdict: "accepted_unreviewed".into(),
                     gaps: Vec::new(),
                     summary: "judge skipped (no active goal or interrupted)".into(),
                     model: String::new(),
@@ -2405,7 +2406,9 @@ Do not mention this reminder to the user.\n</system-reminder>"
             Err(reason) => {
                 tracing::warn!("goal judge failed, accepting claim: {reason}");
                 crate::goal_judge::GoalJudgeRecord {
-                    verdict: "failopen".into(),
+                    // Fail-open is NOT a review outcome: recorded as
+                    // accepted_unreviewed so it never reads as judge approval.
+                    verdict: "accepted_unreviewed".into(),
                     gaps: Vec::new(),
                     summary: reason,
                     model: String::new(),
@@ -2502,7 +2505,7 @@ Do not mention this reminder to the user.\n</system-reminder>"
                 "Goal marked complete and cleared. Write a short final summary of the outcome for the user now, then stop.",
             )
             .with_stop_turn();
-            if record.verdict != "failopen" {
+            if record.verdict != "accepted_unreviewed" {
                 tracing::info!(
                     "Goal completion approved by judge for session {}",
                     session_id

@@ -122,7 +122,7 @@ pub enum AgentEvent {
     /// Emitted only when `[goal] judge_enabled` is on.
     GoalJudge {
         session_id: String,
-        /// "approve" | "reject" | "failopen"
+        /// "approve" | "reject" | "accepted_unreviewed"
         verdict: String,
         #[serde(default)]
         gaps: Vec<String>,
