@@ -99,6 +99,35 @@ impl GoalTool {
 
     async fn update(&self, input: &Value) -> ToolOutput {
         let status = input.get("status").and_then(|v| v.as_str()).unwrap_or("");
+        let criterion = input
+            .get("completionCriterion")
+            .or_else(|| input.get("completion_criterion"))
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|c| !c.is_empty());
+
+        if criterion.is_some() && self.goal_mgr.get_goal().await.is_none() {
+            return ToolOutput::error("No active goal.");
+        }
+
+        // Criterion-only update: refresh the acceptance bar without a
+        // lifecycle transition.
+        if status.is_empty() {
+            if let Some(criterion) = criterion {
+                self.goal_mgr.set_completion_criterion(criterion).await;
+                let body = self
+                    .goal_mgr
+                    .get_goal()
+                    .await
+                    .map(|g| serde_json::to_string_pretty(&g).unwrap_or_default())
+                    .unwrap_or_else(|| "Completion criterion updated.".into());
+                return ToolOutput::success(body);
+            }
+            return ToolOutput::error(
+                "update requires a status (active, paused, complete, or blocked) \
+                 or a completionCriterion to set.",
+            );
+        }
 
         match status {
             "complete" => {
@@ -145,6 +174,11 @@ impl GoalTool {
             }
             "active" => {
                 if self.goal_mgr.resume_goal().await {
+                    // Resume + criterion refresh is the one combined form that
+                    // keeps the goal current; terminal transitions ignore it.
+                    if let Some(criterion) = criterion {
+                        self.goal_mgr.set_completion_criterion(criterion).await;
+                    }
                     ToolOutput::success("Goal resumed.")
                 } else {
                     ToolOutput::error(
@@ -373,11 +407,12 @@ Subsumes the former CreateGoal / GetGoal / UpdateGoal / SetGoalBudget tools."
                 },
                 "completionCriterion": {
                     "type": "string",
-                    "description": "create: how to verify the goal is complete"
+                    "description": "create/update: how to verify the goal is complete. \
+        update accepts it alone or together with status=active; ignored on terminal transitions."
                 },
                 "completion_criterion": {
                     "type": "string",
-                    "description": "create: alias for completionCriterion"
+                    "description": "create/update: alias for completionCriterion"
                 },
                 "replace": {
                     "type": "boolean",
@@ -576,6 +611,89 @@ mod tests {
             assert!(out.is_error, "unexpected success: {}", out.content);
         }
         assert_eq!(mgr.get_goal().await.unwrap().budget, GoalBudget::default());
+    }
+
+    #[tokio::test]
+    async fn update_sets_completion_criterion_without_status() {
+        let mgr = Arc::new(GoalManager::new());
+        let tool = GoalTool::new(mgr.clone());
+        tool.execute(
+            serde_json::json!({"action": "create", "objective": "ship it"}),
+            &context(),
+        )
+        .await
+        .unwrap();
+
+        // Criterion-only update.
+        let out = tool
+            .execute(
+                serde_json::json!({
+                    "action": "update",
+                    "completionCriterion": "clippy clean and tests green"
+                }),
+                &context(),
+            )
+            .await
+            .unwrap();
+        assert!(!out.is_error, "unexpected error: {}", out.content);
+        assert_eq!(
+            mgr.get_goal()
+                .await
+                .unwrap()
+                .completion_criterion
+                .as_deref(),
+            Some("clippy clean and tests green")
+        );
+
+        // Alias parameter works too.
+        let out = tool
+            .execute(
+                serde_json::json!({"action": "update", "completion_criterion": "docs updated"}),
+                &context(),
+            )
+            .await
+            .unwrap();
+        assert!(!out.is_error);
+        assert_eq!(
+            mgr.get_goal()
+                .await
+                .unwrap()
+                .completion_criterion
+                .as_deref(),
+            Some("docs updated")
+        );
+
+        // Resume + criterion refresh in one call.
+        mgr.pause_goal().await;
+        let out = tool
+            .execute(
+                serde_json::json!({"action": "update", "status": "active", "completionCriterion": "bench passes"}),
+                &context(),
+            )
+            .await
+            .unwrap();
+        assert!(!out.is_error, "unexpected error: {}", out.content);
+        let goal = mgr.get_goal().await.unwrap();
+        assert_eq!(goal.status, kkagent_protocol::goal::GoalStatus::Active);
+        assert_eq!(goal.completion_criterion.as_deref(), Some("bench passes"));
+
+        // update with neither status nor criterion is an error.
+        let out = tool
+            .execute(serde_json::json!({"action": "update"}), &context())
+            .await
+            .unwrap();
+        assert!(out.is_error);
+
+        // Criterion update on a cleared goal fails.
+        mgr.complete_goal("done").await;
+        let out = tool
+            .execute(
+                serde_json::json!({"action": "update", "completionCriterion": "late"}),
+                &context(),
+            )
+            .await
+            .unwrap();
+        assert!(out.is_error);
     }
 
     #[tokio::test]

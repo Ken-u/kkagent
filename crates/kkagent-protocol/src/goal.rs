@@ -526,9 +526,23 @@ impl GoalManager {
 
     pub async fn set_completion_criterion(&self, criterion: &str) {
         let mut guard = self.inner.lock().await;
+        let mut op = None;
         if let Some(goal) = guard.current.as_mut() {
             goal.completion_criterion = Some(criterion.to_string());
             goal.updated_at = Utc::now().to_rfc3339();
+            op = Some(GoalOp::Update {
+                goal_id: Some(goal.goal_id.clone()),
+                status: None,
+                reason: Some("criterion_updated".into()),
+                turns_used: None,
+                tokens_used: None,
+                wall_clock_ms: None,
+                budget: None,
+                time: goal.updated_at.clone(),
+            });
+        }
+        if let Some(op) = op {
+            guard.journal.push(op);
             self.persist(&guard).await;
         }
     }
@@ -867,6 +881,37 @@ mod tests {
         assert!(mgr.resume_goal().await);
         assert_eq!(mgr.get_goal().await.unwrap().status, GoalStatus::Active);
         assert!(mgr.should_continue().await);
+    }
+
+    #[tokio::test]
+    async fn criterion_update_writes_journal_and_persists() {
+        let path = temp_goal_path("criterion");
+        let mgr = GoalManager::with_persist(path.clone()).await;
+        mgr.create_goal("with criteria", GoalBudget::default())
+            .await;
+        mgr.set_completion_criterion("clippy clean").await;
+
+        let goal = mgr.get_goal().await.unwrap();
+        assert_eq!(goal.completion_criterion.as_deref(), Some("clippy clean"));
+        assert!(mgr.journal().await.iter().any(|op| matches!(
+            op,
+            GoalOp::Update {
+                reason: Some(reason),
+                ..
+            } if reason == "criterion_updated"
+        )));
+
+        // Criterion survives a manager round-trip via the goal snapshot.
+        let restored = GoalManager::with_persist(path.clone()).await;
+        assert_eq!(
+            restored
+                .get_goal()
+                .await
+                .unwrap()
+                .completion_criterion
+                .as_deref(),
+            Some("clippy clean")
+        );
     }
 
     fn temp_goal_path(tag: &str) -> std::path::PathBuf {

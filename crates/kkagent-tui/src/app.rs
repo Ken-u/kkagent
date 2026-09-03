@@ -11063,6 +11063,58 @@ impl TuiApp {
                             Err(e) => self.system_message(format!("Goal budget failed: {e}")),
                         }
                     }
+                    "criterion" => {
+                        if rest.is_empty() {
+                            match self
+                                .client
+                                .rpc_call(
+                                    "session.goal",
+                                    Some(serde_json::json!({
+                                        "session_id": session_id,
+                                        "action": "criterion",
+                                    })),
+                                )
+                                .await
+                            {
+                                Ok(body) => {
+                                    let criterion = body
+                                        .pointer("/goal/completion_criterion")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("");
+                                    if criterion.is_empty() {
+                                        self.system_message("No completion criterion.".into());
+                                    } else {
+                                        self.system_message(format!(
+                                            "Completion criterion:\n{criterion}"
+                                        ));
+                                    }
+                                }
+                                Err(e) => {
+                                    self.system_message(format!("Goal criterion failed: {e}"))
+                                }
+                            }
+                        } else {
+                            match self
+                                .client
+                                .rpc_call(
+                                    "session.goal",
+                                    Some(serde_json::json!({
+                                        "session_id": session_id,
+                                        "action": "criterion",
+                                        "text": rest,
+                                    })),
+                                )
+                                .await
+                            {
+                                Ok(_) => {
+                                    self.system_message(format!("Goal criterion updated:\n{rest}"))
+                                }
+                                Err(e) => {
+                                    self.system_message(format!("Goal criterion failed: {e}"))
+                                }
+                            }
+                        }
+                    }
                     "replace" => {
                         if rest.is_empty() {
                             self.system_message("Usage: /goal replace <objective>".into());

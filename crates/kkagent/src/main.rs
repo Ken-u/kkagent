@@ -1570,6 +1570,25 @@ async fn run_print_goal(client: &mut KkagentClient, session_id: &str, args: &str
             println!("{}", serde_json::to_string_pretty(&body)?);
             return Ok(exit_codes::SUCCESS_COMPLETE);
         }
+        "criterion" => {
+            let body = if rest.is_empty() {
+                session_goal_rpc(&requester, session_id, "criterion", None).await?
+            } else {
+                requester
+                    .rpc_call(
+                        "session.goal",
+                        Some(serde_json::json!({
+                            "session_id": session_id,
+                            "action": "criterion",
+                            "text": rest,
+                        })),
+                    )
+                    .await
+                    .map_err(|error| anyhow::anyhow!("{error}"))?
+            };
+            println!("{}", serde_json::to_string_pretty(&body)?);
+            return Ok(exit_codes::SUCCESS_COMPLETE);
+        }
         "replace" => {
             if rest.is_empty() {
                 anyhow::bail!("Usage: /goal replace <objective>");
@@ -8572,6 +8591,30 @@ async fn handle_rpc_call(
                             ));
                         }
                     }
+                    Ok(body)
+                }
+                "criterion" => {
+                    let text = params
+                        .as_ref()
+                        .and_then(|p| {
+                            p.get("text")
+                                .or_else(|| p.get("criterion"))
+                                .or_else(|| p.get("completion_criterion"))
+                        })
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .trim()
+                        .to_string();
+                    if text.is_empty() {
+                        // Read semantics: snapshot includes the criterion.
+                        return Ok(goal_snapshot(&goal_mgr).await);
+                    }
+                    if goal_mgr.get_goal().await.is_none() {
+                        return Err((-32000, "No active goal.".into()));
+                    }
+                    goal_mgr.set_completion_criterion(&text).await;
+                    let body = goal_snapshot(&goal_mgr).await;
+                    publish_goal(session_id.clone(), &body, "criterion_updated");
                     Ok(body)
                 }
                 "create" | "replace" | "start" => {

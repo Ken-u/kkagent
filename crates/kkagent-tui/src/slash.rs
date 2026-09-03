@@ -107,7 +107,9 @@ pub const BUILTIN_SLASH_COMMANDS: &[SlashCommand] = &[
         aliases: &[],
         description: "Start or manage an autonomous goal",
         priority: 80,
-        argument_hint: Some("[status|pause|resume|cancel|budget <unit> <value|off>] | <objective>"),
+        argument_hint: Some(
+            "[status|pause|resume|cancel|budget <unit> <value|off>|criterion <text>] | <objective>",
+        ),
     },
     SlashCommand {
         name: "undo",
