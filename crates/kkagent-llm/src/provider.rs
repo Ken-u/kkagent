@@ -204,13 +204,22 @@ fn build_client(config: &ProviderConfig) -> anyhow::Result<reqwest::Client> {
         value.set_sensitive(true);
         headers.insert(name, value);
     }
-    Ok(reqwest::Client::builder()
+    // No default total timeout: streaming LLM responses can legitimately run
+    // for minutes, and a whole-request deadline kills healthy long
+    // generations mid-stream (surfacing as `kind=decode, kind=timeout`).
+    // Stalls are bounded by the per-read idle timeout below plus the
+    // first-token gate; a total deadline stays opt-in via
+    // `request_timeout_ms`.
+    let mut builder = reqwest::Client::builder()
         .default_headers(headers)
         .connect_timeout(std::time::Duration::from_secs(30))
-        .timeout(std::time::Duration::from_secs(300))
         .pool_max_idle_per_host(0)
         .http1_only()
-        .build()?)
+        .read_timeout(std::time::Duration::from_secs(60));
+    if let Some(ms) = config.request_timeout_ms.filter(|ms| *ms > 0) {
+        builder = builder.timeout(std::time::Duration::from_millis(ms));
+    }
+    Ok(builder.build()?)
 }
 
 pub fn create_provider(

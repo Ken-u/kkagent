@@ -25,6 +25,7 @@ TUI 问题同时查看 `~/.kkagent/kkagent.log`。分享日志前删除 token、
 | 400 / max tokens | 减小 `max_output_size`，校准 context，必要时关闭 thinking。 |
 | 400 / reasoning effort | 模型不支持的 effort 等级会被启动校验拦截；若上游仍报错，检查 `support_efforts` 是否与上游实际支持一致，或用 `/effort` 换用较低等级。 |
 | `first token timeout` | 上游迟迟不吐首字；调大模型/Provider 的 `first_token_timeout_ms`，或设 `0` 禁用；也可配置 `fallback_model`。 |
+| `error decoding response body [kind=decode, kind=timeout]` | 流式读取超时：上游/代理断流或空闲超时。流式请求默认无总超时；若为 Provider 配置了 `request_timeout_ms`，检查是否打满该上限，并排查上游与代理稳定性。 |
 | 模型不调用工具 | 加入 `capabilities = ["tool_use"]`，并确认上游支持。 |
 | 上下文过长 | `/compact`，开启 `auto_compact`，或降低 `compact_keep_last`。 |
 | 项目指令/Skill 没生效 | 在工程目录运行 `kkagent --dump-system-prompt` 查看实际合成的系统提示词，确认 `AGENTS.md`、Skill 目录段是否注入。 |

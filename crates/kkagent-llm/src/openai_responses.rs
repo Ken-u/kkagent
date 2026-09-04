@@ -151,7 +151,6 @@ pub async fn openai_responses_stream(
         .bearer_auth(api_key)
         .header("content-type", "application/json")
         .header("accept", "text/event-stream")
-        .timeout(std::time::Duration::from_secs(300))
         .body(body.to_string())
         .send()
         .await

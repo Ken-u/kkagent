@@ -804,6 +804,7 @@ async fn provision_managed_kimi_config(
                 oauth_host: oauth_host.map(str::to_string),
             }),
             first_token_timeout_ms: None,
+            request_timeout_ms: None,
             extra_fields: Default::default(),
         },
     );

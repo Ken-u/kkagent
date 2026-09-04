@@ -175,7 +175,6 @@ pub async fn anthropic_stream(
         .header("anthropic-version", "2023-06-01")
         .header("content-type", "application/json")
         .header("accept", "text/event-stream")
-        .timeout(std::time::Duration::from_secs(300))
         .body(body.to_string())
         .send()
         .await
@@ -621,7 +620,6 @@ async fn chat_completions_stream(
         .bearer_auth(api_key)
         .header("content-type", "application/json")
         .header("accept", "text/event-stream")
-        .timeout(std::time::Duration::from_secs(300))
         .body(body.to_string())
         .send()
         .await
@@ -892,7 +890,6 @@ pub async fn google_stream(
         .post(&url)
         .header("content-type", "application/json")
         .header("accept", "text/event-stream")
-        .timeout(std::time::Duration::from_secs(300))
         .body(body.to_string())
         .send()
         .await

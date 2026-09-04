@@ -31,6 +31,7 @@ api_key = "sk-your-key-here"
 base_url = "http://127.0.0.1:3000"
 # custom_headers = { "X-Organization" = "example" }
 # first_token_timeout_ms = 30000  # provider 级首字超时；模型级可覆盖；0 禁用
+# request_timeout_ms = 600000     # 单请求总超时；不设置或 0 禁用（流式由首字超时 + 60s 逐读空闲超时兜底）
 
 [models."local/default"]
 provider = "local"

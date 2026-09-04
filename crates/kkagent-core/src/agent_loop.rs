@@ -4184,6 +4184,7 @@ mod retry_tests {
                 custom_headers: HashMap::new(),
                 oauth: None,
                 first_token_timeout_ms: None,
+                request_timeout_ms: None,
                 extra_fields: Default::default(),
             },
         );
@@ -4311,6 +4312,7 @@ mod retry_tests {
                 custom_headers: HashMap::new(),
                 oauth: None,
                 first_token_timeout_ms: None,
+                request_timeout_ms: None,
                 extra_fields: Default::default(),
             },
         );
@@ -4488,6 +4490,7 @@ mod retry_tests {
                     custom_headers: HashMap::new(),
                     oauth: None,
                     first_token_timeout_ms: None,
+                    request_timeout_ms: None,
                     extra_fields: Default::default(),
                 },
             );
@@ -4598,6 +4601,7 @@ mod retry_tests {
                 custom_headers: HashMap::new(),
                 oauth: None,
                 first_token_timeout_ms: None,
+                request_timeout_ms: None,
                 extra_fields: Default::default(),
             },
         );
@@ -4725,6 +4729,7 @@ mod retry_tests {
                     custom_headers: HashMap::new(),
                     oauth: None,
                     first_token_timeout_ms: None,
+                    request_timeout_ms: None,
                     extra_fields: Default::default(),
                 },
             );
@@ -4894,6 +4899,7 @@ mod retry_tests {
                 custom_headers: HashMap::new(),
                 oauth: None,
                 first_token_timeout_ms: None,
+                request_timeout_ms: None,
                 extra_fields: Default::default(),
             },
         );
@@ -5068,6 +5074,7 @@ mod retry_tests {
                 custom_headers: HashMap::new(),
                 oauth: None,
                 first_token_timeout_ms: None,
+                request_timeout_ms: None,
                 extra_fields: Default::default(),
             },
         );
@@ -5145,6 +5152,7 @@ mod retry_tests {
                 custom_headers: HashMap::new(),
                 oauth: None,
                 first_token_timeout_ms: None,
+                request_timeout_ms: None,
                 extra_fields: Default::default(),
             },
         );
@@ -5597,6 +5605,7 @@ mod retry_tests {
                 custom_headers: HashMap::new(),
                 oauth: None,
                 first_token_timeout_ms: None,
+                request_timeout_ms: None,
                 extra_fields: Default::default(),
             },
         );
@@ -5700,6 +5709,7 @@ mod retry_tests {
                 custom_headers: HashMap::new(),
                 oauth: None,
                 first_token_timeout_ms: None,
+                request_timeout_ms: None,
                 extra_fields: Default::default(),
             },
         );
@@ -5810,6 +5820,7 @@ mod retry_tests {
                 custom_headers: HashMap::new(),
                 oauth: None,
                 first_token_timeout_ms: None,
+                request_timeout_ms: None,
                 extra_fields: Default::default(),
             },
         );
@@ -6004,6 +6015,7 @@ mod retry_tests {
                 custom_headers: HashMap::new(),
                 oauth: None,
                 first_token_timeout_ms: None,
+                request_timeout_ms: None,
                 extra_fields: Default::default(),
             },
         );
@@ -6255,6 +6267,7 @@ mod retry_tests {
                 custom_headers: HashMap::new(),
                 oauth: None,
                 first_token_timeout_ms: None,
+                request_timeout_ms: None,
                 extra_fields: Default::default(),
             },
         );

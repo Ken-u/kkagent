@@ -516,6 +516,11 @@ pub struct ProviderConfig {
     /// Model-level config wins; `0` disables. See [`resolve_first_token_timeout`].
     #[serde(default)]
     pub first_token_timeout_ms: Option<u64>,
+    /// Total HTTP request timeout (milliseconds) for this provider's LLM
+    /// requests. Unset or `0` disables it — streaming is then bounded only by
+    /// the first-token gate and the per-read idle timeout (60s).
+    #[serde(default)]
+    pub request_timeout_ms: Option<u64>,
     /// Unknown keys captured for diagnostics. A key here almost always means
     /// either a typo or — much more commonly — that the key physically belongs
     /// to the *following* TOML table (TOML assigns keys to the nearest
@@ -1516,7 +1521,7 @@ impl AppConfig {
     /// Resolve streaming first-token timeout for a model/provider pair.
     ///
     /// Priority: model (`Some(0)` disables) → provider (`Some(0)` disables) → default 60s.
-    /// Values ≥ 300s are clamped to 290s (below the HTTP total timeout).
+    /// Values ≥ 300s are clamped to 290s.
     pub fn resolve_first_token_timeout(
         model: &ModelConfig,
         provider: &ProviderConfig,
@@ -1701,6 +1706,7 @@ mod tests {
                 custom_headers: HashMap::new(),
                 oauth: None,
                 first_token_timeout_ms: None,
+                request_timeout_ms: None,
                 extra_fields: BTreeMap::new(),
             },
         );
@@ -1752,6 +1758,7 @@ mod tests {
             custom_headers: HashMap::new(),
             oauth: None,
             first_token_timeout_ms: Some(30_000),
+            request_timeout_ms: None,
             extra_fields: BTreeMap::new(),
         };
         assert_eq!(
