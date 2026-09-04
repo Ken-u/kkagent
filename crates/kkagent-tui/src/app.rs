@@ -9371,10 +9371,7 @@ impl TuiApp {
     }
 
     async fn discard_session_record(&mut self, session_id: &str) -> anyhow::Result<()> {
-        let params = serde_json::json!({"session_id": session_id});
-        self.client
-            .rpc_call("sessions.delete", Some(params))
-            .await?;
+        self.client.discard_session_record(session_id).await?;
         self.state.tab_strip.tabs.retain(|t| t.id != session_id);
         self.state
             .workspace_sessions
@@ -14337,9 +14334,9 @@ mod app_state_tests {
                 let deleted_tx = deleted_tx.clone();
                 async move {
                     match method.as_str() {
-                        "sessions.delete" => {
+                        "sessions.discard" => {
                             deleted_tx.send(params.unwrap_or_default()).unwrap();
-                            Ok(serde_json::json!({"deleted": true}))
+                            Ok(serde_json::json!({"discarded": true}))
                         }
                         "usage.history" => Ok(serde_json::json!({"days": 30, "available": false})),
                         other => panic!("unexpected RPC method: {other}"),

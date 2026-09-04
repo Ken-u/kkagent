@@ -2307,6 +2307,32 @@ async fn ensure_session_loaded(state: &Arc<ServerState>, session_id: &str) -> Re
     Ok(())
 }
 
+/// Shared teardown for `sessions.delete` / `sessions.discard`: archive the
+/// transcript record, evict in-memory runtime state and close services.
+async fn remove_session_runtime(state: &Arc<ServerState>, session_id: &str) {
+    {
+        let db = state.transcript.lock().await;
+        let _ = db.archive_session(session_id);
+    }
+    let removed = state.sessions.lock().await.remove(session_id);
+    state.interrupt_flags.lock().await.remove(session_id);
+    state.model_aliases.lock().await.remove(session_id);
+    state.fallback_models.lock().await.remove(session_id);
+    state.permission_modes.lock().await.remove(session_id);
+    state.plan_mode_requests.lock().await.remove(session_id);
+    state.approval_txs.lock().await.remove(session_id);
+    state.question_txs.lock().await.remove(session_id);
+    state.steer_mailboxes.lock().await.remove(session_id);
+    state.active_btw_sessions.lock().await.remove(session_id);
+    state.drop_goal(session_id).await;
+    state.goal_judge_records.lock().await.remove(session_id);
+    state.judge_chat_history.lock().await.remove(session_id);
+    state.judge_chat_locks.lock().await.remove(session_id);
+    if let Some(session) = removed {
+        session.services.on_close(SessionCloseReason::Exit).await;
+    }
+}
+
 async fn recover_durable_turns(backend: Arc<AgentHttpBackend>) {
     let turns = match backend.state.durable_http.recoverable_turns() {
         Ok(turns) => turns,
@@ -7529,6 +7555,27 @@ async fn handle_rpc_call(
                 ));
             }
             let store = SessionStore::open_default();
+            if store.get(source_id).is_err() {
+                // Index miss: the session may still exist in the transcript DB
+                // (e.g. tombstoned by an over-eager discard, or a DB-only
+                // copy from another machine). Fall back to the DB record and
+                // backfill the disk-store index so fork can proceed.
+                let record = {
+                    let db = state.transcript.lock().await;
+                    db.get_session(source_id)
+                        .map_err(|e| (-32000, e.to_string()))?
+                };
+                if let Some(record) = record {
+                    let work_dir = PathBuf::from(&record.working_dir);
+                    let title = record.title;
+                    store
+                        .backfill(source_id, &work_dir)
+                        .map_err(|e| (-32000, e.to_string()))?;
+                    if let Some(title) = title.as_deref().filter(|t| !t.trim().is_empty()) {
+                        let _ = store.rename(source_id, title);
+                    }
+                }
+            }
             let summary = match message_limit {
                 Some(limit) => store.fork_with_message_limit(source_id, &target_id, title, limit),
                 None => store.fork(source_id, &target_id, title, turn_index),
@@ -7603,30 +7650,65 @@ async fn handle_rpc_call(
             SessionStore::open_default()
                 .delete(&session_id)
                 .map_err(|e| (-32000, e.to_string()))?;
-            {
-                let db = state.transcript.lock().await;
-                let _ = db.archive_session(&session_id);
-            }
-            let removed = state.sessions.lock().await.remove(&session_id);
-            state.interrupt_flags.lock().await.remove(&session_id);
-            state.model_aliases.lock().await.remove(&session_id);
-            state.fallback_models.lock().await.remove(&session_id);
-            state.permission_modes.lock().await.remove(&session_id);
-            state.plan_mode_requests.lock().await.remove(&session_id);
-            state.approval_txs.lock().await.remove(&session_id);
-            state.question_txs.lock().await.remove(&session_id);
-            state.steer_mailboxes.lock().await.remove(&session_id);
-            state.active_btw_sessions.lock().await.remove(&session_id);
-            state.drop_goal(&session_id).await;
-            state.goal_judge_records.lock().await.remove(&session_id);
-            state.judge_chat_history.lock().await.remove(&session_id);
-            state.judge_chat_locks.lock().await.remove(&session_id);
-            if let Some(session) = removed {
-                session.services.on_close(SessionCloseReason::Exit).await;
-            }
+            remove_session_runtime(&state, &session_id).await;
             drop(_turn_permit);
             state.turn_locks.remove(&session_id).await;
             Ok(serde_json::json!({"session_id": session_id, "deleted": true}))
+        }
+        "sessions.discard" => {
+            // Auto-discard path used by the TUI for "empty" sessions. The
+            // emptiness verdict is authoritative on the server: if the
+            // transcript DB or the on-disk store still holds messages, the
+            // delete is refused instead of silently dropping real history
+            // (previously a fast exit before the transcript finished loading
+            // could tombstone a session that was actually in use).
+            let session_id = params
+                .as_ref()
+                .and_then(|p| p.get("session_id"))
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| (-32602, "Missing session_id".into()))?
+                .to_string();
+            let _turn_permit = state
+                .turn_locks
+                .try_acquire(&session_id)
+                .await
+                .map_err(|message| (-32001, message))?;
+            let db_messages = {
+                let db = state.transcript.lock().await;
+                db.load_messages(&session_id)
+                    .map_err(|e| (-32000, e.to_string()))?
+                    .len()
+            };
+            if db_messages > 0 {
+                drop(_turn_permit);
+                return Err((
+                    -32000,
+                    format!(
+                        "refusing to discard session {session_id}: {db_messages} message(s) in transcript"
+                    ),
+                ));
+            }
+            if let Ok(summary) = SessionStore::open_default().get(&session_id) {
+                let messages_path = Path::new(&summary.session_dir).join("messages.jsonl");
+                if let Ok(text) = std::fs::read_to_string(&messages_path) {
+                    if text.lines().any(|line| !line.trim().is_empty()) {
+                        drop(_turn_permit);
+                        return Err((
+                            -32000,
+                            format!(
+                                "refusing to discard session {session_id}: non-empty on-disk transcript"
+                            ),
+                        ));
+                    }
+                }
+            }
+            SessionStore::open_default()
+                .delete(&session_id)
+                .map_err(|e| (-32000, e.to_string()))?;
+            remove_session_runtime(&state, &session_id).await;
+            drop(_turn_permit);
+            state.turn_locks.remove(&session_id).await;
+            Ok(serde_json::json!({"session_id": session_id, "discarded": true}))
         }
         "session.preview" => {
             let session_id = params

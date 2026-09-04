@@ -231,6 +231,36 @@ impl SessionStore {
         Ok(())
     }
 
+    /// Recreate the index entry and on-disk metadata for a session that is
+    /// present in the transcript DB but missing from `session_index.jsonl`
+    /// (e.g. tombstoned by an over-eager discard, or lost when data was
+    /// copied between machines). Never overwrites an existing index entry or
+    /// directory. Returns `Ok(None)` when the entry already exists.
+    pub fn backfill(&self, id: &str, work_dir: &Path) -> anyhow::Result<Option<SessionSummary>> {
+        if !is_safe_session_id(id) {
+            anyhow::bail!("unsafe session id: {id}");
+        }
+        if self.find_entry(id)?.is_some() {
+            return Ok(None);
+        }
+        let work = normalize_work_dir(work_dir);
+        let dir = self.session_dir_for(id, &work)?;
+        std::fs::create_dir_all(&dir)?;
+        let result = (|| {
+            let meta = SessionMetadataService::load_or_create(&dir, id, &work)?;
+            append_session_index_entry(
+                &self.home_dir,
+                &SessionIndexEntry {
+                    session_id: id.to_string(),
+                    session_dir: dir.to_string_lossy().into(),
+                    work_dir: work.to_string_lossy().into(),
+                },
+            )?;
+            anyhow::Ok(Some(summary_from_meta(id, &dir, &work, meta.read())))
+        })();
+        cleanup_failed_session_dir(&dir, result)
+    }
+
     /// Sweep legacy `sub-*` index entries left behind by old builds that
     /// persisted subagent runs as real sessions (shell with no transcript
     /// content). Each candidate is only removed when its metadata confirms it
@@ -492,6 +522,43 @@ fn truncate_transcript_at_turn(session_dir: &Path, turn_index: usize) -> anyhow:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn backfill_restores_tombstoned_session() {
+        let home = std::env::temp_dir().join(format!("kkagent-store-{}", uuid::Uuid::new_v4()));
+        let store = SessionStore::new(&home);
+        let work = home.join("proj");
+        std::fs::create_dir_all(&work).unwrap();
+
+        let created = store.create("bf1", &work).unwrap();
+        std::fs::write(
+            Path::new(&created.session_dir).join("messages.jsonl"),
+            "{\"role\":\"user\"}\n",
+        )
+        .unwrap();
+        // Simulate a discard: delete the store (removes dir + tombstones index).
+        store.delete("bf1").unwrap();
+        assert!(store.get("bf1").is_err());
+
+        // Recreate the directory the way a running server would when the
+        // session keeps being used after the delete.
+        let dir = store.session_dir_for("bf1", &work).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Backfill is a no-op while the index still holds an entry… (here the
+        // entry is tombstoned, so it proceeds) and refuses to overwrite an
+        // existing entry.
+        let summary = store.backfill("bf1", &work).unwrap().expect("backfilled");
+        assert_eq!(summary.id, "bf1");
+        assert_eq!(summary.work_dir, work);
+        assert!(store.get("bf1").is_ok());
+
+        // Second backfill must not clobber the existing entry.
+        assert!(store.backfill("bf1", &work).unwrap().is_none());
+        assert!(store.get("bf1").is_ok());
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
 
     #[test]
     fn create_rolls_back_directory_when_index_append_fails() {

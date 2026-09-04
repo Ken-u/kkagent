@@ -170,6 +170,19 @@ impl KkagentClient {
         Ok(())
     }
 
+    /// Server-side auto-discard of an "empty" session. The server refuses the
+    /// delete when the transcript DB or on-disk store still holds messages,
+    /// so a fast exit before the transcript finished loading can no longer
+    /// tombstone a session that is actually in use.
+    pub async fn discard_session_record(&self, session_id: &str) -> anyhow::Result<()> {
+        let params = serde_json::json!({"session_id": session_id});
+        self.rpc
+            .call("sessions.discard", Some(params))
+            .await
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        Ok(())
+    }
+
     pub async fn fork_session(
         &self,
         session_id: &str,
