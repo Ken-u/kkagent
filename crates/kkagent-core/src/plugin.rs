@@ -211,8 +211,10 @@ impl PluginSubagentSpec {
 
     /// Symbolic model alias tokens accepted by the `model` field.
     /// Expansion follows the standard token machinery
-    /// (`expand_model_alias_token`); raw model ids are not accepted.
-    pub const MODEL_ALIASES: [&'static str; 4] = ["default", "fast", "current", "secondary"];
+    /// (`expand_model_alias_token`); raw model ids and the retired v1
+    /// spellings `default` / `secondary` are not accepted — startup
+    /// migration rewrites them in installed manifests.
+    pub const MODEL_ALIASES: [&'static str; 4] = ["quality", "balance", "fast", "current"];
 
     /// The declared model alias, trimmed and lowercased, if it is one of
     /// [`MODEL_ALIASES`](Self::MODEL_ALIASES). Anything else (raw model
@@ -1313,9 +1315,19 @@ mod tests {
                         "model": "fast"
                     },
                     {
+                        "name": "quality-bound",
+                        "transport": "internal",
+                        "model": "QUALITY"
+                    },
+                    {
                         "name": "valid",
                         "transport": "internal",
-                        "model": " secondary "
+                        "model": " balance "
+                    },
+                    {
+                        "name": "legacy-rejected",
+                        "transport": "internal",
+                        "model": "secondary"
                     }
                 ]
             })
@@ -1338,8 +1350,14 @@ mod tests {
         // Raw model ids are not a binding — alias-only by design.
         assert_eq!(by_name("raw-id").model_alias(), None);
         assert_eq!(by_name("acp-bound").model_alias(), Some("fast".into()));
+        assert_eq!(
+            by_name("quality-bound").model_alias(),
+            Some("quality".into())
+        );
         // Whitespace is trimmed.
-        assert_eq!(by_name("valid").model_alias(), Some("secondary".into()));
+        assert_eq!(by_name("valid").model_alias(), Some("balance".into()));
+        // The v1 spellings are retired, not aliased.
+        assert_eq!(by_name("legacy-rejected").model_alias(), None);
 
         let diagnostics = manager
             .list()

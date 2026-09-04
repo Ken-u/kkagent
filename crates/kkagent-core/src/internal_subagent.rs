@@ -6,7 +6,7 @@
 //!
 //! - carry its own **system prompt** (`spec.system_prompt`);
 //! - **bind a model alias at declaration time** (`spec.model`) — one of
-//!   `default` / `fast` / `current` / `secondary`, expanded like every
+//!   `quality` / `balance` / `fast` / `current`, expanded like every
 //!   other symbolic token and overriding the delegation request's `model`;
 //! - restrict its tool set to an **allowlist** (`spec.tools`) — core tools,
 //!   the Web tool and plugin-private MCP tools all qualify for filtering;
@@ -39,10 +39,10 @@ const MAX_ROUNDS: u32 = 24;
 /// Resolve the model an internal plugin subagent runs with.
 ///
 /// A valid declaration-time alias binding (`spec.model`, one of
-/// `default`/`fast`/`current`/`secondary`) wins over the delegation
-/// request's `model` token; without a binding the standard subagent chain
-/// applies (request token → `[subagent.default_models]` for `general` →
-/// global `secondary_model` → `default_model`).
+/// `quality`/`balance`/`fast`/`current`) wins over the delegation request's
+/// `model` token; without a binding the standard subagent chain applies
+/// (request token → `[subagent.default_models]` for `general` → global
+/// `balance_model` → `default_model`).
 pub fn resolve_internal_subagent_model(
     spec: &PluginSubagentSpec,
     app_config: &kkagent_config::AppConfig,
@@ -318,7 +318,7 @@ mod tests {
         kkagent_config::AppConfig {
             default_model: Some(default.to_string()),
             fast_model: fast.map(str::to_string),
-            secondary_model: secondary.map(str::to_string),
+            balance_model: secondary.map(str::to_string),
             ..Default::default()
         }
     }
@@ -337,8 +337,19 @@ mod tests {
             spec_with_model(Some(" secondary "))
                 .model_alias()
                 .as_deref(),
-            Some("secondary")
+            None
         );
+        assert_eq!(
+            spec_with_model(Some("Quality")).model_alias().as_deref(),
+            Some("quality")
+        );
+        assert_eq!(
+            spec_with_model(Some("Balance")).model_alias().as_deref(),
+            Some("balance")
+        );
+        // The v1 spellings are retired, not aliased.
+        assert_eq!(spec_with_model(Some("secondary")).model_alias(), None);
+        assert_eq!(spec_with_model(Some("default")).model_alias(), None);
         assert_eq!(spec_with_model(Some("test/model")).model_alias(), None);
         assert_eq!(spec_with_model(Some("")).model_alias(), None);
         assert_eq!(spec_with_model(None).model_alias(), None);

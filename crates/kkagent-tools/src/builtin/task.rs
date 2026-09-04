@@ -790,8 +790,8 @@ impl Tool for AgentTool {
                 "subagent_type": {"type": "string", "description": "Alias for profile"},
                 "model": {
                     "type": "string",
-                    "enum": ["default", "fast", "current"],
-                    "description": "Model token: default = top-level default_model; fast = fast_model (falls back to secondary_model, then default_model); current = parent session model. Omit to use [subagent.default_models] for the profile"
+                    "enum": ["quality", "balance", "fast", "current"],
+                    "description": "Model token: quality = high-quality primary model (top-level default_model); balance = mid-tier model (balance_model, falls back to default_model); fast = fast_model (falls back to balance_model, then default_model); current = parent session model. Omit to use [subagent.default_models] for the profile"
                 },
                 "resume": {
                     "type": "string",
@@ -826,7 +826,7 @@ impl Tool for AgentTool {
                             "profile": {"type": "string"},
                             "model": {
                                 "type": "string",
-                                "enum": ["default", "fast", "current"],
+                                "enum": ["quality", "balance", "fast", "current"],
                                 "description": "Per-agent model token (same semantics as top-level model)"
                             }
                         },

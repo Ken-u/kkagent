@@ -1722,6 +1722,13 @@ impl TuiApp {
         {
             self.system_message(hint);
         }
+
+        // Surface config-schema migration notes performed by the embedded
+        // server during startup (same process). Empty in remote/server mode —
+        // those deployments log the same lines instead.
+        for notice in kkagent_config::take_startup_notices() {
+            self.system_message(notice);
+        }
         if self.config.ui.check_updates && crate::version_check::cache_is_stale() {
             self.jobs.spawn_version_check();
         }

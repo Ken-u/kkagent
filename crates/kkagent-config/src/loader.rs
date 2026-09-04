@@ -257,6 +257,18 @@ pub fn load_config(path: Option<&Path>) -> Result<AppConfig> {
         tracing::info!("Config file not found at {:?}, using defaults", config_path);
         AppConfig::default()
     } else {
+        // Bring the stored config up to the current schema before parsing.
+        // Migration is lossless (toml_edit) and backs up the original; a
+        // failure here must never block startup — the regular parse below
+        // will surface real problems.
+        if let Err(error) = crate::migrate::migrate_config_file(&config_path) {
+            tracing::warn!("config migration skipped: {error:#}");
+        }
+        if let Err(error) =
+            crate::migrate::migrate_plugin_manifests(&default_config_dir().join("plugins"))
+        {
+            tracing::warn!("plugin manifest migration skipped: {error:#}");
+        }
         let content = std::fs::read_to_string(&config_path)
             .with_context(|| format!("Failed to read config: {config_path:?}"))?;
         toml::from_str(&content)
@@ -358,7 +370,8 @@ fn recognized_env_key(name: &str) -> bool {
     matches!(
         name,
         "KKAGENT_DEFAULT_MODEL"
-            | "KKAGENT_SECONDARY_MODEL"
+            | "KKAGENT_QUALITY_MODEL"
+            | "KKAGENT_BALANCE_MODEL"
             | "KKAGENT_COMPACTION_MODEL"
             | "KKAGENT_IMAGE_MAX_EDGE_PX"
             | "KKAGENT_IMAGE_READ_BYTE_BUDGET"
@@ -382,8 +395,11 @@ fn apply_env_overrides(config: &mut AppConfig) {
     if let Ok(v) = std::env::var("KKAGENT_DEFAULT_MODEL") {
         config.default_model = Some(v);
     }
-    if let Ok(v) = std::env::var("KKAGENT_SECONDARY_MODEL") {
-        config.secondary_model = Some(v);
+    if let Ok(v) = std::env::var("KKAGENT_QUALITY_MODEL") {
+        config.quality_model = Some(v);
+    }
+    if let Ok(v) = std::env::var("KKAGENT_BALANCE_MODEL") {
+        config.balance_model = Some(v);
     }
     if let Ok(v) = std::env::var("KKAGENT_COMPACTION_MODEL") {
         config.compaction_model = Some(v);

@@ -2,8 +2,9 @@
 # 密钥也可通过 ANTHROPIC_API_KEY / OPENAI_API_KEY / KIMI_API_KEY / GOOGLE_API_KEY 提供。
 
 default_model = "local/default"
-# secondary_model = "local/fast"   # 未配置 [subagent.default_models] 时，子 Agent 回退到此模型
-# fast_model = "local/cheap"       # 符号 `fast` 的目标模型；未配置时回退 secondary_model，再回退 default_model
+# quality_model = "local/max"      # quality 档的目标模型；未配置时回退 default_model
+# balance_model = "local/fast"     # 中间档模型；未配置 [subagent.default_models] 时，子 Agent 回退到此模型
+# fast_model = "local/cheap"       # 符号 `fast` 的目标模型；未配置时回退 balance_model，再回退 default_model
 default_permission_mode = "manual" # manual | yolo | auto
 default_plan_mode = false
 merge_all_available_skills = false  # true 会把所有 Skill 正文加入初始上下文
@@ -86,7 +87,7 @@ token_counting = "measured+estimated" # measured+estimated | measured | estimate
 # [subagent.default_models]
 # explore = "current"     # 跟随父会话当前模型
 # coder = "default"       # 使用顶层 default_model
-# general = "fast"        # fast_model → secondary_model → default_model
+# general = "fast"        # fast_model → balance_model → default_model
 # fallback = "secondary"  # 未单独列出的 profile 回退
 
 [image]

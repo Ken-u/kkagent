@@ -508,7 +508,7 @@ fn build_summarizer_messages(
 
 /// Resolve the model alias used for compaction summaries.
 ///
-/// Priority: `compaction_model` > `secondary_model` > session model alias >
+/// Priority: `compaction_model` > `balance_model` > session model alias >
 /// `default_model`. Empty strings are ignored.
 pub fn resolve_compaction_model_alias(
     config: &AppConfig,
@@ -518,7 +518,7 @@ pub fn resolve_compaction_model_alias(
         .compaction_model
         .clone()
         .filter(|m| !m.is_empty())
-        .or_else(|| config.secondary_model.clone().filter(|m| !m.is_empty()))
+        .or_else(|| config.balance_model.clone().filter(|m| !m.is_empty()))
         .or_else(|| {
             session_model_alias.and_then(|s| {
                 // Only honor aliases that still resolve; stale session aliases
@@ -974,8 +974,8 @@ mod tests {
         empty.default_model = None;
         assert_eq!(resolve_compaction_model_alias(&empty, Some("")), None);
 
-        // secondary_model outranks session alias and default.
-        config.secondary_model = Some("secondary".into());
+        // balance_model outranks session alias and default.
+        config.balance_model = Some("secondary".into());
         assert_eq!(
             resolve_compaction_model_alias(&config, Some("session")),
             Some("secondary".into())

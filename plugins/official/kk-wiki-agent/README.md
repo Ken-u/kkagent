@@ -20,7 +20,7 @@ agent 的私有 MCP：**只在委派发生时懒加载启动**，用完即弃，
 ## 自定义
 
 - `systemPrompt`：子 agent 人设；
-- `model`：声明即绑定的模型别名（`default` / `fast` / `current` / `secondary`），
+- `model`：声明即绑定的模型别名（`quality` / `balance` / `fast` / `current`），
   固定该子 agent 的模型档位，优先于委派时的 `model` 参数；别名以外的值会被忽略
   并记入插件诊断；
 - `tools`：allowlist，未列出的工具（含 core/MCP）全部不可用；

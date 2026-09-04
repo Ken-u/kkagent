@@ -728,7 +728,7 @@ impl Tool for AgentSwarmTool {
                             },
                             "model": {
                                 "type": "string",
-                                "enum": ["default", "fast", "current"],
+                                "enum": ["quality", "balance", "fast", "current"],
                                 "description": "Per-agent model token (same semantics as top-level model)"
                             }
                         },
@@ -747,8 +747,8 @@ impl Tool for AgentSwarmTool {
                 },
                 "model": {
                     "type": "string",
-                    "enum": ["default", "fast", "current"],
-                    "description": "Default model token for spawned members: default = top-level default_model; fast = fast_model (falls back to secondary_model, then default_model); current = parent session model. Omit to use [subagent.default_models] per profile"
+                    "enum": ["quality", "balance", "fast", "current"],
+                    "description": "Default model token for spawned members: quality = high-quality primary model (top-level default_model); balance = mid-tier model (balance_model, falls back to default_model); fast = fast_model (falls back to balance_model, then default_model); current = parent session model. Omit to use [subagent.default_models] per profile"
                 }
             }
         })

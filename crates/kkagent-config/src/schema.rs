@@ -7,23 +7,30 @@ use crate::toolchain::ToolchainConfig;
 pub struct AppConfig {
     #[serde(default)]
     pub default_model: Option<String>,
+    /// High-quality model alias (the `quality` token's target). Falls back
+    /// to `default_model` when unset. Distinct from `default_model`, which
+    /// only decides what model a *new session* starts with.
+    #[serde(default)]
+    pub quality_model: Option<String>,
     /// Global fallback model alias used after the primary model exhausts its
     /// normal per-step retry budget.
     #[serde(default)]
     pub fallback_model: Option<String>,
-    /// Optional secondary model alias used as a global fallback for
+    /// Mid-tier model alias (`balance` slot): used as a global fallback for
     /// subagents (after per-profile `[subagent.default_models]`) and as a
     /// mid-priority compaction summarizer when `compaction_model` is unset.
-    #[serde(default)]
-    pub secondary_model: Option<String>,
+    /// Named `secondary_model` before config schema v2; startup migration
+    /// renames the key.
+    #[serde(default, alias = "secondary_model")]
+    pub balance_model: Option<String>,
     /// Optional fast/cheap model alias targeted at subagents. The symbolic
     /// token `fast` (in tool `model` overrides and
     /// `[subagent.default_models]` values) resolves here first, then
-    /// `secondary_model`, then `default_model`.
+    /// `balance_model`, then `default_model`.
     #[serde(default)]
     pub fast_model: Option<String>,
     /// Dedicated model alias for history compaction summaries. When set it
-    /// takes precedence over `secondary_model`, the session model and
+    /// takes precedence over `balance_model`, the session model and
     /// `default_model` when resolving the compaction summarizer.
     #[serde(default)]
     pub compaction_model: Option<String>,
@@ -138,10 +145,10 @@ pub struct SubagentSettings {
     /// dedicated entry.
     ///
     /// Values may be a real `[models]` alias, or one of the symbolic tokens
-    /// `current` (parent session model), `default` (top-level
-    /// `default_model`), `fast` (top-level `fast_model`, falling back to
-    /// `secondary_model` then `default_model`), or `secondary` (top-level
-    /// `secondary_model`, falling back to `default_model` when unset).
+    /// `quality` (top-level `default_model`), `balance` (top-level
+    /// `balance_model`, falling back to `default_model`), `fast`
+    /// (top-level `fast_model`, falling back to `balance_model` then
+    /// `default_model`), or `current` (parent session model).
     #[serde(default)]
     pub default_models: HashMap<String, String>,
 }
@@ -190,12 +197,13 @@ impl SubagentSettings {
 }
 
 /// Reserved model tokens usable in `[subagent.default_models]` values and
-/// tool `model` overrides. Tool schemas only expose `current` / `default` /
-/// `fast`; `secondary` remains accepted for config-level compatibility.
+/// tool `model` overrides. Tool schemas expose exactly these; the v1
+/// spellings `default` / `secondary` are no longer accepted and are
+/// rewritten automatically at startup (see [`crate::migrate`]).
 pub fn is_symbolic_model_alias(token: &str) -> bool {
     matches!(
         token.trim().to_ascii_lowercase().as_str(),
-        "current" | "default" | "fast" | "secondary"
+        "quality" | "balance" | "fast" | "current"
     )
 }
 
@@ -637,7 +645,7 @@ pub struct GoalConfig {
     /// before accepting it. Off by default (legacy behavior).
     pub judge_enabled: bool,
     /// Model alias for the judge agent. Empty/None falls back to the
-    /// compaction resolution chain (`compaction_model` > `secondary_model` >
+    /// compaction resolution chain (`compaction_model` > `balance_model` >
     /// session model > `default_model`).
     pub judge_model: Option<String>,
     /// Rejects tolerated before the goal is blocked instead of continued.
@@ -1373,10 +1381,16 @@ impl AppConfig {
         if !self.models.contains_key(default_model) {
             anyhow::bail!("default_model {default_model} is not present in [models]");
         }
-        if let Some(secondary) = self.secondary_model.as_deref() {
+        if let Some(quality) = self.quality_model.as_deref() {
+            let quality = quality.trim();
+            if !quality.is_empty() && !self.models.contains_key(quality) {
+                anyhow::bail!("quality_model {quality} is not present in [models]");
+            }
+        }
+        if let Some(secondary) = self.balance_model.as_deref() {
             let secondary = secondary.trim();
             if !secondary.is_empty() && !self.models.contains_key(secondary) {
-                anyhow::bail!("secondary_model {secondary} is not present in [models]");
+                anyhow::bail!("balance_model {secondary} is not present in [models]");
             }
         }
         if let Some(fast) = self.fast_model.as_deref() {
@@ -1399,7 +1413,7 @@ impl AppConfig {
             if is_symbolic_model_alias(alias) {
                 anyhow::bail!(
                     "model alias '{alias}' collides with a reserved symbolic token \
-                     (current/default/fast/secondary); rename it in [models]"
+                     (quality/balance/fast/current); rename it in [models]"
                 );
             }
         }
@@ -1522,22 +1536,34 @@ impl AppConfig {
 
     /// Expand a model token that may be a symbolic alias.
     ///
+    /// - `quality` → `quality_model`, else `default_model`
+    /// - `balance` → `balance_model`, else `default_model`
     /// - `current` → `current_model`, else `default_model`
-    /// - `default` → `default_model`
-    /// - `fast` → `fast_model`, else `secondary_model`, else `default_model`
-    /// - `secondary` → `secondary_model`, else `default_model`
+    /// - `fast` → `fast_model`, else `balance_model`, else `default_model`
     /// - anything else → returned trimmed as-is
     pub fn expand_model_alias_token(&self, token: &str, current_model: Option<&str>) -> String {
         match token.trim().to_ascii_lowercase().as_str() {
-            "current" => current_model
+            "quality" => self
+                .quality_model
+                .as_deref()
                 .map(str::trim)
                 .filter(|model| !model.is_empty())
                 .map(|model| model.to_string())
                 .or_else(|| self.default_model_alias().map(|model| model.to_string()))
                 .unwrap_or_else(|| "default".into()),
-            "default" => self
-                .default_model_alias()
+            "balance" => self
+                .balance_model
+                .as_deref()
+                .map(str::trim)
+                .filter(|model| !model.is_empty())
                 .map(|model| model.to_string())
+                .or_else(|| self.default_model_alias().map(|model| model.to_string()))
+                .unwrap_or_else(|| "default".into()),
+            "current" => current_model
+                .map(str::trim)
+                .filter(|model| !model.is_empty())
+                .map(|model| model.to_string())
+                .or_else(|| self.default_model_alias().map(|model| model.to_string()))
                 .unwrap_or_else(|| "default".into()),
             "fast" => self
                 .fast_model
@@ -1546,20 +1572,12 @@ impl AppConfig {
                 .filter(|model| !model.is_empty())
                 .map(|model| model.to_string())
                 .or_else(|| {
-                    self.secondary_model
+                    self.balance_model
                         .as_deref()
                         .map(str::trim)
                         .filter(|model| !model.is_empty())
                         .map(|model| model.to_string())
                 })
-                .or_else(|| self.default_model_alias().map(|model| model.to_string()))
-                .unwrap_or_else(|| "default".into()),
-            "secondary" => self
-                .secondary_model
-                .as_deref()
-                .map(str::trim)
-                .filter(|model| !model.is_empty())
-                .map(|model| model.to_string())
                 .or_else(|| self.default_model_alias().map(|model| model.to_string()))
                 .unwrap_or_else(|| "default".into()),
             _ => token.trim().to_string(),
@@ -1569,8 +1587,8 @@ impl AppConfig {
     /// Resolve the model alias a subagent should run with.
     ///
     /// Priority: explicit tool override → `[subagent.default_models]` for the
-    /// profile → global `secondary_model` → `default_model`. Symbolic tokens
-    /// (`current` / `default` / `secondary`) are expanded using
+    /// profile → global `balance_model` → `default_model`. Symbolic tokens
+    /// (`quality` / `balance` / `current` / `fast`) are expanded using
     /// `current_model` (the parent session model).
     pub fn resolve_subagent_model(
         &self,
@@ -1588,7 +1606,7 @@ impl AppConfig {
                     .map(|model| model.to_string())
             })
             .or_else(|| {
-                self.secondary_model
+                self.balance_model
                     .as_deref()
                     .map(str::trim)
                     .filter(|model| !model.is_empty())
@@ -1804,17 +1822,21 @@ max_concurrent = 2
 
 [default_models]
 explore = "current"
-Coder = "secondary"
-fallback = "default"
+Coder = "balance"
+Researcher = "quality"
+Reviewer = "balance"
+fallback = "quality"
 "#,
         )
         .unwrap();
         assert_eq!(settings.max_depth, 3);
         assert_eq!(settings.max_concurrent, 2);
         assert_eq!(settings.model_for_profile("explore"), Some("current"));
-        assert_eq!(settings.model_for_profile("coder"), Some("secondary"));
-        assert_eq!(settings.model_for_profile("agent"), Some("default"));
-        assert_eq!(settings.model_for_profile("unknown"), Some("default"));
+        assert_eq!(settings.model_for_profile("coder"), Some("balance"));
+        assert_eq!(settings.model_for_profile("researcher"), Some("quality"));
+        assert_eq!(settings.model_for_profile("reviewer"), Some("balance"));
+        assert_eq!(settings.model_for_profile("agent"), Some("quality"));
+        assert_eq!(settings.model_for_profile("unknown"), Some("quality"));
 
         let mut config = valid_config();
         config.subagent.default_models = settings.default_models.clone();
@@ -1834,7 +1856,7 @@ fallback = "default"
     #[test]
     fn resolve_subagent_model_priority() {
         let mut config = valid_config();
-        config.secondary_model = Some("test/secondary".into());
+        config.balance_model = Some("test/secondary".into());
         config.models.insert(
             "test/secondary".into(),
             ModelConfig {
@@ -1890,7 +1912,7 @@ fallback = "default"
             config.resolve_subagent_model("coder", Some(""), None),
             "test/secondary"
         );
-        config.secondary_model = None;
+        config.balance_model = None;
         assert_eq!(
             config.resolve_subagent_model("coder", None, None),
             "test/model"
@@ -1900,7 +1922,7 @@ fallback = "default"
     #[test]
     fn resolve_subagent_model_symbolic_aliases() {
         let mut config = valid_config();
-        config.secondary_model = Some("test/secondary".into());
+        config.balance_model = Some("test/secondary".into());
         config.models.insert(
             "test/secondary".into(),
             ModelConfig {
@@ -1946,15 +1968,40 @@ fallback = "default"
         config
             .subagent
             .default_models
-            .insert("coder".into(), "default".into());
+            .insert("coder".into(), "quality".into());
         config
             .subagent
             .default_models
-            .insert("general".into(), "secondary".into());
+            .insert("general".into(), "balance".into());
         config
             .subagent
             .default_models
             .insert("fallback".into(), "fast".into());
+        config
+            .subagent
+            .default_models
+            .insert("reviewer".into(), "quality".into());
+        // quality_model is distinct from default_model when configured.
+        config.quality_model = Some("test/quality".into());
+        config.models.insert(
+            "test/quality".into(),
+            ModelConfig {
+                provider: "test".into(),
+                model: "quality".into(),
+                max_context_size: Some(100_000),
+                max_output_size: Some(4_096),
+                capabilities: vec!["tool_use".into()],
+                display_name: None,
+                support_efforts: Vec::new(),
+                default_effort: None,
+                pricing: None,
+                experimental_adaptive_thinking: false,
+                experimental_vision_proxy: false,
+                experimental_visible_empty_retries: 0,
+                experimental_bad_toolcall_auto_retries: 0,
+                first_token_timeout_ms: None,
+            },
+        );
 
         assert_eq!(
             config.resolve_subagent_model("explore", None, Some("test/session")),
@@ -1966,21 +2013,26 @@ fallback = "default"
         );
         assert_eq!(
             config.resolve_subagent_model("coder", None, Some("test/session")),
-            "test/model"
+            "test/quality"
         );
         assert_eq!(
             config.resolve_subagent_model("general", None, Some("test/session")),
             "test/secondary"
         );
+        // `quality` pins quality_model, ignoring the parent session model.
         assert_eq!(
-            config.resolve_subagent_model("explore", Some("secondary"), Some("test/session")),
+            config.resolve_subagent_model("reviewer", None, Some("test/session")),
+            "test/quality"
+        );
+        assert_eq!(
+            config.resolve_subagent_model("explore", Some("balance"), Some("test/session")),
             "test/secondary"
         );
         assert_eq!(
             config.resolve_subagent_model("explore", Some("CURRENT"), Some("test/session")),
             "test/session"
         );
-        // `fast` falls back to secondary_model when fast_model is unset.
+        // `fast` falls back to balance_model when fast_model is unset.
         assert_eq!(
             config.resolve_subagent_model("unknown-profile", None, None),
             "test/secondary"
@@ -2000,8 +2052,29 @@ fallback = "default"
             config.resolve_subagent_model("explore", Some("FAST"), None),
             "test/fast"
         );
+        // Explicit quality overrides any profile default and pins
+        // quality_model (falling back to default_model when unset).
+        assert_eq!(
+            config.resolve_subagent_model("explore", Some("quality"), Some("test/session")),
+            "test/quality"
+        );
+        config.quality_model = None;
+        assert_eq!(
+            config.resolve_subagent_model("explore", Some("quality"), Some("test/session")),
+            "test/model"
+        );
+        // Balance pins the mid-tier balance_model.
+        assert_eq!(
+            config.resolve_subagent_model("explore", Some("BALANCE"), Some("test/session")),
+            "test/secondary"
+        );
+        // Balance falls back to default_model when balance_model is unset.
+        config.balance_model = None;
+        assert_eq!(
+            config.resolve_subagent_model("explore", Some("balance"), None),
+            "test/model"
+        );
 
-        config.secondary_model = None;
         config.fast_model = None;
         assert_eq!(
             config.resolve_subagent_model("unknown-profile", None, None),
@@ -2094,7 +2167,7 @@ fallback = "default"
         config
             .subagent
             .default_models
-            .insert("General".into(), "default".into());
+            .insert("General".into(), "balance".into());
         assert!(config
             .validate()
             .unwrap_err()
@@ -2110,7 +2183,7 @@ fallback = "default"
         config
             .subagent
             .default_models
-            .insert("agent".into(), "default".into());
+            .insert("agent".into(), "balance".into());
         assert!(config
             .validate()
             .unwrap_err()

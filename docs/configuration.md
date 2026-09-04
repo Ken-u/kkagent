@@ -19,11 +19,12 @@ kkagent config preset safe
 
 | 字段 | 类型 | 默认值 | 说明 |
 |---|---:|---:|---|
-| `default_model` | string | 必填 | 默认模型别名，必须存在于 `models`。 |
+| `default_model` | string | 必填 | 新建会话的默认模型别名，必须存在于 `models`。也是所有符号档位未配置时的终端兜底。 |
+| `quality_model` | string | 无 | 高质量档（`quality`）的目标模型别名；未配置时回退到 `default_model`。与 `default_model` 分开配置：`default_model` 只决定新会话用什么模型。 |
 | `fallback_model` | string | 无 | 全局 fallback 模型别名；主模型耗尽单步重试后使用，必须存在于 `models`。 |
-| `secondary_model` | string | 无 | 全局辅助模型别名。子 Agent 在未配置 `[subagent.default_models]` 对应 profile、且工具调用未显式传 `model` 时回退到此模型；也用作未设置 `compaction_model` 时的压缩摘要候选。必须存在于 `models`。 |
-| `fast_model` | string | 无 | 快速/廉价模型别名。符号 `fast`（工具 `model` 参数与 `[subagent.default_models]` 值）优先解析到此模型；未配置时回退到 `secondary_model`，再回退到 `default_model`。必须存在于 `models`。 |
-| `compaction_model` | string | 无 | 专用于 `/compact` 历史压缩摘要的模型别名，必须存在于 `models`。设置后优先级最高，高于 `secondary_model`、session 当前模型和 `default_model`。也可用环境变量 `KKAGENT_COMPACTION_MODEL` 覆盖。 |
+| `balance_model` | string | 无 | 中间档模型别名（`balance` 档位的目标）。子 Agent 在未配置 `[subagent.default_models]` 对应 profile、且工具调用未显式传 `model` 时回退到此模型；也用作未设置 `compaction_model` 时的压缩摘要候选。必须存在于 `models`。 |
+| `fast_model` | string | 无 | 快速/廉价模型别名。符号 `fast`（工具 `model` 参数与 `[subagent.default_models]` 值）优先解析到此模型；未配置时回退到 `balance_model`，再回退到 `default_model`。必须存在于 `models`。 |
+| `compaction_model` | string | 无 | 专用于 `/compact` 历史压缩摘要的模型别名，必须存在于 `models`。设置后优先级最高，高于 `balance_model`、session 当前模型和 `default_model`。也可用环境变量 `KKAGENT_COMPACTION_MODEL` 覆盖。 |
 | `default_permission_mode` | string | `manual` | `manual`、`yolo` 或 `auto`。 |
 | `default_plan_mode` | bool | `false` | 新会话是否以 Plan 模式开始。 |
 | `merge_all_available_skills` | bool | `false` | 把全部 Skill 正文合入初始上下文；默认只注入目录并按需加载。 |
@@ -40,7 +41,7 @@ Goal 模式（`/goal`）的完成判定裁判。**默认关闭**——关闭时�
 | 字段 | 类型 | 默认值 | 说明 |
 |---|---:|---:|---|
 | `judge_enabled` | bool | `false` | 开启后，模型自报 goal 完成会先交给**独立裁判 agent** 审查：裁判使用独立模型与受限工具集（`GoalJudge` + `Read`），基于 objective、completionCriterion 与 transcript 证据做出 approve/reject 裁决（通过 `GoalJudge` toolcall 标记）。approve 才真正完成；reject 会把具体缺口注入给工作模型继续推进，连续 `judge_max_rejects` 次拒绝后 goal 转 blocked 并停下向用户说明。 |
-| `judge_model` | string | 无 | 裁判使用的模型别名，必须存在于 `models`。未配置时回退到压缩摘要模型链：`compaction_model` > `secondary_model` > 会话当前模型 > `default_model`。 |
+| `judge_model` | string | 无 | 裁判使用的模型别名，必须存在于 `models`。未配置时回退到压缩摘要模型链：`compaction_model` > `balance_model` > 会话当前模型 > `default_model`。 |
 | `judge_max_rejects` | int | `2` | 允许的最大拒绝次数；达到后 goal 转 `blocked`（可 `/goal resume` 重置计数）。 |
 | `judge_timeout_secs` | int | `120` | 单次裁判 agent 运行的墙钟超时。 |
 
@@ -212,18 +213,20 @@ general = "fast"
 
 | 符号 | 含义 |
 |---|---|
+| `quality` | 顶层 `quality_model`（高质量主力模型）；未配置时回退到 `default_model`。 |
+| `balance` | 顶层 `balance_model`（中间档）；未配置时回退到 `default_model`。 |
 | `current` | 父会话当前正在使用的模型（主模型失败切到 fallback 时为 fallback 模型）；不可用时回退到 `default_model`。 |
-| `default` | 顶层 `default_model`。 |
-| `fast` | 顶层 `fast_model`；未配置时回退 `secondary_model`，再回退 `default_model`。 |
-| `secondary` | 顶层 `secondary_model`；未配置时回退到 `default_model`。 |
+| `fast` | 顶层 `fast_model`；未配置时回退 `balance_model`，再回退 `default_model`。 |
 
-子 Agent 选用模型的优先级：工具调用显式 `model`（也可写上述符号）→ `[subagent.default_models]` 对应 profile → 顶层 `secondary_model` → `default_model`。
+子 Agent 选用模型的优先级：工具调用显式 `model`（也可写上述符号）→ `[subagent.default_models]` 对应 profile → 顶层 `balance_model` → `default_model`。
 
-工具 schema 中的 `model` 参数是静态枚举 `default` / `fast` / `current`，LLM 无需感知真实模型别名即可选择档位；`secondary` 与真实别名仅在配置文件中支持。枚举是静态的，不会随 `[models]` 变化导致模型缓存失效。
+工具 schema 中的 `model` 参数是静态枚举 `quality` / `balance` / `fast` / `current`，LLM 无需感知真实模型别名即可选择档位；真实别名仅在配置文件中支持。枚举是静态的，不会随 `[models]` 变化导致模型缓存失效。
+
+v1 旧写法 `default`（= `quality`）与 `secondary`（= `balance`）已移除：启动时自动迁移（无损改写 `config.toml` 与插件清单，原文件备份为 `*.bak`），并在界面提示迁移详情。
 
 校验规则：
 
-- `current` / `default` / `fast` / `secondary` 是保留符号，`[models]` 中的别名不能使用这些名字（含大小写变体），否则校验报错。
+- `quality` / `balance` / `current` / `fast` 是保留符号，`[models]` 中的别名不能使用这些名字（含大小写变体），否则校验报错。
 - `[subagent.default_models]` 的键在归一化后（大小写折叠、`agent` → `general`）不得重复，否则校验报错。
 
 ## 后台任务
@@ -461,7 +464,7 @@ client_label = "kkagent"
 | 环境变量 | 用途 |
 |---|---|
 | `KKAGENT_DEFAULT_MODEL` | 默认模型。 |
-| `KKAGENT_SECONDARY_MODEL` | 辅助模型。 |
+| `KKAGENT_BALANCE_MODEL` | 中间档模型（`balance_model`）。 |
 | `KKAGENT_PERMISSION_MODE` | 默认权限模式。 |
 | `KKAGENT_PLUGIN_MARKETPLACE_URL` | 覆盖顶层 `plugin_marketplace`（默认市场），指定本地路径、file URL 或 HTTP(S) marketplace JSON。不影响 `plugin_marketplaces`。 |
 | `ANTHROPIC_API_KEY`、`OPENAI_API_KEY`、`KIMI_API_KEY`、`GOOGLE_API_KEY` | 对应 Provider 密钥。 |

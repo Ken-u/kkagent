@@ -264,7 +264,7 @@ provider 取值与 wire 格式要求见 [configuration.md 的 Web 搜索](config
 | 字段 | 类型 | 说明 |
 |---|---|---|
 | `systemPrompt` | string | 子 agent 人设，追加在工作区指令与通用子 agent 框架之后 |
-| `model` | string | **声明即绑定的模型别名**：`"default"` / `"fast"` / `"current"` / `"secondary"`（大小写不敏感）。有效绑定时覆盖调用方在 Agent 工具里传的 `model` token；原始模型 id 不被接受（加载时记录诊断并忽略）。`current` 按父会话模型展开，`fast` 依次回退 `fast_model` → `secondary_model` → `default_model` |
+| `model` | string | **声明即绑定的模型别名**：`"quality"` / `"balance"` / `"fast"` / `"current"`（大小写不敏感）。有效绑定时覆盖调用方在 Agent 工具里传的 `model` token；原始模型 id 与 v1 旧写法（`default` / `secondary`，启动迁移会自动改写清单）不被接受，加载时记录诊断并忽略。`quality` 展开为顶层 `default_model`，`balance` 展开为顶层 `balance_model`（未配置回退 `default_model`），`current` 按父会话模型展开，`fast` 依次回退 `fast_model` → `balance_model` → `default_model` |
 | `tools` | string[] | **allowlist**：只保留列出的工具（core 工具、Web、私有 MCP 工具都参与过滤）；缺省 = 继承默认子 agent 工具集 |
 | `mcpServers` | object | 插件私有的 MCP server，**委派时懒加载**。server 运行时名 `plugin-<plugin-id>:<server>`，工具命名空间压缩为 `<plugin_id>_<server>`（如 `wiki_search`），与主会话插件 MCP 规则一致 |
 
@@ -277,8 +277,10 @@ provider 取值与 wire 格式要求见 [configuration.md 的 Web 搜索](config
   Completed 摘要（400 字）。
 - internal 型的模型支持**声明期绑定**：清单里写 `model: "fast"` 这类别名即固定该
   子 agent 的模型，覆盖调用时的 `model` token；未绑定时走标准子 agent 模型解析
-  （`model` 传符号 token、`[subagent.default_models]`、`secondary`、`default` 依次
-  兜底）。别名以外（含原始模型 id）一律拒绝并记入诊断日志。
+  （`model` 传符号 token `quality`/`balance`/`fast`/`current`、
+  `[subagent.default_models]`、全局 `balance_model`、`default_model` 依次兜底）。
+  别名以外（含原始模型 id 与已下线的 v1 写法 `default`/`secondary`）一律拒绝并
+  记入诊断日志。
 - **嵌套委派**：`allowDelegation: true` 的 internal 型可以通过 Agent 工具再委派
   其它 profile（内建与插件类型均可）；嵌套深度沿用全局 `[subagent] max_depth`
   预算，超限的孙代请求会被拒绝并计入 TaskOutput。默认 `false` 时委派工具以空白
