@@ -819,9 +819,15 @@ Do not mention this reminder to the user.\n</system-reminder>"
             let (stream_tx, mut stream_rx) = mpsc::channel::<StreamEvent>(256);
             let provider = create_provider(provider_config, model_config)?;
             let stream_error_tx = stream_tx.clone();
+            let stream_error_session_id = session_id.clone();
             let handle = tokio::spawn(async move {
                 if let Err(e) = provider.stream_chat(request, stream_tx).await {
-                    tracing::error!("LLM stream error: {}", e);
+                    // Include the session id so session-filtered debug exports
+                    // (export_session_debug_bundle) capture this line.
+                    tracing::error!(
+                        session_id = %stream_error_session_id,
+                        "LLM stream error: {}", e
+                    );
                     let _ = stream_error_tx
                         .send(kkagent_llm::stream_error_event(&e))
                         .await;

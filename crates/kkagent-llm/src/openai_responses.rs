@@ -166,8 +166,14 @@ pub async fn openai_responses_stream(
     let mut usage = TokenUsage::default();
     let mut active_calls = std::collections::HashMap::<String, ActiveCall>::new();
     let mut first_token = FirstTokenGate::new(request.first_token_timeout, &request.model);
-
-    while let Some(chunk) = first_token.next_chunk(&mut stream).await? {
+    let mut stream_timer = crate::http_error::StreamTimer::start();
+    loop {
+        let chunk = match first_token.next_chunk(&mut stream).await {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => break,
+            Err(error) => return Err(stream_timer.annotate(error)),
+        };
+        stream_timer.tick();
         buffer.push_str(&drain_utf8(&mut byte_buf, &chunk));
         while let Some(pos) = buffer.find('\n') {
             let line = buffer[..pos].to_string();

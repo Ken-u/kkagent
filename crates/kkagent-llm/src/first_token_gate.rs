@@ -47,8 +47,8 @@ impl FirstTokenGate {
     /// timeout only until [`Self::mark_content`] is called.
     ///
     /// After the first content chunk the gate is open and chunks are awaited
-    /// without an additional deadline (the reqwest 300 s request timeout still
-    /// applies as a backstop).
+    /// without an additional deadline (the client's per-read idle timeout
+    /// still bounds each individual chunk wait).
     pub(crate) async fn next_chunk<S, B>(&mut self, stream: &mut S) -> anyhow::Result<Option<B>>
     where
         S: StreamExt<Item = Result<B, reqwest::Error>> + Unpin,

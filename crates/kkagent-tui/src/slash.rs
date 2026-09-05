@@ -301,8 +301,15 @@ pub const BUILTIN_SLASH_COMMANDS: &[SlashCommand] = &[
         argument_hint: None,
     },
     SlashCommand {
+        name: "export",
+        aliases: &[],
+        description: "Export debug bundle (zip) for this session",
+        priority: 40,
+        argument_hint: None,
+    },
+    SlashCommand {
         name: "export-md",
-        aliases: &["export"],
+        aliases: &[],
         description: "Export current session as Markdown",
         priority: 40,
         argument_hint: None,

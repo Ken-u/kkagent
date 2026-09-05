@@ -11629,7 +11629,50 @@ impl TuiApp {
                     }
                 }
             }
-            "export-md" | "export" => {
+            "export" => {
+                // Debug bundle export: zips transcript, audit trail, filtered
+                // logs and the session directory for offline analysis.
+                let Some(session_id) = self.state.session_id.clone() else {
+                    self.system_message("No active session to export.".into());
+                    return Ok(());
+                };
+                self.system_message("Exporting debug bundle…".into());
+                let result = tokio::task::spawn_blocking(move || {
+                    kkagent_core::session::export_session_debug_bundle_zip_by_id(&session_id, None)
+                })
+                .await;
+                match result {
+                    Ok(Ok((path, manifest))) => {
+                        let mut note = format!(
+                            "Debug bundle exported to {}\n  messages: {:?}  audit events: {:?}  log lines: {:?}  files: {}",
+                            path.display(),
+                            manifest.message_count,
+                            manifest.audit_event_count,
+                            manifest.log_line_count,
+                            manifest.files.len(),
+                        );
+                        if !manifest.missing.is_empty() {
+                            note.push_str("\n  missing sources:");
+                            for m in &manifest.missing {
+                                note.push_str(&format!("\n    - {m}"));
+                            }
+                        }
+                        note.push_str(
+                            "\n  Secrets from your config were redacted, but the bundle may \
+                             still contain sensitive text you typed into the session — review \
+                             it before sharing.",
+                        );
+                        self.system_message(note);
+                    }
+                    Ok(Err(e)) => {
+                        self.system_message(format!("Export failed: {e:#}"));
+                    }
+                    Err(e) => {
+                        self.system_message(format!("Export task failed: {e}"));
+                    }
+                }
+            }
+            "export-md" => {
                 let path = dirs::home_dir()
                     .unwrap_or_else(|| std::path::PathBuf::from("."))
                     .join(".kkagent")
@@ -12811,6 +12854,16 @@ impl TuiApp {
                         self.state.status = SessionStatus::Idle;
                         if message != "Interrupted" {
                             self.system_message(format!("Error: {}", message));
+                            // Non-interrupted Error events are terminal: the
+                            // agent loop already exhausted its retries. Point
+                            // the user at the debug-bundle export so the
+                            // failure can be analyzed offline.
+                            self.system_message(
+                                "To capture diagnostics for this failure, run /export \
+                                 (writes a redacted zip under /tmp). Review it before \
+                                 sharing — redaction is best-effort."
+                                    .into(),
+                            );
                         }
                     }
                     AgentEvent::PlanModeChanged { enabled, .. } => {

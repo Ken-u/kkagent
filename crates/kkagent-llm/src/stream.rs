@@ -197,8 +197,14 @@ pub async fn anthropic_stream(
     let mut stop_reason = None;
     let mut completed = false;
     let mut first_token = FirstTokenGate::new(request.first_token_timeout, &request.model);
-
-    while let Some(chunk) = first_token.next_chunk(&mut stream).await? {
+    let mut stream_timer = crate::http_error::StreamTimer::start();
+    loop {
+        let chunk = match first_token.next_chunk(&mut stream).await {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => break,
+            Err(error) => return Err(stream_timer.annotate(error)),
+        };
+        stream_timer.tick();
         chunk_count += 1;
         if chunk_count <= 3 {
             tracing::debug!("SSE chunk #{}: {} bytes", chunk_count, chunk.len());
@@ -639,8 +645,14 @@ async fn chat_completions_stream(
     let mut usage = TokenUsage::default();
     let mut completed = false;
     let mut first_token = FirstTokenGate::new(request.first_token_timeout, &request.model);
-
-    while let Some(chunk) = first_token.next_chunk(&mut stream).await? {
+    let mut stream_timer = crate::http_error::StreamTimer::start();
+    loop {
+        let chunk = match first_token.next_chunk(&mut stream).await {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => break,
+            Err(error) => return Err(stream_timer.annotate(error)),
+        };
+        stream_timer.tick();
         buffer.push_str(&drain_utf8(&mut byte_buf, &chunk));
         while let Some(pos) = buffer.find('\n') {
             let line = buffer[..pos].to_string();
@@ -908,7 +920,14 @@ pub async fn google_stream(
     let mut gemini_thought_tokens: u64 = 0;
     let mut completed = false;
     let mut first_token = FirstTokenGate::new(request.first_token_timeout, &request.model);
-    while let Some(chunk) = first_token.next_chunk(&mut stream).await? {
+    let mut stream_timer = crate::http_error::StreamTimer::start();
+    loop {
+        let chunk = match first_token.next_chunk(&mut stream).await {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => break,
+            Err(error) => return Err(stream_timer.annotate(error)),
+        };
+        stream_timer.tick();
         buffer.push_str(&drain_utf8(&mut byte_buf, &chunk));
         while let Some(pos) = buffer.find('\n') {
             let line = buffer[..pos].to_string();
@@ -1378,6 +1397,30 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;
         });
         format!("http://{address}")
+    }
+
+    #[tokio::test]
+    async fn openai_mid_stream_stall_annotates_idle_timing() {
+        // Content arrives first (opening the first-token gate), then the
+        // upstream goes silent: the per-read idle timeout must surface as a
+        // decode/timeout error annotated with idle/elapsed timing.
+        let base_url =
+            serve_headers_then_stall("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n")
+                .await;
+        let (tx, _rx) = mpsc::channel(8);
+        let client = Client::builder()
+            .read_timeout(std::time::Duration::from_millis(100))
+            .build()
+            .unwrap();
+        let mut request = request();
+        request.first_token_timeout = Some(std::time::Duration::from_secs(5));
+        let error = openai_stream(&client, &base_url, "token", request, tx)
+            .await
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("kind=timeout"), "{message}");
+        assert!(message.contains("stream idle_ms="), "{message}");
+        assert!(message.contains("elapsed_ms="), "{message}");
     }
 
     #[tokio::test]

@@ -1,5 +1,5 @@
 use std::error::Error as StdError;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use reqwest::{header::HeaderMap, Response, StatusCode};
 
@@ -36,6 +36,47 @@ pub struct FirstTokenTimeoutError {
 impl FirstTokenTimeoutError {
     pub fn is_retryable(&self) -> bool {
         true
+    }
+}
+
+/// Wall-clock timing for a streaming request, used to annotate transport
+/// errors: `idle_ms` (time since the last received chunk) distinguishes a
+/// mid-stream stall — typically sitting near the client's per-read idle
+/// timeout (60 s) when an upstream or proxy stops sending data — from a late
+/// failure of a long-lived stream (`elapsed_ms` large, `idle_ms` small).
+pub struct StreamTimer {
+    started: Instant,
+    last_chunk: Instant,
+}
+
+impl StreamTimer {
+    pub fn start() -> Self {
+        let now = Instant::now();
+        Self {
+            started: now,
+            last_chunk: now,
+        }
+    }
+
+    /// Record that a chunk just arrived; resets the idle clock.
+    pub fn tick(&mut self) {
+        self.last_chunk = Instant::now();
+    }
+
+    /// Append idle/elapsed timing to an already-flattened transport error
+    /// (see [`detailed_reqwest_error`]) so a `kind=decode, kind=timeout`
+    /// failure can be classified from the message alone. First-token timeout
+    /// errors are passed through untouched — they carry their own typed
+    /// payload that callers downcast for.
+    pub fn annotate(&self, error: anyhow::Error) -> anyhow::Error {
+        if error.downcast_ref::<FirstTokenTimeoutError>().is_some() {
+            return error;
+        }
+        anyhow::anyhow!(
+            "{error} [stream idle_ms={} elapsed_ms={}]",
+            self.last_chunk.elapsed().as_millis() as u64,
+            self.started.elapsed().as_millis() as u64,
+        )
     }
 }
 
@@ -301,6 +342,51 @@ mod tests {
             crate::types::StreamEvent::Error(message)
                 if message.contains(FIRST_TOKEN_TIMEOUT_MARKER)
         ));
+    }
+
+    #[test]
+    fn stream_timer_annotates_error_with_idle_and_elapsed() {
+        let mut timer = StreamTimer::start();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        timer.tick();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let message = timer
+            .annotate(anyhow::anyhow!(
+                "error decoding response body [kind=decode, kind=timeout]"
+            ))
+            .to_string();
+        assert!(
+            message.starts_with("error decoding response body [kind=decode, kind=timeout]"),
+            "{message}"
+        );
+        assert!(message.contains("stream idle_ms="), "{message}");
+        assert!(message.contains("elapsed_ms="), "{message}");
+        let idle: u64 = message
+            .split("idle_ms=")
+            .nth(1)
+            .and_then(|rest| rest.split([' ', ']']).next())
+            .and_then(|value| value.parse().ok())
+            .expect("idle_ms should be numeric");
+        let elapsed: u64 = message
+            .split("elapsed_ms=")
+            .nth(1)
+            .and_then(|rest| rest.split([' ', ']']).next())
+            .and_then(|value| value.parse().ok())
+            .expect("elapsed_ms should be numeric");
+        assert!(idle < elapsed, "idle {idle} should be < elapsed {elapsed}");
+    }
+
+    #[test]
+    fn stream_timer_annotates_first_token_timeout_message() {
+        // The agent loop classifies first-token timeouts by message marker;
+        // the timing suffix must not break that detection.
+        let error = FirstTokenTimeoutError {
+            timeout_ms: 1500,
+            model: "demo".into(),
+        };
+        let timer = StreamTimer::start();
+        let message = timer.annotate(error.into()).to_string();
+        assert!(message.contains(FIRST_TOKEN_TIMEOUT_MARKER), "{message}");
     }
 
     #[test]

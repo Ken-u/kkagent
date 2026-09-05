@@ -222,7 +222,12 @@ pub fn export_session_debug_bundle(
         missing.push(format!("audit log not found: {}", audit_src.display()));
     }
 
-    // 4. Diagnostic log: lines mentioning the session id.
+    // 4. Diagnostic log: two extracts into one file.
+    //    a) lines mentioning the session id (explicit correlation), and
+    //    b) lines inside the session's activity window — transport errors
+    //       like `LLM stream error` may not carry the session id, but their
+    //       timestamp falls between the first and last transcript message.
+    //    (b) is appended only for lines not already captured by (a).
     let log_src = audit_src
         .parent()
         .map(|p| p.join("kkagent.log"))
@@ -232,7 +237,13 @@ pub fn export_session_debug_bundle(
         });
     let mut log_line_count = None;
     if log_src.is_file() {
-        match filter_lines_by_session(&log_src, &summary.id, &output_dir.join("kkagent.log")) {
+        let window = session_activity_window(&summary.id);
+        match filter_log_lines(
+            &log_src,
+            &summary.id,
+            window.as_ref(),
+            &output_dir.join("kkagent.log"),
+        ) {
             Ok(count) => {
                 log_line_count = Some(count);
                 files.push("kkagent.log".into());
@@ -292,6 +303,293 @@ fn write_json(path: &Path, value: &serde_json::Value) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Resolve a session summary by id. Tolerates a pruned session index by
+/// scanning the sessions directory (flat `sessions/<id>` or bucketed
+/// `sessions/<bucket>/<id>` layouts), mirroring `kk export-session`.
+pub fn find_session_summary(session_id: &str) -> anyhow::Result<SessionSummary> {
+    anyhow::ensure!(
+        !session_id.trim().is_empty(),
+        "session id must not be empty"
+    );
+    let store = crate::session::store::SessionStore::open_default();
+    if let Ok(summary) = store.get(session_id) {
+        return Ok(summary);
+    }
+    let sessions_dir = store.sessions_dir;
+    let found = sessions_dir
+        .join(session_id)
+        .is_dir()
+        .then(|| sessions_dir.join(session_id))
+        .or_else(|| {
+            std::fs::read_dir(&sessions_dir)
+                .ok()?
+                .flatten()
+                .find_map(|bucket| {
+                    let candidate = bucket.path().join(session_id);
+                    candidate.is_dir().then_some(candidate)
+                })
+        });
+    let Some(session_dir) = found else {
+        anyhow::bail!(
+            "session not found: {session_id} (nothing in session store under {})",
+            sessions_dir.display()
+        );
+    };
+    Ok(SessionSummary {
+        id: session_id.to_string(),
+        session_dir: session_dir.to_string_lossy().into_owned(),
+        work_dir: std::env::current_dir()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        title: None,
+        is_custom_title: false,
+        archived: false,
+        last_prompt: None,
+        first_prompt: None,
+        created_at: 0,
+        updated_at: 0,
+        forked_from: None,
+    })
+}
+
+/// Default debug-bundle zip name under the system temp dir:
+/// `kkagent-debug-<session8>-<YYYYmmdd-HHMMSS>.zip`.
+pub fn default_debug_zip_path(session_id: &str) -> PathBuf {
+    let short = &session_id[..session_id.len().min(8)];
+    let ts = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+    std::env::temp_dir().join(format!("kkagent-debug-{short}-{ts}.zip"))
+}
+
+/// Export a session debug bundle (see [`export_session_debug_bundle`]) and
+/// package it as a single zip at `output_zip`. The bundle is staged in a
+/// temporary directory next to the final zip (same filesystem, reliable
+/// cleanup) and removed after archiving.
+pub fn export_session_debug_bundle_zip(
+    summary: &SessionSummary,
+    output_zip: impl AsRef<Path>,
+) -> anyhow::Result<(PathBuf, DebugExportManifest)> {
+    export_session_debug_bundle_zip_with_secrets(summary, output_zip, &collect_config_secrets())
+}
+
+/// Testable core of [`export_session_debug_bundle_zip`]: `secrets` is the
+/// explicit allow-list of literal values to scrub before archiving.
+fn export_session_debug_bundle_zip_with_secrets(
+    summary: &SessionSummary,
+    output_zip: impl AsRef<Path>,
+    secrets: &[String],
+) -> anyhow::Result<(PathBuf, DebugExportManifest)> {
+    let output_zip = output_zip.as_ref().to_path_buf();
+    let staging = staging_dir_for(&output_zip);
+    let mut result = export_session_debug_bundle(summary, &staging);
+    let sanitized_files = sanitize_bundle_secrets(&staging, secrets);
+    if let Ok(result) = result.as_mut() {
+        result.manifest.notes.push(format!(
+            "Sanitized {sanitized_files} file(s): known API keys and URL key= parameters redacted"
+        ));
+        result.manifest.notes.push(
+            "Redaction is best-effort: review bundle contents for other sensitive text \
+             (e.g. strings you typed into the session) before sharing"
+                .into(),
+        );
+    }
+    let zip_result = result
+        .map(|r| (r, staging.clone()))
+        .and_then(|(r, staging)| zip_directory(&staging, &output_zip).map(|_| r));
+    let _ = std::fs::remove_dir_all(&staging);
+    let manifest = zip_result?.manifest;
+    Ok((output_zip, manifest))
+}
+
+/// Resolve a session by id and export its debug bundle as a zip, defaulting
+/// the output path to [`default_debug_zip_path`].
+pub fn export_session_debug_bundle_zip_by_id(
+    session_id: &str,
+    output_zip: Option<&Path>,
+) -> anyhow::Result<(PathBuf, DebugExportManifest)> {
+    let summary = find_session_summary(session_id)?;
+    let path = output_zip
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| default_debug_zip_path(session_id));
+    export_session_debug_bundle_zip(&summary, &path)
+}
+
+fn staging_dir_for(output_zip: &Path) -> PathBuf {
+    let parent = output_zip.parent().unwrap_or(Path::new("."));
+    let name = output_zip
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "bundle.zip".into());
+    parent.join(format!(".{name}.staging-{}", uuid::Uuid::new_v4()))
+}
+
+const SECRET_PLACEHOLDER: &str = "<redacted>";
+
+/// Collect secret strings that must never leave the machine in a debug
+/// bundle: provider API keys (inline `api_key` and the env vars named by
+/// `api_key_env`) and custom header values (auth tokens). Only strings worth
+/// scrubbing are kept (short values would mangle ordinary text).
+pub fn collect_config_secrets() -> Vec<String> {
+    let Ok(config) = kkagent_config::load_config(None) else {
+        return Vec::new();
+    };
+    let mut secrets = Vec::new();
+    for provider in config.providers.values() {
+        if let Some(key) = provider.api_key.as_deref() {
+            secrets.push(key.to_string());
+        }
+        if let Some(env_name) = provider.api_key_env.as_deref() {
+            if let Ok(value) = std::env::var(env_name) {
+                secrets.push(value);
+            }
+        }
+        for value in provider.custom_headers.values() {
+            secrets.push(value.clone());
+        }
+    }
+    // Custom web-search/fetch service keys follow the same env convention.
+    for env_name in [
+        "KKAGENT_SEARCH_API_KEY",
+        "KKAGENT_FETCH_API_KEY",
+        "KIMI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "OPENAI_API_KEY",
+        "GOOGLE_API_KEY",
+        "GEMINI_API_KEY",
+    ] {
+        if let Ok(value) = std::env::var(env_name) {
+            secrets.push(value);
+        }
+    }
+    secrets.into_iter().filter(|s| s.len() >= 8).collect()
+}
+
+/// Redact query parameters that commonly carry credentials in URLs (the
+/// Google GenAI streaming URL embeds `?key=<api_key>` and reqwest error
+/// messages include the full URL, which then lands in kkagent.log).
+fn redact_url_secrets(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(pos) = rest.find("key=") {
+        let before = &rest[..pos];
+        // Only treat it as a query parameter when preceded by `?` or `&`
+        // (possibly with whitespace between).
+        let trimmed = before.trim_end();
+        let is_param = trimmed.ends_with('?') || trimmed.ends_with('&');
+        out.push_str(before);
+        if !is_param {
+            out.push_str("key=");
+            rest = &rest[pos + 4..];
+            continue;
+        }
+        out.push_str("key=");
+        out.push_str(SECRET_PLACEHOLDER);
+        rest = &rest[pos + 4..];
+        let end = rest
+            .find(['&', ' ', '"', '\'', '\n', '\r', '\\', ')'])
+            .unwrap_or(rest.len());
+        rest = &rest[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Redact every occurrence of `secret` in `text` with a placeholder.
+fn redact_literal(text: &str, secret: &str) -> String {
+    text.replace(secret, SECRET_PLACEHOLDER)
+}
+
+/// Whether the buffer looks like UTF-8 text (secrets never hide in binary
+/// payloads in practice, and blind replacement would corrupt binaries).
+fn looks_like_text(bytes: &[u8]) -> bool {
+    std::str::from_utf8(bytes).is_ok()
+}
+
+/// Best-effort sanitize of every text file under `dir`: known secret
+/// literals and `?key=`/`&key=` URL parameters are replaced with
+/// `<redacted>`. Returns the number of files modified. Never fails on
+/// unreadable files — the export must succeed even when sanitizing does not.
+pub fn sanitize_bundle_secrets(dir: &Path, secrets: &[String]) -> usize {
+    let mut modified = 0usize;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&current) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(ty) = entry.file_type() else { continue };
+            if ty.is_dir() {
+                stack.push(entry.path());
+                continue;
+            }
+            if !ty.is_file() {
+                continue;
+            }
+            let path = entry.path();
+            let Ok(bytes) = std::fs::read(&path) else {
+                continue;
+            };
+            if !looks_like_text(&bytes) {
+                continue;
+            }
+            let Ok(mut text) = String::from_utf8(bytes) else {
+                continue;
+            };
+            let original = text.clone();
+            for secret in secrets {
+                if !secret.is_empty() {
+                    text = redact_literal(&text, secret);
+                }
+            }
+            text = redact_url_secrets(&text);
+            if text != original && std::fs::write(&path, &text).is_ok() {
+                modified += 1;
+            }
+        }
+    }
+    modified
+}
+
+/// Recursively archive `src` into a zip at `dst`. Directory entries are
+/// recorded so empty directories survive; symlinks are skipped.
+fn zip_directory(src: &Path, dst: &Path) -> anyhow::Result<()> {
+    let file = std::fs::File::create(dst)
+        .map_err(|e| anyhow::anyhow!("failed to create zip {}: {e}", dst.display()))?;
+    let mut writer = zip::ZipWriter::new(std::io::BufWriter::new(file));
+    let options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+    add_tree_to_zip(src, "", &mut writer, options)?;
+    writer
+        .finish()
+        .map_err(|e| anyhow::anyhow!("failed to finalize zip {}: {e}", dst.display()))?;
+    Ok(())
+}
+
+fn add_tree_to_zip(
+    src: &Path,
+    prefix: &str,
+    writer: &mut zip::ZipWriter<std::io::BufWriter<std::fs::File>>,
+    options: zip::write::SimpleFileOptions,
+) -> anyhow::Result<()> {
+    use std::io::Write;
+
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let entry_path = format!("{prefix}{name}");
+        let ty = entry.file_type()?;
+        if ty.is_dir() {
+            writer.add_directory(&entry_path, options)?;
+            add_tree_to_zip(&entry.path(), &format!("{entry_path}/"), writer, options)?;
+        } else if ty.is_file() {
+            writer.start_file(&entry_path, options)?;
+            let data = std::fs::read(entry.path())?;
+            writer.write_all(&data)?;
+        }
+        // Symlinks and other special files are skipped.
+    }
+    Ok(())
+}
+
 fn relative_name(path: &Path, root: &Path) -> String {
     path.strip_prefix(root)
         .map(|p| p.to_string_lossy().into_owned())
@@ -320,10 +618,97 @@ fn filter_audit_lines_by_session(
     })
 }
 
-/// Copy diagnostic log lines that mention `session_id`.
-fn filter_lines_by_session(src: &Path, session_id: &str, dst: &Path) -> anyhow::Result<usize> {
+/// A half-open time window `[start, end]` parsed from RFC3339 timestamps.
+#[derive(Debug, Clone, Copy)]
+struct ActivityWindow {
+    start: chrono::DateTime<chrono::Utc>,
+    end: chrono::DateTime<chrono::Utc>,
+}
+
+/// Compute the session's activity window from its transcript messages:
+/// first message timestamp (minus a lead-in margin) to last message
+/// timestamp (plus a tail margin). Returns `None` when the transcript has no
+/// parseable timestamps — the log extract then falls back to id matching only.
+fn session_activity_window(session_id: &str) -> Option<ActivityWindow> {
+    const LEAD_IN: chrono::Duration = chrono::Duration::minutes(10);
+    const TAIL: chrono::Duration = chrono::Duration::minutes(10);
+
+    let db = crate::transcript::TranscriptDb::open_default().ok()?;
+    let messages = db.load_messages(session_id).ok()?;
+    let mut start: Option<chrono::DateTime<chrono::Utc>> = None;
+    let mut end: Option<chrono::DateTime<chrono::Utc>> = None;
+    for message in &messages {
+        let Ok(ts) = chrono::DateTime::parse_from_rfc3339(&message.created_at) else {
+            continue;
+        };
+        let ts = ts.with_timezone(&chrono::Utc);
+        start = Some(start.map_or(ts, |s: chrono::DateTime<chrono::Utc>| s.min(ts)));
+        end = Some(end.map_or(ts, |e: chrono::DateTime<chrono::Utc>| e.max(ts)));
+    }
+    Some(ActivityWindow {
+        start: start? - LEAD_IN,
+        end: end? + TAIL,
+    })
+}
+
+/// Extract a diagnostic-log bundle for one session:
+/// - every line mentioning `session_id` (verbatim, any age), then
+/// - lines whose tracing timestamp falls inside `window` (time-correlated
+///   context such as `LLM stream error` lines that lack a session id).
+///
+/// Duplicates are suppressed: a line captured by the id filter is not
+/// repeated by the window filter.
+fn filter_log_lines(
+    src: &Path,
+    session_id: &str,
+    window: Option<&ActivityWindow>,
+    dst: &Path,
+) -> anyhow::Result<usize> {
+    use std::io::{BufRead, BufWriter, Write};
+
     anyhow::ensure!(!session_id.is_empty(), "session id must not be empty");
-    filter_lines(src, dst, |line| line.contains(session_id))
+    let input = std::fs::File::open(src)?;
+    let reader = std::io::BufReader::new(input);
+    let output = std::fs::File::create(dst)?;
+    let mut writer = BufWriter::new(output);
+    let mut kept = 0usize;
+
+    // First pass: id-matching lines, in order.
+    let mut window_pending: Vec<String> = Vec::new();
+    for line in reader.lines() {
+        let Ok(line) = line else { continue };
+        if line.contains(session_id) {
+            writeln!(writer, "{line}")?;
+            kept += 1;
+        } else if window.is_some() {
+            window_pending.push(line);
+        }
+    }
+
+    // Second pass: window-correlated lines (session id absent from the line).
+    if let Some(window) = window {
+        for line in window_pending {
+            let Some(ts) = tracing_line_timestamp(&line) else {
+                continue;
+            };
+            if ts >= window.start && ts <= window.end {
+                writeln!(writer, "{line}")?;
+                kept += 1;
+            }
+        }
+    }
+    writer.flush()?;
+    Ok(kept)
+}
+
+/// Parse the RFC3339 UTC timestamp prefix of a tracing log line
+/// (`2026-09-05T08:46:12.613044Z  INFO ...`). Returns `None` for lines
+/// without a recognizable timestamp.
+fn tracing_line_timestamp(line: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    let end = line.find(|c: char| c.is_whitespace()).unwrap_or(line.len());
+    chrono::DateTime::parse_from_rfc3339(&line[..end])
+        .ok()
+        .map(|ts| ts.with_timezone(&chrono::Utc))
 }
 
 fn filter_lines(
@@ -472,9 +857,253 @@ mod debug_export_tests {
         let src = dir.join("empty.log");
         std::fs::write(&src, "").unwrap();
         let dst = dir.join("out.log");
-        let kept = filter_lines_by_session(&src, "sid", &dst).unwrap();
+        let kept = filter_log_lines(&src, "sid", None, &dst).unwrap();
         assert_eq!(kept, 0);
         assert_eq!(std::fs::read_to_string(&dst).unwrap(), "");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn log_extract_includes_time_window_lines_without_session_id() {
+        let dir =
+            std::env::temp_dir().join(format!("kkagent-export-test-win-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("kkagent.log");
+        std::fs::write(
+            &src,
+            concat!(
+                "2026-09-05T08:20:00.000000Z  INFO kkagent: startup unrelated-session line\n",
+                "2026-09-05T08:26:30.000000Z  INFO kkagent: Auto-resuming session session_id=sid-1\n",
+                "2026-09-05T08:27:00.000000Z ERROR sid: LLM stream error: decode/timeout no session id\n",
+                "2026-09-05T08:28:00.000000Z  INFO kkagent: window line without id or level marker\n",
+                "2027-01-01T00:00:00.000000Z ERROR sid: LLM stream error: far outside the window\n",
+                "not-a-timestamp-line sid\n",
+            ),
+        )
+        .unwrap();
+        let dst = dir.join("extract.log");
+        let window = ActivityWindow {
+            start: chrono::Utc::now() - chrono::Duration::hours(1),
+            end: chrono::Utc::now() + chrono::Duration::hours(1),
+        };
+        let kept = filter_log_lines(&src, "sid-1", Some(&window), &dst).unwrap();
+        let body = std::fs::read_to_string(&dst).unwrap();
+
+        // The resume line carries the session id.
+        assert!(body.contains("Auto-resuming session session_id=sid-1"));
+        // The id-less transport error inside the window is captured by time.
+        assert!(
+            body.contains("LLM stream error: decode/timeout no session id"),
+            "window extraction must keep id-less error lines: {body}"
+        );
+        // The same error far outside the window must not leak in.
+        assert!(!body.contains("far outside the window"));
+        // Timestamp-less lines are never window-matched; other sessions' ids
+        // ("sid") must not be captured by this session's filter ("sid-1").
+        assert!(!body.contains("not-a-timestamp-line sid"));
+        // The 08:28 id-less line is inside the window and does carry a
+        // timestamp, so it is expected to be captured by time correlation.
+        // The 08:20 startup line is likewise inside the window (now ± 1h).
+        assert!(body.contains("window line without id"));
+        assert_eq!(kept, 4);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn tracing_timestamp_parsing() {
+        assert!(tracing_line_timestamp("2026-09-05T08:46:12.613044Z  INFO x: y").is_some());
+        assert!(tracing_line_timestamp("not a timestamp").is_none());
+        assert!(tracing_line_timestamp("").is_none());
+    }
+
+    #[test]
+    fn debug_bundle_zip_round_trips_all_files() {
+        let root =
+            std::env::temp_dir().join(format!("kkagent-export-zip-{}", uuid::Uuid::new_v4()));
+        let session_dir = root.join("session-source");
+        std::fs::create_dir_all(session_dir.join("plans")).unwrap();
+        std::fs::write(session_dir.join("state.json"), "{\"ok\":true}").unwrap();
+        std::fs::write(session_dir.join("plans/plan.md"), "# plan\n").unwrap();
+        std::fs::write(session_dir.join("plans/.empty-dir-marker"), "").unwrap();
+        let zip_path = root.join("bundle.zip");
+
+        // manifest.json is always written into the bundle (not listed in
+        // manifest.files, which only covers the artifacts it describes).
+        let (path, manifest) =
+            export_session_debug_bundle_zip(&summary_for_export(&session_dir), &zip_path).unwrap();
+        assert_eq!(path, zip_path);
+        assert!(zip_path.is_file());
+        // The staging directory must not linger next to the zip.
+        let siblings: Vec<_> = std::fs::read_dir(&root)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(".bundle.zip.staging-"))
+            .collect();
+        assert!(
+            siblings.is_empty(),
+            "staging dirs left behind: {siblings:?}"
+        );
+
+        // Round-trip: every manifest entry must be present inside the zip.
+        let file = std::fs::File::open(&zip_path).unwrap();
+        let mut archive = zip::ZipArchive::new(std::io::BufReader::new(file)).unwrap();
+        for entry in archive.file_names() {
+            assert!(!entry.starts_with('/'), "absolute zip entry: {entry}");
+            assert!(!entry.contains(".."), "traversal zip entry: {entry}");
+        }
+        let names: Vec<String> = archive.file_names().map(str::to_string).collect();
+        assert!(names.contains(&"manifest.json".to_string()));
+        for file in &manifest.files {
+            assert!(names.contains(file), "zip missing manifest entry: {file}");
+        }
+        assert!(names.contains(&"session/state.json".to_string()));
+        assert!(names.contains(&"session/plans/plan.md".to_string()));
+
+        // Spot-check content survives compression.
+        let mut entry = archive.by_name("session/state.json").unwrap();
+        let mut body = String::new();
+        std::io::Read::read_to_string(&mut entry, &mut body).unwrap();
+        assert_eq!(body, "{\"ok\":true}");
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn default_debug_zip_path_lives_in_temp_dir_with_short_id() {
+        let path = default_debug_zip_path("12345678-abcd");
+        assert!(path.starts_with(std::env::temp_dir()));
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.starts_with("kkagent-debug-12345678-"), "{name}");
+        assert!(name.ends_with(".zip"), "{name}");
+        // Short ids must not panic on slicing.
+        let short = default_debug_zip_path("ab");
+        assert!(short
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("kkagent-debug-ab-"));
+    }
+
+    #[test]
+    fn find_session_summary_errors_on_unknown_id() {
+        let err = find_session_summary("").unwrap_err();
+        assert!(err.to_string().contains("must not be empty"));
+        let err = find_session_summary("kkagent-nonexistent-session").unwrap_err();
+        assert!(err.to_string().contains("session not found"));
+    }
+
+    #[test]
+    fn sanitize_redacts_known_secrets_and_url_key_params() {
+        let dir = std::env::temp_dir().join(format!("kkagent-sanitize-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("nested")).unwrap();
+        let log = dir.join("kkagent.log");
+        std::fs::write(
+            &log,
+            "LLM transport error: url=https://api.example.com/v1beta/models/gemini:streamGenerateContent?alt=sse&key=AIzaSyD-1234567890abcdef [kind=timeout]\n\
+             auth header was Bearer sk-ant-api03-real-secret-value-123\n",
+        )
+        .unwrap();
+        let other = dir.join("nested/notes.txt");
+        std::fs::write(&other, "no secrets here, just key= in plain text\n").unwrap();
+
+        let secrets = vec!["sk-ant-api03-real-secret-value-123".to_string()];
+        let modified = sanitize_bundle_secrets(&dir, &secrets);
+        assert_eq!(modified, 1, "only the log should change");
+
+        let log_body = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            log_body.contains("&key=<redacted>"),
+            "url key param must be redacted: {log_body}"
+        );
+        assert!(
+            log_body.contains("Bearer <redacted>"),
+            "known secret must be redacted: {log_body}"
+        );
+        assert!(!log_body.contains("AIzaSyD-1234567890abcdef"));
+        assert!(!log_body.contains("sk-ant-api03-real-secret-value-123"));
+
+        // Plain-text `key=` (not a query param) must survive untouched.
+        let other_body = std::fs::read_to_string(&other).unwrap();
+        assert_eq!(
+            other_body, "no secrets here, just key= in plain text\n",
+            "non-param key= occurrences must not be redacted"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sanitize_skips_binary_files() {
+        let dir =
+            std::env::temp_dir().join(format!("kkagent-sanitize-bin-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("image.bin");
+        let payload: Vec<u8> = vec![0xFF, 0xFE, b'k', b'e', b'y', b'=', 0x00, 0x01];
+        std::fs::write(&bin, &payload).unwrap();
+
+        let modified = sanitize_bundle_secrets(&dir, &["whatever-secret".to_string()]);
+        assert_eq!(modified, 0);
+        assert_eq!(
+            std::fs::read(&bin).unwrap(),
+            payload,
+            "binary must be untouched"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn redact_url_secrets_handles_multiple_params_and_line_end() {
+        let text = "a?key=one&key=two b?x=1&key=three\nc url?friendlykey=keep";
+        let out = redact_url_secrets(text);
+        assert_eq!(
+            out,
+            "a?key=<redacted>&key=<redacted> b?x=1&key=<redacted>\nc url?friendlykey=keep"
+        );
+    }
+
+    #[test]
+    fn debug_bundle_zip_sanitizes_secrets_before_archiving() {
+        let root =
+            std::env::temp_dir().join(format!("kkagent-export-sec-{}", uuid::Uuid::new_v4()));
+        let session_dir = root.join("session-source");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        // The fake secret below must never appear in the zipped log; simulate
+        // a leaked log inside the session directory.
+        std::fs::write(
+            session_dir.join("leaked.log"),
+            "transport error: Bearer sk-test-secret-abcdef1234 [kind=timeout]\n",
+        )
+        .unwrap();
+        let zip_path = root.join("bundle.zip");
+
+        // Drive the sanitize-then-zip path with an explicit secret list.
+        let (_, manifest) = export_session_debug_bundle_zip_with_secrets(
+            &summary_for_export(&session_dir),
+            &zip_path,
+            &["sk-test-secret-abcdef1234".to_string()],
+        )
+        .unwrap();
+        assert!(zip_path.is_file());
+        assert!(
+            manifest
+                .notes
+                .iter()
+                .any(|n| n.starts_with("Sanitized") || n.contains("redacted")),
+            "manifest should mention sanitization: {:?}",
+            manifest.notes
+        );
+
+        let file = std::fs::File::open(&zip_path).unwrap();
+        let mut archive = zip::ZipArchive::new(std::io::BufReader::new(file)).unwrap();
+        let mut entry = archive
+            .by_name("session/leaked.log")
+            .expect("leaked.log must be inside the zip");
+        let mut body = String::new();
+        std::io::Read::read_to_string(&mut entry, &mut body).unwrap();
+        assert!(
+            !body.contains("sk-test-secret-abcdef1234"),
+            "secret must not survive into the zip when configured"
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 }
