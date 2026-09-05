@@ -93,7 +93,7 @@ default_effort = "medium"
 
 `provider` 必须引用已有 Provider。`max_context_size` 和 `max_output_size` 参与上下文预算。`tool_use` 控制是否向模型发送工具定义；`image_in`、`video_in`、`audio_in` 声明多模态输入能力；`support_efforts` 和 `default_effort` 描述可用推理强度（`none`、`minimal`、`low`、`medium`、`high`、`xhigh`、`max`，如 GPT-5.6 支持 `none`/`low`/`medium`/`high`/`xhigh`/`max`）。`default_effort` 必须列在 `support_efforts` 中（若后者非空）。
 
-`first_token_timeout_ms` 控制流式请求等待第一个有效内容 chunk（文本 / thinking / tool_use）的超时。优先级为：模型级 → Provider 级 → 默认 `60000`（60 秒）。设为 `0` 表示禁用（退化为仅受逐读空闲超时约束）。≥ 300s 的配置会被 clamp 到 290s。超时后请求中断；若配置了 `fallback_model`，Agent loop 会按既有重试策略切换。
+`first_token_timeout_ms` 控制流式请求等待第一个有效内容 chunk（文本 / thinking / tool_use）的超时。优先级为：模型级 → Provider 级 → 默认 `60000`（60 秒）。设为 `0` 表示禁用（退化为仅受逐读空闲超时约束）。若配置了 `request_timeout_ms` 且首字超时 ≥ 该总超时，首字超时会被 clamp 到总超时前 1 秒；未配置总超时时首字超时按配置值生效。超时后请求中断；若配置了 `fallback_model`，Agent loop 会按既有重试策略切换。
 
 流式 LLM 请求默认没有总超时（旧的固定 300s 总超时会截断长时间生成，已在流式路径移除）：等待首字受 `first_token_timeout_ms` 约束，之后若连续 60 秒没有收到任何数据会被逐读空闲超时中断。需要恢复总超时兜底时，为 Provider 配置 `request_timeout_ms`（`0` 或不设置表示禁用）。
 

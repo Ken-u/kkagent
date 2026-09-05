@@ -7673,6 +7673,25 @@ async fn handle_rpc_call(
                 .try_acquire(&session_id)
                 .await
                 .map_err(|message| (-32001, message))?;
+            let store = SessionStore::open_default();
+            let store_entry = store.get(&session_id).ok();
+            let db_record = {
+                let db = state.transcript.lock().await;
+                db.get_session(&session_id)
+                    .map_err(|e| (-32000, e.to_string()))?
+            };
+            if store_entry.is_none() && db_record.is_none() {
+                // Nothing on disk nor in the DB: treat as already discarded
+                // so repeated auto-discards (e.g. resume race retries) stay
+                // idempotent instead of surfacing "session not found".
+                drop(_turn_permit);
+                state.turn_locks.remove(&session_id).await;
+                return Ok(serde_json::json!({
+                    "session_id": session_id,
+                    "discarded": true,
+                    "idempotent": true,
+                }));
+            }
             let db_messages = {
                 let db = state.transcript.lock().await;
                 db.load_messages(&session_id)
@@ -7688,7 +7707,7 @@ async fn handle_rpc_call(
                     ),
                 ));
             }
-            if let Ok(summary) = SessionStore::open_default().get(&session_id) {
+            if let Some(summary) = store_entry.as_ref() {
                 let messages_path = Path::new(&summary.session_dir).join("messages.jsonl");
                 if let Ok(text) = std::fs::read_to_string(&messages_path) {
                     if text.lines().any(|line| !line.trim().is_empty()) {
@@ -7702,9 +7721,11 @@ async fn handle_rpc_call(
                     }
                 }
             }
-            SessionStore::open_default()
-                .delete(&session_id)
-                .map_err(|e| (-32000, e.to_string()))?;
+            if store_entry.is_some() {
+                store
+                    .delete(&session_id)
+                    .map_err(|e| (-32000, e.to_string()))?;
+            }
             remove_session_runtime(&state, &session_id).await;
             drop(_turn_permit);
             state.turn_locks.remove(&session_id).await;
@@ -11542,7 +11563,7 @@ mod runtime_http_tests {
     /// Uses a unique temp transcript DB per call so parallel tests never share
     /// a SQLite schema (SQLITE_SCHEMA race) nor touch the user's real
     /// `~/.kkagent/transcripts.db`.
-    async fn test_server_state() -> Arc<ServerState> {
+    pub(crate) async fn test_server_state() -> Arc<ServerState> {
         let config = Arc::new(AppConfig::default());
         let (shutdown_tx, _) = watch::channel(false);
         let temp_db_dir =
@@ -11560,7 +11581,7 @@ mod runtime_http_tests {
         state
     }
 
-    fn rpc_event_sink() -> mpsc::Sender<Frame> {
+    pub(crate) fn rpc_event_sink() -> mpsc::Sender<Frame> {
         let (tx, _rx) = mpsc::channel(16);
         tx
     }
@@ -12394,5 +12415,117 @@ mod steer_admission_tests {
             result.is_err(),
             "grace expiry must degrade to the prompt path"
         );
+    }
+}
+
+#[cfg(test)]
+mod discard_rpc_tests {
+    use super::runtime_http_tests::{rpc_event_sink, test_server_state};
+    use super::*;
+
+    #[tokio::test]
+    async fn discard_refuses_session_with_db_history() {
+        let state = test_server_state().await;
+        let sid = format!("discard-db-{}", uuid::Uuid::new_v4());
+        {
+            let db = state.transcript.lock().await;
+            db.create_session(&sid, "test", "/tmp").unwrap();
+            db.append_message(&sid, "user", r#"[{"type":"text","text":"hi"}]"#, None)
+                .unwrap();
+        }
+
+        let error = handle_rpc_call(
+            state.clone(),
+            "sessions.discard",
+            Some(serde_json::json!({ "session_id": sid })),
+            rpc_event_sink(),
+        )
+        .await
+        .expect_err("session with transcript history must not be discarded");
+        assert_eq!(error.0, -32000);
+        assert!(error.1.contains("refusing to discard"));
+        assert!(error.1.contains("message(s) in transcript"));
+
+        // History is intact after the refused discard.
+        let messages = {
+            let db = state.transcript.lock().await;
+            db.load_messages(&sid).unwrap()
+        };
+        assert_eq!(messages.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn discard_refuses_session_with_non_empty_disk_transcript() {
+        let state = test_server_state().await;
+        let sid = format!("discard-disk-{}", uuid::Uuid::new_v4());
+        let work = std::env::temp_dir().join(format!("kkagent-discard-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&work).unwrap();
+        let summary = SessionStore::open_default().create(&sid, &work).unwrap();
+        std::fs::write(
+            Path::new(&summary.session_dir).join("messages.jsonl"),
+            "{\"role\":\"user\"}\n",
+        )
+        .unwrap();
+
+        let error = handle_rpc_call(
+            state.clone(),
+            "sessions.discard",
+            Some(serde_json::json!({ "session_id": sid })),
+            rpc_event_sink(),
+        )
+        .await
+        .expect_err("session with on-disk transcript must not be discarded");
+        assert_eq!(error.0, -32000);
+        assert!(error.1.contains("non-empty on-disk transcript"));
+        assert!(Path::new(&summary.session_dir).is_dir());
+
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    #[tokio::test]
+    async fn discard_removes_truly_empty_session() {
+        let state = test_server_state().await;
+        let sid = format!("discard-empty-{}", uuid::Uuid::new_v4());
+        let work = std::env::temp_dir().join(format!("kkagent-discard-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&work).unwrap();
+        let summary = SessionStore::open_default().create(&sid, &work).unwrap();
+
+        let result = handle_rpc_call(
+            state.clone(),
+            "sessions.discard",
+            Some(serde_json::json!({ "session_id": sid })),
+            rpc_event_sink(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result["discarded"], serde_json::json!(true));
+        assert!(!Path::new(&summary.session_dir).exists());
+
+        // Second discard is idempotent even though the session is gone.
+        let again = handle_rpc_call(
+            state.clone(),
+            "sessions.discard",
+            Some(serde_json::json!({ "session_id": sid })),
+            rpc_event_sink(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(again["idempotent"], serde_json::json!(true));
+
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    #[tokio::test]
+    async fn discard_missing_session_is_idempotent() {
+        let state = test_server_state().await;
+        let result = handle_rpc_call(
+            state,
+            "sessions.discard",
+            Some(serde_json::json!({ "session_id": "never-existed" })),
+            rpc_event_sink(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result["idempotent"], serde_json::json!(true));
     }
 }

@@ -1224,13 +1224,13 @@ pub struct McpOAuthConfig {
 }
 
 const DEFAULT_FIRST_TOKEN_TIMEOUT_MS: u64 = 60_000;
-const HTTP_TOTAL_TIMEOUT_MS: u64 = 300_000;
-const FIRST_TOKEN_TIMEOUT_CLAMP_MS: u64 = 290_000;
 
 /// Resolve streaming first-token timeout.
 ///
 /// Priority: model (`Some(0)` disables) → provider (`Some(0)` disables) → default 60s.
-/// Values ≥ 300s are clamped to 290s.
+/// Values larger than the provider's opt-in `request_timeout_ms` are clamped
+/// just below it so the first-token gate cannot outlive the total deadline;
+/// with no total timeout configured the value is used as-is.
 pub fn resolve_first_token_timeout(
     model: &ModelConfig,
     provider: &ProviderConfig,
@@ -1244,15 +1244,23 @@ pub fn resolve_first_token_timeout(
             None => DEFAULT_FIRST_TOKEN_TIMEOUT_MS,
         },
     };
-    let ms = if raw >= HTTP_TOTAL_TIMEOUT_MS {
-        tracing::warn!(
-            configured_ms = raw,
-            clamped_ms = FIRST_TOKEN_TIMEOUT_CLAMP_MS,
-            "first_token_timeout_ms >= 300s; clamping to 290s"
-        );
-        FIRST_TOKEN_TIMEOUT_CLAMP_MS
-    } else {
-        raw
+    let ms = match provider
+        .request_timeout_ms
+        .filter(|ms| *ms > 0 && raw >= *ms)
+    {
+        Some(total_ms) => {
+            // Keep the first-token gate strictly below the total request
+            // deadline; a 1s margin avoids racing the total timeout.
+            let clamped = (total_ms - 1_000).max(1_000);
+            tracing::warn!(
+                configured_ms = raw,
+                request_timeout_ms = total_ms,
+                clamped_ms = clamped,
+                "first_token_timeout_ms >= request_timeout_ms; clamping"
+            );
+            clamped
+        }
+        None => raw,
     };
     Some(std::time::Duration::from_millis(ms))
 }
@@ -1521,7 +1529,8 @@ impl AppConfig {
     /// Resolve streaming first-token timeout for a model/provider pair.
     ///
     /// Priority: model (`Some(0)` disables) → provider (`Some(0)` disables) → default 60s.
-    /// Values ≥ 300s are clamped to 290s.
+    /// Values larger than the provider's opt-in `request_timeout_ms` are clamped
+    /// just below it; with no total timeout configured the value is used as-is.
     pub fn resolve_first_token_timeout(
         model: &ModelConfig,
         provider: &ProviderConfig,
@@ -1781,9 +1790,16 @@ mod tests {
             Some(std::time::Duration::from_millis(60_000))
         );
         model.first_token_timeout_ms = Some(300_000);
+        // No request_timeout_ms configured: the 300s first-token gate is kept.
         assert_eq!(
             resolve_first_token_timeout(&model, &provider),
-            Some(std::time::Duration::from_millis(290_000))
+            Some(std::time::Duration::from_millis(300_000))
+        );
+        // A total request timeout clamps the first-token gate just below it.
+        provider.request_timeout_ms = Some(120_000);
+        assert_eq!(
+            resolve_first_token_timeout(&model, &provider),
+            Some(std::time::Duration::from_millis(119_000))
         );
     }
 
