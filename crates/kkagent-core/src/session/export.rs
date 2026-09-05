@@ -869,22 +869,31 @@ mod debug_export_tests {
             std::env::temp_dir().join(format!("kkagent-export-test-win-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let src = dir.join("kkagent.log");
-        std::fs::write(
-            &src,
-            concat!(
-                "2026-09-05T08:20:00.000000Z  INFO kkagent: startup unrelated-session line\n",
-                "2026-09-05T08:26:30.000000Z  INFO kkagent: Auto-resuming session session_id=sid-1\n",
-                "2026-09-05T08:27:00.000000Z ERROR sid: LLM stream error: decode/timeout no session id\n",
-                "2026-09-05T08:28:00.000000Z  INFO kkagent: window line without id or level marker\n",
-                "2027-01-01T00:00:00.000000Z ERROR sid: LLM stream error: far outside the window\n",
-                "not-a-timestamp-line sid\n",
-            ),
-        )
-        .unwrap();
+        // Timestamps are generated relative to the current time so the
+        // fixture always lines up with the `now ± 1h` window below; hardcoded
+        // dates would silently slide out of the window and break the test.
+        let now = chrono::Utc::now();
+        let ts = |offset: chrono::Duration| -> String {
+            (now + offset).to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
+        };
+        let content = format!(
+            "{}  INFO kkagent: startup unrelated-session line\n\
+             {}  INFO kkagent: Auto-resuming session session_id=sid-1\n\
+             {} ERROR sid: LLM stream error: decode/timeout no session id\n\
+             {}  INFO kkagent: window line without id or level marker\n\
+             {} ERROR sid: LLM stream error: far outside the window\n\
+             not-a-timestamp-line sid\n",
+            ts(chrono::Duration::minutes(-40)),
+            ts(chrono::Duration::minutes(-10)),
+            ts(chrono::Duration::minutes(-5)),
+            ts(chrono::Duration::minutes(-2)),
+            ts(chrono::Duration::hours(48)),
+        );
+        std::fs::write(&src, content).unwrap();
         let dst = dir.join("extract.log");
         let window = ActivityWindow {
-            start: chrono::Utc::now() - chrono::Duration::hours(1),
-            end: chrono::Utc::now() + chrono::Duration::hours(1),
+            start: now - chrono::Duration::hours(1),
+            end: now + chrono::Duration::hours(1),
         };
         let kept = filter_log_lines(&src, "sid-1", Some(&window), &dst).unwrap();
         let body = std::fs::read_to_string(&dst).unwrap();
@@ -901,9 +910,9 @@ mod debug_export_tests {
         // Timestamp-less lines are never window-matched; other sessions' ids
         // ("sid") must not be captured by this session's filter ("sid-1").
         assert!(!body.contains("not-a-timestamp-line sid"));
-        // The 08:28 id-less line is inside the window and does carry a
-        // timestamp, so it is expected to be captured by time correlation.
-        // The 08:20 startup line is likewise inside the window (now ± 1h).
+        // The startup line (now-40m) and the id-less window line (now-2m)
+        // carry timestamps inside the window, so both are captured by time
+        // correlation.
         assert!(body.contains("window line without id"));
         assert_eq!(kept, 4);
         std::fs::remove_dir_all(&dir).ok();
