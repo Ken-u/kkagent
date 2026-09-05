@@ -308,13 +308,14 @@ async fn main() -> Result<()> {
     }
 
     let is_tui = cli.command.is_none() && cli.prompt.is_none();
+    let is_server = matches!(cli.command, Some(Commands::Server { .. }));
 
     // Detect an unusable kkagent home (e.g. `~/.kkagent` being a regular file)
     // before logging/diagnostics try to write into it, so the user gets one
     // clear, actionable error instead of cryptic OS errors like `File exists`.
     kkagent_config::validate_config_dir()?;
 
-    init_logging(is_tui)?;
+    init_logging(is_tui, is_server)?;
 
     let mut diagnostics = RunDiagnostics::start(runtime_mode(&cli))?;
     diagnostics.install_panic_hook();
@@ -656,11 +657,19 @@ fn print_doctor_bundle(configured_path: Option<&std::path::Path>) -> Result<()> 
     Ok(())
 }
 
-fn init_logging(tui_mode: bool) -> Result<()> {
+/// Where the global tracing subscriber writes.
+///
+/// - TUI: file only (stderr belongs to the alternate screen).
+/// - Server: file **and** stderr. Standalone servers spawned by the TUI get
+///   `Stdio::null()` on both pipes, so without the file sink their logs
+///   (including session-tagged `LLM stream error` lines that
+///   `export_session_debug_bundle` filters on) would be lost entirely.
+/// - Everything else: stderr only.
+fn init_logging(tui_mode: bool, server_mode: bool) -> Result<()> {
     let filter = tracing_subscriber::EnvFilter::from_default_env()
         .add_directive("kkagent=info".parse().unwrap());
 
-    if tui_mode {
+    if tui_mode || server_mode {
         let dir = kkagent_config::default_config_dir();
         std::fs::create_dir_all(&dir)?;
         let path = dir.join("kkagent.log");
@@ -668,11 +677,14 @@ fn init_logging(tui_mode: bool) -> Result<()> {
             .create(true)
             .append(true)
             .open(&path)?;
-        tracing_subscriber::fmt()
+        let subscriber = tracing_subscriber::fmt()
             .with_env_filter(filter)
-            .with_ansi(false)
-            .with_writer(std::sync::Mutex::new(file))
-            .init();
+            .with_ansi(false);
+        if server_mode {
+            subscriber.with_writer(Tee::new(file)).init();
+        } else {
+            subscriber.with_writer(std::sync::Mutex::new(file)).init();
+        }
     } else {
         tracing_subscriber::fmt()
             .with_env_filter(filter)
@@ -680,6 +692,53 @@ fn init_logging(tui_mode: bool) -> Result<()> {
             .init();
     }
     Ok(())
+}
+
+/// [`tracing_subscriber::fmt::MakeWriter`] that duplicates every log line to a
+/// shared append-only file and to stderr. The file handle is shared across
+/// threads (one `Mutex`), mirroring the TUI's `Mutex<File>` writer.
+struct Tee {
+    file: std::sync::Mutex<std::fs::File>,
+}
+
+impl Tee {
+    fn new(file: std::fs::File) -> Self {
+        Self {
+            file: std::sync::Mutex::new(file),
+        }
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Tee {
+    type Writer = TeeWriter<'a>;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        TeeWriter { file: &self.file }
+    }
+}
+
+struct TeeWriter<'a> {
+    file: &'a std::sync::Mutex<std::fs::File>,
+}
+
+impl std::io::Write for TeeWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if let Ok(mut file) = self.file.lock() {
+            // Log persistence must never take the process down: a failed file
+            // write still reaches stderr.
+            let _ = file.write_all(buf);
+        }
+        let _ = std::io::stderr().write_all(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        if let Ok(mut file) = self.file.lock() {
+            let _ = file.flush();
+        }
+        let _ = std::io::stderr().flush();
+        Ok(())
+    }
 }
 
 async fn run_auth(command: &AuthCommands, config_path: Option<&std::path::Path>) -> Result<()> {
