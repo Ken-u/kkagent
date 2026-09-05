@@ -44,13 +44,13 @@ cargo run -p kkagent -- --config .env -y -p "读取 Cargo.toml"
 ```text
 x86_64-apple-darwin
 aarch64-apple-darwin
-x86_64-unknown-linux-gnu / musl
-aarch64-unknown-linux-gnu / musl
+x86_64-unknown-linux-musl
+aarch64-unknown-linux-musl
 x86_64-pc-windows-msvc / gnu
 aarch64-pc-windows-msvc
 ```
 
-本机原生构建最可靠。交叉编译需先 `rustup target add <target>`，并安装对应 linker、SDK 或 musl 工具链（Linux musl 需 `musl-tools`，见 `.cargo/config.toml`）。GitHub `Release` workflow 在八种 runner/target 组合上构建并打包；本地 `make dist` 只适合已有对应 linker 的开发机，不能代替完整 CI 矩阵。
+本机原生构建最可靠。交叉编译需先 `rustup target add <target>`，并安装对应 linker、SDK 或 musl 工具链（Linux musl 需 `musl-tools`，见 `.cargo/config.toml`）。GitHub `Release` workflow 在六种 runner/target 组合上构建并打包；本地 `make dist` 只适合已有对应 linker 的开发机，不能代替完整 CI 矩阵。
 
 ## Node SDK
 

@@ -3,7 +3,6 @@
 English | [简体中文](README.md)
 
 [![CI](https://github.com/Ken-u/kkagent/actions/workflows/ci.yml/badge.svg)](https://github.com/Ken-u/kkagent/actions/workflows/ci.yml)
-[![Release](https://github.com/Ken-u/kkagent/actions/workflows/release.yml/badge.svg)](https://github.com/Ken-u/kkagent/actions/workflows/release.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust: 1.88+](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org/)
 
@@ -69,12 +68,11 @@ On top of that, kkagent also ships: system-level Bash sandboxing (Linux Bubblewr
 curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/Ken-u/kkagent/main/install.sh | sh
 ```
 
-The installer detects macOS/Linux and x86_64/arm64, downloads the latest Release, and verifies its SHA-256 checksum. On Linux it defaults to the musl static build (`unknown-linux-musl`), so no system OpenSSL is required. It uses `/usr/local/bin` when writable and otherwise falls back to `~/.local/bin`. You can also pin the directory, version, or glibc artifact:
+The installer detects macOS/Linux and x86_64/arm64, downloads the latest Release, and verifies its SHA-256 checksum. On Linux it uses the musl static build (`unknown-linux-musl`), so no system OpenSSL or specific glibc version is required. It uses `/usr/local/bin` when writable and otherwise falls back to `~/.local/bin`. You can also pin the directory or version:
 
 ```bash
 curl --proto '=https' --tlsv1.2 -fsSLO https://raw.githubusercontent.com/Ken-u/kkagent/main/install.sh
 KKAGENT_INSTALL_DIR="$HOME/bin" KKAGENT_VERSION=<version> sh install.sh
-KKAGENT_TARGET=x86_64-unknown-linux-gnu sh install.sh
 ```
 
 The installer also adds `kkagent-update`; run that command later to upgrade in the original installation directory. The TUI checks GitHub Releases in the background at most once every 24 hours and only displays a notice; set `[ui] check_updates = false` to disable it.
@@ -89,7 +87,6 @@ Current release matrix:
 |---|---|---|
 | macOS | x86_64 / arm64 | `kkagent-x86_64-apple-darwin.tar.gz` / `kkagent-aarch64-apple-darwin.tar.gz` |
 | Linux (musl, static) | x86_64 / arm64 | `kkagent-x86_64-unknown-linux-musl.tar.gz` / `kkagent-aarch64-unknown-linux-musl.tar.gz` |
-| Linux (glibc) | x86_64 / arm64 | `kkagent-x86_64-unknown-linux-gnu.tar.gz` / `kkagent-aarch64-unknown-linux-gnu.tar.gz` |
 | Windows | x86_64 / arm64 | `kkagent-x86_64-pc-windows-msvc.zip` / `kkagent-aarch64-pc-windows-msvc.zip` |
 
 ### Windows (PowerShell)

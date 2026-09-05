@@ -3,7 +3,6 @@
 [English](README.en.md) | 简体中文
 
 [![CI](https://github.com/Ken-u/kkagent/actions/workflows/ci.yml/badge.svg)](https://github.com/Ken-u/kkagent/actions/workflows/ci.yml)
-[![Release](https://github.com/Ken-u/kkagent/actions/workflows/release.yml/badge.svg)](https://github.com/Ken-u/kkagent/actions/workflows/release.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust: 1.88+](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org/)
 
@@ -69,12 +68,11 @@ kkagent 是一个用 Rust 实现的终端 Coding Agent，重点增强长任务�
 curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/Ken-u/kkagent/main/install.sh | sh
 ```
 
-安装器会自动识别 macOS/Linux 与 x86_64/arm64，下载最新 Release 并校验 SHA-256。Linux 默认使用 musl 静态包（`unknown-linux-musl`），无需系统 OpenSSL。`/usr/local/bin` 可写时安装到该目录，否则自动使用 `~/.local/bin`。也可指定目录、版本或 glibc 包：
+安装器会自动识别 macOS/Linux 与 x86_64/arm64，下载最新 Release 并校验 SHA-256。Linux 使用 musl 静态链接包（`unknown-linux-musl`），无需系统 OpenSSL，也不依赖发行版 glibc 版本。`/usr/local/bin` 可写时安装到该目录，否则自动使用 `~/.local/bin`。也可指定目录或版本：
 
 ```bash
 curl --proto '=https' --tlsv1.2 -fsSLO https://raw.githubusercontent.com/Ken-u/kkagent/main/install.sh
 KKAGENT_INSTALL_DIR="$HOME/bin" KKAGENT_VERSION=<version> sh install.sh
-KKAGENT_TARGET=x86_64-unknown-linux-gnu sh install.sh
 ```
 
 安装完成后会同时安装 `kkagent-update`，以后直接执行该命令即可升级，且会沿用原安装目录。TUI 默认每 24 小时在后台检查一次 GitHub Release；只显示提示，不会自动下载。可在配置中设置 `[ui] check_updates = false` 关闭。
@@ -89,7 +87,6 @@ KKAGENT_TARGET=x86_64-unknown-linux-gnu sh install.sh
 |---|---|---|
 | macOS | x86_64 / arm64 | `kkagent-x86_64-apple-darwin.tar.gz` / `kkagent-aarch64-apple-darwin.tar.gz` |
 | Linux (musl, 静态) | x86_64 / arm64 | `kkagent-x86_64-unknown-linux-musl.tar.gz` / `kkagent-aarch64-unknown-linux-musl.tar.gz` |
-| Linux (glibc) | x86_64 / arm64 | `kkagent-x86_64-unknown-linux-gnu.tar.gz` / `kkagent-aarch64-unknown-linux-gnu.tar.gz` |
 | Windows | x86_64 / arm64 | `kkagent-x86_64-pc-windows-msvc.zip` / `kkagent-aarch64-pc-windows-msvc.zip` |
 
 ### Windows（PowerShell）

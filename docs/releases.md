@@ -2,12 +2,10 @@
 
 ## 支持的产物
 
-修改 `[workspace.package].version` 并推送到 `main` 后，Release workflow 会等待同一提交的 CI 成功，再在对应系统 runner 上执行锁定依赖的 release 构建。若 `v<version>` Release 已存在，自动任务会安全跳过，不重复发布；CI 失败不会发版：
+修改 `[workspace.package].version` 并推送到 `main` 后，CI workflow 会在同一运行中完成版本解析、六平台 release 构建与发布；常规提交只运行检查矩阵，版本提交会跳过冗余的跨平台检查（发布构建本身即全量编译）。若 `v<version>` Release 已存在，自动任务会安全跳过，不重复发布；fmt/clippy/test 或构建失败不会发版：
 
 | 系统 | 架构 | Rust target | 资产 |
 |---|---|---|---|
-| Linux | x86_64 | `x86_64-unknown-linux-gnu` | `.tar.gz` |
-| Linux | arm64 | `aarch64-unknown-linux-gnu` | `.tar.gz` |
 | Linux (musl, 静态) | x86_64 | `x86_64-unknown-linux-musl` | `.tar.gz` |
 | Linux (musl, 静态) | arm64 | `aarch64-unknown-linux-musl` | `.tar.gz` |
 | macOS | x86_64 | `x86_64-apple-darwin` | `.tar.gz` |
@@ -15,7 +13,7 @@
 | Windows | x86_64 | `x86_64-pc-windows-msvc` | `.zip` |
 | Windows | arm64 | `aarch64-pc-windows-msvc` | `.zip` |
 
-每个包包含可执行文件、README 和 MIT License。发布任务等待八个构建全部成功，随后生成 `SHA256SUMS`，使用 GitHub Actions OIDC 对清单执行 Cosign keyless 签名，并上传 `SHA256SUMS.sigstore.json`。
+每个包包含可执行文件、README 和 MIT License。发布任务等待六个构建全部成功，随后生成 `SHA256SUMS`，使用 GitHub Actions OIDC 对清单执行 Cosign keyless 签名，并上传 `SHA256SUMS.sigstore.json`。
 
 ## 安装
 
@@ -30,7 +28,6 @@ sh install.sh
 ```bash
 KKAGENT_INSTALL_DIR=/absolute/writable/bin sh install.sh
 KKAGENT_VERSION=0.2.0 sh install.sh
-KKAGENT_TARGET=x86_64-unknown-linux-gnu sh install.sh
 ```
 
 Windows PowerShell 默认写入 `%LOCALAPPDATA%\Programs\kkagent`，并在缺失时加入用户 PATH：
@@ -59,7 +56,7 @@ Release 压缩包同时携带对应平台的安装器，因此安装后会得到
 ```bash
 cosign verify-blob \
   --bundle SHA256SUMS.sigstore.json \
-  --certificate-identity-regexp 'https://github.com/.*/kkagent/.github/workflows/release.yml@.*' \
+  --certificate-identity-regexp 'https://github.com/.*/kkagent/.github/workflows/ci.yml@.*' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com \
   SHA256SUMS
 ```
@@ -70,8 +67,8 @@ cosign verify-blob \
 
 1. 确保本地测试、真实 Provider 冒烟和文档检查通过。
 2. 提升根 `Cargo.toml` 的 `[workspace.package].version` 并推送到 `main`；例如 `0.1.0` 升为 `0.1.1`。
-3. 等待同一提交的 CI，以及 `Release` workflow 的版本解析、八个 build job 和 publish job 全部成功。
-4. 在 GitHub Release 中确认八个包、校验清单、Sigstore bundle 和自动 release notes。
+3. 等待同一个 CI 运行中的版本解析、六个 build job 和 publish job 全部成功。
+4. 在 GitHub Release 中确认六个包、校验清单、Sigstore bundle 和自动 release notes。
 
 发布任务会在最后创建 `v<version>` tag 和 Release。需要重新构建已有版本资产时，可手动运行 workflow 并填写现有 tag；上传使用覆盖模式。正式版本不应移动已经对外发布的 tag。
 

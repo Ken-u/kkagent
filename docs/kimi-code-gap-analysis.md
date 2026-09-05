@@ -121,8 +121,7 @@ ref 文档：
 
 当前：
 
-- `.github/workflows/ci.yml`
-- `.github/workflows/release.yml`
+- `.github/workflows/ci.yml`（检查 + 版本发布一体）
 - `Makefile`（Rust cross compile）
 - `install.sh` / `install.ps1`
 
