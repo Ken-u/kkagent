@@ -298,10 +298,48 @@ pub fn load_config(path: Option<&Path>) -> Result<AppConfig> {
     if let Ok(cwd) = std::env::current_dir() {
         config.tools.merge_project_overrides(&cwd);
     }
+    // Project-level `.kk/config.toml` overlay (whitelisted sections; trust
+    // gating for security-relevant sections happens at their use sites).
+    if let Ok(cwd) = std::env::current_dir() {
+        match crate::load_project_config(&cwd) {
+            Ok(Some(project)) => {
+                if let Some(model) = project
+                    .default_model
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|m| !m.is_empty())
+                {
+                    apply_project_default_model(&mut config, model)?;
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                // A broken project file must not kill startup, but it must be
+                // loud — the user explicitly wrote it.
+                tracing::warn!("ignoring invalid <workspace>/.kk/config.toml: {error:#}");
+            }
+        }
+    }
     config
         .validate()
         .with_context(|| format!("Invalid kkagent configuration: {config_path:?}"))?;
     Ok(config)
+}
+
+/// Apply a project overlay `default_model`: the alias must exist in the
+/// global `models` map — project files may only *select* among globally
+/// declared models, not introduce new ones (the subsequent `validate()` also
+/// enforces this, but this check gives a message that points at the project
+/// file rather than the global config).
+fn apply_project_default_model(config: &mut AppConfig, model: &str) -> Result<()> {
+    if !config.models.contains_key(model) {
+        anyhow::bail!(
+            ".kk/config.toml default_model `{model}` is not defined in the global `models` map; \
+             project files can only select among globally declared models"
+        );
+    }
+    config.default_model = Some(model.to_string());
+    Ok(())
 }
 
 /// Load only kkagent/model-provider variables from `<cwd>/.env` without
@@ -1029,5 +1067,73 @@ api_key_env = "OAI_API_KEY"
         let config: AppConfig = toml::from_str(raw).unwrap();
         assert!(config.providers["oai"].api_key_env.is_none());
         assert!(config.providers["oai"].extra_fields.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod project_overlay_tests {
+    use super::*;
+    use crate::ProjectConfigFile;
+
+    fn config_with_model(alias: &str) -> AppConfig {
+        let raw = format!(
+            r#"
+default_model = "fallback"
+
+[providers.oai]
+type = "openai"
+api_key = "k"
+
+[models."oai/fallback"]
+provider = "oai"
+model = "fallback"
+
+[models."oai/{alias}"]
+provider = "oai"
+model = "{alias}"
+"#
+        );
+        toml::from_str(&raw).unwrap()
+    }
+
+    #[test]
+    fn project_default_model_overrides_when_globally_declared() {
+        let mut config = config_with_model("mini");
+        apply_project_default_model(&mut config, "oai/mini").unwrap();
+        assert_eq!(config.default_model.as_deref(), Some("oai/mini"));
+    }
+
+    #[test]
+    fn project_default_model_must_reference_global_models() {
+        let mut config = config_with_model("mini");
+        let err = apply_project_default_model(&mut config, "oai/does-not-exist").unwrap_err();
+        assert!(err.to_string().contains(".kk/config.toml"));
+        // Original value untouched on failure.
+        assert_eq!(config.default_model.as_deref(), Some("fallback"));
+    }
+
+    #[test]
+    fn project_config_file_parses_default_model() {
+        let raw = r#"
+default_model = "oai/mini"
+
+[services.image_gen]
+base_url = "http://127.0.0.1:8317/v1"
+"#;
+        let project: ProjectConfigFile = toml::from_str(raw).unwrap();
+        assert_eq!(project.default_model.as_deref(), Some("oai/mini"));
+        assert!(project.services.unwrap().image_gen.is_some());
+    }
+
+    #[test]
+    fn project_config_rejects_models_and_providers_sections() {
+        for raw in [
+            "[models.x]\nprovider = \"p\"\nmodel = \"m\"\n",
+            "[providers.p]\ntype = \"openai\"\n",
+            "[permission]\nmode = \"yolo\"\n",
+        ] {
+            let result: Result<ProjectConfigFile, _> = toml::from_str(raw);
+            assert!(result.is_err(), "must reject: {raw}");
+        }
     }
 }

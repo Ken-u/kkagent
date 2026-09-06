@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
+use std::path::Path;
 
 use crate::toolchain::ToolchainConfig;
 
@@ -1108,6 +1109,112 @@ pub struct ServicesConfig {
     /// Deprecated — prefer `web_fetch`.
     #[serde(default)]
     pub moonshot_fetch: Option<ServiceEndpoint>,
+    /// Text-to-image backend for the `GenerateImage` tool
+    /// (`[services.image_gen]`). Optional: the tool registers only when a
+    /// backend is configured — globally here, or per project via
+    /// `<workspace>/.kk/config.toml` (which overrides this section).
+    #[serde(default)]
+    pub image_gen: Option<ImageGenServiceConfig>,
+}
+
+/// `[services.image_gen]` — OpenAI Images compatible text-to-image backend.
+///
+/// Requests go to `POST {base_url}/images/generations`; both `b64_json` and
+/// `url` responses are accepted. Works with the official OpenAI API and
+/// OpenAI-compatible gateways (e.g. CLIProxyAPI exposing a Codex
+/// subscription — `model` must then be in that gateway's image-model
+/// allowlist, not a chat model).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct ImageGenServiceConfig {
+    /// Endpoint base, e.g. `https://api.openai.com/v1` or
+    /// `http://127.0.0.1:8317/v1` (CLIProxyAPI).
+    pub base_url: Option<String>,
+    /// Inline API key. `api_key_env` (env var name) takes precedence.
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// Name of an environment variable holding the API key. Takes precedence
+    /// over the inline `api_key` — matches the provider/service convention.
+    #[serde(default)]
+    pub api_key_env: Option<String>,
+    /// Image model name (default `gpt-image-2`).
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Request timeout in milliseconds (default 180s — generation is slow).
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+    /// Default size passed to the backend (e.g. "1024x1024").
+    #[serde(default)]
+    pub default_size: Option<String>,
+}
+
+impl ImageGenServiceConfig {
+    /// Resolve the API key: `api_key_env` first (non-empty env var), then the
+    /// inline `api_key`.
+    pub fn api_key(&self) -> Option<String> {
+        if let Some(env_name) = self.api_key_env.as_deref().map(str::trim) {
+            if !env_name.is_empty() {
+                if let Ok(value) = std::env::var(env_name) {
+                    if !value.trim().is_empty() {
+                        return Some(value);
+                    }
+                }
+            }
+        }
+        self.api_key.clone()
+    }
+
+    pub fn base_url_trimmed(&self) -> Option<&str> {
+        self.base_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    }
+}
+
+/// Project-level configuration overlay: `<workspace>/.kk/config.toml`.
+///
+/// Deliberately minimal: only sections listed here are honored, and unknown
+/// top-level sections are a hard parse error (loud typo detection). A project
+/// overrides the matching global section entirely; absence keeps the global
+/// value. Currently supported:
+///
+/// - `[services.image_gen]` — enables/overrides the `GenerateImage` tool for
+///   this workspace. Loading is gated on workspace trust by the caller.
+/// - `default_model` — model alias for new sessions in this workspace;
+///   overrides the global `default_model` (alias must exist globally).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectConfigFile {
+    #[serde(default)]
+    pub services: Option<ProjectServicesOverrides>,
+    /// Model alias override for new sessions in this workspace. The alias
+    /// must exist in the global `models` map — project files cannot define
+    /// models or providers, only select among the globally declared ones.
+    #[serde(default)]
+    pub default_model: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectServicesOverrides {
+    #[serde(default)]
+    pub image_gen: Option<ImageGenServiceConfig>,
+}
+
+/// Load `<workspace>/.kk/config.toml`. `Ok(None)` when the file does not
+/// exist (the project has not opted into any overrides). A malformed file is
+/// an error — the user explicitly wrote it, silence would hide the typo.
+pub fn load_project_config(workspace: &Path) -> anyhow::Result<Option<ProjectConfigFile>> {
+    let path = workspace.join(".kk").join("config.toml");
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let text = std::fs::read_to_string(&path)
+        .map_err(|error| anyhow::anyhow!("read {}: {error}", path.display()))?;
+    let config: ProjectConfigFile = toml::from_str(&text)
+        .map_err(|error| anyhow::anyhow!("parse {}: {error}", path.display()))?;
+    Ok(Some(config))
 }
 
 /// Outbound HTTP proxy policy for a web service endpoint.

@@ -1751,6 +1751,7 @@ mod tests {
             web_fetch: effective.web_fetch,
             moonshot_search: None,
             moonshot_fetch: None,
+            image_gen: None,
         });
         assert!(web.search.is_some());
 

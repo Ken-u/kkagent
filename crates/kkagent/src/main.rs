@@ -2188,6 +2188,29 @@ async fn run_dump_system_prompt(config_path: Option<&Path>) -> Result<()> {
     // static, so the output matches what a real turn would register.
     let mut tools = kkagent_tools::ToolRegistry::new();
     kkagent_tools::register_builtin_tools(&mut tools);
+    // Mirror the real-turn path: `GenerateImage` appears when the global or
+    // trusted-workspace `.kk/config.toml` service config enables it.
+    {
+        let global = config.services.as_ref().and_then(|s| s.image_gen.clone());
+        let project = if kkagent_core::is_workspace_trusted(&config, &working_dir) {
+            match kkagent_config::load_project_config(&working_dir) {
+                Ok(Some(project)) => project.services.and_then(|s| s.image_gen).or(global),
+                Ok(None) => global,
+                Err(error) => {
+                    eprintln!("warning: ignoring .kk/config.toml: {error}");
+                    global
+                }
+            }
+        } else {
+            None
+        };
+        if let Some(image_gen) = project {
+            match kkagent_tools::builtin::GenerateImageTool::new(image_gen) {
+                Ok(tool) => tools.register(Arc::new(tool)),
+                Err(error) => eprintln!("warning: GenerateImage disabled: {error}"),
+            }
+        }
+    }
     let subagent_mgr = Arc::new(kkagent_protocol::subagent::SubagentManager::new(
         config.subagent.effective_max_concurrent(),
     ));
@@ -2227,6 +2250,7 @@ async fn run_dump_system_prompt(config_path: Option<&Path>) -> Result<()> {
         web_fetch: svc_overrides.web_fetch,
         moonshot_search: None,
         moonshot_fetch: None,
+        image_gen: None,
     });
     if let Some(web) = kkagent_tools::builtin::WebTool::try_new(Arc::new(web_cfg)) {
         tools.register(Arc::new(web));
@@ -4085,12 +4109,55 @@ async fn build_turn_tool_registry(
     event_tx: mpsc::Sender<AgentEvent>,
     todos: Vec<kkagent_protocol::TodoItemEvent>,
     session_id: &str,
+    working_dir: &std::path::Path,
 ) -> ToolRegistry {
     // MCP discovery starts in the background so the TUI can paint immediately.
     // Synchronize only when a turn actually needs its final tool registry.
     state.mcp.wait_until_initialized().await;
     let mut tools = ToolRegistry::new();
     kkagent_tools::register_builtin_tools(&mut tools);
+    // `GenerateImage` opt-in resolution: global `[services.image_gen]`
+    // enables the tool everywhere; a trusted workspace's
+    // `.kk/config.toml` `[services.image_gen]` overrides it for this project
+    // only. Untrusted workspaces never load the project overlay (fail
+    // closed); per-turn resolution means different sessions (different
+    // working dirs) on this server never see each other's opt-in.
+    let effective_image_gen = {
+        let global = state
+            .config()
+            .services
+            .as_ref()
+            .and_then(|s| s.image_gen.clone());
+        let project = if kkagent_core::is_workspace_trusted(&state.config(), working_dir) {
+            match kkagent_config::load_project_config(working_dir) {
+                Ok(Some(project)) => project.services.and_then(|s| s.image_gen).or(global),
+                Ok(None) => global,
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        workspace = %working_dir.display(),
+                        "failed to load <workspace>/.kk/config.toml; ignoring project overrides"
+                    );
+                    global
+                }
+            }
+        } else {
+            tracing::debug!(
+                workspace = %working_dir.display(),
+                "workspace not trusted; ignoring <workspace>/.kk/config.toml"
+            );
+            None
+        };
+        project
+    };
+    if let Some(config) = effective_image_gen {
+        match kkagent_tools::builtin::GenerateImageTool::new(config) {
+            Ok(tool) => tools.register(Arc::new(tool)),
+            Err(error) => {
+                tracing::warn!(%error, "GenerateImage config invalid; tool not registered")
+            }
+        }
+    }
     tools.register(Arc::new(kkagent_tools::builtin::TodoListTool::with_items(
         todos,
     )));
@@ -4375,6 +4442,7 @@ async fn run_http_turn(
         event_tx.clone(),
         session.todo_items(),
         session.id.as_str(),
+        &session.working_dir,
     )
     .await;
 
@@ -5737,6 +5805,7 @@ async fn rebuild_web_services(state: &ServerState) {
         web_fetch: svc_overrides.web_fetch,
         moonshot_search: None,
         moonshot_fetch: None,
+        image_gen: None,
     };
     web_cfg.merge_plugin_overrides(&svc_as_config);
     *state.web.write().await = Arc::new(web_cfg);
@@ -5980,6 +6049,7 @@ async fn build_server_state_with_shutdown(
         web_fetch: svc_overrides.web_fetch,
         moonshot_search: None,
         moonshot_fetch: None,
+        image_gen: None,
     };
     web_cfg.merge_plugin_overrides(&svc_as_config);
     let web = tokio::sync::RwLock::new(Arc::new(web_cfg));
@@ -6636,15 +6706,28 @@ async fn spawn_session_agent_turn(
             });
         }
 
-        let todos = {
+        let (todos, session_working_dir) = {
             let sessions = state_clone.sessions.lock().await;
-            sessions
+            let working_dir = sessions
                 .get(&sid)
-                .map(Session::todo_items)
-                .unwrap_or_default()
+                .map(|s| s.working_dir.clone())
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| ".".into()));
+            (
+                sessions
+                    .get(&sid)
+                    .map(Session::todo_items)
+                    .unwrap_or_default(),
+                working_dir,
+            )
         };
-        let tools =
-            build_turn_tool_registry(&state_clone, agent_event_tx.clone(), todos, &sid).await;
+        let tools = build_turn_tool_registry(
+            &state_clone,
+            agent_event_tx.clone(),
+            todos,
+            &sid,
+            &session_working_dir,
+        )
+        .await;
         let permission = PermissionChain::with_shared_mode(shared_mode, permission_rules);
         let agent_loop = Arc::new(
             AgentLoop::new(

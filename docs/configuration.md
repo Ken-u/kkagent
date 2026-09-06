@@ -429,6 +429,69 @@ proxy = "auto"                              # auto | none | system，默认 auto
 
 旧的 `[services.moonshot_search]` / `[services.moonshot_fetch]` 仍会被读取一次（用于一次性迁移）：`moonshot_search` 自动补 `/v1/search` 后缀并按 Moonshot 兼容协议处理，api_key 缺失时从 `moonshot_fetch` 兜底复用；`moonshot_fetch` 自动补 `/v1/fetch` 后缀。迁移期间工具输出会附带迁移提示，建议尽快改用 `[services.web_search]` / `[services.web_fetch]`。
 
+### 项目级覆盖（`<workspace>/.kk/config.toml`）
+
+受信任的 workspace 可以放一个 `.kk/config.toml` 覆盖**白名单内的**配置项。文件
+不存在 = 完全跟随全局；出现未知顶层段落会直接报错（防止把本应全局生效的安全配置
+误写进项目文件）。当前支持：
+
+| 段落 | 覆盖行为 |
+|---|---|
+| `default_model` | 新会话默认模型别名。**只能引用全局 `[models]` 里已声明的别名**——项目文件不能定义模型或 provider，只能选用 |
+| `[services.image_gen]` | 生图后端。整体覆盖全局同名段落（详见下节） |
+
+明确**不可**项目化的：`[providers.*]`（凭据属账号级资源）、`permission` / `sandbox`
+（安全边界——clone 陌生仓库不能改变本机的权限模式）。这些写在项目文件里会被拒绝。
+
+`default_model` 示例：
+
+```toml
+# <project>/.kk/config.toml
+default_model = "oai/mini"   # 必须存在于全局 [models]
+```
+
+别名不存在时启动会失败并明确指向 `.kk/config.toml`；文件格式错误时降级为全局配置
+并打 warning。
+
+### 生图（`GenerateImage`，`[services.image_gen]`）
+
+`GenerateImage` 按配置 opt-in：全局 `config.toml` 配置 `[services.image_gen]` 对所有
+项目启用；项目级 `<workspace>/.kk/config.toml` 的 `[services.image_gen]` 只对该项目
+启用并**整体覆盖**全局配置。两者都没配 = 工具完全不注册，零影响。项目覆盖仅在
+workspace 受信任时读取（fail closed），文件里出现未知顶层段落会直接报错。
+
+全局 `config.toml`：
+
+```toml
+[services.image_gen]
+base_url = "https://api.openai.com/v1"
+api_key_env = "OPENAI_API_KEY"
+model = "gpt-image-2"
+timeout_ms = 180000
+default_size = "1024x1024"
+```
+
+项目级 `<project>/.kk/config.toml`（只写要覆盖的段落，当前仅支持 `[services.image_gen]`）：
+
+```toml
+[services.image_gen]
+base_url = "http://127.0.0.1:8317/v1"   # 例如 CLIProxyAPI 反代的 Codex 订阅
+api_key_env = "CPA_API_KEY"
+model = "gpt-image-2"                    # 须在网关的图像模型白名单内，不是对话模型名
+```
+
+| 字段 | 说明 |
+|---|---|
+| `base_url` | endpoint 前缀，实际请求 `POST {base_url}/images/generations`（必填） |
+| `api_key` / `api_key_env` | API key；`api_key_env` 指定环境变量名且优先 |
+| `model` | 生图模型名，缺省 `gpt-image-2`。注意是图像模型名，不是对话模型名 |
+| `timeout_ms` | 请求超时，默认 180000（生图较慢） |
+| `default_size` | 默认尺寸，可被工具参数覆盖 |
+
+工具参数：`prompt`（必填）、`size`、`n`（1-4）、`output_path`（相对 workspace 保存，
+多图自动加 `-0`/`-1` 后缀）。生成的图片以附件形式回到对话中，vision 模型可直接查看
+并继续迭代。`response_format` 同时支持 `b64_json` 与 `url` 两种响应。
+
 ## MCP Server
 
 stdio：
