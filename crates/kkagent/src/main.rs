@@ -4543,8 +4543,10 @@ struct ServerState {
     /// reattached TUI can rebuild `/usage` without replaying the stream.
     /// Subagent completion usage is folded in here too.
     session_usage: Mutex<HashMap<String, kkagent_protocol::ModelUsageEntry>>,
-    /// Pending cron-fire XML injections for the next turn.
-    cron_fires: Arc<Mutex<Vec<String>>>,
+    /// Pending cron-fire XML injections keyed by target session. Jobs bound
+    /// to a session are drained only by that session's next turn; unbound
+    /// (legacy) jobs stay in the `None` bucket for whichever session fires next.
+    cron_fires: Arc<Mutex<HashMap<Option<String>, Vec<String>>>>,
     hooks: Arc<kkagent_mcp::HookManager>,
     skills: Arc<kkagent_tools::SkillCatalog>,
     /// Web service backends; rebuilt when plugin service overrides change
@@ -4933,6 +4935,77 @@ async fn push_steer_tolerating_turn_start(
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+}
+
+/// Deliver a due cron-fire to the session that created the job.
+///
+/// - Idle session: wake it directly — inject the fire and spawn a turn
+///   (mirrors the goal-resume pattern).
+/// - Busy session: deliver as a mid-turn steer so it lands before the next
+///   model step.
+///
+/// Returns `true` when the fire is fully handled (delivered, or permanently
+/// dropped because the session no longer exists) and `false` when the caller
+/// should keep it in the per-session bucket for a later retry.
+async fn deliver_cron_fire(
+    state: &Arc<ServerState>,
+    session_id: Option<&str>,
+    xml: String,
+) -> bool {
+    let Some(sid) = session_id else {
+        // Legacy job without a bound session: bucket for the next active turn.
+        return false;
+    };
+    if let Err(error) = ensure_session_loaded(state, sid).await {
+        tracing::warn!("cron fire dropped: session {sid} cannot be loaded: {error}");
+        return true;
+    }
+    for _ in 0..3 {
+        match state.turn_locks.try_acquire(sid).await {
+            Ok(turn_permit) => {
+                {
+                    let mut sessions = state.sessions.lock().await;
+                    let Some(session) = sessions.get_mut(sid) else {
+                        tracing::warn!("cron fire dropped: session {sid} vanished");
+                        return true;
+                    };
+                    session.add_user_message(xml);
+                    session.begin_turn();
+                }
+                if let Err((code, error)) =
+                    spawn_session_agent_turn(state.clone(), sid.to_string(), turn_permit).await
+                {
+                    tracing::warn!("cron wake turn for session {sid} failed ({code}): {error}");
+                }
+                return true;
+            }
+            Err(_) => {
+                // Busy with a live turn: steer so the fire lands before the
+                // next model step.
+                let steered = {
+                    let mailboxes = state.steer_mailboxes.lock().await;
+                    mailboxes
+                        .get(sid)
+                        .map(|mailbox| {
+                            mailbox
+                                .try_push(SteerInput {
+                                    text: xml.clone(),
+                                    images: Vec::new(),
+                                })
+                                .is_ok()
+                        })
+                        .unwrap_or(false)
+                };
+                if steered {
+                    return true;
+                }
+                // The turn likely ended between the permit check and the push;
+                // fall through and retry acquisition.
+            }
+        }
+    }
+    tracing::warn!("cron fire for session {sid} could not land; bucketed for next turn");
+    false
 }
 
 impl ServerState {
@@ -6054,42 +6127,8 @@ async fn build_server_state_with_shutdown(
     web_cfg.merge_plugin_overrides(&svc_as_config);
     let web = tokio::sync::RwLock::new(Arc::new(web_cfg));
 
-    let cron_fires: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-    {
-        let cron_bg = cron.clone();
-        let fires = cron_fires.clone();
-        let hooks_cron = hooks.clone();
-        let task = tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(std::time::Duration::from_secs(15)).await;
-                let due = match cron_bg.take_due().await {
-                    Ok(due) => due,
-                    Err(error) => {
-                        tracing::warn!("cron dispatch skipped: {error:#}");
-                        continue;
-                    }
-                };
-                for (id, prompt, recurring) in due {
-                    let xml = kkagent_tools::render_cron_fire_xml(
-                        &id,
-                        "scheduled",
-                        &prompt,
-                        recurring,
-                        1,
-                        false,
-                    );
-                    tracing::info!(
-                        "Cron job {} due: {}",
-                        id,
-                        prompt.chars().take(80).collect::<String>()
-                    );
-                    fires.lock().await.push(xml);
-                    let _ = hooks_cron.fire_notification(&format!("cron:{id}")).await;
-                }
-            }
-        });
-        background_tasks.push(task.abort_handle());
-    }
+    let cron_fires: Arc<Mutex<HashMap<Option<String>, Vec<String>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
 
     let di_root = ServiceContainer::new("kkagent-root");
     let telemetry = TelemetryService::new();
@@ -6185,6 +6224,62 @@ async fn build_server_state_with_shutdown(
         rpc_event_subscribers: StdRwLock::new(HashMap::new()),
         rpc_event_subscriber_seq: AtomicUsize::new(0),
     });
+
+    // Cron scheduler: fire due jobs and deliver them to the session that
+    // created each job — waking idle sessions directly and steering busy
+    // ones mid-turn (see `deliver_cron_fire`). Unbound legacy jobs fall back
+    // to the `None` bucket and are drained by whichever session turns next.
+    {
+        let state_cron = state.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                let due = match state_cron.cron.take_due().await {
+                    Ok(due) => due,
+                    Err(error) => {
+                        tracing::warn!("cron dispatch skipped: {error:#}");
+                        continue;
+                    }
+                };
+                for (id, prompt, recurring, session_id) in due {
+                    let xml = kkagent_tools::render_cron_fire_xml(
+                        &id,
+                        "scheduled",
+                        &prompt,
+                        recurring,
+                        1,
+                        false,
+                    );
+                    tracing::info!(
+                        "Cron job {} due for session {:?}: {}",
+                        id,
+                        session_id,
+                        prompt.chars().take(80).collect::<String>()
+                    );
+                    let handled =
+                        deliver_cron_fire(&state_cron, session_id.as_deref(), xml.clone()).await;
+                    if !handled {
+                        state_cron
+                            .cron_fires
+                            .lock()
+                            .await
+                            .entry(session_id)
+                            .or_default()
+                            .push(xml);
+                    }
+                    let _ = state_cron
+                        .hooks
+                        .fire_notification(&format!("cron:{id}"))
+                        .await;
+                }
+            }
+        });
+        state
+            .background_tasks
+            .lock()
+            .await
+            .push(task.abort_handle());
+    }
     let recovery_state = state.clone();
     let recovery_task = tokio::spawn(async move {
         recover_subagents(recovery_state).await;
@@ -8615,10 +8710,15 @@ async fn handle_rpc_call(
                 let mut sessions = state.sessions.lock().await;
                 if let Some(session) = sessions.get_mut(&session_id) {
                     session.clear_interrupt();
-                    // Drain due cron-fire XML into the conversation.
+                    // Drain due cron-fire XML into the conversation. Only this
+                    // session's own fires (or unbound legacy fires) are taken.
                     let fires = {
                         let mut g = state.cron_fires.lock().await;
-                        g.drain(..).collect::<Vec<_>>()
+                        let mut taken = g.remove(&Some(session_id.clone())).unwrap_or_default();
+                        if let Some(unbound) = g.remove(&None) {
+                            taken.extend(unbound);
+                        }
+                        taken
                     };
                     for xml in fires {
                         session.add_user_message(xml);

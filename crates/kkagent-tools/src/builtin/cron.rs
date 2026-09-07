@@ -20,6 +20,10 @@ pub struct CronJob {
     pub enabled: bool,
     #[serde(default = "default_recurring")]
     pub recurring: bool,
+    /// Session that created the job; fires are delivered back to it.
+    /// `None` (legacy jobs) falls back to the next session that starts a turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
 }
 
 fn default_recurring() -> bool {
@@ -96,6 +100,7 @@ impl CronManager {
         expr: String,
         prompt: String,
         recurring: bool,
+        session_id: Option<String>,
     ) -> anyhow::Result<CronJob> {
         let id = Uuid::new_v4().to_string();
         let next = parse_next_run(&expr)?;
@@ -109,6 +114,7 @@ impl CronManager {
             next_run: next,
             enabled: true,
             recurring,
+            session_id,
         };
         let _mutation = self.mutation.lock().await;
         {
@@ -143,7 +149,7 @@ impl CronManager {
     /// Return due job prompts and advance/disable them. When persisting fails,
     /// schedule mutations are rolled back and nothing is returned, so a
     /// restart cannot fire the same prompts again.
-    pub async fn take_due(&self) -> anyhow::Result<Vec<(String, String, bool)>> {
+    pub async fn take_due(&self) -> anyhow::Result<Vec<(String, String, bool, Option<String>)>> {
         let _mutation = self.mutation.lock().await;
         let now = Utc::now();
         let mut jobs = self.jobs.lock().await;
@@ -152,7 +158,12 @@ impl CronManager {
         let mut previous = Vec::new();
         for (id, job) in jobs.iter_mut() {
             if job.enabled && job.next_run <= now {
-                due.push((id.clone(), job.prompt.clone(), job.recurring));
+                due.push((
+                    id.clone(),
+                    job.prompt.clone(),
+                    job.recurring,
+                    job.session_id.clone(),
+                ));
                 previous.push((id.clone(), job.clone()));
                 if !job.recurring || looks_like_delay(&job.expression_or_delay) {
                     job.enabled = false;
@@ -308,7 +319,7 @@ impl CronTool {
         Self { mgr }
     }
 
-    async fn create(&self, input: &Value) -> ToolOutput {
+    async fn create(&self, input: &Value, ctx: &ToolContext) -> ToolOutput {
         let delay = input
             .get("delay")
             .or_else(|| input.get("cron"))
@@ -328,12 +339,18 @@ impl CronTool {
             .get("recurring")
             .and_then(|v| v.as_bool())
             .unwrap_or(true);
-        match self.mgr.create(delay, prompt, recurring).await {
+        // Bind the job to the creating session so fires are delivered here.
+        match self
+            .mgr
+            .create(delay, prompt, recurring, Some(ctx.session_id.clone()))
+            .await
+        {
             Ok(job) => ToolOutput::success(format!(
-                "Cron job created id={} recurring={} next_run={}",
+                "Cron job created id={} recurring={} next_run={} session={}",
                 job.id,
                 job.recurring,
-                job.next_run.to_rfc3339()
+                job.next_run.to_rfc3339(),
+                job.session_id.as_deref().unwrap_or("none")
             )),
             Err(e) => ToolOutput::error(e.to_string()),
         }
@@ -408,13 +425,13 @@ Subsumes the former CronCreate / CronList / CronDelete tools."
         })
     }
 
-    async fn execute(&self, input: Value, _ctx: &ToolContext) -> anyhow::Result<ToolOutput> {
+    async fn execute(&self, input: Value, ctx: &ToolContext) -> anyhow::Result<ToolOutput> {
         let action = input
             .get("action")
             .and_then(|v| v.as_str())
             .unwrap_or("list");
         Ok(match action {
-            "create" => self.create(&input).await,
+            "create" => self.create(&input, ctx).await,
             "list" => self.list().await,
             "delete" => self.delete(&input).await,
             other => ToolOutput::error(format!(
@@ -465,7 +482,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("cron.json");
         let mgr = CronManager::with_persist(path.clone()).await;
-        mgr.create("in 5m".into(), "seed".into(), false)
+        mgr.create("in 5m".into(), "seed".into(), false, None)
             .await
             .unwrap();
         // Make the persistence target unwritable: replace the file with a
@@ -474,7 +491,7 @@ mod tests {
         std::fs::create_dir_all(&path).unwrap();
 
         assert!(mgr
-            .create("in 5m".into(), "should roll back".into(), false)
+            .create("in 5m".into(), "should roll back".into(), false, None)
             .await
             .is_err());
         assert_eq!(mgr.list().await.len(), 1);
@@ -494,7 +511,7 @@ mod tests {
         let path = dir.join("cron.json");
         let mgr = CronManager::with_persist(path.clone()).await;
         let job = mgr
-            .create("in 5m".into(), "hello".into(), false)
+            .create("in 5m".into(), "hello".into(), false, None)
             .await
             .unwrap();
         drop(mgr);
@@ -532,6 +549,7 @@ mod tests {
             .await
             .unwrap();
         assert!(!created.is_error);
+        assert!(created.content.contains("session=cron-session"));
         let id = created
             .content
             .split("id=")
@@ -554,5 +572,25 @@ mod tests {
             .await
             .unwrap();
         assert!(!deleted.is_error);
+    }
+
+    #[tokio::test]
+    async fn take_due_reports_the_bound_session_id() {
+        let mgr = CronManager::new();
+        mgr.create("in 1s".into(), "hi".into(), false, Some("s-a".into()))
+            .await
+            .unwrap();
+        mgr.create("in 1s".into(), "legacy".into(), false, None)
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        let due = mgr.take_due().await.unwrap();
+        assert_eq!(due.len(), 2);
+        assert!(due
+            .iter()
+            .any(|(_, prompt, _, session)| prompt == "hi" && session.as_deref() == Some("s-a")));
+        assert!(due
+            .iter()
+            .any(|(_, prompt, _, session)| prompt == "legacy" && session.is_none()));
     }
 }
