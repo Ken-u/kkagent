@@ -67,7 +67,8 @@ custom_headers = { "X-Organization" = "example" }
 | `custom_headers` | 发送给上游的附加 HTTP Header。 |
 | `oauth` | 托管 OAuth 配置，通常由 `kkagent auth login` 管理。 |
 | `first_token_timeout_ms` | Provider 级流式首字超时默认值（毫秒）；模型级可覆盖；`0` 禁用。 |
-| `request_timeout_ms` | 单个 LLM 请求的总超时（毫秒）。默认不设置或 `0` 表示禁用：流式请求由首字超时与逐读空闲超时（60s 无数据即中断）兜底，允许长时间生成不被截断。 |
+| `request_timeout_ms` | 单个 LLM 请求的总超时（毫秒）。默认不设置或 `0` 表示禁用：流式请求由首字超时与逐读空闲超时兜底，允许长时间生成不被截断。 |
+| `read_timeout_ms` | 逐读空闲超时（毫秒）：流式响应连续这么久没有收到任何字节即中断请求。默认 180s；`0` 禁用。部分网关会把整个 tool call 参数攒齐后一次性下发，空闲超时过紧会在长 tool call 生成中途误杀。 |
 
 OAuth 子项：`storage` 默认 `file`，`key` 默认 `kimi-code`，`oauth_host` 可覆盖登录服务地址。
 
@@ -95,7 +96,7 @@ default_effort = "medium"
 
 `first_token_timeout_ms` 控制流式请求等待第一个有效内容 chunk（文本 / thinking / tool_use）的超时。优先级为：模型级 → Provider 级 → 默认 `60000`（60 秒）。设为 `0` 表示禁用（退化为仅受逐读空闲超时约束）。若配置了 `request_timeout_ms` 且首字超时 ≥ 该总超时，首字超时会被 clamp 到总超时前 1 秒；未配置总超时时首字超时按配置值生效。超时后请求中断；若配置了 `fallback_model`，Agent loop 会按既有重试策略切换。
 
-流式 LLM 请求默认没有总超时（旧的固定 300s 总超时会截断长时间生成，已在流式路径移除）：等待首字受 `first_token_timeout_ms` 约束，之后若连续 60 秒没有收到任何数据会被逐读空闲超时中断。需要恢复总超时兜底时，为 Provider 配置 `request_timeout_ms`（`0` 或不设置表示禁用）。
+流式 LLM 请求默认没有总超时（旧的固定 300s 总超时会截断长时间生成，已在流式路径移除）：等待首字受 `first_token_timeout_ms` 约束，之后若连续 180 秒没有收到任何数据会被逐读空闲超时中断（provider 级 `read_timeout_ms` 可调整，`0` 禁用）。需要恢复总超时兜底时，为 Provider 配置 `request_timeout_ms`（`0` 或不设置表示禁用）。
 
 `experimental_adaptive_thinking` 仅影响 Anthropic 请求：开启后发送 `thinking.type = "adaptive"`，并通过 `output_config.effort` 转发当前 thinking effort。`experimental_visible_empty_retries` 指定 tool result 后遇到“无正文且无新 tool call”的成功响应时最多重试几次；thinking-only 也属于这种响应。重试只重新请求模型，不会再次执行已经完成的工具。`experimental_bad_toolcall_auto_retries` 指定模型返回的 tool call 参数不是合法 JSON 对象、被服务端以 HTTP 400 拒绝时，自动回滚该条 assistant 小步骤并重新请求模型的次数；回滚只丢弃这一步及其后的 tool result，不会反向恢复已发生的工具副作用。重试次数耗尽后仍按原有行为停下来等待 `continue`。三个选项都按模型配置，未设置时保持原有行为。
 

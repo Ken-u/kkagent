@@ -210,12 +210,22 @@ fn build_client(config: &ProviderConfig) -> anyhow::Result<reqwest::Client> {
     // Stalls are bounded by the per-read idle timeout below plus the
     // first-token gate; a total deadline stays opt-in via
     // `request_timeout_ms`.
+    //
+    // The idle default is 180s: some OpenAI-compatible gateways do not stream
+    // tool-call arguments incrementally but buffer the entire call (tens of
+    // KB of JSON) and emit it in a single chunk — a 60s idle bound aborted
+    // such healthy generations mid-stream.
+    const DEFAULT_READ_TIMEOUT: u64 = 180_000;
+    let read_timeout_ms = config.read_timeout_ms.unwrap_or(DEFAULT_READ_TIMEOUT);
     let mut builder = reqwest::Client::builder()
         .default_headers(headers)
         .connect_timeout(std::time::Duration::from_secs(30))
         .pool_max_idle_per_host(0)
-        .http1_only()
-        .read_timeout(std::time::Duration::from_secs(60));
+        .http1_only();
+    // `0` explicitly disables the per-read idle timeout.
+    if read_timeout_ms > 0 {
+        builder = builder.read_timeout(std::time::Duration::from_millis(read_timeout_ms));
+    }
     if let Some(ms) = config.request_timeout_ms.filter(|ms| *ms > 0) {
         builder = builder.timeout(std::time::Duration::from_millis(ms));
     }

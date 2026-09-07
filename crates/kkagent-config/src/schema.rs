@@ -519,9 +519,17 @@ pub struct ProviderConfig {
     pub first_token_timeout_ms: Option<u64>,
     /// Total HTTP request timeout (milliseconds) for this provider's LLM
     /// requests. Unset or `0` disables it — streaming is then bounded only by
-    /// the first-token gate and the per-read idle timeout (60s).
+    /// the first-token gate and the per-read idle timeout.
     #[serde(default)]
     pub request_timeout_ms: Option<u64>,
+    /// Per-read idle timeout (milliseconds) for streaming responses. The
+    /// request is aborted when no bytes arrive on the wire for this long.
+    /// Defaults to 180s; `0` disables it. Some gateways buffer a whole tool
+    /// call's arguments and emit them in one chunk, so a too-tight idle
+    /// timeout kills healthy long tool-call generations mid-stream. See
+    /// `build_client`.
+    #[serde(default)]
+    pub read_timeout_ms: Option<u64>,
     /// Unknown keys captured for diagnostics. A key here almost always means
     /// either a typo or — much more commonly — that the key physically belongs
     /// to the *following* TOML table (TOML assigns keys to the nearest
@@ -1823,6 +1831,7 @@ mod tests {
                 oauth: None,
                 first_token_timeout_ms: None,
                 request_timeout_ms: None,
+                read_timeout_ms: None,
                 extra_fields: BTreeMap::new(),
             },
         );
@@ -1875,6 +1884,7 @@ mod tests {
             oauth: None,
             first_token_timeout_ms: Some(30_000),
             request_timeout_ms: None,
+            read_timeout_ms: None,
             extra_fields: BTreeMap::new(),
         };
         assert_eq!(

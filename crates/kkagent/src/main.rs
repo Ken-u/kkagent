@@ -864,6 +864,7 @@ async fn provision_managed_kimi_config(
             }),
             first_token_timeout_ms: None,
             request_timeout_ms: None,
+            read_timeout_ms: None,
             extra_fields: Default::default(),
         },
     );
