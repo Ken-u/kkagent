@@ -436,10 +436,6 @@ for background jobs (shell_id/stop remain as aliases)."
             if !safety_note.is_empty() {
                 out.content = format!("{safety_note}{}", out.content);
             }
-            // Also emit a delivery hint so the model can collect via Task*.
-            out = out.with_delivery(
-                "<system>Background bash started. Use TaskOutput/TaskStop with the shell_id when ready.</system>",
-            );
             return Ok(out);
         }
 
