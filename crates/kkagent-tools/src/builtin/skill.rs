@@ -246,22 +246,19 @@ impl Default for SkillCatalog {
 
 async fn ensure_builtin_skills() -> anyhow::Result<()> {
     let root = kkagent_config::default_config_dir().join("skills");
+    // Builtin skill bodies live as standalone SKILL.md files and are embedded
+    // at compile time. Directory name must match the frontmatter `name`.
     let builtins = [
-        (
-            "consolidate",
-            "# consolidate\n\nSummarize long threads into decisions, open questions, and next actions. Prefer bullets.\n",
-        ),
-        (
-            "review",
-            "# review\n\nReview code changes for correctness, security, and missing tests. Be specific about file:line.\n",
-        ),
-        (
-            "write-goal",
-            "# write-goal\n\nHelp craft a clear CreateGoal description with measurable done criteria and budgets.\n",
-        ),
+        ("consolidate", include_str!("skills/consolidate/SKILL.md")),
+        ("review", include_str!("skills/review/SKILL.md")),
+        ("write-goal", include_str!("skills/write-goal/SKILL.md")),
         (
             "toolchain-sandbox",
-            "# toolchain-sandbox\n\nDiagnose sandbox / toolchain failures (blocked installs, cache paths, missing mounts).\n\nUse when:\n- A Bash command is rejected with a `Blocked toolchain mutation` message (e.g. `npm install -g`): the deny list protects host toolchains; use a workspace-local install instead (`npm_config_cache`/`CARGO_HOME` etc. are redirected to `~/.kkagent/toolchains` when enabled).\n- A build picks up the wrong cache/registry path, or seems to re-download everything: caches are profile-scoped and env-redirected only under workspace sandbox mode.\n- You need the current toolchain posture (profiles, env keys, cache sizes, deny patterns): run `kkagent doctor` (add `--json` for machine-readable output) via Bash — the `toolchain` check embeds the full report.\n\nPersisting extra paths: grants are no longer a runtime tool; declare them statically in `~/.kkagent/config.toml` under `[toolchain.profiles.<name>]` (`runtime_read_only` / `agent_cache_read_write` / `env`).\n",
+            include_str!("skills/toolchain-sandbox/SKILL.md"),
+        ),
+        (
+            "config-wizard",
+            include_str!("skills/config-wizard/SKILL.md"),
         ),
     ];
     for (name, body) in builtins {

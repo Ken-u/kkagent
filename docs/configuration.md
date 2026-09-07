@@ -4,6 +4,8 @@
 
 kkagent 读取一份 TOML 配置：优先使用 `--config <path>`，否则读取 `~/.kkagent/config.toml`。配置不存在时，交互终端会启动首次运行向导；非交互运行会提示先执行 `kkagent init`。环境变量会覆盖部分字段。启动时会校验默认模型、Provider 引用、URL、权限模式和数值范围。
 
+不确定怎么改时，可以让 AI 加载内置 skill `config-wizard`（配置向导），由它引导你完成配置修改。
+
 常用维护命令：
 
 ```bash
