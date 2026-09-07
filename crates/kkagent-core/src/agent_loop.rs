@@ -635,6 +635,9 @@ Do not mention this reminder to the user.\n</system-reminder>"
         if steers > 0 {
             tracing::info!("Injected {steers} steer message(s) before the next model step");
         }
+        if self.deliver_task_notifications(session)? {
+            tracing::info!("Delivered background task notification(s) before the next model step");
+        }
         let mut messages = self.prepare_messages(session, &tool_defs, &system_prompt);
         tracing::debug!("Conversation has {} messages (projected)", messages.len());
 
@@ -2351,6 +2354,13 @@ Do not mention this reminder to the user.\n</system-reminder>"
             tracing::info!("Continuing turn for newly buffered steer input");
             return Ok(TurnStep::Continue);
         }
+        // A background task finished while the model was finishing its reply:
+        // deliver the completion now and grant one more model pass instead of
+        // letting the result sit undelivered until the next user input.
+        if self.deliver_task_notifications(session)? {
+            tracing::info!("Continuing turn for background task notification(s)");
+            return Ok(TurnStep::Continue);
+        }
         self.finish_turn(session, true).await?;
         Ok(TurnStep::Done)
     }
@@ -2561,6 +2571,35 @@ Do not mention this reminder to the user.\n</system-reminder>"
         Ok(())
     }
 
+    /// Drain completed background-task notifications (subagents / background
+    /// Bash jobs) and append them to the conversation as one harness-injected
+    /// user message. Returns `true` when notifications were delivered, so the
+    /// caller keeps the turn open for a model pass that reacts to them.
+    fn deliver_task_notifications(&self, session: &mut Session) -> anyhow::Result<bool> {
+        let notifications =
+            kkagent_tools::task_notify::global_hub().drain_notifications(&session.id);
+        if notifications.is_empty() {
+            return Ok(false);
+        }
+        let text = kkagent_tools::task_notify::format_notifications(&notifications);
+        session.add_user_message(text);
+        Ok(true)
+    }
+
+    /// Append the still-running reminder at turn end so the model knows
+    /// pending background results will arrive as `<task-notification>` and
+    /// must not be polled or scheduled.
+    fn append_running_tasks_reminder(&self, session: &mut Session) -> anyhow::Result<()> {
+        let running = kkagent_tools::task_notify::global_hub().running_for(&session.id);
+        if running.is_empty() {
+            return Ok(());
+        }
+        let text =
+            crate::system_reminder::wrap(&kkagent_tools::task_notify::running_tasks_body(&running));
+        session.add_user_message(text);
+        Ok(())
+    }
+
     async fn finish_interrupted(&self, session: &mut Session) -> anyhow::Result<()> {
         self.finish_interrupted_with_message(session, "Interrupted".into())
             .await
@@ -2614,6 +2653,7 @@ Do not mention this reminder to the user.\n</system-reminder>"
         if let Some(reminder) = session.swarm.on_turn_end() {
             session.add_user_message(reminder.into());
         }
+        let _ = self.append_running_tasks_reminder(session);
         let session_id = session.id.clone();
         if record_goal {
             if let Some(goal_mgr) = &self.goal_mgr {

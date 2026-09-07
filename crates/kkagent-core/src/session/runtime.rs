@@ -1805,6 +1805,7 @@ When a task requires creating, modifying, or running things in the working envir
 
 The following are defaults — project instructions (AGENTS.md etc.) override them where they conflict:
 - Exploration: for broad codebase exploration (map a module, find call sites across many files, compare alternatives), prefer launching an `Agent` subagent with a focused prompt, then collect results with `TaskOutput` (actions: status/list/stop); do it yourself for small, single-path lookups. Skip subagents entirely if project instructions restrict them.
+- Background tasks push results to you: finished background subagents and background Bash commands arrive automatically as `<task-notification>` messages. Never poll a running task in a loop and never schedule (Cron) checks for task status; call `TaskOutput` with `block=true` only when you cannot continue without that specific result.
 - Tool choice: reach for a dedicated tool before raw shell — `Read` a known path, `Glob` to find files by name, `Grep` to search file contents.
 - Parallelism: when you anticipate multiple non-interfering tool calls, make them in a single response.
 

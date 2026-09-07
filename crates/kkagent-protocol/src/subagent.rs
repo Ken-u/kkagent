@@ -65,6 +65,10 @@ pub struct SubagentState {
     /// (issues/subagent_issues.md #7).
     #[serde(default)]
     pub working_dir: Option<String>,
+    /// Parent session the agent was launched from; used to route completion
+    /// notifications to the session that will consume them.
+    #[serde(default)]
+    pub parent_session_id: Option<String>,
 }
 
 /// Kimi-compatible delegation policy for built-in profiles.
@@ -99,6 +103,20 @@ pub fn stamp_child_depth(
     Ok(())
 }
 
+/// One background subagent reaching a terminal state, delivered to the
+/// completion sink so the owning session can be notified without polling.
+#[derive(Debug, Clone)]
+pub struct SubagentCompletion {
+    pub agent_id: String,
+    pub parent_session_id: Option<String>,
+    pub description: String,
+    pub status: SubagentStatus,
+    /// Result text (on complete) or error text (on fail / cancel).
+    pub summary: Option<String>,
+}
+
+type CompletionSink = std::sync::Arc<dyn Fn(SubagentCompletion) + Send + Sync>;
+
 pub struct SubagentManager {
     agents: Arc<Mutex<HashMap<String, SubagentState>>>,
     aborts: Arc<Mutex<HashMap<String, AbortHandle>>>,
@@ -107,6 +125,10 @@ pub struct SubagentManager {
     /// Monotonic counter bumped on every state change so subscribers can react
     /// without polling at intervals.
     revision: tokio::sync::watch::Sender<u64>,
+    /// Optional terminal-state sink (wired by the host to the task
+    /// notification hub). Fired before the revision bump so synchronous
+    /// waiters never observe a completion before its notification is queued.
+    sink: std::sync::Mutex<Option<CompletionSink>>,
 }
 
 impl SubagentManager {
@@ -118,6 +140,7 @@ impl SubagentManager {
             max_concurrent,
             persistence: None,
             revision,
+            sink: std::sync::Mutex::new(None),
         }
     }
 
@@ -181,7 +204,10 @@ impl SubagentManager {
                     turns_used: row.get(5)?,
                     profile: config.as_ref().and_then(|config| config.profile.clone()),
                     subagents: config.as_ref().and_then(|config| config.subagents.clone()),
-                    working_dir: config.map(|config| config.working_dir),
+                    working_dir: config.as_ref().map(|config| config.working_dir.clone()),
+                    parent_session_id: config
+                        .as_ref()
+                        .and_then(|config| config.parent_session_id.clone()),
                 })
             })?;
             for row in rows {
@@ -195,7 +221,42 @@ impl SubagentManager {
             max_concurrent,
             persistence: Some(connection),
             revision: tokio::sync::watch::channel(0u64).0,
+            sink: std::sync::Mutex::new(None),
         })
+    }
+
+    /// Register the terminal-state sink. The host wires this to the task
+    /// notification hub so background completions are pushed into the owning
+    /// session instead of being discovered by polling.
+    pub fn set_completion_sink(&self, sink: CompletionSink) {
+        *self
+            .sink
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(sink);
+    }
+
+    fn emit_completion(
+        &self,
+        agent_id: &str,
+        description: &str,
+        parent_session_id: Option<String>,
+        status: SubagentStatus,
+        summary: Option<String>,
+    ) {
+        let sink = self
+            .sink
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let Some(sink) = sink {
+            sink(SubagentCompletion {
+                agent_id: agent_id.to_string(),
+                parent_session_id,
+                description: description.to_string(),
+                status,
+                summary,
+            });
+        }
     }
 
     pub async fn spawn(&self, config: SubagentConfig) -> anyhow::Result<String> {
@@ -220,6 +281,7 @@ impl SubagentManager {
             profile: config.profile.clone(),
             subagents: config.subagents.clone(),
             working_dir: Some(config.working_dir.clone()),
+            parent_session_id: config.parent_session_id.clone(),
         };
 
         self.persist_spawn(&config)?;
@@ -281,27 +343,53 @@ impl SubagentManager {
 
     pub async fn complete(&self, agent_id: &str, result: String) {
         let mut agents = self.agents.lock().await;
+        let mut completion = None;
         if let Some(agent) = agents.get_mut(agent_id) {
             if agent.status == SubagentStatus::Running {
                 agent.status = SubagentStatus::Complete;
                 agent.result = Some(result.clone());
+                completion = Some((agent.description.clone(), agent.parent_session_id.clone()));
             }
         }
+        drop(agents);
         self.aborts.lock().await.remove(agent_id);
         let _ = self.persist_status(agent_id, "complete", Some(&result), None, false);
+        // Queue the notification before the revision bump: a synchronous
+        // waiter waking on the bump must never beat the hub push.
+        if let Some((description, parent)) = completion {
+            self.emit_completion(
+                agent_id,
+                &description,
+                parent,
+                SubagentStatus::Complete,
+                Some(result.clone()),
+            );
+        }
         self.notify();
     }
 
     pub async fn fail(&self, agent_id: &str, error: String) {
         let mut agents = self.agents.lock().await;
+        let mut completion = None;
         if let Some(agent) = agents.get_mut(agent_id) {
             if agent.status == SubagentStatus::Running {
                 agent.status = SubagentStatus::Failed;
                 agent.error = Some(error.clone());
+                completion = Some((agent.description.clone(), agent.parent_session_id.clone()));
             }
         }
+        drop(agents);
         self.aborts.lock().await.remove(agent_id);
         let _ = self.persist_status(agent_id, "failed", None, Some(&error), false);
+        if let Some((description, parent)) = completion {
+            self.emit_completion(
+                agent_id,
+                &description,
+                parent,
+                SubagentStatus::Failed,
+                Some(error.clone()),
+            );
+        }
         self.notify();
     }
 
@@ -327,6 +415,13 @@ impl SubagentManager {
                     None,
                     Some("Stopped by TaskStop"),
                     false,
+                );
+                self.emit_completion(
+                    agent_id,
+                    &snapshot.description,
+                    snapshot.parent_session_id.clone(),
+                    SubagentStatus::Cancelled,
+                    Some("Stopped by TaskStop".into()),
                 );
                 self.notify();
                 Ok(snapshot)
@@ -522,6 +617,47 @@ mod tests {
             allowed_subagents_for(config.profile.as_deref().unwrap()),
             Some(Vec::new())
         );
+    }
+
+    #[tokio::test]
+    async fn completion_sink_receives_terminal_states() {
+        let manager = SubagentManager::new(2);
+        let events: std::sync::Arc<std::sync::Mutex<Vec<SubagentCompletion>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink_events = events.clone();
+        manager.set_completion_sink(std::sync::Arc::new(move |completion| {
+            sink_events.lock().unwrap().push(completion);
+        }));
+        manager
+            .spawn(SubagentConfig {
+                agent_id: "agent-notify".into(),
+                description: "notify me".into(),
+                prompt: "p".into(),
+                model: None,
+                working_dir: ".".into(),
+                profile: Some("coder".into()),
+                subagents: allowed_subagents_for("coder"),
+                parent_session_id: Some("session-1".into()),
+                parent_tool_call_id: None,
+                run_in_background: true,
+                depth: 0,
+                parent_model: None,
+            })
+            .await
+            .unwrap();
+        manager.complete("agent-notify", "done".into()).await;
+        {
+            let events = events.lock().unwrap();
+            assert_eq!(events.len(), 1);
+            let event = &events[0];
+            assert_eq!(event.agent_id, "agent-notify");
+            assert_eq!(event.parent_session_id.as_deref(), Some("session-1"));
+            assert_eq!(event.status, SubagentStatus::Complete);
+            assert_eq!(event.summary.as_deref(), Some("done"));
+        }
+        // Already-terminal agents emit nothing further on fail().
+        manager.fail("agent-notify", "late".into()).await;
+        assert_eq!(events.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]

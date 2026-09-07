@@ -8,6 +8,7 @@ pub mod path_policy;
 pub mod registry;
 pub mod sandbox;
 pub mod shell_safety;
+pub mod task_notify;
 pub mod toolchain;
 pub mod web_providers;
 
@@ -320,7 +321,19 @@ pub fn register_subagent_tools(
         allowed_subagents,
         tools_config,
     )));
-    registry.register(Arc::new(builtin::TaskOutputTool::new(manager)));
+    registry.register(Arc::new(builtin::TaskOutputTool::new(manager.clone())));
+    // Wire the completion sink so background subagent completions are pushed
+    // into the owning session as <task-notification> instead of waiting to be
+    // discovered by polling.
+    manager.set_completion_sink(std::sync::Arc::new(|completion| {
+        crate::task_notify::global_hub().on_subagent_completion(
+            completion.parent_session_id.as_deref(),
+            &completion.agent_id,
+            &completion.description,
+            completion.status,
+            completion.summary,
+        );
+    }));
 }
 
 /// Compatibility shim for callers without external plugin profiles.

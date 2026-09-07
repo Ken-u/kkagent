@@ -3,6 +3,7 @@ use kkagent_protocol::subagent::{
     allowed_subagents_for, SubagentConfig, SubagentManager, SubagentStatus,
 };
 use serde_json::Value;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -109,9 +110,17 @@ async fn spawn_subagent(
                     .interrupted
                     .clone()
                     .unwrap_or_else(|| Arc::new(std::sync::atomic::AtomicBool::new(false)));
+                crate::task_notify::global_hub().track(
+                    &ctx.session_id,
+                    &resume,
+                    crate::task_notify::TaskKind::Agent,
+                    &cfg.description,
+                );
                 (launch)(cfg, interrupt);
                 return Ok(ToolOutput::success(format!(
-                    "Resumed subagent id={resume}. Use TaskOutput to fetch results."
+                    "Resumed subagent id={resume}. Its result will be delivered \
+                     automatically as a <task-notification> when it finishes — no \
+                     polling needed."
                 )));
             }
             Err(e) => return Ok(ToolOutput::error(format!("Failed to resume: {e}"))),
@@ -149,10 +158,18 @@ async fn spawn_subagent(
                 .interrupted
                 .clone()
                 .unwrap_or_else(|| Arc::new(std::sync::atomic::AtomicBool::new(false)));
+            crate::task_notify::global_hub().track(
+                &ctx.session_id,
+                &agent_id,
+                crate::task_notify::TaskKind::Agent,
+                desc,
+            );
             (launch)(config, interrupt);
             Ok(ToolOutput::success(format!(
-                "Subagent launched: {desc} (id={agent_id}). \
-Use TaskOutput with this id to fetch results when ready; use TaskList to see status."
+                "Subagent launched: {desc} (id={agent_id}). Its result will be \
+                 delivered automatically as a <task-notification> when it finishes — \
+                 no polling needed; TaskOutput with block=true can wait for it if \
+                 you need the result sooner."
             )))
         }
         Err(e) => Ok(ToolOutput::error(format!(
@@ -165,6 +182,8 @@ Use TaskOutput with this id to fetch results when ready; use TaskList to see sta
 pub struct TaskOutputTool {
     subagent_mgr: Arc<SubagentManager>,
     bash_shells: Option<Arc<BackgroundShellManager>>,
+    /// Per-task poll counter + window start, backing the anti-polling nudge.
+    poll_counts: std::sync::Mutex<HashMap<String, (u32, std::time::Instant)>>,
 }
 
 impl TaskOutputTool {
@@ -172,6 +191,7 @@ impl TaskOutputTool {
         Self {
             subagent_mgr,
             bash_shells: None,
+            poll_counts: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -182,49 +202,142 @@ impl TaskOutputTool {
         Self {
             subagent_mgr,
             bash_shells: Some(bash_shells),
+            poll_counts: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
-    async fn fetch_status(&self, id: &str) -> ToolOutput {
-        if let Some(state) = self.subagent_mgr.get_state(id).await {
-            let mut out = format!(
-                "task_id: {}\ndescription: {}\nstatus: {:?}\nturns_used: {}",
-                state.agent_id, state.description, state.status, state.turns_used
+    /// Note appended when a task is still running. The first occurrences are
+    /// neutral; if the model keeps polling the same task within a two-minute
+    /// window, an explicit reminder is added that completions are pushed and
+    /// polling is unnecessary.
+    fn running_note(&self, id: &str) -> String {
+        let mut note = String::from(
+            "\n\n(still running — a <task-notification> with the result will arrive \
+             automatically when it finishes; polling is unnecessary. If you need the \
+             result to proceed right now, call TaskOutput once with \
+             {\"block\": true, \"timeout_ms\": 60000}.)",
+        );
+        let mut counts = self
+            .poll_counts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let entry = counts
+            .entry(id.to_string())
+            .or_insert_with(|| (0u32, std::time::Instant::now()));
+        if entry.1.elapsed() >= Duration::from_secs(120) {
+            *entry = (0, std::time::Instant::now());
+        }
+        entry.0 += 1;
+        if entry.0 > 2 {
+            note.push_str(
+                "\n\n<strong-reminder>This is a repeated status poll of the same task. \
+                 Do not poll: completed tasks are pushed into the conversation as \
+                 <task-notification> automatically. Continue other work or end the \
+                 turn; use block=true if you genuinely must wait.</strong-reminder>",
             );
-            if let Some(ref r) = state.result {
-                out.push_str("\n\nresult:\n");
-                out.push_str(r);
-            }
-            if let Some(ref e) = state.error {
-                out.push_str("\n\nerror:\n");
-                out.push_str(e);
-            }
-            if state.status == SubagentStatus::Running {
-                out.push_str("\n\n(still running — call TaskOutput again later)");
-            }
-            return ToolOutput::success(out);
         }
-        if let Some(bash) = &self.bash_shells {
-            if let Some((description, _command, status, output, exit_code, running)) =
-                bash.snapshot(id).await
-            {
-                let mut out = format!(
-                    "task_id: {id}\nkind: bash\ndescription: {description}\nstatus: {status}"
-                );
-                if let Some(code) = exit_code {
-                    out.push_str(&format!("\nexit_code: {code}"));
+        note
+    }
+
+    async fn fetch_status(
+        &self,
+        id: &str,
+        block: bool,
+        timeout_ms: u64,
+        interrupted: Option<&Arc<std::sync::atomic::AtomicBool>>,
+    ) -> ToolOutput {
+        let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms);
+        let mut watch_rx = self.subagent_mgr.subscribe();
+        loop {
+            if let Some(state) = self.subagent_mgr.get_state(id).await {
+                if matches!(
+                    state.status,
+                    SubagentStatus::Complete | SubagentStatus::Failed | SubagentStatus::Cancelled
+                ) {
+                    // Synchronous delivery — drop any pending notification so
+                    // the same result is not pushed again later.
+                    let _ = crate::task_notify::global_hub().consume(id);
+                    self.poll_counts
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .remove(id);
+                    let mut out = format!(
+                        "task_id: {}\ndescription: {}\nstatus: {:?}\nturns_used: {}",
+                        state.agent_id, state.description, state.status, state.turns_used
+                    );
+                    if let Some(ref r) = state.result {
+                        out.push_str("\n\nresult:\n");
+                        out.push_str(r);
+                    }
+                    if let Some(ref e) = state.error {
+                        out.push_str("\n\nerror:\n");
+                        out.push_str(e);
+                    }
+                    return ToolOutput::success(out);
                 }
-                if !output.is_empty() {
-                    out.push_str("\n\n");
-                    out.push_str(&output);
+                // Still running.
+                let give_up = !block
+                    || std::time::Instant::now() >= deadline
+                    || interrupted
+                        .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst));
+                if give_up {
+                    let mut out = format!(
+                        "task_id: {}\ndescription: {}\nstatus: {:?}\nturns_used: {}",
+                        state.agent_id, state.description, state.status, state.turns_used
+                    );
+                    out.push_str(&self.running_note(id));
+                    return ToolOutput::success(out);
                 }
-                if running {
-                    out.push_str("\n\n(still running — call TaskOutput again later)");
-                }
-                return ToolOutput::success(out);
+                // Block until the manager bumps its revision (state change).
+                let _ = tokio::time::timeout(Duration::from_millis(500), watch_rx.changed()).await;
+                continue;
             }
+            if let Some(bash) = &self.bash_shells {
+                if let Some((description, _command, status, output, exit_code, running)) =
+                    bash.snapshot(id).await
+                {
+                    if !running {
+                        let _ = crate::task_notify::global_hub().consume(id);
+                        self.poll_counts
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .remove(id);
+                        let mut out = format!(
+                            "task_id: {id}\nkind: bash\ndescription: {description}\nstatus: {status}"
+                        );
+                        if let Some(code) = exit_code {
+                            out.push_str(&format!("\nexit_code: {code}"));
+                        }
+                        if !output.is_empty() {
+                            out.push_str("\n\n");
+                            out.push_str(&output);
+                        }
+                        return ToolOutput::success(out);
+                    }
+                    let give_up = !block
+                        || std::time::Instant::now() >= deadline
+                        || interrupted
+                            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst));
+                    if give_up {
+                        let mut out = format!(
+                            "task_id: {id}\nkind: bash\ndescription: {description}\nstatus: {status}"
+                        );
+                        if let Some(code) = exit_code {
+                            out.push_str(&format!("\nexit_code: {code}"));
+                        }
+                        if !output.is_empty() {
+                            out.push_str("\n\n");
+                            out.push_str(&output);
+                        }
+                        out.push_str(&self.running_note(id));
+                        return ToolOutput::success(out);
+                    }
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    continue;
+                }
+            }
+            return ToolOutput::error(format!("Unknown task_id: {}", id));
         }
-        ToolOutput::error(format!("Unknown task_id: {}", id))
     }
 
     async fn list(&self) -> ToolOutput {
@@ -288,7 +401,10 @@ impl Tool for TaskOutputTool {
     }
     fn description(&self) -> &str {
         "Manage background tasks by id (subagents and background Bash jobs): fetch status/result \
-(default), list all, or stop one. This subsumes the former TaskList / TaskStop tools."
+(default), list all, or stop one. This subsumes the former TaskList / TaskStop tools.\n\n\
+Completion is pushed to you automatically as a <task-notification> — never poll a running task \
+in a loop and never schedule checks for it. When you truly need a result before continuing, \
+call TaskOutput once with block=true and timeout_ms to wait efficiently."
     }
     fn parameters_schema(&self) -> Value {
         serde_json::json!({
@@ -306,6 +422,14 @@ impl Tool for TaskOutputTool {
                 "agent_id": {
                     "type": "string",
                     "description": "Alias for task_id"
+                },
+                "block": {
+                    "type": "boolean",
+                    "description": "Wait for completion (or timeout) instead of returning the running status immediately"
+                },
+                "timeout_ms": {
+                    "type": "integer",
+                    "description": "Max wait when block=true (default 30000, cap 120000)"
                 }
             }
         })
@@ -338,7 +462,15 @@ impl Tool for TaskOutputTool {
                         "Missing task_id. Use action=list to see all tasks.",
                     ));
                 }
-                Ok(self.fetch_status(&id).await)
+                let block = input.get("block").and_then(Value::as_bool).unwrap_or(false);
+                let timeout_ms = input
+                    .get("timeout_ms")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(30_000)
+                    .min(120_000);
+                Ok(self
+                    .fetch_status(&id, block, timeout_ms, _ctx.interrupted.as_ref())
+                    .await)
             }
         }
     }
@@ -424,7 +556,9 @@ impl AgentTool {
             "Delegate a task to a subagent running in its own context. Single `prompt` = one agent \
 (sync, or `run_in_background=true` for async). `agents[]` = parallel fan-out with per-agent \
 prompts. `prompt_template` + `items[]` = templated fan-out. `resume` / `resume_agent_ids` = \
-re-prompt finished agents. After launching, collect results with TaskOutput.",
+re-prompt finished agents. Background results are delivered automatically as \
+<task-notification> — never poll or schedule checks for them; TaskOutput (block=true) exists \
+only for when you must have a result before continuing.",
             allowed_subagents.as_deref(),
         );
         Self {
@@ -631,7 +765,8 @@ re-prompt finished agents. After launching, collect results with TaskOutput.",
             ));
         }
         Ok(ToolOutput::success(format!(
-            "Launched {} agents: {}\nUse TaskOutput to collect results.",
+            "Launched {} agents: {}\nEach result will be delivered automatically as a \
+             <task-notification> when its agent finishes — no polling needed.",
             launched.len(),
             launched.join(", ")
         )))
@@ -706,14 +841,17 @@ re-prompt finished agents. After launching, collect results with TaskOutput.",
             {
                 return Ok(ToolOutput::success(
                     "Agent interrupted by user. Subagent detached and still running \
-                     in the background — use TaskOutput to fetch its result later.",
+                     in the background — its result will be delivered automatically \
+                     as a <task-notification> when it finishes. Do not poll.",
                 ));
             }
             if let Some(dl) = deadline {
                 if std::time::Instant::now() >= dl {
                     return Ok(ToolOutput::success(
                         "Agent wait timed out. Subagent detached and still running \
-                         in the background — use TaskOutput to fetch its result later.",
+                         in the background — its result will be delivered automatically \
+                         as a <task-notification> when it finishes. Do not poll; use \
+                         TaskOutput with block=true if you must wait synchronously.",
                     ));
                 }
             }
@@ -726,6 +864,9 @@ re-prompt finished agents. After launching, collect results with TaskOutput.",
                             | SubagentStatus::Cancelled
                     ) =>
                 {
+                    // Synchronous delivery — drop any pending notification so
+                    // the same result is not pushed again later.
+                    let _ = crate::task_notify::global_hub().consume(&id);
                     let mut out = format!(
                         "Agent {} finished ({:?})\ndescription: {}\n",
                         id, state.status, state.description

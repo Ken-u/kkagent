@@ -46,8 +46,8 @@ impl Default for BashOptions {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
-enum ShellStatus {
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum ShellStatus {
     Running,
     Complete,
     Failed,
@@ -127,6 +127,15 @@ impl BackgroundShellManager {
                 "background shell history limit reached ({MAX_BACKGROUND_JOBS} jobs)"
             ));
         }
+        // Register with the task-notification hub so the session is reminded
+        // about this task at turn end and pushed a <task-notification> when
+        // it finishes — the model never needs to poll for completion.
+        crate::task_notify::global_hub().track(
+            session_id,
+            id,
+            crate::task_notify::TaskKind::Bash,
+            &description,
+        );
         let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
         jobs.insert(
             id.to_string(),
@@ -167,10 +176,29 @@ impl BackgroundShellManager {
     }
 
     async fn finish(&self, id: &str, status: ShellStatus, exit_code: Option<i32>) {
-        if let Some(job) = self.jobs.lock().await.get_mut(id) {
+        let (session_id, description, output) = {
+            let mut jobs = self.jobs.lock().await;
+            let Some(job) = jobs.get_mut(id) else {
+                return;
+            };
             job.status = status;
             job.exit_code = exit_code;
-        }
+            (
+                job.session_id.clone(),
+                job.description.clone(),
+                job.output.clone(),
+            )
+        };
+        // Push the completion into the task-notification hub (single funnel
+        // for every background-shell termination path).
+        crate::task_notify::global_hub().on_bash_finished(
+            &session_id,
+            id,
+            &description,
+            status,
+            exit_code,
+            &output,
+        );
     }
 
     pub async fn snapshot(
@@ -575,7 +603,8 @@ impl BashTool {
         });
         Ok(ToolOutput::success(format!(
             "Background shell started: {description} (shell_id={id}). \
-Also available as task_id={id} via TaskOutput/TaskStop."
+Also available as task_id={id} via TaskOutput/TaskStop. Its completion (status and \
+output) will be delivered automatically as a <task-notification> — no polling needed."
         )))
     }
 
@@ -774,7 +803,7 @@ Also available as task_id={id} via TaskOutput/TaskStop."
                     Ok(ToolOutput::success(format!(
                         "Command timed out after {timeout_ms}ms and was moved to the background.\n\
 shell_id: {id}\ndescription: {desc}\n\
-Poll with Bash({{\"shell_id\":\"{id}\"}})."
+Its completion will be delivered automatically as a <task-notification> — no polling needed."
                     )))
                 } else {
                     terminate_process_tree(&mut child).await;

@@ -397,7 +397,9 @@ impl Tool for CronTool {
     fn description(&self) -> &str {
         "Schedule prompts to run later. Actions: create (delay like `in 5m` / `30s`, or a \
 5-field cron expression with recurring=true default / false one-shot), list, delete. \
-Subsumes the former CronCreate / CronList / CronDelete tools."
+Subsumes the former CronCreate / CronList / CronDelete tools.\n\n\
+Not for waiting on background tasks: those results are pushed to you automatically as \
+<task-notification> when they finish — do not schedule recurring checks of task status."
     }
     fn disclosure(&self) -> crate::ToolDisclosure {
         crate::ToolDisclosure::Deferred
