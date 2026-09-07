@@ -10794,6 +10794,39 @@ async fn handle_rpc_call(
                 Err((-32000, format!("Unknown or finished task: {task_id}")))
             }
         }
+        "cron.list" => {
+            let jobs = state.cron.list().await;
+            let mut sorted = jobs;
+            sorted.sort_by_key(|job| job.next_run);
+            let jobs_json: Vec<_> = sorted
+                .iter()
+                .map(|job| {
+                    serde_json::json!({
+                        "id": job.id,
+                        "expression_or_delay": job.expression_or_delay,
+                        "prompt": job.prompt,
+                        "next_run": job.next_run.to_rfc3339(),
+                        "created_at": job.created_at.to_rfc3339(),
+                        "recurring": job.recurring,
+                        "enabled": job.enabled,
+                        "session_id": job.session_id,
+                    })
+                })
+                .collect();
+            Ok(serde_json::json!({ "jobs": jobs_json }))
+        }
+        "cron.delete" => {
+            let id = params
+                .as_ref()
+                .and_then(|p| p.get("id"))
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| (-32602, "Missing id".into()))?;
+            match state.cron.delete(id).await {
+                Ok(true) => Ok(serde_json::json!({ "ok": true, "id": id })),
+                Ok(false) => Err((-32000, format!("Unknown cron id: {id}"))),
+                Err(error) => Err((-32000, error.to_string())),
+            }
+        }
         "session.resolve_pending_plan_review" => {
             let params = params.ok_or_else(|| (-32602, "Missing approval response".into()))?;
             let session_id = params
@@ -12770,5 +12803,66 @@ mod discard_rpc_tests {
         .await
         .unwrap();
         assert_eq!(result["idempotent"], serde_json::json!(true));
+    }
+}
+
+#[cfg(test)]
+mod cron_rpc_tests {
+    use super::runtime_http_tests::{rpc_event_sink, test_server_state};
+    use super::*;
+
+    #[tokio::test]
+    async fn cron_list_and_delete_round_trip() {
+        let state = test_server_state().await;
+        let job = state
+            .cron
+            .create(
+                "10s".into(),
+                "ping the user".into(),
+                false,
+                Some("sess-cron".into()),
+            )
+            .await
+            .expect("create cron job");
+
+        let listed = handle_rpc_call(state.clone(), "cron.list", None, rpc_event_sink())
+            .await
+            .expect("cron.list");
+        let jobs = listed["jobs"].as_array().expect("jobs array");
+        assert!(jobs.iter().any(|item| item["id"] == job.id));
+        let matched = jobs
+            .iter()
+            .find(|item| item["id"] == job.id)
+            .expect("created job in list");
+        assert_eq!(matched["prompt"], "ping the user");
+        assert_eq!(matched["session_id"], "sess-cron");
+        assert_eq!(matched["recurring"], false);
+
+        let deleted = handle_rpc_call(
+            state.clone(),
+            "cron.delete",
+            Some(serde_json::json!({ "id": job.id })),
+            rpc_event_sink(),
+        )
+        .await
+        .expect("cron.delete");
+        assert_eq!(deleted["ok"], true);
+
+        let listed = handle_rpc_call(state.clone(), "cron.list", None, rpc_event_sink())
+            .await
+            .expect("cron.list after delete");
+        let jobs = listed["jobs"].as_array().expect("jobs array");
+        assert!(!jobs.iter().any(|item| item["id"] == job.id));
+
+        let missing = handle_rpc_call(
+            state,
+            "cron.delete",
+            Some(serde_json::json!({ "id": job.id })),
+            rpc_event_sink(),
+        )
+        .await
+        .expect_err("unknown cron id");
+        assert_eq!(missing.0, -32000);
+        assert!(missing.1.contains("Unknown cron id"));
     }
 }

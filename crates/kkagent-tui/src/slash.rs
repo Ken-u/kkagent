@@ -182,6 +182,13 @@ pub const BUILTIN_SLASH_COMMANDS: &[SlashCommand] = &[
         argument_hint: None,
     },
     SlashCommand {
+        name: "cron",
+        aliases: &[],
+        description: "Browse and delete scheduled cron jobs",
+        priority: 60,
+        argument_hint: Some("[list|delete <id>]"),
+    },
+    SlashCommand {
         name: "agents",
         aliases: &["agent"],
         description: "Browse subagent status and recent activity",

@@ -326,6 +326,20 @@ impl KkagentClient {
             .unwrap_or(false))
     }
 
+    pub async fn list_cron_jobs(&self) -> anyhow::Result<serde_json::Value> {
+        self.rpc
+            .call("cron.list", None)
+            .await
+            .map_err(|e| anyhow::anyhow!("{}", e))
+    }
+
+    pub async fn delete_cron_job(&self, id: &str) -> anyhow::Result<serde_json::Value> {
+        self.rpc
+            .call("cron.delete", Some(serde_json::json!({ "id": id })))
+            .await
+            .map_err(|e| anyhow::anyhow!("{}", e))
+    }
+
     pub async fn rpc_call(
         &self,
         method: &str,

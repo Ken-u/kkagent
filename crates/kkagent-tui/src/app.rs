@@ -251,6 +251,8 @@ pub struct AppState {
     pub plugin_marketplace_source: Option<String>,
     /// Plugin currently being inspected by the plugin picker.
     pub plugin_selected_id: Option<String>,
+    /// Cron job currently being inspected by the `/cron` picker.
+    pub cron_selected_id: Option<String>,
     /// Background tasks browser overlay
     pub tasks_panel: Option<TasksPanelState>,
     /// Queued user prompt to send after a slash command (avoids async recursion)
@@ -662,6 +664,12 @@ pub enum ListPickerKind {
     PluginMarketplaceEntries,
     PluginMarketplaceDetail,
     PluginConfirm,
+    /// Scheduled jobs (`/cron`).
+    Cron,
+    /// Single cron job details + delete action.
+    CronDetail,
+    /// Confirm deleting a cron job.
+    CronConfirm,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1188,6 +1196,7 @@ impl AppState {
             plugin_prompt: None,
             plugin_marketplace_source: None,
             plugin_selected_id: None,
+            cron_selected_id: None,
             tasks_panel: None,
             pending_prompt: None,
             tick: 0,
@@ -2892,6 +2901,7 @@ impl TuiApp {
         self.state.plugin_prompt = None;
         self.state.plugin_marketplace_source = None;
         self.state.plugin_selected_id = None;
+        self.state.cron_selected_id = None;
         self.state.session_picker_preview = None;
         self.state.session_delete_confirm = None;
         self.state.history_edit_turns.clear();
@@ -2910,6 +2920,7 @@ impl TuiApp {
         self.state.plugin_prompt = None;
         self.state.plugin_marketplace_source = None;
         self.state.plugin_selected_id = None;
+        self.state.cron_selected_id = None;
         self.state.session_picker_preview = None;
         self.state.session_delete_confirm = None;
         self.state.history_edit_turns.clear();
@@ -4808,6 +4819,7 @@ impl TuiApp {
                 "model" => self.open_model_picker(),
                 "sessions" | "resume" => self.open_session_picker().await?,
                 "tasks" | "task" | "ps" => self.open_tasks_panel().await?,
+                "cron" => self.open_cron_picker().await?,
                 "agents" | "agent" => self.open_agents_panel(),
                 "permission" => self.open_permission_picker(),
                 "config" => self.open_config_picker(),
@@ -4968,6 +4980,220 @@ impl TuiApp {
             }
             Err(e) => self.system_message(format!("Failed to read task output: {}", e)),
         }
+    }
+
+    async fn open_cron_picker(&mut self) -> anyhow::Result<()> {
+        match self.client.list_cron_jobs().await {
+            Ok(data) => {
+                let mut items = Vec::new();
+                if let Some(arr) = data.get("jobs").and_then(|v| v.as_array()) {
+                    for job in arr {
+                        let id = job
+                            .get("id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("?")
+                            .to_string();
+                        let expr = job
+                            .get("expression_or_delay")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("?");
+                        let next = job.get("next_run").and_then(|v| v.as_str()).unwrap_or("?");
+                        let prompt = job.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
+                        let recurring = job
+                            .get("recurring")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        let enabled = job
+                            .get("enabled")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        let session = job
+                            .get("session_id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("-");
+                        let kind = if recurring { "recurring" } else { "once" };
+                        let status = if enabled { "on" } else { "off" };
+                        let prompt_preview: String = prompt.chars().take(72).collect();
+                        let prompt_preview = if prompt.chars().count() > 72 {
+                            format!("{prompt_preview}…")
+                        } else {
+                            prompt_preview
+                        };
+                        items.push(ListPickerItem {
+                            id,
+                            label: format!("{expr} · {kind} · {status}"),
+                            detail: format!("next {next} · session {session} · {prompt_preview}"),
+                        });
+                    }
+                }
+                let title = if items.is_empty() {
+                    " Cron · no jobs · Esc close ".into()
+                } else {
+                    " Cron jobs · Enter details · Esc close ".into()
+                };
+                self.replace_list_picker(ListPickerState {
+                    kind: ListPickerKind::Cron,
+                    title,
+                    all_items: items.clone(),
+                    items,
+                    selected: 0,
+                    filter: String::new(),
+                });
+            }
+            Err(e) => self.system_message(format!("Failed to list cron jobs: {e}")),
+        }
+        Ok(())
+    }
+
+    async fn open_cron_detail(&mut self, job_id: &str) -> anyhow::Result<()> {
+        let data = self.client.list_cron_jobs().await?;
+        let job = data
+            .get("jobs")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+            .find(|job| job.get("id").and_then(|v| v.as_str()) == Some(job_id))
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("Unknown cron id: {job_id}"))?;
+
+        let expr = job
+            .get("expression_or_delay")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?");
+        let next = job.get("next_run").and_then(|v| v.as_str()).unwrap_or("?");
+        let created = job
+            .get("created_at")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?");
+        let prompt = job.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
+        let recurring = job
+            .get("recurring")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let enabled = job
+            .get("enabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let session = job
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("(legacy / unbound)");
+
+        let items = vec![
+            ListPickerItem {
+                id: "__info__".into(),
+                label: "Id".into(),
+                detail: job_id.to_string(),
+            },
+            ListPickerItem {
+                id: "__info__".into(),
+                label: "Schedule".into(),
+                detail: expr.to_string(),
+            },
+            ListPickerItem {
+                id: "__info__".into(),
+                label: "Next run".into(),
+                detail: next.to_string(),
+            },
+            ListPickerItem {
+                id: "__info__".into(),
+                label: "Created".into(),
+                detail: created.to_string(),
+            },
+            ListPickerItem {
+                id: "__info__".into(),
+                label: "Mode".into(),
+                detail: format!(
+                    "{} · {}",
+                    if recurring { "recurring" } else { "once" },
+                    if enabled { "enabled" } else { "disabled" }
+                ),
+            },
+            ListPickerItem {
+                id: "__info__".into(),
+                label: "Session".into(),
+                detail: session.to_string(),
+            },
+            ListPickerItem {
+                id: "__info__".into(),
+                label: "Prompt".into(),
+                detail: prompt.to_string(),
+            },
+            ListPickerItem {
+                id: "delete".into(),
+                label: "Delete job".into(),
+                detail: "Remove this scheduled prompt".into(),
+            },
+        ];
+        let short_id: String = job_id.chars().take(8).collect();
+        self.replace_list_picker(ListPickerState {
+            kind: ListPickerKind::CronDetail,
+            title: format!(" Cron {short_id}… · Enter delete · Esc back "),
+            all_items: items.clone(),
+            items,
+            selected: 0,
+            filter: String::new(),
+        });
+        Ok(())
+    }
+
+    fn open_cron_delete_confirm(&mut self, job_id: &str) {
+        let short_id: String = job_id.chars().take(8).collect();
+        let items = vec![
+            ListPickerItem {
+                id: "no".into(),
+                label: "Keep job".into(),
+                detail: "Do not delete".into(),
+            },
+            ListPickerItem {
+                id: "yes".into(),
+                label: "Delete".into(),
+                detail: format!("Permanently remove cron {short_id}…"),
+            },
+        ];
+        self.replace_list_picker(ListPickerState {
+            kind: ListPickerKind::CronConfirm,
+            title: format!(" Delete cron {short_id}…? "),
+            all_items: items.clone(),
+            items,
+            selected: 0,
+            filter: String::new(),
+        });
+    }
+
+    async fn apply_cron_confirmation(
+        &mut self,
+        picker: ListPickerState,
+        action: &str,
+    ) -> anyhow::Result<()> {
+        match action {
+            "yes" => {
+                let Some(id) = self.state.cron_selected_id.clone() else {
+                    self.state.list_picker = Some(picker);
+                    self.system_message("No cron job selected.".into());
+                    return Ok(());
+                };
+                match self.client.delete_cron_job(&id).await {
+                    Ok(_) => {
+                        self.system_message(format!("Deleted cron job {id}"));
+                        self.state.cron_selected_id = None;
+                        // Drop confirm + detail, refresh the root cron list.
+                        self.pop_list_picker_level(); // confirm
+                        self.pop_list_picker_level(); // detail
+                        self.open_cron_picker().await?;
+                    }
+                    Err(error) => {
+                        self.state.list_picker = Some(picker);
+                        self.system_message(format!("Failed to delete cron job: {error}"));
+                    }
+                }
+            }
+            _ => {
+                // Keep / cancel — return to detail.
+                self.pop_list_picker_level();
+            }
+        }
+        Ok(())
     }
 
     fn open_agents_panel(&mut self) {
@@ -5295,6 +5521,7 @@ impl TuiApp {
                         | "tasks"
                         | "task"
                         | "ps"
+                        | "cron"
                         | "agents"
                         | "agent"
                         | "mcp"
@@ -5432,6 +5659,31 @@ impl TuiApp {
             }
             ListPickerKind::PluginConfirm => {
                 self.apply_plugin_confirmation(picker, &item.id).await?;
+            }
+            ListPickerKind::Cron => {
+                self.state.cron_selected_id = Some(item.id.clone());
+                self.state.list_picker_stack.push(picker);
+                if let Err(error) = self.open_cron_detail(&item.id).await {
+                    self.pop_list_picker_level();
+                    self.system_message(format!("Failed to load cron job: {error}"));
+                }
+            }
+            ListPickerKind::CronDetail => {
+                if item.id == "delete" {
+                    let Some(id) = self.state.cron_selected_id.clone() else {
+                        self.state.list_picker = Some(picker);
+                        self.system_message("No cron job selected.".into());
+                        return Ok(());
+                    };
+                    self.state.list_picker_stack.push(picker);
+                    self.open_cron_delete_confirm(&id);
+                } else {
+                    // Info rows are browse-only.
+                    self.state.list_picker = Some(picker);
+                }
+            }
+            ListPickerKind::CronConfirm => {
+                self.apply_cron_confirmation(picker, &item.id).await?;
             }
             ListPickerKind::SkillManage | ListPickerKind::McpManage => {
                 // Enter is handled by toggle_manage_picker; keep picker open.
@@ -7206,6 +7458,7 @@ impl TuiApp {
             "experimental-flags" | "flags" => self.open_flags_picker(),
             "sessions" | "resume" => self.open_session_picker().await?,
             "tasks" | "task" | "ps" => self.open_tasks_panel().await?,
+            "cron" => self.open_cron_picker().await?,
             "agents" | "agent" => self.open_agents_panel(),
             "mcp" => self.open_mcp_manager().await?,
             "skills" => self.open_skill_manager().await?,
@@ -11265,6 +11518,34 @@ impl TuiApp {
                 self.begin_root_picker();
                 self.open_tasks_panel().await?;
             }
+            "cron" => {
+                let mut parts = args.split_whitespace();
+                match parts.next().unwrap_or("") {
+                    "" | "list" | "ls" => {
+                        self.begin_root_picker();
+                        self.open_cron_picker().await?;
+                    }
+                    "delete" | "rm" | "remove" => {
+                        let Some(id) = parts.next() else {
+                            self.system_message(
+                                "Usage: /cron delete <id>  (or /cron to browse)".into(),
+                            );
+                            return Ok(());
+                        };
+                        match self.client.delete_cron_job(id).await {
+                            Ok(_) => self.system_message(format!("Deleted cron job {id}")),
+                            Err(error) => {
+                                self.system_message(format!("Failed to delete cron job: {error}"))
+                            }
+                        }
+                    }
+                    other => {
+                        self.system_message(format!(
+                            "Unknown /cron action '{other}'. Use /cron, /cron list, or /cron delete <id>."
+                        ));
+                    }
+                }
+            }
             "agents" | "agent" => {
                 self.begin_root_picker();
                 self.open_agents_panel();
@@ -13740,6 +14021,7 @@ fn slash_command_opens_immediately(name: &str) -> bool {
             | "tasks"
             | "task"
             | "ps"
+            | "cron"
             | "permission"
             | "config"
             | "provider"
@@ -14554,6 +14836,102 @@ mod app_state_tests {
             app.state.list_picker.as_ref().map(|picker| &picker.kind),
             Some(&ListPickerKind::PluginHome)
         );
+    }
+
+    #[tokio::test]
+    async fn cron_slash_opens_picker_and_can_delete_a_job() {
+        use futures::FutureExt;
+        use std::sync::Mutex;
+
+        let (client_transport, server_transport) =
+            kkagent_rpc::transport::memory::create_memory_pair();
+        let (event_tx, event_rx) = tokio::sync::mpsc::channel(16);
+        let rpc = kkagent_rpc::RpcClient::new(client_transport, event_tx);
+        let client = kkagent_client::KkagentClient::new(rpc, event_rx);
+        let jobs = Arc::new(Mutex::new(vec![serde_json::json!({
+            "id": "job-abc",
+            "expression_or_delay": "0 * * * *",
+            "prompt": "hourly check",
+            "next_run": "2026-09-07T13:00:00+00:00",
+            "created_at": "2026-09-07T12:00:00+00:00",
+            "recurring": true,
+            "enabled": true,
+            "session_id": "sess-1",
+        })]));
+        let handler: kkagent_rpc::server::RequestHandler =
+            Arc::new(move |_id, method, params, _event_tx| {
+                let jobs = jobs.clone();
+                async move {
+                    match method.as_str() {
+                        "cron.list" => {
+                            let jobs = jobs.lock().unwrap().clone();
+                            Ok(serde_json::json!({ "jobs": jobs }))
+                        }
+                        "cron.delete" => {
+                            let id = params
+                                .as_ref()
+                                .and_then(|p| p.get("id"))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default()
+                                .to_string();
+                            jobs.lock().unwrap().retain(|job| {
+                                job.get("id").and_then(|v| v.as_str()) != Some(id.as_str())
+                            });
+                            Ok(serde_json::json!({ "ok": true, "id": id }))
+                        }
+                        other => panic!("unexpected RPC method: {other}"),
+                    }
+                }
+                .boxed()
+            });
+        tokio::spawn(async move {
+            kkagent_rpc::RpcServer::new(handler)
+                .serve(server_transport)
+                .await;
+        });
+
+        let mut app = TuiApp::new(AppConfig::default(), client);
+        app.handle_slash_command("/cron").await.unwrap();
+        let picker = app.state.list_picker.as_ref().unwrap();
+        assert_eq!(picker.kind, ListPickerKind::Cron);
+        assert_eq!(picker.items.len(), 1);
+        assert_eq!(picker.items[0].id, "job-abc");
+        assert!(picker.items[0].label.contains("0 * * * *"));
+
+        app.apply_list_picker().await.unwrap();
+        assert_eq!(
+            app.state.list_picker.as_ref().map(|p| &p.kind),
+            Some(&ListPickerKind::CronDetail)
+        );
+        assert_eq!(app.state.cron_selected_id.as_deref(), Some("job-abc"));
+
+        // Select the Delete action and confirm.
+        if let Some(picker) = app.state.list_picker.as_mut() {
+            picker.selected = picker
+                .items
+                .iter()
+                .position(|item| item.id == "delete")
+                .expect("delete action");
+        }
+        app.apply_list_picker().await.unwrap();
+        assert_eq!(
+            app.state.list_picker.as_ref().map(|p| &p.kind),
+            Some(&ListPickerKind::CronConfirm)
+        );
+        if let Some(picker) = app.state.list_picker.as_mut() {
+            picker.selected = 1; // Delete
+        }
+        app.apply_list_picker().await.unwrap();
+        assert_eq!(
+            app.state.list_picker.as_ref().map(|p| &p.kind),
+            Some(&ListPickerKind::Cron)
+        );
+        assert!(app.state.list_picker.as_ref().unwrap().items.is_empty());
+        assert!(app
+            .state
+            .messages
+            .iter()
+            .any(|m| m.content.contains("Deleted cron job job-abc")));
     }
 
     #[tokio::test]
