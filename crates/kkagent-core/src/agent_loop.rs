@@ -996,6 +996,12 @@ Do not mention this reminder to the user.\n</system-reminder>"
                     Ok(None) => {
                         let pending = delta_buffer.take();
                         send_buffered_delta(&self.event_tx, &session_id, pending).await;
+                        // `session.interrupt` aborts the stream task, which closes
+                        // this channel. Re-read the flag so we don't treat the
+                        // abort as an empty/incomplete stream and enter retry.
+                        if session.is_interrupted() {
+                            interrupted = true;
+                        }
                         break;
                     }
                     Err(_) => {
@@ -1009,6 +1015,13 @@ Do not mention this reminder to the user.\n</system-reminder>"
             }
 
             self.abort_registry.lock().await.remove(&session_id);
+
+            // Abort may win the race against the cooperative check above
+            // (flag set + stream task aborted → Ok(None) without setting the
+            // local `interrupted` latch). Re-check before any retry path.
+            if session.is_interrupted() {
+                interrupted = true;
+            }
 
             if interrupted {
                 break;
@@ -3854,6 +3867,137 @@ mod retry_tests {
         assert_eq!(remaining.first(), Some(&2));
         assert!(remaining.contains(&1));
         assert_eq!(remaining.last(), Some(&0));
+    }
+
+    #[tokio::test]
+    async fn interrupt_abort_does_not_enter_llm_retry() {
+        // Reproduces Esc/session.interrupt: set the cooperative flag and abort
+        // the stream task. Without the post-stream interrupt re-check, the
+        // closed channel looks like an empty failure and publishes LlmRetry.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 8192];
+            let _ = socket.read(&mut request).await.unwrap();
+            // Hang until the client aborts — never emit MessageEnd.
+            let _ = tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+
+        let mut config = AppConfig {
+            default_model: Some("test/model".into()),
+            loop_control: Some(LoopControlConfig {
+                max_attempts_per_step: 3,
+                rate_limit_retry_base_seconds: 0,
+                retry_base_seconds: 0,
+                reserved_context_size: 1_000,
+                max_steps_per_turn: 4,
+                auto_compact: true,
+                compact_keep_last: 4,
+                token_counting: "estimated".into(),
+                ..Default::default()
+            }),
+            ..AppConfig::default()
+        };
+        config.providers.insert(
+            "test".into(),
+            ProviderConfig {
+                provider_type: "openai-chat".into(),
+                api_key: Some("token".into()),
+                api_key_env: None,
+                base_url: Some(base_url),
+                custom_headers: HashMap::new(),
+                oauth: None,
+                first_token_timeout_ms: Some(0),
+                request_timeout_ms: None,
+                read_timeout_ms: Some(0),
+                extra_fields: Default::default(),
+            },
+        );
+        config.models.insert(
+            "test/model".into(),
+            ModelConfig {
+                provider: "test".into(),
+                model: "test-model".into(),
+                max_context_size: Some(16_000),
+                max_output_size: Some(1_000),
+                capabilities: Vec::new(),
+                display_name: None,
+                support_efforts: Vec::new(),
+                default_effort: None,
+                pricing: None,
+                experimental_adaptive_thinking: false,
+                experimental_vision_proxy: false,
+                experimental_visible_empty_retries: 0,
+                experimental_bad_toolcall_auto_retries: 0,
+                first_token_timeout_ms: Some(0),
+            },
+        );
+        let config = Arc::new(config);
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let abort_registry: Arc<Mutex<HashMap<String, AbortHandle>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let loop_ = AgentLoop::new(
+            config,
+            Arc::new(ToolRegistry::new()),
+            Arc::new(Mutex::new(PermissionChain::new(
+                PermissionMode::Auto,
+                Vec::new(),
+            ))),
+            event_tx,
+            abort_registry.clone(),
+        );
+        let workspace =
+            std::env::temp_dir().join(format!("kkagent-interrupt-abort-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let mut session = Session::new(
+            "interrupt-abort-test".into(),
+            workspace.clone(),
+            PermissionMode::Auto,
+            "test/model".into(),
+        );
+        session.add_user_message("hello".into());
+
+        let interrupt_flag = session.interrupted.clone();
+        let session_id = session.id.clone();
+        let abort_for_interrupt = abort_registry.clone();
+        tokio::spawn(async move {
+            for _ in 0..200 {
+                if abort_for_interrupt.lock().await.contains_key(&session_id) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            // Mirror session.interrupt: flag first, then abort the stream task.
+            interrupt_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            if let Some(handle) = abort_for_interrupt.lock().await.remove(&session_id) {
+                handle.abort();
+            }
+        });
+
+        loop_.run_turn(&mut session).await.unwrap();
+
+        let mut errors = Vec::new();
+        let mut retries = 0_u32;
+        let mut turn_ends = 0_u32;
+        while let Ok(event) = event_rx.try_recv() {
+            match event {
+                AgentEvent::Error { message, .. } => errors.push(message),
+                AgentEvent::LlmRetry { .. } => retries += 1,
+                AgentEvent::TurnEnd { .. } => turn_ends += 1,
+                _ => {}
+            }
+        }
+        assert_eq!(
+            retries, 0,
+            "abort+interrupt must finish as Interrupted, not enter LLM retry"
+        );
+        assert!(
+            errors.iter().any(|message| message == "Interrupted"),
+            "expected Interrupted error, got {errors:?}"
+        );
+        assert_eq!(turn_ends, 1);
+        std::fs::remove_dir_all(workspace).unwrap();
     }
 
     #[test]
