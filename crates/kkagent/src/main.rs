@@ -5025,6 +5025,51 @@ async fn deliver_cron_fire(
     false
 }
 
+/// Wake a session that went idle while its background tasks were still
+/// running: acquire the turn permit (with a short grace to ride out the
+/// previous turn's teardown window), re-check that a notification is still
+/// pending, then spawn a short turn whose agent loop drains the notification
+/// hub before its first model step (`deliver_task_notifications`). Busy
+/// sessions need no wake — the live turn drains the hub before every model
+/// step and at its final step; the grace wait covers the narrow window where
+/// the hub push races the previous turn's shutdown.
+async fn wake_session_for_task_notifications(state: &Arc<ServerState>, session_id: &str) {
+    if let Err(error) = ensure_session_loaded(state, session_id).await {
+        tracing::warn!(
+            "task-notification wake skipped: session {session_id} cannot be loaded: {error}"
+        );
+        return;
+    }
+    let Ok(turn_permit) = state
+        .turn_locks
+        .try_acquire_with_grace(session_id, Duration::from_secs(2))
+        .await
+    else {
+        // Busy with a live turn: that turn delivers the notification itself.
+        return;
+    };
+    // Spurious-wake guard: the notification may have been consumed
+    // synchronously (TaskOutput fetch / sync Agent wait) since the push.
+    if !kkagent_tools::task_notify::global_hub().has_pending(session_id) {
+        return;
+    }
+    {
+        let mut sessions = state.sessions.lock().await;
+        let Some(session) = sessions.get_mut(session_id) else {
+            tracing::warn!("task-notification wake dropped: session {session_id} vanished");
+            return;
+        };
+        session.begin_turn();
+    }
+    if let Err((code, error)) =
+        spawn_session_agent_turn(state.clone(), session_id.to_string(), turn_permit).await
+    {
+        tracing::warn!(
+            "task-notification wake turn for session {session_id} failed ({code}): {error}"
+        );
+    }
+}
+
 impl ServerState {
     fn client_count(&self) -> usize {
         self.client_count.load(Ordering::SeqCst)
@@ -6241,6 +6286,30 @@ async fn build_server_state_with_shutdown(
         rpc_event_subscribers: StdRwLock::new(HashMap::new()),
         rpc_event_subscriber_seq: AtomicUsize::new(0),
     });
+
+    // Wake idle sessions when a background task (subagent / background Bash)
+    // completes — the push half of the task contract. Without this, a
+    // completion pushed into the notification hub after the turn ended would
+    // sit there until the next unrelated user input. The hook spawns the
+    // wake asynchronously so `push_notification` (called from tool threads)
+    // never blocks; busy sessions are ignored because the live turn drains
+    // the hub itself.
+    let wake_state_anchor = state.clone();
+    kkagent_tools::task_notify::global_hub().set_wake_hook(Some(Arc::new(
+        move |session_id: &str| {
+            let wake_state = wake_state_anchor.clone();
+            let session_id = session_id.to_string();
+            // push_notification may run on any thread; only spawn the wake
+            // when a tokio runtime is available, never panic the caller.
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    wake_session_for_task_notifications(&wake_state, &session_id).await;
+                });
+            } else {
+                tracing::warn!("task-notification wake skipped: no tokio runtime context");
+            }
+        },
+    )));
 
     // Cron scheduler: fire due jobs and deliver them to the session that
     // created each job — waking idle sessions directly and steering busy

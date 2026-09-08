@@ -12,6 +12,10 @@
 //! - tools call [`TaskNotificationHub::track`] when they launch a task;
 //! - completion sinks call [`TaskNotificationHub::push_notification`]
 //!   (or the typed helpers) when a task reaches a terminal state;
+//! - a queued notification fires the host-registered wake hook
+//!   ([`TaskNotificationHub::set_wake_hook`]) so an idle session is woken
+//!   with a short turn that drains it — without the hook the notification
+//!   would sit in the hub until the next unrelated user input;
 //! - the agent loop drains a session's notifications before every model step;
 //! - a synchronous result delivery (`Agent` sync wait, `TaskOutput` fetch)
 //!   calls [`TaskNotificationHub::consume`] so the notification is not
@@ -64,9 +68,17 @@ struct TrackedTask {
     notification: Option<TaskNotification>,
 }
 
+/// Host-registered callback fired whenever a notification is queued, so an
+/// idle session can be woken to deliver it. The hub itself stays
+/// runtime-agnostic and cannot depend on kkagent-core; the host (kkagent's
+/// server state) installs the implementation. Receives the target session id.
+pub type WakeHook = Arc<dyn Fn(&str) + Send + Sync>;
+
 #[derive(Default)]
 struct HubInner {
     tasks: HashMap<String, TrackedTask>,
+    /// See [`TaskNotificationHub::set_wake_hook`].
+    wake_hook: Option<WakeHook>,
 }
 
 /// Session-keyed registry of background tasks and their pending completion
@@ -109,22 +121,62 @@ impl TaskNotificationHub {
     /// Queue a completion notification. Delivers to the entry recorded by
     /// [`TaskNotificationHub::track`] when present, otherwise creates one
     /// (robust for tasks launched before tracking existed).
+    ///
+    /// Fires the host-registered wake hook (outside the hub lock) so an idle
+    /// session is woken to drain the notification instead of waiting for the
+    /// next user input.
     pub fn push_notification(&self, session_id: &str, notification: TaskNotification) {
+        let wake = {
+            let mut inner = match self.inner.lock() {
+                Ok(inner) => inner,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            let entry = inner
+                .tasks
+                .entry(notification.task_id.clone())
+                .or_insert_with(|| TrackedTask {
+                    session_id: session_id.to_string(),
+                    kind: notification.kind,
+                    description: notification.description.clone(),
+                    notification: None,
+                });
+            entry.session_id = session_id.to_string();
+            entry.notification = Some(notification);
+            inner.wake_hook.clone()
+        };
+        // Fired after the lock is dropped: the hook spawns an async wake task
+        // and returns immediately; it only re-enters the hub from that task.
+        if let Some(wake) = wake {
+            wake(session_id);
+        }
+    }
+
+    /// Register the host-provided wake callback, fired from
+    /// [`TaskNotificationHub::push_notification`] whenever a notification is
+    /// queued. Replaces any previously registered hook; passing `None` only
+    /// makes sense in tests (a server without the hook would never wake idle
+    /// sessions for background results).
+    pub fn set_wake_hook(&self, hook: Option<WakeHook>) {
         let mut inner = match self.inner.lock() {
             Ok(inner) => inner,
             Err(poisoned) => poisoned.into_inner(),
         };
-        let entry = inner
+        inner.wake_hook = hook;
+    }
+
+    /// Whether `session_id` has at least one undelivered completion
+    /// notification. The wake path re-checks this after acquiring the turn
+    /// permit so a notification that was already consumed synchronously
+    /// (`TaskOutput` fetch / sync `Agent` wait) does not spawn a no-op turn.
+    pub fn has_pending(&self, session_id: &str) -> bool {
+        let inner = match self.inner.lock() {
+            Ok(inner) => inner,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        inner
             .tasks
-            .entry(notification.task_id.clone())
-            .or_insert_with(|| TrackedTask {
-                session_id: session_id.to_string(),
-                kind: notification.kind,
-                description: notification.description.clone(),
-                notification: None,
-            });
-        entry.session_id = session_id.to_string();
-        entry.notification = Some(notification);
+            .values()
+            .any(|task| task.session_id == session_id && task.notification.is_some())
     }
 
     /// Typed entry point for the `SubagentManager` completion sink.
@@ -399,6 +451,51 @@ mod tests {
     fn untracked_completion_still_delivers_with_fallback_entry() {
         let hub = TaskNotificationHub::default();
         hub.push_notification("s1", note("late", "completed"));
+        assert_eq!(hub.drain_notifications("s1").len(), 1);
+    }
+
+    #[test]
+    fn wake_hook_fires_once_per_push_with_session_id() {
+        let hub = TaskNotificationHub::default();
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_for_hook = seen.clone();
+        hub.set_wake_hook(Some(Arc::new(move |session_id: &str| {
+            seen_for_hook.lock().unwrap().push(session_id.to_string());
+        })));
+        hub.track("s1", "t1", TaskKind::Bash, "build");
+        hub.push_notification("s1", note("t1", "completed"));
+        hub.push_notification("s1", note("t2", "failed"));
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec!["s1".to_string(), "s1".to_string()]
+        );
+        // Draining or consuming must not fire the hook again.
+        assert!(!hub.drain_notifications("s1").is_empty());
+        assert_eq!(seen.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn wake_hook_sessions_follow_the_push() {
+        let hub = TaskNotificationHub::default();
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_for_hook = seen.clone();
+        hub.set_wake_hook(Some(Arc::new(move |session_id: &str| {
+            seen_for_hook.lock().unwrap().push(session_id.to_string());
+        })));
+        hub.push_notification("s2", note("t3", "completed"));
+        assert_eq!(*seen.lock().unwrap(), vec!["s2".to_string()]);
+        assert!(hub.has_pending("s2"));
+        assert!(!hub.has_pending("s1"));
+        hub.drain_notifications("s2");
+        assert!(!hub.has_pending("s2"));
+    }
+
+    #[test]
+    fn wake_hook_can_be_replaced_or_cleared() {
+        let hub = TaskNotificationHub::default();
+        hub.set_wake_hook(Some(Arc::new(|_| panic!("cleared hook fired"))));
+        hub.set_wake_hook(None);
+        hub.push_notification("s1", note("t4", "completed")); // must not panic
         assert_eq!(hub.drain_notifications("s1").len(), 1);
     }
 
