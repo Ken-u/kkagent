@@ -37,6 +37,7 @@ use kkagent_tui::TuiApp;
 
 mod diagnostics;
 mod headless;
+mod mcp_serve;
 mod onboarding;
 use diagnostics::RunDiagnostics;
 use onboarding::{run_config, run_doctor, run_init};
@@ -146,6 +147,11 @@ enum Commands {
     },
     /// Serve Agent Client Protocol over stdio (IDE bridge)
     Acp,
+    /// Expose kkagent as an MCP (Model Context Protocol) server
+    Mcp {
+        #[command(subcommand)]
+        command: McpCommand,
+    },
     /// Manage Kimi Code managed-account authentication
     Auth {
         #[command(subcommand)]
@@ -263,6 +269,12 @@ pub(crate) enum ConfigCommands {
 }
 
 #[derive(Subcommand)]
+enum McpCommand {
+    /// Serve MCP over stdio (expose kkagent as tools to any MCP client)
+    Serve,
+}
+
+#[derive(Subcommand)]
 enum AuthCommands {
     /// Sign in with the Kimi device-code flow and provision managed models
     Login {
@@ -333,6 +345,7 @@ fn runtime_mode(cli: &Cli) -> &'static str {
     match (&cli.command, &cli.prompt) {
         (Some(Commands::Server { .. }), _) => "server",
         (Some(Commands::Acp), _) => "acp",
+        (Some(Commands::Mcp { .. }), _) => "mcp",
         (Some(Commands::Auth { .. }), _) => "auth",
         (Some(Commands::Init { .. }), _) => "init",
         (Some(Commands::Config { .. }), _) => "config",
@@ -511,6 +524,9 @@ async fn run(cli: Cli) -> Result<()> {
             let server = kkagent_acp::AcpServer::with_host(Arc::new(AgentAcpHost { state }));
             server.serve_stdio().await
         }
+        Some(Commands::Mcp {
+            command: McpCommand::Serve,
+        }) => mcp_serve::run_mcp_serve(Arc::new(config)).await,
         Some(Commands::Auth { .. }) => unreachable!("auth handled before config startup"),
         Some(
             Commands::Init { .. }
@@ -564,7 +580,7 @@ fn print_completions(shell: &str) -> Result<()> {
 #   eval "$(kkagent completions bash)"
 _kkagent() {{
   local cur="${{COMP_WORDS[COMP_CWORD]}}"
-  local cmds="server acp auth init config doctor completions"
+  local cmds="server acp mcp auth init config doctor completions"
   if [[ ${{COMP_CWORD}} -eq 1 ]]; then
     COMPREPLY=( $(compgen -W "$cmds --help --version --config --yolo --auto --plan --prompt --resume --connect --no-alt-screen --dump-system-prompt" -- "$cur") )
   elif [[ ${{COMP_WORDS[1]}} == server ]]; then
@@ -591,14 +607,14 @@ _arguments \
   '--connect[Connect to server]:endpoint:' \
   '--no-alt-screen[Keep primary screen]' \
   '--dump-system-prompt[Print the composed system prompt and exit]' \
-  '1:command:(server acp auth init config doctor completions export-session)'
+  '1:command:(server acp mcp auth init config doctor completions export-session)'
 "#
             );
         }
         "fish" => {
             println!(
                 r#"# kkagent fish completion — save to ~/.config/fish/completions/kkagent.fish
-complete -c kkagent -n '__fish_use_subcommand' -a 'server acp auth init config doctor completions'
+complete -c kkagent -n '__fish_use_subcommand' -a 'server acp mcp auth init config doctor completions'
 complete -c kkagent -l config -r
 complete -c kkagent -l yolo
 complete -c kkagent -l auto
@@ -618,7 +634,7 @@ complete -c kkagent -l dump-system-prompt
 #   kkagent completions powershell | Out-String | Invoke-Expression
 Register-ArgumentCompleter -CommandName kkagent -ScriptBlock {{
   param($wordToComplete, $commandAst, $cursorPosition)
-  $cmds = @('server','acp','auth','init','config','doctor','completions')
+  $cmds = @('server','acp','mcp','auth','init','config','doctor','completions')
   $cmds | Where-Object {{ $_ -like "$wordToComplete*" }} | ForEach-Object {{
     [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterValue', $_)
   }}
