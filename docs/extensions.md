@@ -31,6 +31,72 @@ kkagent 可把外部 MCP Server 的工具动态注册给模型。支持：
 
 配置见[配置参考](configuration.md)。启动后通过 `/mcp` 检查连接和工具。给不可信 MCP Server 的权限应按远程代码执行能力对待：它可以看到传入参数，也可能访问网络或本机文件。
 
+## MCP Server
+
+`kkagent mcp serve` 把 kkagent 本身暴露为一个 MCP Server——一个异步编码任务监督/委派 API，供外部编排方（网页 ChatGPT、Codex、另一个 agent）决策与规划、kkagent 执行：
+
+- `list_workspaces` / `get_context` — 发现工作区（自动注册自 kkagent 会话历史 + 配置的 trusted_workspaces）与项目监督级状态；
+- `inspect` / `Glob` / `Grep` — 只读查阅源码、日志、git diff、图片与任务产物，不跑 agent；Glob/Grep 复用内置搜索工具和路径策略；
+- `write_plan` / `get_plan` — 持久化编排方撰写的执行计划（markdown），返回 `plan_id` / `plan_version`；修订产生新版本，历史正文仍可读取；
+- `delegate` — 启动异步编码任务并立即返回 `task_id`；可传 `plan_id`，计划全文会注入任务 prompt 之前作为范围事实来源。模型、工具、worktree 隔离均由 kkagent 自行决定；
+- `get_progress` / `continue_task` / `get_result` / `cancel` — 轮询状态（queued / running / waiting_input / waiting_permission / completed / failed / cancelled）、回答提问、审批动作、追加指令、取审查摘要、取消任务。
+
+### 客户端与 worker 协作
+
+推荐流程：`get_context` → `Glob/Grep/inspect` → `write_plan` → `delegate` → `get_progress` → `get_result/inspect` → `continue_task`。
+
+- 新任务：`delegate({workspace, prompt, plan_id?, plan_version?, request_id?})`。返回 `task_id`、`session_id` 和实际 `run_dir`；审查或搜索隔离任务的代码时使用这个 `run_dir`。
+- 历史会话：`continue_task({session_id, instruction})`，session_id 支持唯一前缀；恢复原会话消息、模型、fallback、工作目录和 core 保存的检查点/计划状态。与 `task_id` 互斥；已有 MCP task 会被复用，返回 task_id 后使用它轮询、回答问题和审批。
+- 接续计划：`continue_task({task_id, plan_id, plan_version, instruction?})`。省略版本使用最新版本；仅编辑 `write_plan` 不会影响正在执行的任务。
+- 审查交接：执行状态 `completed` 与 `review_status: awaiting_review` 分开。`get_result` 返回 base/head、包含未提交及未跟踪修改的 snapshot、工作区状态、worker 报告及产物路径。验收使用 `continue_task({task_id, review:{accepted:true, head, snapshot}})`；传 false 记录需修改，然后另发 instruction。代码快照不匹配时拒绝旧审查结果。验收不会自动提交或发布；继续执行时需明确指令和验证范围。快照要求 Git 仓库至少已有一个 commit；非 Git 工作区仍可执行、查阅和继续任务。
+- 指令重试：`delegate`、`continue_task`、`write_plan`、`cancel` 支持 `request_id`，相同工具及相同参数重试返回保存的回执；不同参数复用同一个 ID 会报错。它防止正常网络重试重复派工，不承诺进程恰在动作与回执落盘之间崩溃时的 exactly-once；崩溃后先查任务状态再决定是否重发。
+- 增量进度：`get_progress({task_id, after_event})` 返回 `event_cursor` 和较新的 recent_events；`events_lost` 表示已超出有限保留窗口。需要历史背景时用 `get_session_context({session_id, offset?, limit?})` 分页获取最近用户/助手正文，不返回 thinking 或全量工具 transcript。
+
+任务、计划版本和重试回执复用 transcript SQLite 连接持久化；会话消息由原有 AgentLoop 持久化。服务重启后不会自动执行未完成任务，而是标记失败并提示显式继续；已经完成的报告和审查记录仍可查询。重启前尚未消费的指令及交互回答不会自动重放，客户端应核对历史后重新给出需要执行的指令。历史 CLI/TUI session 的恢复面向已经停止执行的会话，不用于接管另一个进程中仍在运行的 turn。
+
+搜索参数保留 `workspace`、`pattern`、`path`、`limit`；Grep 另有 `glob`、`case_insensitive`、`context` 和 `offset`，返回匹配行号。Glob 被截断时可缩小 pattern/path 或提高 limit（最大 2000）；Grep 依赖本机 `rg`。只读搜索限制在指定 workspace 内，并沿用敏感路径和忽略规则。
+
+Diff 示例：
+
+```json
+{"kind":"diff","workspace":"/path/to/repo","base":"HEAD~1","head":"HEAD","format":"files"}
+{"kind":"diff","workspace":"/path/to/repo","base":"main","head":"feature","merge_base":true,"path":"src/main.rs","offset":0,"limit":400}
+```
+
+`base/head` 都不传时对比 HEAD 与当前工作区（含已暂存修改）；只传 base 时对比该版本与工作区；head 必须与 base 一起传。`format` 为 `patch`（默认）、`stat` 或 `files`，通过 `next_offset` 继续分页。未跟踪文件不在 git diff 内，应按 `get_result.working_tree_status` 用 inspect 读取。`reviewed_snapshot` 记录已验收的快照，后续代码变化后应重新审查当前 snapshot。
+
+### 传输方式
+
+```bash
+# stdio（默认）：MCP 客户端以子进程方式拉起,协议走 stdin/stdout
+kkagent mcp serve
+
+# Streamable HTTP(本地端口,方便远程/网页客户端连接)
+kkagent mcp serve --http                    # 默认 127.0.0.1:8788
+kkagent mcp serve --http 0.0.0.0:9000 --http-token <token>
+
+# 后台运行(与 `kkagent server` 相同的 daemon 模式)
+kkagent mcp serve --daemon --http           # 立即返回,日志在 ~/.kkagent/mcp-http-daemon.log
+kkagent mcp status                          # 查看状态(pid/地址/tunnel)
+kkagent mcp status --json                   # 机器可读
+kkagent mcp stop                            # 停止(SIGTERM,会一并停掉 tunnel-client)
+```
+
+HTTP 模式下 MCP 客户端 `POST http://<addr>/mcp`（JSON-RPC,响应为 `application/json`；通知返回 `202`）,`GET /healthz` 免认证探活。Bearer 认证必须：`--http-token` > `KKAGENT_MCP_HTTP_TOKEN` 环境变量 > 复用 `~/.kkagent/http_token`（与 `kkagent server --http` 共用,0600 权限）。HTTP 端口能被路由到的任何进程访问——kkagent mcp 可执行任意委派编码任务,因此未配置 token 时拒绝启动；绑定非回环地址前请确认网络边界。
+
+### OpenAI Secure MCP Tunnel（可选）
+
+在 ChatGPT / Codex 等支持的 OpenAI 产品中连接私有部署的 kkagent,无需公网入口：
+
+```bash
+export CONTROL_PLANE_API_KEY=sk-...   # OpenAI Runtime API key,需 Tunnels Read+Use 权限
+kkagent mcp serve --tunnel tunnel_xxx # 隐含 --http
+```
+
+kkagent 会以子进程方式运行 [tunnel-client](https://github.com/openai/tunnel-client)（通过 `--tunnel-client` 指定路径,否则按 PATH 搜索;macOS 用 `brew install openai/tools/tunnel-client`,其他平台从 GitHub Releases 下载）。tunnel id 在 [Platform tunnel settings](https://platform.openai.com/settings/organization/tunnels) 创建并关联目标 ChatGPT workspace。kkagent 停止（Ctrl-C / SIGTERM）时子进程一并退出;tunnel-client 启动即失败会报错退出,tunnel 运行中断线仅警告、本地端点继续服务。
+
+kkagent 会自动为子进程配置 `MCP_EXTRA_HEADERS` 与 `MCP_DISCOVERY_EXTRA_HEADERS`（发现/探测请求与常规 MCP 流量在 tunnel-client 中是两组独立的静态头,缺一会导致 discover 探测 401）,并设置 `CONTROL_PLANE_POLL_CHANNELS=main` 只轮询 main 通道、忽略 harpoon 命令。手动运行 tunnel-client 时需自行带上这三项;注意 header 值中的 `env:` 引用必须是**整个值**（如 `Authorization: env:KKAGENT_MCP_HTTP_AUTH`,变量值含 `Bearer ` 前缀）,写成 `Bearer env:VAR` 会按字面量发送导致 401。
+
 ## Skills
 
 Skill 是一个目录中的 `SKILL.md`。发现顺序包括：

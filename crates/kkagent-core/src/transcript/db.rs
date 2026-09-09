@@ -704,6 +704,55 @@ impl TranscriptDb {
         Ok(sessions)
     }
 
+    /// Resolve a session by exact id or unique id prefix (same semantics as
+    /// `kkagent --resume <id-or-prefix>`). Returns `Ok(None)` when nothing
+    /// matches and an error when a prefix is ambiguous.
+    ///
+    /// Strictly byte-wise case-sensitive prefix matching via `substr`
+    /// equality under the default BINARY collation: `%`/`_` in the query are
+    /// literals (never LIKE wildcards) and `ABC` does not match `abc…`.
+    pub fn find_session_by_prefix(&self, query: &str) -> anyhow::Result<Option<SessionRecord>> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT session_id, title, model, fallback_model, working_dir, created_at, updated_at,
+                    message_count, is_archived
+             FROM sessions WHERE is_archived = 0 AND substr(session_id, 1, ?2) = ?1
+             ORDER BY updated_at DESC",
+        )?;
+        let prefix_chars = query.chars().count() as i64;
+        let rows = stmt
+            .query_map(params![query, prefix_chars], |row| {
+                Ok(SessionRecord {
+                    session_id: row.get(0)?,
+                    title: row.get(1)?,
+                    model: row.get(2)?,
+                    fallback_model: row.get(3)?,
+                    working_dir: row.get(4)?,
+                    created_at: row.get(5)?,
+                    updated_at: row.get(6)?,
+                    message_count: row.get(7)?,
+                    is_archived: row.get::<_, i32>(8)? != 0,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        if rows.is_empty() {
+            return Ok(None);
+        }
+        // An exact id always wins; otherwise a single prefix match resolves.
+        if let Some(exact) = rows.iter().find(|r| r.session_id == query) {
+            return Ok(Some(exact.clone()));
+        }
+        if rows.len() == 1 {
+            return Ok(Some(rows.into_iter().next().unwrap()));
+        }
+        anyhow::bail!(
+            "session id prefix {query:?} is ambiguous: {} candidates ({}…, {}…, …)",
+            rows.len(),
+            rows[0].session_id,
+            rows[1].session_id
+        );
+    }
+
     /// Fetch records for a session-list page with a bounded number of SQL
     /// statements instead of preparing one query per session.
     pub fn sessions_by_ids(
@@ -1145,6 +1194,68 @@ mod tests {
 
     fn test_db() -> TranscriptDb {
         TranscriptDb::open(&PathBuf::from(":memory:")).unwrap()
+    }
+
+    #[test]
+    fn find_session_by_prefix_exact_unique_and_ambiguous() {
+        let db = test_db();
+        let full = "aaaaaaaa-1111-2222-3333-444444444444";
+        let other = "aaaaaaaa-9999-8888-7777-666666666666";
+        db.create_session(full, "m", "/w1").unwrap();
+        db.create_session(other, "m", "/w2").unwrap();
+
+        // Exact id wins regardless of how many share the prefix.
+        let found = db.find_session_by_prefix(full).unwrap().expect("exact");
+        assert_eq!(found.session_id, full);
+
+        // Unique prefix resolves.
+        let found = db
+            .find_session_by_prefix("aaaaaaaa-1111")
+            .unwrap()
+            .expect("unique prefix");
+        assert_eq!(found.session_id, full);
+
+        // Shared prefix with two candidates is ambiguous.
+        let error = db
+            .find_session_by_prefix("aaaaaaaa")
+            .expect_err("ambiguous prefix");
+        assert!(error.to_string().contains("ambiguous"));
+
+        // No match at all → None, not an error.
+        assert!(db.find_session_by_prefix("zzzz").unwrap().is_none());
+    }
+
+    /// Prefix matching is strict: SQL wildcards are literals and matching is
+    /// case-sensitive (BINARY collation), so `a_` never matches `axb` and
+    /// `AB` never matches `abc…`.
+    #[test]
+    fn find_session_by_prefix_is_strict() {
+        let db = test_db();
+        db.create_session("abc_def", "m", "/w1").unwrap();
+        db.create_session("abcXdef", "m", "/w2").unwrap();
+        db.create_session("plain-id", "m", "/w3").unwrap();
+
+        // `_` / `%` are literals, not LIKE wildcards.
+        let found = db
+            .find_session_by_prefix("abc_")
+            .unwrap()
+            .expect("underscore is a literal");
+        assert_eq!(found.session_id, "abc_def");
+        assert!(db.find_session_by_prefix("abc%").unwrap().is_none());
+        // Exact ids containing wildcard characters still resolve.
+        let found = db
+            .find_session_by_prefix("abc_def")
+            .unwrap()
+            .expect("exact id with wildcard char");
+        assert_eq!(found.session_id, "abc_def");
+
+        // Case-sensitive: no ASCII case folding like SQLite LIKE.
+        assert!(db.find_session_by_prefix("ABC").unwrap().is_none());
+        assert!(db.find_session_by_prefix("PLAIN").unwrap().is_none());
+
+        // Both candidate sessions sharing `abc` stay ambiguous.
+        let error = db.find_session_by_prefix("abc").expect_err("ambiguous");
+        assert!(error.to_string().contains("ambiguous"));
     }
 
     /// Concurrent first opens of the same database file used to race their

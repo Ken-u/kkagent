@@ -165,6 +165,24 @@ kk -y -p "Read ./Cargo.toml and count workspace members"
 
 更多用法见 [docs/cli-and-tui.md](docs/cli-and-tui.md)。
 
+## 把 kkagent 接入 ChatGPT / Codex（MCP Server）
+
+`kkagent mcp serve` 把 kkagent 暴露为一个 MCP Server：网页 ChatGPT（或任何 MCP 编排方）负责决策和写计划，kkagent 在本机执行并回报结果。
+
+```bash
+# 本地 HTTP 端点（Streamable HTTP,默认 127.0.0.1:8788,Bearer 认证）
+kkagent mcp serve --http
+
+# 一条命令接入 OpenAI 生态(ChatGPT / Codex):自动拉起 tunnel-client,
+# 无需公网入口
+export CONTROL_PLANE_API_KEY=sk-...   # OpenAI Runtime API key(Tunnels Read+Use)
+kkagent mcp serve --tunnel tunnel_xxx
+```
+
+编排方的典型工作流：`write_plan` 存储执行计划拿到 `plan_id` → `delegate(plan_id)` 派发异步编码任务（计划全文作为范围事实来源注入）→ `get_progress` 轮询 → `continue_task` 回答提问 / 审批动作 → `get_result` 收取审查摘要。另有 `list_workspaces`、`get_context`、`inspect`、`cancel` 覆盖监督全流程。
+
+MCP 客户端配置：URL `http://127.0.0.1:8788/mcp`,Header `Authorization: Bearer <token>`（默认复用 `~/.kkagent/http_token`）。详见 [docs/extensions.md](docs/extensions.md#mcp-server)。
+
 ## 核心特性
 
 - **原生 Rust**：单二进制分发，无 Node.js 运行时依赖，跨平台原生支持。
@@ -174,6 +192,7 @@ kk -y -p "Read ./Cargo.toml and count workspace members"
 - **可靠恢复**：会话、事件、turn 队列、后台任务与检查点持久化到 `~/.kkagent/transcripts.db`，支持 `--resume`、断线重连与跨重启恢复。
 - **多会话协作**：会话标签、`/new`、`/fork`、BTW 侧问、Todo 面板和 transcript 搜索共同服务长任务工作流。
 - **自动化与接入**：支持 headless / CI 结构化输入输出、Web UI、ACP，以及本地和 SSH 远程执行环境。
+- **MCP Server**：`kkagent mcp serve --http` 把 kkagent 暴露为 MCP Server，配合 `--tunnel` 一条命令接入 ChatGPT / Codex——编排方决策与写计划（`write_plan`），kkagent 异步执行（`delegate`）并回报审查摘要。
 - **可扩展工具系统**：内置文件、搜索、Shell、任务、计划、Web 和媒体工具，并支持 MCP、Skills、Hooks 与插件市场；插件还可声明自定义子 Agent 类型与模型绑定。
 - **可观测性**：结构化日志、HTTP 审计日志和可配置 telemetry 事件。
 

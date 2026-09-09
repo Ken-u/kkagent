@@ -1456,6 +1456,7 @@ version = "0.3.42"
 dependencies = [
  "anyhow",
  "async-trait",
+ "axum",
  "base64 0.22.1",
  "chrono",
  "clap",
@@ -1483,6 +1484,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "toml",
+ "tower-http",
  "tracing",
  "tracing-subscriber",
  "uuid",

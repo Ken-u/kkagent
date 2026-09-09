@@ -271,7 +271,39 @@ pub(crate) enum ConfigCommands {
 #[derive(Subcommand)]
 enum McpCommand {
     /// Serve MCP over stdio (expose kkagent as tools to any MCP client)
-    Serve,
+    Serve {
+        /// Serve over Streamable HTTP at this address instead of stdio
+        /// (e.g. `--http` for 127.0.0.1:8788 or `--http 0.0.0.0:9000`)
+        #[arg(long, value_name = "ADDR", num_args(0..=1), default_missing_value = "127.0.0.1:8788")]
+        http: Option<String>,
+        /// Bearer token for HTTP mode. Prefer the KKAGENT_MCP_HTTP_TOKEN
+        /// environment variable (this CLI flag is visible in process
+        /// listings); default: that env, else the persisted local kkagent
+        /// HTTP token
+        #[arg(long, value_name = "TOKEN")]
+        http_token: Option<String>,
+        /// Run the OpenAI Secure MCP Tunnel client for this tunnel id so
+        /// ChatGPT / Codex can reach this endpoint; implies --http.
+        /// Requires CONTROL_PLANE_API_KEY and a tunnel-client binary on PATH
+        /// (or pass --tunnel-client).
+        #[arg(long, value_name = "TUNNEL_ID")]
+        tunnel: Option<String>,
+        /// Path to the tunnel-client binary (default: search PATH)
+        #[arg(long, value_name = "PATH")]
+        tunnel_client: Option<PathBuf>,
+        /// Start in the background (detach from the terminal) and return
+        /// immediately; manage with `kkagent mcp stop` / `kkagent mcp status`
+        #[arg(long)]
+        daemon: bool,
+    },
+    /// Stop the background MCP HTTP server (started with --daemon)
+    Stop,
+    /// Show background MCP HTTP server status
+    Status {
+        /// Emit machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -525,8 +557,43 @@ async fn run(cli: Cli) -> Result<()> {
             server.serve_stdio().await
         }
         Some(Commands::Mcp {
-            command: McpCommand::Serve,
-        }) => mcp_serve::run_mcp_serve(Arc::new(config)).await,
+            command: McpCommand::Stop,
+        }) => run_mcp_stop().await,
+        Some(Commands::Mcp {
+            command: McpCommand::Status { json },
+        }) => run_mcp_status(json).await,
+        Some(Commands::Mcp {
+            command:
+                McpCommand::Serve {
+                    http,
+                    http_token,
+                    tunnel,
+                    tunnel_client,
+                    daemon,
+                },
+        }) => {
+            let tunnel_options = tunnel.map(|tunnel_id| mcp_serve::TunnelOptions {
+                tunnel_id,
+                client_bin: tunnel_client,
+                api_key: None,
+            });
+            // --tunnel implies HTTP mode on the default address.
+            let http =
+                http.or_else(|| (tunnel_options.is_some()).then(|| "127.0.0.1:8788".to_string()));
+            let Some(addr) = http else {
+                // stdio mode is inherently foreground; --daemon needs HTTP.
+                if daemon {
+                    anyhow::bail!("--daemon requires --http (or --tunnel)");
+                }
+                let _ = mcp_serve::run_mcp_serve(Arc::new(config)).await;
+                return Ok(());
+            };
+            if daemon {
+                return run_mcp_daemon(config_path, &addr, http_token, tunnel_options.as_ref())
+                    .await;
+            }
+            mcp_serve::run_mcp_serve_http(Arc::new(config), &addr, http_token, tunnel_options).await
+        }
         Some(Commands::Auth { .. }) => unreachable!("auth handled before config startup"),
         Some(
             Commands::Init { .. }
@@ -1278,6 +1345,316 @@ async fn wait_for_socket(
             }
         }
     }
+}
+
+/// State file for the background MCP HTTP server (`kkagent mcp serve
+/// --daemon`): pid + listen address + how it was started.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct McpDaemonState {
+    pid: u32,
+    addr: String,
+    tunnel_id: Option<String>,
+}
+
+fn mcp_daemon_state_path() -> PathBuf {
+    kkagent_config::default_config_dir().join("mcp-http-daemon.json")
+}
+
+fn read_mcp_daemon_state() -> Option<McpDaemonState> {
+    let content = std::fs::read_to_string(mcp_daemon_state_path()).ok()?;
+    serde_json::from_str(&content).ok()
+}
+
+/// The daemonized server is alive only when the recorded pid is a running
+/// kkagent AND its health endpoint answers (stale state files must not make
+/// `status`/`stop` lie).
+async fn mcp_daemon_is_alive(state: &McpDaemonState) -> bool {
+    if !mcp_daemon_pid_alive(state.pid) {
+        return false;
+    }
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        reqwest::get(format!("http://{}/healthz", state.addr)),
+    )
+    .await
+    .ok()
+    .and_then(|result| result.ok())
+    .is_some_and(|response| response.status().is_success())
+}
+
+async fn clear_mcp_daemon_state_if_stale() -> Option<McpDaemonState> {
+    let state = read_mcp_daemon_state()?;
+    if mcp_daemon_is_alive(&state).await {
+        return Some(state);
+    }
+    let _ = std::fs::remove_file(mcp_daemon_state_path());
+    None
+}
+
+/// Try to atomically create the daemon state file (O_EXCL), claiming the
+/// daemon slot. Fails when another starter is mid-launch (file exists).
+fn claim_mcp_daemon_state(state: &McpDaemonState) -> Result<()> {
+    use std::io::Write;
+    let path = mcp_daemon_state_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)?;
+    file.write_all(&serde_json::to_vec(state)?)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
+}
+
+/// `kkagent mcp serve --daemon` — spawn ourselves detached with the exact
+/// same serve arguments (minus --daemon), then wait for the health endpoint.
+///
+/// Concurrency: concurrent starters race an atomic O_EXCL create of the
+/// state file; a stale state file from a dead daemon is removed first, so a
+/// crashed previous run never blocks a fresh launch. The command returns
+/// only after the daemon's health endpoint answers, so a successful exit
+/// means a usable endpoint.
+async fn run_mcp_daemon(
+    config_path: PathBuf,
+    addr: &str,
+    http_token: Option<String>,
+    tunnel: Option<&mcp_serve::TunnelOptions>,
+) -> Result<()> {
+    // A stale registration (daemon crashed, machine rebooted) must not block
+    // relaunching; a live one keeps its file and the spawn below fails fast.
+    let existing = clear_mcp_daemon_state_if_stale().await;
+    if existing.is_some() {
+        anyhow::bail!(
+            "a background MCP HTTP server is already registered in {}; \
+             check it with `kkagent mcp status` or stop it with `kkagent mcp stop`",
+            mcp_daemon_state_path().display()
+        );
+    }
+    let exe = std::env::current_exe().context("failed to resolve kkagent executable")?;
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.arg("--config")
+        .arg(&config_path)
+        .arg("mcp")
+        .arg("serve")
+        .arg("--http")
+        .arg(addr);
+    // The token travels through the environment, never argv: `ps`/proc
+    // listings expose full command lines to every local user, env of other
+    // users' processes is not readable.
+    if let Some(token) = &http_token {
+        cmd.env("KKAGENT_MCP_HTTP_TOKEN", token);
+    }
+    if let Some(tunnel) = tunnel {
+        cmd.arg("--tunnel").arg(&tunnel.tunnel_id);
+        if let Some(client_bin) = &tunnel.client_bin {
+            cmd.arg("--tunnel-client").arg(client_bin);
+        }
+    }
+    // Diagnostics go to a log file instead of the (detached) terminal.
+    let log_path = kkagent_config::default_config_dir().join("mcp-http-daemon.log");
+    let log = std::fs::File::create(&log_path)
+        .with_context(|| format!("creating daemon log {}", log_path.display()))?;
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(log));
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // Detach from the terminal process group so closing the terminal or
+        // Ctrl-C in the shell cannot reach the daemon.
+        cmd.process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
+    }
+    let child = cmd
+        .spawn()
+        .with_context(|| format!("failed to spawn daemon ({})", exe.display()))?;
+    let state = McpDaemonState {
+        pid: child.id(),
+        addr: addr.to_string(),
+        tunnel_id: tunnel.map(|t| t.tunnel_id.clone()),
+    };
+    if let Err(error) = claim_mcp_daemon_state(&state) {
+        // Registration lost the race (or the file system refused): do not
+        // leave an unmanaged daemon behind.
+        let _ = kill_mcp_daemon_process(state.pid);
+        anyhow::bail!(
+            "cannot register daemon state {}: {error}",
+            mcp_daemon_state_path().display()
+        );
+    }
+    println!(
+        "kkagent mcp daemon starting (pid {}, http://{addr}/mcp, log {})",
+        state.pid,
+        log_path.display()
+    );
+    // Wait until the health endpoint answers so a successful exit of this
+    // command means a usable endpoint. A daemon that dies during startup is
+    // reported immediately instead of silently succeeding.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if mcp_daemon_is_alive(&state).await {
+            return Ok(());
+        }
+        if !mcp_daemon_pid_alive(state.pid) {
+            let _ = std::fs::remove_file(mcp_daemon_state_path());
+            anyhow::bail!(
+                "daemon pid {} exited during startup; see {}",
+                state.pid,
+                log_path.display()
+            );
+        }
+        if Instant::now() >= deadline {
+            let _ = std::fs::remove_file(mcp_daemon_state_path());
+            anyhow::bail!(
+                "daemon pid {} did not become healthy within 15s; see {}",
+                state.pid,
+                log_path.display()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// True when the recorded pid names a live process. On Windows `tasklist`
+/// exits 0 even when nothing matches, so the CSV output must contain the
+/// pid; a failing probe assumes alive (the health check is the arbiter).
+fn mcp_daemon_pid_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    }
+    #[cfg(windows)]
+    {
+        std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+            .output()
+            .map(|out| String::from_utf8_lossy(&out.stdout).contains(&pid.to_string()))
+            .unwrap_or(true)
+    }
+}
+
+/// Send a termination signal to the daemon process. Returns `true` when the
+/// signal (probably) reached a process.
+fn kill_mcp_daemon_process(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        // SIGTERM: the server's shutdown handler stops the tunnel child.
+        std::process::Command::new("kill")
+            .args(["15", &pid.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    }
+    #[cfg(windows)]
+    {
+        // `kill.exe` does not exist on Windows; taskkill is the native way.
+        std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    }
+}
+
+/// Force-kill the daemon (SIGKILL on unix; `taskkill /F` on Windows).
+fn force_kill_mcp_daemon_process(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        std::process::Command::new("kill")
+            .args(["-9", &pid.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    }
+    #[cfg(windows)]
+    {
+        std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/F"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    }
+}
+
+async fn run_mcp_stop() -> Result<()> {
+    let Some(state) = clear_mcp_daemon_state_if_stale().await else {
+        anyhow::bail!("no background MCP HTTP server is running");
+    };
+    let _ = std::fs::remove_file(mcp_daemon_state_path());
+    // SIGTERM first: the server's shutdown handler stops the tunnel child.
+    kill_mcp_daemon_process(state.pid);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while mcp_daemon_is_alive(&state).await && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    if mcp_daemon_is_alive(&state).await {
+        force_kill_mcp_daemon_process(state.pid);
+        anyhow::bail!(
+            "daemon pid {} did not exit within 10s; force-killed",
+            state.pid
+        );
+    }
+    println!(
+        "kkagent mcp daemon stopped (pid {}, http://{}/mcp)",
+        state.pid, state.addr
+    );
+    Ok(())
+}
+
+async fn run_mcp_status(json: bool) -> Result<()> {
+    let state = clear_mcp_daemon_state_if_stale().await;
+    let payload = match &state {
+        Some(state) => serde_json::json!({
+            "running": true,
+            "pid": state.pid,
+            "addr": state.addr,
+            "url": format!("http://{}/mcp", state.addr),
+            "tunnel_id": state.tunnel_id,
+        }),
+        None => serde_json::json!({ "running": false }),
+    };
+    if json {
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+        return Ok(());
+    }
+    match state {
+        Some(state) => {
+            println!(
+                "kkagent mcp daemon running: pid {}, http://{}/mcp{}",
+                state.pid,
+                state.addr,
+                state
+                    .tunnel_id
+                    .as_deref()
+                    .map(|t| format!(" (tunnel {t})"))
+                    .unwrap_or_default()
+            );
+        }
+        None => println!("kkagent mcp daemon is not running"),
+    }
+    let _ = payload;
+    Ok(())
 }
 
 async fn run_server_stop(listen: Option<String>) -> Result<()> {

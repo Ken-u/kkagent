@@ -165,6 +165,24 @@ kk -y -p "Read ./Cargo.toml and count workspace members"
 
 See [docs/cli-and-tui.md](docs/cli-and-tui.md) for more.
 
+## Wire kkagent into ChatGPT / Codex (MCP Server)
+
+`kkagent mcp serve` exposes kkagent as an MCP server: web ChatGPT (or any MCP orchestrator) decides and writes the plan, while kkagent executes locally and reports back.
+
+```bash
+# Local HTTP endpoint (Streamable HTTP, default 127.0.0.1:8788, bearer auth)
+kkagent mcp serve --http
+
+# One command into the OpenAI ecosystem (ChatGPT / Codex): runs
+# tunnel-client automatically, no public ingress required
+export CONTROL_PLANE_API_KEY=sk-...   # OpenAI runtime API key (Tunnels Read+Use)
+kkagent mcp serve --tunnel tunnel_xxx
+```
+
+The orchestrator workflow: `write_plan` stores an execution plan and returns a `plan_id` → `delegate(plan_id)` dispatches an async coding task (the full plan is injected as the scope source of truth) → `get_progress` polls → `continue_task` answers questions / approves actions → `get_result` collects the review summary. `list_workspaces`, `get_context`, `inspect`, and `cancel` round out the supervision surface.
+
+MCP client configuration: URL `http://127.0.0.1:8788/mcp`, header `Authorization: Bearer <token>` (defaults to `~/.kkagent/http_token`). See [docs/extensions.md](docs/extensions.md#mcp-server).
+
 ## Core Features
 
 - **Native Rust**: a single binary with no Node.js runtime dependency and native cross-platform support.
@@ -174,6 +192,7 @@ See [docs/cli-and-tui.md](docs/cli-and-tui.md) for more.
 - **Reliable recovery**: sessions, events, turn queues, background tasks, and checkpoints are persisted to `~/.kkagent/transcripts.db`, supporting `--resume`, reconnects, and cross-restart recovery.
 - **Multi-session workflows**: session tabs, `/new`, `/fork`, BTW side questions, a docked todo panel, and transcript search for long-running tasks.
 - **Automation and integrations**: headless / CI structured I/O, Web UI, ACP, plus local and SSH remote execution environments.
+- **MCP server**: `kkagent mcp serve --http` exposes kkagent as an MCP server; with `--tunnel` one command wires it into ChatGPT / Codex — the orchestrator decides and plans (`write_plan`), kkagent executes asynchronously (`delegate`) and reports back a review summary.
 - **Extensible tool system**: built-in file, search, shell, task, plan, web, and media tools, with MCP, Skills, Hooks, and plugin marketplaces; plugins can also declare custom subagent types with dedicated model bindings.
 - **Observability**: structured logging, HTTP audit logs, and configurable telemetry events.
 

@@ -9,6 +9,9 @@
 //!   sessions, in-flight tasks, items needing attention.
 //! - `inspect` — direct read-only fetch of a resource in a workspace: source
 //!   code, text, logs, git diffs, images, and task artifacts; no agent runs.
+//! - `write_plan` — store an orchestrator-authored execution plan (markdown)
+//!   and get a `plan_id`; `delegate` accepts it and injects the full plan
+//!   ahead of the task prompt as the scope source of truth.
 //! - `delegate` — start an async coding task (equivalent to a fresh default
 //!   kkagent session in the workspace); returns `task_id` immediately. kkagent
 //!   decides model, tools, and worktree isolation itself.
@@ -29,14 +32,32 @@
 //! The transport is newline-delimited JSON-RPC 2.0 on stdin/stdout — exactly
 //! what the MCP stdio transport requires. Nothing besides protocol frames may
 //! ever be written to stdout; logging goes to stderr.
+//!
+//! `kkagent mcp serve --http [ADDR]` serves the same protocol over the MCP
+//! Streamable HTTP transport instead (default `127.0.0.1:8788`): MCP clients
+//! POST JSON-RPC messages to `http://ADDR/mcp`; notifications are answered
+//! with `202 Accepted`. Bearer-token auth is required (`--http-token`,
+//! `KKAGENT_MCP_HTTP_TOKEN`, or the persisted local kkagent HTTP token) and
+//! `GET /healthz` reports liveness without auth for connection checks.
+//!
+//! `--tunnel <TUNNEL_ID>` additionally runs the OpenAI Secure MCP Tunnel
+//! client (https://github.com/openai/tunnel-client) as a supervised child
+//! process, so ChatGPT / Codex / the Responses API can reach this private
+//! endpoint through an OpenAI-hosted tunnel. The runtime API key is read
+//! from `CONTROL_PLANE_API_KEY` (never argv); the MCP bearer token is passed
+//! to tunnel-client via `MCP_EXTRA_HEADERS` with an `env:` value reference.
+//! Stopping kkagent (Ctrl-C / SIGTERM) also stops the child.
 
+mod collaboration;
+use collaboration::{CollaborationStore, TaskRecord};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
-use anyhow::Result;
+use anyhow::{anyhow, Context as _, Result};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use kkagent_core::permission::PermissionChain;
@@ -72,13 +93,15 @@ const TASK_KIND: &str = "delegate";
 /// model override resolves to the globally configured default model. kkagent
 /// decides everything itself — the caller only supplies goal and workspace.
 const TASK_PROFILE: &str = "general";
+/// Char cap for orchestrator-authored plans stored with `write_plan`.
+const MAX_PLAN_CHARS: usize = 100_000;
 
 // ---------------------------------------------------------------------------
 // Task model
 // ---------------------------------------------------------------------------
 
 /// Lifecycle phase, surfaced verbatim through `get_progress`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 enum TaskPhase {
     Queued,
     Running,
@@ -110,7 +133,7 @@ impl TaskPhase {
     }
 }
 
-#[derive(Default, Clone)]
+#[derive(Default, Clone, Serialize, Deserialize)]
 struct Progress {
     tool_calls: u64,
     tool_results: u64,
@@ -131,10 +154,97 @@ impl Progress {
     }
 }
 
+/// Liveness slot for a task's runner, mutated only under its mutex so
+/// spawn decisions are atomic with runner exit decisions.
+///
+/// The invariant that makes `continue_task` reliable: a spawn decision keys
+/// on the synchronous `exited` flag, never on `AbortHandle::is_finished()`
+/// (which is only asynchronously true and races every exit path). A runner
+/// that stops serving the task must pass through `runner_should_restart`
+/// or the [`RunnerGuard`] drop, both of which set `exited` under the lock
+/// before the tokio task can be observed as finished. Combined with the
+/// runner's final pre-exit check running under the same lock, exactly one
+/// of "the parked runner consumes the instruction" and "`ensure_runner`
+/// spawns a fresh runner for it" holds for every accepted instruction.
+struct RunnerSlot {
+    /// Abort handle for the runner's tokio task (hard cancel backstop).
+    abort: Option<tokio::task::AbortHandle>,
+    /// The runner is parked in `wait_for_instruction` and reachable via
+    /// `runner_notify`.
+    waiting: bool,
+    /// No runner is serving (or will ever serve) the task. `true` by default
+    /// so the first `ensure_runner` call spawns.
+    exited: bool,
+}
+
+impl RunnerSlot {
+    /// Fresh slot: no runner yet, so the next `ensure_runner` spawns one.
+    fn initial() -> Self {
+        Self {
+            abort: None,
+            waiting: false,
+            exited: true,
+        }
+    }
+}
+
+/// Wall-clock timestamps of the latest model / tool activity, surfaced by
+/// `get_progress` so an orchestrator can tell "thinking", "tool blocked" and
+/// "runner gone" apart.
+#[derive(Default)]
+struct ActivityStamp {
+    last_progress: Option<SystemTime>,
+    last_model: Option<SystemTime>,
+    last_tool: Option<SystemTime>,
+}
+
+impl ActivityStamp {
+    fn note_progress(&mut self) {
+        self.last_progress = Some(SystemTime::now());
+    }
+
+    fn note_model(&mut self) {
+        self.note_progress();
+        self.last_model = Some(SystemTime::now());
+    }
+
+    fn note_tool(&mut self) {
+        self.note_progress();
+        self.last_tool = Some(SystemTime::now());
+    }
+
+    /// `(progress, model, tool)` ages in whole seconds; `None` = never.
+    fn ages(&self) -> (Option<u64>, Option<u64>, Option<u64>) {
+        fn age(stamp: Option<SystemTime>) -> Option<u64> {
+            stamp.and_then(|t| t.elapsed().ok()).map(|d| d.as_secs())
+        }
+        (
+            age(self.last_progress),
+            age(self.last_model),
+            age(self.last_tool),
+        )
+    }
+}
+
+/// RAII marker for a live runner: dropping it (normal exit, panic unwind or
+/// early return) publishes `exited` under the slot lock, so a racing
+/// `spawn_runner` always observes the death synchronously.
+struct RunnerGuard {
+    task: Arc<McpTask>,
+}
+
+impl Drop for RunnerGuard {
+    fn drop(&mut self) {
+        let mut slot = self.task.runner.lock().unwrap_or_else(|e| e.into_inner());
+        slot.exited = true;
+        slot.waiting = false;
+    }
+}
+
 /// Review summary refreshed by the runner after every turn. Mechanical only —
 /// composed from the session's final assistant text and git/checkpoint data,
 /// never a second LLM pass.
-#[derive(Default, Clone)]
+#[derive(Default, Clone, Serialize, Deserialize)]
 struct TaskSummary {
     final_message: String,
     files_changed: Vec<String>,
@@ -179,9 +289,17 @@ impl TaskSummary {
 /// request handlers both hold `Arc<McpTask>`.
 struct McpTask {
     id: String,
+    resume: bool,
+    plan_ref: StdMutex<Option<Value>>,
+    review: StdMutex<String>,
+    reviewed_snapshot: StdMutex<Option<String>>,
+    event_sequence: std::sync::atomic::AtomicU64,
     session_id: String,
     description: String,
     prompt: String,
+    /// Orchestrator-authored plan (write_plan) injected ahead of the prompt.
+    plan_title: Option<String>,
+    plan: Option<String>,
     origin_workspace: PathBuf,
     /// Directory the agent actually runs in (worktree path when isolated).
     run_dir: Mutex<PathBuf>,
@@ -197,14 +315,21 @@ struct McpTask {
     /// turn. `None` until then (tasks queued have nothing to answer).
     question_tx: StdMutex<Option<mpsc::Sender<QuestionResponse>>>,
     approval_tx: StdMutex<Option<mpsc::Sender<ApprovalResponse>>>,
-    /// Wakes the runner when new instructions / answers arrive.
+    /// Best-effort wake for a runner parked in `wait_for_instruction`
+    /// (Notify keeps an unconsumed permit, so the wake itself is never
+    /// lost). Correctness never depends on it: instruction consumption is
+    /// guaranteed by the [`RunnerSlot`] protocol instead.
     runner_notify: Notify,
-    /// Abort handle for the runner's tokio task (hard cancel backstop).
-    abort: StdMutex<Option<tokio::task::AbortHandle>>,
+    /// Liveness bookkeeping for the runner task. Guards spawn decisions
+    /// against the lost-wakeup race between completion/runner-exit and
+    /// `continue_task`.
+    runner: StdMutex<RunnerSlot>,
 
     // observed state
     phase: StdMutex<TaskPhase>,
     progress: StdMutex<Progress>,
+    /// Timestamps of the last model / tool activity, for get_progress.
+    activity: StdMutex<ActivityStamp>,
     recent_events: StdMutex<Vec<String>>,
     pending_question: StdMutex<Option<QuestionPayload>>,
     pending_approval: StdMutex<Option<ApprovalRequest>>,
@@ -239,7 +364,8 @@ impl McpTask {
 
     fn push_event(&self, text: String) {
         let mut events = self.recent_events.lock().unwrap_or_else(|e| e.into_inner());
-        events.push(text);
+        let sequence = self.event_sequence.fetch_add(1, Ordering::SeqCst) + 1;
+        events.push(format!("{sequence}: {text}"));
         let len = events.len();
         if len > RECENT_EVENT_CAP {
             events.drain(..len - RECENT_EVENT_CAP);
@@ -251,6 +377,80 @@ impl McpTask {
             Some(finished) => (finished - self.started_at).as_secs(),
             None => self.started_at.elapsed().as_secs(),
         }
+    }
+
+    /// Hard-cancel backstop for the runner's tokio task, if one is live.
+    /// Marks the slot exited synchronously under the lock: an abort is only
+    /// processed at the runner's next await point, so a continue_task racing
+    /// the cancellation must not conclude a runner is still alive.
+    fn abort_runner(&self) {
+        let mut slot = self.runner.lock().unwrap_or_else(|e| e.into_inner());
+        slot.exited = true;
+        slot.waiting = false;
+        if let Some(handle) = slot.abort.take() {
+            handle.abort();
+        }
+    }
+
+    /// Runner liveness for get_progress: `waiting` when parked for
+    /// instructions, `running` when a tokio task exists, `exited` otherwise.
+    fn runner_state(&self) -> &'static str {
+        let slot = self.runner.lock().unwrap_or_else(|e| e.into_inner());
+        if slot.exited {
+            "exited"
+        } else if slot.waiting {
+            "waiting_for_instruction"
+        } else {
+            "running"
+        }
+    }
+
+    /// Mark the runner as parked in `wait_for_instruction` (reachable via
+    /// `runner_notify`).
+    fn mark_runner_waiting(&self) {
+        self.runner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .waiting = true;
+    }
+
+    /// Clear the parked flag before the runner does non-idle work.
+    fn mark_runner_active(&self) {
+        self.runner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .waiting = false;
+    }
+
+    /// Final pre-exit check for the runner: returns `true` when instructions
+    /// arrived in the closing window between the last queue check and now.
+    /// Runs while `RunnerGuard` still holds, so a racing `spawn_runner` sees
+    /// `exited == false` and never double-spawns.
+    fn runner_should_restart(&self) -> bool {
+        let should_restart = !self
+            .pending_instructions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
+            && !self.interrupt.load(Ordering::SeqCst);
+        if should_restart {
+            self.mark_runner_active();
+        }
+        should_restart
+    }
+
+    fn note_model_activity(&self) {
+        self.activity
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .note_model();
+    }
+
+    fn note_tool_activity(&self) {
+        self.activity
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .note_tool();
     }
 
     fn progress_snapshot(&self) -> Value {
@@ -325,6 +525,8 @@ struct RunnerCtx {
     config: Arc<kkagent_config::AppConfig>,
     web: Arc<kkagent_tools::WebServicesConfig>,
     queue: Arc<Semaphore>,
+    transcript: TranscriptDb,
+    store: CollaborationStore,
 }
 
 // ---------------------------------------------------------------------------
@@ -338,7 +540,7 @@ pub async fn run_mcp_serve(config: Arc<kkagent_config::AppConfig>) -> Result<()>
         eprintln!("kkagent mcp: transcript registry unavailable: {e}");
         e
     })?;
-    let server = Arc::new(McpServer::new(config, transcript));
+    let server = Arc::new(McpServer::new(config, transcript)?);
     serve_stdio(server).await
 }
 
@@ -377,30 +579,641 @@ pub async fn serve_stdio(server: Arc<McpServer>) -> Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Streamable HTTP transport
+// ---------------------------------------------------------------------------
+
+/// Build the MCP runtime and serve over the MCP Streamable HTTP transport
+/// until the process is stopped. `addr` is `host:port`, e.g.
+/// `127.0.0.1:8788`. When `tunnel` is set, the OpenAI Secure MCP Tunnel
+/// client is run as a supervised child and stopped together with the server.
+pub async fn run_mcp_serve_http(
+    config: Arc<kkagent_config::AppConfig>,
+    addr: &str,
+    token: Option<String>,
+    tunnel: Option<TunnelOptions>,
+) -> Result<()> {
+    let transcript = TranscriptDb::open_default().context("opening transcript registry")?;
+    let server = Arc::new(McpServer::new(config, transcript)?);
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("binding MCP HTTP listener on {addr}"))?;
+    serve_http(server, listener, token, tunnel).await
+}
+
+/// Options for running the OpenAI Secure MCP Tunnel client alongside the
+/// HTTP endpoint (`kkagent mcp serve --http --tunnel <TUNNEL_ID>`).
+#[derive(Debug, Clone)]
+pub struct TunnelOptions {
+    /// OpenAI tunnel id (`tunnel_` + 32 hex chars) from Platform tunnel
+    /// settings.
+    pub tunnel_id: String,
+    /// Explicit path to the `tunnel-client` binary; searched on PATH when
+    /// `None`.
+    pub client_bin: Option<PathBuf>,
+    /// OpenAI runtime API key. When `None`, read from the
+    /// `CONTROL_PLANE_API_KEY` environment variable.
+    pub api_key: Option<String>,
+}
+
+/// Serve the MCP protocol over the Streamable HTTP transport.
+///
+/// The MCP spec (2025-03-26+) defines Streamable HTTP: clients POST JSON-RPC
+/// messages to a single endpoint and receive either `application/json` (the
+/// response) or an SSE stream; notifications are answered with `202 Accepted`.
+/// This server only uses the plain-JSON mode — every tool call here is
+/// synchronous from the protocol's point of view, so a stream adds no value.
+///
+/// Takes an already-bound listener so tests (and callers embedding the
+/// endpoint) can bind port 0 and discover the address without a race.
+///
+/// When `tunnel` is `Some`, the OpenAI Secure MCP Tunnel client is spawned
+/// before serving starts and killed when the server stops (Ctrl-C / SIGTERM).
+pub async fn serve_http(
+    server: Arc<McpServer>,
+    listener: tokio::net::TcpListener,
+    token: Option<String>,
+    tunnel: Option<TunnelOptions>,
+) -> Result<()> {
+    use axum::routing::{any, get};
+
+    // Auth: `--http-token`, else `KKAGENT_MCP_HTTP_TOKEN`, else the persisted
+    // local kkagent HTTP token (already 0600-protected on disk). HTTP is
+    // reachable by anything on the network that can route to `addr`, so an
+    // unauthenticated run is refused — kkagent mcp can run arbitrary delegated
+    // coding tasks.
+    let token = match token.clone().or_else(|| {
+        std::env::var("KKAGENT_MCP_HTTP_TOKEN")
+            .ok()
+            .filter(|t| !t.is_empty())
+    }) {
+        Some(token) => token,
+        None => load_or_generate_http_token(),
+    };
+
+    let app = axum::Router::new()
+        .route("/mcp", any(handle_mcp_post))
+        .route("/healthz", get(async || "ok\n"))
+        .layer(axum::extract::Extension(Arc::clone(&server)))
+        .layer(axum::extract::Extension(HttpToken(Arc::new(token.clone()))))
+        .with_state(());
+
+    let mcp_url = mcp_url_for(listener.local_addr().ok());
+    eprintln!("kkagent mcp: HTTP endpoint {mcp_url} (Streamable HTTP; bearer auth)");
+
+    // Serve FIRST: tunnel-client starts probing this endpoint (2s budget)
+    // as soon as it spawns, and a bound-but-not-accepting listener would
+    // let that probe time out. Failures in tunnel setup abort the serve
+    // task via the JoinHandle drop below.
+    let serve_task = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .context("running MCP HTTP server")
+    });
+
+    // Optional OpenAI tunnel: resolve + spawn before parking on the serve
+    // task so a bad setup (missing binary, missing API key, client that
+    // dies immediately) fails fast instead of serving an endpoint nothing
+    // can reach through the tunnel.
+    let mut startup_failure_rx = None;
+    let tunnel_child = match &tunnel {
+        Some(options) => {
+            let child = match spawn_tunnel_child(options, &mcp_url, &token).await {
+                Ok(child) => Arc::new(child),
+                Err(error) => {
+                    serve_task.abort();
+                    return Err(error);
+                }
+            };
+            // A client that dies right after spawn must fail the serve (a
+            // tunnel nobody can reach is worse than no tunnel). The monitor
+            // owns that decision — polling survives slow fork+exec that a
+            // fixed startup probe window would race — and reports it back.
+            let (startup_tx, startup_rx) = tokio::sync::oneshot::channel();
+            spawn_tunnel_monitor(&child, Some(startup_tx));
+            startup_failure_rx = Some(startup_rx);
+            Some(child)
+        }
+        None => None,
+    };
+
+    // Resolves only when the tunnel-client exited within its startup window;
+    // stays pending forever otherwise (benign outcomes just drop the
+    // sender), so the select below keeps waiting on serve/shutdown.
+    let startup_failure = async move {
+        if let Some(rx) = startup_failure_rx.as_mut() {
+            if let Ok(Err(error)) = rx.await {
+                return error;
+            }
+        }
+        std::future::pending().await
+    };
+    // Pinned so the select can poll the JoinHandle by reference without
+    // consuming it (the startup-failure branch still needs `abort()`).
+    tokio::pin!(serve_task);
+    let outcome = tokio::select! {
+        result = &mut serve_task => result.context("MCP HTTP serve task"),
+        _ = shutdown_signal() => {
+            eprintln!("kkagent mcp: shutting down on signal");
+            if let Some(child) = &tunnel_child {
+                child.kill().await;
+            }
+            Ok(Ok(()))
+        }
+        error = startup_failure => {
+            eprintln!("kkagent mcp: failing serve because the tunnel-client died during startup");
+            serve_task.abort();
+            Ok(Err(error))
+        }
+    };
+    outcome.and_then(|inner| inner)
+}
+/// Local URL for the bound listener (e.g. `http://127.0.0.1:8788/mcp`),
+/// preferring 127.0.0.1 over an unspecified bind address so tunnel-client
+/// always dials loopback.
+fn mcp_url_for(addr: Option<std::net::SocketAddr>) -> String {
+    let Some(addr) = addr else {
+        return "http://127.0.0.1/mcp".to_string();
+    };
+    let host = match addr.ip() {
+        std::net::IpAddr::V4(v4) => v4.to_string(),
+        std::net::IpAddr::V6(v6) => format!("[{v6}]"),
+    };
+    let host = if addr.ip().is_unspecified() {
+        "127.0.0.1".to_string()
+    } else {
+        host
+    };
+    format!("http://{host}:{}/mcp", addr.port())
+}
+
+// -- OpenAI Secure MCP Tunnel supervision ------------------------------------
+
+/// Shared handle for the supervised `tunnel-client` child process.
+struct TunnelChild {
+    child: Mutex<Option<tokio::process::Child>>,
+}
+
+impl TunnelChild {
+    /// Kill the child (no-op when it already exited or was reaped).
+    async fn kill(&self) {
+        if let Some(mut child) = self.child.lock().await.take() {
+            let _ = child.kill().await;
+        }
+    }
+}
+
+/// Spawn `tunnel-client run` wired to this HTTP endpoint.
+///
+/// The runtime API key is read from `CONTROL_PLANE_API_KEY` (never argv);
+/// the kkagent bearer token is forwarded on every MCP request through
+/// `MCP_EXTRA_HEADERS` with an `env:` value reference that tunnel-client
+/// resolves itself, so the token stays out of its argv and config files.
+async fn spawn_tunnel_child(
+    options: &TunnelOptions,
+    mcp_url: &str,
+    token: &str,
+) -> Result<TunnelChild> {
+    let bin = resolve_tunnel_client(options.client_bin.as_deref())?;
+    let api_key = options
+        .api_key
+        .clone()
+        .filter(|k| !k.is_empty())
+        .or_else(|| {
+            std::env::var("CONTROL_PLANE_API_KEY")
+                .ok()
+                .filter(|k| !k.is_empty())
+        })
+        .context(
+            "--tunnel requires CONTROL_PLANE_API_KEY (OpenAI runtime API key with Tunnels \
+             Read+Use; create one at https://platform.openai.com/settings/organization/api-keys)",
+        )?;
+
+    let mut command = tokio::process::Command::new(&bin);
+    command
+        .args([
+            "run",
+            "--control-plane.tunnel-id",
+            &options.tunnel_id,
+            "--mcp.server-url",
+            mcp_url,
+        ])
+        .env("CONTROL_PLANE_API_KEY", api_key)
+        // `env:` references in tunnel-client header values must be the WHOLE
+        // value (any other prefix makes it a literal), so the "Bearer " part
+        // lives inside the variable.
+        .env("KKAGENT_MCP_HTTP_AUTH", format!("Bearer {token}"))
+        // Runtime MCP traffic AND discovery/probe requests each have their
+        // own static-header set in tunnel-client; both must carry the bearer
+        // token or the OpenAI-side discover probe gets a 401 from kkagent.
+        .env(
+            "MCP_EXTRA_HEADERS",
+            "Authorization: env:KKAGENT_MCP_HTTP_AUTH",
+        )
+        .env(
+            "MCP_DISCOVERY_EXTRA_HEADERS",
+            "Authorization: env:KKAGENT_MCP_HTTP_AUTH",
+        )
+        // Poll only the main MCP channel: without an allowlist the client
+        // receives harpoon-channel commands too and logs "unsupported
+        // channel" errors for every one of them.
+        .env("CONTROL_PLANE_POLL_CHANNELS", "main")
+        .stdin(std::process::Stdio::null())
+        // tunnel-client reports health/ready progress on stdout+stderr;
+        // surface both so operators can follow startup in the terminal.
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        // If the serve task is cancelled/dropped without the explicit signal
+        // path, dropping the Child must still terminate the client.
+        .kill_on_drop(true);
+    let child = command
+        .spawn()
+        .with_context(|| format!("spawning tunnel-client ({})", bin.display()))?;
+    eprintln!(
+        "kkagent mcp: tunnel-client running (pid {}), forwarding {mcp_url} through tunnel {}",
+        child.id().unwrap_or_default(),
+        options.tunnel_id
+    );
+    Ok(TunnelChild {
+        child: Mutex::new(Some(child)),
+    })
+}
+
+/// Startup window: a client exiting within it fails `serve_http` (the tunnel
+/// is unusable and likely misconfigured). Generous enough to absorb slow
+/// fork+exec under load — the flake mode of the fixed probe this replaces —
+/// and overridable via `KKAGENT_TUNNEL_STARTUP_WINDOW_SECS` for tests on
+/// pathologically slow file systems.
+fn tunnel_startup_window() -> std::time::Duration {
+    let secs = std::env::var("KKAGENT_TUNNEL_STARTUP_WINDOW_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(10);
+    std::time::Duration::from_secs(secs)
+}
+
+/// Reap the tunnel client in the background; the HTTP server keeps serving
+/// locally even when the tunnel goes down. Exits during the startup window
+/// are reported through `startup_failure` so the server fails instead of
+/// serving an unreachable tunnel; later exits are degraded-service warnings.
+///
+/// Holds only a weak handle: when `serve_http` is dropped/aborted its strong
+/// reference goes away, the `Child` is dropped with it and `kill_on_drop`
+/// terminates the client even without a graceful shutdown.
+fn spawn_tunnel_monitor(
+    child: &Arc<TunnelChild>,
+    mut startup_failure: Option<tokio::sync::oneshot::Sender<anyhow::Result<()>>>,
+) {
+    let child = Arc::downgrade(child);
+    let started = std::time::Instant::now();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            // Upgrade failed ⇒ the server is gone; kill_on_drop fired.
+            let Some(child) = child.upgrade() else {
+                break;
+            };
+            let mut guard = child.child.lock().await;
+            match guard.as_mut() {
+                // Killed by shutdown — stop monitoring.
+                None => break,
+                Some(running) => match running.try_wait() {
+                    Ok(None) => {
+                        if started.elapsed() >= tunnel_startup_window() {
+                            // Survived startup: drop the sender so the
+                            // server stops waiting on it; later exits are
+                            // just warnings.
+                            startup_failure = None;
+                        }
+                    }
+                    Ok(Some(status)) => {
+                        if started.elapsed() < tunnel_startup_window() {
+                            if let Some(sender) = startup_failure.take() {
+                                let _ = sender.send(Err(anyhow!(
+                                    "tunnel-client exited during startup ({status}); check \
+                                     CONTROL_PLANE_API_KEY, the tunnel id, and outbound access \
+                                     to api.openai.com:443 (diagnose with `tunnel-client doctor \
+                                     --explain`)"
+                                )));
+                            }
+                        } else {
+                            eprintln!(
+                                "kkagent mcp: WARNING tunnel-client exited ({status}); the \
+                                 tunnel is down but the local MCP HTTP server keeps serving"
+                            );
+                        }
+                        guard.take();
+                        break;
+                    }
+                    Err(error) => {
+                        eprintln!("kkagent mcp: WARNING tunnel-client wait failed: {error}");
+                        break;
+                    }
+                },
+            }
+        }
+    });
+}
+
+/// Platform-appropriate installation hint for `tunnel-client`. Homebrew is
+/// the supported channel on macOS (release ZIPs are not notarized and can be
+/// blocked by Gatekeeper); everywhere else, official release archives come
+/// from GitHub Releases or the Platform tunnel settings download link.
+fn tunnel_client_install_hint() -> &'static str {
+    match std::env::consts::OS {
+        "macos" => "install it with `brew install openai/tools/tunnel-client`",
+        "windows" => {
+            "download the windows release from \
+             https://github.com/openai/tunnel-client/releases/latest"
+        }
+        _ => {
+            "download a release archive from \
+             https://github.com/openai/tunnel-client/releases/latest"
+        }
+    }
+}
+
+/// Locate the `tunnel-client` binary: explicit path first, then a PATH
+/// search (both `tunnel-client` and `tunnel-client.exe`).
+fn resolve_tunnel_client(explicit: Option<&Path>) -> Result<PathBuf> {
+    if let Some(explicit) = explicit {
+        if explicit.is_file() {
+            return Ok(explicit.to_path_buf());
+        }
+        return Err(anyhow!("tunnel-client not found at {}", explicit.display()));
+    }
+    if let Some(path_var) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path_var) {
+            for name in ["tunnel-client", "tunnel-client.exe"] {
+                let candidate = dir.join(name);
+                if candidate.is_file() {
+                    return Ok(candidate);
+                }
+            }
+        }
+    }
+    Err(anyhow!(
+        "tunnel-client not found on PATH; {}, or pass \
+         --tunnel-client /path/to/tunnel-client",
+        tunnel_client_install_hint()
+    ))
+}
+
+/// Resolve when the process is asked to stop (Ctrl-C or SIGTERM).
+async fn shutdown_signal() {
+    let ctrl_c = tokio::signal::ctrl_c();
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut terminate = signal(SignalKind::terminate()).expect("installing SIGTERM handler");
+        tokio::select! {
+            _ = ctrl_c => {}
+            _ = terminate.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = ctrl_c.await;
+    }
+}
+
+/// Shared bearer token for the HTTP transport.
+#[derive(Clone)]
+struct HttpToken(Arc<String>);
+
+async fn handle_mcp_post(
+    axum::extract::Extension(server): axum::extract::Extension<Arc<McpServer>>,
+    axum::extract::Extension(token): axum::extract::Extension<HttpToken>,
+    method: axum::http::Method,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    use axum::http::{header, StatusCode};
+    use axum::response::IntoResponse;
+
+    let unauthorized = || {
+        (
+            StatusCode::UNAUTHORIZED,
+            [
+                (header::WWW_AUTHENTICATE, "Bearer realm=\"kkagent-mcp\""),
+                (header::CONTENT_TYPE, "application/json"),
+            ],
+            // JSON body: tunnel probes (e.g. the OpenAI tunnel-client
+            // discover request) try to parse every response as JSON; a text
+            // body surfaces upstream as "malformed_json" transport errors.
+            error_response_value(
+                Value::Null,
+                -32000,
+                "unauthorized: missing or invalid bearer token",
+            )
+            .to_string(),
+        )
+    };
+    let authorized = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .is_some_and(|given| constant_time_eq(given.as_bytes(), token.0.as_bytes()));
+    if !authorized {
+        return unauthorized().into_response();
+    }
+
+    // JSON-only Streamable HTTP: no SSE listening stream (GET) and no session
+    // lifecycle (DELETE — this server is stateless, it never issues
+    // Mcp-Session-Id). Spec-compliant 405 lets Streamable HTTP clients such
+    // as the OpenAI tunnel-client http-streamable transport degrade cleanly.
+    if method != axum::http::Method::POST {
+        return (
+            StatusCode::METHOD_NOT_ALLOWED,
+            [(header::ALLOW, "POST")],
+            "kkagent mcp HTTP transport supports POST (application/json) only\n",
+        )
+            .into_response();
+    }
+
+    // SSE responses are never produced; refuse clients that demand a stream.
+    if headers
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|accept| {
+            !accept.contains("application/json") && accept.contains("text/event-stream")
+        })
+    {
+        return (
+            StatusCode::NOT_ACCEPTABLE,
+            "kkagent mcp HTTP transport returns application/json only\n",
+        )
+            .into_response();
+    }
+
+    let text = match std::str::from_utf8(&body) {
+        Ok(text) => text,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                error_response_value(Value::Null, -32700, "Parse error: body is not UTF-8")
+                    .to_string(),
+            )
+                .into_response()
+        }
+    };
+    match server.handle_message(text).await {
+        // Notification (no id): no response body per JSON-RPC / MCP spec.
+        None => StatusCode::ACCEPTED.into_response(),
+        Some(response) => ([(header::CONTENT_TYPE, "application/json")], response).into_response(),
+    }
+}
+
+/// Length-checked byte equality that does not early-exit on mismatch.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter()
+        .zip(b.iter())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
+}
+
+/// Resolve the bearer token for the HTTP transport: explicit `--http-token`,
+/// then `KKAGENT_MCP_HTTP_TOKEN`, else reuse the persisted local kkagent HTTP
+/// token (shared with `kkagent server --http`; 0600 on disk).
+fn load_or_generate_http_token() -> String {
+    let path = kkagent_config::default_config_dir().join("http_token");
+    if let Ok(content) = std::fs::read_to_string(&path) {
+        let trimmed = content.trim();
+        if !trimmed.is_empty() {
+            // Older releases created the token file world-readable; tighten it
+            // so a token minted before the 0600-at-creation fix is protected.
+            tighten_secret_permissions(&path);
+            return trimmed.to_string();
+        }
+    }
+    // Generate a new token and persist it for future restarts.
+    let token = uuid::Uuid::new_v4().to_string();
+    if let Err(error) = persist_token(&path, &token) {
+        eprintln!(
+            "kkagent mcp: failed to persist HTTP token to {}: {error}; token will change on restart",
+            path.display()
+        );
+    }
+    token
+}
+
+/// Write the HTTP token to disk with restrictive permissions (0600 on Unix).
+///
+/// The mode is applied when the file's inode is first created, not only
+/// after the write: a two-step `create → chmod` lets any local process
+/// observe (and open) a briefly world-readable token.
+fn persist_token(path: &Path, token: &str) -> Result<()> {
+    use std::io::Write;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut file = create_secret_file(path)?;
+    file.write_all(token.as_bytes())?;
+    file.flush()?;
+    Ok(())
+}
+
+/// Create (or truncate) a secret file with mode 0600 applied at inode
+/// creation time on Unix, so the file is never observable with wider
+/// permissions. Windows relies on the default user-profile ACL.
+fn create_secret_file(path: &Path) -> Result<std::fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)
+    }
+}
+
+/// Best-effort restriction of an already-persisted secret file (e.g. written
+/// by an older kkagent release without 0600 at creation).
+fn tighten_secret_permissions(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+}
+
+/// One orchestrator-authored execution plan stored with `write_plan` and
+/// referenced from `delegate` via `plan_id`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StoredPlan {
+    version: u64,
+    revisions: std::collections::BTreeMap<u64, String>,
+    title: String,
+    content: String,
+    /// Workspace the plan was authored for (informational).
+    workspace: Option<PathBuf>,
+}
+
 pub struct McpServer {
+    store: CollaborationStore,
+    mutation: Mutex<()>,
     config: Arc<kkagent_config::AppConfig>,
     web: Arc<kkagent_tools::WebServicesConfig>,
     transcript: TranscriptDb,
     queue: Arc<Semaphore>,
     tasks: Arc<Mutex<HashMap<String, Arc<McpTask>>>>,
+    plans: Arc<Mutex<HashMap<String, StoredPlan>>>,
 }
 
 impl McpServer {
-    pub fn new(config: Arc<kkagent_config::AppConfig>, transcript: TranscriptDb) -> Self {
+    pub fn new(config: Arc<kkagent_config::AppConfig>, transcript: TranscriptDb) -> Result<Self> {
         let web = Arc::new(kkagent_tools::WebServicesConfig::from_app(config.as_ref()));
         let queue = Arc::new(Semaphore::new(config.subagent.effective_max_concurrent()));
-        Self {
+        let store = CollaborationStore::new(&transcript);
+        let plans = store
+            .list("plan")
+            .map_err(anyhow::Error::msg)?
+            .into_iter()
+            .map(|(id, v)| Ok((id, serde_json::from_value(v)?)))
+            .collect::<Result<HashMap<String, StoredPlan>>>()?;
+        let tasks = store
+            .list("task")
+            .map_err(anyhow::Error::msg)?
+            .into_iter()
+            .map(|(id, v)| {
+                let record: TaskRecord = serde_json::from_value(v)?;
+                let mut task = record.into_task();
+                task.isolated = task.worktree.get_mut().is_some();
+                Ok((id, Arc::new(task)))
+            })
+            .collect::<Result<HashMap<String, Arc<McpTask>>>>()?;
+        Ok(Self {
+            store,
+            mutation: Mutex::new(()),
             config,
             web,
             transcript,
             queue,
-            tasks: Arc::new(Mutex::new(HashMap::new())),
-        }
+            tasks: Arc::new(Mutex::new(tasks)),
+            plans: Arc::new(Mutex::new(plans)),
+        })
     }
 
     /// Handle one raw stdin line. Returns the JSON-RPC response line to write
     /// back, or `None` for notifications / unparseable noise.
-    pub async fn handle_message(&self, line: &str) -> Option<String> {
+    pub async fn handle_message(self: &Arc<Self>, line: &str) -> Option<String> {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             return None;
@@ -425,7 +1238,7 @@ impl McpServer {
     }
 
     async fn handle_request(
-        &self,
+        self: &Arc<Self>,
         method: &str,
         params: &Value,
     ) -> std::result::Result<Value, (i64, String)> {
@@ -461,20 +1274,25 @@ impl McpServer {
                 "name": SERVER_NAME,
                 "version": env!("CARGO_PKG_VERSION"),
             },
-            "instructions": "kkagent is an asynchronous coding-agent supervisor. Workflow: \
-             list_workspaces to discover projects (auto-registered from kkagent session \
-             history), get_context to load a project's supervisor-level state, inspect to \
-             read sources, logs, diffs, images and task artifacts directly, delegate to \
-             start an async coding task as a fresh default session (returns task_id; \
-             kkagent picks model and worktree isolation itself), get_progress to \
-             poll, continue_task to send new instructions (answer questions / approve \
-             actions / steer / continue a task in its original session), get_result for a \
-             review-ready summary (image paths included; read them with inspect), cancel \
-             to stop a task while keeping its changes and worktree.",
+            "instructions": "kkagent is an asynchronous coding-agent supervisor designed for \
+             orchestrator-driven work: the orchestrator decides and plans, kkagent executes. \
+             Workflow: list_workspaces to discover projects (auto-registered from kkagent \
+             session history), get_context to load a project's supervisor-level state, inspect \
+             to read sources, logs, diffs, images and task artifacts directly, write_plan to \
+             store an execution plan and get a plan_id (revise by re-storing with the same \
+             plan_id), delegate to start an async coding task as a fresh default session \
+             (optionally with plan_id; returns task_id; kkagent picks model and worktree \
+             isolation itself), get_progress to poll, continue_task to send new instructions \
+             (answer questions / approve actions / steer / continue a task in its original \
+             session), get_result for a review-ready summary (image paths included; read them \
+             with inspect), cancel to stop a task while keeping its changes and worktree.",
         })
     }
 
-    async fn tools_call(&self, params: &Value) -> std::result::Result<Value, (i64, String)> {
+    async fn tools_call(
+        self: &Arc<Self>,
+        params: &Value,
+    ) -> std::result::Result<Value, (i64, String)> {
         let name = params
             .get("name")
             .and_then(|v| v.as_str())
@@ -484,14 +1302,38 @@ impl McpServer {
             return Err((-32602, "tools/call requires a tool name".into()));
         }
         let args = params.get("arguments").cloned().unwrap_or(json!({}));
+        let mutating = matches!(name, "delegate" | "continue_task" | "write_plan" | "cancel");
+        let _guard = if mutating {
+            Some(self.mutation.lock().await)
+        } else {
+            None
+        };
+        let request_id = args.get("request_id").and_then(Value::as_str);
+        let request_key = request_id.map(|id| format!("{name}:{id}"));
+        if let Some(key) = &request_key {
+            let saved = self.store.list("request").map_err(|e| (-32603, e))?;
+            if let Some((_, v)) = saved.into_iter().find(|(id, _)| id == key) {
+                if v["arguments"] != args {
+                    return Err((
+                        -32602,
+                        "request_id already used with different arguments".into(),
+                    ));
+                }
+                return Ok(v["result"].clone());
+            }
+        }
         // inspect may inline image content blocks (image kind); every other
         // tool returns plain text, normalized to a single text block.
         let outcome = match name {
             "get_result" => self.tool_get_result(&args).await,
             "inspect" => self.tool_inspect(&args).await,
+            "Glob" | "Grep" => self.tool_search(name, &args).await.map_text_block(),
+            "get_plan" => self.tool_get_plan(&args).await.map_text_block(),
+            "get_session_context" => self.tool_session_context(&args).await.map_text_block(),
             "list_workspaces" => self.tool_list_workspaces(&args).await.map_text_block(),
             "get_context" => self.tool_get_context(&args).await.map_text_block(),
             "delegate" => self.tool_delegate(&args).await.map_text_block(),
+            "write_plan" => self.tool_write_plan(&args).await.map_text_block(),
             "get_progress" => self.tool_get_progress(&args).await.map_text_block(),
             "continue_task" => self.tool_continue_task(&args).await.map_text_block(),
             "cancel" => self.tool_cancel(&args).await.map_text_block(),
@@ -505,6 +1347,11 @@ impl McpServer {
                 });
                 if let Some(structured) = structured {
                     result["structuredContent"] = structured;
+                }
+                if let Some(key) = request_key {
+                    self.store
+                        .put("request", &key, &json!({"arguments":args,"result":result}))
+                        .map_err(|e| (-32603, e))?;
                 }
                 Ok(result)
             }
@@ -676,6 +1523,7 @@ impl McpServer {
         for task in tasks.values().filter(|t| t.origin_workspace == workspace) {
             let entry = json!({
                 "task_id": task.id,
+            "session_id": task.session_id,
                 "kind": TASK_KIND,
                 "status": task.status(),
                 "description": task.description,
@@ -686,13 +1534,14 @@ impl McpServer {
                 TaskPhase::AwaitingInput | TaskPhase::AwaitingPermission | TaskPhase::Failed
             ) {
                 attention.push(json!({
-                    "task_id": task.id,
-                    "reason": match phase {
-                        TaskPhase::AwaitingInput => "waiting for input (question pending)",
-                        TaskPhase::AwaitingPermission => "waiting for permission approval",
-                        _ => "failed; inspect with get_result",
-                    },
-                }));
+                        "task_id": task.id,
+                "session_id": task.session_id,
+                        "reason": match phase {
+                            TaskPhase::AwaitingInput => "waiting for input (question pending)",
+                            TaskPhase::AwaitingPermission => "waiting for permission approval",
+                            _ => "failed; inspect with get_result",
+                        },
+                    }));
             }
             task_list.push(entry);
         }
@@ -750,20 +1599,7 @@ impl McpServer {
 
         // Git diff: no path required (whole-worktree diff, optionally scoped).
         if kind == "diff" {
-            let path = args.get("path").and_then(|v| v.as_str()).map(str::trim);
-            let diff = git_diff(&workspace, path).await.ok_or_else(|| {
-                format!(
-                    "cannot compute git diff in {} (not a git repo?)",
-                    workspace.display()
-                )
-            })?;
-            let payload = json!({
-                "workspace": workspace.to_string_lossy(),
-                "kind": "diff",
-                "path": path,
-                "truncated": diff.len() >= MAX_INSPECT_BYTES,
-            });
-            return Ok((vec![json!({ "type": "text", "text": diff })], Some(payload)));
+            return collaboration::inspect_diff(&workspace, args).await;
         }
 
         let raw = args
@@ -863,6 +1699,9 @@ impl McpServer {
                 offset + selected.len()
             ));
         }
+        // Put the file body in structuredContent too: OpenAI hosts (ChatGPT /
+        // Codex) drop content[] whenever structuredContent is present, so a
+        // metadata-only structured payload makes inspect look empty there.
         let payload = json!({
             "workspace": workspace.to_string_lossy(),
             "kind": kind,
@@ -872,12 +1711,102 @@ impl McpServer {
             "offset": offset,
             "returned_lines": selected.len(),
             "truncated": truncated,
+            "text": text.clone(),
         });
         Ok((vec![json!({ "type": "text", "text": text })], Some(payload)))
     }
 
-    async fn tool_delegate(
+    /// Store an orchestrator-authored execution plan (ChatGPT web decides and
+    /// plans; kkagent executes). Revisions use the same `plan_id`. Plans only
+    /// take effect when a task is delegated with the matching `plan_id` —
+    /// later revisions never alter already-running tasks.
+    async fn tool_write_plan(
         &self,
+        args: &Value,
+    ) -> std::result::Result<(String, Option<Value>), String> {
+        let content = args
+            .get("plan")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                "plan is required (markdown: goal, steps, acceptance criteria)".to_string()
+            })?;
+        let chars = content.chars().count();
+        if chars > MAX_PLAN_CHARS {
+            return Err(format!(
+                "plan is {chars} chars; write_plan accepts up to {MAX_PLAN_CHARS}"
+            ));
+        }
+        let title = args
+            .get("title")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| clip_chars(content.lines().next().unwrap_or("plan"), 80));
+        // Optional informational workspace binding; validated when provided.
+        let workspace = if args.get("workspace").is_some() || args.get("working_dir").is_some() {
+            Some(self.resolve_workspace_arg(args).await?)
+        } else {
+            None
+        };
+
+        let plan_id = match args
+            .get("plan_id")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(plan_id) => {
+                let exists = self.plans.lock().await.contains_key(plan_id);
+                if !exists {
+                    return Err(format!(
+                        "unknown plan_id: {plan_id}; omit plan_id to create a new plan"
+                    ));
+                }
+                plan_id.to_string()
+            }
+            None => uuid::Uuid::new_v4().to_string(),
+        };
+        let mut plans = self.plans.lock().await;
+        let mut revisions = plans
+            .get(&plan_id)
+            .map(|p| p.revisions.clone())
+            .unwrap_or_default();
+        let version = plans.get(&plan_id).map_or(1, |p| p.version + 1);
+        revisions.insert(version, content.to_string());
+        let stored = StoredPlan {
+            title: title.clone(),
+            content: content.to_string(),
+            workspace,
+            version,
+            revisions,
+        };
+        self.store.put(
+            "plan",
+            &plan_id,
+            &serde_json::to_value(&stored).map_err(|e| e.to_string())?,
+        )?;
+        plans.insert(plan_id.clone(), stored);
+
+        Ok((
+            format!(
+                "plan {plan_id} stored: {title} ({chars} chars). Delegate work against it \
+                 with delegate or continue_task and plan_id/plan_version; later revisions \
+                 never modify running tasks implicitly."
+            ),
+            Some(json!({
+                "plan_id": plan_id,
+                "title": title,
+                "chars": chars,
+                "plan_version": version,
+            })),
+        ))
+    }
+
+    async fn tool_delegate(
+        self: &Arc<Self>,
         args: &Value,
     ) -> std::result::Result<(String, Option<Value>), String> {
         let prompt = args
@@ -895,6 +1824,51 @@ impl McpServer {
             ));
         }
         let description = clip_chars(&prompt, 80);
+
+        // Optional orchestrator-authored plan (write_plan): looked up before
+        // any state is created, so unknown ids fail without side effects.
+        let plan = match args
+            .get("plan_id")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(plan_id) => {
+                let stored = self
+                    .plans
+                    .lock()
+                    .await
+                    .get(plan_id)
+                    .ok_or_else(|| {
+                        format!("unknown plan_id: {plan_id} (create it with write_plan first)")
+                    })?
+                    .clone();
+                // The plan's workspace binding is informational; surface a
+                // mismatch so a plan authored for another project is visible.
+                if let Some(plan_ws) = &stored.workspace {
+                    if plan_ws != &workspace {
+                        eprintln!(
+                            "kkagent mcp: WARNING plan {plan_id} was authored for {} but is \
+                             being executed in {}",
+                            plan_ws.display(),
+                            workspace.display()
+                        );
+                    }
+                }
+                let version = args["plan_version"].as_u64().unwrap_or(stored.version);
+                let content = stored
+                    .revisions
+                    .get(&version)
+                    .ok_or("unknown plan_version")?
+                    .clone();
+                Some((plan_id.to_string(), stored.title, content))
+            }
+            None => None,
+        };
+        let (plan_id, plan_title, plan) = match plan {
+            Some((id, title, content)) => (Some(id), Some(title), Some(content)),
+            None => (None, None, None),
+        };
 
         // kkagent decides worktree isolation itself: git repos with the
         // worktree feature enabled run in an isolated worktree so the main
@@ -921,9 +1895,20 @@ impl McpServer {
 
         let task = Arc::new(McpTask {
             id: task_id.clone(),
+            resume: false,
+            plan_ref: StdMutex::new(if plan_id.is_some() {
+                self.tool_get_plan(args).await?.1
+            } else {
+                None
+            }),
+            review: StdMutex::new("pending".into()),
+            reviewed_snapshot: StdMutex::new(None),
+            event_sequence: std::sync::atomic::AtomicU64::new(0),
             session_id: format!("mcp-{task_id}"),
             description: description.clone(),
             prompt: prompt.clone(),
+            plan_title: plan_title.clone(),
+            plan: plan.clone(),
             origin_workspace: workspace.clone(),
             run_dir: Mutex::new(run_dir.clone()),
             worktree: Mutex::new(worktree),
@@ -934,9 +1919,10 @@ impl McpServer {
             question_tx: StdMutex::new(None),
             approval_tx: StdMutex::new(None),
             runner_notify: Notify::new(),
-            abort: StdMutex::new(None),
+            runner: StdMutex::new(RunnerSlot::initial()),
             phase: StdMutex::new(TaskPhase::Queued),
             progress: StdMutex::new(Progress::default()),
+            activity: StdMutex::new(ActivityStamp::default()),
             recent_events: StdMutex::new(Vec::new()),
             pending_question: StdMutex::new(None),
             pending_approval: StdMutex::new(None),
@@ -946,18 +1932,15 @@ impl McpServer {
             started_at: Instant::now(),
             finished_at: StdMutex::new(None),
         });
+        self.persist_task(&task).await?;
         self.tasks
             .lock()
             .await
             .insert(task_id.clone(), Arc::clone(&task));
 
-        let ctx = RunnerCtx {
-            config: Arc::clone(&self.config),
-            web: Arc::clone(&self.web),
-            queue: Arc::clone(&self.queue),
-        };
-        let handle = tokio::spawn(run_task(ctx, Arc::clone(&task)));
-        *task.abort.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle.abort_handle());
+        // RunnerSlot::initial() reports `exited`, so the initial runner goes
+        // through the same slot protocol as every respawn.
+        self.ensure_runner(&task);
 
         Ok((
             format!(
@@ -971,11 +1954,13 @@ impl McpServer {
             ),
             Some(json!({
                 "task_id": task_id,
+                "session_id": task.session_id,
                 "kind": TASK_KIND,
                 "status": "queued",
                 "workspace": workspace.to_string_lossy(),
                 "run_dir": run_dir.to_string_lossy(),
                 "isolated": isolated,
+                "plan_id": plan_id,
             })),
         ))
     }
@@ -986,17 +1971,57 @@ impl McpServer {
     ) -> std::result::Result<(String, Option<Value>), String> {
         let task = self.require_task(args).await?;
         let phase = task.phase();
+        let (events, event_cursor, events_lost) = {
+            let events = task.recent_events.lock().unwrap_or_else(|e| e.into_inner());
+            let cursor = task.event_sequence.load(Ordering::SeqCst);
+            let after = args["after_event"].as_u64().unwrap_or(0);
+            (
+                events
+                    .iter()
+                    .filter(|e| {
+                        e.split(':')
+                            .next()
+                            .and_then(|s| s.parse::<u64>().ok())
+                            .unwrap_or(0)
+                            > after
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                cursor,
+                after < cursor.saturating_sub(events.len() as u64),
+            )
+        };
+        let (runner_state, pending_instruction_count, activity_ages) = {
+            let state = task.runner_state();
+            let pending = task
+                .pending_instructions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .len();
+            let ages = task
+                .activity
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .ages();
+            (state, pending, ages)
+        };
+        let (last_progress_age, last_model_age, last_tool_age) = activity_ages;
         let payload = json!({
             "task_id": task.id,
+            "session_id": task.session_id,
             "kind": TASK_KIND,
             "status": phase.as_str(),
             "description": task.description,
+            "plan_title": task.plan_title,
             "workspace": task.origin_workspace.to_string_lossy(),
             "run_dir": task.run_dir.lock().await.to_string_lossy(),
             "isolated": task.isolated,
             "elapsed_seconds": task.elapsed_seconds(),
             "progress": task.progress_snapshot(),
-            "recent_events": task.recent_events.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+            "recent_events": events,
+            "event_cursor":event_cursor,"events_lost":events_lost,
+            "review_status":task.review.lock().unwrap_or_else(|e|e.into_inner()).clone(),
+            "plan":task.plan_ref.lock().unwrap_or_else(|e|e.into_inner()).clone(),
             "pending_question": task.pending_question.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|q| json!({
                 "question_id": q.question_id,
                 "text": q.text,
@@ -1010,10 +2035,30 @@ impl McpServer {
                 "action": a.action,
                 "tool_input_display": a.tool_input_display,
             })),
-            "instructions_received": task.pending_instructions.lock().unwrap_or_else(|e| e.into_inner()).len(),
+            "instructions_received": pending_instruction_count,
+            "pending_instruction_count": pending_instruction_count,
+            // `running` (a turn can run) | `waiting_for_instruction` (runner
+            // parked, instructions would start a turn immediately) | `exited`
+            // (no runner; with pending instructions > 0 this would be a bug
+            // because an accepted instruction must have a runner).
+            "runner_state": runner_state,
+            // Seconds since the last observable activity; `null` = never.
+            // A growing `last_model_activity_age_seconds` with
+            // `runner_state == "running"` means the model is thinking or the
+            // request is stuck; `last_tool_activity_age_seconds` growing
+            // alone points at a long-running/blocked tool.
+            "last_progress_at": last_progress_age.map(|s| json!(s)).unwrap_or(Value::Null),
+            "last_progress_age_seconds": last_progress_age,
+            "last_model_activity_age_seconds": last_model_age,
+            "last_tool_activity_age_seconds": last_tool_age,
             "error": task.error.lock().unwrap_or_else(|e| e.into_inner()).clone(),
         });
-        let mut text = format!("task {} is {}", task.id, phase.as_str());
+        let mut text = format!(
+            "task {} is {} (runner: {})",
+            task.id,
+            phase.as_str(),
+            runner_state
+        );
         if phase == TaskPhase::AwaitingInput {
             if let Some(q) = task
                 .pending_question
@@ -1044,39 +2089,112 @@ impl McpServer {
     }
 
     async fn tool_continue_task(
-        &self,
+        self: &Arc<Self>,
         args: &Value,
     ) -> std::result::Result<(String, Option<Value>), String> {
-        let instruction = args
+        if args.get("plan_version").is_some() && args.get("plan_id").is_none() {
+            return Err("plan_version requires plan_id".into());
+        }
+        if args
             .get("instruction")
-            .and_then(|v| v.as_str())
+            .and_then(Value::as_str)
+            .is_none_or(|s| s.trim().is_empty())
+            && !args["decision"].is_object()
+            && args.get("plan_id").is_none()
+            && !args["review"].is_object()
+        {
+            return Err("instruction or decision is required".into());
+        }
+        let plan = self.plan_instruction(args).await?;
+        let task = if args.get("session_id").is_some() {
+            self.resume_task(args).await?
+        } else {
+            self.require_task(args).await?
+        };
+        if let Some(review) = args.get("review") {
+            if !task.phase().terminal() {
+                return Err("review requires a finished task".into());
+            }
+            if args.get("instruction").is_some()
+                || args.get("decision").is_some()
+                || args.get("plan_id").is_some()
+            {
+                return Err("review cannot be combined with instruction, decision or plan".into());
+            }
+            let expected = review["head"].as_str().ok_or("review.head is required")?;
+            let dir = task.run_dir.lock().await.clone();
+            if git_head(&dir).await.as_deref() != Some(expected) {
+                return Err("review head changed; inspect the latest code first".into());
+            }
+            let snapshot = review["snapshot"]
+                .as_str()
+                .ok_or("review.snapshot is required (from get_result)")?;
+            if collaboration::review_snapshot(&dir).await? != snapshot {
+                return Err("review snapshot changed; inspect the latest code first".into());
+            }
+            let accepted = review["accepted"]
+                .as_bool()
+                .ok_or("review.accepted is required")?;
+            *task.review.lock().unwrap_or_else(|e| e.into_inner()) = if accepted {
+                "accepted"
+            } else {
+                "changes_requested"
+            }
+            .into();
+            *task
+                .reviewed_snapshot
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = Some(snapshot.into());
+            self.persist_task(&task).await?;
+            return Ok((
+                "review recorded".into(),
+                Some(
+                    json!({"task_id":task.id,"session_id":task.session_id,"review":task.review.lock().unwrap_or_else(|e|e.into_inner()).clone()}),
+                ),
+            ));
+        }
+        let mut instruction = args
+            .get("instruction")
+            .and_then(Value::as_str)
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_string);
-        let decision = args.get("decision").cloned().filter(|v| v.is_object());
+        let decision = args.get("decision").cloned().filter(Value::is_object);
+        if let Some((text, _)) = &plan {
+            instruction = Some(format!("{text}\n{}", instruction.unwrap_or_default()));
+        }
         if instruction.is_none() && decision.is_none() {
-            return Err("instruction or decision is required".to_string());
+            return Err("instruction or decision is required".into());
         }
-        let task = self.require_task(args).await?;
-        if let Some(instruction) = &instruction {
-            let mut pending = task
-                .pending_instructions
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            if pending.len() >= PENDING_INSTRUCTIONS_CAP {
-                return Err(format!(
-                    "task {} already has {} pending instructions; wait for them to be consumed",
-                    task.id,
-                    pending.len()
-                ));
+        if let Some((_, metadata)) = &plan {
+            if decision.is_some()
+                || matches!(
+                    task.phase(),
+                    TaskPhase::AwaitingInput | TaskPhase::AwaitingPermission
+                )
+            {
+                return Err("apply a plan with a follow-up instruction after resolving the pending decision".into());
             }
-            pending.push(instruction.clone());
+            *task.plan_ref.lock().unwrap_or_else(|e| e.into_inner()) = Some(metadata.clone());
         }
-
-        match task.phase() {
+        if task
+            .pending_instructions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len()
+            >= PENDING_INSTRUCTIONS_CAP
+        {
+            return Err("too many pending instructions".into());
+        }
+        let outcome: Result<(String, Option<Value>), String> = match task.phase() {
             TaskPhase::AwaitingInput => {
                 // Answer the pending question; the agent continues its turn.
-                let Some(question) = task.take_pending_question() else {
+                let Some(question) = task
+                    .pending_question
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone()
+                else {
                     return Err("no pending question".into());
                 };
                 let response = match &decision {
@@ -1160,7 +2278,6 @@ impl McpServer {
                         }
                     }
                 };
-                task.set_phase(TaskPhase::Running);
                 task.push_event(format!(
                     "input: {}",
                     clip_chars(
@@ -1172,22 +2289,35 @@ impl McpServer {
                     )
                 ));
                 task.send_question_answer(response)?;
+                task.take_pending_question();
+                task.set_phase(TaskPhase::Running);
                 Ok((
                     format!("answer delivered to task {}", task.id),
                     Some(json!({
-                        "task_id": task.id,
-                        "status": task.status(),
-                        "action": "question_answered",
-                    })),
+                                "task_id": task.id,
+                    "session_id": task.session_id,
+                                "status": task.status(),
+                                "action": "question_answered",
+                            })),
                 ))
             }
             TaskPhase::AwaitingPermission => {
                 // Approve only on explicit decision or explicit approval
                 // wording; anything else rejects the action (fail closed) and
                 // carries the text as guidance for the agent's next step.
-                let Some(request) = task.take_pending_approval() else {
+                let Some(request) = task
+                    .pending_approval
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone()
+                else {
                     return Err("no pending approval".into());
                 };
+                if let Some(expected) = decision.as_ref().and_then(|d| d["approval_id"].as_str()) {
+                    if expected != request.approval_id {
+                        return Err("approval_id does not match pending approval".into());
+                    }
+                }
                 let (approve, feedback) = match &decision {
                     Some(decision) => {
                         let Some(approve) = decision.get("approve").and_then(|v| v.as_bool())
@@ -1222,7 +2352,6 @@ impl McpServer {
                         (approve, feedback)
                     }
                 };
-                task.set_phase(TaskPhase::Running);
                 task.push_event(format!(
                     "permission {} for {}",
                     if approve { "approved" } else { "rejected" },
@@ -1239,6 +2368,8 @@ impl McpServer {
                     feedback,
                     selected_label: None,
                 })?;
+                task.take_pending_approval();
+                task.set_phase(TaskPhase::Running);
                 Ok((
                     format!(
                         "permission {} for task {}",
@@ -1246,10 +2377,11 @@ impl McpServer {
                         task.id
                     ),
                     Some(json!({
-                        "task_id": task.id,
-                        "status": task.status(),
-                        "action": if approve { "approved" } else { "rejected" },
-                    })),
+                                "task_id": task.id,
+                    "session_id": task.session_id,
+                                "status": task.status(),
+                                "action": if approve { "approved" } else { "rejected" },
+                            })),
                 ))
             }
             TaskPhase::Queued | TaskPhase::Running => {
@@ -1278,17 +2410,23 @@ impl McpServer {
                         .unwrap_or_else(|e| e.into_inner())
                         .push(instruction);
                 }
+                // Backstop with the same contract as the terminal branch: if
+                // the phase was stale (runner already gone between the last
+                // turn ending and this call), a fresh runner is spawned to
+                // consume the parked instruction.
+                self.ensure_runner(&task);
                 task.runner_notify.notify_one();
                 Ok((
                     format!("instruction delivered to running task {}", task.id),
                     Some(json!({
-                        "task_id": task.id,
-                        "status": task.status(),
-                        "action": "instruction_queued",
-                    })),
+                                "task_id": task.id,
+                    "session_id": task.session_id,
+                                "status": task.status(),
+                                "action": "instruction_queued",
+                            })),
                 ))
             }
-            TaskPhase::Completed | TaskPhase::Failed => {
+            TaskPhase::Completed | TaskPhase::Failed | TaskPhase::Cancelled => {
                 if decision.is_some() {
                     return Err(
                         "task has no pending question or approval; use instruction to continue it"
@@ -1301,25 +2439,54 @@ impl McpServer {
                 // Continue the finished task in its original session: wake
                 // the runner, which appends the instruction and runs a new
                 // turn (no new agent session is created).
-                task.set_phase(TaskPhase::Running);
+                if !is_trusted(&self.config, &task.origin_workspace) {
+                    return Err("not a trusted workspace".into());
+                }
+                task.interrupt.store(false, Ordering::SeqCst);
+                task.pending_instructions
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(instruction.unwrap());
+                *task.review.lock().unwrap_or_else(|e| e.into_inner()) = "pending".into();
+                *task.error.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                *task.finished_at.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                task.set_phase(TaskPhase::Queued);
+                // Reliability contract: an accepted continue guarantees the
+                // instruction is consumed. `ensure_runner` decides under the
+                // slot lock — the same lock the dying runner holds for its
+                // final pre-exit check — so either the parked runner is alive
+                // and will pick the instruction up, or a fresh runner is
+                // spawned here to consume it. No lost wakeup is possible.
+                self.ensure_runner(&task);
                 task.runner_notify.notify_one();
+                self.persist_task(&task).await?;
                 Ok((
                     format!(
                         "task {} will continue with the new instruction in its original session",
                         task.id
                     ),
                     Some(json!({
-                        "task_id": task.id,
-                        "status": task.status(),
-                        "action": "task_continued",
-                    })),
+                                "task_id": task.id,
+                    "session_id": task.session_id,
+                                "status": task.status(),
+                                "action": "task_continued",
+                            })),
                 ))
             }
-            TaskPhase::Cancelled => Err(format!(
-                "task {} was cancelled; delegate a new task to continue this work",
-                task.id
-            )),
+        };
+        let (text, mut payload) = outcome?;
+        if let Some(value) = &mut payload {
+            value["run_dir"] = json!(task.run_dir.lock().await.clone());
+            value["workspace"] = json!(task.origin_workspace);
+            value["plan"] = task
+                .plan_ref
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+                .unwrap_or(Value::Null);
         }
+        self.persist_task(&task).await?;
+        Ok((text, payload))
     }
     async fn tool_get_result(
         &self,
@@ -1336,10 +2503,25 @@ impl McpServer {
         // here; callers read images with the `inspect` tool.
         let run_dir = task.run_dir.lock().await.clone();
         let images = collect_task_image_paths(&run_dir).await;
+        let head = git_head(&run_dir).await;
+        let snapshot = collaboration::review_snapshot(&run_dir).await.ok();
+        let status = tokio::process::Command::new("git")
+            .args(["status", "--porcelain=v1", "--untracked-files=all"])
+            .current_dir(&run_dir)
+            .output()
+            .await
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
         let payload = json!({
             "task_id": task.id,
+            "session_id": task.session_id,
             "kind": TASK_KIND,
             "status": phase.as_str(),
+            "reviewed_snapshot":task.reviewed_snapshot.lock().unwrap_or_else(|e|e.into_inner()).clone(),
+            "snapshot":snapshot,"head":head,"base":task.base_commit.lock().unwrap_or_else(|e|e.into_inner()).clone(),
+            "working_tree_status":status,"review_status":task.review.lock().unwrap_or_else(|e|e.into_inner()).clone(),
+            "plan":task.plan_ref.lock().unwrap_or_else(|e|e.into_inner()).clone(),
             "description": task.description,
             "workspace": task.origin_workspace.to_string_lossy(),
             "run_dir": task.run_dir.lock().await.to_string_lossy(),
@@ -1399,9 +2581,7 @@ impl McpServer {
         // Cooperative stop (interrupt flag) + hard abort backstop. Code
         // changes and the worktree are intentionally kept for later review.
         task.interrupt.store(true, Ordering::SeqCst);
-        if let Some(handle) = task.abort.lock().unwrap_or_else(|e| e.into_inner()).take() {
-            handle.abort();
-        }
+        task.abort_runner();
         // Answer any pending question/approval so nothing blocks on them.
         if let Some(question) = task.take_pending_question() {
             let _ = task.send_question_answer(QuestionResponse {
@@ -1414,6 +2594,7 @@ impl McpServer {
         task.set_phase(TaskPhase::Cancelled);
         task.set_error("cancelled by client".into());
         task.push_event("cancelled".into());
+        self.persist_task(&task).await?;
         Ok((
             format!(
                 "task {} cancelled; run_dir {} preserved",
@@ -1422,6 +2603,7 @@ impl McpServer {
             ),
             Some(json!({
                 "task_id": task.id,
+            "session_id": task.session_id,
                 "status": "cancelled",
                 "run_dir": task.run_dir.lock().await.to_string_lossy(),
                 "worktree_kept": task.isolated,
@@ -1445,9 +2627,7 @@ impl McpServer {
             .get(task_id)
             .cloned()
             .ok_or_else(|| {
-                format!(
-                    "unknown task_id: {task_id} (only tasks started in this server session are tracked)"
-                )
+                format!("unknown task_id: {task_id}; use session_id to resume a historical session")
             })
     }
 
@@ -1457,7 +2637,6 @@ impl McpServer {
         let raw = args
             .get("workspace")
             .or_else(|| args.get("working_dir"))
-            .or_else(|| args.get("path"))
             .and_then(|v| v.as_str())
             .map(str::trim)
             .filter(|s| !s.is_empty());
@@ -1493,41 +2672,118 @@ impl McpServer {
 /// instructions (steer / continuation / answers), and publish summaries.
 /// Exits when the task is cancelled or a terminal state is reached without
 /// further queued work.
+///
+/// Every exit path (early return, normal break, panic unwind) releases the
+/// [`RunnerGuard`], which publishes `RunnerSlot::exited` synchronously so the
+/// next `continue_task` can spawn a replacement runner. The pre-exit
+/// instruction check runs while the guard is still held: if instructions
+/// arrived in the closing window the loop continues, so an accepted
+/// instruction is always consumed by *some* runner.
 async fn run_task(ctx: RunnerCtx, task: Arc<McpTask>) {
-    // Queued until a concurrency slot frees up.
-    let _permit = ctx.queue.acquire().await;
+    let _guard = RunnerGuard {
+        task: Arc::clone(&task),
+    };
+    // Each active turn acquires a slot; idle sessions retain their context.
     if task.interrupt.load(Ordering::SeqCst) {
         return;
     }
-    task.set_phase(TaskPhase::Running);
-
+    task.mark_runner_active();
     let run_dir = task.run_dir.lock().await.clone();
     // Fresh default session: `general` profile with no override resolves to
     // the globally configured default model.
     let model = ctx.config.resolve_subagent_model(TASK_PROFILE, None, None);
-    let mut session = Session::for_subagent(
-        task.session_id.clone(),
-        run_dir.clone(),
-        PermissionMode::Auto,
-        model,
-    );
+    let saved = match ctx.transcript.get_session(&task.session_id) {
+        Ok(r) => r,
+        Err(e) => {
+            task.set_error(e.to_string());
+            task.set_phase(TaskPhase::Failed);
+            return;
+        }
+    };
+
+    let mut session = if let Some(record) = saved {
+        let mut session = Session::resume(
+            task.session_id.clone(),
+            run_dir.clone(),
+            ctx.config
+                .effective_permission_mode()
+                .parse()
+                .unwrap_or_default(),
+            if record.model.is_empty() {
+                model.clone()
+            } else {
+                record.model
+            },
+        );
+        session.set_fallback_model(
+            kkagent_core::session::runtime::SessionFallbackModel::from_persisted(
+                record.fallback_model.as_deref(),
+            ),
+        );
+        match ctx.transcript.load_messages(&task.session_id) {
+            Ok(records) => {
+                session.messages = super::messages_from_records(&records);
+                session.persisted_message_count = session.messages.len();
+            }
+            Err(e) => {
+                task.set_error(e.to_string());
+                task.set_phase(TaskPhase::Failed);
+                return;
+            }
+        }
+        session
+    } else {
+        if task.resume {
+            task.set_error("session transcript missing".into());
+            task.set_phase(TaskPhase::Failed);
+            return;
+        }
+        if let Err(e) =
+            ctx.transcript
+                .create_session(&task.session_id, &model, &run_dir.to_string_lossy())
+        {
+            task.set_error(e.to_string());
+            task.set_phase(TaskPhase::Failed);
+            return;
+        }
+        Session::new(
+            task.session_id.clone(),
+            run_dir.clone(),
+            PermissionMode::Auto,
+            model,
+        )
+    };
+    let restoring = !session.messages.is_empty();
+    session.inherit_interrupted(task.interrupt.clone());
+    session.steer_mailbox = task.mailbox.clone();
     session.attach_workspace_concurrency_guard();
     session.inject_workspace_instructions().await;
     session.system_prompt.push_str(&supervisor_system_addon());
     // Drain pre-dispatch instructions into the initial message, then wire the
     // answer channels to this session so continue_task can respond to
     // AskUserQuestion / approval requests of the live turn.
-    let initial_instructions = task
-        .pending_instructions
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone();
-    task.pending_instructions
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clear();
+    let initial_instructions = std::mem::take(
+        &mut *task
+            .pending_instructions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()),
+    );
     session.add_user_message(build_initial_prompt_sync(
-        &task.prompt,
+        if restoring {
+            "Continue the existing session following the new instructions below."
+        } else {
+            &task.prompt
+        },
+        if restoring {
+            None
+        } else {
+            task.plan_title.as_deref()
+        },
+        if restoring {
+            None
+        } else {
+            task.plan.as_deref()
+        },
         &initial_instructions,
     ));
     *task.question_tx.lock().unwrap_or_else(|e| e.into_inner()) = Some(session.question_tx.clone());
@@ -1543,7 +2799,14 @@ async fn run_task(ctx: RunnerCtx, task: Arc<McpTask>) {
     // auto-approved except AskUserQuestion; config deny-rules still apply.
     // Actions requiring interactive approval emit ApprovalRequested, which
     // the collector surfaces as `waiting_permission` for continue_task.
-    let permission = PermissionChain::new(PermissionMode::Auto, permission_rules);
+    let permission = PermissionChain::new(
+        session
+            .permission_mode
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone(),
+        permission_rules,
+    );
 
     let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(512);
     let collector_task = Arc::clone(&task);
@@ -1631,18 +2894,35 @@ async fn run_task(ctx: RunnerCtx, task: Arc<McpTask>) {
         abort_registry,
         max_rounds,
     );
-    let result_store = Arc::new(kkagent_core::agent_loop::ToolResultStore::for_subagent(
+    let result_store = Arc::new(kkagent_core::agent_loop::ToolResultStore::new(
         kkagent_config::default_config_dir(),
-        task.session_id.clone(),
+        Some(ctx.transcript.clone()),
     ));
-    agent = agent.with_tool_result_store(result_store);
+    agent = agent
+        .with_tool_result_store(result_store)
+        .with_transcript_db(ctx.transcript.clone());
 
     loop {
+        task.set_phase(TaskPhase::Queued);
+        let Ok(permit) = ctx.queue.acquire().await else {
+            break;
+        };
+        if task.interrupt.load(Ordering::SeqCst) {
+            break;
+        }
+        task.set_phase(TaskPhase::Running);
+        *task.review.lock().unwrap_or_else(|e| e.into_inner()) = "pending".into();
         task.progress
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .turns += 1;
         let run_result = agent.run_turn(&mut session).await;
+        drop(permit);
+        if let Err(e) =
+            kkagent_core::transcript::persist_session_delta(&ctx.transcript, &mut session)
+        {
+            task.set_error(format!("cannot persist session: {e}"));
+        }
 
         // Publish a review summary after every turn.
         let summary = build_task_summary(&task, &session, &run_dir).await;
@@ -1657,6 +2937,7 @@ async fn run_task(ctx: RunnerCtx, task: Arc<McpTask>) {
         match &run_result {
             Ok(()) => {
                 task.set_phase(TaskPhase::Completed);
+                *task.review.lock().unwrap_or_else(|e| e.into_inner()) = "awaiting_review".into();
                 let summary =
                     build_summary_with_message(&task, &session, &run_dir, final_text).await;
                 *task.summary.lock().unwrap_or_else(|e| e.into_inner()) = summary;
@@ -1670,6 +2951,9 @@ async fn run_task(ctx: RunnerCtx, task: Arc<McpTask>) {
             }
         }
 
+        if let Err(e) = collaboration::persist_task(&ctx.store, &task).await {
+            task.set_error(format!("cannot persist task: {e}"));
+        }
         // Steers that arrived during the closing window become continuations.
         for steer in task.mailbox.close_and_drain() {
             task.pending_instructions
@@ -1692,6 +2976,14 @@ async fn run_task(ctx: RunnerCtx, task: Arc<McpTask>) {
 
     drop(agent);
     let _ = collector.await;
+    // Final pre-exit check while the RunnerGuard is still held: instructions
+    // accepted in the closing window (the terminal publish above and this
+    // point) must be consumed. If any arrived, restart the turn loop as the
+    // same runner instead of exiting — from a `continue_task` caller's point
+    // of view nothing was lost. Cancelled/interrupted tasks do not restart.
+    if task.runner_should_restart() {
+        return Box::pin(run_task(ctx, task)).await;
+    }
 }
 
 /// Park until a new instruction arrives on a terminal task. Returns `None`
@@ -1700,17 +2992,26 @@ async fn wait_for_instruction(task: &Arc<McpTask>) -> Option<String> {
     loop {
         let notified = task.runner_notify.notified();
         // Check the queue after arming the notifier to avoid missed wakes.
-        let next = task
-            .pending_instructions
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .pop();
+        let next = {
+            let mut pending = task
+                .pending_instructions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if pending.is_empty() {
+                None
+            } else {
+                Some(pending.remove(0))
+            }
+        };
         if let Some(text) = next {
+            task.mark_runner_active();
             return Some(text);
         }
         if task.interrupt.load(Ordering::SeqCst) {
             return None;
         }
+        // Publish the parked state for get_progress; cleared on wake above.
+        task.mark_runner_waiting();
         notified.await;
     }
 }
@@ -1722,6 +3023,7 @@ fn handle_task_event(task: &Arc<McpTask>, event: AgentEvent) {
             AgentEvent::ToolCall { tool_name, .. } => {
                 progress.tool_calls += 1;
                 drop(progress);
+                task.note_tool_activity();
                 task.push_event(format!("tool: {tool_name}"));
                 return;
             }
@@ -1732,6 +3034,7 @@ fn handle_task_event(task: &Arc<McpTask>, event: AgentEvent) {
             } => {
                 progress.tool_results += 1;
                 drop(progress);
+                task.note_tool_activity();
                 if *is_error {
                     task.push_event(format!("tool error: {tool_name}"));
                 }
@@ -1739,10 +3042,14 @@ fn handle_task_event(task: &Arc<McpTask>, event: AgentEvent) {
             }
             AgentEvent::MessageDelta { text, .. } => {
                 progress.output_chars += text.chars().count() as u64;
+                drop(progress);
+                task.note_model_activity();
                 return;
             }
             AgentEvent::ThinkingDelta { text, .. } => {
                 progress.thinking_chars += text.chars().count() as u64;
+                drop(progress);
+                task.note_model_activity();
                 return;
             }
             _ => {}
@@ -1775,16 +3082,39 @@ fn handle_task_event(task: &Arc<McpTask>, event: AgentEvent) {
     }
 }
 
-fn build_initial_prompt_sync(prompt: &str, instructions: &[String]) -> String {
+/// Compose the initial user message for a task's first turn: the goal, the
+/// orchestrator-authored plan (when delegated with a plan_id) ahead of it as
+/// the scope source of truth, then any pre-dispatch instructions.
+fn build_initial_prompt_sync(
+    prompt: &str,
+    plan_title: Option<&str>,
+    plan: Option<&str>,
+    instructions: &[String],
+) -> String {
+    let mut combined = String::new();
+    if let Some(plan) = plan {
+        combined.push_str("# Execution plan (authored by the orchestrator)\n\n");
+        if let Some(title) = plan_title {
+            combined.push_str(&format!("Plan: {title}\n\n"));
+        }
+        combined.push_str(plan.trim_end());
+        combined.push_str(
+            "\n\nThe plan above is the scope source of truth. Follow its \
+                           steps and decisions; update your final report to state which \
+                           plan steps are done and which are not. If you must deviate, \
+                           finish the plan-compatible part first, then state the deviation \
+                           explicitly in the report.\n\n",
+        );
+        combined.push_str("# Task\n\n");
+    }
+    combined.push_str(prompt);
     // Instructions queued before the first turn start become part of the
     // initial task description (delegate + immediate continue_task race).
-    if instructions.is_empty() {
-        return prompt.to_string();
-    }
-    let mut combined = prompt.to_string();
-    combined.push_str("\n\nAdditional instructions received at dispatch:\n");
-    for instruction in instructions {
-        combined.push_str(&format!("- {instruction}\n"));
+    if !instructions.is_empty() {
+        combined.push_str("\n\nAdditional instructions received at dispatch:\n");
+        for instruction in instructions {
+            combined.push_str(&format!("- {instruction}\n"));
+        }
     }
     combined
 }
@@ -1958,7 +3288,9 @@ fn supervisor_system_addon() -> String {
     format!(
         "\n\n# MCP delegated task\n{kind_line}\n{profile_line}\n\
          End with a review-ready report: what was done, which files changed and why, \
-         build/test results, and any open issues."
+         build/test commands, exit codes and log paths, and any open issues. \
+         Completion hands the work to the orchestrator for review. Follow the assigned \
+         validation scope; do not commit, push or publish unless explicitly instructed."
     )
 }
 
@@ -1991,30 +3323,6 @@ async fn git_diff_stat(dir: &Path, base: &str) -> Option<String> {
         return None;
     }
     let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    Some(text)
-}
-
-/// Working-tree diff (optionally scoped to one path), size-bounded.
-async fn git_diff(dir: &Path, path: Option<&str>) -> Option<String> {
-    let mut args = vec!["diff".to_string(), "HEAD".to_string()];
-    args.push("--".to_string());
-    if let Some(path) = path {
-        args.push(path.to_string());
-    }
-    let out = tokio::process::Command::new("git")
-        .args(&args)
-        .current_dir(dir)
-        .output()
-        .await
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let mut text = String::from_utf8_lossy(&out.stdout).to_string();
-    if text.chars().count() > MAX_INSPECT_BYTES {
-        text = clip_chars(&text, MAX_INSPECT_BYTES);
-        text.push_str("\n\n[diff truncated]");
-    }
     Some(text)
 }
 
@@ -2133,16 +3441,19 @@ async fn git_snapshot(dir: &Path) -> Option<Value> {
 }
 
 fn error_response(id: Value, code: i64, message: &str) -> String {
+    error_response_value(id, code, message).to_string()
+}
+
+fn error_response_value(id: Value, code: i64, message: &str) -> Value {
     json!({
         "jsonrpc": "2.0",
         "id": id,
         "error": { "code": code, "message": message },
     })
-    .to_string()
 }
 
 fn tool_definitions() -> Vec<Value> {
-    vec![
+    let mut definitions = vec![
         json!({
             "name": "list_workspaces",
             "description": "List workspaces available to kkagent. Workspaces auto-register: any directory that ever hosted a kkagent session appears here, plus configured trusted roots. Each entry reports session count, last activity and in-flight task counts. Returns the most recently active workspaces first (default 5; use limit for more).",
@@ -2184,17 +3495,43 @@ fn tool_definitions() -> Vec<Value> {
                 "properties": {
                     "kind": { "type": "string" },
                     "path": { "type": "string" },
-                    "truncated": { "type": "boolean" }
+                    "truncated": { "type": "boolean" },
+                    "text": { "type": "string", "description": "File / diff body (also in content[].text; required for hosts that prefer structuredContent)" }
                 },
             },
         }),
         json!({
+            "name": "write_plan",
+            "description": "Store an orchestrator-authored execution plan (markdown: goal, steps, acceptance criteria) and get a plan_id. This is how a remote orchestrator decides and plans while kkagent executes. The plan takes effect when passed to delegate via plan_id; it is injected ahead of the task prompt as the scope source of truth. Revise by re-storing with the same plan_id BEFORE delegating — later revisions never modify already-running tasks.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "plan": { "type": "string", "description": "Full execution plan in markdown: goal, ordered steps, risks, acceptance criteria (max 100k chars)" },
+                    "title": { "type": "string", "description": "Short plan name (defaults to the first line of plan)" },
+                    "workspace": { "type": "string", "description": "Optional informational workspace the plan targets" },
+                    "plan_id": { "type": "string", "description": "Existing plan id to REVISE an earlier plan; omit to create a new plan" }
+                },
+                "required": ["plan"],
+                "additionalProperties": false,
+            },
+            "outputSchema": {
+                "type": "object",
+                "properties": {
+                    "plan_id": { "type": "string", "description": "Pass this to delegate(plan_id)" },
+                    "title": { "type": "string" },
+                    "chars": { "type": "integer" }
+                },
+                "required": ["plan_id"],
+            },
+        }),
+        json!({
             "name": "delegate",
-            "description": "Delegate a new task to a kkagent coding agent — equivalent to opening a fresh default kkagent session in the workspace — and return immediately with a task_id. kkagent decides everything itself (model, profile, tools, and whether to use an isolated git worktree); the agent autonomously handles code retrieval, planning, file modification, build, test, fix and verification. Poll get_progress, deliver decisions with continue_task, collect with get_result.",
+            "description": "Delegate a new task to a kkagent coding agent — equivalent to opening a fresh default kkagent session in the workspace — and return immediately with a task_id. kkagent decides everything itself (model, profile, tools, and whether to use an isolated git worktree); the agent autonomously handles code retrieval, planning, file modification, build, test, fix and verification. Pass plan_id (from write_plan) to execute an orchestrator-authored plan as the scope source of truth. Poll get_progress, deliver decisions with continue_task, collect with get_result.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "prompt": { "type": "string", "description": "Full task description: goal, requirements, constraints" },
+                    "plan_id": { "type": "string", "description": "Plan id from write_plan; its content is injected ahead of the prompt as the scope source of truth" },
                     "workspace": { "type": "string", "description": "Target workspace directory (must be trusted; defaults to the first trusted workspace)" }
                 },
                 "required": ["prompt"],
@@ -2212,7 +3549,7 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "get_progress",
-            "description": "Poll a background task: status (queued | running | waiting_input | waiting_permission | completed | failed | cancelled), elapsed time, activity counters, recent events, the pending question or approval if any, and errors.",
+            "description": "Poll a background task: status (queued | running | waiting_input | waiting_permission | completed | failed | cancelled), runner_state (running | waiting_for_instruction | exited), elapsed time, activity counters, last model/tool activity ages, recent events, pending_instruction_count, the pending question or approval if any, and errors.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -2291,7 +3628,9 @@ fn tool_definitions() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
-    ]
+    ];
+    collaboration::extend_definitions(&mut definitions);
+    definitions
 }
 
 // ---------------------------------------------------------------------------
@@ -2302,11 +3641,20 @@ fn tool_definitions() -> Vec<Value> {
 mod tests {
     use super::*;
 
+    /// Serializes the tunnel-integration tests: they spawn real child
+    /// processes and (in one case) mutate process env, which is not safe to
+    /// race with sibling tests in the same process.
+    #[cfg(unix)]
+    static TUNNEL_PROC_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     async fn server() -> Arc<McpServer> {
-        Arc::new(McpServer::new(
-            Arc::new(kkagent_config::AppConfig::default()),
-            TranscriptDb::open_in_memory().expect("in-memory transcript db"),
-        ))
+        Arc::new(
+            McpServer::new(
+                Arc::new(kkagent_config::AppConfig::default()),
+                TranscriptDb::open_in_memory().expect("in-memory transcript db"),
+            )
+            .unwrap(),
+        )
     }
 
     /// Server with the given directories marked as trusted workspaces.
@@ -2325,10 +3673,13 @@ mod tests {
                 .collect(),
             ..kkagent_config::AppConfig::default()
         };
-        Arc::new(McpServer::new(
-            Arc::new(config),
-            TranscriptDb::open_in_memory().expect("in-memory transcript db"),
-        ))
+        Arc::new(
+            McpServer::new(
+                Arc::new(config),
+                TranscriptDb::open_in_memory().expect("in-memory transcript db"),
+            )
+            .unwrap(),
+        )
     }
 
     #[tokio::test]
@@ -2361,7 +3712,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tools_list_exposes_the_eight_delegation_tools() {
+    async fn tools_list_exposes_the_delegation_tools() {
         let server = server().await;
         let response = server
             .handle_message(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#)
@@ -2376,15 +3727,21 @@ mod tests {
                 "list_workspaces",
                 "get_context",
                 "inspect",
+                "write_plan",
                 "delegate",
                 "get_progress",
                 "continue_task",
                 "get_result",
                 "cancel",
+                "Glob",
+                "Grep",
+                "get_plan",
+                "get_session_context",
             ]
         );
         let delegate = tools.iter().find(|t| t["name"] == "delegate").unwrap();
-        // delegate takes only prompt + workspace — kkagent decides the rest.
+        // delegate takes only prompt + plan_id + workspace — kkagent decides
+        // the rest.
         let delegate_props = &delegate["inputSchema"]["properties"];
         assert_eq!(
             delegate_props
@@ -2393,9 +3750,202 @@ mod tests {
                 .keys()
                 .map(String::as_str)
                 .collect::<Vec<_>>(),
-            vec!["prompt", "workspace"]
+            vec![
+                "plan_id",
+                "plan_version",
+                "prompt",
+                "request_id",
+                "workspace"
+            ]
         );
         assert!(delegate["outputSchema"]["properties"]["task_id"].is_object());
+        let write_plan = tools.iter().find(|t| t["name"] == "write_plan").unwrap();
+        assert!(write_plan["inputSchema"]["properties"]["plan"].is_object());
+        assert!(write_plan["outputSchema"]["properties"]["plan_id"].is_object());
+    }
+
+    async fn call_write_plan(server: &Arc<McpServer>, args: Value) -> Value {
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 99,
+            "method": "tools/call",
+            "params": { "name": "write_plan", "arguments": args },
+        });
+        let response = server
+            .handle_message(&request.to_string())
+            .await
+            .expect("write_plan expects a response");
+        serde_json::from_str(&response).expect("jsonrpc response")
+    }
+
+    #[tokio::test]
+    async fn continue_task_with_session_id_wraps_previous_session() {
+        let server = server().await;
+        // Seed a previous session with a couple of messages.
+        let full_id = "cccccccc-1111-2222-3333-444444444444";
+        server
+            .transcript
+            .create_session(full_id, "test-model", "/tmp")
+            .unwrap();
+        server
+            .transcript
+            .append_message(full_id, "user", r#"[{"type":"text","text":"hello"}]"#, None)
+            .unwrap();
+
+        // Mutual exclusion: session_id + task_id is rejected.
+        let request = json!({
+            "jsonrpc": "2.0", "id": 70, "method": "tools/call",
+            "params": { "name": "continue_task", "arguments": {
+                "session_id": full_id, "task_id": "t1", "instruction": "go"
+            } },
+        });
+        let parsed: Value =
+            serde_json::from_str(&server.handle_message(&request.to_string()).await.unwrap())
+                .unwrap();
+        assert_eq!(parsed["result"]["isError"], true);
+        assert!(parsed["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("either session_id"));
+
+        // decision with session_id is rejected.
+        let request = json!({
+            "jsonrpc": "2.0", "id": 71, "method": "tools/call",
+            "params": { "name": "continue_task", "arguments": {
+                "session_id": full_id, "decision": { "approve": true }
+            } },
+        });
+        let parsed: Value =
+            serde_json::from_str(&server.handle_message(&request.to_string()).await.unwrap())
+                .unwrap();
+        assert_eq!(parsed["result"]["isError"], true);
+        assert!(parsed["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("only valid with task_id"));
+
+        // Unknown session id is a tool error, not a panic.
+        let request = json!({
+            "jsonrpc": "2.0", "id": 71, "method": "tools/call",
+            "params": { "name": "continue_task", "arguments": {
+                "session_id": "deadbeef-0000", "instruction": "go"
+            } },
+        });
+        let parsed: Value =
+            serde_json::from_str(&server.handle_message(&request.to_string()).await.unwrap())
+                .unwrap();
+        assert_eq!(parsed["result"]["isError"], true);
+        assert!(parsed["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("unknown session_id"));
+
+        // Happy-path prefix resolution: the unique PREFIX resolves and
+        // reaches the trusted-workspace gate (/tmp is not trusted in the
+        // test server), which is the next check before any runner spawns.
+        let request = json!({
+            "jsonrpc": "2.0", "id": 72, "method": "tools/call",
+            "params": { "name": "continue_task", "arguments": {
+                "session_id": "cccccccc-1111", "instruction": "carry on"
+            } },
+        });
+        let parsed: Value =
+            serde_json::from_str(&server.handle_message(&request.to_string()).await.unwrap())
+                .unwrap();
+        assert_eq!(parsed["result"]["isError"], true);
+        assert!(
+            parsed["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("not a trusted workspace"),
+            "unexpected: {}",
+            parsed["result"]["content"][0]["text"]
+        );
+    }
+
+    #[tokio::test]
+    async fn write_plan_stores_and_revises_by_id() {
+        let server = server().await;
+        // Create.
+        let parsed = call_write_plan(
+            &server,
+            json!({
+                "title": "Add MCP auth",
+                "plan": "# Goal\nAdd bearer auth.\n\n## Steps\n1. Add token check\n2. Test it",
+            }),
+        )
+        .await;
+        let plan_id = parsed["result"]["structuredContent"]["plan_id"]
+            .as_str()
+            .expect("plan_id")
+            .to_string();
+        assert!(!plan_id.is_empty());
+        assert_eq!(
+            parsed["result"]["structuredContent"]["title"],
+            "Add MCP auth"
+        );
+
+        // Revise with the same id (accepted, content replaced).
+        let parsed = call_write_plan(
+            &server,
+            json!({
+                "plan_id": plan_id,
+                "title": "Add MCP auth v2",
+                "plan": "# Goal\nAdd bearer auth with constant-time compare.",
+            }),
+        )
+        .await;
+        assert_eq!(
+            parsed["result"]["structuredContent"]["plan_id"].as_str(),
+            Some(plan_id.as_str())
+        );
+
+        // Unknown revision id is rejected without creating anything.
+        let parsed =
+            call_write_plan(&server, json!({ "plan_id": "does-not-exist", "plan": "x" })).await;
+        assert_eq!(parsed["result"]["isError"], true);
+        assert!(parsed["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("unknown plan_id"));
+
+        // Missing plan content is a tool error, not a protocol error.
+        let parsed = call_write_plan(&server, json!({ "title": "no content" })).await;
+        assert_eq!(parsed["result"]["isError"], true);
+        assert!(parsed["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("plan is required"));
+
+        // Oversized plan is rejected with the cap named.
+        let parsed =
+            call_write_plan(&server, json!({ "plan": "x".repeat(MAX_PLAN_CHARS + 1) })).await;
+        assert_eq!(parsed["result"]["isError"], true);
+        assert!(parsed["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("write_plan accepts up to"));
+    }
+
+    #[test]
+    fn initial_prompt_puts_plan_ahead_of_task() {
+        let prompt = build_initial_prompt_sync(
+            "implement it",
+            Some("Add MCP auth"),
+            Some("1. Add token check\n2. Test it"),
+            &["extra note".to_string()],
+        );
+        let plan_pos = prompt.find("# Execution plan").expect("plan header");
+        let task_pos = prompt.find("# Task").expect("task header");
+        let goal_pos = prompt.find("implement it").expect("goal text");
+        assert!(plan_pos == 0, "plan must come first");
+        assert!(plan_pos < task_pos && task_pos < goal_pos);
+        assert!(prompt.contains("Add token check"));
+        assert!(prompt.contains("scope source of truth"));
+        assert!(prompt.contains("- extra note"));
+        // No plan → unchanged single-section layout.
+        let plain = build_initial_prompt_sync("just do it", None, None, &[]);
+        assert_eq!(plain, "just do it");
     }
 
     #[tokio::test]
@@ -2441,6 +3991,9 @@ mod tests {
         assert_eq!(structured["kind"], "text");
         assert_eq!(structured["total_lines"], 100);
         assert_eq!(structured["truncated"], true);
+        // Hosts that prefer structuredContent (ChatGPT/Codex) must still see
+        // the file body — not just path/offset metadata.
+        assert_eq!(structured["text"].as_str().unwrap(), text);
     }
 
     #[tokio::test]
@@ -2765,10 +4318,13 @@ mod tests {
                 .to_string()],
             ..kkagent_config::AppConfig::default()
         };
-        let server = Arc::new(McpServer::new(
-            Arc::new(config),
-            TranscriptDb::open_in_memory().expect("in-memory transcript db"),
-        ));
+        let server = Arc::new(
+            McpServer::new(
+                Arc::new(config),
+                TranscriptDb::open_in_memory().expect("in-memory transcript db"),
+            )
+            .unwrap(),
+        );
         let request = json!({
             "jsonrpc": "2.0",
             "id": 900,
@@ -2790,9 +4346,7 @@ mod tests {
             .expect("task registered");
         // Kill the runner immediately: it would fail fast under the default
         // (model-less) config and race the test's manual state setup.
-        if let Some(handle) = task.abort.lock().unwrap_or_else(|e| e.into_inner()).take() {
-            handle.abort();
-        }
+        task.abort_runner();
         (server, task, dir)
     }
 
@@ -2880,6 +4434,10 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("unknown option id `nope`"));
+        assert!(task.pending_question.lock().unwrap().is_some());
+        assert!(task.pending_instructions.lock().unwrap().is_empty());
+        let retry=server.tool_continue_task(&json!({"task_id":task.id,"decision":{"question_id":"q-1","selected_option_ids":["opt-a"]}})).await;
+        assert!(retry.is_ok(), "{retry:?}");
     }
 
     #[tokio::test]
@@ -3098,5 +4656,526 @@ mod tests {
     fn clip_chars_truncates() {
         assert_eq!(clip_chars("hello", 10), "hello");
         assert_eq!(clip_chars("hello", 4), "hell…");
+    }
+
+    #[test]
+    fn constant_time_eq_matches_and_rejects() {
+        assert!(constant_time_eq(b"secret", b"secret"));
+        assert!(!constant_time_eq(b"secret", b"secreT"));
+        assert!(!constant_time_eq(b"secret", b"secret "));
+        assert!(!constant_time_eq(b"", b"x"));
+        assert!(constant_time_eq(b"", b""));
+    }
+
+    #[tokio::test]
+    async fn http_transport_end_to_end() {
+        let server = server().await;
+        // Bind port 0 so parallel test runs never collide; the bound listener
+        // is handed to serve_http (no double bind race).
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local addr").to_string();
+        let handle = tokio::spawn(serve_http(
+            Arc::clone(&server),
+            listener,
+            Some("tok1".into()),
+            None,
+        ));
+
+        let url = format!("http://{addr}");
+        // Bounded client: a server-side regression must fail fast, never
+        // hang the whole test suite.
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .build()
+            .expect("reqwest client");
+        let json_call = |method: &str, id: u64| {
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": method,
+                "params": {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {},
+                    "clientInfo": { "name": "test", "version": "0" },
+                },
+            })
+        };
+
+        // Missing token → 401 with WWW-Authenticate and a JSON body (tunnel
+        // probes parse responses as JSON; a text body would surface as a
+        // malformed_json transport error upstream).
+        let res = client
+            .post(format!("{url}/mcp"))
+            .header("accept", "application/json")
+            .body(json_call("initialize", 1).to_string())
+            .send()
+            .await
+            .expect("request");
+        assert_eq!(res.status(), reqwest::StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            res.headers()
+                .get("www-authenticate")
+                .and_then(|v| v.to_str().ok()),
+            Some("Bearer realm=\"kkagent-mcp\"")
+        );
+        let body: Value = res.json().await.expect("401 body is JSON");
+        assert_eq!(body["error"]["code"], -32000);
+
+        // Wrong token → 401.
+        let res = client
+            .post(format!("{url}/mcp"))
+            .header("accept", "application/json")
+            .header("authorization", "Bearer nope")
+            .body(json_call("initialize", 2).to_string())
+            .send()
+            .await
+            .expect("request");
+        assert_eq!(res.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+        // Correct token → JSON-RPC result with MCP headers.
+        let res = client
+            .post(format!("{url}/mcp"))
+            .header("accept", "application/json")
+            .header("authorization", "Bearer tok1")
+            .header("mcp-protocol-version", "2025-06-18")
+            .json(&json_call("initialize", 3))
+            .send()
+            .await
+            .expect("request");
+        assert_eq!(res.status(), reqwest::StatusCode::OK);
+        assert_eq!(
+            res.headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
+            Some("application/json")
+        );
+        let parsed: Value = res.json().await.expect("json body");
+        assert_eq!(parsed["id"], 3);
+        assert_eq!(parsed["result"]["protocolVersion"], "2025-06-18");
+
+        // Notification (no id) → 202 Accepted, empty body.
+        let res = client
+            .post(format!("{url}/mcp"))
+            .header("accept", "application/json")
+            .header("authorization", "Bearer tok1")
+            .body(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#)
+            .send()
+            .await
+            .expect("request");
+        assert_eq!(res.status(), reqwest::StatusCode::ACCEPTED);
+        assert!(res.text().await.expect("body").is_empty());
+
+        // healthz needs no auth.
+        let res = client
+            .get(format!("{url}/healthz"))
+            .send()
+            .await
+            .expect("request");
+        assert_eq!(res.status(), reqwest::StatusCode::OK);
+        assert_eq!(res.text().await.expect("body").trim(), "ok");
+
+        // SSE-only accept → 406.
+        let res = client
+            .post(format!("{url}/mcp"))
+            .header("accept", "text/event-stream")
+            .header("authorization", "Bearer tok1")
+            .body(json_call("ping", 4).to_string())
+            .send()
+            .await
+            .expect("request");
+        assert_eq!(res.status(), reqwest::StatusCode::NOT_ACCEPTABLE);
+
+        // Streamable HTTP: GET (SSE listener) and DELETE (session teardown)
+        // get a spec-compliant 405 — this server is stateless and JSON-only.
+        for method in ["GET", "DELETE"] {
+            let res = client
+                .request(
+                    reqwest::Method::from_bytes(method.as_bytes()).unwrap(),
+                    format!("{url}/mcp"),
+                )
+                .header("authorization", "Bearer tok1")
+                .send()
+                .await
+                .expect("request");
+            assert_eq!(
+                res.status(),
+                reqwest::StatusCode::METHOD_NOT_ALLOWED,
+                "{method}"
+            );
+            assert_eq!(
+                res.headers().get("allow").and_then(|v| v.to_str().ok()),
+                Some("POST"),
+                "{method}"
+            );
+        }
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn http_transport_binds_and_shuts_down() {
+        let server = server().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let handle = tokio::spawn(serve_http(
+            Arc::clone(&server),
+            listener,
+            Some("t".into()),
+            None,
+        ));
+        // Give the accept loop a moment, then drop it — serve_http must end
+        // cleanly when its listener is closed.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        handle.abort();
+        let _ = handle.await;
+    }
+
+    #[test]
+    fn mcp_url_for_prefers_loopback() {
+        let addr: std::net::SocketAddr = "0.0.0.0:8788".parse().unwrap();
+        assert_eq!(mcp_url_for(Some(addr)), "http://127.0.0.1:8788/mcp");
+        let addr: std::net::SocketAddr = "192.168.1.5:9000".parse().unwrap();
+        assert_eq!(mcp_url_for(Some(addr)), "http://192.168.1.5:9000/mcp");
+        let addr: std::net::SocketAddr = "[::]:8788".parse().unwrap();
+        assert_eq!(mcp_url_for(Some(addr)), "http://127.0.0.1:8788/mcp");
+        assert_eq!(mcp_url_for(None), "http://127.0.0.1/mcp");
+    }
+
+    /// The install hint must match the running platform: Homebrew is
+    /// macOS-only; other platforms point at release archives.
+    #[test]
+    fn tunnel_client_install_hint_matches_platform() {
+        match std::env::consts::OS {
+            "macos" => {
+                assert!(tunnel_client_install_hint().contains("brew install"));
+            }
+            "windows" => {
+                let hint = tunnel_client_install_hint();
+                assert!(hint.contains("windows release"));
+                assert!(hint.contains("releases/latest"));
+            }
+            _ => {
+                let hint = tunnel_client_install_hint();
+                assert!(hint.contains("release archive"));
+                assert!(hint.contains("releases/latest"));
+                assert!(!hint.contains("brew"));
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn write_executable(dir: &Path, name: &str, body: &str) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, body).expect("write fake tunnel-client");
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod fake tunnel-client");
+        path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_tunnel_client_explicit_and_path() {
+        let _guard = TUNNEL_PROC_TESTS.blocking_lock();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let fake = write_executable(temp.path(), "tunnel-client", "#!/bin/sh\nexit 0\n");
+        // Explicit path resolves.
+        assert_eq!(
+            resolve_tunnel_client(Some(&fake)).expect("explicit path"),
+            fake
+        );
+        // Explicit but missing path fails.
+        assert!(resolve_tunnel_client(Some(&temp.path().join("nope"))).is_err());
+        // PATH search finds it.
+        let path_var = std::env::join_paths([
+            temp.path().to_path_buf(),
+            std::path::PathBuf::from("/usr/bin"),
+            std::path::PathBuf::from("/bin"),
+        ])
+        .expect("join paths");
+        let previous = std::env::var_os("PATH");
+        // Safety: single-threaded test mutation of process env.
+        std::env::set_var("PATH", &path_var);
+        let resolved = resolve_tunnel_client(None).expect("PATH search");
+        match previous {
+            Some(previous) => std::env::set_var("PATH", previous),
+            None => std::env::remove_var("PATH"),
+        }
+        assert_eq!(resolved, fake);
+    }
+
+    /// End-to-end: a fake `tunnel-client` shell script records its argv and
+    /// environment and stays alive; serve_http must spawn it with the right
+    /// wiring and kill it when the server stops.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tunnel_child_spawned_and_stopped_with_server() {
+        let _guard = TUNNEL_PROC_TESTS.lock().await;
+        use std::sync::atomic::AtomicUsize;
+
+        // Unique files so concurrent test runs never collide.
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let unique = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let temp = tempfile::tempdir().expect("tempdir");
+        let args_file = temp.path().join(format!("args-{unique}.txt"));
+        let env_file = temp.path().join(format!("env-{unique}.txt"));
+        let pid_file = temp.path().join(format!("pid-{unique}.txt"));
+        let fake_bin = write_executable(
+            temp.path(),
+            "tunnel-client",
+            &format!(
+                "#!/bin/sh\n\
+                 echo \"$@\" > \"{args}\"\n\
+                 env > \"{env}\"\n\
+                 echo $$ > \"{pid}\"\n\
+                 exec sleep 300\n",
+                args = args_file.display(),
+                env = env_file.display(),
+                pid = pid_file.display(),
+            ),
+        );
+
+        let server = server().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+        let handle = tokio::spawn(serve_http(
+            Arc::clone(&server),
+            listener,
+            Some("t".into()),
+            Some(TunnelOptions {
+                tunnel_id: "tunnel_0123456789abcdef0123456789abcdef".into(),
+                client_bin: Some(fake_bin),
+                api_key: Some("sk-test-key".into()),
+            }),
+        ));
+        // Startup probe window: wait for the fake client to actually start
+        // (files appear after its fork+exec completes) instead of a fixed
+        // sleep — exec latency is environment-dependent.
+        async fn wait_for_file(path: &std::path::Path) -> String {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            loop {
+                if let Ok(content) = std::fs::read_to_string(path) {
+                    return content;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "fake tunnel-client never wrote {}",
+                    path.display()
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        }
+        let args = wait_for_file(&args_file).await;
+        assert!(
+            !handle.is_finished(),
+            "serve_http should still be running with a healthy tunnel child"
+        );
+
+        // The endpoint must already be serving while the tunnel child is
+        // alive — tunnel-client probes it with a 2s budget right after
+        // spawning.
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .expect("reqwest client");
+        let res = client
+            .post(format!("http://{addr}/mcp"))
+            .header("accept", "application/json")
+            .header("authorization", "Bearer t")
+            .body(
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "ping",
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .expect("request during tunnel startup");
+        assert_eq!(res.status(), reqwest::StatusCode::OK);
+
+        // argv wiring.
+        assert!(
+            args.contains("--control-plane.tunnel-id tunnel_0123456789abcdef0123456789abcdef"),
+            "argv: {args}"
+        );
+        assert!(
+            args.contains(&format!(
+                "--mcp.server-url http://127.0.0.1:{}/mcp",
+                addr.port()
+            )),
+            "argv: {args}"
+        );
+        // env wiring: key + token via env-ref header.
+        let env = wait_for_file(&env_file).await;
+        assert!(
+            env.contains("CONTROL_PLANE_API_KEY=sk-test-key"),
+            "env: {env}"
+        );
+        assert!(
+            env.lines()
+                .any(|line| line == "KKAGENT_MCP_HTTP_AUTH=Bearer t"),
+            "auth env: {env}"
+        );
+        assert!(
+            env.lines()
+                .any(|line| line == "MCP_EXTRA_HEADERS=Authorization: env:KKAGENT_MCP_HTTP_AUTH"),
+            "headers env: {env}"
+        );
+        assert!(
+            env.lines().any(|line| line
+                == "MCP_DISCOVERY_EXTRA_HEADERS=Authorization: env:KKAGENT_MCP_HTTP_AUTH"),
+            "discovery headers env: {env}"
+        );
+        // Only the main MCP channel is polled; harpoon commands are ignored.
+        assert!(
+            env.lines()
+                .any(|line| line == "CONTROL_PLANE_POLL_CHANNELS=main"),
+            "poll channels env: {env}"
+        );
+        // The fake client is actually running.
+        let pid: u32 = std::fs::read_to_string(&pid_file)
+            .expect("pid file")
+            .trim()
+            .parse()
+            .expect("pid");
+
+        // Abort the server: the tunnel child must die with it (kill_on_drop).
+        handle.abort();
+        let _ = handle.await;
+        for _ in 0..50 {
+            let gone = !std::process::Command::new("kill")
+                .args(["-0", &pid.to_string()])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .expect("kill probe")
+                .success();
+            if gone {
+                return; // child is gone ✓
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        panic!("tunnel child (pid {pid}) survived serve_http shutdown");
+    }
+
+    /// Startup failures fail fast with actionable errors (empty explicit key
+    /// is rejected without touching process env, so no parallel-test races).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tunnel_child_fails_fast_without_api_key() {
+        let _guard = TUNNEL_PROC_TESTS.lock().await;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let fake_bin = write_executable(temp.path(), "tunnel-client", "#!/bin/sh\nexit 0\n");
+        let server = server().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let error = serve_http(
+            Arc::clone(&server),
+            listener,
+            Some("t".into()),
+            Some(TunnelOptions {
+                tunnel_id: "tunnel_0123456789abcdef0123456789abcdef".into(),
+                client_bin: Some(fake_bin),
+                api_key: Some(String::new()),
+            }),
+        )
+        .await
+        .expect_err("missing API key must fail");
+        assert!(
+            error.to_string().contains("CONTROL_PLANE_API_KEY"),
+            "error: {error}"
+        );
+    }
+
+    /// A tunnel-client that dies during startup aborts serve_http instead of
+    /// serving a tunnel nobody can reach. Bounded: a probe regression must
+    /// fail the test, never hang the whole suite.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tunnel_child_dying_at_startup_fails_serve() {
+        let _guard = TUNNEL_PROC_TESTS.lock().await;
+        // Slow fork+exec on network file systems can keep the client "not
+        // yet started" past the default startup window; widen it so the test
+        // exercises the fail-fast path itself rather than environment
+        // latency. The guard removes the override even on panic.
+        struct RemoveOnDrop(&'static str);
+        impl Drop for RemoveOnDrop {
+            fn drop(&mut self) {
+                std::env::remove_var(self.0);
+            }
+        }
+        std::env::set_var("KKAGENT_TUNNEL_STARTUP_WINDOW_SECS", "120");
+        let _window_override = RemoveOnDrop("KKAGENT_TUNNEL_STARTUP_WINDOW_SECS");
+        let served = tokio::time::timeout(
+            std::time::Duration::from_secs(150),
+            tunnel_dying_serve_once(),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            panic!("serve_http did not fail within 150s for a dying tunnel-client")
+        });
+        let error = served.expect_err("dead client must fail serve_http");
+        assert!(
+            error.to_string().contains("exited during startup"),
+            "error: {error}"
+        );
+    }
+
+    #[cfg(unix)]
+    async fn tunnel_dying_serve_once() -> Result<()> {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let fake_bin = write_executable(
+            temp.path(),
+            "tunnel-client",
+            "#!/bin/sh\necho boom >&2\nexit 7\n",
+        );
+        let server = server().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        serve_http(
+            Arc::clone(&server),
+            listener,
+            Some("t".into()),
+            Some(TunnelOptions {
+                tunnel_id: "tunnel_0123456789abcdef0123456789abcdef".into(),
+                client_bin: Some(fake_bin),
+                api_key: Some("sk-test-key".into()),
+            }),
+        )
+        .await
+    }
+    #[tokio::test]
+    async fn continuation_queue_is_fifo_and_rejects_decisions_without_mutation() {
+        let (server, task, _dir) = delegated_task().await;
+        task.set_phase(TaskPhase::Queued);
+        let invalid = server.tool_continue_task(&json!({"task_id":task.id,"instruction":"must not queue","decision":{"approve":true}})).await;
+        assert!(invalid.is_err());
+        assert!(task.pending_instructions.lock().unwrap().is_empty());
+        for instruction in ["first", "second"] {
+            server
+                .tool_continue_task(&json!({"task_id":task.id,"instruction":instruction}))
+                .await
+                .unwrap();
+        }
+        assert_eq!(task.pending_instructions.lock().unwrap().len(), 2);
+        assert_eq!(wait_for_instruction(&task).await.as_deref(), Some("first"));
+        assert_eq!(wait_for_instruction(&task).await.as_deref(), Some("second"));
+        assert!(task.pending_instructions.lock().unwrap().is_empty());
+        task.mailbox.start_turn();
+        server
+            .tool_continue_task(&json!({"task_id":task.id,"instruction":"live"}))
+            .await
+            .unwrap();
+        assert!(task.pending_instructions.lock().unwrap().is_empty());
+        assert_eq!(task.mailbox.drain().len(), 1);
     }
 }
