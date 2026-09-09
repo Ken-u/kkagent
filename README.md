@@ -179,9 +179,11 @@ export CONTROL_PLANE_API_KEY=sk-...   # OpenAI Runtime API key(Tunnels Read+Use)
 kkagent mcp serve --tunnel tunnel_xxx
 ```
 
-编排方的典型工作流：`write_plan` 存储执行计划拿到 `plan_id` → `delegate(plan_id)` 派发异步编码任务（计划全文作为范围事实来源注入）→ `get_progress` 轮询 → `continue_task` 回答提问 / 审批动作 → `get_result` 收取审查摘要。另有 `list_workspaces`、`get_context`、`inspect`、`cancel` 覆盖监督全流程。
+编排方的典型工作流：`write_plan` 存储执行计划拿到 `plan_id` → `delegate(plan_id)` 派发异步编码任务（计划以 session `plan_file_path` 落盘，prompt 只带路径引用）→ `get_progress` 轮询 → `continue_task` 回答提问 / 审批动作 → `get_result` 收取审查摘要。另有 `list_workspaces`、`get_context`、`inspect`、`cancel` 覆盖监督全流程。
 
-MCP 客户端配置：URL `http://127.0.0.1:8788/mcp`,Header `Authorization: Bearer <token>`（默认复用 `~/.kkagent/http_token`）。详见 [docs/extensions.md](docs/extensions.md#mcp-server)。
+**申请 tunnel、关联 ChatGPT workspace、创建 Runtime key、在 Connectors 里挂 Tunnel 的逐步说明**见 [docs/extensions.md § OpenAI Secure MCP Tunnel](docs/extensions.md#openai-secure-mcp-tunnel接入-chatgpt)。
+
+MCP 客户端本地直连：URL `http://127.0.0.1:8788/mcp`，Header `Authorization: Bearer <token>`（默认复用 `~/.kkagent/http_token`）。完整 MCP 工具与传输说明见 [docs/extensions.md#mcp-server](docs/extensions.md#mcp-server)。
 
 ## 核心特性
 

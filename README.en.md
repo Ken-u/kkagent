@@ -179,9 +179,11 @@ export CONTROL_PLANE_API_KEY=sk-...   # OpenAI runtime API key (Tunnels Read+Use
 kkagent mcp serve --tunnel tunnel_xxx
 ```
 
-The orchestrator workflow: `write_plan` stores an execution plan and returns a `plan_id` → `delegate(plan_id)` dispatches an async coding task (the full plan is injected as the scope source of truth) → `get_progress` polls → `continue_task` answers questions / approves actions → `get_result` collects the review summary. `list_workspaces`, `get_context`, `inspect`, and `cancel` round out the supervision surface.
+The orchestrator workflow: `write_plan` stores an execution plan and returns a `plan_id` → `delegate(plan_id)` dispatches an async coding task (plan body is installed at the session `plan_file_path`; the prompt only references the path) → `get_progress` polls → `continue_task` answers questions / approves actions → `get_result` collects the review summary. `list_workspaces`, `get_context`, `inspect`, and `cancel` round out the supervision surface.
 
-MCP client configuration: URL `http://127.0.0.1:8788/mcp`, header `Authorization: Bearer <token>` (defaults to `~/.kkagent/http_token`). See [docs/extensions.md](docs/extensions.md#mcp-server).
+**Step-by-step: create a tunnel, associate a ChatGPT workspace, mint a Runtime API key, and attach Tunnel in Connectors** — see [docs/extensions.md § OpenAI Secure MCP Tunnel](docs/extensions.md#openai-secure-mcp-tunnel接入-chatgpt).
+
+Local MCP client config: URL `http://127.0.0.1:8788/mcp`, header `Authorization: Bearer <token>` (defaults to `~/.kkagent/http_token`). Full tool/transport reference: [docs/extensions.md](docs/extensions.md#mcp-server).
 
 ## Core Features
 

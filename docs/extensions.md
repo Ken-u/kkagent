@@ -38,7 +38,7 @@ kkagent 可把外部 MCP Server 的工具动态注册给模型。支持：
 - `list_workspaces` / `get_context` — 发现工作区（自动注册自 kkagent 会话历史 + 配置的 trusted_workspaces）与项目监督级状态；
 - `inspect` / `Glob` / `Grep` — 只读查阅源码、日志、git diff、图片与任务产物，不跑 agent；Glob/Grep 复用内置搜索工具和路径策略；
 - `write_plan` / `get_plan` — 持久化编排方撰写的执行计划（markdown），返回 `plan_id` / `plan_version`；修订产生新版本，历史正文仍可读取；
-- `delegate` — 启动异步编码任务并立即返回 `task_id`；可传 `plan_id`，计划全文会注入任务 prompt 之前作为范围事实来源。模型、工具、worktree 隔离均由 kkagent 自行决定；
+- `delegate` — 启动异步编码任务并立即返回 `task_id`；可传 `plan_id`，计划会安装到 session 的 `plan_file_path`，prompt 只引用路径。模型、工具、worktree 隔离均由 kkagent 自行决定；
 - `get_progress` / `continue_task` / `get_result` / `cancel` — 轮询状态（queued / running / waiting_input / waiting_permission / completed / failed / cancelled）、回答提问、审批动作、追加指令、取审查摘要、取消任务。
 
 ### 客户端与 worker 协作
@@ -88,18 +88,161 @@ HTTP 模式下 MCP 客户端 `POST http://<addr>/mcp`（JSON-RPC,响应为 `appl
 
 `write_plan` 将计划正文落盘为 markdown（`~/.kkagent/mcp-plans/`）。`delegate` 经 `sessions.create` 拿到真实的 `plan_file_path` 后拷到该确切路径；Agent 侧 `Read` 仅对该路径做只读特例（不放开整个 session 目录），对齐默认 Plan 模式；**不会**把全文灌进首条 user message。
 
-### OpenAI Secure MCP Tunnel（可选）
+### OpenAI Secure MCP Tunnel（接入 ChatGPT）
 
-在 ChatGPT / Codex 等支持的 OpenAI 产品中连接私有部署的 kkagent,无需公网入口：
+Secure MCP Tunnel 让 **ChatGPT / Codex / Responses API** 调用你本机的 `kkagent mcp serve`，**不需要**把 MCP 端口暴露到公网：本机只出站访问 `api.openai.com:443`，OpenAI 产品走托管的 tunnel 端点，由 `tunnel-client` 把请求转到本地 HTTP MCP。
+
+官方总览：[Secure MCP Tunnel](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels)；操作细节也可对照 [tunnel-client end-user guide](https://github.com/openai/tunnel-client/blob/master/docs/end-user-guide.md)。
+
+#### 1. 准备权限与三个值
+
+| 值 | 从哪里拿 | 用途 |
+| --- | --- | --- |
+| `tunnel_id`（形如 `tunnel_` + 32 位 hex） | [Platform → Tunnels](https://platform.openai.com/settings/organization/tunnels)，或 `tunnel-client admin tunnels create` | ChatGPT 与 `tunnel-client` / `kkagent --tunnel` 必须用**同一个** id |
+| `CONTROL_PLANE_API_KEY`（`sk-...`） | [Platform → API keys（Runtime）](https://platform.openai.com/settings/organization/api-keys) | 长期守护进程鉴权（`tunnel-client run` / `kkagent --tunnel`） |
+| `OPENAI_ADMIN_KEY`（可选） | [Platform → Admin keys](https://platform.openai.com/settings/organization/admin-keys) | **仅**用于 CLI 创建/改/删 tunnel，**不要**塞进长期 daemon |
+
+权限拆分（Platform **组织级**，不是 project 级）：
+
+- **创建 / 编辑 tunnel**：Tunnels **Read + Manage**
+- **跑 tunnel-client / 在 ChatGPT 里选 tunnel**：Tunnels **Read + Use**
+- 建 Runtime key 时选 **Restricted**，勾选 Tunnels **Read + Use**；不要用 Admin key 或 “All” 当长期密钥
+- ChatGPT **开发者模式**是另一套 workspace 权限：Enterprise/Edu 需 workspace 管理员开通，用户再在 Settings → Security and login 里打开（见 OpenAI Help Center 的 developer mode 说明）
+
+角色 / 组： [Organization roles](https://platform.openai.com/settings/organization/people/roles)、[groups](https://platform.openai.com/settings/organization/people/groups)。新角色生效可能需要最多约 30 分钟。
+
+#### 2. 申请（创建）tunnel，并挂上 ChatGPT workspace
+
+1. 打开 [Platform tunnel settings](https://platform.openai.com/settings/organization/tunnels)，选中正确的 Platform organization。
+2. **Create tunnel**，填名称 / 描述。
+3. **关联（association）**——这一步决定 ChatGPT 里能不能看到它：
+   - 勾选（或添加）**管理该 tunnel 的 Platform organization**；
+   - 勾选（或添加）**要用它的 ChatGPT workspace**（Business / Enterprise / Edu 等）；
+   - 若 Codex / Responses API 会从**另一个** Platform org 调用，也把那个 org 加进去。
+4. 保存后复制 `tunnel_id`。
+
+也可用 Admin key 脚本化创建（需已有 org / workspace id）：
 
 ```bash
-export CONTROL_PLANE_API_KEY=sk-...   # OpenAI Runtime API key,需 Tunnels Read+Use 权限
-kkagent mcp serve --tunnel tunnel_xxx # 隐含 --http
+export OPENAI_ADMIN_KEY=...
+tunnel-client admin tunnels create \
+  --name "kkagent local" \
+  --description "Routes ChatGPT to local kkagent mcp serve" \
+  --organization-id <ORG_ID> \
+  --workspace-id <CHATGPT_WORKSPACE_ID>
 ```
 
-kkagent 会以子进程方式运行 [tunnel-client](https://github.com/openai/tunnel-client)（通过 `--tunnel-client` 指定路径,否则按 PATH 搜索;macOS 用 `brew install openai/tools/tunnel-client`,其他平台从 GitHub Releases 下载）。tunnel id 在 [Platform tunnel settings](https://platform.openai.com/settings/organization/tunnels) 创建并关联目标 ChatGPT workspace。kkagent 停止（Ctrl-C / SIGTERM）时子进程一并退出;tunnel-client 启动即失败会报错退出,tunnel 运行中断线仅警告、本地端点继续服务。
+注意：
 
-kkagent 会自动为子进程配置 `MCP_EXTRA_HEADERS` 与 `MCP_DISCOVERY_EXTRA_HEADERS`（发现/探测请求与常规 MCP 流量在 tunnel-client 中是两组独立的静态头,缺一会导致 discover 探测 401）,并设置 `CONTROL_PLANE_POLL_CHANNELS=main` 只轮询 main 通道、忽略 harpoon 命令。手动运行 tunnel-client 时需自行带上这三项;注意 header 值中的 `env:` 引用必须是**整个值**（如 `Authorization: env:KKAGENT_MCP_HTTP_AUTH`,变量值含 `Bearer ` 前缀）,写成 `Bearer env:VAR` 会按字面量发送导致 401。
+- 只关联个人 Platform org、**没有**目标 ChatGPT workspace 时，Enterprise/Edu 的 workspace 选择器里通常**不会**出现该 tunnel。
+- Platform org 与 ChatGPT workspace 需能被 OpenAI 校验为同一实体；企业侧自动关联失败时，需联系 OpenAI account team 做人工 mapping（客户侧无法强制绑定）。
+
+#### 3. 创建 Runtime API key
+
+1. 打开 [Runtime API keys](https://platform.openai.com/settings/organization/api-keys)。
+2. Create → **Restricted** → Tunnels **Read** + **Use**。
+3. 复制 `sk-...`，仅放进环境变量 / secret store，不要写进 argv 或 git。
+
+#### 4. 安装 tunnel-client
+
+```bash
+# macOS
+brew install openai/tools/tunnel-client
+
+# 其他平台：Platform Tunnels 页的下载链接，或
+# https://github.com/openai/tunnel-client/releases/latest
+tunnel-client --version
+tunnel-client help quickstart   # 可选自检路径
+```
+
+本机还需能出站访问 `api.openai.com:443`（若配置 control-plane mTLS 则为 `mtls.api.openai.com:443`），并访问本地 kkagent HTTP MCP。
+
+#### 5. 启动 kkagent（推荐一条命令）
+
+先确保本机已有可用的 kkagent 配置（`~/.kkagent/config.toml`）、trusted workspace，以及 HTTP bearer token（`--http-token` / `KKAGENT_MCP_HTTP_TOKEN` / 默认 `~/.kkagent/http_token`）。
+
+```bash
+export CONTROL_PLANE_API_KEY=sk-...          # 上一步的 Runtime key
+kkagent mcp serve --tunnel tunnel_xxxxxxxxxxxx  # 隐含 --http，默认 127.0.0.1:8788
+```
+
+可选：
+
+```bash
+# 指定 tunnel-client 路径 / 监听地址 / token
+kkagent mcp serve --tunnel tunnel_xxx \
+  --tunnel-client /path/to/tunnel-client \
+  --http 127.0.0.1:8788 \
+  --http-token "$(cat ~/.kkagent/http_token)"
+
+# 后台（日志 ~/.kkagent/mcp-http-daemon.log）
+kkagent mcp serve --daemon --tunnel tunnel_xxx
+kkagent mcp status
+kkagent mcp stop    # 会一并停掉 tunnel-client
+```
+
+kkagent 会：
+
+1. 先起本地 Streamable HTTP MCP（`/mcp` + `/healthz`）；
+2. 再以子进程跑 `tunnel-client`，把本地 `http://127.0.0.1:<port>/mcp` 挂到该 `tunnel_id`；
+3. 自动注入 `MCP_EXTRA_HEADERS` / `MCP_DISCOVERY_EXTRA_HEADERS`（Bearer）与 `CONTROL_PLANE_POLL_CHANNELS=main`。
+
+启动失败（缺 API key、找不到 binary、tunnel-client 启动窗口内退出）会让整个 `mcp serve` 失败；运行中断线仅警告，本地 HTTP 仍可用。
+
+手动跑 tunnel-client（一般不必）时，HTTP MCP 示例：
+
+```bash
+export CONTROL_PLANE_API_KEY=sk-...
+export KKAGENT_MCP_HTTP_AUTH="Bearer $(cat ~/.kkagent/http_token)"
+# 先单独起：kkagent mcp serve --http
+tunnel-client run \
+  --control-plane.tunnel-id tunnel_xxx \
+  --mcp-server-url http://127.0.0.1:8788/mcp
+# 仍需自行设置 MCP_EXTRA_HEADERS / MCP_DISCOVERY_EXTRA_HEADERS；
+# env: 引用必须是整个 header 值，例如 Authorization: env:KKAGENT_MCP_HTTP_AUTH
+```
+
+#### 6. 把 tunnel 挂到 ChatGPT
+
+在 **`kkagent mcp serve --tunnel ...` 保持运行**（`/healthz` 正常）的前提下：
+
+1. 用目标 workspace 登录 [ChatGPT](https://chatgpt.com)。
+2. 确认账号已开 **developer mode**（Settings → Security and login；企业需管理员授权）。
+3. 打开连接器 / 插件设置之一：
+   - [Connectors](https://chatgpt.com/#settings/Connectors)，或
+   - ChatGPT Plugins → **+** 新建 developer-mode app。
+4. **Connection** 选 **Tunnel**。
+5. 在列表中选中你的 tunnel，或粘贴同一个 `tunnel_id`。
+6. 保存后，在对话里启用该 connector / app，即可调用 kkagent 暴露的工具（`write_plan`、`delegate`、`get_progress` 等）。
+
+创建或发现 connector 时 tunnel-client **必须在线**；停掉 `kkagent mcp serve` 后工具调用会失败。
+
+Codex / Responses API：在 MCP tool 定义里传 `tunnel_id`（不要把 OpenAI 托管 tunnel URL 填进 `server_url`）。示例见 [官方 Secure MCP Tunnel 文档](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels)。
+
+#### 7. 建议验收顺序
+
+1. 本机：`curl -sS -H "Authorization: Bearer <token>" http://127.0.0.1:8788/healthz`
+2. （若单独跑 tunnel-client）打开其 `/readyz` 与 `/ui`，确认 healthy / ready / connected
+3. ChatGPT：Connectors 里能看到并选中 tunnel → 对话里能 `list_workspaces` / `get_context`
+4. 完整链路：`write_plan` → `delegate` → `get_progress` → `get_result`；可用 TUI `kkagent --resume <session_id>` 直播同一 session
+
+#### 8. 常见问题
+
+| 现象 | 排查 |
+| --- | --- |
+| Platform 提示 “Tunnels access required” | 组织选错，或角色缺 Read/Manage/Use；等角色传播后再试 |
+| Platform 有 tunnel，ChatGPT 列表没有 | tunnel 未关联目标 **ChatGPT workspace**；操作者缺 Tunnels **Use**；daemon 未 ready；新建后稍等传播 |
+| ChatGPT 能选 tunnel 但工具 401 / discover 失败 | 检查 kkagent bearer token；缺 `MCP_DISCOVERY_EXTRA_HEADERS`（kkagent 托管模式已自动设） |
+| `kkagent mcp serve --tunnel` 立刻退出 | `CONTROL_PLANE_API_KEY`、tunnel id、出站 `api.openai.com:443`、`tunnel-client doctor` / 日志 |
+| 企业 workspace 无法关联 Platform org | 联系 OpenAI account team 做人工 association，客户无法自助强制绑定 |
+
+#### 相关链接
+
+- [Platform Tunnels](https://platform.openai.com/settings/organization/tunnels)
+- [Runtime API keys](https://platform.openai.com/settings/organization/api-keys)
+- [ChatGPT Connectors](https://chatgpt.com/#settings/Connectors)
+- [openai/tunnel-client](https://github.com/openai/tunnel-client) / [Releases](https://github.com/openai/tunnel-client/releases/latest)
+- [OpenAI Secure MCP Tunnel guide](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels)
 
 ## Skills
 
