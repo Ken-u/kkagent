@@ -564,6 +564,10 @@ impl AgentLoop {
             crate::dynamic_tools::inject_deferred_tools_diff(session, &visible_defs);
         }
 
+        // Note: no turn-count Todo reminder. Todo attention changes are driven
+        // only by material task-state transitions surfaced through the compact
+        // TodoList write summaries.
+
         let vision_proxy_engaged = crate::vision_proxy::engaged(&self.config, capability.vision);
         // When dynamic loading is on, the request starts with the core set
         // (Inline only). Deferred schemas are loaded after SelectTools: Kimi
@@ -585,18 +589,6 @@ impl AgentLoop {
             tool_defs.clear();
         }
         tracing::debug!("Sending {} core tools to LLM", tool_defs.len());
-
-        // Todo reminder injection
-        session.turns_since_todo = session.turns_since_todo.saturating_add(1);
-        if session.turns_since_todo >= 8 {
-            session.add_user_message(
-                "<system-reminder>\nThe TodoList tool has not been updated recently. \
-If you are working on multi-step tasks, consider updating TodoList. \
-Do not mention this reminder to the user.\n</system-reminder>"
-                    .into(),
-            );
-            session.turns_since_todo = 0;
-        }
 
         if let Some(hooks) = &self.hooks {
             let _ = hooks
@@ -2174,17 +2166,16 @@ Do not mention this reminder to the user.\n</system-reminder>"
                     output.content.len()
                 );
 
-                // Commit the latest TodoList snapshot before any hook or UI
-                // await so an app exit cannot strand a visibly completed update.
+                // The TodoList tool mutates the session-scoped service
+                // directly; the loop re-persists the authoritative state
+                // before any hook/UI await so an app exit cannot strand a
+                // visibly completed update.
                 let todo_items = if !output.is_error && name == "TodoList" {
-                    session.turns_since_todo = 0;
-                    let items = todo_items_from_output(&output);
-                    if let Some(items) = items.as_ref() {
-                        if let Err(error) = session.set_todos_persisted(items.clone()) {
-                            tracing::warn!(%error, "failed to persist session todo list");
-                        }
+                    let items = session.todo_items();
+                    if let Err(error) = session.set_todos_persisted(items.clone()) {
+                        tracing::warn!(%error, "failed to persist session todo list");
                     }
-                    items
+                    Some(items)
                 } else {
                     None
                 };
@@ -3366,22 +3357,6 @@ fn normalize_path_lex(p: &std::path::Path) -> std::path::PathBuf {
     out
 }
 
-fn todo_items_from_output(output: &ToolOutput) -> Option<Vec<kkagent_protocol::TodoItemEvent>> {
-    let data = output.data.as_ref()?;
-    let arr = data.get("items")?.as_array()?;
-    let items = arr
-        .iter()
-        .filter_map(|v| {
-            Some(kkagent_protocol::TodoItemEvent {
-                id: v.get("id")?.as_str()?.to_string(),
-                content: v.get("content")?.as_str()?.to_string(),
-                status: v.get("status")?.as_str()?.to_string(),
-            })
-        })
-        .collect();
-    Some(items)
-}
-
 fn skill_activated_from_output(session_id: &str, output: &ToolOutput) -> Option<AgentEvent> {
     let data = output.data.as_ref()?;
     if data.get("kind").and_then(|v| v.as_str()) != Some("skill_activation") {
@@ -4321,6 +4296,36 @@ mod retry_tests {
         }));
         assert!(session.last_compacted_tokens.is_some());
         std::fs::remove_dir_all(workspace).unwrap();
+    }
+
+    /// The turn-driven Todo reminder is gone: a Session carries no
+    /// `turns_since_todo` field, and `system_reminder::todo_reminder` no
+    /// longer exists. This test pins both invariants at the type level.
+    #[test]
+    fn turn_driven_todo_reminder_machinery_is_removed() {
+        // No reminder helper: system_reminder must not re-introduce it.
+        // (Compile-time check: `kkagent_core::system_reminder::todo_reminder`
+        // is intentionally not importable.)
+        let mut session = Session::new(
+            "reminder-test".into(),
+            std::env::temp_dir(),
+            PermissionMode::Auto,
+            "missing/model".into(),
+        );
+        for _ in 0..12 {
+            session.add_user_message("filler".into());
+        }
+        // Simulate many turns beyond the former 8-turn threshold: no
+        // system-reminder about TodoList may appear in the messages.
+        for _ in 0..10 {
+            session.add_user_message("next turn".into());
+        }
+        let has_todo_reminder = session.messages.iter().any(|m| {
+            m.content.iter().any(|c| {
+                matches!(c, ChatContent::Text { text } if text.contains("TodoList tool has not been updated"))
+            })
+        });
+        assert!(!has_todo_reminder);
     }
 
     #[tokio::test]

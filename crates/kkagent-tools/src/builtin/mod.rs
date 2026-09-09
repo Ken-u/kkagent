@@ -37,7 +37,7 @@ pub use skill::{
     SkillCatalog, SkillTool,
 };
 pub use task::{AgentTool, TaskOutputTool};
-pub use todo::TodoListTool;
+pub use todo::{detached_handle, TodoListHandle, TodoListTool};
 pub use web::WebTool;
 pub use write::WriteTool;
 pub use write_plan::WritePlanTool;

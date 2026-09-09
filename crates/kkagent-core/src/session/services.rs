@@ -34,7 +34,7 @@ pub struct SessionServices {
     pub activity: SessionActivityView,
     pub interaction: Arc<SessionInteractionService>,
     pub agents: Arc<AgentLifecycleService>,
-    pub todos: SessionTodoService,
+    pub todos: Arc<SessionTodoService>,
     pub btw: Arc<SessionBtwService>,
     pub tool_policy_gate: SessionToolPolicyGate,
     pub cron: SessionCronService,
@@ -85,7 +85,7 @@ impl SessionServices {
             activity: SessionActivityView::new(),
             interaction: Arc::new(SessionInteractionService::new()),
             agents,
-            todos: SessionTodoService::new(),
+            todos: Arc::new(SessionTodoService::new()),
             btw: Arc::new(SessionBtwService::new()),
             tool_policy_gate,
             cron,
@@ -161,6 +161,11 @@ impl SessionServices {
                 }),
             )
             .await;
+    }
+
+    /// Shared handle to the authoritative Todo service.
+    pub fn todos_handle(&self) -> Arc<crate::session::todo::SessionTodoService> {
+        self.todos.clone()
     }
 
     pub fn mark_turn_started(&self) {
