@@ -160,48 +160,81 @@ fn todo_tool_use_arg_chars(input: &serde_json::Value) -> usize {
         .unwrap_or(0)
 }
 
-/// Fold non-recent Todo tool traffic:
-/// - read calls (`list`) keep protocol pairing but drop the arguments body;
-/// - write calls keep only an empty object (protocol requires an object);
-/// - both read and write results are replaced by a one-line stub.
+/// Fold completed Todo tool traffic:
+/// - **completed write calls** (a matching ToolResult already exists) shed
+///   their argument payload to a protocol-valid empty object *everywhere*,
+///   including the recent window — so the next model request after a long
+///   Todo write never carries the full op list. In-flight calls (no result
+///   yet) are never compacted.
+/// - explicit `list` call args stay intact in the recent window (tiny); aged
+///   read/write **results** are folded to a one-line stub.
+/// - results are paired by actual Todo tool_use id (no content heuristics),
+///   so unrelated long tool results are never touched.
 ///
-/// The current focus/progress remains available because every Todo write
-/// result already contains the compact transition summary, and the most
-/// recent messages (inside `keep_recent`) are never folded.
+/// The current focus/progress remains available because the most recent
+/// (in-window) Todo write result already contains the compact transition
+/// summary.
 pub fn fold_todo_history(messages: &mut [ChatMessage], keep_recent: usize) -> usize {
-    let split = messages.len().saturating_sub(keep_recent.max(1));
-    // Collect Todo tool_use ids in the foldable prefix so their results can
-    // be matched even when they live in a later (result-only) message.
-    let mut folded = 0usize;
-    for msg in messages[..split].iter_mut() {
-        for part in &mut msg.content {
-            match part {
-                ChatContent::ToolUse { name, input, .. } if is_todo_tool_name(name) => {
-                    if todo_tool_use_is_read(input) {
-                        // Explicit full-list read: drop the (historically
-                        // large) echo; pairing/id stays valid.
-                        *input = serde_json::json!({});
-                        folded += 1;
-                    } else if todo_tool_use_arg_chars(input) > 64 {
-                        // Write args stay a valid JSON object but shed the
-                        // full payload (legacy `todos: [...]` snapshots).
-                        *input = serde_json::json!({});
-                        folded += 1;
+    // Pass 1: index Todo tool_use ids and the ids that already have a result.
+    let mut todo_ids: std::collections::HashSet<String> = Default::default();
+    let mut todo_write_ids: std::collections::HashSet<String> = Default::default();
+    for msg in messages.iter() {
+        for part in &msg.content {
+            if let ChatContent::ToolUse { id, name, input } = part {
+                if is_todo_tool_name(name) {
+                    todo_ids.insert(id.clone());
+                    if !todo_tool_use_is_read(input) {
+                        todo_write_ids.insert(id.clone());
                     }
                 }
+            }
+        }
+    }
+    let mut result_ids: std::collections::HashSet<String> = Default::default();
+    for msg in messages.iter() {
+        for part in &msg.content {
+            if let ChatContent::ToolResult { tool_use_id, .. } = part {
+                result_ids.insert(tool_use_id.clone());
+            }
+        }
+    }
+
+    let split = messages.len().saturating_sub(keep_recent.max(1));
+    let mut folded = 0usize;
+    for (index, msg) in messages.iter_mut().enumerate() {
+        let historical = index < split;
+        for part in &mut msg.content {
+            match part {
+                ChatContent::ToolUse { id, input, .. }
+                    if todo_write_ids.contains(id)
+                        && result_ids.contains(id)
+                        && todo_tool_use_arg_chars(input) > 64 =>
+                {
+                    // Completed Todo writes: drop the argument payload while
+                    // keeping the call/result pairing protocol-valid. This
+                    // applies everywhere (recent window included) so the
+                    // immediate next request after a large batch write
+                    // carries no full Todo snapshot. In-flight calls (no
+                    // result yet) are left untouched.
+                    *input = serde_json::json!({});
+                    folded += 1;
+                }
                 ChatContent::ToolResult {
-                    content, is_error, ..
+                    tool_use_id,
+                    content,
+                    is_error,
                 } => {
-                    if *is_error {
+                    if *is_error || !todo_ids.contains(tool_use_id) {
                         continue;
                     }
-                    // Results for Todo calls are recognizable by content: a
-                    // full rendering always starts with the render title, and
-                    // any Todo result longer than a compact summary gets
-                    // folded to a minimal stub.
-                    let is_full_render = content.starts_with("Current todo list:");
-                    let is_long = content.chars().count() > 200;
-                    if is_full_render || (is_long && content.contains("Progress:")) {
+                    // Only aged (non-recent) Todo results are folded; the
+                    // newest write result keeps its compact transition
+                    // summary and an explicit `list` result stays full in
+                    // its immediate turn.
+                    if historical
+                        && (content.starts_with("Current todo list:")
+                            || content.chars().count() > 200)
+                    {
                         *content = TODO_WRITE_RESULT_STUB.to_string();
                         folded += 1;
                     }

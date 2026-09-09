@@ -86,6 +86,11 @@ impl SessionTodoService {
 
     /// Replace the whole list (restore / migration path only; the model-facing
     /// tool never performs full replacement).
+    ///
+    /// Central invariant enforcement on restore: at most one `in_progress`
+    /// item. The first active item is preserved; any subsequent active item
+    /// is demoted to pending. When nothing is active and unfinished items
+    /// remain, the first pending item is auto-promoted.
     pub fn set_todos(&self, todos: Vec<TodoItem>) {
         let mut max: u64 = 0;
         for item in &todos {
@@ -95,8 +100,10 @@ impl SessionTodoService {
                 }
             }
         }
+        let mut normalized = todos;
+        normalize_single_active(&mut normalized);
         *self.next_id.write().unwrap_or_else(|e| e.into_inner()) = max;
-        *self.todos.write().unwrap_or_else(|e| e.into_inner()) = todos;
+        *self.todos.write().unwrap_or_else(|e| e.into_inner()) = normalized;
     }
 
     pub fn clear(&self) {
@@ -279,6 +286,25 @@ fn current_title<'a, I: Iterator<Item = &'a TodoItem>>(mut todos: I) -> Option<S
         .map(|t| t.title.clone())
 }
 
+/// Enforce single-`in_progress` on restore/full-set: preserve the first
+/// active item, demote subsequent active items to pending, and auto-promote
+/// the first pending item when nothing is active but unfinished items remain.
+fn normalize_single_active(todos: &mut [TodoItem]) {
+    let mut active_seen = false;
+    for item in todos.iter_mut() {
+        if matches!(item.status, TodoStatus::InProgress) {
+            if active_seen {
+                item.status = TodoStatus::Pending;
+            } else {
+                active_seen = true;
+            }
+        }
+    }
+    if !active_seen {
+        promote_first_pending(todos);
+    }
+}
+
 /// Enforce single-`in_progress`: promote the first pending item only when
 /// nothing is currently in progress.
 fn promote_first_pending(todos: &mut [TodoItem]) -> bool {
@@ -410,6 +436,78 @@ mod tests {
         let todos = svc.get_todos();
         assert_eq!(todos[0].id, "todo-7");
         assert_eq!(todos[1].id, "todo-8");
+    }
+
+    #[test]
+    fn restore_demotes_extra_active_items_to_single_in_progress() {
+        let svc = SessionTodoService::new();
+        svc.set_todos(vec![
+            TodoItem {
+                id: "todo-1".into(),
+                title: "first active".into(),
+                status: TodoStatus::InProgress,
+            },
+            TodoItem {
+                id: "todo-2".into(),
+                title: "second active".into(),
+                status: TodoStatus::InProgress,
+            },
+            TodoItem {
+                id: "todo-3".into(),
+                title: "pending".into(),
+                status: TodoStatus::Pending,
+            },
+        ]);
+        let todos = svc.get_todos();
+        let active: Vec<_> = todos
+            .iter()
+            .filter(|t| matches!(t.status, TodoStatus::InProgress))
+            .collect();
+        assert_eq!(active.len(), 1, "exactly one active after restore");
+        assert_eq!(active[0].title, "first active", "first active is preserved");
+        assert!(matches!(todos[1].status, TodoStatus::Pending));
+        assert!(matches!(todos[2].status, TodoStatus::Pending));
+    }
+
+    #[test]
+    fn restore_promotes_first_pending_when_nothing_is_active() {
+        let svc = SessionTodoService::new();
+        svc.set_todos(vec![
+            TodoItem {
+                id: "todo-1".into(),
+                title: "done".into(),
+                status: TodoStatus::Done,
+            },
+            TodoItem {
+                id: "todo-2".into(),
+                title: "later".into(),
+                status: TodoStatus::Pending,
+            },
+        ]);
+        let todos = svc.get_todos();
+        assert!(matches!(todos[1].status, TodoStatus::InProgress));
+        assert_eq!(
+            SessionTodoService::summary(&todos),
+            "Current task: later. Progress: 1/2 completed."
+        );
+    }
+
+    #[test]
+    fn restore_with_all_finished_keeps_no_active() {
+        let svc = SessionTodoService::new();
+        svc.set_todos(vec![TodoItem {
+            id: "todo-1".into(),
+            title: "done".into(),
+            status: TodoStatus::Done,
+        }]);
+        let todos = svc.get_todos();
+        assert!(todos
+            .iter()
+            .all(|t| !matches!(t.status, TodoStatus::InProgress)));
+        assert_eq!(
+            SessionTodoService::summary(&todos),
+            "All tasks completed. Progress: 1/1 completed."
+        );
     }
 
     #[test]
