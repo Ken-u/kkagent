@@ -6412,12 +6412,16 @@ mod tests {
         ));
         // Startup probe window: wait for the fake client to actually start
         // (files appear after its fork+exec completes) instead of a fixed
-        // sleep — exec latency is environment-dependent.
+        // sleep — exec latency is environment-dependent. Require non-empty
+        // content: shell `env > file` truncates before writing, so an empty
+        // read is a mid-write race.
         async fn wait_for_file(path: &std::path::Path) -> String {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
             loop {
                 if let Ok(content) = std::fs::read_to_string(path) {
-                    return content;
+                    if !content.trim().is_empty() {
+                        return content;
+                    }
                 }
                 assert!(
                     std::time::Instant::now() < deadline,
