@@ -13577,6 +13577,8 @@ impl TuiApp {
                         }
                         self.system_message(format!("Tool {tool_call_id} cancelled"));
                     }
+                    // Durable post-persist signal for MCP; TUI already settled on TurnEnd.
+                    AgentEvent::TurnCommitted { .. } => {}
                 }
             }
         }

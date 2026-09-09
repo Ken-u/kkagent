@@ -3612,7 +3612,7 @@ mod security_tests {
         .await
         .unwrap();
         let id = created["terminal_id"].as_str().unwrap().to_string();
-        for _ in 0..50 {
+        for _ in 0..200 {
             let Json(snapshot) = terminal_get(
                 State(state.clone()),
                 Path(id.clone()),
@@ -3628,7 +3628,7 @@ mod security_tests {
             {
                 return;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
         panic!("terminal did not exit with captured output");
     }

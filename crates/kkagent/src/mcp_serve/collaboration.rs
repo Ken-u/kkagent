@@ -64,6 +64,9 @@ pub(super) struct TaskRecord {
     pub recent_events: Vec<String>,
     #[serde(default)]
     pub progress: Progress,
+    /// Persisted so resumed MCP tasks keep routing decisions after restart.
+    #[serde(default)]
+    pub via_standalone: bool,
 }
 
 impl TaskRecord {
@@ -87,6 +90,7 @@ impl TaskRecord {
             isolated: false,
             run_dir: Mutex::new(self.run_dir),
             base_commit: StdMutex::new(self.base_commit),
+            via_standalone: self.via_standalone,
             interrupt: Arc::new(AtomicBool::new(false)),
             mailbox: SessionSteerMailbox::default(),
             question_tx: StdMutex::new(None),
@@ -200,15 +204,18 @@ impl McpServer {
             .get(id)
             .ok_or_else(|| format!("unknown plan_id: {id}"))?;
         let version = args["plan_version"].as_u64().unwrap_or(plan.version);
-        let content = plan.revisions.get(&version).ok_or("unknown plan_version")?;
+        // Prefer on-disk markdown (default Plan mode alignment); fall back to
+        // legacy in-DB revision bodies from older releases.
+        let body = read_stored_plan_body(plan, version)?;
         Ok((
-            content.clone(),
+            body.clone(),
             Some(json!({
                 "plan_id": id,
                 "plan_version": version,
                 "title": plan.title,
                 "workspace": plan.workspace,
-                "text": content,
+                "path": plan.revision_paths.get(&version).unwrap_or(&plan.path),
+                "text": body,
             })),
         ))
     }
@@ -220,11 +227,38 @@ impl McpServer {
         if args.get("plan_id").is_none() {
             return Ok(None);
         }
-        let (content, metadata) = self.tool_get_plan(args).await?;
-        Ok(Some((
-            build_initial_prompt_sync("", None, Some(&content), &[]),
-            metadata.unwrap(),
-        )))
+        let id = args["plan_id"].as_str().ok_or("plan_id is required")?;
+        let plans = self.plans.lock().await;
+        let plan = plans
+            .get(id)
+            .ok_or_else(|| format!("unknown plan_id: {id}"))?
+            .clone();
+        drop(plans);
+        let version = args["plan_version"].as_u64().unwrap_or(plan.version);
+        // Immutable revision: unknown versions must fail, never silently fall
+        // back to latest (delegate already uses read_stored_plan_body).
+        let _body = read_stored_plan_body(&plan, version)?;
+        let path = plan
+            .revision_paths
+            .get(&version)
+            .cloned()
+            .or_else(|| {
+                (version == plan.version && !plan.path.as_os_str().is_empty())
+                    .then(|| plan.path.clone())
+            })
+            .ok_or_else(|| format!("unknown plan_version: {version} for plan {id}"))?;
+        let metadata = plan_ref_value(id, version, &plan.title, Some(&path));
+        let instruction = build_initial_prompt_sync(
+            "",
+            Some(PlanPromptRef {
+                title: &plan.title,
+                path: &path,
+                plan_id: id,
+                plan_version: version,
+            }),
+            &[],
+        );
+        Ok(Some((instruction, metadata)))
     }
 
     pub(super) async fn tool_session_context(
@@ -322,6 +356,7 @@ pub(super) async fn persist_task(store: &CollaborationStore, task: &McpTask) -> 
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone(),
+        via_standalone: task.via_standalone,
     };
     store.put(
         "task",
@@ -445,6 +480,21 @@ pub(super) async fn inspect_diff(
         page.push('\n');
         count += 1;
     }
+    // Forward progress: an oversized first line after byte-cap must still
+    // consume one source unit so next_offset cannot equal offset forever.
+    if count == 0 && offset < expanded.len() {
+        let line = expanded[offset];
+        let mut end = line.len().min(MAX_INSPECT_BYTES.saturating_sub(1));
+        while end > 0 && !line.is_char_boundary(end) {
+            end -= 1;
+        }
+        page.push_str(&line[..end]);
+        if end < line.len() {
+            page.push_str("\n…[truncated]");
+        }
+        page.push('\n');
+        count = 1;
+    }
     let more = offset + count < expanded.len();
     // Include the patch body in structuredContent — OpenAI hosts prefer it
     // over content[] when both are present.
@@ -457,7 +507,7 @@ pub(super) async fn inspect_diff(
             "head": head,
             "truncated": more,
             "next_offset": more.then_some(offset + count),
-            "total_lines": lines.len(),
+            "total_lines": expanded.len(),
             "text": page,
         })),
     ))
@@ -555,6 +605,8 @@ impl McpServer {
             event_sequence: 0,
             recent_events: Vec::new(),
             progress: Progress::default(),
+            // Historical sessions live on the shared server when MCP is attached.
+            via_standalone: self.rpc.is_some(),
         }
         .into_task();
         let task = Arc::new(task);
@@ -712,6 +764,7 @@ mod tests {
                     ..Default::default()
                 }),
                 db,
+                None,
             )
             .unwrap(),
         )
@@ -1028,7 +1081,7 @@ mod tests {
         };
         config.providers.insert("test".into(),serde_json::from_value(json!({"type":"openai-chat","api_key":"test","base_url":format!("http://{addr}"),"request_timeout_ms":5000})).unwrap());
         config.models.insert("test/model".into(),serde_json::from_value(json!({"provider":"test","model":"test-model","max_context_size":128000,"max_output_size":1000,"capabilities":["tool_use"]})).unwrap());
-        let server = Arc::new(McpServer::new(Arc::new(config), db.clone()).unwrap());
+        let server = Arc::new(McpServer::new(Arc::new(config), db.clone(), None).unwrap());
         let slots = server.queue.available_permits();
         let result = call(
             &server,
@@ -1050,7 +1103,7 @@ mod tests {
                 )
                 .await;
             }
-            let request = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+            let request = tokio::time::timeout(std::time::Duration::from_secs(60), rx.recv())
                 .await
                 .unwrap()
                 .unwrap();
@@ -1063,7 +1116,7 @@ mod tests {
             if turn == 2 {
                 assert!(messages.contains("worker completed"));
             }
-            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::time::timeout(std::time::Duration::from_secs(60), async {
                 while !task.phase().terminal() {
                     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                 }
@@ -1131,7 +1184,7 @@ mod tests {
         };
         config.providers.insert("test".into(),serde_json::from_value(json!({"type":"openai-chat","api_key":"test","base_url":format!("http://{addr}"),"request_timeout_ms":5000})).unwrap());
         config.models.insert("test/model".into(),serde_json::from_value(json!({"provider":"test","model":"test-model","max_context_size":128000,"max_output_size":1000,"capabilities":["tool_use"]})).unwrap());
-        let server = Arc::new(McpServer::new(Arc::new(config), db.clone()).unwrap());
+        let server = Arc::new(McpServer::new(Arc::new(config), db.clone(), None).unwrap());
         let first = call(
             &server,
             "continue_task",
@@ -1144,7 +1197,7 @@ mod tests {
             .await
             .unwrap();
         // Consume the seed turn's model request before racing continuations.
-        let seed_request = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+        let seed_request = tokio::time::timeout(std::time::Duration::from_secs(60), rx.recv())
             .await
             .unwrap()
             .unwrap();
@@ -1158,7 +1211,7 @@ mod tests {
             let instruction = format!("followup-{round}");
             // Wait for terminal, then continue IMMEDIATELY — the race this
             // test exists for.
-            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::time::timeout(std::time::Duration::from_secs(60), async {
                 while !task.phase().terminal() {
                     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
                 }
@@ -1175,7 +1228,7 @@ mod tests {
             assert_eq!(accepted["isError"], false, "{accepted}");
             // The accepted instruction must be consumed: exactly one more
             // model request carrying it arrives.
-            let request = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+            let request = tokio::time::timeout(std::time::Duration::from_secs(60), rx.recv())
                 .await
                 .unwrap()
                 .unwrap();

@@ -585,14 +585,21 @@ async fn run(cli: Cli) -> Result<()> {
                 if daemon {
                     anyhow::bail!("--daemon requires --http (or --tunnel)");
                 }
-                let _ = mcp_serve::run_mcp_serve(Arc::new(config)).await;
+                let _ = mcp_serve::run_mcp_serve(Arc::new(config), Some(&config_path)).await;
                 return Ok(());
             };
             if daemon {
                 return run_mcp_daemon(config_path, &addr, http_token, tunnel_options.as_ref())
                     .await;
             }
-            mcp_serve::run_mcp_serve_http(Arc::new(config), &addr, http_token, tunnel_options).await
+            mcp_serve::run_mcp_serve_http(
+                Arc::new(config),
+                &addr,
+                http_token,
+                tunnel_options,
+                Some(&config_path),
+            )
+            .await
         }
         Some(Commands::Auth { .. }) => unreachable!("auth handled before config startup"),
         Some(
@@ -1347,6 +1354,18 @@ async fn wait_for_socket(
     }
 }
 
+/// How far along a background MCP HTTP daemon is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+enum McpDaemonPhase {
+    /// Child spawned; healthz not confirmed yet. A live PID in this phase
+    /// must not be treated as stale merely because healthz is down.
+    Starting,
+    /// healthz answered successfully.
+    #[default]
+    Running,
+}
+
 /// State file for the background MCP HTTP server (`kkagent mcp serve
 /// --daemon`): pid + listen address + how it was started.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -1354,27 +1373,46 @@ struct McpDaemonState {
     pid: u32,
     addr: String,
     tunnel_id: Option<String>,
+    #[serde(default)]
+    phase: McpDaemonPhase,
+    /// Unix epoch seconds when the slot was claimed (startup grace clock).
+    #[serde(default)]
+    claimed_at_unix: u64,
+    /// Process identity (start time). Required — records without this field
+    /// fail to deserialize and are deleted as stale (never signalled).
+    start_token: String,
 }
+
+/// Bound during which a live `starting` daemon is preserved even if healthz
+/// is not ready yet (covers slow tunnel-client / bind races).
+const MCP_DAEMON_STARTUP_GRACE_SECS: u64 = 20;
 
 fn mcp_daemon_state_path() -> PathBuf {
     kkagent_config::default_config_dir().join("mcp-http-daemon.json")
 }
 
-fn read_mcp_daemon_state() -> Option<McpDaemonState> {
-    let content = std::fs::read_to_string(mcp_daemon_state_path()).ok()?;
-    serde_json::from_str(&content).ok()
+/// Load a valid daemon state. Missing/empty `start_token` or corrupt JSON
+/// yields `None` (caller deletes the file without signalling).
+fn read_mcp_daemon_state_at(path: &Path) -> Option<McpDaemonState> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let state: McpDaemonState = serde_json::from_str(&content).ok()?;
+    if state.start_token.trim().is_empty() {
+        return None;
+    }
+    Some(state)
 }
 
-/// The daemonized server is alive only when the recorded pid is a running
-/// kkagent AND its health endpoint answers (stale state files must not make
-/// `status`/`stop` lie).
-async fn mcp_daemon_is_alive(state: &McpDaemonState) -> bool {
-    if !mcp_daemon_pid_alive(state.pid) {
-        return false;
-    }
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+async fn mcp_daemon_healthz_ok(addr: &str) -> bool {
     tokio::time::timeout(
         Duration::from_secs(3),
-        reqwest::get(format!("http://{}/healthz", state.addr)),
+        reqwest::get(format!("http://{addr}/healthz")),
     )
     .await
     .ok()
@@ -1382,34 +1420,212 @@ async fn mcp_daemon_is_alive(state: &McpDaemonState) -> bool {
     .is_some_and(|response| response.status().is_success())
 }
 
+/// True when the recorded pid still refers to the same process we registered.
+fn mcp_daemon_identity_matches(state: &McpDaemonState) -> bool {
+    mcp_daemon_process_start_token(state.pid).as_ref() == Some(&state.start_token)
+}
+
+/// Capture a stable-enough identity for `pid` (process start time).
+fn mcp_daemon_process_start_token(pid: u32) -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            // comm may contain spaces/parens; starttime is field 22 after the
+            // closing paren of the command name.
+            if let Some(rest) = stat.rsplit(')').next() {
+                let fields: Vec<&str> = rest.split_whitespace().collect();
+                // After ')': state is index 0 → starttime is index 19.
+                if let Some(starttime) = fields.get(19) {
+                    return Some(format!("linux:{starttime}"));
+                }
+            }
+        }
+    }
+    #[cfg(unix)]
+    {
+        let output = std::process::Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "lstart="])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if text.is_empty() {
+            None
+        } else {
+            Some(format!("lstart:{text}"))
+        }
+    }
+    #[cfg(windows)]
+    {
+        let output = std::process::Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                &format!(
+                    "(Get-Process -Id {pid} -ErrorAction Stop).StartTime.ToUniversalTime().ToString('o')"
+                ),
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if text.is_empty() {
+            None
+        } else {
+            Some(format!("win:{text}"))
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+/// Fully ready: known identity AND healthz.
+async fn mcp_daemon_is_healthy(state: &McpDaemonState) -> bool {
+    mcp_daemon_identity_matches(state) && mcp_daemon_healthz_ok(&state.addr).await
+}
+
+/// Decide whether a recorded state should be kept when the PID is still ours.
+/// A live PID that is still within the startup grace window is kept even when
+/// healthz is down — otherwise `status` / a concurrent `serve --daemon` would
+/// orphan the child.
+fn mcp_daemon_state_should_keep(
+    state: &McpDaemonState,
+    identity_ok: bool,
+    healthz_ok: bool,
+    now_unix: u64,
+) -> bool {
+    if !identity_ok {
+        return false;
+    }
+    if healthz_ok {
+        return true;
+    }
+    match state.phase {
+        McpDaemonPhase::Starting => {
+            let age = now_unix.saturating_sub(state.claimed_at_unix);
+            age <= MCP_DAEMON_STARTUP_GRACE_SECS
+        }
+        // Identity-verified Running daemon: keep through healthz blips. Stop
+        // still signals the matching process; recycled PIDs fail identity.
+        McpDaemonPhase::Running => true,
+    }
+}
+
 async fn clear_mcp_daemon_state_if_stale() -> Option<McpDaemonState> {
-    let state = read_mcp_daemon_state()?;
-    if mcp_daemon_is_alive(&state).await {
+    clear_mcp_daemon_state_if_stale_at(&mcp_daemon_state_path()).await
+}
+
+async fn clear_mcp_daemon_state_if_stale_at(path: &Path) -> Option<McpDaemonState> {
+    if !path.exists() {
+        return None;
+    }
+    let Some(state) = read_mcp_daemon_state_at(path) else {
+        // Corrupt or pre-identity legacy JSON: drop the file, never signal.
+        let _ = std::fs::remove_file(path);
+        return None;
+    };
+    let identity_ok = mcp_daemon_pid_alive(state.pid) && mcp_daemon_identity_matches(&state);
+    let healthz = if identity_ok {
+        mcp_daemon_healthz_ok(&state.addr).await
+    } else {
+        false
+    };
+    if mcp_daemon_state_should_keep(&state, identity_ok, healthz, unix_now_secs()) {
         return Some(state);
     }
-    let _ = std::fs::remove_file(mcp_daemon_state_path());
+    let _ = std::fs::remove_file(path);
     None
 }
 
 /// Try to atomically create the daemon state file (O_EXCL), claiming the
-/// daemon slot. Fails when another starter is mid-launch (file exists).
+/// daemon slot. Mode 0600 is applied at inode creation on Unix.
 fn claim_mcp_daemon_state(state: &McpDaemonState) -> Result<()> {
+    claim_mcp_daemon_state_at(&mcp_daemon_state_path(), state)
+}
+
+fn claim_mcp_daemon_state_at(path: &Path, state: &McpDaemonState) -> Result<()> {
     use std::io::Write;
-    let path = mcp_daemon_state_path();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&path)?;
+    let mut file = {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(path)?
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)?
+        }
+    };
     file.write_all(&serde_json::to_vec(state)?)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-    }
+    file.flush()?;
     Ok(())
+}
+
+fn write_mcp_daemon_state_at(path: &Path, state: &McpDaemonState) -> Result<()> {
+    use std::io::Write;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut file = {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(path)?
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(path)?
+        }
+    };
+    file.write_all(&serde_json::to_vec(state)?)?;
+    file.flush()?;
+    Ok(())
+}
+
+/// After a failed/timed-out daemon launch: terminate the child only when
+/// identity still matches, then remove the state file.
+async fn cleanup_failed_mcp_daemon_launch(state: &McpDaemonState, state_path: &Path) {
+    if mcp_daemon_identity_matches(state) {
+        kill_mcp_daemon_process(state.pid);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while mcp_daemon_identity_matches(state) && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        if mcp_daemon_identity_matches(state) {
+            force_kill_mcp_daemon_process(state.pid);
+        }
+    }
+    let _ = std::fs::remove_file(state_path);
 }
 
 /// `kkagent mcp serve --daemon` — spawn ourselves detached with the exact
@@ -1477,21 +1693,51 @@ async fn run_mcp_daemon(
         const DETACHED_PROCESS: u32 = 0x0000_0008;
         cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
     }
-    let child = cmd
+    let mut child = cmd
         .spawn()
         .with_context(|| format!("failed to spawn daemon ({})", exe.display()))?;
+    let pid = child.id();
+    // Capture identity before claiming so stop/status never kill a recycled PID.
+    let start_token = {
+        let mut token = None;
+        for _ in 0..50 {
+            token = mcp_daemon_process_start_token(pid);
+            if token.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        token
+    };
+    let Some(start_token) = start_token else {
+        // We still hold the Child handle — kill this exact process safely
+        // without relying on PID identity.
+        let _ = child.kill();
+        let _ = child.wait();
+        anyhow::bail!(
+            "cannot fingerprint daemon pid {pid}; refused to register and terminated the child"
+        );
+    };
+    // Drop the Child handle without killing: the daemon stays alive under
+    // state + start_token. (forget would only delay releasing the process
+    // handle / pidfd until this launcher exits.)
+    drop(child);
+    let state_path = mcp_daemon_state_path();
     let state = McpDaemonState {
-        pid: child.id(),
+        pid,
         addr: addr.to_string(),
         tunnel_id: tunnel.map(|t| t.tunnel_id.clone()),
+        phase: McpDaemonPhase::Starting,
+        claimed_at_unix: unix_now_secs(),
+        start_token,
     };
     if let Err(error) = claim_mcp_daemon_state(&state) {
         // Registration lost the race (or the file system refused): do not
         // leave an unmanaged daemon behind.
-        let _ = kill_mcp_daemon_process(state.pid);
+        cleanup_failed_mcp_daemon_launch(&state, &state_path).await;
         anyhow::bail!(
             "cannot register daemon state {}: {error}",
-            mcp_daemon_state_path().display()
+            state_path.display()
         );
     }
     println!(
@@ -1504,11 +1750,14 @@ async fn run_mcp_daemon(
     // reported immediately instead of silently succeeding.
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
-        if mcp_daemon_is_alive(&state).await {
+        if mcp_daemon_is_healthy(&state).await {
+            let mut ready = state.clone();
+            ready.phase = McpDaemonPhase::Running;
+            let _ = write_mcp_daemon_state_at(&state_path, &ready);
             return Ok(());
         }
-        if !mcp_daemon_pid_alive(state.pid) {
-            let _ = std::fs::remove_file(mcp_daemon_state_path());
+        if !mcp_daemon_identity_matches(&state) {
+            let _ = std::fs::remove_file(&state_path);
             anyhow::bail!(
                 "daemon pid {} exited during startup; see {}",
                 state.pid,
@@ -1516,7 +1765,7 @@ async fn run_mcp_daemon(
             );
         }
         if Instant::now() >= deadline {
-            let _ = std::fs::remove_file(mcp_daemon_state_path());
+            cleanup_failed_mcp_daemon_launch(&state, &state_path).await;
             anyhow::bail!(
                 "daemon pid {} did not become healthy within 15s; see {}",
                 state.pid,
@@ -1602,13 +1851,20 @@ async fn run_mcp_stop() -> Result<()> {
         anyhow::bail!("no background MCP HTTP server is running");
     };
     let _ = std::fs::remove_file(mcp_daemon_state_path());
+    if !mcp_daemon_identity_matches(&state) {
+        println!(
+            "kkagent mcp daemon registration cleared (pid {} no longer matches recorded identity)",
+            state.pid
+        );
+        return Ok(());
+    }
     // SIGTERM first: the server's shutdown handler stops the tunnel child.
     kill_mcp_daemon_process(state.pid);
     let deadline = Instant::now() + Duration::from_secs(10);
-    while mcp_daemon_is_alive(&state).await && Instant::now() < deadline {
+    while mcp_daemon_identity_matches(&state) && Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
-    if mcp_daemon_is_alive(&state).await {
+    if mcp_daemon_identity_matches(&state) {
         force_kill_mcp_daemon_process(state.pid);
         anyhow::bail!(
             "daemon pid {} did not exit within 10s; force-killed",
@@ -1624,22 +1880,31 @@ async fn run_mcp_stop() -> Result<()> {
 
 async fn run_mcp_status(json: bool) -> Result<()> {
     let state = clear_mcp_daemon_state_if_stale().await;
+    let (phase, healthy) = match &state {
+        Some(state) => {
+            let healthy = mcp_daemon_healthz_ok(&state.addr).await;
+            let phase = if healthy { "running" } else { "starting" };
+            (Some(phase), healthy)
+        }
+        None => (None, false),
+    };
     let payload = match &state {
         Some(state) => serde_json::json!({
-            "running": true,
+            "running": healthy,
+            "phase": phase,
             "pid": state.pid,
             "addr": state.addr,
             "url": format!("http://{}/mcp", state.addr),
             "tunnel_id": state.tunnel_id,
         }),
-        None => serde_json::json!({ "running": false }),
+        None => serde_json::json!({ "running": false, "phase": "stopped" }),
     };
     if json {
         println!("{}", serde_json::to_string_pretty(&payload)?);
         return Ok(());
     }
     match state {
-        Some(state) => {
+        Some(state) if healthy => {
             println!(
                 "kkagent mcp daemon running: pid {}, http://{}/mcp{}",
                 state.pid,
@@ -1651,9 +1916,20 @@ async fn run_mcp_status(json: bool) -> Result<()> {
                     .unwrap_or_default()
             );
         }
+        Some(state) => {
+            println!(
+                "kkagent mcp daemon starting: pid {}, http://{}/mcp (waiting for healthz){}",
+                state.pid,
+                state.addr,
+                state
+                    .tunnel_id
+                    .as_deref()
+                    .map(|t| format!(" (tunnel {t})"))
+                    .unwrap_or_default()
+            );
+        }
         None => println!("kkagent mcp daemon is not running"),
     }
-    let _ = payload;
     Ok(())
 }
 
@@ -7253,6 +7529,11 @@ async fn spawn_session_agent_turn(
                     }
                 }
                 state_clone.active_btw_sessions.lock().await.remove(&sid);
+                let _ = agent_event_tx
+                    .send(AgentEvent::TurnCommitted {
+                        session_id: sid.clone(),
+                    })
+                    .await;
                 return;
             }
 
@@ -7347,6 +7628,11 @@ async fn spawn_session_agent_turn(
             }
             state_clone.checkin_session(&sid, session).await;
             state_clone.active_btw_sessions.lock().await.remove(&sid);
+            let _ = agent_event_tx
+                .send(AgentEvent::TurnCommitted {
+                    session_id: sid.clone(),
+                })
+                .await;
             return;
         }
 
@@ -7428,6 +7714,13 @@ async fn spawn_session_agent_turn(
         }
         state_clone.checkin_session(&sid, session).await;
         state_clone.active_btw_sessions.lock().await.remove(&sid);
+        // Durable signal for MCP / other UDS clients: TurnEnd arrives before
+        // persist, so finalization must wait for this event.
+        let _ = agent_event_tx
+            .send(AgentEvent::TurnCommitted {
+                session_id: sid.clone(),
+            })
+            .await;
     });
 
     Ok(())
@@ -8029,6 +8322,7 @@ async fn handle_rpc_call(
                 .insert(session_id.clone(), session.steer_mailbox.clone());
             session.services.on_created().await;
             let session_dir = session.session_dir().display().to_string();
+            let plan_file_path = session.plan_file_path.display().to_string();
             state
                 .sessions
                 .lock()
@@ -8044,6 +8338,7 @@ async fn handle_rpc_call(
             Ok(serde_json::json!({
                 "session_id": session_id,
                 "session_dir": session_dir,
+                "plan_file_path": plan_file_path,
                 "model": model_alias,
             }))
         }
@@ -13326,5 +13621,171 @@ mod cron_rpc_tests {
         .expect_err("unknown cron id");
         assert_eq!(missing.0, -32000);
         assert!(missing.1.contains("Unknown cron id"));
+    }
+}
+
+#[cfg(test)]
+mod mcp_daemon_lifecycle_tests {
+    use super::*;
+
+    fn sample_state(
+        phase: McpDaemonPhase,
+        claimed_at_unix: u64,
+        start_token: &str,
+    ) -> McpDaemonState {
+        McpDaemonState {
+            pid: std::process::id(),
+            addr: "127.0.0.1:1".into(),
+            tunnel_id: None,
+            phase,
+            claimed_at_unix,
+            start_token: start_token.into(),
+        }
+    }
+
+    #[test]
+    fn starting_live_pid_kept_during_grace_without_healthz() {
+        let state = sample_state(McpDaemonPhase::Starting, 100, "lstart:test");
+        assert!(mcp_daemon_state_should_keep(
+            &state,
+            true,
+            false,
+            100 + MCP_DAEMON_STARTUP_GRACE_SECS
+        ));
+        assert!(!mcp_daemon_state_should_keep(
+            &state,
+            true,
+            false,
+            100 + MCP_DAEMON_STARTUP_GRACE_SECS + 1
+        ));
+        assert!(!mcp_daemon_state_should_keep(&state, false, false, 100));
+    }
+
+    #[test]
+    fn dead_or_mismatched_identity_is_always_stale() {
+        let state = sample_state(McpDaemonPhase::Running, 1, "lstart:test");
+        assert!(!mcp_daemon_state_should_keep(&state, false, true, 999));
+    }
+
+    #[test]
+    fn running_identity_kept_even_if_healthz_blips() {
+        let state = sample_state(McpDaemonPhase::Running, 1, "lstart:test");
+        assert!(mcp_daemon_state_should_keep(&state, true, false, 999_999));
+        assert!(mcp_daemon_state_should_keep(&state, true, true, 999_999));
+    }
+
+    #[test]
+    fn claim_is_atomic_and_unix_mode_is_0600() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp-http-daemon.json");
+        let state = McpDaemonState {
+            pid: 42,
+            addr: "127.0.0.1:8788".into(),
+            tunnel_id: None,
+            phase: McpDaemonPhase::Starting,
+            claimed_at_unix: 10,
+            start_token: "lstart:fixture".into(),
+        };
+        claim_mcp_daemon_state_at(&path, &state).unwrap();
+        let err = claim_mcp_daemon_state_at(&path, &state).unwrap_err();
+        assert!(
+            err.to_string().contains("exists")
+                || err
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|e| e.kind() == std::io::ErrorKind::AlreadyExists),
+            "second claim must fail atomically: {err}"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        let loaded = read_mcp_daemon_state_at(&path).unwrap();
+        assert_eq!(loaded.pid, 42);
+        assert_eq!(loaded.phase, McpDaemonPhase::Starting);
+        assert_eq!(loaded.start_token, "lstart:fixture");
+    }
+
+    #[tokio::test]
+    async fn legacy_state_without_start_token_is_deleted_without_kill() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp-http-daemon.json");
+        std::fs::write(
+            &path,
+            r#"{"pid":1,"addr":"127.0.0.1:1","tunnel_id":null,"phase":"running","claimed_at_unix":1}"#,
+        )
+        .unwrap();
+        assert!(clear_mcp_daemon_state_if_stale_at(&path).await.is_none());
+        assert!(!path.exists(), "legacy state must be removed");
+    }
+
+    #[tokio::test]
+    async fn alive_pid_with_mismatched_identity_is_deleted_without_kill() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp-http-daemon.json");
+        let pid = std::process::id();
+        let state = McpDaemonState {
+            pid,
+            addr: "127.0.0.1:1".into(),
+            tunnel_id: None,
+            phase: McpDaemonPhase::Running,
+            claimed_at_unix: 1,
+            start_token: "lstart:definitely-not-this-process".into(),
+        };
+        write_mcp_daemon_state_at(&path, &state).unwrap();
+        assert!(
+            clear_mcp_daemon_state_if_stale_at(&path).await.is_none(),
+            "mismatched identity must be treated as stale"
+        );
+        assert!(!path.exists());
+        // If cleanup had signalled us, this assertion would never run.
+        assert_eq!(std::process::id(), pid);
+    }
+
+    #[tokio::test]
+    async fn running_daemon_with_matching_identity_kept_when_healthz_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp-http-daemon.json");
+        let pid = std::process::id();
+        let start_token = mcp_daemon_process_start_token(pid).expect("fingerprint self");
+        let state = McpDaemonState {
+            pid,
+            // Nothing listens here → healthz fails.
+            addr: "127.0.0.1:1".into(),
+            tunnel_id: None,
+            phase: McpDaemonPhase::Running,
+            claimed_at_unix: 1,
+            start_token,
+        };
+        write_mcp_daemon_state_at(&path, &state).unwrap();
+        let kept = clear_mcp_daemon_state_if_stale_at(&path)
+            .await
+            .expect("matching Running daemon must be kept through healthz blips");
+        assert_eq!(kept.pid, pid);
+        assert!(path.exists());
+    }
+
+    #[tokio::test]
+    async fn cleanup_does_not_signal_mismatched_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp-http-daemon.json");
+        let pid = std::process::id();
+        let state = McpDaemonState {
+            pid,
+            addr: "127.0.0.1:1".into(),
+            tunnel_id: None,
+            phase: McpDaemonPhase::Starting,
+            claimed_at_unix: unix_now_secs(),
+            start_token: "lstart:wrong".into(),
+        };
+        write_mcp_daemon_state_at(&path, &state).unwrap();
+        cleanup_failed_mcp_daemon_launch(&state, &path).await;
+        assert!(!path.exists());
+        assert_eq!(
+            std::process::id(),
+            pid,
+            "cleanup must not SIGTERM a mismatched identity"
+        );
     }
 }

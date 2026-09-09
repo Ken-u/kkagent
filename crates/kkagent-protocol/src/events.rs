@@ -48,6 +48,12 @@ pub enum AgentEvent {
     TurnEnd {
         session_id: String,
     },
+    /// Emitted after the standalone server has persisted the turn and checked
+    /// the session back in. Clients that need durable transcript state (e.g.
+    /// MCP `get_result`) must wait for this rather than `TurnEnd`.
+    TurnCommitted {
+        session_id: String,
+    },
     StatusUpdate {
         session_id: String,
         status: SessionStatus,
@@ -265,6 +271,7 @@ impl AgentEvent {
             | Self::ToolResult { session_id, .. }
             | Self::TurnStart { session_id, .. }
             | Self::TurnEnd { session_id, .. }
+            | Self::TurnCommitted { session_id, .. }
             | Self::StatusUpdate { session_id, .. }
             | Self::Heartbeat { session_id, .. }
             | Self::LlmRetry { session_id, .. }

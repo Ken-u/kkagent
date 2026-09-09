@@ -82,7 +82,11 @@ kkagent mcp status --json                   # 机器可读
 kkagent mcp stop                            # 停止(SIGTERM,会一并停掉 tunnel-client)
 ```
 
-HTTP 模式下 MCP 客户端 `POST http://<addr>/mcp`（JSON-RPC,响应为 `application/json`；通知返回 `202`）,`GET /healthz` 免认证探活。Bearer 认证必须：`--http-token` > `KKAGENT_MCP_HTTP_TOKEN` 环境变量 > 复用 `~/.kkagent/http_token`（与 `kkagent server --http` 共用,0600 权限）。HTTP 端口能被路由到的任何进程访问——kkagent mcp 可执行任意委派编码任务,因此未配置 token 时拒绝启动；绑定非回环地址前请确认网络边界。
+HTTP 模式下 MCP 客户端 `POST http://<addr>/mcp`（JSON-RPC,响应为 `application/json`；通知返回 `202`）,`GET /healthz` 免认证探活。Bearer 认证必须：`--http-token` > `KKAGENT_MCP_HTTP_TOKEN` 环境变量 > 复用 `~/.kkagent/http_token`（与 `kkagent server --http` 共用,0600 权限）。HTTP 端口能被路由到的任何进程访问——kkagent mcp 可执行任意委派编码任务,因此未配置 token 时拒绝启动；绑定非回环地址前请确认网络边界。浏览器带 `Origin` 的请求仅接受 loopback；无 Origin 的非浏览器客户端（含 tunnel-client）不受影响。
+
+`kkagent mcp serve` 启动时会连接（或自动拉起）本机 standalone `kkagent server`（与 TUI 相同的 UDS）。`delegate` 在该 server 上创建 session 并跑 AgentLoop，因此可用 TUI `--resume <session_id>` **直播**同一会话；turn 进行中 TUI 侧再发 prompt 会因 busy 被拒绝。协议版本协商支持 `2024-11-05` / `2025-03-26` / `2025-06-18`（故意保持兼容，不强制更新 transport）。
+
+`write_plan` 将计划正文落盘为 markdown（`~/.kkagent/mcp-plans/`）。`delegate` 经 `sessions.create` 拿到真实的 `plan_file_path` 后拷到该确切路径；Agent 侧 `Read` 仅对该路径做只读特例（不放开整个 session 目录），对齐默认 Plan 模式；**不会**把全文灌进首条 user message。
 
 ### OpenAI Secure MCP Tunnel（可选）
 

@@ -58,9 +58,21 @@ Rejects binary/image files — use ReadMediaFile for media."
         if !path.exists() {
             return Ok(ToolOutput::error(format!("File not found: {}", path_str)));
         }
-        // S1-4: workspace directory constraint
-        if let Err(reason) = ctx.check_path_guard(&path) {
-            return Ok(ToolOutput::error(reason));
+        // S1-4: workspace directory constraint. Exact match to the session's
+        // plan file is a read-only exception so orchestrator / Plan-mode plans
+        // under ~/.kkagent/sessions/... remain readable without opening the
+        // whole session directory.
+        let is_plan_file = ctx.plan_file_path.as_ref().is_some_and(|plan| {
+            path == *plan
+                || match (std::fs::canonicalize(&path), std::fs::canonicalize(plan)) {
+                    (Ok(a), Ok(b)) => a == b,
+                    _ => false,
+                }
+        });
+        if !is_plan_file {
+            if let Err(reason) = ctx.check_path_guard(&path) {
+                return Ok(ToolOutput::error(reason));
+            }
         }
         if looks_binary_ext(&path) {
             return Ok(ToolOutput::error(format!(
@@ -553,6 +565,70 @@ mod tests {
         let model = output.model_content();
         assert!(model.contains("<system>"));
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn strict_path_guard_allows_exact_plan_file_outside_workspace() {
+        let workspace =
+            std::env::temp_dir().join(format!("kkagent-read-ws-{}", uuid::Uuid::new_v4()));
+        let session =
+            std::env::temp_dir().join(format!("kkagent-read-sess-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let plan = session
+            .join("agents")
+            .join("main")
+            .join("plans")
+            .join("plan.md");
+        std::fs::create_dir_all(plan.parent().unwrap()).unwrap();
+        std::fs::write(&plan, "# orchestrator plan\n").unwrap();
+
+        let tools_config = kkagent_config::ToolsConfig {
+            path_guard_mode: "strict".into(),
+            ..Default::default()
+        };
+        let ctx = ToolContext {
+            working_dir: workspace.clone(),
+            session_id: "s".into(),
+            turn_id: "t".into(),
+            plan_file_path: Some(plan.clone()),
+            image: kkagent_config::ImageConfig::default(),
+            tool_call_id: None,
+            interrupted: None,
+            tools_config,
+            model_alias: None,
+        };
+
+        let denied = ReadTool
+            .execute(
+                json!({"path": session.join("agents/main/plans/other.md")}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(denied.is_error); // missing file
+
+        let sibling = session
+            .join("agents")
+            .join("main")
+            .join("plans")
+            .join("other.md");
+        std::fs::write(&sibling, "secret").unwrap();
+        let denied = ReadTool
+            .execute(json!({"path": sibling}), &ctx)
+            .await
+            .unwrap();
+        assert!(denied.is_error);
+        assert!(
+            denied.content.contains("path_guard_mode") || denied.content.contains("outside"),
+            "{}",
+            denied.content
+        );
+
+        let allowed = ReadTool.execute(json!({"path": plan}), &ctx).await.unwrap();
+        assert!(!allowed.is_error, "{}", allowed.content);
+        assert!(allowed.content.contains("orchestrator plan"));
+        let _ = std::fs::remove_dir_all(&workspace);
+        let _ = std::fs::remove_dir_all(&session);
     }
 
     #[tokio::test]
