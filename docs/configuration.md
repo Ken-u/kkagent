@@ -131,6 +131,8 @@ keep = "all"
 
 `keep` 是 Provider 兼容字符串。并非所有端点都支持 thinking 与 tools 同时使用；遇到 400 响应时可先删除 `keep` 并关闭 thinking 验证。
 
+GLM-4.7、GLM-5 系列经 Chat Completions 调用时（按上游模型 ID 匹配，大小写不敏感，支持 `zai-org/GLM-5.3` 等带命名空间的 ID），适配器将历史思考原样放入 `reasoning_content`，与普通回答正文分开，并发送 `thinking = {type: "enabled", clear_thinking: false}` 保留跨轮思考。配置或运行时选定的 `reasoning_effort` 继续正常转发。GLM-5.3 不能关闭思考，可用 `low`、`high`、`max` 调整强度；不适用上一段关闭 thinking 的排障建议。参见[智谱思考模式](https://docs.bigmodel.cn/cn/guide/capabilities/thinking-mode)和[深度思考参数](https://docs.bigmodel.cn/cn/guide/capabilities/thinking)。
+
 ## TUI
 
 ```toml

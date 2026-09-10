@@ -460,6 +460,24 @@ async fn chat_completions_stream(
     kimi: bool,
 ) -> anyhow::Result<()> {
     let url = api_endpoint(base_url, "chat/completions");
+    // GLM uses reasoning_content for interleaved/preserved thinking, including
+    // namespaced model IDs served by OpenAI-compatible gateways.
+    let model_id = request
+        .model
+        .rsplit('/')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    // Older GLM families do not all support preserved thinking.
+    let glm = ["glm-4.7", "glm-5"].into_iter().any(|family| {
+        model_id.strip_prefix(family).is_some_and(|suffix| {
+            suffix.is_empty()
+                || suffix.starts_with('.')
+                || suffix.starts_with('-')
+                || suffix.starts_with(':')
+        })
+    });
+    let native_reasoning = kimi || glm;
 
     let mut messages: Vec<serde_json::Value> = Vec::new();
     if let Some(system) = &request.system {
@@ -519,7 +537,7 @@ async fn chat_completions_stream(
                         "video_url": {"url": format!("ms://{file_id}"), "id": file_id}
                     }));
                 }
-                ChatContent::Thinking { thinking } if kimi => {
+                ChatContent::Thinking { thinking } if native_reasoning => {
                     thinking_parts.push(thinking.clone());
                 }
                 ChatContent::Thinking { thinking } => text_parts.push(thinking.clone()),
@@ -551,8 +569,13 @@ async fn chat_completions_stream(
             if !tool_calls.is_empty() {
                 msg["tool_calls"] = json!(tool_calls);
             }
-            if kimi && !thinking_parts.is_empty() {
-                msg["reasoning_content"] = json!(thinking_parts.join("\n"));
+            if native_reasoning && !thinking_parts.is_empty() {
+                // Preserve GLM reasoning verbatim, including whitespace.
+                msg["reasoning_content"] = json!(if glm {
+                    thinking_parts.concat()
+                } else {
+                    thinking_parts.join("\n")
+                });
             }
             messages.push(msg);
         } else if m.role == "user" {
@@ -606,6 +629,11 @@ async fn chat_completions_stream(
     }
     if !tools.is_empty() {
         body["tools"] = json!(tools);
+    }
+    if glm {
+        // Coding tasks benefit from continuity across tool calls and turns.
+        // GLM-5.3 requires thinking; do not use a disable flag to limit effort.
+        body["thinking"] = json!({"type": "enabled", "clear_thinking": false});
     }
     if !kimi {
         if let Some(key) = &request.prompt_cache_key {
@@ -1995,6 +2023,124 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("connection closed"));
+    }
+
+    #[tokio::test]
+    async fn glm_preserves_reasoning_across_tool_calls_without_mixing_visible_text() {
+        for model in [
+            "glm-5.3",
+            "glm-5.3-flash",
+            "zai-org/GLM-5.3",
+            "glm-5.2",
+            "glm-5",
+            "glm-4.7",
+        ] {
+            let (base_url, captured) =
+                serve_once("200 OK", "text/event-stream", "data: [DONE]\n").await;
+            let mut request = request();
+            request.model = model.into();
+            request.thinking = Some(ThinkingParams {
+                budget_tokens: 10000,
+                adaptive: false,
+                effort: Some("high".into()),
+            });
+            request.messages.push(ChatMessage::new(
+                "assistant",
+                vec![
+                    ChatContent::Thinking {
+                        thinking: "  检查当前任务\n".into(),
+                    },
+                    ChatContent::Thinking {
+                        thinking: "然后读取文件。  ".into(),
+                    },
+                    ChatContent::Text {
+                        text: "Reading the file.".into(),
+                    },
+                    ChatContent::ToolUse {
+                        id: "call-1".into(),
+                        name: "Read".into(),
+                        input: json!({"path": "Cargo.toml"}),
+                    },
+                ],
+            ));
+            request.messages.push(ChatMessage::new(
+                "user",
+                vec![ChatContent::ToolResult {
+                    tool_use_id: "call-1".into(),
+                    content: "file contents".into(),
+                    is_error: false,
+                }],
+            ));
+            request.messages.push(ChatMessage::new(
+                "assistant",
+                vec![
+                    ChatContent::Thinking {
+                        thinking: "Continue from the tool result.\n".into(),
+                    },
+                    ChatContent::ToolUse {
+                        id: "call-2".into(),
+                        name: "Read".into(),
+                        input: json!({"path": "src/main.rs"}),
+                    },
+                ],
+            ));
+            request.messages.push(ChatMessage::new(
+                "user",
+                vec![ChatContent::ToolResult {
+                    tool_use_id: "call-2".into(),
+                    content: "more contents".into(),
+                    is_error: false,
+                }],
+            ));
+            let (tx, _rx) = mpsc::channel(8);
+            openai_stream(&Client::new(), &base_url, "test-token", request, tx)
+                .await
+                .unwrap();
+            let captured = captured.await.unwrap();
+            let body: serde_json::Value = serde_json::from_str(&captured.body).unwrap();
+            assert_eq!(body["model"], model);
+            assert_eq!(
+                body["thinking"],
+                json!({"type": "enabled", "clear_thinking": false})
+            );
+            assert_eq!(body["reasoning_effort"], "high");
+            assert_eq!(body["messages"][2]["content"], "Reading the file.");
+            assert_eq!(
+                body["messages"][2]["reasoning_content"],
+                "  检查当前任务\n然后读取文件。  "
+            );
+            assert_eq!(body["messages"][2]["tool_calls"][0]["id"], "call-1");
+            assert_eq!(body["messages"][3]["tool_call_id"], "call-1");
+            assert_eq!(body["messages"][4]["content"], "");
+            assert_eq!(
+                body["messages"][4]["reasoning_content"],
+                "Continue from the tool result.\n"
+            );
+            assert_eq!(body["messages"][4]["tool_calls"][0]["id"], "call-2");
+            assert_eq!(body["messages"][5]["tool_call_id"], "call-2");
+        }
+    }
+
+    #[tokio::test]
+    async fn openai_other_models_do_not_receive_glm_thinking_options() {
+        for model in ["test-model", "glm-4-plus", "glm-4-flash"] {
+            let (base_url, captured) =
+                serve_once("200 OK", "text/event-stream", "data: [DONE]\n").await;
+            let mut request = request();
+            request.model = model.into();
+            let (tx, _rx) = mpsc::channel(8);
+            openai_stream(&Client::new(), &base_url, "test-token", request, tx)
+                .await
+                .unwrap();
+            let body: serde_json::Value =
+                serde_json::from_str(&captured.await.unwrap().body).unwrap();
+            assert!(body.get("thinking").is_none());
+            assert!(body["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|m| m.get("reasoning_content").is_none()));
+        }
     }
 
     #[tokio::test]
