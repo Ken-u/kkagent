@@ -3081,6 +3081,12 @@ async fn remove_session_runtime(state: &Arc<ServerState>, session_id: &str) {
     state.goal_judge_records.lock().await.remove(session_id);
     state.judge_chat_history.lock().await.remove(session_id);
     state.judge_chat_locks.lock().await.remove(session_id);
+    // Cancel this session's running background shells before tearing down
+    // their hub bookkeeping, so nothing keeps executing (and completing)
+    // for a session that no longer exists. `forget_session` then drops the
+    // hub entries — and, via the forgotten marker, any completion that
+    // still races in afterwards instead of leaking an undrainable entry.
+    state.bash_shells.cancel_session(session_id).await;
     kkagent_tools::task_notify::global_hub().forget_session(session_id);
     if let Some(session) = removed {
         session.services.on_close(SessionCloseReason::Exit).await;

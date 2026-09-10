@@ -81,6 +81,12 @@ struct HubInner {
     /// `drain_notifications`, `running_for`) don't scan every other
     /// session's entries too (issues/bash_background_issues.md #5).
     by_session: HashMap<String, HashSet<String>>,
+    /// Sessions explicitly torn down (`forget_session`). A task finishing
+    /// after its session was destroyed would otherwise re-register an
+    /// entry nobody ever drains (`push_notification`'s fallback path);
+    /// entries for forgotten sessions are dropped instead. Session ids are
+    /// UUIDs and never reused, so this set never masks a live session.
+    forgotten: HashSet<String>,
     /// See [`TaskNotificationHub::set_wake_hook`].
     wake_hook: Option<WakeHook>,
 }
@@ -116,12 +122,16 @@ pub struct TaskNotificationHub {
 
 impl TaskNotificationHub {
     /// Record a freshly launched background task so the turn-end reminder can
-    /// report it while it runs.
+    /// report it while it runs. No-op for sessions torn down by
+    /// [`TaskNotificationHub::forget_session`].
     pub fn track(&self, session_id: &str, task_id: &str, kind: TaskKind, description: &str) {
         let mut inner = match self.inner.lock() {
             Ok(inner) => inner,
             Err(poisoned) => poisoned.into_inner(),
         };
+        if inner.forgotten.contains(session_id) {
+            return;
+        }
         inner.tasks.insert(
             task_id.to_string(),
             TrackedTask {
@@ -146,15 +156,43 @@ impl TaskNotificationHub {
         }
     }
 
+    /// Atomically remove `task_id` *only if* it has no undelivered
+    /// notification. Returns `false` (leaving the entry intact) when a
+    /// notification raced in between the caller's earlier `has_notification`
+    /// filter and this call, so history eviction can never destroy a
+    /// completion the owning session hasn't seen (issues/bash_background_issues.md #5).
+    /// Absent ids count as removed and return `true`.
+    pub fn untrack_if_no_pending(&self, task_id: &str) -> bool {
+        let mut inner = match self.inner.lock() {
+            Ok(inner) => inner,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        match inner.tasks.get(task_id) {
+            Some(task) if task.notification.is_some() => false,
+            Some(_) => {
+                let task = inner
+                    .tasks
+                    .remove(task_id)
+                    .expect("entry checked present above");
+                inner.index_remove(&task.session_id, task_id);
+                true
+            }
+            None => true,
+        }
+    }
+
     /// Drop every entry (running or with an undelivered notification)
     /// belonging to `session_id`. Call this when a session is destroyed so
     /// its background-task bookkeeping doesn't live on forever in the hub
-    /// (issues/bash_background_issues.md #5).
+    /// (issues/bash_background_issues.md #5). The session is also marked
+    /// forgotten, so tasks finishing *after* the teardown (their drivers may
+    /// take a moment to observe cancellation) don't re-register entries.
     pub fn forget_session(&self, session_id: &str) {
         let mut inner = match self.inner.lock() {
             Ok(inner) => inner,
             Err(poisoned) => poisoned.into_inner(),
         };
+        inner.forgotten.insert(session_id.to_string());
         if let Some(task_ids) = inner.by_session.remove(session_id) {
             for task_id in task_ids {
                 inner.tasks.remove(&task_id);
@@ -177,6 +215,17 @@ impl TaskNotificationHub {
             };
             let task_id = notification.task_id.clone();
             let previous_session = inner.tasks.get(&task_id).map(|t| t.session_id.clone());
+            if inner.forgotten.contains(session_id)
+                && previous_session
+                    .as_deref()
+                    .is_none_or(|prev| prev == session_id)
+            {
+                // The owning session was torn down (sessions.delete/discard)
+                // after this task launched. Nobody will ever drain a
+                // notification re-registered here, so drop it instead of
+                // leaking a permanent entry (see `HubInner::forgotten`).
+                return;
+            }
             let entry = inner
                 .tasks
                 .entry(task_id.clone())
@@ -227,17 +276,14 @@ impl TaskNotificationHub {
             Ok(inner) => inner,
             Err(poisoned) => poisoned.into_inner(),
         };
-        inner
-            .by_session
-            .get(session_id)
-            .is_some_and(|task_ids| {
-                task_ids.iter().any(|id| {
-                    inner
-                        .tasks
-                        .get(id)
-                        .is_some_and(|task| task.notification.is_some())
-                })
+        inner.by_session.get(session_id).is_some_and(|task_ids| {
+            task_ids.iter().any(|id| {
+                inner
+                    .tasks
+                    .get(id)
+                    .is_some_and(|task| task.notification.is_some())
             })
+        })
     }
 
     /// Whether `task_id` currently has an undelivered notification. Callers
@@ -551,6 +597,54 @@ mod tests {
     }
 
     #[test]
+    fn untrack_if_no_pending_keeps_entries_with_undelivered_notifications() {
+        let hub = TaskNotificationHub::default();
+        hub.track("s1", "running", TaskKind::Bash, "still going");
+        assert!(
+            hub.untrack_if_no_pending("running"),
+            "running entry removed"
+        );
+
+        hub.track("s1", "finished", TaskKind::Bash, "done");
+        hub.push_notification("s1", note("finished", "completed"));
+        assert!(
+            !hub.untrack_if_no_pending("finished"),
+            "entry with a pending notification must be kept"
+        );
+        assert!(
+            hub.has_notification("finished"),
+            "pending notification must survive the refused untrack"
+        );
+        // Once drained, the same call succeeds.
+        hub.drain_notifications("s1");
+        assert!(hub.untrack_if_no_pending("finished"));
+
+        assert!(hub.untrack_if_no_pending("missing"), "absent id is fine");
+    }
+
+    #[test]
+    fn forget_session_marks_session_so_late_completions_do_not_reregister() {
+        let hub = TaskNotificationHub::default();
+        hub.track("s1", "inflight", TaskKind::Bash, "cancelled by teardown");
+        hub.forget_session("s1");
+
+        // Task driver finishes after the teardown: the fallback entry must
+        // not be re-created for the forgotten session.
+        hub.push_notification("s1", note("inflight", "completed"));
+        assert!(hub.drain_notifications("s1").is_empty());
+        assert!(!hub.has_notification("inflight"));
+        assert!(hub.running_for("s1").is_empty());
+
+        // Same for tasks tracked *after* the teardown.
+        hub.track("s1", "post-teardown", TaskKind::Bash, "no-op");
+        assert!(hub.running_for("s1").is_empty());
+
+        // A never-forgotten session still gets the fallback entry.
+        hub.push_notification("s2", note("late", "completed"));
+        assert_eq!(hub.drain_notifications("s2").len(), 1);
+    }
+
+    #[test]
     fn wake_hook_fires_once_per_push_with_session_id() {
         let hub = TaskNotificationHub::default();
         let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
@@ -615,18 +709,27 @@ mod tests {
     fn has_notification_reflects_pending_vs_delivered_state() {
         let hub = TaskNotificationHub::default();
         hub.track("s1", "t1", TaskKind::Bash, "build");
-        assert!(!hub.has_notification("t1"), "still running, no notification yet");
+        assert!(
+            !hub.has_notification("t1"),
+            "still running, no notification yet"
+        );
 
         hub.push_notification("s1", note("t1", "completed"));
         assert!(hub.has_notification("t1"), "notification is now pending");
 
         hub.drain_notifications("s1");
-        assert!(!hub.has_notification("t1"), "drained notifications are gone");
+        assert!(
+            !hub.has_notification("t1"),
+            "drained notifications are gone"
+        );
 
         hub.push_notification("s1", note("t2", "failed"));
         assert!(hub.has_notification("t2"));
         hub.consume("t2");
-        assert!(!hub.has_notification("t2"), "consumed notifications are gone");
+        assert!(
+            !hub.has_notification("t2"),
+            "consumed notifications are gone"
+        );
     }
 
     #[test]

@@ -6578,17 +6578,23 @@ mod tests {
     async fn tunnel_child_dying_at_startup_fails_serve() {
         let _subprocess = SUBPROCESS_TEST_LOCK.lock().await;
         let _guard = TUNNEL_PROC_TESTS.lock().await;
-        // Slow fork+exec on network file systems can keep the client "not
-        // yet started" past the default startup window; widen it so the test
-        // exercises the fail-fast path itself rather than environment
-        // latency. The guard removes the override even on panic.
+        // The window must EXCEED this test's 150s timeout: the failure mode
+        // under a loaded `cargo test --workspace` is monitor starvation (its
+        // first tick delayed far past the child's instant exit), and any
+        // window shorter than the delay makes the monitor classify that exit
+        // as a *late* one — serve never fails, the test burns its whole
+        // timeout. With window > timeout, the late-exit branch is
+        // unreachable inside the test: whenever the monitor finally gets
+        // polled, the observed exit still lands "during startup" and
+        // fail-fast proceeds as designed. Slow fork+exec headroom comes for
+        // free. The guard removes the override even on panic.
         struct RemoveOnDrop(&'static str);
         impl Drop for RemoveOnDrop {
             fn drop(&mut self) {
                 std::env::remove_var(self.0);
             }
         }
-        std::env::set_var("KKAGENT_TUNNEL_STARTUP_WINDOW_SECS", "120");
+        std::env::set_var("KKAGENT_TUNNEL_STARTUP_WINDOW_SECS", "300");
         let _window_override = RemoveOnDrop("KKAGENT_TUNNEL_STARTUP_WINDOW_SECS");
         let served = tokio::time::timeout(
             std::time::Duration::from_secs(150),

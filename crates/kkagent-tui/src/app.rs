@@ -2672,7 +2672,10 @@ impl TuiApp {
                 self.apply_tasks_list_data(data);
             }
             crate::async_jobs::JobChannel::TasksDetail => {
-                let task_id = data.get("task_id").and_then(|v| v.as_str()).map(String::from);
+                let task_id = data
+                    .get("task_id")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
                 if let Some(task_id) = task_id {
                     self.apply_task_detail_data(&task_id, data);
                 }
@@ -4953,20 +4956,14 @@ impl TuiApp {
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .to_string(),
-                    elapsed_secs: t
-                        .get("elapsed_secs")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0),
+                    elapsed_secs: t.get("elapsed_secs").and_then(|v| v.as_u64()).unwrap_or(0),
                     fetched_at,
                     status: t
                         .get("status")
                         .and_then(|v| v.as_str())
                         .unwrap_or("running")
                         .to_string(),
-                    running: t
-                        .get("running")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(true),
+                    running: t.get("running").and_then(|v| v.as_bool()).unwrap_or(true),
                 });
             }
         }

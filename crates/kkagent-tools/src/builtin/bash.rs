@@ -25,6 +25,10 @@ const MAX_RUNNING_JOBS_PER_SESSION: usize = 8;
 /// Bound on how long `stop()` waits to observe the job actually leave
 /// `Running` before reporting an unconfirmed request back to the caller.
 const STOP_CONFIRM_TIMEOUT_MS: u64 = 2_000;
+/// Marker prepended to the in-memory rolling output window once bytes have
+/// been dropped from its front. Kept intact across trims (see
+/// `append_output`) so it never accumulates partial copies.
+const TRUNCATION_MARKER: &str = "... earlier output truncated ...\n";
 
 #[derive(Debug, Clone)]
 pub struct BashOptions {
@@ -188,21 +192,26 @@ impl BackgroundShellManager {
             // whose completion notification hasn't been drained yet —
             // untracking it would silently destroy the notification before
             // the owning session ever sees it (issues/bash_background_issues.md #5).
+            // `untrack_if_no_pending` re-checks under the hub lock, closing
+            // the race where a job completes between the `has_notification`
+            // filter above and the untrack below.
             let hub = crate::task_notify::global_hub();
             let mut finished: Vec<(String, std::time::Instant)> = jobs
                 .iter()
-                .filter(|(id, job)| {
-                    job.status != ShellStatus::Running && !hub.has_notification(id)
-                })
+                .filter(|(id, job)| job.status != ShellStatus::Running && !hub.has_notification(id))
                 .map(|(id, job)| (id.clone(), job.started_at))
                 .collect();
             finished.sort_by_key(|(_, started_at)| *started_at);
             let overflow = jobs.len() + 1 - MAX_BACKGROUND_JOBS;
             for (evict_id, _) in finished.into_iter().take(overflow) {
+                if !hub.untrack_if_no_pending(&evict_id) {
+                    // A completion notification raced in since the filter;
+                    // keep the job (and its notification) for the session.
+                    continue;
+                }
                 if let Some(job) = jobs.remove(&evict_id) {
                     evicted_logs.push(job.output_log);
                 }
-                hub.untrack(&evict_id);
             }
         }
         if jobs.len() >= MAX_BACKGROUND_JOBS {
@@ -259,12 +268,18 @@ impl BackgroundShellManager {
             };
             job.output.push_str(chunk);
             if job.output.len() > MAX_OUTPUT * 2 {
-                let overflow = job.output.len() - MAX_OUTPUT * 2;
-                drop_utf8_bytes_from_front_in_place(&mut job.output, overflow);
-                if !job.output.starts_with("... earlier output truncated ...\n") {
-                    job.output
-                        .insert_str(0, "... earlier output truncated ...\n");
+                // Rebuild the rolling window: strip the previous marker whole,
+                // trim the body to the cap, then re-add the marker. Trimming
+                // across a live marker would leave a partial remnant that
+                // stacks under the re-added one ("...lier output truncated ...").
+                if job.output.starts_with(TRUNCATION_MARKER) {
+                    drop_utf8_bytes_from_front_in_place(&mut job.output, TRUNCATION_MARKER.len());
                 }
+                if job.output.len() > MAX_OUTPUT * 2 {
+                    let overflow = job.output.len() - MAX_OUTPUT * 2;
+                    drop_utf8_bytes_from_front_in_place(&mut job.output, overflow);
+                }
+                job.output.insert_str(0, TRUNCATION_MARKER);
             }
             job.output_log.clone()
         };
@@ -315,7 +330,11 @@ impl BackgroundShellManager {
     /// Handle to a job's disk-backed output log, for incremental
     /// (`since_offset`) reads (issues/bash_background_issues.md #6).
     pub async fn output_log(&self, id: &str) -> Option<crate::output_log::OutputLog> {
-        self.jobs.lock().await.get(id).map(|job| job.output_log.clone())
+        self.jobs
+            .lock()
+            .await
+            .get(id)
+            .map(|job| job.output_log.clone())
     }
 
     /// List all known background shell jobs (for TaskList unification).
@@ -725,7 +744,11 @@ impl BashTool {
                     ));
                     if !delta.is_empty() {
                         out.push_str("\n\n");
-                        out.push_str(&truncate_chars(&delta, MAX_OUTPUT));
+                        // Tail, not head: `next_offset` already advances past
+                        // the whole delta, so anything dropped here is gone
+                        // from every later incremental poll. Keeping the tail
+                        // matches the snapshot branch below (`tail_chars`).
+                        out.push_str(&tail_chars(&delta, MAX_OUTPUT));
                     } else if running {
                         out.push_str(
                             "\n\n(no new output since offset — still running, call again later)",
@@ -964,6 +987,10 @@ output) will be delivered automatically as a <task-notification> — no polling 
                     // manager so `/ps` output is live instead of a single
                     // snapshot at detach time (issues/bash_background_issues.md #2).
                     let flush_offset = Arc::new(std::sync::atomic::AtomicUsize::new(so_far_len));
+                    // Graceful flusher shutdown: signal between flushes and
+                    // wait for the handle, so the final flush below never
+                    // overlaps an in-flight periodic flush (duplicate bytes).
+                    let flush_shutdown = Arc::new(tokio::sync::Notify::new());
                     tokio::spawn(async move {
                         let _sandbox_guard = sandbox_guard;
                         let flusher = spawn_output_flusher(
@@ -971,6 +998,7 @@ output) will be delivered automatically as a <task-notification> — no polling 
                             mgr.clone(),
                             id_clone.clone(),
                             flush_offset.clone(),
+                            flush_shutdown.clone(),
                         );
                         let (status, code) = drive_background_child(
                             mgr.clone(),
@@ -981,7 +1009,8 @@ output) will be delivered automatically as a <task-notification> — no polling 
                             cancel,
                         )
                         .await;
-                        flusher.abort();
+                        flush_shutdown.notify_one();
+                        let _ = flusher.await;
                         flush_pending_output(&collected, &mgr, &id_clone, &flush_offset).await;
                         mgr.finish(&id_clone, status, code).await;
                     });
@@ -1027,16 +1056,25 @@ async fn flush_pending_output(
 
 /// Periodically flushes `collected` into the manager while a
 /// foreground-timeout-detached child is still running (see
-/// [`flush_pending_output`]). Aborted by the caller once the child exits.
+/// [`flush_pending_output`]). Exits between flushes when `shutdown` fires;
+/// the caller awaits the handle before its own final flush, so the two can
+/// never interleave inside [`flush_pending_output`] and double-append the
+/// same bytes (a plain `abort()` could land exactly there).
 fn spawn_output_flusher(
     collected: Arc<Mutex<String>>,
     mgr: Arc<BackgroundShellManager>,
     id: String,
     offset: Arc<std::sync::atomic::AtomicUsize>,
+    shutdown: Arc<tokio::sync::Notify>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
-            tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
+            tokio::select! {
+                _ = tokio::time::sleep(tokio::time::Duration::from_millis(150)) => {}
+                // `notify_one`, not `notify_waiters`: a signal sent while a
+                // flush is in flight (no waiter registered) must not be lost.
+                _ = shutdown.notified() => break,
+            }
             flush_pending_output(&collected, &mgr, &id, &offset).await;
         }
     })
@@ -1082,8 +1120,7 @@ async fn drive_background_child(
             (st, code)
         }
         Some(Ok(Err(e))) => {
-            mgr.append_output(id, &format!("\nwait error: {}", e))
-                .await;
+            mgr.append_output(id, &format!("\nwait error: {}", e)).await;
             (ShellStatus::Failed, None)
         }
         Some(Err(_)) => {
@@ -1326,6 +1363,7 @@ fn shell_and_flag() -> (&'static str, &'static str) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_via_kaos(
     kaos: &kkagent_kaos::KaosHandle,
     command: &str,
@@ -1358,11 +1396,12 @@ async fn run_via_kaos(
                 _ = cancel.cancelled() => Outcome::Cancelled,
             }
         }
-        (Some(ms), None) => match tokio::time::timeout(std::time::Duration::from_millis(ms), exec).await
-        {
-            Ok(r) => Outcome::Done(r),
-            Err(_) => Outcome::TimedOut,
-        },
+        (Some(ms), None) => {
+            match tokio::time::timeout(std::time::Duration::from_millis(ms), exec).await {
+                Ok(r) => Outcome::Done(r),
+                Err(_) => Outcome::TimedOut,
+            }
+        }
         (None, Some(cancel)) => {
             tokio::select! {
                 r = exec => Outcome::Done(r),
@@ -1500,6 +1539,24 @@ mod tests {
         }
     }
 
+    /// Redirect background-shell output logs to a throwaway tempdir so tests
+    /// never write into the user's real config dir. Shared by the whole
+    /// module (one `OnceLock` tempdir): the override is process-global, and
+    /// per-test roots would stomp each other across concurrently running
+    /// tests. The tempdir is not auto-removed at process exit (statics don't
+    /// run `Drop`), which leaves at most one identifiable scratch dir under
+    /// the OS temp dir.
+    fn redirect_bg_output_logs() {
+        static LOG_ROOT: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+        let dir = LOG_ROOT.get_or_init(|| {
+            tempfile::Builder::new()
+                .prefix("kkagent-test-bg-logs-")
+                .tempdir()
+                .expect("tempdir for bg output logs")
+        });
+        crate::output_log::set_root_for_tests(Some(std::sync::Arc::from(dir.path())));
+    }
+
     #[tokio::test]
     async fn limits_concurrent_background_jobs() {
         let manager = BackgroundShellManager::new();
@@ -1508,7 +1565,12 @@ mod tests {
         for index in 0..MAX_RUNNING_JOBS {
             let session = format!("session-{}", index % (MAX_RUNNING_JOBS_PER_SESSION - 1));
             manager
-                .insert_running(&format!("job-{index}"), &session, "test".into(), "test".into())
+                .insert_running(
+                    &format!("job-{index}"),
+                    &session,
+                    "test".into(),
+                    "test".into(),
+                )
                 .await
                 .expect("job within global limit");
         }
@@ -1636,6 +1698,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn background_job_can_be_stopped_and_polled() {
+        redirect_bg_output_logs();
         let tool = BashTool::default();
         let started = tool
             .execute(
@@ -1747,6 +1810,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn list_running_for_session_filters_by_session_and_status() {
+        redirect_bg_output_logs();
         let tool = BashTool::default();
         let first = start_sleep_job(&tool, "session-1", "first").await;
         tokio::time::sleep(std::time::Duration::from_millis(30)).await;
@@ -1790,6 +1854,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn snapshot_detail_reports_status_output_and_elapsed() {
+        redirect_bg_output_logs();
         let tool = BashTool::default();
         let id = start_sleep_job(&tool, "session-1", "watch").await;
         assert!(!id.is_empty());
@@ -1828,6 +1893,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn disabled_timeout_background_job_can_still_be_cancelled() {
+        redirect_bg_output_logs();
         let tool = BashTool::default();
         let started = tool
             .execute(
@@ -1872,6 +1938,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn detached_job_reports_incremental_output_before_it_finishes() {
+        redirect_bg_output_logs();
         let tool = BashTool::default();
         let started = tool
             .execute(
@@ -1919,6 +1986,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn append_output_keeps_accepting_data_past_the_in_memory_cap() {
+        redirect_bg_output_logs();
         let manager = BackgroundShellManager::new();
         let id = "overflow-job";
         manager
@@ -1940,7 +2008,7 @@ mod tests {
             "rolling tail buffer must keep accepting new output past the cap"
         );
         assert!(
-            output.len() <= MAX_OUTPUT * 2 + "... earlier output truncated ...\n".len(),
+            output.len() <= MAX_OUTPUT * 2 + TRUNCATION_MARKER.len(),
             "in-memory buffer must stay bounded, got {} bytes",
             output.len()
         );
@@ -1948,7 +2016,40 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn in_memory_window_keeps_a_single_truncation_marker_across_refills() {
+        redirect_bg_output_logs();
+        let manager = BackgroundShellManager::new();
+        let id = "marker-stack-job";
+        manager
+            .insert_running(id, "session-1", "marker test".into(), "test".into())
+            .await
+            .expect("insert running job");
+
+        // Two full refill rounds: after each overflow the window must carry
+        // exactly one marker (no partial remnants stacking under a fresh one).
+        for _ in 0..2 {
+            let chunk = "y".repeat(1024);
+            for _ in 0..(MAX_OUTPUT * 2 / 1024 + 8) {
+                manager.append_output(id, &chunk).await;
+            }
+            let (_, _, _, output, _, _) = manager.snapshot(id).await.expect("job exists");
+            assert!(
+                output.starts_with(TRUNCATION_MARKER),
+                "window must start with the truncation marker after overflow"
+            );
+            assert_eq!(
+                output.matches(TRUNCATION_MARKER).count(),
+                1,
+                "exactly one marker expected, got: {:?}",
+                &output[..200.min(output.len())]
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn since_offset_polling_returns_only_new_output() {
+        redirect_bg_output_logs();
         let tool = BashTool::default();
         let started = tool
             .execute(
