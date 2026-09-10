@@ -4,6 +4,7 @@ pub mod bash_ast;
 pub mod builtin;
 pub mod display;
 pub mod git_worktree;
+pub mod output_log;
 pub mod path_policy;
 pub mod registry;
 pub mod sandbox;

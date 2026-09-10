@@ -18,6 +18,13 @@ const DEFAULT_BG_TIMEOUT_S: u64 = 600;
 const MAX_BG_TIMEOUT_S: u64 = 86_400; // 24h
 const MAX_BACKGROUND_JOBS: usize = 256;
 const MAX_RUNNING_JOBS: usize = 16;
+/// Per-session cap, strictly tighter than the process-global cap, so one
+/// session (or one delegate) cannot alone exhaust every slot on a shared
+/// standalone server.
+const MAX_RUNNING_JOBS_PER_SESSION: usize = 8;
+/// Bound on how long `stop()` waits to observe the job actually leave
+/// `Running` before reporting an unconfirmed request back to the caller.
+const STOP_CONFIRM_TIMEOUT_MS: u64 = 2_000;
 
 #[derive(Debug, Clone)]
 pub struct BashOptions {
@@ -55,6 +62,43 @@ pub(crate) enum ShellStatus {
     Cancelled,
 }
 
+/// Cooperative cancellation signal with an event-driven observer: `cancelled()`
+/// resolves as soon as `cancel()` is called instead of polling on an interval,
+/// so cancellation works uniformly whether or not a timeout is also in play.
+#[derive(Debug, Default)]
+pub(crate) struct CancelToken {
+    flag: std::sync::atomic::AtomicBool,
+    notify: tokio::sync::Notify,
+}
+
+impl CancelToken {
+    fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    pub(crate) fn cancel(&self) {
+        self.flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.notify.notify_waiters();
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.flag.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Resolves once `cancel()` has been called. Registers the waiter before
+    /// checking the flag so a `cancel()` racing with the first poll is never
+    /// missed (unlike a plain `sleep`-based busy loop).
+    async fn cancelled(&self) {
+        loop {
+            let notified = self.notify.notified();
+            if self.is_cancelled() {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
 #[derive(Clone)]
 struct ShellJob {
     session_id: String,
@@ -64,16 +108,23 @@ struct ShellJob {
     output: String,
     exit_code: Option<i32>,
     started_at: std::time::Instant,
-    cancel: Arc<std::sync::atomic::AtomicBool>,
+    cancel: Arc<CancelToken>,
+    output_log: crate::output_log::OutputLog,
 }
 
-/// Compact info about a running background shell (for /ps panel lists).
+/// Compact info about a background shell (for /ps panel lists). Covers both
+/// running jobs and — when the caller asks for recent history — jobs that
+/// already reached a terminal state, so a finished task doesn't just vanish
+/// from the panel (issues/bash_background_issues.md #7 point 4).
 #[derive(Debug, Clone)]
 pub struct BackgroundJobInfo {
     pub id: String,
     pub description: String,
     pub command: String,
     pub elapsed_secs: u64,
+    /// `running` | `complete` | `failed` | `timedout` | `cancelled`
+    pub status: String,
+    pub running: bool,
 }
 
 /// Full snapshot of a background shell (for in-panel output views).
@@ -107,20 +158,52 @@ impl BackgroundShellManager {
         session_id: &str,
         description: String,
         command: String,
-    ) -> Result<Arc<std::sync::atomic::AtomicBool>, String> {
+    ) -> Result<Arc<CancelToken>, String> {
         let mut jobs = self.jobs.lock().await;
-        if jobs
+        let running_for_session = jobs
             .values()
-            .filter(|job| job.status == ShellStatus::Running)
-            .count()
-            >= MAX_RUNNING_JOBS
-        {
+            .filter(|job| job.session_id == session_id && job.status == ShellStatus::Running)
+            .count();
+        if running_for_session >= MAX_RUNNING_JOBS_PER_SESSION {
             return Err(format!(
-                "background shell limit reached ({MAX_RUNNING_JOBS} running jobs)"
+                "background shell limit reached for this session \
+                 ({running_for_session}/{MAX_RUNNING_JOBS_PER_SESSION} running)"
             ));
         }
+        let running_total = jobs
+            .values()
+            .filter(|job| job.status == ShellStatus::Running)
+            .count();
+        if running_total >= MAX_RUNNING_JOBS {
+            return Err(format!(
+                "background shell limit reached globally \
+                 ({running_total}/{MAX_RUNNING_JOBS} running across all sessions)"
+            ));
+        }
+        let mut evicted_logs: Vec<crate::output_log::OutputLog> = Vec::new();
         if jobs.len() >= MAX_BACKGROUND_JOBS {
-            jobs.retain(|_, job| job.status == ShellStatus::Running);
+            // Evict the oldest *finished* jobs first (FIFO), not every
+            // finished job in one sweep, so unrelated sessions' history
+            // isn't wiped out by one session's churn. Never evict a job
+            // whose completion notification hasn't been drained yet —
+            // untracking it would silently destroy the notification before
+            // the owning session ever sees it (issues/bash_background_issues.md #5).
+            let hub = crate::task_notify::global_hub();
+            let mut finished: Vec<(String, std::time::Instant)> = jobs
+                .iter()
+                .filter(|(id, job)| {
+                    job.status != ShellStatus::Running && !hub.has_notification(id)
+                })
+                .map(|(id, job)| (id.clone(), job.started_at))
+                .collect();
+            finished.sort_by_key(|(_, started_at)| *started_at);
+            let overflow = jobs.len() + 1 - MAX_BACKGROUND_JOBS;
+            for (evict_id, _) in finished.into_iter().take(overflow) {
+                if let Some(job) = jobs.remove(&evict_id) {
+                    evicted_logs.push(job.output_log);
+                }
+                hub.untrack(&evict_id);
+            }
         }
         if jobs.len() >= MAX_BACKGROUND_JOBS {
             return Err(format!(
@@ -136,7 +219,7 @@ impl BackgroundShellManager {
             crate::task_notify::TaskKind::Bash,
             &description,
         );
-        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancel = CancelToken::new();
         jobs.insert(
             id.to_string(),
             ShellJob {
@@ -148,8 +231,13 @@ impl BackgroundShellManager {
                 exit_code: None,
                 started_at: std::time::Instant::now(),
                 cancel: cancel.clone(),
+                output_log: crate::output_log::OutputLog::new(session_id, id),
             },
         );
+        drop(jobs);
+        for log in evicted_logs {
+            log.remove().await;
+        }
         Ok(cancel)
     }
 
@@ -158,21 +246,29 @@ impl BackgroundShellManager {
         let jobs = self.jobs.lock().await;
         for job in jobs.values() {
             if job.session_id == session_id && job.status == ShellStatus::Running {
-                job.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+                job.cancel.cancel();
             }
         }
     }
 
     async fn append_output(&self, id: &str, chunk: &str) {
-        if let Some(job) = self.jobs.lock().await.get_mut(id) {
-            if job.output.len() < MAX_OUTPUT * 2 {
-                job.output.push_str(chunk);
-                if job.output.len() > MAX_OUTPUT * 2 {
-                    truncate_utf8_bytes_in_place(&mut job.output, MAX_OUTPUT * 2);
-                    job.output.push_str("\n... output truncated ...");
+        let output_log = {
+            let mut jobs = self.jobs.lock().await;
+            let Some(job) = jobs.get_mut(id) else {
+                return;
+            };
+            job.output.push_str(chunk);
+            if job.output.len() > MAX_OUTPUT * 2 {
+                let overflow = job.output.len() - MAX_OUTPUT * 2;
+                drop_utf8_bytes_from_front_in_place(&mut job.output, overflow);
+                if !job.output.starts_with("... earlier output truncated ...\n") {
+                    job.output
+                        .insert_str(0, "... earlier output truncated ...\n");
                 }
             }
-        }
+            job.output_log.clone()
+        };
+        output_log.append(chunk).await;
     }
 
     async fn finish(&self, id: &str, status: ShellStatus, exit_code: Option<i32>) {
@@ -216,6 +312,12 @@ impl BackgroundShellManager {
         ))
     }
 
+    /// Handle to a job's disk-backed output log, for incremental
+    /// (`since_offset`) reads (issues/bash_background_issues.md #6).
+    pub async fn output_log(&self, id: &str) -> Option<crate::output_log::OutputLog> {
+        self.jobs.lock().await.get(id).map(|job| job.output_log.clone())
+    }
+
     /// List all known background shell jobs (for TaskList unification).
     pub async fn list_jobs(&self) -> Vec<(String, String, String, bool)> {
         self.jobs
@@ -235,10 +337,22 @@ impl BackgroundShellManager {
 
     /// Running background jobs for one session, oldest first (for /ps panel).
     pub async fn list_running_for_session(&self, session_id: &str) -> Vec<BackgroundJobInfo> {
-        let mut jobs: Vec<(std::time::Instant, BackgroundJobInfo)> = self
-            .jobs
-            .lock()
-            .await
+        self.list_for_session(session_id, 0).await
+    }
+
+    /// Background jobs for one session: every running job (oldest first),
+    /// followed by up to `recent_finished_limit` most-recently-started jobs
+    /// that already reached a terminal state. Keeping a bounded tail of
+    /// finished jobs means a completed/failed task stays visible in the /ps
+    /// panel instead of disappearing the instant it stops running
+    /// (issues/bash_background_issues.md #7 point 4).
+    pub async fn list_for_session(
+        &self,
+        session_id: &str,
+        recent_finished_limit: usize,
+    ) -> Vec<BackgroundJobInfo> {
+        let jobs = self.jobs.lock().await;
+        let mut running: Vec<(std::time::Instant, BackgroundJobInfo)> = jobs
             .iter()
             .filter(|(_, job)| job.session_id == session_id && job.status == ShellStatus::Running)
             .map(|(id, job)| {
@@ -249,13 +363,47 @@ impl BackgroundShellManager {
                         description: job.description.clone(),
                         command: job.command.clone(),
                         elapsed_secs: job.started_at.elapsed().as_secs(),
+                        status: "running".to_string(),
+                        running: true,
                     },
                 )
             })
             .collect();
         // Sort by Instant so sub-second starts stay stable (elapsed_secs is too coarse).
-        jobs.sort_by_key(|(started_at, _)| *started_at);
-        jobs.into_iter().map(|(_, info)| info).collect()
+        running.sort_by_key(|(started_at, _)| *started_at);
+        let mut result: Vec<BackgroundJobInfo> =
+            running.into_iter().map(|(_, info)| info).collect();
+
+        if recent_finished_limit > 0 {
+            let mut finished: Vec<(std::time::Instant, BackgroundJobInfo)> = jobs
+                .iter()
+                .filter(|(_, job)| {
+                    job.session_id == session_id && job.status != ShellStatus::Running
+                })
+                .map(|(id, job)| {
+                    (
+                        job.started_at,
+                        BackgroundJobInfo {
+                            id: id.clone(),
+                            description: job.description.clone(),
+                            command: job.command.clone(),
+                            elapsed_secs: job.started_at.elapsed().as_secs(),
+                            status: format!("{:?}", job.status).to_lowercase(),
+                            running: false,
+                        },
+                    )
+                })
+                .collect();
+            // Most recently started first, as a proxy for most recently finished.
+            finished.sort_by_key(|(started_at, _)| std::cmp::Reverse(*started_at));
+            result.extend(
+                finished
+                    .into_iter()
+                    .take(recent_finished_limit)
+                    .map(|(_, info)| info),
+            );
+        }
+        result
     }
 
     /// Full snapshot of one background job (for in-panel output view).
@@ -273,17 +421,53 @@ impl BackgroundShellManager {
         })
     }
 
-    pub async fn stop(&self, id: &str) -> bool {
-        let jobs = self.jobs.lock().await;
-        let Some(job) = jobs.get(id) else {
-            return false;
+    /// Request cancellation of a running job and wait briefly to see whether
+    /// it actually reached a terminal state, so callers (model, TUI, RPC) get
+    /// an honest answer instead of an unconditional "stopped" the moment the
+    /// cancel flag is set (see issues/bash_background_issues.md #1).
+    pub async fn stop(&self, id: &str) -> StopOutcome {
+        let cancel = {
+            let jobs = self.jobs.lock().await;
+            let Some(job) = jobs.get(id) else {
+                return StopOutcome::NotFound;
+            };
+            if job.status != ShellStatus::Running {
+                return StopOutcome::NotFound;
+            }
+            job.cancel.clone()
         };
-        if job.status != ShellStatus::Running {
-            return false;
+        cancel.cancel();
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_millis(STOP_CONFIRM_TIMEOUT_MS);
+        loop {
+            let still_running = {
+                let jobs = self.jobs.lock().await;
+                jobs.get(id).map(|job| job.status == ShellStatus::Running)
+            };
+            match still_running {
+                None | Some(false) => return StopOutcome::Confirmed,
+                Some(true) => {}
+            }
+            if std::time::Instant::now() >= deadline {
+                return StopOutcome::Requested;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
-        job.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
-        true
     }
+}
+
+/// Outcome of [`BackgroundShellManager::stop`] — distinguishes an observed
+/// termination from a cancellation request that is still in flight, so
+/// callers never claim a stop that hasn't actually happened yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopOutcome {
+    NotFound,
+    /// The job was observed to leave `Running` within the confirm window.
+    Confirmed,
+    /// Cancellation was requested but the job was still running when the
+    /// confirm window elapsed (e.g. a remote/kaos job that cannot be killed,
+    /// or a slow-to-die process tree).
+    Requested,
 }
 
 impl Default for BackgroundShellManager {
@@ -352,7 +536,8 @@ for background jobs (shell_id/stop remain as aliases)."
                 "run_in_background": {"type": "boolean", "description": "Start in background and return a shell_id / task id immediately"},
                 "disable_timeout": {"type": "boolean", "description": "If true, do not apply a timeout. Only applies when run_in_background is true."},
                 "shell_id": {"type": "string", "description": "Poll a previously started background shell (prefer TaskOutput)"},
-                "stop": {"type": "boolean", "description": "With shell_id, stop the background process tree (prefer TaskStop)"}
+                "stop": {"type": "boolean", "description": "With shell_id, stop the background process tree (prefer TaskStop)"},
+                "since_offset": {"type": "integer", "description": "With shell_id, return only output written after this byte offset (from a previous poll's next_offset) instead of a tail snapshot — for incremental catch-up on long-running jobs."}
             }
         })
     }
@@ -370,15 +555,21 @@ for background jobs (shell_id/stop remain as aliases)."
                 .unwrap_or(false);
             if !has_command {
                 if input.get("stop").and_then(Value::as_bool).unwrap_or(false) {
-                    return Ok(if self.backgrounds.stop(shell_id).await {
-                        ToolOutput::success(format!("Stop requested for shell_id: {shell_id}"))
-                    } else {
-                        ToolOutput::error(format!(
+                    return Ok(match self.backgrounds.stop(shell_id).await {
+                        StopOutcome::Confirmed => {
+                            ToolOutput::success(format!("Stopped shell_id: {shell_id}"))
+                        }
+                        StopOutcome::Requested => ToolOutput::success(format!(
+                            "Stop requested for shell_id: {shell_id}, but it had not \
+                             terminated within {STOP_CONFIRM_TIMEOUT_MS}ms — poll again to confirm."
+                        )),
+                        StopOutcome::NotFound => ToolOutput::error(format!(
                             "Unknown or no longer running shell_id: {shell_id}"
-                        ))
+                        )),
                     });
                 }
-                return Ok(self.poll_shell(shell_id).await);
+                let since_offset = input.get("since_offset").and_then(Value::as_u64);
+                return Ok(self.poll_shell(shell_id, since_offset).await);
             }
         }
 
@@ -513,7 +704,7 @@ fn resolve_timeout_ms(input: &Value, run_in_background: bool, default_fg_timeout
 }
 
 impl BashTool {
-    async fn poll_shell(&self, shell_id: &str) -> ToolOutput {
+    async fn poll_shell(&self, shell_id: &str, since_offset: Option<u64>) -> ToolOutput {
         match self.backgrounds.snapshot(shell_id).await {
             None => ToolOutput::error(format!("Unknown shell_id: {}", shell_id)),
             Some((description, _command, status, output, exit_code, running)) => {
@@ -524,9 +715,27 @@ impl BashTool {
                 if let Some(code) = exit_code {
                     out.push_str(&format!("\nexit_code: {}", code));
                 }
+                if let Some(offset) = since_offset {
+                    let (delta, next_offset) = match self.backgrounds.output_log(shell_id).await {
+                        Some(log) => log.read_from(offset).await,
+                        None => (String::new(), offset),
+                    };
+                    out.push_str(&format!(
+                        "\nsince_offset: {offset}\nnext_offset: {next_offset}"
+                    ));
+                    if !delta.is_empty() {
+                        out.push_str("\n\n");
+                        out.push_str(&truncate_chars(&delta, MAX_OUTPUT));
+                    } else if running {
+                        out.push_str(
+                            "\n\n(no new output since offset — still running, call again later)",
+                        );
+                    }
+                    return ToolOutput::success(out);
+                }
                 if !output.is_empty() {
                     out.push_str("\n\n");
-                    out.push_str(&truncate_chars(&output, MAX_OUTPUT));
+                    out.push_str(&tail_chars(&output, MAX_OUTPUT));
                 } else if running {
                     out.push_str("\n\n(still running — call TaskOutput/Bash again with this id)");
                 }
@@ -566,6 +775,7 @@ impl BashTool {
                     &command,
                     &cwd,
                     timeout_ms,
+                    None,
                     Some(&cancel),
                     &desc_for_kaos,
                     &session_id,
@@ -627,6 +837,7 @@ output) will be delivered automatically as a <task-notification> — no polling 
                 &cwd,
                 Some(timeout_ms),
                 interrupted.as_ref(),
+                None,
                 &description,
                 &session_id,
             )
@@ -748,56 +959,31 @@ output) will be delivered automatically as a <task-notification> — no polling 
 
                     let mgr = self.backgrounds.clone();
                     let id_clone = id.clone();
+                    // `collected` keeps receiving stdio from the still-running
+                    // `pump` task; a periodic flush copies the delta into the
+                    // manager so `/ps` output is live instead of a single
+                    // snapshot at detach time (issues/bash_background_issues.md #2).
+                    let flush_offset = Arc::new(std::sync::atomic::AtomicUsize::new(so_far_len));
                     tokio::spawn(async move {
                         let _sandbox_guard = sandbox_guard;
-                        let waited = tokio::select! {
-                            result = tokio::time::timeout(
-                                tokio::time::Duration::from_millis(MAX_BG_TIMEOUT_S * 1000),
-                                child.wait(),
-                            ) => Some(result),
-                            _ = wait_for_interrupt(Some(cancel)) => None,
-                        };
-                        let status = match waited {
-                            Some(Ok(Ok(status))) => status,
-                            Some(Ok(Err(error))) => {
-                                mgr.append_output(&id_clone, &format!("\nwait error: {error}"))
-                                    .await;
-                                mgr.finish(&id_clone, ShellStatus::Failed, None).await;
-                                join_pump(pump).await;
-                                return;
-                            }
-                            Some(Err(_)) => {
-                                terminate_process_tree(&mut child).await;
-                                mgr.append_output(
-                                    &id_clone,
-                                    "\n(background lifetime exceeded; killed)",
-                                )
-                                .await;
-                                mgr.finish(&id_clone, ShellStatus::TimedOut, None).await;
-                                join_pump(pump).await;
-                                return;
-                            }
-                            None => {
-                                terminate_process_tree(&mut child).await;
-                                mgr.append_output(&id_clone, "\n(cancelled; process tree killed)")
-                                    .await;
-                                mgr.finish(&id_clone, ShellStatus::Cancelled, None).await;
-                                join_pump(pump).await;
-                                return;
-                            }
-                        };
-                        join_pump(pump).await;
-                        let late = collected.lock().await.clone();
-                        if late.len() > so_far_len {
-                            mgr.append_output(&id_clone, &late[so_far_len..]).await;
-                        }
-                        let code = status.code();
-                        let st = if status.success() {
-                            ShellStatus::Complete
-                        } else {
-                            ShellStatus::Failed
-                        };
-                        mgr.finish(&id_clone, st, code).await;
+                        let flusher = spawn_output_flusher(
+                            collected.clone(),
+                            mgr.clone(),
+                            id_clone.clone(),
+                            flush_offset.clone(),
+                        );
+                        let (status, code) = drive_background_child(
+                            mgr.clone(),
+                            &id_clone,
+                            child,
+                            pump,
+                            Some(MAX_BG_TIMEOUT_S * 1000),
+                            cancel,
+                        )
+                        .await;
+                        flusher.abort();
+                        flush_pending_output(&collected, &mgr, &id_clone, &flush_offset).await;
+                        mgr.finish(&id_clone, status, code).await;
                     });
 
                     Ok(ToolOutput::success(format!(
@@ -822,6 +1008,107 @@ Its completion will be delivered automatically as a <task-notification> — no p
     }
 }
 
+/// Copy whatever `collected` has accumulated past `offset` into the manager
+/// and advance `offset`, used both by the periodic flusher and for the final
+/// catch-up flush once the child has exited.
+async fn flush_pending_output(
+    collected: &Arc<Mutex<String>>,
+    mgr: &Arc<BackgroundShellManager>,
+    id: &str,
+    offset: &Arc<std::sync::atomic::AtomicUsize>,
+) {
+    let snapshot = collected.lock().await.clone();
+    let prev = offset.load(std::sync::atomic::Ordering::SeqCst);
+    if snapshot.len() > prev {
+        mgr.append_output(id, &snapshot[prev..]).await;
+        offset.store(snapshot.len(), std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Periodically flushes `collected` into the manager while a
+/// foreground-timeout-detached child is still running (see
+/// [`flush_pending_output`]). Aborted by the caller once the child exits.
+fn spawn_output_flusher(
+    collected: Arc<Mutex<String>>,
+    mgr: Arc<BackgroundShellManager>,
+    id: String,
+    offset: Arc<std::sync::atomic::AtomicUsize>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
+            flush_pending_output(&collected, &mgr, &id, &offset).await;
+        }
+    })
+}
+
+/// Shared tail for every background/detached child: wait for exit (bounded by
+/// `timeout_ms` when set) or cooperative cancellation, kill the process tree
+/// on timeout/cancel, and join the stdio pump. Does not call
+/// [`BackgroundShellManager::finish`] — callers that need a final output
+/// flush before the completion notification is computed (the
+/// foreground-timeout-detach path) must do so between this call and calling
+/// `finish` themselves.
+async fn drive_background_child(
+    mgr: Arc<BackgroundShellManager>,
+    id: &str,
+    mut child: Child,
+    pump: tokio::task::JoinHandle<()>,
+    timeout_ms: Option<u64>,
+    cancel: Arc<CancelToken>,
+) -> (ShellStatus, Option<i32>) {
+    let waited = match timeout_ms {
+        Some(ms) => {
+            tokio::select! {
+                result = tokio::time::timeout(tokio::time::Duration::from_millis(ms), child.wait()) => Some(result),
+                _ = cancel.cancelled() => None,
+            }
+        }
+        None => {
+            tokio::select! {
+                result = child.wait() => Some(Ok(result)),
+                _ = cancel.cancelled() => None,
+            }
+        }
+    };
+    let status = match waited {
+        Some(Ok(Ok(status))) => {
+            let code = status.code();
+            let st = if status.success() {
+                ShellStatus::Complete
+            } else {
+                ShellStatus::Failed
+            };
+            (st, code)
+        }
+        Some(Ok(Err(e))) => {
+            mgr.append_output(id, &format!("\nwait error: {}", e))
+                .await;
+            (ShellStatus::Failed, None)
+        }
+        Some(Err(_)) => {
+            terminate_process_tree(&mut child).await;
+            mgr.append_output(
+                id,
+                &format!(
+                    "\n(timed out after {}ms and killed)",
+                    timeout_ms.unwrap_or_default()
+                ),
+            )
+            .await;
+            (ShellStatus::TimedOut, None)
+        }
+        None => {
+            terminate_process_tree(&mut child).await;
+            mgr.append_output(id, "\n(cancelled; process tree killed)")
+                .await;
+            (ShellStatus::Cancelled, None)
+        }
+    };
+    join_pump(pump).await;
+    status
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_shell_job(
     mgr: Arc<BackgroundShellManager>,
@@ -830,7 +1117,7 @@ async fn run_shell_job(
     cwd: PathBuf,
     session_root: PathBuf,
     timeout_ms: Option<u64>,
-    cancel: Arc<std::sync::atomic::AtomicBool>,
+    cancel: Arc<CancelToken>,
     sandbox: crate::sandbox::SandboxPolicy,
 ) {
     let (shell, flag) = shell_and_flag();
@@ -877,52 +1164,9 @@ async fn run_shell_job(
         pump_stdio_to_mgr(stdout, stderr, mgr_out, id_out).await;
     });
 
-    let waited = if let Some(ms) = timeout_ms {
-        tokio::select! {
-            result = tokio::time::timeout(tokio::time::Duration::from_millis(ms), child.wait()) => Some(result),
-            _ = wait_for_interrupt(Some(cancel)) => None,
-        }
-    } else {
-        Some(Ok(child.wait().await))
-    };
-    let status = match waited {
-        Some(result) => match result {
-            Ok(Ok(status)) => {
-                let code = status.code();
-                let st = if status.success() {
-                    ShellStatus::Complete
-                } else {
-                    ShellStatus::Failed
-                };
-                (st, code)
-            }
-            Ok(Err(e)) => {
-                mgr.append_output(&id, &format!("\nwait error: {}", e))
-                    .await;
-                (ShellStatus::Failed, None)
-            }
-            Err(_) => {
-                terminate_process_tree(&mut child).await;
-                mgr.append_output(
-                    &id,
-                    &format!(
-                        "\n(timed out after {}ms and killed)",
-                        timeout_ms.unwrap_or_default()
-                    ),
-                )
-                .await;
-                (ShellStatus::TimedOut, None)
-            }
-        },
-        None => {
-            terminate_process_tree(&mut child).await;
-            mgr.append_output(&id, "\n(cancelled; process tree killed)")
-                .await;
-            (ShellStatus::Cancelled, None)
-        }
-    };
-    join_pump(pump).await;
-    mgr.finish(&id, status.0, status.1).await;
+    let (status, code) =
+        drive_background_child(mgr.clone(), &id, child, pump, timeout_ms, cancel).await;
+    mgr.finish(&id, status, code).await;
 }
 
 async fn collect_stdio(
@@ -1088,6 +1332,7 @@ async fn run_via_kaos(
     cwd: &Path,
     timeout_ms: Option<u64>,
     interrupted: Option<&Arc<std::sync::atomic::AtomicBool>>,
+    cancel: Option<&Arc<CancelToken>>,
     description: &str,
     session_id: &str,
 ) -> anyhow::Result<ToolOutput> {
@@ -1097,18 +1342,53 @@ async fn run_via_kaos(
         cwd = %cwd.display(),
         "Executing Bash via Kaos"
     );
+    enum Outcome {
+        Done(Result<kkagent_kaos::ExecResult, kkagent_kaos::KaosError>),
+        TimedOut,
+        Cancelled,
+    }
     let exec = kaos.exec(command, Some(cwd));
-    let result = if let Some(ms) = timeout_ms {
-        match tokio::time::timeout(std::time::Duration::from_millis(ms), exec).await {
-            Ok(r) => r,
-            Err(_) => {
-                return Ok(ToolOutput::error(format!(
-                    "Remote command timed out after {ms}ms ({description})"
-                )));
+    let outcome = match (timeout_ms, cancel) {
+        (Some(ms), Some(cancel)) => {
+            tokio::select! {
+                r = tokio::time::timeout(std::time::Duration::from_millis(ms), exec) => match r {
+                    Ok(r) => Outcome::Done(r),
+                    Err(_) => Outcome::TimedOut,
+                },
+                _ = cancel.cancelled() => Outcome::Cancelled,
             }
         }
-    } else {
-        exec.await
+        (Some(ms), None) => match tokio::time::timeout(std::time::Duration::from_millis(ms), exec).await
+        {
+            Ok(r) => Outcome::Done(r),
+            Err(_) => Outcome::TimedOut,
+        },
+        (None, Some(cancel)) => {
+            tokio::select! {
+                r = exec => Outcome::Done(r),
+                _ = cancel.cancelled() => Outcome::Cancelled,
+            }
+        }
+        (None, None) => Outcome::Done(exec.await),
+    };
+    let result = match outcome {
+        Outcome::TimedOut => {
+            return Ok(ToolOutput::error(format!(
+                "Remote command timed out after {}ms ({description})",
+                timeout_ms.unwrap_or_default()
+            )));
+        }
+        Outcome::Cancelled => {
+            // kaos/SSH exec has no remote kill: cancellation only stops us
+            // from waiting on it — the remote process may still be running.
+            // Honest about that instead of claiming a confirmed stop
+            // (issues/bash_background_issues.md #1 point 4).
+            return Ok(ToolOutput::error(
+                "Cancelled: stopped waiting for the remote command. It may still be \
+                 running on the remote host — kaos/SSH exec cannot be killed remotely.",
+            ));
+        }
+        Outcome::Done(result) => result,
     };
     if interrupted.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst)) {
         return Ok(ToolOutput::error("Interrupted"));
@@ -1172,15 +1452,34 @@ fn truncate_chars(s: &str, max: usize) -> String {
     }
 }
 
-fn truncate_utf8_bytes_in_place(value: &mut String, max: usize) {
-    if value.len() <= max {
+/// Keep the trailing `max` characters of `s`, prefixing a marker when
+/// something was dropped. Mirrors `task_notify::excerpt`'s tail semantics so
+/// polling and push notifications show the same end of a long-running job's
+/// output instead of disagreeing on which end matters
+/// (issues/bash_background_issues.md #6).
+fn tail_chars(s: &str, max: usize) -> String {
+    let total = s.chars().count();
+    if total <= max {
+        return s.to_string();
+    }
+    let start = total - max;
+    let tail: String = s.chars().skip(start).collect();
+    format!("... earlier output omitted ({total} chars total) ...\n{tail}")
+}
+
+fn drop_utf8_bytes_from_front_in_place(value: &mut String, drop_bytes: usize) {
+    if drop_bytes == 0 {
         return;
     }
-    let mut boundary = max;
-    while boundary > 0 && !value.is_char_boundary(boundary) {
-        boundary -= 1;
+    if drop_bytes >= value.len() {
+        value.clear();
+        return;
     }
-    value.truncate(boundary);
+    let mut boundary = drop_bytes;
+    while boundary < value.len() && !value.is_char_boundary(boundary) {
+        boundary += 1;
+    }
+    value.drain(..boundary);
 }
 
 #[cfg(test)]
@@ -1204,7 +1503,26 @@ mod tests {
     #[tokio::test]
     async fn limits_concurrent_background_jobs() {
         let manager = BackgroundShellManager::new();
+        // Spread across sessions (fewer than MAX_RUNNING_JOBS_PER_SESSION each)
+        // so the per-session cap doesn't shadow the global cap under test.
         for index in 0..MAX_RUNNING_JOBS {
+            let session = format!("session-{}", index % (MAX_RUNNING_JOBS_PER_SESSION - 1));
+            manager
+                .insert_running(&format!("job-{index}"), &session, "test".into(), "test".into())
+                .await
+                .expect("job within global limit");
+        }
+        let error = manager
+            .insert_running("overflow", "session-overflow", "test".into(), "test".into())
+            .await
+            .expect_err("job over the global limit must fail");
+        assert!(error.contains("limit reached"));
+    }
+
+    #[tokio::test]
+    async fn limits_concurrent_background_jobs_per_session() {
+        let manager = BackgroundShellManager::new();
+        for index in 0..MAX_RUNNING_JOBS_PER_SESSION {
             manager
                 .insert_running(
                     &format!("job-{index}"),
@@ -1213,21 +1531,25 @@ mod tests {
                     "test".into(),
                 )
                 .await
-                .expect("job within limit");
+                .expect("job within per-session limit");
         }
         let error = manager
             .insert_running("overflow", "bash-test", "test".into(), "test".into())
             .await
-            .expect_err("job over limit must fail");
-        assert!(error.contains("limit reached"));
+            .expect_err("job over the per-session limit must fail");
+        assert!(error.contains("limit reached for this session"));
     }
 
     #[test]
-    fn truncates_utf8_only_at_character_boundaries() {
-        let mut value = "测试内容".repeat(MAX_OUTPUT);
-        truncate_utf8_bytes_in_place(&mut value, MAX_OUTPUT * 2);
-        assert!(value.len() <= MAX_OUTPUT * 2);
+    fn drops_utf8_only_at_character_boundaries_from_the_front() {
+        let repeated = "测试内容".repeat(MAX_OUTPUT);
+        let mut value = repeated.clone();
+        let original_len = value.len();
+        drop_utf8_bytes_from_front_in_place(&mut value, MAX_OUTPUT);
+        assert!(value.len() < original_len);
         assert!(std::str::from_utf8(value.as_bytes()).is_ok());
+        // Dropped from the front: what remains must be a suffix of the original.
+        assert!(repeated.ends_with(&value));
     }
 
     #[test]
@@ -1501,5 +1823,199 @@ mod tests {
         .expect("stopped job must settle to cancelled");
 
         assert!(tool.backgrounds.snapshot_detail("missing").await.is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn disabled_timeout_background_job_can_still_be_cancelled() {
+        let tool = BashTool::default();
+        let started = tool
+            .execute(
+                json!({
+                    "command": "sleep 30",
+                    "description": "disable_timeout cancellation",
+                    "run_in_background": true,
+                    "disable_timeout": true
+                }),
+                &context(None),
+            )
+            .await
+            .expect("start background job");
+        let id = started
+            .content
+            .split("shell_id=")
+            .nth(1)
+            .and_then(|tail| tail.split([')', ' ', '/', '.']).next())
+            .expect("shell id in start response")
+            .to_string();
+
+        tool.backgrounds.stop(&id).await;
+
+        tokio::time::timeout(std::time::Duration::from_secs(4), async {
+            loop {
+                let detail = tool
+                    .backgrounds
+                    .snapshot_detail(&id)
+                    .await
+                    .expect("detail exists");
+                if !detail.running {
+                    assert_eq!(detail.status, "cancelled");
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("disable_timeout=true job must still converge to cancelled after stop");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn detached_job_reports_incremental_output_before_it_finishes() {
+        let tool = BashTool::default();
+        let started = tool
+            .execute(
+                json!({
+                    "command": "for i in 1 2 3 4 5; do echo line-$i; sleep 0.2; done",
+                    "description": "incremental output during detach",
+                    "timeout_ms": 300
+                }),
+                &context(None),
+            )
+            .await
+            .expect("foreground command detaches after timeout");
+        let id = started
+            .content
+            .split("shell_id: ")
+            .nth(1)
+            .and_then(|tail| tail.split(['\n', ' ']).next())
+            .expect("detached shell id in timeout response")
+            .to_string();
+
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let detail = tool
+                    .backgrounds
+                    .snapshot_detail(&id)
+                    .await
+                    .expect("detail exists");
+                let lines = detail.output.matches("line-").count();
+                if detail.running && lines >= 2 {
+                    break;
+                }
+                assert!(
+                    detail.running,
+                    "job finished before the flusher proved incremental delivery"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("detached job must expose at least 2 lines of output before it finishes");
+
+        tool.backgrounds.stop(&id).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn append_output_keeps_accepting_data_past_the_in_memory_cap() {
+        let manager = BackgroundShellManager::new();
+        let id = "overflow-job";
+        manager
+            .insert_running(id, "session-1", "overflow test".into(), "test".into())
+            .await
+            .expect("insert running job");
+
+        // Push well past MAX_OUTPUT * 2 so the old implementation would have
+        // frozen and silently dropped every chunk after the first ~100KB.
+        let chunk = "x".repeat(1024);
+        for _ in 0..(MAX_OUTPUT * 2 / 1024 + 8) {
+            manager.append_output(id, &chunk).await;
+        }
+        manager.append_output(id, "LATEST-MARKER\n").await;
+
+        let (_, _, _, output, _, _) = manager.snapshot(id).await.expect("job exists");
+        assert!(
+            output.contains("LATEST-MARKER"),
+            "rolling tail buffer must keep accepting new output past the cap"
+        );
+        assert!(
+            output.len() <= MAX_OUTPUT * 2 + "... earlier output truncated ...\n".len(),
+            "in-memory buffer must stay bounded, got {} bytes",
+            output.len()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn since_offset_polling_returns_only_new_output() {
+        let tool = BashTool::default();
+        let started = tool
+            .execute(
+                json!({
+                    "command": "echo first; sleep 0.3; echo second; sleep 5",
+                    "description": "since_offset incremental poll",
+                    "run_in_background": true,
+                    "timeout_ms": 30_000
+                }),
+                &context(None),
+            )
+            .await
+            .expect("start background job");
+        let id = started
+            .content
+            .split("shell_id=")
+            .nth(1)
+            .and_then(|tail| tail.split([')', ' ', '/', '.']).next())
+            .expect("shell id in start response")
+            .to_string();
+
+        // Wait for "first" to land, then poll from offset 0 to learn the
+        // current next_offset (baseline for the incremental poll below).
+        let baseline = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let polled = tool
+                    .execute(json!({"shell_id": id, "since_offset": 0}), &context(None))
+                    .await
+                    .expect("poll from offset 0");
+                if polled.content.contains("first") {
+                    break polled;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("first line must appear promptly");
+        assert!(!baseline.content.contains("second"));
+        let next_offset: u64 = baseline
+            .content
+            .split("next_offset: ")
+            .nth(1)
+            .and_then(|tail| tail.split('\n').next())
+            .and_then(|n| n.trim().parse().ok())
+            .expect("next_offset in poll response");
+
+        // Poll again from that offset once "second" has been printed: the
+        // response must contain only the new line, not "first" again.
+        let incremental = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let polled = tool
+                    .execute(
+                        json!({"shell_id": id, "since_offset": next_offset}),
+                        &context(None),
+                    )
+                    .await
+                    .expect("incremental poll");
+                if polled.content.contains("second") {
+                    break polled;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("second line must appear promptly");
+        assert!(!incremental.content.contains("first"));
+
+        tool.backgrounds.stop(&id).await;
     }
 }

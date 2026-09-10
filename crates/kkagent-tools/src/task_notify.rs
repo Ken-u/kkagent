@@ -25,7 +25,7 @@
 //! session's next turn starts (Claude Code's `later` priority) — they are
 //! never dropped.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
 
 /// How much of a finished task's output rides along in the notification.
@@ -77,8 +77,33 @@ pub type WakeHook = Arc<dyn Fn(&str) + Send + Sync>;
 #[derive(Default)]
 struct HubInner {
     tasks: HashMap<String, TrackedTask>,
+    /// Secondary index so session-scoped lookups (`has_pending`,
+    /// `drain_notifications`, `running_for`) don't scan every other
+    /// session's entries too (issues/bash_background_issues.md #5).
+    by_session: HashMap<String, HashSet<String>>,
     /// See [`TaskNotificationHub::set_wake_hook`].
     wake_hook: Option<WakeHook>,
+}
+
+impl HubInner {
+    fn index_insert(&mut self, session_id: &str, task_id: &str) {
+        self.by_session
+            .entry(session_id.to_string())
+            .or_default()
+            .insert(task_id.to_string());
+    }
+
+    /// Remove `task_id` from whichever session bucket it's indexed under.
+    /// Used when a task moves session (rare: fallback entries created by
+    /// `push_notification` before `track`) or is removed entirely.
+    fn index_remove(&mut self, session_id: &str, task_id: &str) {
+        if let Some(bucket) = self.by_session.get_mut(session_id) {
+            bucket.remove(task_id);
+            if bucket.is_empty() {
+                self.by_session.remove(session_id);
+            }
+        }
+    }
 }
 
 /// Session-keyed registry of background tasks and their pending completion
@@ -106,6 +131,7 @@ impl TaskNotificationHub {
                 notification: None,
             },
         );
+        inner.index_insert(session_id, task_id);
     }
 
     /// Forget a task entirely (explicit stop / external cleanup) without
@@ -115,7 +141,25 @@ impl TaskNotificationHub {
             Ok(inner) => inner,
             Err(poisoned) => poisoned.into_inner(),
         };
-        inner.tasks.remove(task_id);
+        if let Some(task) = inner.tasks.remove(task_id) {
+            inner.index_remove(&task.session_id, task_id);
+        }
+    }
+
+    /// Drop every entry (running or with an undelivered notification)
+    /// belonging to `session_id`. Call this when a session is destroyed so
+    /// its background-task bookkeeping doesn't live on forever in the hub
+    /// (issues/bash_background_issues.md #5).
+    pub fn forget_session(&self, session_id: &str) {
+        let mut inner = match self.inner.lock() {
+            Ok(inner) => inner,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(task_ids) = inner.by_session.remove(session_id) {
+            for task_id in task_ids {
+                inner.tasks.remove(&task_id);
+            }
+        }
     }
 
     /// Queue a completion notification. Delivers to the entry recorded by
@@ -131,9 +175,11 @@ impl TaskNotificationHub {
                 Ok(inner) => inner,
                 Err(poisoned) => poisoned.into_inner(),
             };
+            let task_id = notification.task_id.clone();
+            let previous_session = inner.tasks.get(&task_id).map(|t| t.session_id.clone());
             let entry = inner
                 .tasks
-                .entry(notification.task_id.clone())
+                .entry(task_id.clone())
                 .or_insert_with(|| TrackedTask {
                     session_id: session_id.to_string(),
                     kind: notification.kind,
@@ -142,6 +188,14 @@ impl TaskNotificationHub {
                 });
             entry.session_id = session_id.to_string();
             entry.notification = Some(notification);
+            match previous_session {
+                Some(prev) if prev != session_id => {
+                    inner.index_remove(&prev, &task_id);
+                    inner.index_insert(session_id, &task_id);
+                }
+                Some(_) => {}
+                None => inner.index_insert(session_id, &task_id),
+            }
             inner.wake_hook.clone()
         };
         // Fired after the lock is dropped: the hook spawns an async wake task
@@ -174,9 +228,32 @@ impl TaskNotificationHub {
             Err(poisoned) => poisoned.into_inner(),
         };
         inner
+            .by_session
+            .get(session_id)
+            .is_some_and(|task_ids| {
+                task_ids.iter().any(|id| {
+                    inner
+                        .tasks
+                        .get(id)
+                        .is_some_and(|task| task.notification.is_some())
+                })
+            })
+    }
+
+    /// Whether `task_id` currently has an undelivered notification. Callers
+    /// evicting finished entries elsewhere (e.g. `BackgroundShellManager`'s
+    /// history cap) must check this before `untrack`-ing a task: untracking
+    /// one with a pending notification would silently destroy it before the
+    /// owning session ever drains it (issues/bash_background_issues.md #5).
+    pub fn has_notification(&self, task_id: &str) -> bool {
+        let inner = match self.inner.lock() {
+            Ok(inner) => inner,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        inner
             .tasks
-            .values()
-            .any(|task| task.session_id == session_id && task.notification.is_some())
+            .get(task_id)
+            .is_some_and(|task| task.notification.is_some())
     }
 
     /// Typed entry point for the `SubagentManager` completion sink.
@@ -278,14 +355,23 @@ impl TaskNotificationHub {
             Err(poisoned) => poisoned.into_inner(),
         };
         let mut drained = Vec::new();
-        let done: Vec<String> = inner
-            .tasks
-            .iter()
-            .filter(|(_, task)| task.session_id == session_id && task.notification.is_some())
-            .map(|(id, _)| id.clone())
+        let candidates: Vec<String> = inner
+            .by_session
+            .get(session_id)
+            .map(|ids| ids.iter().cloned().collect())
+            .unwrap_or_default();
+        let done: Vec<String> = candidates
+            .into_iter()
+            .filter(|id| {
+                inner
+                    .tasks
+                    .get(id)
+                    .is_some_and(|task| task.notification.is_some())
+            })
             .collect();
         for id in done {
             if let Some(task) = inner.tasks.remove(&id) {
+                inner.index_remove(&task.session_id, &id);
                 if let Some(notification) = task.notification {
                     drained.push(notification);
                 }
@@ -305,7 +391,9 @@ impl TaskNotificationHub {
             Err(poisoned) => poisoned.into_inner(),
         };
         let notification = inner.tasks.get_mut(task_id)?.notification.take()?;
-        inner.tasks.remove(task_id);
+        if let Some(task) = inner.tasks.remove(task_id) {
+            inner.index_remove(&task.session_id, task_id);
+        }
         Some(notification)
     }
 
@@ -317,10 +405,18 @@ impl TaskNotificationHub {
             Err(poisoned) => poisoned.into_inner(),
         };
         let mut running: Vec<(String, TaskKind, String)> = inner
-            .tasks
-            .iter()
-            .filter(|(_, task)| task.session_id == session_id && task.notification.is_none())
-            .map(|(id, task)| (id.clone(), task.kind, task.description.clone()))
+            .by_session
+            .get(session_id)
+            .into_iter()
+            .flatten()
+            .filter_map(|id| {
+                let task = inner.tasks.get(id)?;
+                if task.notification.is_none() {
+                    Some((id.clone(), task.kind, task.description.clone()))
+                } else {
+                    None
+                }
+            })
             .collect();
         running.sort_by(|a, b| a.0.cmp(&b.0));
         running
@@ -497,6 +593,40 @@ mod tests {
         hub.set_wake_hook(None);
         hub.push_notification("s1", note("t4", "completed")); // must not panic
         assert_eq!(hub.drain_notifications("s1").len(), 1);
+    }
+
+    #[test]
+    fn forget_session_drops_running_and_pending_entries_for_that_session_only() {
+        let hub = TaskNotificationHub::default();
+        hub.track("s1", "running", TaskKind::Bash, "still going");
+        hub.push_notification("s1", note("finished", "completed"));
+        hub.track("s2", "other", TaskKind::Bash, "untouched");
+
+        hub.forget_session("s1");
+
+        assert!(hub.running_for("s1").is_empty());
+        assert!(hub.drain_notifications("s1").is_empty());
+        assert!(!hub.has_notification("finished"));
+        // s2 must survive.
+        assert_eq!(hub.running_for("s2").len(), 1);
+    }
+
+    #[test]
+    fn has_notification_reflects_pending_vs_delivered_state() {
+        let hub = TaskNotificationHub::default();
+        hub.track("s1", "t1", TaskKind::Bash, "build");
+        assert!(!hub.has_notification("t1"), "still running, no notification yet");
+
+        hub.push_notification("s1", note("t1", "completed"));
+        assert!(hub.has_notification("t1"), "notification is now pending");
+
+        hub.drain_notifications("s1");
+        assert!(!hub.has_notification("t1"), "drained notifications are gone");
+
+        hub.push_notification("s1", note("t2", "failed"));
+        assert!(hub.has_notification("t2"));
+        hub.consume("t2");
+        assert!(!hub.has_notification("t2"), "consumed notifications are gone");
     }
 
     #[test]

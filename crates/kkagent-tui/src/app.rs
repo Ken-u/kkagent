@@ -757,7 +757,26 @@ pub struct TaskInfo {
     pub task_id: String,
     pub description: String,
     pub command: String,
+    /// Elapsed seconds as of `fetched_at` — combine with `fetched_at.elapsed()`
+    /// at render time so the panel ticks instead of freezing between polls
+    /// (issues/bash_background_issues.md #7 point 1).
     pub elapsed_secs: u64,
+    pub fetched_at: std::time::Instant,
+    /// `running` | `complete` | `failed` | `timedout` | `cancelled`
+    pub status: String,
+    pub running: bool,
+}
+
+impl TaskInfo {
+    /// Live elapsed seconds, extrapolated from the last fetch using the
+    /// client's own monotonic clock (no server round trip needed to tick).
+    pub fn live_elapsed_secs(&self) -> u64 {
+        if self.running {
+            self.elapsed_secs + self.fetched_at.elapsed().as_secs()
+        } else {
+            self.elapsed_secs
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -769,8 +788,23 @@ pub struct TaskDetailState {
     pub description: String,
     pub command: String,
     pub elapsed_secs: u64,
+    pub fetched_at: std::time::Instant,
     pub output: String,
     pub scroll: u16,
+    /// When true, the view stays pinned to the newest output on each
+    /// refresh; cleared the moment the user scrolls up manually, and
+    /// re-armed by scrolling all the way back down (issues/bash_background_issues.md #7 point 3).
+    pub follow_bottom: bool,
+}
+
+impl TaskDetailState {
+    pub fn live_elapsed_secs(&self) -> u64 {
+        if self.running {
+            self.elapsed_secs + self.fetched_at.elapsed().as_secs()
+        } else {
+            self.elapsed_secs
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2035,6 +2069,15 @@ impl TuiApp {
                         }
                     }
                 }
+                if self.state.tick.is_multiple_of(20) {
+                    if let Some(panel) = self.state.tasks_panel.as_ref() {
+                        let detail_task_id = panel.detail.as_ref().map(|d| d.task_id.clone());
+                        self.enqueue_tasks_list_refresh();
+                        if let Some(task_id) = detail_task_id {
+                            self.enqueue_task_detail_refresh(&task_id);
+                        }
+                    }
+                }
             }
             self.flush_preview_debounce();
             self.flush_file_complete_debounce();
@@ -2625,6 +2668,15 @@ impl TuiApp {
                     // Manager open path may still want the picker rebuilt — handled by callers.
                 }
             }
+            crate::async_jobs::JobChannel::TasksList => {
+                self.apply_tasks_list_data(data);
+            }
+            crate::async_jobs::JobChannel::TasksDetail => {
+                let task_id = data.get("task_id").and_then(|v| v.as_str()).map(String::from);
+                if let Some(task_id) = task_id {
+                    self.apply_task_detail_data(&task_id, data);
+                }
+            }
             _ => {}
         }
     }
@@ -2636,6 +2688,14 @@ impl TuiApp {
         method: &str,
         err: String,
     ) {
+        // Periodic /ps panel polls fail silently — they retry on the next
+        // tick, and surfacing every transient failure would spam the user.
+        if matches!(
+            channel,
+            crate::async_jobs::JobChannel::TasksList | crate::async_jobs::JobChannel::TasksDetail
+        ) {
+            return;
+        }
         // Background session refresh failures are soft — show retryable notice.
         let retryable = matches!(
             channel,
@@ -3879,6 +3939,7 @@ impl TuiApp {
                         if let Some(ref mut p) = self.state.tasks_panel {
                             if let Some(ref mut d) = p.detail {
                                 d.scroll = d.scroll.saturating_sub(1);
+                                d.follow_bottom = false;
                             }
                         }
                         return Ok(());
@@ -3887,6 +3948,7 @@ impl TuiApp {
                         if let Some(ref mut p) = self.state.tasks_panel {
                             if let Some(ref mut d) = p.detail {
                                 d.scroll = d.scroll.saturating_add(1);
+                                d.follow_bottom = false;
                             }
                         }
                         return Ok(());
@@ -3895,6 +3957,7 @@ impl TuiApp {
                         if let Some(ref mut p) = self.state.tasks_panel {
                             if let Some(ref mut d) = p.detail {
                                 d.scroll = d.scroll.saturating_sub(10);
+                                d.follow_bottom = false;
                             }
                         }
                         return Ok(());
@@ -3903,6 +3966,7 @@ impl TuiApp {
                         if let Some(ref mut p) = self.state.tasks_panel {
                             if let Some(ref mut d) = p.detail {
                                 d.scroll = d.scroll.saturating_add(10);
+                                d.follow_bottom = false;
                             }
                         }
                         return Ok(());
@@ -3911,6 +3975,7 @@ impl TuiApp {
                         if let Some(ref mut p) = self.state.tasks_panel {
                             if let Some(ref mut d) = p.detail {
                                 d.scroll = 0;
+                                d.follow_bottom = false;
                             }
                         }
                         return Ok(());
@@ -3920,6 +3985,7 @@ impl TuiApp {
                         if let Some(ref mut p) = self.state.tasks_panel {
                             if let Some(ref mut d) = p.detail {
                                 d.scroll = u16::MAX;
+                                d.follow_bottom = true;
                             }
                         }
                         return Ok(());
@@ -4855,56 +4921,117 @@ impl TuiApp {
             .rpc_call("ps.list", Some(serde_json::json!({ "session_id": sid })))
             .await
         {
-            Ok(data) => {
-                let mut tasks = Vec::new();
-                if let Some(arr) = data.get("processes").and_then(|v| v.as_array()) {
-                    for t in arr {
-                        tasks.push(TaskInfo {
-                            task_id: t
-                                .get("task_id")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("?")
-                                .to_string(),
-                            description: t
-                                .get("description")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("")
-                                .to_string(),
-                            command: t
-                                .get("command")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("")
-                                .to_string(),
-                            elapsed_secs: t
-                                .get("elapsed_secs")
-                                .and_then(|v| v.as_u64())
-                                .unwrap_or(0),
-                        });
-                    }
-                }
-                let prev = self.state.tasks_panel.take();
-                let selected = prev
-                    .as_ref()
-                    .map(|p| p.selected.min(tasks.len().saturating_sub(1)))
-                    .unwrap_or(0);
-                // Keep the detail view only if that job is still in the list.
-                let detail = prev.and_then(|p| {
-                    let d = p.detail?;
-                    if tasks.iter().any(|t| t.task_id == d.task_id) {
-                        Some(d)
-                    } else {
-                        None
-                    }
-                });
-                self.state.tasks_panel = Some(TasksPanelState {
-                    tasks,
-                    selected,
-                    detail,
-                });
-            }
+            Ok(data) => self.apply_tasks_list_data(data),
             Err(e) => self.system_message(format!("Failed to list tasks: {}", e)),
         }
         Ok(())
+    }
+
+    /// Apply a `ps.list` response to the open tasks panel — shared by the
+    /// initial/manual open (`open_tasks_panel`, direct await) and the
+    /// tick-driven background refresh (`enqueue_tasks_list_refresh`, never
+    /// awaited on the UI loop) so the panel doesn't freeze between manual
+    /// `r` presses (issues/bash_background_issues.md #7 point 2).
+    fn apply_tasks_list_data(&mut self, data: serde_json::Value) {
+        let mut tasks = Vec::new();
+        let fetched_at = std::time::Instant::now();
+        if let Some(arr) = data.get("processes").and_then(|v| v.as_array()) {
+            for t in arr {
+                tasks.push(TaskInfo {
+                    task_id: t
+                        .get("task_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("?")
+                        .to_string(),
+                    description: t
+                        .get("description")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    command: t
+                        .get("command")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    elapsed_secs: t
+                        .get("elapsed_secs")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0),
+                    fetched_at,
+                    status: t
+                        .get("status")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("running")
+                        .to_string(),
+                    running: t
+                        .get("running")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(true),
+                });
+            }
+        }
+        let prev = self.state.tasks_panel.take();
+        let selected = prev
+            .as_ref()
+            .map(|p| p.selected.min(tasks.len().saturating_sub(1)))
+            .unwrap_or(0);
+        // Keep the detail view only if that job is still in the list.
+        let detail = prev.and_then(|p| {
+            let d = p.detail?;
+            if tasks.iter().any(|t| t.task_id == d.task_id) {
+                Some(d)
+            } else {
+                None
+            }
+        });
+        self.state.tasks_panel = Some(TasksPanelState {
+            tasks,
+            selected,
+            detail,
+        });
+    }
+
+    /// Guarded, non-blocking periodic refresh of the tasks list while the
+    /// panel is open — the tick loop must never `.await` an RPC directly
+    /// (issues/bash_background_issues.md #7 point 2).
+    fn enqueue_tasks_list_refresh(&mut self) {
+        let Some(sid) = self.state.session_id.clone() else {
+            return;
+        };
+        if self
+            .jobs
+            .pending
+            .contains_key(&crate::async_jobs::JobChannel::TasksList)
+        {
+            return;
+        }
+        self.jobs.spawn_rpc(
+            self.client.requester(),
+            crate::async_jobs::JobChannel::TasksList,
+            "ps.list",
+            Some(serde_json::json!({ "session_id": sid })),
+            None,
+            true,
+        );
+    }
+
+    /// Guarded, non-blocking periodic refresh of the open task's output.
+    fn enqueue_task_detail_refresh(&mut self, task_id: &str) {
+        if self
+            .jobs
+            .pending
+            .contains_key(&crate::async_jobs::JobChannel::TasksDetail)
+        {
+            return;
+        }
+        self.jobs.spawn_rpc(
+            self.client.requester(),
+            crate::async_jobs::JobChannel::TasksDetail,
+            "ps.output",
+            Some(serde_json::json!({ "task_id": task_id })),
+            None,
+            true,
+        );
     }
 
     /// Stop a background shell task; refresh list (and detail view when requested).
@@ -4914,7 +5041,17 @@ impl TuiApp {
             .rpc_call("ps.stop", Some(serde_json::json!({ "task_id": task_id })))
             .await
         {
-            Ok(_) => self.system_message(format!("Stopped task {}", task_id)),
+            Ok(data) => {
+                let status = data.get("status").and_then(|v| v.as_str()).unwrap_or("");
+                if status == "stop_requested" {
+                    self.system_message(format!(
+                        "Stop requested for task {} — still shutting down, refresh to confirm.",
+                        task_id
+                    ));
+                } else {
+                    self.system_message(format!("Stopped task {}", task_id));
+                }
+            }
             Err(e) => self.system_message(format!("Stop failed: {}", e)),
         }
         if refresh_detail {
@@ -4928,57 +5065,84 @@ impl TuiApp {
             .rpc_call("ps.output", Some(serde_json::json!({ "task_id": task_id })))
             .await
         {
-            Ok(data) => {
-                let detail = TaskDetailState {
-                    task_id: data
-                        .get("task_id")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or(task_id)
-                        .to_string(),
-                    status: data
-                        .get("status")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("?")
-                        .to_string(),
-                    running: data
-                        .get("running")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false),
-                    exit_code: data.get("exit_code").and_then(|v| v.as_i64()),
-                    description: data
-                        .get("description")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string(),
-                    command: data
-                        .get("command")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string(),
-                    elapsed_secs: data
-                        .get("elapsed_secs")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0),
-                    output: data
-                        .get("output")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string(),
-                    // Preserve scroll position on refresh; renderer clamps.
-                    scroll: self
-                        .state
-                        .tasks_panel
-                        .as_ref()
-                        .and_then(|p| p.detail.as_ref())
-                        .filter(|d| d.task_id == task_id)
-                        .map(|d| d.scroll)
-                        .unwrap_or(0),
-                };
-                if let Some(ref mut p) = self.state.tasks_panel {
-                    p.detail = Some(detail);
-                }
-            }
+            Ok(data) => self.apply_task_detail_data(task_id, data),
             Err(e) => self.system_message(format!("Failed to read task output: {}", e)),
+        }
+    }
+
+    /// Apply a `ps.output` response to the open task detail view — shared by
+    /// the manual open/refresh (direct await) and the tick-driven background
+    /// refresh (`enqueue_task_detail_refresh`), which is what keeps a
+    /// foreground-timeout-detached job's output live in the panel instead of
+    /// frozen at the moment it was opened (issues/bash_background_issues.md #7
+    /// point 3).
+    fn apply_task_detail_data(&mut self, task_id: &str, data: serde_json::Value) {
+        // The detail view may have been closed, or switched to a different
+        // task, while this refresh was in flight — drop a stale result.
+        let still_open = self
+            .state
+            .tasks_panel
+            .as_ref()
+            .and_then(|p| p.detail.as_ref())
+            .is_some_and(|d| d.task_id == task_id);
+        if !still_open {
+            return;
+        }
+        let prev = self
+            .state
+            .tasks_panel
+            .as_ref()
+            .and_then(|p| p.detail.as_ref());
+        let detail = TaskDetailState {
+            task_id: data
+                .get("task_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or(task_id)
+                .to_string(),
+            status: data
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?")
+                .to_string(),
+            running: data
+                .get("running")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            exit_code: data.get("exit_code").and_then(|v| v.as_i64()),
+            description: data
+                .get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            command: data
+                .get("command")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            elapsed_secs: data
+                .get("elapsed_secs")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+            fetched_at: std::time::Instant::now(),
+            output: data
+                .get("output")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            // Preserve scroll position on refresh; renderer clamps.
+            // While following the bottom, re-arm the sentinel so a
+            // refresh with new output still lands at the new bottom.
+            scroll: if prev.map(|d| d.follow_bottom).unwrap_or(true) {
+                u16::MAX
+            } else {
+                prev.map(|d| d.scroll).unwrap_or(0)
+            },
+            // First open of this task follows the bottom by default;
+            // otherwise keep whatever the user last chose.
+            follow_bottom: prev.map(|d| d.follow_bottom).unwrap_or(true),
+        };
+        if let Some(ref mut p) = self.state.tasks_panel {
+            p.detail = Some(detail);
         }
     }
 

@@ -3081,6 +3081,7 @@ async fn remove_session_runtime(state: &Arc<ServerState>, session_id: &str) {
     state.goal_judge_records.lock().await.remove(session_id);
     state.judge_chat_history.lock().await.remove(session_id);
     state.judge_chat_locks.lock().await.remove(session_id);
+    kkagent_tools::task_notify::global_hub().forget_session(session_id);
     if let Some(session) = removed {
         session.services.on_close(SessionCloseReason::Exit).await;
     }
@@ -10606,7 +10607,8 @@ async fn handle_rpc_call(
                 .ok_or_else(|| (-32602, "Missing tool_call_id".into()))?
                 .to_string();
             // Best-effort: cancel matching background shell jobs for this session.
-            let stopped = state.bash_shells.stop(&tool_call_id).await;
+            let stopped = state.bash_shells.stop(&tool_call_id).await
+                != kkagent_tools::builtin::bash::StopOutcome::NotFound;
             if !stopped {
                 // Also try listing and stopping by description match — shell_id may differ.
                 for (id, _desc, _status, running) in state.bash_shells.list_jobs().await {
@@ -11499,9 +11501,13 @@ async fn handle_rpc_call(
                 .and_then(|p| p.get("session_id"))
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| (-32602, "Missing session_id".into()))?;
+            // Keep a bounded tail of recently finished jobs visible too, so a
+            // completed/failed task doesn't just vanish from /ps the instant
+            // it stops running (issues/bash_background_issues.md #7 point 4).
+            const RECENT_FINISHED_LIMIT: usize = 5;
             let processes: Vec<_> = state
                 .bash_shells
-                .list_running_for_session(session_id)
+                .list_for_session(session_id, RECENT_FINISHED_LIMIT)
                 .await
                 .into_iter()
                 .map(|job| {
@@ -11510,6 +11516,8 @@ async fn handle_rpc_call(
                         "description": job.description,
                         "command": job.command,
                         "elapsed_secs": job.elapsed_secs,
+                        "status": job.status,
+                        "running": job.running,
                     })
                 })
                 .collect();
@@ -11541,14 +11549,20 @@ async fn handle_rpc_call(
                 .and_then(|p| p.get("task_id"))
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| (-32602, "Missing task_id".into()))?;
-            if state.bash_shells.stop(task_id).await {
-                Ok(serde_json::json!({
+            match state.bash_shells.stop(task_id).await {
+                kkagent_tools::builtin::bash::StopOutcome::Confirmed => Ok(serde_json::json!({
                     "ok": true,
                     "task_id": task_id,
                     "status": "cancelled",
-                }))
-            } else {
-                Err((-32000, format!("Unknown or finished task: {task_id}")))
+                })),
+                kkagent_tools::builtin::bash::StopOutcome::Requested => Ok(serde_json::json!({
+                    "ok": true,
+                    "task_id": task_id,
+                    "status": "stop_requested",
+                })),
+                kkagent_tools::builtin::bash::StopOutcome::NotFound => {
+                    Err((-32000, format!("Unknown or finished task: {task_id}")))
+                }
             }
         }
         "cron.list" => {

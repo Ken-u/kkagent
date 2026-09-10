@@ -386,8 +386,17 @@ impl TaskOutputTool {
             ));
         }
         if let Some(bash) = &self.bash_shells {
-            if bash.stop(id).await {
-                return ToolOutput::success(format!("Stopped bash task {id}"));
+            match bash.stop(id).await {
+                crate::builtin::bash::StopOutcome::Confirmed => {
+                    return ToolOutput::success(format!("Stopped bash task {id}"));
+                }
+                crate::builtin::bash::StopOutcome::Requested => {
+                    return ToolOutput::success(format!(
+                        "Stop requested for bash task {id}, but it had not terminated yet — \
+                         poll again to confirm."
+                    ));
+                }
+                crate::builtin::bash::StopOutcome::NotFound => {}
             }
         }
         ToolOutput::error(format!("Unknown task_id: {id}"))

@@ -3567,11 +3567,16 @@ fn render_tasks_panel(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme
             } else {
                 Style::default().fg(theme.text)
             };
-            let elapsed = format_elapsed_hms(task.elapsed_secs);
+            let elapsed = format_elapsed_hms(task.live_elapsed_secs());
+            let marker = if task.running {
+                elapsed
+            } else {
+                format!("[{}]", task.status)
+            };
             if is_narrow(panel_area.width) {
                 lines.push(Line::from(Span::styled(
                     truncate_display_width(
-                        &format!("{}{} {}", prefix, elapsed, task.task_id),
+                        &format!("{}{} {}", prefix, marker, task.task_id),
                         inner.width as usize,
                     ),
                     style,
@@ -3590,7 +3595,7 @@ fn render_tasks_panel(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme
                 let label = format!(
                     "{}{} {} — {}",
                     prefix,
-                    elapsed,
+                    marker,
                     truncate_display_width(&task.description, 40),
                     truncate_display_width(&task.command, 48)
                 );
@@ -3652,7 +3657,7 @@ fn render_task_detail(f: &mut Frame, area: Rect, detail: &TaskDetailState, theme
 
     f.render_widget(Clear, panel_area);
     let status_label = if detail.running {
-        format!("running {}", format_elapsed_hms(detail.elapsed_secs))
+        format!("running {}", format_elapsed_hms(detail.live_elapsed_secs()))
     } else {
         match detail.exit_code {
             Some(code) => format!("{} (exit {})", detail.status, code),
