@@ -233,6 +233,8 @@ pub struct Session {
     /// Names of deferred tools already announced via `<tools_added>` diffs.
     /// Rebuilt from history at turn boundaries so compaction self-heals.
     pub announced_deferred_tools: std::collections::HashSet<String>,
+    /// Turns since last TodoList write (for reminder).
+    pub turns_since_todo: u32,
     /// Cross-turn tool dedupe tracker.
     pub tool_dedupe: crate::tool_dedupe::ToolDedupeTracker,
     /// Session token counter (measured anchors + estimates).
@@ -440,6 +442,7 @@ impl Session {
             undo_stack: Vec::new(),
             loaded_deferred_tools: std::collections::HashSet::new(),
             announced_deferred_tools: std::collections::HashSet::new(),
+            turns_since_todo: 0,
             tool_dedupe: crate::tool_dedupe::ToolDedupeTracker::new(),
             token_counter: crate::token_counting::TokenCounter::new(
                 crate::token_counting::TokenCountingStrategy::MeasuredPlusEstimated,
@@ -550,21 +553,22 @@ impl Session {
         )
     }
 
-    /// Shared handle to the authoritative Todo service (cloned into the
-    /// per-turn tool registry so `TodoList` mutates session state directly).
-    pub fn todos_handle(&self) -> Arc<kkagent_protocol::todo::SessionTodoService> {
-        self.services.todos.clone()
-    }
-
     pub fn todo_items(&self) -> Vec<kkagent_protocol::TodoItemEvent> {
         self.services
             .todos
             .get_todos()
             .into_iter()
-            .map(|item| kkagent_protocol::TodoItemEvent {
-                id: item.id,
+            .enumerate()
+            .map(|(index, item)| kkagent_protocol::TodoItemEvent {
+                id: (index + 1).to_string(),
                 content: item.title,
-                status: item.status.as_str().into(),
+                status: match item.status {
+                    crate::session::todo::TodoStatus::Pending => "pending",
+                    crate::session::todo::TodoStatus::InProgress => "in_progress",
+                    crate::session::todo::TodoStatus::Done => "completed",
+                    crate::session::todo::TodoStatus::Cancelled => "cancelled",
+                }
+                .into(),
             })
             .collect()
     }
@@ -1511,8 +1515,7 @@ fn todo_service_items(
 ) -> Vec<crate::session::todo::TodoItem> {
     items
         .iter()
-        .enumerate()
-        .filter_map(|(index, item)| {
+        .filter_map(|item| {
             let title = item.content.trim();
             if title.is_empty() {
                 return None;
@@ -1523,22 +1526,7 @@ fn todo_service_items(
                 "cancelled" | "canceled" => crate::session::todo::TodoStatus::Cancelled,
                 _ => crate::session::todo::TodoStatus::Pending,
             };
-            // Restore normalization: old persisted records may have
-            // index-derived or empty IDs. Reuse a well-formed stable ID as-is
-            // (so restore keeps IDs stable); otherwise allocate a
-            // deterministic fallback from the record position. The result is
-            // then persisted by the next `set_todos_persisted` call.
-            let id = item.id.trim();
-            let id = if id.is_empty()
-                || id.chars().all(|c| c.is_ascii_digit())
-                || !id.starts_with("todo-")
-            {
-                format!("todo-restored-{}", index + 1)
-            } else {
-                id.to_string()
-            };
             Some(crate::session::todo::TodoItem {
-                id,
                 title: title.to_string(),
                 status,
             })
@@ -2016,21 +2004,10 @@ mod working_directory_tests {
         let restored_todos = todo_items_from_metadata(Some(&metadata));
         assert_eq!(restored_todos.len(), 2);
         assert_eq!(restored_todos[1].content, "Second");
-        let service_items = todo_service_items(&restored_todos);
         assert_eq!(
-            service_items[1].status,
+            todo_service_items(&restored_todos)[1].status,
             crate::session::todo::TodoStatus::InProgress
         );
-        // Restore normalization: legacy index-derived IDs become stable
-        // non-index IDs; well-formed stable IDs are preserved as-is.
-        assert_eq!(service_items[0].id, "todo-restored-1");
-        assert_eq!(service_items[1].id, "todo-restored-2");
-        let stable = todo_service_items(&[kkagent_protocol::TodoItemEvent {
-            id: "todo-42".into(),
-            content: "kept".into(),
-            status: "pending".into(),
-        }]);
-        assert_eq!(stable[0].id, "todo-42");
     }
 
     #[test]

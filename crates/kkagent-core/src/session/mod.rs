@@ -88,5 +88,5 @@ pub use swarm_batch::{
     SwarmTaskKind,
 };
 pub use terminal::{SessionTerminalService, TerminalHandle};
-pub use todo::{render_todo_list, SessionTodoService, TodoItem, TodoOp, TodoOpResult, TodoStatus};
+pub use todo::{parse_todo_items, render_todo_list, SessionTodoService, TodoItem, TodoStatus};
 pub use workspace_context::{SessionWorkspaceContext, WorkspaceInfo};

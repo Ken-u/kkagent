@@ -14,6 +14,13 @@ pub fn plan_reminder(plan_path: &Path) -> String {
     )
 }
 
+pub fn todo_reminder() -> String {
+    "<system-reminder>\nThe TodoList tool has not been updated recently. \
+If you are working on multi-step tasks, consider updating TodoList. \
+Do not mention this reminder to the user.\n</system-reminder>"
+        .into()
+}
+
 pub fn agents_md_loaded(name: &str) -> String {
     format!(
         "<system-reminder>\nProject instructions from {name} are loaded into the system prompt.\n</system-reminder>"
