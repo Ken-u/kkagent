@@ -83,7 +83,7 @@ use tokio::sync::{mpsc, Mutex, Notify, Semaphore};
 /// before [`TUNNEL_PROC_TESTS`]; nothing acquires it after, so the order is
 /// deadlock-free.
 #[cfg(test)]
-pub(crate) static SUBPROCESS_TEST_LOCK: StdMutex<()> = StdMutex::new(());
+pub(crate) static SUBPROCESS_TEST_LOCK: Mutex<()> = Mutex::const_new(());
 
 const SUPPORTED_PROTOCOL_VERSIONS: [&str; 3] = ["2024-11-05", "2025-03-26", "2025-06-18"];
 const LATEST_PROTOCOL_VERSION: &str = "2025-06-18";
@@ -6382,9 +6382,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn tunnel_child_spawned_and_stopped_with_server() {
-        let _subprocess = SUBPROCESS_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _subprocess = SUBPROCESS_TEST_LOCK.lock().await;
         let _guard = TUNNEL_PROC_TESTS.lock().await;
         use std::sync::atomic::AtomicUsize;
 
@@ -6546,9 +6544,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn tunnel_child_fails_fast_without_api_key() {
-        let _subprocess = SUBPROCESS_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _subprocess = SUBPROCESS_TEST_LOCK.lock().await;
         let _guard = TUNNEL_PROC_TESTS.lock().await;
         let temp = tempfile::tempdir().expect("tempdir");
         let fake_bin = write_executable(temp.path(), "tunnel-client", "#!/bin/sh\nexit 0\n");
@@ -6580,9 +6576,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn tunnel_child_dying_at_startup_fails_serve() {
-        let _subprocess = SUBPROCESS_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _subprocess = SUBPROCESS_TEST_LOCK.lock().await;
         let _guard = TUNNEL_PROC_TESTS.lock().await;
         // Slow fork+exec on network file systems can keep the client "not
         // yet started" past the default startup window; widen it so the test
