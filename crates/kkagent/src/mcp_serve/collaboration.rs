@@ -924,6 +924,9 @@ mod tests {
 
     #[tokio::test]
     async fn diffs_compare_commits_and_page_without_losing_lines() {
+        let _subprocess = crate::mcp_serve::SUBPROCESS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = repo();
         let base = git(dir.path(), &["rev-parse", "HEAD"]);
         std::fs::write(dir.path().join("code.rs"), "fn after() {}\n").unwrap();
@@ -965,6 +968,9 @@ mod tests {
     /// arguments like `HEAD^` must resolve.
     #[tokio::test]
     async fn inspect_schema_exposes_base_head_and_accepts_revisions() {
+        let _subprocess = crate::mcp_serve::SUBPROCESS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = repo();
         std::fs::write(dir.path().join("code.rs"), "fn after() {}\n").unwrap();
         git(dir.path(), &["commit", "-am", "change"]);
@@ -1008,6 +1014,9 @@ mod tests {
 
     #[tokio::test]
     async fn built_in_search_is_confined_and_has_line_numbers() {
+        let _subprocess = crate::mcp_serve::SUBPROCESS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("code.rs"), "fn searchable() {}\n").unwrap();
         let server = server_at(dir.path(), TranscriptDb::open_in_memory().unwrap());
@@ -1036,6 +1045,9 @@ mod tests {
 
     #[tokio::test]
     async fn review_snapshot_detects_uncommitted_and_untracked_edits() {
+        let _subprocess = crate::mcp_serve::SUBPROCESS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = repo();
         let initial = review_snapshot(dir.path()).await.unwrap();
         std::fs::write(dir.path().join("new.rs"), "new code").unwrap();

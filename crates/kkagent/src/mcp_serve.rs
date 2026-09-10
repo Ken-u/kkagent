@@ -73,6 +73,18 @@ use kkagent_protocol::{AgentEvent, Frame, PermissionMode, SessionStatus};
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, Mutex, Notify, Semaphore};
 
+/// Serializes tests that spawn real subprocesses (`rg`, `git`, tunnel
+/// children). Under libtest's default parallelism, concurrent spawn pressure
+/// inflates macOS `posix_spawn`/exec latency from milliseconds to tens of
+/// seconds (measured: `built_in_search_is_confined_and_has_line_numbers`
+/// runs 0.8s alone but tens of seconds next to the git/tunnel tests). Tests
+/// hold this lock for their whole body so the spawn-heavy clique runs one
+/// at a time while still overlapping with the rest of the suite. Acquire it
+/// before [`TUNNEL_PROC_TESTS`]; nothing acquires it after, so the order is
+/// deadlock-free.
+#[cfg(test)]
+pub(crate) static SUBPROCESS_TEST_LOCK: StdMutex<()> = StdMutex::new(());
+
 const SUPPORTED_PROTOCOL_VERSIONS: [&str; 3] = ["2024-11-05", "2025-03-26", "2025-06-18"];
 const LATEST_PROTOCOL_VERSION: &str = "2025-06-18";
 const SERVER_NAME: &str = "kkagent";
@@ -6370,6 +6382,9 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn tunnel_child_spawned_and_stopped_with_server() {
+        let _subprocess = SUBPROCESS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let _guard = TUNNEL_PROC_TESTS.lock().await;
         use std::sync::atomic::AtomicUsize;
 
@@ -6531,6 +6546,9 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn tunnel_child_fails_fast_without_api_key() {
+        let _subprocess = SUBPROCESS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let _guard = TUNNEL_PROC_TESTS.lock().await;
         let temp = tempfile::tempdir().expect("tempdir");
         let fake_bin = write_executable(temp.path(), "tunnel-client", "#!/bin/sh\nexit 0\n");
@@ -6562,6 +6580,9 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn tunnel_child_dying_at_startup_fails_serve() {
+        let _subprocess = SUBPROCESS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let _guard = TUNNEL_PROC_TESTS.lock().await;
         // Slow fork+exec on network file systems can keep the client "not
         // yet started" past the default startup window; widen it so the test
