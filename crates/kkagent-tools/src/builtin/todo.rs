@@ -27,7 +27,7 @@ struct TodoWrite {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TodoUpdate {
-    id: String,
+    id: Option<String>,
     title: Option<String>,
     status: Option<String>,
 }
@@ -36,8 +36,21 @@ fn pending_status() -> String {
     "pending".into()
 }
 
-fn new_id() -> String {
-    uuid::Uuid::new_v4().to_string()
+/// 12 hex chars: unguessable (a model cannot fabricate an id that hits a real
+/// task, so mistakes fail loudly instead of editing the wrong entry), but far
+/// cheaper in tokens than a full UUID.
+fn short_id() -> String {
+    uuid::Uuid::new_v4().simple().to_string()[..12].to_string()
+}
+
+/// First non-colliding short id; the caller inserts the result into `taken`.
+fn fresh_id(taken: &HashSet<String>) -> String {
+    loop {
+        let id = short_id();
+        if !taken.contains(&id) {
+            return id;
+        }
+    }
 }
 
 impl TodoListTool {
@@ -48,18 +61,18 @@ impl TodoListTool {
     }
 
     pub fn with_items(items: Vec<kkagent_protocol::TodoItemEvent>) -> Self {
-        let mut ids = HashSet::new();
+        let mut taken = HashSet::new();
         let todos = items
             .into_iter()
             .filter_map(|item| {
                 let title = item.content.trim().to_string();
-                let id = if item.id.trim().is_empty() || !ids.insert(item.id.clone()) {
-                    let id = new_id();
-                    ids.insert(id.clone());
-                    id
+                let keep = !item.id.trim().is_empty() && !taken.contains(&item.id);
+                let id = if keep {
+                    item.id.clone()
                 } else {
-                    item.id
+                    fresh_id(&taken)
                 };
+                taken.insert(id.clone());
                 (!title.is_empty()).then(|| TodoItem {
                     id,
                     title,
@@ -141,14 +154,17 @@ impl TodoListTool {
         let active_count = usize::from(current.is_some()) + active.count();
         let focus = match (active_count, current) {
             (1, Some(item)) => format!(
-                "Current task: {} (id: {})\nFocus on this task and its necessary dependencies. \
+                "Current task: {}\nFocus on this task and its necessary dependencies. \
 Take the next concrete action once you have enough information; defer details of pending tasks. \
-After completing and verifying this task, or identifying a blocker, update progress and choose the next unblocked task.",
-                item.title, item.id
+After completing and verifying this task, or identifying a blocker, update progress and choose the next unblocked task. \
+Updates without id act on this task.",
+                item.title
             ),
             (0, _) if pending > 0 => {
                 let candidate = todos.iter().find(|t| t.status == "pending").unwrap();
-                format!("No task is in_progress. Next pending candidate: {} (id: {}). If unblocked and relevant to the user's current request, mark it in_progress using updates; otherwise read the list and choose another. Defer details of the other pending tasks.", candidate.title, candidate.id)
+                let title = candidate.title.as_str();
+                format!("No task is in_progress. Next pending candidate: {title}. \
+Read TodoList for IDs before acting on a specific task; defer details of the other pending tasks.")
             }
             (0, _) => "No unfinished todo items remain. Check the result against the user's request before concluding.".into(),
             _ => "Multiple tasks are in_progress. Choose one current task and return the others to pending; only expand the current task and its necessary dependencies.".into(),
@@ -182,7 +198,8 @@ After completing and verifying this task, or identifying a blocker, update progr
                 id
             } else {
                 todos.iter().find(|t| t.title == title && !ids.contains(&t.id) && !explicit_ids.contains(&t.id))
-                    .map(|t| t.id.clone()).unwrap_or_else(new_id)
+                    .map(|t| t.id.clone())
+                    .unwrap_or_else(|| fresh_id(&ids))
             };
             if !ids.insert(id.clone()) {
                 return Err(format!("Duplicate todo id: {id}"));
@@ -191,25 +208,57 @@ After completing and verifying this task, or identifying a blocker, update progr
         }).collect()
     }
 
+    /// The unique in_progress task; omit-id updates resolve against this.
+    fn current_task_id(todos: &[TodoItem]) -> Result<String, String> {
+        let mut current = todos.iter().filter(|t| t.status == "in_progress");
+        match (current.next(), current.next()) {
+            (Some(item), None) => Ok(item.id.clone()),
+            (None, _) => Err(
+                "No task is in_progress; an update without id targets the current task. Read TodoList for IDs to act on a specific task, or add one first."
+                    .into(),
+            ),
+            (Some(_), Some(_)) => Err(
+                "Multiple tasks are in_progress; pass an explicit id to disambiguate".into(),
+            ),
+        }
+    }
+
     fn patch(todos: &[TodoItem], input: &Value) -> Result<Vec<TodoItem>, String> {
         // Stage all changes so a bad ID/status cannot partially update the list.
         let mut next = todos.to_vec();
         if let Some(value) = input.get("updates") {
             let updates: Vec<TodoUpdate> = serde_json::from_value(value.clone())
                 .map_err(|e| format!("Invalid updates: {e}"))?;
-            let mut ids = HashSet::new();
-            for update in updates {
-                if !ids.insert(update.id.clone()) {
-                    return Err(format!("Duplicate update for todo id: {}", update.id));
+            // Resolve targets against the list as it looks when the call
+            // arrives, before anything is applied.
+            let mut targets = Vec::with_capacity(updates.len());
+            let mut idless_seen = false;
+            for update in &updates {
+                let id = match update.id.as_deref().map(str::trim) {
+                    Some(id) if !id.is_empty() => id.to_string(),
+                    _ => {
+                        if idless_seen {
+                            return Err(
+                                "Only one update may omit id; it targets the current in_progress task"
+                                    .into(),
+                            );
+                        }
+                        idless_seen = true;
+                        Self::current_task_id(&next)?
+                    }
+                };
+                targets.push(id);
+            }
+            let mut seen = HashSet::new();
+            for (update, id) in updates.into_iter().zip(targets) {
+                if !seen.insert(id.clone()) {
+                    return Err(format!("Duplicate update for todo id: {id}"));
                 }
                 if update.title.is_none() && update.status.is_none() {
                     return Err("Each update needs a title or status".into());
                 }
-                let item = next.iter_mut().find(|t| t.id == update.id).ok_or_else(|| {
-                    format!(
-                        "Unknown todo id: {}. Read TodoList for current IDs.",
-                        update.id
-                    )
+                let item = next.iter_mut().find(|t| t.id == id).ok_or_else(|| {
+                    format!("Unknown todo id: {id}. Read TodoList for current IDs.")
                 })?;
                 if let Some(title) = update.title {
                     item.title = Self::checked_title(&title)?;
@@ -222,14 +271,17 @@ After completing and verifying this task, or identifying a blocker, update progr
         if let Some(value) = input.get("add") {
             let items: Vec<TodoWrite> =
                 serde_json::from_value(value.clone()).map_err(|e| format!("Invalid add: {e}"))?;
+            let mut taken: HashSet<String> = next.iter().map(|t| t.id.clone()).collect();
             for item in items {
                 if item.id.is_some() {
                     return Err(
                         "New items in add must omit id; IDs are generated by the tool".into(),
                     );
                 }
+                let id = fresh_id(&taken);
+                taken.insert(id.clone());
                 next.push(TodoItem {
-                    id: new_id(),
+                    id,
                     title: Self::checked_title(&item.title)?,
                     status: Self::parse_status(&item.status)?.into(),
                 });
@@ -252,13 +304,16 @@ impl Tool for TodoListTool {
     }
     fn description(&self) -> &str {
         "Manage a structured TODO list for tracking progress on multi-step tasks. \
-Prefer updates to change only specific tasks by stable id, and add to append new tasks. \
-Call with no arguments to read the full list and IDs. Use todos only to create or replace the entire list \
-(include unchanged items; preserve their IDs when renaming/reordering); todos: [] clears. \
-Do not combine todos with updates/add. Updates and add may be combined atomically. \
-Keep task titles brief and at most one task in_progress. Plan overall order and dependencies, \
-then work on the current task and its necessary dependencies; defer implementation details of pending tasks. \
-Writes return progress and the current focus/candidate with its ID; reads return the full list."
+IDs are short random tokens a model cannot guess, so a mistaken id fails safely instead of \
+editing the wrong task; they appear only in read results. Complete, cancel, or edit the \
+current task with updates:[{status?,title?}] — omit id to target the task that is in_progress \
+(at most one such update per call); pass an id from a read only when acting on another task. \
+add appends tasks; todos creates or replaces the whole list (include unchanged items, \
+preserving their ids); todos: [] clears. Do not combine todos with updates/add. \
+Updates and add may be combined atomically. Keep task titles brief and at most one task \
+in_progress. Plan overall order and dependencies, then work on the current task and its \
+necessary dependencies; defer implementation details of pending tasks. \
+Writes return progress and the current focus/candidate without IDs; reads return the full list."
     }
     fn parameters_schema(&self) -> Value {
         json!({
@@ -283,15 +338,14 @@ Writes return progress and the current focus/candidate with its ID; reads return
                 },
                 "updates": {
                     "type": "array",
-                    "description": "Preferred for progress updates. Only specified fields change. Use cancelled to drop a task; may complete the current task and start the next in one call.",
+                    "description": "Preferred for progress updates. Omit id to act on the current in_progress task (at most one such update per call); include id from a read for any other task. Use cancelled to drop a task.",
                     "items": {
                         "type": "object",
                         "properties": {
-                            "id": {"type": "string", "description": "Stable ID from TodoList; never a list position."},
+                            "id": {"type": "string", "description": "Stable ID from a read; omit to target the current in_progress task."},
                             "title": {"type": "string"},
                             "status": {"type": "string", "enum": ["pending", "in_progress", "done", "cancelled"]}
                         },
-                        "required": ["id"],
                         "additionalProperties": false
                     }
                 },
@@ -399,12 +453,13 @@ impl TodoListTool {
                     if let Some(existing) = todos.iter_mut().find(|t| t.title == title) {
                         existing.status = status;
                     } else {
+                        let taken: HashSet<String> = todos.iter().map(|t| t.id.clone()).collect();
                         todos.push(TodoItem {
                             id: previous
                                 .iter()
                                 .find(|t| t.title == title)
                                 .map(|t| t.id.clone())
-                                .unwrap_or_else(new_id),
+                                .unwrap_or_else(|| fresh_id(&taken)),
                             title,
                             status,
                         });
@@ -457,7 +512,8 @@ mod tests {
         .await;
         let original = items(&created);
         assert!(created.content.contains("Current work"));
-        assert!(created.content.contains(&original[0].id));
+        // Write summaries no longer carry IDs; they appear only in reads.
+        assert!(!created.content.contains(&original[0].id));
         assert!(!created.content.contains("Future work"));
         assert!(!created.content.contains("Later work"));
 
@@ -502,6 +558,111 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn idless_updates_act_on_the_current_task() {
+        let tool = TodoListTool::new();
+        let created = run(
+            &tool,
+            json!({"todos": [
+                {"title": "First", "status": "in_progress"},
+                {"title": "Second", "status": "pending"}
+            ]}),
+        )
+        .await;
+        let original = items(&created);
+        // Current task's id never needs to be known: complete it and start
+        // the next task in one call.
+        let advanced = run(
+            &tool,
+            json!({"updates": [
+                {"status": "done"},
+                {"id": original[1].id, "status": "in_progress"}
+            ]}),
+        )
+        .await;
+        assert!(!advanced.is_error, "{}", advanced.content);
+        let after = items(&advanced);
+        assert_eq!(after[0].id, original[0].id);
+        assert_eq!(after[0].status, "completed");
+        assert_eq!(after[1].id, original[1].id);
+        assert_eq!(after[1].status, "in_progress");
+        assert!(advanced.content.contains("Second"));
+        assert!(advanced
+            .content
+            .contains("Updates without id act on this task"));
+
+        // Only one update may omit id.
+        let two_idless = run(
+            &tool,
+            json!({"updates": [{"status": "done"}, {"title": "Renamed"}]}),
+        )
+        .await;
+        assert!(two_idless.is_error);
+        // Finish the new current task, then an idless update has no target.
+        assert!(
+            !run(&tool, json!({"updates": [{"status": "done"}]}))
+                .await
+                .is_error
+        );
+        let no_current = run(&tool, json!({"updates": [{"status": "done"}]})).await;
+        assert!(no_current.is_error);
+        // With several in_progress tasks, idless updates are ambiguous.
+        run(
+            &tool,
+            json!({"add": [
+                {"title": "P1", "status": "in_progress"},
+                {"title": "P2", "status": "in_progress"}
+            ]}),
+        )
+        .await;
+        let ambiguous = run(&tool, json!({"updates": [{"status": "pending"}]})).await;
+        assert!(ambiguous.is_error);
+        assert_eq!(items(&run(&tool, json!({})).await).len(), 4);
+    }
+
+    #[tokio::test]
+    async fn fresh_ids_are_short_random_hex_and_legacy_ids_survive() {
+        let tool = TodoListTool::new();
+        let added = run(
+            &tool,
+            json!({"add": [{"title": "A"}, {"title": "B"}, {"title": "C"}]}),
+        )
+        .await;
+        let fresh = items(&added);
+        assert_eq!(fresh.len(), 3);
+        for item in &fresh {
+            assert_eq!(item.id.len(), 12, "{}", item.id);
+            assert!(item
+                .id
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        }
+        // Legacy persisted ids are kept as-is on seed.
+        let seeded = TodoListTool::with_items(vec![kkagent_protocol::TodoItemEvent {
+            id: "42".into(),
+            content: "Legacy".into(),
+            status: "in_progress".into(),
+        }]);
+        assert_eq!(seeded.todos.lock().unwrap()[0].id, "42");
+        // A pre-seeded id colliding with a fresh short id would be lengthened;
+        // dedup keeps ids unique regardless.
+        let dup = TodoListTool::with_items(vec![
+            kkagent_protocol::TodoItemEvent {
+                id: "abc123def456".into(),
+                content: "One".into(),
+                status: "pending".into(),
+            },
+            kkagent_protocol::TodoItemEvent {
+                id: "abc123def456".into(),
+                content: "Two".into(),
+                status: "pending".into(),
+            },
+        ]);
+        let ids = dup.todos.lock().unwrap();
+        assert_eq!(ids[0].id, "abc123def456");
+        assert_ne!(ids[1].id, ids[0].id);
+    }
+
+    #[tokio::test]
     async fn invalid_batches_leave_the_entire_list_unchanged() {
         let tool = TodoListTool::new();
         let created = run(&tool, json!({"add": [{"title": "Keep"}]})).await;
@@ -520,6 +681,9 @@ mod tests {
             json!({"todos": [{"title": "Bad", "status": "bogus"}]}),
             json!({"todos": [{"id": "missing", "title": "Bad", "status": "pending"}]}),
             json!({"todos": [{"id": id, "title": "A"}, {"id": id, "title": "B"}]}),
+            json!({"updates": [{"status": "done"}]}),
+            json!({"updates": [{"status": "done"}, {"status": "pending"}]}),
+            json!({"updates": [{"id": ""}, {"status": "pending"}]}),
         ] {
             let output = run(&tool, invalid.clone()).await;
             assert!(output.is_error, "accepted invalid input: {invalid}");

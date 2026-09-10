@@ -58,7 +58,9 @@ impl SessionTodoService {
 }
 
 fn new_id() -> String {
-    uuid::Uuid::new_v4().to_string()
+    // 12 hex chars: unguessable by models but cheaper than a full UUID;
+    // matches kkagent-tools TodoList id format.
+    uuid::Uuid::new_v4().simple().to_string()[..12].to_string()
 }
 
 pub fn render_todo_list(todos: &[TodoItem], title: &str) -> String {
