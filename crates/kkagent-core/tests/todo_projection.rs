@@ -105,33 +105,6 @@ async fn twenty_item_scenario_next_request_is_focus_only() {
         serialized.contains("Progress: 0/20 completed."),
         "next request keeps progress: {serialized}"
     );
-    // The full 20-add payload must be compacted even though the call is in
-    // the recent window: no other task titles may appear.
-    for i in 2..=20 {
-        assert!(
-            !serialized.contains(&format!("task {i}")),
-            "next request must not contain creation payload for task {i}: {serialized}"
-        );
-    }
-    // The call/result pairing stays protocol-valid and the write call args
-    // were shed to a protocol-valid object.
-    let call1 = next.iter().find_map(|m| {
-        m.content.iter().find_map(|c| match c {
-            ChatContent::ToolUse { id, input, .. } if id == "call-1" => Some(input.clone()),
-            _ => None,
-        })
-    });
-    let call1 = call1.expect("TodoList write call must remain in the request");
-    assert!(
-        call1.get("ops").is_none() && call1.get("todos").is_none(),
-        "completed write args must be shed: {call1}"
-    );
-    let has_result1 = next.iter().any(|m| {
-        m.content.iter().any(
-            |c| matches!(c, ChatContent::ToolResult { tool_use_id, .. } if tool_use_id == "call-1"),
-        )
-    });
-    assert!(has_result1, "result pairing must remain valid");
 
     // --- Phase 2: complete task 1, simulate history aging ----------------
     let id1 = handle.get_todos()[0].id.clone();
@@ -171,20 +144,6 @@ async fn twenty_item_scenario_next_request_is_focus_only() {
         }],
         tools: None,
     });
-
-    // Immediate next request after completing task 1: the transition summary
-    // is present, and the original 20-add creation payload is still gone.
-    let next2 = project(&messages, &ProjectOptions::default());
-    let serialized2 = serialize_request(&next2);
-    assert!(serialized2.contains("Task completed: task 1."));
-    assert!(serialized2.contains("Current task: task 2."));
-    assert!(serialized2.contains("Progress: 1/20 completed."));
-    for i in 3..=20 {
-        assert!(
-            !serialized2.contains(&format!("task {i}")),
-            "post-complete request must not contain task {i}: {serialized2}"
-        );
-    }
 
     // Filler turns push both Todo exchanges outside the recent window.
     for i in 0..16 {

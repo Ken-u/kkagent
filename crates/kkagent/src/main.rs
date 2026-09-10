@@ -4777,7 +4777,7 @@ fn resolve_http_fs_path(config: &AppConfig, raw: &str, for_write: bool) -> Resul
 async fn build_turn_tool_registry(
     state: &Arc<ServerState>,
     event_tx: mpsc::Sender<AgentEvent>,
-    todo_service: kkagent_tools::builtin::TodoListHandle,
+    todos: Vec<kkagent_protocol::TodoItemEvent>,
     session_id: &str,
     working_dir: &std::path::Path,
 ) -> ToolRegistry {
@@ -4828,9 +4828,9 @@ async fn build_turn_tool_registry(
             }
         }
     }
-    tools.register(Arc::new(
-        kkagent_tools::builtin::TodoListTool::with_service(todo_service),
-    ));
+    tools.register(Arc::new(kkagent_tools::builtin::TodoListTool::with_items(
+        todos,
+    )));
     let background_config = state.config().background.clone();
     let auto_background_on_timeout = background_config
         .as_ref()
@@ -5110,7 +5110,7 @@ async fn run_http_turn(
     let tools = build_turn_tool_registry(
         &state,
         event_tx.clone(),
-        session.services.todos_handle(),
+        session.todo_items(),
         session.id.as_str(),
         &session.working_dir,
     )
@@ -7545,7 +7545,7 @@ async fn spawn_session_agent_turn(
             });
         }
 
-        let (todo_service, session_working_dir) = {
+        let (todos, session_working_dir) = {
             let sessions = state_clone.sessions.lock().await;
             let working_dir = sessions
                 .get(&sid)
@@ -7554,15 +7554,15 @@ async fn spawn_session_agent_turn(
             (
                 sessions
                     .get(&sid)
-                    .map(Session::todos_handle)
-                    .unwrap_or_else(kkagent_tools::builtin::todo::detached_handle),
+                    .map(Session::todo_items)
+                    .unwrap_or_default(),
                 working_dir,
             )
         };
         let tools = build_turn_tool_registry(
             &state_clone,
             agent_event_tx.clone(),
-            todo_service,
+            todos,
             &sid,
             &session_working_dir,
         )
