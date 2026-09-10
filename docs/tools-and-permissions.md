@@ -32,6 +32,34 @@ Kimi provider 原生支持 `messages[].tools`：加载的 schema 追加在历史
 
 基线约 4.5k token 的工具 schema 降至常规请求约 2.3k token（约 -49%）。随后通过合并语义重叠的冷门工具（Task/Agent/AgentSwarm → Agent；TaskList/TaskStop → TaskOutput action；Goal 四件套 → Goal；Cron 三件套 → Cron；WebSearch/FetchURL → Web），并把零调用的沙箱元工具（RequestToolchainAccess、ToolchainDoctor）转为 Deferred，工具总数从 29 降至 19，公告名从 15 降至 8，inline schema 降至 12 个。再后来这两个沙箱元工具因长期零调用被彻底移除：工具链诊断并入 `kkagent doctor`（`toolchain` 检查项含完整报告与缓存配额告警），一次性路径授权改为在 `~/.kkagent/config.toml` 的 `[toolchain.profiles.<name>]` 里静态声明（`runtime_read_only` / `agent_cache_read_write` / `env`），模型侧引导收敛到内置 skill `toolchain-sandbox`。
 
+## TodoList
+
+TodoList 支持增量更新。首次建清单可以传 `todos`，日常推进优先使用 `updates` 按稳定 ID 修改指定任务，或使用 `add` 追加任务，避免反复生成整份清单。
+
+| 参数 | 用途 |
+|---|---|
+| 无参数 `{}` | 读取完整清单、状态和稳定 ID。 |
+| `updates: [{id, status?, title?}]` | 只修改指定字段；每项至少提供 `status` 或 `title`。 |
+| `add: [{title, status?}]` | 追加任务，由工具生成 ID；默认状态为 `pending`。 |
+| `todos: [{id?, title, status}]` | 创建或整体替换清单，必须包含要保留的任务；空数组清空。 |
+
+例如，完成当前项并追加一个后续事项：
+
+```json
+{
+  "updates": [{"id": "从工具返回中取得的实际ID", "status": "done"}],
+  "add": [{"title": "检查边界条件"}]
+}
+```
+
+状态支持 `pending`、`in_progress`、`done`、`cancelled`。使用 `updates` 将任务设为 `cancelled` 可取消该任务。`updates` 与 `add` 可以组合，整次请求验证通过后才应用；未知 ID、无效状态或空标题会拒绝整次变更。`todos` 不与 `updates/add` 混用。旧的 `action/items/merge` 调用仍兼容。
+
+ID 随会话持久化，重命名、重排、跨回合和恢复会话时保持不变。旧清单中的数字 ID 会继续保留。整体替换时应携带已有任务的 ID；省略 ID 的条目会尽量按相同标题匹配旧任务，否则创建新 ID。
+
+写入结果只返回进度统计和当前任务及其 ID；没有当前项时提供一个待办候选及其 ID。完整快照仍用于持久化和 TUI 更新，模型需要全局视图时主动读取。工具不会自动启动下一项或把任务标为完成。
+
+提示词引导模型最多保持一项 `in_progress`，先处理当前任务及必要依赖，进入后续任务时再展开细节。多项同时进行时工具提示调整，但不会强制改写状态。恢复或压缩后如果缺少当前任务状态，模型应读取已保存清单。以上是执行引导，不能保证模型的实际思考范围。
+
 ## 图片输入
 
 模型配置含 `image_in`（也兼容 `vision`、`image`、`multimodal`）时启用完整图片输入：

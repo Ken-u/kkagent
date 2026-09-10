@@ -17,6 +17,8 @@ pub fn plan_reminder(plan_path: &Path) -> String {
 pub fn todo_reminder() -> String {
     "<system-reminder>\nThe TodoList tool has not been updated recently. \
 If you are working on multi-step tasks, consider updating TodoList. \
+Keep at most one task in_progress and focus on it and its necessary dependencies; \
+defer details of pending tasks. Update progress after completion, relevant verification, or a blocker. \
 Do not mention this reminder to the user.\n</system-reminder>"
         .into()
 }

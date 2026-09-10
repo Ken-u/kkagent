@@ -558,9 +558,8 @@ impl Session {
             .todos
             .get_todos()
             .into_iter()
-            .enumerate()
-            .map(|(index, item)| kkagent_protocol::TodoItemEvent {
-                id: (index + 1).to_string(),
+            .map(|item| kkagent_protocol::TodoItemEvent {
+                id: item.id,
                 content: item.title,
                 status: match item.status {
                     crate::session::todo::TodoStatus::Pending => "pending",
@@ -579,7 +578,10 @@ impl Session {
     ) -> anyhow::Result<()> {
         self.services.todos.set_todos(todo_service_items(&items));
         let mut custom = self.services.metadata.read().custom.clone();
-        custom.insert(TODOS_META_KEY.into(), serde_json::to_value(&items)?);
+        custom.insert(
+            TODOS_META_KEY.into(),
+            serde_json::to_value(self.todo_items())?,
+        );
         self.services.metadata.update(
             SessionMetaPatch {
                 custom: Some(custom),
@@ -1527,6 +1529,7 @@ fn todo_service_items(
                 _ => crate::session::todo::TodoStatus::Pending,
             };
             Some(crate::session::todo::TodoItem {
+                id: item.id.clone(),
                 title: title.to_string(),
                 status,
             })
@@ -1663,6 +1666,83 @@ mod tests {
             PermissionMode::Manual,
             "test-model".into(),
         )
+    }
+
+    #[test]
+    fn todo_ids_survive_persistence_reordering_and_resume() {
+        let mut session = test_session();
+        let original = vec![
+            kkagent_protocol::TodoItemEvent {
+                id: "stable-a".into(),
+                content: "First".into(),
+                status: "pending".into(),
+            },
+            kkagent_protocol::TodoItemEvent {
+                id: "2".into(),
+                content: "Second".into(),
+                status: "in_progress".into(),
+            },
+        ];
+        session.set_todos_persisted(original.clone()).unwrap();
+        let mut reordered = original;
+        reordered.reverse();
+        reordered[0].content = "Renamed second".into();
+        session.set_todos_persisted(reordered).unwrap();
+        let expected = serde_json::to_value(session.todo_items()).unwrap();
+        assert_eq!(expected[0]["id"], "2");
+        assert_eq!(expected[1]["id"], "stable-a");
+        assert_eq!(
+            serde_json::to_value(load_persisted_todos(&session.id, &session.working_dir)).unwrap(),
+            expected
+        );
+        let id = session.id.clone();
+        let working_dir = session.working_dir.clone();
+        drop(session);
+        let restored = Session::new_with_source(
+            id,
+            working_dir,
+            PermissionMode::Manual,
+            "test-model".into(),
+            SessionCreateSource::Resume,
+            None,
+        );
+        assert_eq!(
+            serde_json::to_value(restored.todo_items()).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn todo_persistence_normalizes_missing_and_duplicate_ids_once() {
+        let mut session = test_session();
+        session
+            .set_todos_persisted(vec![
+                kkagent_protocol::TodoItemEvent {
+                    id: "".into(),
+                    content: "Missing ID".into(),
+                    status: "pending".into(),
+                },
+                kkagent_protocol::TodoItemEvent {
+                    id: "same".into(),
+                    content: "Original".into(),
+                    status: "done".into(),
+                },
+                kkagent_protocol::TodoItemEvent {
+                    id: "same".into(),
+                    content: "Duplicate ID".into(),
+                    status: "pending".into(),
+                },
+            ])
+            .unwrap();
+        let todos = session.todo_items();
+        assert!(todos.iter().all(|t| !t.id.is_empty()));
+        assert_eq!(todos[1].id, "same");
+        let ids: std::collections::HashSet<_> = todos.iter().map(|t| &t.id).collect();
+        assert_eq!(ids.len(), 3);
+        assert_eq!(
+            serde_json::to_value(&todos).unwrap(),
+            serde_json::to_value(load_persisted_todos(&session.id, &session.working_dir)).unwrap()
+        );
     }
 
     #[test]
@@ -1823,6 +1903,16 @@ Defaults for working in an existing codebase — project conventions win:
 Git: publishing or rewriting history (`push`, `reset`, `rebase`, force operations) always requires explicit user approval. Local commits follow the first applicable rule: the user's explicit request, else the project's commit convention (e.g. "commit after each fix"), else ask.
 
 Weigh reversibility and blast radius before destructive actions (`rm -rf`, dropping databases, force-pushing). Confirm first when the action is hard to undo or reaches beyond the local workspace. This is a safety rule — never overridden by project instructions.
+
+# Multi-step Task Execution
+
+Use TodoList for multi-step work when useful. When creating a list, capture brief task boundaries, order, and necessary dependencies; defer detailed implementation decisions for pending tasks. Keep at most one item in_progress. Prefer updates by stable task ID for progress changes and add for new tasks; reserve full-list replacement for initialization or deliberate replanning.
+
+During execution, focus on the current item and its necessary dependencies. Once you have enough information to choose a concrete tool action, take it and use the result to decide the next action. Do not repeatedly expand the entire remaining plan before acting. Shared interfaces, data models, and cross-platform constraints may need up-front analysis when they affect the current item.
+
+After completing the current item and its relevant verification, update its status and choose the next unblocked item. If blocked, record the blocker and adjust the plan without claiming completion. New evidence or a changed user request may require reordering or revising the list. Task boundaries do not require user confirmation unless the user's instructions or permissions require it. In plan mode, follow the planning workflow and its approval boundary.
+
+After resuming or context compaction, read TodoList if the current task state is missing, then continue from the saved progress instead of recreating the whole plan. A saved list is progress context; always follow the user's current request.
 
 # Context Management
 

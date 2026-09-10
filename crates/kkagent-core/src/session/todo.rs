@@ -1,7 +1,7 @@
 //! Session-shared todo list.
 
 use serde::{Deserialize, Serialize};
-use std::sync::RwLock;
+use std::{collections::HashSet, sync::RwLock};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -14,6 +14,8 @@ pub enum TodoStatus {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TodoItem {
+    #[serde(default = "new_id")]
+    pub id: String,
     pub title: String,
     pub status: TodoStatus,
 }
@@ -32,7 +34,14 @@ impl SessionTodoService {
         self.todos.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
-    pub fn set_todos(&self, todos: Vec<TodoItem>) {
+    pub fn set_todos(&self, mut todos: Vec<TodoItem>) {
+        let mut ids = HashSet::new();
+        for item in &mut todos {
+            if item.id.trim().is_empty() || !ids.insert(item.id.clone()) {
+                item.id = new_id();
+                ids.insert(item.id.clone());
+            }
+        }
         *self.todos.write().unwrap_or_else(|e| e.into_inner()) = todos;
     }
 
@@ -48,6 +57,10 @@ impl SessionTodoService {
     }
 }
 
+fn new_id() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
 pub fn render_todo_list(todos: &[TodoItem], title: &str) -> String {
     if todos.is_empty() {
         return "Todo list is empty.".into();
@@ -60,7 +73,7 @@ pub fn render_todo_list(todos: &[TodoItem], title: &str) -> String {
             TodoStatus::Done => "[done]",
             TodoStatus::Cancelled => "[cancelled]",
         };
-        lines.push(format!("  {marker} {}", t.title));
+        lines.push(format!("  {marker} {} (id: {})", t.title, t.id));
     }
     lines.join("\n")
 }
@@ -78,7 +91,13 @@ pub fn parse_todo_items(raw: &serde_json::Value) -> Vec<TodoItem> {
                 Some("cancelled") | Some("canceled") => TodoStatus::Cancelled,
                 _ => TodoStatus::Pending,
             };
-            Some(TodoItem { title, status })
+            let id = v
+                .get("id")
+                .and_then(|v| v.as_str())
+                .filter(|id| !id.trim().is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(new_id);
+            Some(TodoItem { id, title, status })
         })
         .collect()
 }

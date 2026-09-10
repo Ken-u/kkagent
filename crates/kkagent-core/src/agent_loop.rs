@@ -589,12 +589,7 @@ impl AgentLoop {
         // Todo reminder injection
         session.turns_since_todo = session.turns_since_todo.saturating_add(1);
         if session.turns_since_todo >= 8 {
-            session.add_user_message(
-                "<system-reminder>\nThe TodoList tool has not been updated recently. \
-If you are working on multi-step tasks, consider updating TodoList. \
-Do not mention this reminder to the user.\n</system-reminder>"
-                    .into(),
-            );
+            session.add_user_message(crate::system_reminder::todo_reminder());
             session.turns_since_todo = 0;
         }
 
