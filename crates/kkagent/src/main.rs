@@ -6496,13 +6496,52 @@ impl ServerState {
     }
 }
 
-/// Keep live writers; drop closed ones. Full queues stay subscribed but skip the frame.
+/// Keep live writers; drop closed ones. Full queues stay subscribed but skip
+/// the frame — except lifecycle frames (issues/mcp_serve_task_issues.md #5):
+/// token deltas may be shed under load, but `turn_start` / `turn_end` /
+/// `turn_committed` / `status_update` / `error` / approval / question frames
+/// drive downstream phase machines (e.g. the MCP delegate pump finalizes a
+/// task only on `turn_committed`) and are delivered with backpressure via a
+/// spawned await-send instead of being skipped. Turn-level volume is low, so
+/// a stuck client holds at most a handful of tiny pending tasks, never an
+/// unbounded buffer.
 fn retain_rpc_event_subscribers(subscribers: &mut HashMap<u64, mpsc::Sender<Frame>>, frame: Frame) {
+    let lifecycle = is_lifecycle_frame(&frame);
     subscribers.retain(|_, tx| match tx.try_send(frame.clone()) {
         Ok(()) => true,
-        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => true,
+        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+            if lifecycle {
+                let tx = tx.clone();
+                let frame = frame.clone();
+                tokio::spawn(async move {
+                    // Closed between the try_send and here: nothing to do.
+                    let _ = tx.send(frame).await;
+                });
+            }
+            true
+        }
         Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => false,
     });
+}
+
+/// Event frames whose loss could stall a downstream state machine. Deltas
+/// and progress-only events are safe to shed.
+fn is_lifecycle_frame(frame: &Frame) -> bool {
+    let Frame::Event { data, .. } = frame else {
+        return false;
+    };
+    matches!(
+        data.get("type").and_then(|t| t.as_str()),
+        Some(
+            "turn_start"
+                | "turn_end"
+                | "turn_committed"
+                | "status_update"
+                | "error"
+                | "approval_requested"
+                | "question_asked"
+        )
+    )
 }
 
 fn configured_mcp_servers(config: &AppConfig) -> Vec<kkagent_mcp::McpServerConfig> {
@@ -8520,6 +8559,26 @@ async fn handle_rpc_call(
                 })
                 .collect();
             Ok(serde_json::json!({"sessions": list}))
+        }
+        "sessions.status" => {
+            // Liveness probe for one session (issues/mcp_serve_task_issues.md
+            // #3): lets MCP-side restart reconciliation and cancel
+            // confirmation tell "still running a turn" from "idle/unknown".
+            // Unknown sessions report turn_active=false — callers treat that
+            // as safe-to-confirm.
+            let session_id = params
+                .as_ref()
+                .and_then(|p| p.get("session_id"))
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| (-32602, "Missing session_id".into()))?
+                .to_string();
+            let in_memory = state.sessions.lock().await.contains_key(&session_id);
+            let turn_active = state.turn_locks.is_busy(&session_id).await;
+            Ok(serde_json::json!({
+                "session_id": session_id,
+                "known": in_memory,
+                "turn_active": turn_active,
+            }))
         }
         "sessions.fork" => {
             let source_id = params
@@ -11972,6 +12031,50 @@ mod http_path_tests {
         assert!(matches!(got, Frame::Event { .. }));
         assert_eq!(subscribers.len(), 1, "closed subscriber should be pruned");
         assert!(subscribers.contains_key(&1));
+    }
+
+    /// Lifecycle frames drive downstream phase machines (issues/
+    /// mcp_serve_task_issues.md #5): they are delivered with backpressure on
+    /// a full queue, while deltas are still shed.
+    #[tokio::test]
+    async fn rpc_event_fanout_sheds_deltas_but_awaits_lifecycle_frames() {
+        let mut subscribers = HashMap::new();
+        let (tx, mut rx) = mpsc::channel(1);
+        subscribers.insert(1, tx);
+        let event = |kind: &str| Frame::Event {
+            event: "agent".into(),
+            scope: None,
+            data: serde_json::json!({"type": kind}),
+        };
+
+        // Fill the single slot, then overflow it: the second delta is shed.
+        retain_rpc_event_subscribers(&mut subscribers, event("message_delta"));
+        retain_rpc_event_subscribers(&mut subscribers, event("message_delta"));
+        assert_eq!(subscribers.len(), 1, "full queue keeps the subscriber");
+        // A lifecycle frame is not shed even though the queue is still full.
+        retain_rpc_event_subscribers(&mut subscribers, event("turn_committed"));
+
+        let first = rx.recv().await.expect("first (queued) frame");
+        let Frame::Event {
+            data: first_data, ..
+        } = first
+        else {
+            panic!("expected an event frame");
+        };
+        assert_eq!(first_data["type"], "message_delta");
+        // The awaited lifecycle frame arrives after the queued one.
+        let committed = rx.recv().await.expect("lifecycle frame delivered");
+        let Frame::Event {
+            data: committed_data,
+            ..
+        } = committed
+        else {
+            panic!("expected an event frame");
+        };
+        assert_eq!(committed_data["type"], "turn_committed");
+        // The shed delta never appears.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(rx.try_recv().is_err(), "shed delta must stay dropped");
     }
 
     #[test]

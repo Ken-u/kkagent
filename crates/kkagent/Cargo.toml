@@ -16,6 +16,7 @@ kkagent-core = { workspace = true }
 kkagent-tools = { workspace = true }
 kkagent-mcp = { workspace = true }
 kkagent-client = { workspace = true }
+rusqlite = { workspace = true }
 kkagent-tui = { workspace = true }
 kkagent-di = { workspace = true }
 kkagent-wire = { workspace = true }

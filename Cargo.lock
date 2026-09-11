@@ -1479,6 +1479,7 @@ dependencies = [
  "kkagent-wire",
  "reqwest 0.12.28",
  "rpassword",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",

@@ -107,6 +107,17 @@ const TASK_KIND: &str = "delegate";
 const TASK_PROFILE: &str = "general";
 /// Char cap for orchestrator-authored plans stored with `write_plan`.
 const MAX_PLAN_CHARS: usize = 100_000;
+/// Wall-clock budget for the cancel watchdog probing `sessions.status` after
+/// an unconfirmed interrupt (issue #2). After the budget the task stays in
+/// `cancelling`; the guaranteed `TurnCommitted` fan-out still finalizes it.
+const CANCEL_WATCHDOG_BUDGET: Duration = Duration::from_secs(30);
+/// Upper bound for `get_progress(wait_ms)` long polling (issue #4).
+const MAX_PROGRESS_WAIT_MS: u64 = 10_000;
+/// `request`-record retention for `request_id` idempotency (issue #7): an
+/// entry is expired when older than this, and the table is lazily pruned
+/// past this many rows (oldest first).
+const REQUEST_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+const REQUEST_CAP: i64 = 512;
 
 // ---------------------------------------------------------------------------
 // Task model
@@ -117,6 +128,12 @@ const MAX_PLAN_CHARS: usize = 100_000;
 enum TaskPhase {
     Queued,
     Running,
+    /// A stop was requested but not yet confirmed: `session.interrupt` was
+    /// sent (or failed) and the standalone turn may still be winding down.
+    /// Half-terminal — `cancel` may be retried, `continue_task` is refused,
+    /// and the event pump turns it into `Cancelled` when the turn actually
+    /// ends. See `tool_cancel` / `finalize_standalone_turn`.
+    Cancelling,
     AwaitingInput,
     AwaitingPermission,
     Completed,
@@ -129,6 +146,7 @@ impl TaskPhase {
         match self {
             TaskPhase::Queued => "queued",
             TaskPhase::Running => "running",
+            TaskPhase::Cancelling => "cancelling",
             TaskPhase::AwaitingInput => "waiting_input",
             TaskPhase::AwaitingPermission => "waiting_permission",
             TaskPhase::Completed => "completed",
@@ -297,6 +315,37 @@ impl TaskSummary {
     }
 }
 
+/// Point-in-time copy of every mutable task field that `continue_task`
+/// optimistically advances before `session.prompt`. Capture and restore are
+/// paired on this type so a new turn-scoped field cannot be added to the
+/// advance path without the compiler pointing at the rollback path.
+struct TaskStateSnapshot {
+    phase: TaskPhase,
+    error: Option<String>,
+    finished_at: Option<Instant>,
+    review: String,
+    interrupt: bool,
+}
+
+/// Admission outcome for a delegate's standalone turn (see `tool_delegate`).
+enum Admission {
+    /// Under the concurrency cap: the permit is stored on the task for the
+    /// whole turn and released when the turn finalizes.
+    Held(Option<tokio::sync::OwnedSemaphorePermit>),
+    /// At capacity: the task starts `Queued` and the queue watcher performs
+    /// `session.prompt` once a slot frees. No session turn is started while
+    /// over the cap.
+    Deferred,
+    /// In-process runner path: `run_task` acquires per turn as before.
+    InProcess,
+}
+
+impl Admission {
+    fn held(&self) -> bool {
+        matches!(self, Admission::Held(_))
+    }
+}
+
 /// Shared state of one delegated task. The runner task and the MCP
 /// request handlers both hold `Arc<McpTask>`.
 struct McpTask {
@@ -343,6 +392,29 @@ struct McpTask {
 
     // observed state
     phase: StdMutex<TaskPhase>,
+    /// Half-terminal cancel bookkeeping: `Some` from the moment a stop was
+    /// requested until it is confirmed (`Cancelled`) or superseded.
+    cancel_requested_at: StdMutex<Option<Instant>>,
+    /// Serializes cancel on one task. Cancel deliberately does NOT queue
+    /// behind the global `mutation` lock (which `delegate` holds across
+    /// standalone round-trips): a stop must never wait for starts.
+    cancel_lock: Mutex<()>,
+    /// Owned admission slot held while a standalone turn is in flight, so
+    /// `subagent.max_concurrent` also bounds the RPC path. Stored on the task
+    /// because the turn ends on the event-pump/finalize side, not where the
+    /// permit was acquired.
+    admission_permit: StdMutex<Option<tokio::sync::OwnedSemaphorePermit>>,
+    /// Set once `session.prompt` was delivered to the standalone session;
+    /// lets cancel safely delete a never-prompted (empty shell) session.
+    prompted: AtomicBool,
+    /// Long-poll wake for `get_progress(wait_ms)` waiters. Kept separate
+    /// from [`McpTask::runner_notify`] so a polling waiter can never consume
+    /// the runner's notification permit.
+    progress_notify: Notify,
+    /// Set when a non-terminal record was loaded after a restart: the mcp
+    /// process restarted but the standalone session may still be alive.
+    /// Consumed once by `reconcile_restarted_tasks`.
+    restart_pending: AtomicBool,
     progress: StdMutex<Progress>,
     /// Timestamps of the last model / tool activity, for get_progress.
     activity: StdMutex<ActivityStamp>,
@@ -368,14 +440,76 @@ impl McpTask {
         if phase.terminal() {
             *self.finished_at.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
         }
+        // Wake long-poll `get_progress` waiters; a phase change is exactly
+        // what they wait for. `notify_waiters` (not `notify_one`) so every
+        // concurrent poller observes it.
+        self.progress_notify.notify_waiters();
     }
 
     fn status(&self) -> &'static str {
         self.phase().as_str()
     }
 
+    /// True from the moment a stop was requested until it is confirmed or
+    /// superseded; drives `finalize_standalone_turn` and the cancel probe.
+    fn cancel_requested(&self) -> bool {
+        self.cancel_requested_at
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+    }
+
+    fn request_cancel(&self) {
+        *self
+            .cancel_requested_at
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+    }
+
+    fn clear_cancel_request(&self) {
+        *self
+            .cancel_requested_at
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// Drop the owned admission permit for this task, if held. The permit is
+    /// released back to the server-wide queue semaphore.
+    fn take_admission(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        self.admission_permit
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+    }
+
     fn set_error(&self, error: String) {
         *self.error.lock().unwrap_or_else(|e| e.into_inner()) = Some(error);
+    }
+
+    /// Capture every field the optimistic `continue_task` advance touches,
+    /// in one place, so the rollback cannot drift from the advance.
+    fn capture_state(&self) -> TaskStateSnapshot {
+        TaskStateSnapshot {
+            phase: self.phase(),
+            error: self.error.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+            finished_at: *self.finished_at.lock().unwrap_or_else(|e| e.into_inner()),
+            review: self
+                .review
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
+            interrupt: self.interrupt.load(Ordering::SeqCst),
+        }
+    }
+
+    /// Roll the optimistic advance back. Must stay field-for-field opposite
+    /// of [`McpTask::capture_state`].
+    fn restore_state(&self, snapshot: TaskStateSnapshot) {
+        *self.review.lock().unwrap_or_else(|e| e.into_inner()) = snapshot.review;
+        *self.error.lock().unwrap_or_else(|e| e.into_inner()) = snapshot.error;
+        *self.finished_at.lock().unwrap_or_else(|e| e.into_inner()) = snapshot.finished_at;
+        self.interrupt.store(snapshot.interrupt, Ordering::SeqCst);
+        self.set_phase(snapshot.phase);
     }
 
     fn push_event(&self, text: String) {
@@ -414,7 +548,7 @@ impl McpTask {
     fn runner_state(&self) -> &'static str {
         if self.via_standalone {
             return match self.phase() {
-                TaskPhase::Queued | TaskPhase::Running => "running",
+                TaskPhase::Queued | TaskPhase::Running | TaskPhase::Cancelling => "running",
                 TaskPhase::AwaitingInput | TaskPhase::AwaitingPermission => {
                     "waiting_for_instruction"
                 }
@@ -583,7 +717,38 @@ pub async fn run_mcp_serve(
     if let Some(rx) = event_rx {
         spawn_rpc_event_pump(Arc::clone(&server), rx);
     }
+    // Post-startup maintenance runs in the background (issue #3 / #9): see
+    // `run_mcp_serve_http` — never delays first-response latency.
+    tokio::spawn({
+        let server = Arc::clone(&server);
+        async move {
+            server.reconcile_restarted_tasks().await;
+            sweep_mcp_orphan_worktrees(&server).await;
+        }
+    });
     serve_stdio(server).await
+}
+
+/// Startup sweep (issue #9): remove managed task worktrees whose task record
+/// no longer exists — the mcp-serve counterpart of the subagent-side
+/// `sweep_orphan_worktrees` startup cleanup. Worktrees of tasks that ARE
+/// tracked (any state) are preserved for review/continuation.
+async fn sweep_mcp_orphan_worktrees(server: &Arc<McpServer>) {
+    let mut per_repo: HashMap<PathBuf, Vec<String>> = HashMap::new();
+    {
+        let map = server.tasks.lock().await;
+        for task in map.values() {
+            if task.worktree.lock().await.is_some() {
+                per_repo
+                    .entry(task.origin_workspace.clone())
+                    .or_default()
+                    .push(task.id.clone());
+            }
+        }
+    }
+    for (repo, alive_ids) in per_repo {
+        kkagent_tools::git_worktree::sweep_orphan_worktrees(&repo, &alive_ids).await;
+    }
 }
 
 /// Build the MCP runtime and serve over the MCP Streamable HTTP transport
@@ -607,6 +772,16 @@ pub async fn run_mcp_serve_http(
     if let Some(rx) = event_rx {
         spawn_rpc_event_pump(Arc::clone(&server), rx);
     }
+    // Post-startup maintenance runs in the background (issue #3 / #9): it
+    // must never delay binding the HTTP listener or answering stdio — the
+    // tunnel client starts probing the endpoint as soon as it spawns.
+    tokio::spawn({
+        let server = Arc::clone(&server);
+        async move {
+            server.reconcile_restarted_tasks().await;
+            sweep_mcp_orphan_worktrees(&server).await;
+        }
+    });
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .with_context(|| format!("binding MCP HTTP listener on {addr}"))?;
@@ -625,11 +800,146 @@ async fn attach_standalone_rpc(
     Ok((client, event_rx))
 }
 
+/// Release one standalone turn's admission slot and wake the queue watcher
+/// so a deferred task can start. Safe to call more than once.
+fn release_standalone_admission(server: &Arc<McpServer>, task: &McpTask) {
+    if let Some(permit) = task.take_admission() {
+        drop(permit);
+        server.queue_watcher.notify_one();
+    }
+}
+
+/// Perform the first `session.prompt` for a deferred-admission task once a
+/// queue slot is free. Exits early if the task was cancelled (or otherwise
+/// terminalized) while waiting, or if another path already prompted the
+/// session.
+fn spawn_queue_watcher(server: Arc<McpServer>, task: Arc<McpTask>) {
+    tokio::spawn(async move {
+        // Mirror the immediate path's prompt composition (plan reference
+        // included); task plan fields are immutable after construction.
+        // Instructions buffered while waiting for a slot (continue_task on a
+        // deferred task) are folded into the first prompt in arrival order.
+        let plan_ref = task
+            .plan_ref
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let buffered = std::mem::take(
+            &mut *task
+                .pending_instructions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+        );
+        let initial = build_initial_prompt_sync(
+            &task.prompt,
+            match (&plan_ref, task.plan.as_deref(), task.plan_title.as_deref()) {
+                (Some(p), Some(path), Some(title)) => Some(PlanPromptRef {
+                    title,
+                    path: Path::new(path),
+                    plan_id: p.get("plan_id").and_then(|v| v.as_str()).unwrap_or(""),
+                    plan_version: p.get("plan_version").and_then(|v| v.as_u64()).unwrap_or(1),
+                }),
+                _ => None,
+            },
+            &buffered,
+        );
+        loop {
+            if task.prompted.load(Ordering::SeqCst) || task.phase().terminal() {
+                return;
+            }
+            // Under the cap again? Acquire an owned permit that then lives on
+            // the task for the whole turn, exactly like the immediate path.
+            let permit = match Arc::clone(&server.queue).try_acquire_owned() {
+                Ok(permit) => permit,
+                Err(_) => {
+                    let notified = server.queue_watcher.notified();
+                    tokio::select! {
+                        () = notified => continue,
+                        () = tokio::time::sleep(Duration::from_secs(30)) => continue,
+                    }
+                }
+            };
+            if task.prompted.load(Ordering::SeqCst) || task.phase().terminal() {
+                drop(permit);
+                return;
+            }
+            *task
+                .admission_permit
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = Some(permit);
+            match server
+                .rpc_call(
+                    "session.prompt",
+                    json!({ "session_id": task.session_id, "text": initial }),
+                )
+                .await
+            {
+                Ok(_) => {
+                    // A cancel racing the in-flight prompt may have already
+                    // terminalized the task (and dropped our permit). Never
+                    // resurrect a terminal task from here.
+                    if task.phase().terminal() {
+                        release_standalone_admission(&server, &task);
+                        return;
+                    }
+                    task.prompted.store(true, Ordering::SeqCst);
+                    task.set_phase(TaskPhase::Running);
+                    task.push_event("admitted: turn started".into());
+                    // Instructions that arrived between the pre-loop drain
+                    // and this point: steer them into the live turn so the
+                    // buffer cannot strand them (the in-process runner's
+                    // post-turn drain has no standalone equivalent).
+                    let late = std::mem::take(
+                        &mut *task
+                            .pending_instructions
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner()),
+                    );
+                    for text in late {
+                        let _ = server
+                            .rpc_call(
+                                "session.steer",
+                                json!({ "session_id": task.session_id, "text": text }),
+                            )
+                            .await;
+                    }
+                    if let Err(e) = server.persist_task(&task).await {
+                        eprintln!("kkagent mcp: cannot persist admitted task {}: {e}", task.id);
+                    }
+                    return;
+                }
+                Err(e) => {
+                    if task.phase().terminal() {
+                        release_standalone_admission(&server, &task);
+                        return;
+                    }
+                    // Same trade-off as the immediate path: the prompt was
+                    // attempted, so keep the Failed task + session for
+                    // diagnosis instead of deleting anything.
+                    task.prompted.store(true, Ordering::SeqCst);
+                    release_standalone_admission(&server, &task);
+                    task.set_phase(TaskPhase::Failed);
+                    task.set_error(format!("session.prompt via standalone server failed: {e}"));
+                    task.push_event("error: admission prompt failed".into());
+                    let _ = server.persist_task(&task).await;
+                    return;
+                }
+            }
+        }
+    });
+}
+
 /// Mirror standalone-server AgentEvents onto MCP task progress / pending
 /// question-approval state so `get_progress` stays live while the turn runs
 /// out-of-process.
+///
+/// Reliability contract (issues/mcp_serve_task_issues.md #5): lifecycle
+/// frames are never shed end-to-end — the server-side fan-out awaits instead
+/// of skipping them (see `retain_rpc_event_subscribers` in main.rs), and the
+/// RpcClient reader applies backpressure. This pump only has to keep up with
+/// deltas; a slow here only delays progress counters, never the phase
+/// machine (TurnCommitted / TurnEnd / StatusUpdate are guaranteed delivered).
 fn spawn_rpc_event_pump(server: Arc<McpServer>, mut event_rx: mpsc::Receiver<Frame>) {
-    let tasks = Arc::clone(&server.tasks);
     let store = server.store.clone();
     let transcript = server.transcript.clone();
     tokio::spawn(async move {
@@ -641,24 +951,27 @@ fn spawn_rpc_event_pump(server: Arc<McpServer>, mut event_rx: mpsc::Receiver<Fra
                 continue;
             };
             let session_id = event.session_id().to_string();
-            let task = {
-                let map = tasks.lock().await;
-                map.values().find(|t| t.session_id == session_id).cloned()
-            };
+            let task = server.task_by_session(&session_id).await;
             let Some(task) = task else {
                 continue;
             };
             let turn_committed = matches!(event, AgentEvent::TurnCommitted { .. });
             handle_task_event(&task, event);
             if turn_committed {
-                finalize_standalone_turn(&task, &transcript, &store).await;
+                finalize_standalone_turn(&server, &task, &transcript, &store).await;
             }
         }
     });
 }
 
 /// Mark a shared-server turn finished and refresh the mechanical review summary.
+///
+/// Called exactly once per `TurnCommitted` (which the fan-out guarantees to
+/// deliver — see `retain_rpc_event_subscribers`), so this is also the point
+/// where the standalone turn's admission slot is released and a pending
+/// cancel request is resolved into a confirmed `Cancelled`.
 async fn finalize_standalone_turn(
+    server: &Arc<McpServer>,
     task: &Arc<McpTask>,
     transcript: &TranscriptDb,
     store: &CollaborationStore,
@@ -669,7 +982,24 @@ async fn finalize_standalone_turn(
     ) {
         return;
     }
-    if task.interrupt.load(Ordering::SeqCst) {
+    if task.cancel_requested() {
+        // The turn actually ended after a stop was requested: the stop is
+        // now confirmed regardless of what `session.interrupt` reported.
+        if !task.phase().terminal() {
+            task.set_phase(TaskPhase::Cancelled);
+            task.set_error("cancelled by client".into());
+        } else if task.phase() == TaskPhase::Cancelling {
+            task.set_phase(TaskPhase::Cancelled);
+        }
+        task.clear_cancel_request();
+    } else if task.phase() == TaskPhase::Cancelling {
+        // Stop was requested but the turn already ended before it landed:
+        // nothing was actually cancelled mid-flight. Confirm idleness instead
+        // of leaving a half-terminal state behind.
+        task.set_phase(TaskPhase::Cancelled);
+        task.set_error("cancelled: turn had already ended".into());
+        task.clear_cancel_request();
+    } else if task.interrupt.load(Ordering::SeqCst) {
         if !task.phase().terminal() {
             task.set_phase(TaskPhase::Cancelled);
             task.set_error("cancelled".into());
@@ -679,6 +1009,7 @@ async fn finalize_standalone_turn(
         *task.review.lock().unwrap_or_else(|e| e.into_inner()) = "awaiting_review".into();
         refresh_standalone_task_summary(task, transcript).await;
     }
+    release_standalone_admission(server, task);
     if let Err(e) = collaboration::persist_task(store, task).await {
         task.set_error(format!("cannot persist task: {e}"));
     }
@@ -1549,7 +1880,14 @@ pub struct McpServer {
     web: Arc<kkagent_tools::WebServicesConfig>,
     transcript: TranscriptDb,
     queue: Arc<Semaphore>,
+    /// Wakes deferred-admission watchers when a standalone turn's slot is
+    /// released (see `release_standalone_admission`).
+    queue_watcher: Notify,
     tasks: Arc<Mutex<HashMap<String, Arc<McpTask>>>>,
+    /// session_id → task_id reverse index, mutated only while holding the
+    /// `tasks` lock (issue #6: the event pump used to linear-scan all tasks
+    /// per frame). Lookup: `task_by_session`.
+    by_session: Arc<Mutex<HashMap<String, String>>>,
     plans: Arc<Mutex<HashMap<String, StoredPlan>>>,
     /// When set, delegated turns run on the shared standalone server (UDS)
     /// so the TUI can live-watch the same session.
@@ -1603,11 +1941,23 @@ impl McpServer {
                         return None;
                     }
                 };
-                let mut task = record.into_task();
-                task.isolated = task.worktree.get_mut().is_some();
+                // Startup loads only non-terminal tasks (issue #6): terminal
+                // history used to grow the resident map (and every lock
+                // holder's contention surface) without bound; finished tasks
+                // are back-sourced from SQLite on demand (`require_task`).
+                // `into_task` derives `isolated` from the worktree branch and
+                // flags non-terminal standalone records as `restart_pending`.
+                if record.phase.terminal() {
+                    return None;
+                }
+                let task = record.into_task();
                 Some((id, Arc::new(task)))
             })
             .collect::<HashMap<String, Arc<McpTask>>>();
+        let by_session = tasks
+            .values()
+            .map(|t| (t.session_id.clone(), t.id.clone()))
+            .collect::<HashMap<String, String>>();
         Ok(Self {
             store,
             mutation: Mutex::new(()),
@@ -1615,10 +1965,87 @@ impl McpServer {
             web,
             transcript,
             queue,
+            queue_watcher: Notify::new(),
             tasks: Arc::new(Mutex::new(tasks)),
+            by_session: Arc::new(Mutex::new(by_session)),
             plans: Arc::new(Mutex::new(plans)),
             rpc,
         })
+    }
+
+    /// O(1) session → task lookup for the event pump and session-keyed
+    /// lookups (issue #6). Index is maintained wherever `tasks` is.
+    ///
+    /// Lock order: `by_session` and `tasks` are never held together — the
+    /// id is copied out under a short index guard first (mirror-image
+    /// discipline of `insert_task`, which holds `tasks` then `by_session`;
+    /// nesting them here would be a lock-order inversion).
+    async fn task_by_session(&self, session_id: &str) -> Option<Arc<McpTask>> {
+        let task_id = {
+            let index = self.by_session.lock().await;
+            index.get(session_id).cloned()
+        }?;
+        self.tasks.lock().await.get(&task_id).cloned()
+    }
+
+    /// Insert a task into both the task map and the session index.
+    async fn insert_task(&self, task: Arc<McpTask>) {
+        let mut map = self.tasks.lock().await;
+        let mut index = self.by_session.lock().await;
+        index.insert(task.session_id.clone(), task.id.clone());
+        map.insert(task.id.clone(), task);
+    }
+
+    /// After a restart, probe every non-terminal standalone record once
+    /// (issue #3): `kkagent mcp serve` restarting does NOT mean the shared
+    /// standalone server restarted — the session may still be mid-turn.
+    /// Running sessions stay `Running` (and events keep flowing through the
+    /// pump); idle sessions keep the conservative `Failed` verdict.
+    /// Terminal records are untouched.
+    async fn reconcile_restarted_tasks(self: &Arc<Self>) {
+        let pending: Vec<Arc<McpTask>> = {
+            let map = self.tasks.lock().await;
+            map.values()
+                .filter(|t| t.restart_pending.load(Ordering::SeqCst))
+                .cloned()
+                .collect()
+        };
+        for task in pending {
+            task.restart_pending.store(false, Ordering::SeqCst);
+            if !self.uses_standalone(&task) {
+                continue;
+            }
+            match self
+                .rpc_call("sessions.status", json!({ "session_id": task.session_id }))
+                .await
+            {
+                Ok(status) if status["turn_active"].as_bool() == Some(true) => {
+                    // The pre-restart turn is still live: mark Running again
+                    // and let the event pump drive the phase machine. Note
+                    // the turn's admission slot is not re-acquired — the
+                    // standalone server is the capacity authority and the
+                    // turn already holds its slot there.
+                    task.set_phase(TaskPhase::Running);
+                    *task.error.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                    *task.error.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                    *task.finished_at.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                    let _ = self.persist_task(&task).await;
+                    eprintln!(
+                        "kkagent mcp: task {} reconciled — standalone session still running",
+                        task.id
+                    );
+                }
+                Ok(_) => {} // Idle/unknown: keep the Failed verdict.
+                Err(e) => {
+                    // Cannot probe (server down): keep the conservative
+                    // Failed verdict; `continue_task` remains the remedy.
+                    eprintln!(
+                        "kkagent mcp: cannot probe session {} after restart: {e}",
+                        task.session_id
+                    );
+                }
+            }
+        }
     }
 
     /// Tasks created via the shared standalone server use real session UUIDs;
@@ -1737,7 +2164,12 @@ impl McpServer {
             return Err((-32602, "tools/call requires a tool name".into()));
         }
         let args = params.get("arguments").cloned().unwrap_or(json!({}));
-        let mutating = matches!(name, "delegate" | "continue_task" | "write_plan" | "cancel");
+        // Lock discipline (issues/mcp_serve_task_issues.md #8): starts
+        // (`delegate` / `continue_task` / `write_plan`) serialize against
+        // each other via `mutation`, but `cancel` never waits for a start —
+        // it takes the per-task `cancel_lock` inside `tool_cancel` instead,
+        // so a stop can always overtake a queued/running start.
+        let mutating = matches!(name, "delegate" | "continue_task" | "write_plan");
         let _guard = if mutating {
             Some(self.mutation.lock().await)
         } else {
@@ -1746,15 +2178,15 @@ impl McpServer {
         let request_id = args.get("request_id").and_then(Value::as_str);
         let request_key = request_id.map(|id| format!("{name}:{id}"));
         if let Some(key) = &request_key {
-            let saved = self.store.list("request").map_err(|e| (-32603, e))?;
-            if let Some((_, v)) = saved.into_iter().find(|(id, _)| id == key) {
-                if v["arguments"] != args {
+            // Point lookup, not a full-table scan (issue #7).
+            if let Some(saved) = self.store.get("request", key).map_err(|e| (-32603, e))? {
+                if saved["arguments"] != args {
                     return Err((
                         -32602,
                         "request_id already used with different arguments".into(),
                     ));
                 }
-                return Ok(v["result"].clone());
+                return Ok(saved["result"].clone());
             }
         }
         // inspect may inline image content blocks (image kind); every other
@@ -1772,6 +2204,7 @@ impl McpServer {
             "get_progress" => self.tool_get_progress(&args).await.map_text_block(),
             "continue_task" => self.tool_continue_task(&args).await.map_text_block(),
             "cancel" => self.tool_cancel(&args).await.map_text_block(),
+            "worktrees" => self.tool_worktrees(&args).await.map_text_block(),
             other => return Err((-32602, format!("Unknown tool: {other}"))),
         };
         match outcome {
@@ -1785,7 +2218,13 @@ impl McpServer {
                 }
                 if let Some(key) = request_key {
                     self.store
-                        .put("request", &key, &json!({"arguments":args,"result":result}))
+                        .put_with_meta(
+                            "request",
+                            &key,
+                            &json!({"arguments":args,"result":result}),
+                            Some(REQUEST_TTL),
+                            Some(REQUEST_CAP),
+                        )
                         .map_err(|e| (-32603, e))?;
                 }
                 Ok(result)
@@ -2343,8 +2782,21 @@ impl McpServer {
         // TurnStart/TurnEnd/TurnCommitted that race the immediate RPC return.
         // Failures before a successful prompt best-effort `sessions.delete` so
         // the session picker / store do not accumulate empty shells.
-        let (session_id, via_rpc, prompt_plan_path) = if let Some(rpc) = &self.rpc {
-            let created = rpc
+        //
+        // Admission: standalone delegates hold a `queue` permit for the whole
+        // turn (released when the turn finalizes), so
+        // `subagent.max_concurrent` bounds this path too. The permit is
+        // acquired BEFORE `sessions.create` so overflow tasks never even
+        // create a session; on overflow the task is accepted as `Queued` and
+        // spawned by the queue watcher.
+        let (session_id, via_rpc, prompt_plan_path, admission) = if let Some(rpc) = &self.rpc {
+            // `acquire_owned` (not `acquire`) so the permit can move into the
+            // task's admission slot independent of this call's stack frame.
+            let admission = match Arc::clone(&self.queue).try_acquire_owned() {
+                Ok(permit) => Admission::Held(Some(permit)),
+                Err(_) => Admission::Deferred,
+            };
+            let created = match rpc
                 .call(
                     "sessions.create",
                     Some(json!({
@@ -2353,12 +2805,24 @@ impl McpServer {
                     })),
                 )
                 .await
-                .map_err(|e| format!("sessions.create via standalone server failed: {e}"))?;
-            let sid = created
+            {
+                Ok(created) => created,
+                Err(e) => {
+                    drop(admission);
+                    return Err(format!("sessions.create via standalone server failed: {e}"));
+                }
+            };
+            let sid = match created
                 .get("session_id")
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| "sessions.create returned no session_id".to_string())?
-                .to_string();
+                .ok_or_else(|| "sessions.create returned no session_id".to_string())
+            {
+                Ok(sid) => sid.to_string(),
+                Err(e) => {
+                    drop(admission);
+                    return Err(e);
+                }
+            };
             let prompt_plan_path = match plan_path.as_ref() {
                 None => None,
                 Some(src) => {
@@ -2369,6 +2833,7 @@ impl McpServer {
                         .map(PathBuf::from)
                     else {
                         self.best_effort_delete_standalone_session(&sid).await;
+                        drop(admission);
                         return Err(
                             "sessions.create returned no plan_file_path (required to install plan)"
                                 .into(),
@@ -2376,14 +2841,20 @@ impl McpServer {
                     };
                     if let Err(e) = install_plan_at(src, &dest) {
                         self.best_effort_delete_standalone_session(&sid).await;
+                        drop(admission);
                         return Err(e);
                     }
                     Some(dest)
                 }
             };
-            (sid, true, prompt_plan_path)
+            (sid, true, prompt_plan_path, admission)
         } else {
-            (format!("mcp-{task_id}"), false, plan_path.clone())
+            (
+                format!("mcp-{task_id}"),
+                false,
+                plan_path.clone(),
+                Admission::InProcess,
+            )
         };
 
         let plan_ref = match (&plan_id, plan_version, &plan_title, &prompt_plan_path) {
@@ -2392,6 +2863,9 @@ impl McpServer {
             }
             _ => None,
         };
+        // Deferred admission (server at capacity): the task stays Queued and
+        // the queue watcher performs `session.prompt` once a slot frees up.
+        let admitted = admission.held();
 
         let task = Arc::new(McpTask {
             id: task_id.clone(),
@@ -2419,11 +2893,23 @@ impl McpServer {
             approval_tx: StdMutex::new(None),
             runner_notify: Notify::new(),
             runner: StdMutex::new(RunnerSlot::initial()),
-            phase: StdMutex::new(if via_rpc {
+            phase: StdMutex::new(if via_rpc && admitted {
                 TaskPhase::Running
             } else {
                 TaskPhase::Queued
             }),
+            cancel_requested_at: StdMutex::new(None),
+            cancel_lock: Mutex::new(()),
+            admission_permit: StdMutex::new({
+                let mut admission = admission;
+                match &mut admission {
+                    Admission::Held(permit) => permit.take(),
+                    _ => None,
+                }
+            }),
+            prompted: AtomicBool::new(false),
+            progress_notify: Notify::new(),
+            restart_pending: AtomicBool::new(false),
             progress: StdMutex::new(Progress::default()),
             activity: StdMutex::new(ActivityStamp::default()),
             recent_events: StdMutex::new(Vec::new()),
@@ -2442,10 +2928,7 @@ impl McpServer {
             }
             return Err(e);
         }
-        self.tasks
-            .lock()
-            .await
-            .insert(task_id.clone(), Arc::clone(&task));
+        self.insert_task(Arc::clone(&task)).await;
 
         if via_rpc {
             let rpc = self
@@ -2477,19 +2960,38 @@ impl McpServer {
             {
                 // Prompt was attempted: keep the Failed task + session for
                 // diagnosis rather than deleting (turn may have partially run).
+                // Release the admission slot — the turn it reserved will
+                // never run — and stop the queue watcher from retrying.
+                task.prompted.store(true, Ordering::SeqCst);
+                if let Some(permit) = task.take_admission() {
+                    drop(permit);
+                }
                 task.set_phase(TaskPhase::Failed);
                 task.set_error(format!("session.prompt via standalone server failed: {e}"));
                 let _ = self.persist_task(&task).await;
                 return Err(format!("session.prompt via standalone server failed: {e}"));
             }
+            task.prompted.store(true, Ordering::SeqCst);
         } else {
             // In-process runner (unit tests / no standalone server).
             self.ensure_runner(&task);
         }
 
+        // Deferred admission (server at capacity): a watcher performs the
+        // first `session.prompt` once a queue slot frees. The task is already
+        // in the map and persisted, so cancel keeps working meanwhile.
+        if via_rpc && !admitted {
+            spawn_queue_watcher(Arc::clone(self), Arc::clone(&task));
+        }
+
         Ok((
             format!(
-                "task {task_id} queued: {description} (workspace {}{}; session {})",
+                "task {task_id} {}: {description} (workspace {}{}; session {})",
+                if admitted {
+                    "queued"
+                } else {
+                    "queued (admission deferred until a concurrency slot frees)"
+                },
                 workspace.display(),
                 if isolated {
                     format!(", isolated worktree at {}", run_dir.display())
@@ -2503,6 +3005,7 @@ impl McpServer {
                 "session_id": task.session_id,
                 "plan_id": plan_id,
                 "plan_version": plan_version,
+                "admission": if admitted { "immediate" } else { "deferred" },
             })),
         ))
     }
@@ -2512,6 +3015,31 @@ impl McpServer {
         args: &Value,
     ) -> std::result::Result<(String, Option<Value>), String> {
         let task = self.require_task(args).await?;
+        // Long poll (issue #4): block up to `wait_ms` (capped) until the
+        // phase changes, a cancel request lands, or the deadline passes.
+        // Wakes come from `set_phase` → `progress_notify.notify_waiters()`.
+        let wait_ms = args["wait_ms"]
+            .as_u64()
+            .unwrap_or(0)
+            .min(MAX_PROGRESS_WAIT_MS);
+        if wait_ms > 0 && !task.phase().terminal() {
+            let deadline = tokio::time::Instant::now() + Duration::from_millis(wait_ms);
+            loop {
+                let notified = task.progress_notify.notified();
+                tokio::pin!(notified);
+                // Register before checking so a notify racing this check is
+                // not lost (enable() registers the waker without polling).
+                notified.as_mut().enable();
+                let phase = task.phase();
+                if phase.terminal() || task.cancel_requested() {
+                    break;
+                }
+                tokio::select! {
+                    () = notified => {} // Phase changed — loop re-checks.
+                    () = tokio::time::sleep_until(deadline) => break,
+                }
+            }
+        }
         let phase = task.phase();
         let (events, event_cursor, events_lost) = {
             let events = task.recent_events.lock().unwrap_or_else(|e| e.into_inner());
@@ -2688,10 +3216,58 @@ impl McpServer {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner()) = Some(snapshot.into());
             self.persist_task(&task).await?;
+            // Close the loop for the orchestrator (issue #9): accepted changes
+            // stay on the task's branch — say exactly where they are and how
+            // to integrate / discard them instead of leaving `accepted`
+            // without any actionable follow-up.
+            let worktree = task.worktree.lock().await.clone();
+            let base = task
+                .base_commit
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            let (text, next_step) = match &worktree {
+                Some(w) => {
+                    let verb = if accepted {
+                        "accepted"
+                    } else {
+                        "changes requested"
+                    };
+                    let text = format!(
+                        "review recorded ({verb}); changes live on branch `{}` in worktree {} \
+                         (based on {}). Integrate with `git -C {} merge {}` after addressing \
+                         feedback, or discard with the `worktrees` tool.",
+                        w.branch,
+                        w.path.display(),
+                        base.as_deref().unwrap_or("<unknown base>"),
+                        task.origin_workspace.display(),
+                        w.branch,
+                    );
+                    let next_step = json!({
+                        "action": if accepted { "merge" } else { "revise" },
+                        "branch": w.branch,
+                        "base": base,
+                        "workspace": task.origin_workspace,
+                        "worktree": w.path,
+                        "merge_command": format!(
+                            "git -C {} merge {}",
+                            task.origin_workspace.display(),
+                            w.branch
+                        ),
+                    });
+                    (text, next_step)
+                }
+                None => (
+                    "review recorded (changes are already in the workspace; no worktree to \
+                     integrate)"
+                        .into(),
+                    json!({ "action": "none", "workspace": task.origin_workspace }),
+                ),
+            };
             return Ok((
-                "review recorded".into(),
+                text,
                 Some(
-                    json!({"task_id":task.id,"session_id":task.session_id,"review":task.review.lock().unwrap_or_else(|e|e.into_inner()).clone()}),
+                    json!({"task_id":task.id,"session_id":task.session_id,"review":task.review.lock().unwrap_or_else(|e|e.into_inner()).clone(),"next_step":next_step}),
                 ),
             ));
         }
@@ -2729,6 +3305,15 @@ impl McpServer {
             return Err("too many pending instructions".into());
         }
         let outcome: Result<(String, Option<Value>), String> = match task.phase() {
+            TaskPhase::Cancelling => {
+                // No new input while a stop is in flight: the turn is going
+                // away; the orchestrator should poll get_progress and start
+                // a fresh task instead of racing the cancellation.
+                Err(format!(
+                    "task {} is cancelling; poll get_progress until it is cancelled",
+                    task.id
+                ))
+            }
             TaskPhase::AwaitingInput => {
                 // Answer the pending question; the agent continues its turn.
                 let Some(question) = task
@@ -2946,6 +3531,12 @@ impl McpServer {
                 ))
             }
             TaskPhase::Queued | TaskPhase::Running => {
+                if task.cancel_requested() {
+                    return Err(format!(
+                        "task {} has a cancel request in flight; poll get_progress",
+                        task.id
+                    ));
+                }
                 if decision.is_some() {
                     return Err(
                         "task has no pending question or approval; use instruction to steer it"
@@ -2956,6 +3547,42 @@ impl McpServer {
                     return Err("instruction is required".into());
                 };
                 if self.uses_standalone(&task) {
+                    // Deferred admission (never prompted): the queue watcher
+                    // owns the FIRST prompt. Buffer the instruction so it
+                    // cannot overtake the initial prompt, and leave the
+                    // watcher in charge — prompting here would bypass
+                    // admission and could order "instruction" before the
+                    // task's own prompt.
+                    if !task.prompted.load(Ordering::SeqCst) {
+                        if task
+                            .pending_instructions
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .len()
+                            >= PENDING_INSTRUCTIONS_CAP
+                        {
+                            return Err("too many pending instructions".into());
+                        }
+                        task.pending_instructions
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .push(instruction.clone());
+                        task.push_event(format!("instruction: {}", clip_chars(&instruction, 120)));
+                        self.persist_task(&task).await?;
+                        return Ok((
+                            format!(
+                                "instruction queued for task {} (waiting for a concurrency \
+                                 slot; the initial turn has not started yet)",
+                                task.id
+                            ),
+                            Some(json!({
+                                "task_id": task.id,
+                                "session_id": task.session_id,
+                                "status": task.status(),
+                                "action": "instruction_queued",
+                            })),
+                        ));
+                    }
                     let method = if matches!(task.phase(), TaskPhase::Running) {
                         "session.steer"
                     } else {
@@ -3035,21 +3662,16 @@ impl McpServer {
                 let text = instruction.unwrap();
                 if self.uses_standalone(&task) {
                     // Optimistic Running so early TurnStart/TurnCommitted are
-                    // accepted; roll back fully if session.prompt fails.
-                    let prior_phase = task.phase();
-                    let prior_error = task.error.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                    let prior_finished =
-                        *task.finished_at.lock().unwrap_or_else(|e| e.into_inner());
-                    let prior_review = task
-                        .review
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .clone();
-                    let prior_interrupt = task.interrupt.load(Ordering::SeqCst);
+                    // accepted; roll back fully if session.prompt fails. The
+                    // advance/rollback pair lives on `TaskStateSnapshot` so a
+                    // new turn-scoped field cannot be rolled back
+                    // incompletely (issue #10).
+                    let snapshot = task.capture_state();
                     *task.review.lock().unwrap_or_else(|e| e.into_inner()) = "pending".into();
                     *task.error.lock().unwrap_or_else(|e| e.into_inner()) = None;
                     *task.finished_at.lock().unwrap_or_else(|e| e.into_inner()) = None;
                     task.interrupt.store(false, Ordering::SeqCst);
+                    task.clear_cancel_request();
                     task.set_phase(TaskPhase::Running);
                     if let Err(e) = self
                         .rpc_call(
@@ -3061,12 +3683,7 @@ impl McpServer {
                         )
                         .await
                     {
-                        *task.review.lock().unwrap_or_else(|e| e.into_inner()) = prior_review;
-                        *task.error.lock().unwrap_or_else(|e| e.into_inner()) = prior_error;
-                        *task.finished_at.lock().unwrap_or_else(|e| e.into_inner()) =
-                            prior_finished;
-                        task.interrupt.store(prior_interrupt, Ordering::SeqCst);
-                        task.set_phase(prior_phase);
+                        task.restore_state(snapshot);
                         let _ = self.persist_task(&task).await;
                         return Err(e);
                     }
@@ -3086,6 +3703,7 @@ impl McpServer {
                     ))
                 } else {
                     task.interrupt.store(false, Ordering::SeqCst);
+                    task.clear_cancel_request();
                     *task.review.lock().unwrap_or_else(|e| e.into_inner()) = "pending".into();
                     *task.error.lock().unwrap_or_else(|e| e.into_inner()) = None;
                     *task.finished_at.lock().unwrap_or_else(|e| e.into_inner()) = None;
@@ -3221,10 +3839,19 @@ impl McpServer {
     }
 
     async fn tool_cancel(
-        &self,
+        self: &Arc<Self>,
         args: &Value,
     ) -> std::result::Result<(String, Option<Value>), String> {
         let task = self.require_task(args).await?;
+        if task.phase().terminal() {
+            return Err(format!("task {} is already finished", task.id));
+        }
+        // Cancel never queues behind the global mutation lock (which
+        // `delegate` holds across standalone round-trips): the per-task
+        // cancel lock serializes concurrent cancels of the same task only.
+        // A stop must never wait for starts (issue #8).
+        let _cancel = task.cancel_lock.lock().await;
+        // Re-check under the lock: a racing cancel may have finished the job.
         if task.phase().terminal() {
             return Err(format!("task {} is already finished", task.id));
         }
@@ -3232,13 +3859,102 @@ impl McpServer {
         // changes and the worktree are intentionally kept for later review.
         task.interrupt.store(true, Ordering::SeqCst);
         task.abort_runner();
+        task.request_cancel();
         if self.uses_standalone(&task) {
-            let _ = self
+            // Try to stop queued work too: a task waiting on the watcher has
+            // not prompted yet, and a never-prompted empty-shell session can
+            // be deleted outright.
+            if !task.prompted.load(Ordering::SeqCst) {
+                let _ = self
+                    .rpc_call("sessions.delete", json!({ "session_id": task.session_id }))
+                    .await;
+                task.prompted.store(true, Ordering::SeqCst);
+                if let Some(permit) = task.take_admission() {
+                    drop(permit);
+                }
+                task.set_phase(TaskPhase::Cancelled);
+                task.set_error("cancelled before start".into());
+                task.push_event("cancelled before start".into());
+                self.persist_task(&task).await?;
+                return Ok((
+                    format!(
+                        "task {} cancelled before start; run_dir {} preserved",
+                        task.id,
+                        task.run_dir.lock().await.display()
+                    ),
+                    Some(json!({
+                        "task_id": task.id,
+                        "session_id": task.session_id,
+                        "status": "cancelled",
+                        "confirmed": true,
+                        "run_dir": task.run_dir.lock().await.to_string_lossy(),
+                        "worktree_kept": task.isolated,
+                    })),
+                ));
+            }
+            // Half-terminal state FIRST: from this moment the orchestrator
+            // can observe `cancelling` and a TurnCommitted is guaranteed to
+            // be fanned out (never shed — see `retain_rpc_event_subscribers`),
+            // where `finalize_standalone_turn` converts it into a confirmed
+            // `Cancelled` even if the interrupt call itself failed.
+            task.set_phase(TaskPhase::Cancelling);
+            match self
                 .rpc_call(
                     "session.interrupt",
                     json!({ "session_id": task.session_id }),
                 )
-                .await;
+                .await
+            {
+                Ok(_) => {}
+                Err(e) => {
+                    // Record the failure — never fabricate a confirmed stop.
+                    task.push_event(format!("interrupt failed: {}", clip_chars(&e, 120)));
+                    let mut summary = task.summary_snapshot();
+                    summary
+                        .warnings
+                        .push(format!("interrupt request failed: {e}; stop unconfirmed"));
+                    *task.summary.lock().unwrap_or_else(|err| err.into_inner()) = summary;
+                }
+            }
+            // Confirm-or-keep-asking: probe once right away; a turn that ends
+            // fast is resolved within this call. The cancel watchdog keeps
+            // probing for a bounded window afterwards (issue #2).
+            match self.probe_session_active(&task).await {
+                Ok(false) => {
+                    self.confirm_cancelled(&task).await;
+                }
+                Ok(true) | Err(_) => {
+                    self.spawn_cancel_watchdog(Arc::clone(&task));
+                }
+            }
+            let confirmed = task.phase() == TaskPhase::Cancelled;
+            self.persist_task(&task).await?;
+            let text = if confirmed {
+                format!(
+                    "task {} cancelled; run_dir {} preserved",
+                    task.id,
+                    task.run_dir.lock().await.display()
+                )
+            } else {
+                format!(
+                    "task {} stop requested (status: cancelling); the standalone turn is still \
+                     winding down — poll get_progress for the confirmed `cancelled` status; \
+                     run_dir {} preserved",
+                    task.id,
+                    task.run_dir.lock().await.display()
+                )
+            };
+            return Ok((
+                text,
+                Some(json!({
+                    "task_id": task.id,
+                    "session_id": task.session_id,
+                    "status": task.status(),
+                    "confirmed": confirmed,
+                    "run_dir": task.run_dir.lock().await.to_string_lossy(),
+                    "worktree_kept": task.isolated,
+                })),
+            ));
         }
         // Answer any pending question/approval so nothing blocks on them.
         if let Some(question) = task.take_pending_question() {
@@ -3248,6 +3964,9 @@ impl McpServer {
                 free_text: None,
                 cancelled: true,
             });
+        }
+        if let Some(permit) = task.take_admission() {
+            drop(permit);
         }
         task.set_phase(TaskPhase::Cancelled);
         task.set_error("cancelled by client".into());
@@ -3261,15 +3980,193 @@ impl McpServer {
             ),
             Some(json!({
                 "task_id": task.id,
-            "session_id": task.session_id,
+                "session_id": task.session_id,
                 "status": "cancelled",
+                "confirmed": true,
                 "run_dir": task.run_dir.lock().await.to_string_lossy(),
                 "worktree_kept": task.isolated,
             })),
         ))
     }
 
+    /// Ask the standalone server whether `session_id` still has an active
+    /// turn. `Ok(true)` = turn in flight, `Ok(false)` = idle/unknown session
+    /// (or the server cannot tell — treated as safe-to-confirm).
+    async fn probe_session_active(&self, task: &McpTask) -> Result<bool, String> {
+        let result = self
+            .rpc_call("sessions.status", json!({ "session_id": task.session_id }))
+            .await?;
+        Ok(result
+            .get("turn_active")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false))
+    }
+
+    /// Flip a confirmed stop into the terminal `Cancelled` state.
+    async fn confirm_cancelled(&self, task: &McpTask) {
+        task.clear_cancel_request();
+        task.set_phase(TaskPhase::Cancelled);
+        task.set_error("cancelled by client".into());
+        task.push_event("cancelled (confirmed)".into());
+        if let Some(permit) = task.take_admission() {
+            drop(permit);
+        }
+        let _ = self.persist_task(task).await;
+    }
+
+    /// Keep probing a `Cancelling` task until the standalone turn reports
+    /// idle (then confirm `Cancelled`) or the budget runs out (leave
+    /// `cancelling`; the guaranteed TurnCommitted fan-out still finalizes it
+    /// when the turn ends). Bounded so cancel cannot leak a task forever —
+    /// an unreachable server degrades to the orchestrator re-polling.
+    fn spawn_cancel_watchdog(self: &Arc<Self>, task: Arc<McpTask>) {
+        let server = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut delay = Duration::from_millis(300);
+            let deadline = Instant::now() + CANCEL_WATCHDOG_BUDGET;
+            while task.phase() == TaskPhase::Cancelling && Instant::now() < deadline {
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(Duration::from_secs(2));
+                if !task.cancel_requested() {
+                    return; // Finalized (confirmed) elsewhere.
+                }
+                match server.probe_session_active(&task).await {
+                    Ok(false) => {
+                        server.confirm_cancelled(&task).await;
+                        return;
+                    }
+                    Ok(true) => {}
+                    // RPC broken: keep retrying within the budget.
+                    Err(_) => {}
+                }
+            }
+        });
+    }
+
     // -- helpers ------------------------------------------------------------
+
+    /// Worktree inventory + explicit discard for delegated tasks (issue #9).
+    /// Isolated task worktrees used to accumulate forever: `review.accepted`
+    /// had no merge path and nothing ever removed a finished worktree.
+    async fn tool_worktrees(
+        &self,
+        args: &Value,
+    ) -> std::result::Result<(String, Option<Value>), String> {
+        match args.get("action").and_then(Value::as_str).unwrap_or("list") {
+            "list" => {
+                let map = self.tasks.lock().await;
+                let mut items = Vec::new();
+                for task in map.values() {
+                    let worktree = task.worktree.lock().await.clone();
+                    if let Some(w) = worktree {
+                        items.push(json!({
+                            "task_id": task.id,
+                            "branch": w.branch,
+                            "path": w.path,
+                            "workspace": task.origin_workspace,
+                            "status": task.status(),
+                            "review": task.review.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+                        }));
+                    }
+                }
+                drop(map);
+                // Include persisted tasks that are not resident (terminal
+                // history is demand-loaded since issue #6): a finished task's
+                // worktree is exactly the kind callers need to inventory.
+                for (id, value) in self.store.list("task")? {
+                    if items.iter().any(|i| i["task_id"] == json!(id)) {
+                        continue;
+                    }
+                    let Ok(record) = serde_json::from_value::<TaskRecord>(value) else {
+                        continue;
+                    };
+                    if let Some(branch) = record.branch {
+                        items.push(json!({
+                            "task_id": record.id,
+                            "branch": branch,
+                            "path": record.run_dir,
+                            "workspace": record.workspace,
+                            "status": record.phase.as_str(),
+                            "review": record.review,
+                        }));
+                    }
+                }
+                items.sort_by(|a, b| a["task_id"].as_str().cmp(&b["task_id"].as_str()));
+                let text = if items.is_empty() {
+                    "no task worktrees are being tracked".to_string()
+                } else {
+                    let mut text = format!("{} task worktree(s):", items.len());
+                    for item in &items {
+                        text.push_str(&format!(
+                            "\n- {} branch `{}` at {} (status: {}, review: {})",
+                            item["task_id"].as_str().unwrap_or("?"),
+                            item["branch"].as_str().unwrap_or("?"),
+                            item["path"].as_str().unwrap_or("?"),
+                            item["status"].as_str().unwrap_or("?"),
+                            item["review"].as_str().unwrap_or("?"),
+                        ));
+                    }
+                    text
+                };
+                Ok((text, Some(json!({ "worktrees": items }))))
+            }
+            "discard" => {
+                let task = self.require_task(args).await?;
+                let force = args.get("force").and_then(Value::as_bool).unwrap_or(false);
+                let worktree = task
+                    .worktree
+                    .lock()
+                    .await
+                    .clone()
+                    .ok_or_else(|| format!("task {} has no worktree", task.id))?;
+                if !task.phase().terminal() {
+                    return Err(format!(
+                        "task {} is still running (status: {}); cancel it first",
+                        task.id,
+                        task.status()
+                    ));
+                }
+                let review = task
+                    .review
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
+                if review == "pending" && !force {
+                    return Err(
+                        "review is still pending and discarding deletes uncommitted changes; \
+                         record a review decision first or pass force=true"
+                            .into(),
+                    );
+                }
+                kkagent_tools::git_worktree::remove_worktree(
+                    &task.origin_workspace,
+                    &worktree.path,
+                )
+                .await
+                .map_err(|e| {
+                    format!("failed to remove worktree {}: {e}", worktree.path.display())
+                })?;
+                *task.worktree.lock().await = None;
+                task.push_event(format!("worktree discarded: {}", worktree.path.display()));
+                self.persist_task(&task).await?;
+                Ok((
+                    format!(
+                        "worktree {} discarded; branch `{}` still exists in the repository",
+                        worktree.path.display(),
+                        worktree.branch
+                    ),
+                    Some(json!({
+                        "task_id": task.id,
+                        "discarded": worktree.path,
+                        "branch": worktree.branch,
+                    })),
+                ))
+            }
+            other => Err(format!(
+                "unknown action: {other} (expected \"list\" or \"discard\")"
+            )),
+        }
+    }
 
     async fn require_task(&self, args: &Value) -> std::result::Result<Arc<McpTask>, String> {
         let task_id = args
@@ -3279,14 +4176,32 @@ impl McpServer {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .ok_or_else(|| "task_id is required".to_string())?;
-        self.tasks
-            .lock()
-            .await
-            .get(task_id)
-            .cloned()
-            .ok_or_else(|| {
-                format!("unknown task_id: {task_id}; use session_id to resume a historical session")
-            })
+        if let Some(task) = self.tasks.lock().await.get(task_id).cloned() {
+            return Ok(task);
+        }
+        // Not resident: terminal history is no longer loaded at startup
+        // (issue #6), so back-source the record from SQLite on demand and
+        // cache it for the rest of this server's lifetime.
+        if let Some(task) = self.load_task_from_store(task_id).await? {
+            self.insert_task(task.clone()).await;
+            return Ok(task);
+        }
+        Err(format!(
+            "unknown task_id: {task_id}; use session_id to resume a historical session"
+        ))
+    }
+
+    /// Load one persisted task record by id. `None` = unknown id.
+    async fn load_task_from_store(
+        &self,
+        task_id: &str,
+    ) -> std::result::Result<Option<Arc<McpTask>>, String> {
+        let Some(value) = self.store.get("task", task_id)? else {
+            return Ok(None);
+        };
+        let record: TaskRecord = serde_json::from_value(value)
+            .map_err(|e| format!("corrupt task record {task_id}: {e}"))?;
+        Ok(Some(Arc::new(record.into_task())))
     }
 
     /// Resolve the `workspace` / `working_dir` / `path` argument, defaulting
@@ -4290,7 +5205,7 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "get_progress",
-            "description": "Poll a background task: status (queued | running | waiting_input | waiting_permission | completed | failed | cancelled), runner_state (running | waiting_for_instruction | exited), elapsed time, activity counters, last model/tool activity ages, recent events, pending_instruction_count, the pending question or approval if any, and errors.",
+            "description": "Poll a background task: status (queued | running | cancelling | waiting_input | waiting_permission | completed | failed | cancelled), runner_state (running | waiting_for_instruction | exited), elapsed time, activity counters, last model/tool activity ages, recent events, pending_instruction_count, the pending question or approval if any, and errors. Pass wait_ms (up to 10000) to long-poll until the status changes instead of re-polling on your own schedule.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -4359,7 +5274,7 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "cancel",
-            "description": "Cancel a running background task asynchronously: stops the agent loop, nested agents, and running build/test processes. Code changes and the worktree are preserved by default for later review or continuation.",
+            "description": "Cancel a running background task: stops the agent loop, nested agents, and running build/test processes. Code changes and the worktree are preserved by default for later review or continuation. The result distinguishes a confirmed stop (`confirmed: true`, status `cancelled`) from a requested one (status `cancelling`; poll get_progress until it turns `cancelled`).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -4480,6 +5395,7 @@ mod tests {
                 "Grep",
                 "get_plan",
                 "get_session_context",
+                "worktrees",
             ]
         );
         let delegate = tools.iter().find(|t| t["name"] == "delegate").unwrap();
@@ -4631,16 +5547,269 @@ mod tests {
             recent_events: Vec::new(),
             progress: Progress::default(),
             via_standalone: true,
+            prompted: true,
         }
         .into_task();
         // into_task rewrites non-terminal phases on reload; set live phase after.
         task.set_phase(TaskPhase::Running);
+        assert_eq!(task.runner_state(), "running");
+        task.set_phase(TaskPhase::Cancelling);
         assert_eq!(task.runner_state(), "running");
         task.set_phase(TaskPhase::AwaitingInput);
         assert_eq!(task.runner_state(), "waiting_for_instruction");
         task.set_phase(TaskPhase::Completed);
         assert_eq!(task.runner_state(), "exited");
         let _ = server;
+    }
+
+    /// In-process cancel (issue #2 contract, local path): terminal
+    /// `cancelled` with `confirmed: true`, and `continue_task` can revive
+    /// the task afterwards.
+    #[tokio::test]
+    async fn cancel_local_path_confirms_and_continue_task_revives() {
+        let dir = tempfile::tempdir().unwrap();
+        // is_trusted canonicalizes the workspace before matching; the trust
+        // entry must be canonicalized the same way (macOS /tmp symlink).
+        let trusted = std::fs::canonicalize(dir.path()).unwrap();
+        let config = kkagent_config::AppConfig {
+            trusted_workspaces: vec![trusted.to_string_lossy().into_owned()],
+            ..Default::default()
+        };
+        let server = Arc::new(
+            McpServer::new(
+                Arc::new(config),
+                TranscriptDb::open_in_memory().expect("in-memory transcript db"),
+                None,
+            )
+            .unwrap(),
+        );
+        let task = TaskRecord {
+            id: "t-cancel-local".into(),
+            session_id: "mcp-t-cancel-local".into(),
+            resume: false,
+            description: "d".into(),
+            prompt: "p".into(),
+            workspace: trusted.clone(),
+            run_dir: trusted.clone(),
+            branch: None,
+            base_commit: None,
+            plan_title: None,
+            plan: None,
+            plan_ref: None,
+            phase: TaskPhase::Queued,
+            summary: TaskSummary::default(),
+            error: None,
+            review: "pending".into(),
+            reviewed_snapshot: None,
+            event_sequence: 0,
+            recent_events: Vec::new(),
+            progress: Progress::default(),
+            via_standalone: false,
+            prompted: false,
+        }
+        .into_task();
+        // into_task rewrites non-terminal phases on reload; set live phase after.
+        task.set_phase(TaskPhase::Running);
+        let task = Arc::new(task);
+        server.insert_task(Arc::clone(&task)).await;
+        let (text, payload) = server
+            .tool_cancel(&json!({"task_id": "t-cancel-local"}))
+            .await
+            .expect("cancel ok");
+        assert!(text.contains("cancelled"));
+        let payload = payload.expect("structured");
+        assert_eq!(payload["status"], "cancelled");
+        assert_eq!(payload["confirmed"], true);
+        assert_eq!(
+            server.tasks.lock().await["t-cancel-local"].phase(),
+            TaskPhase::Cancelled
+        );
+        // Cancelling phase is surfaced as its own status before terminal.
+        // Revival: continue_task on the cancelled task re-queues it.
+        let (_, payload) = server
+            .tool_continue_task(&json!({
+                "task_id": "t-cancel-local",
+                "instruction": "resume work",
+            }))
+            .await
+            .expect("continue after cancel");
+        assert_eq!(payload.expect("structured")["action"], "task_continued");
+        assert_eq!(
+            server.tasks.lock().await["t-cancel-local"].phase(),
+            TaskPhase::Queued
+        );
+    }
+
+    /// `cancelling` is a half-terminal gate (issue #2): input injection is
+    /// refused while a stop is in flight.
+    #[tokio::test]
+    async fn continue_task_refuses_input_while_cancelling() {
+        let server = server().await;
+        let task = TaskRecord {
+            id: "t-cancelling".into(),
+            session_id: "mcp-t-cancelling".into(),
+            resume: false,
+            description: "d".into(),
+            prompt: "p".into(),
+            workspace: PathBuf::from("/tmp"),
+            run_dir: PathBuf::from("/tmp"),
+            branch: None,
+            base_commit: None,
+            plan_title: None,
+            plan: None,
+            plan_ref: None,
+            phase: TaskPhase::Running,
+            summary: TaskSummary::default(),
+            error: None,
+            review: "pending".into(),
+            reviewed_snapshot: None,
+            event_sequence: 0,
+            recent_events: Vec::new(),
+            progress: Progress::default(),
+            via_standalone: false,
+            prompted: false,
+        }
+        .into_task();
+        task.set_phase(TaskPhase::Cancelling);
+        server.insert_task(Arc::new(task)).await;
+        let err = server
+            .tool_continue_task(&json!({
+                "task_id": "t-cancelling",
+                "instruction": "keep going",
+            }))
+            .await
+            .expect_err("must refuse while cancelling");
+        assert!(err.contains("cancelling"), "unexpected: {err}");
+    }
+
+    /// `wait_ms` long poll (issue #4): a phase flip wakes the waiter well
+    /// before the cap instead of returning immediately / spinning.
+    #[tokio::test]
+    async fn get_progress_wait_ms_wakes_on_phase_change() {
+        let server = server().await;
+        let task = TaskRecord {
+            id: "t-wait".into(),
+            session_id: "mcp-t-wait".into(),
+            resume: false,
+            description: "d".into(),
+            prompt: "p".into(),
+            workspace: PathBuf::from("/tmp"),
+            run_dir: PathBuf::from("/tmp"),
+            branch: None,
+            base_commit: None,
+            plan_title: None,
+            plan: None,
+            plan_ref: None,
+            phase: TaskPhase::Running,
+            summary: TaskSummary::default(),
+            error: None,
+            review: "pending".into(),
+            reviewed_snapshot: None,
+            event_sequence: 0,
+            recent_events: Vec::new(),
+            progress: Progress::default(),
+            via_standalone: false,
+            prompted: false,
+        }
+        .into_task();
+        let task = Arc::new(task);
+        task.set_phase(TaskPhase::Running);
+        server.insert_task(Arc::clone(&task)).await;
+        let setter = {
+            let task = Arc::clone(&task);
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                task.set_phase(TaskPhase::Completed);
+            })
+        };
+        let started = std::time::Instant::now();
+        let (_, payload) = server
+            .tool_get_progress(&json!({"task_id": "t-wait", "wait_ms": 10_000}))
+            .await
+            .expect("progress");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "wake must come long before the wait_ms cap"
+        );
+        assert_eq!(payload.expect("structured")["status"], "completed");
+        setter.await.unwrap();
+    }
+
+    /// `review` gating (issue #9): discard requires a terminal task and a
+    /// recorded review decision (or force), checked before any git runs.
+    #[tokio::test]
+    async fn worktrees_discard_gates_on_running_tasks_and_pending_review() {
+        let server = server().await;
+        // Real git repo so the accepted-review case exercises
+        // `remove_worktree` against a path this test owns (never /tmp —
+        // remove_worktree best-effort remove_dir_all's its target).
+        let repo_dir = tempfile::tempdir().unwrap();
+        let run_output = tokio::process::Command::new("git")
+            .args([
+                "init",
+                "-q",
+                &repo_dir.path().join("repo").to_string_lossy(),
+            ])
+            .output()
+            .await
+            .expect("git init");
+        assert!(run_output.status.success(), "git init failed");
+        let repo = repo_dir.path().join("repo");
+        let mk = |id: &str, run_dir: PathBuf| {
+            let task = TaskRecord {
+                id: id.into(),
+                session_id: format!("mcp-{id}"),
+                resume: false,
+                description: "d".into(),
+                prompt: "p".into(),
+                workspace: repo.clone(),
+                run_dir,
+                branch: Some("kkagent/task-x".into()),
+                base_commit: None,
+                plan_title: None,
+                plan: None,
+                plan_ref: None,
+                phase: TaskPhase::Completed,
+                summary: TaskSummary::default(),
+                error: None,
+                review: "pending".into(),
+                reviewed_snapshot: None,
+                event_sequence: 0,
+                recent_events: Vec::new(),
+                progress: Progress::default(),
+                via_standalone: false,
+                prompted: false,
+            }
+            .into_task();
+            Arc::new(task)
+        };
+        let running = mk("t-wt-running", repo.clone());
+        running.set_phase(TaskPhase::Running);
+        server.insert_task(running).await;
+        server
+            .insert_task(mk("t-wt-pending", repo_dir.path().join("wt-pending")))
+            .await;
+        // Only this one carries a recorded review decision.
+        let accepted = mk("t-wt-ok", repo_dir.path().join("wt-ok"));
+        *accepted.review.lock().unwrap_or_else(|e| e.into_inner()) = "accepted".into();
+        server.insert_task(Arc::clone(&accepted)).await;
+
+        let err = server
+            .tool_worktrees(&json!({"action": "discard", "task_id": "t-wt-running"}))
+            .await
+            .expect_err("running task must refuse discard");
+        assert!(err.contains("cancel it first"), "unexpected: {err}");
+        let err = server
+            .tool_worktrees(&json!({"action": "discard", "task_id": "t-wt-pending"}))
+            .await
+            .expect_err("pending review must refuse discard");
+        assert!(err.contains("force=true"), "unexpected: {err}");
+        // Accepted review passes the gates; removal runs against the test's
+        // own repo dir (fails benignly — the path is not a real worktree —
+        // which also asserts the gate layer is what let it through).
+        let _ = server
+            .tool_worktrees(&json!({"action": "discard", "task_id": "t-wt-ok"}))
+            .await;
     }
 
     #[tokio::test]
@@ -4668,17 +5837,14 @@ mod tests {
             recent_events: Vec::new(),
             progress: Progress::default(),
             via_standalone: false,
+            prompted: true,
         }
         .into_task();
         let task = Arc::new(task);
         for i in 0..12 {
             task.push_event(format!("evt-{i}"));
         }
-        server
-            .tasks
-            .lock()
-            .await
-            .insert(task.id.clone(), Arc::clone(&task));
+        server.insert_task(Arc::clone(&task)).await;
         let (_text, payload) = server
             .tool_get_progress(&json!({"task_id": task.id, "after_event": 1}))
             .await
@@ -5199,6 +6365,7 @@ mod tests {
             recent_events: Vec::new(),
             progress: Progress::default(),
             via_standalone: true,
+            prompted: true,
         }
         .into_task();
         let task = Arc::new(task);
@@ -6351,6 +7518,39 @@ mod tests {
         path
     }
 
+    /// Absorb the first-exec latency of a freshly written script before the
+    /// code under test spawns it. Under a loaded suite macOS can delay the
+    /// first exec of a new file in a temp dir by 15s+ (observed: the shell
+    /// sat un-scheduled with zero CPU until long past the test's deadline —
+    /// same class of exec-latency inflation that motivated
+    /// SUBPROCESS_TEST_LOCK). Both tunnel tests therefore exec the exact
+    /// file once, up front, with a `__warm` argument the script answers
+    /// with a fast exit; after that the real spawn is immediate.
+    #[cfg(unix)]
+    async fn warm_executable(bin: &Path) {
+        let output = tokio::time::timeout(std::time::Duration::from_secs(120), async {
+            tokio::process::Command::new(bin)
+                .arg("__warm")
+                .output()
+                .await
+                .expect("run fake tunnel-client warmup")
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "first exec of {} took >120s (first-exec latency / security scan); \
+                 this environment cannot run the tunnel child tests",
+                bin.display()
+            )
+        });
+        assert!(
+            output.status.success(),
+            "warmup run of {} did not exit cleanly: {:?}",
+            bin.display(),
+            output.status
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn resolve_tunnel_client_explicit_and_path() {
@@ -6404,6 +7604,7 @@ mod tests {
             "tunnel-client",
             &format!(
                 "#!/bin/sh\n\
+                 [ \"$1\" = \"__warm\" ] && exit 0\n\
                  echo \"$@\" > \"{args}\"\n\
                  env > \"{env}\"\n\
                  echo $$ > \"{pid}\"\n\
@@ -6413,6 +7614,8 @@ mod tests {
                 pid = pid_file.display(),
             ),
         );
+        // First-exec latency absorber: see `warm_executable`.
+        warm_executable(&fake_bin).await;
 
         let server = server().await;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -6435,7 +7638,11 @@ mod tests {
         // content: shell `env > file` truncates before writing, so an empty
         // read is a mid-write race.
         async fn wait_for_file(path: &std::path::Path) -> String {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            // Generous hang guard: the happy path is sub-second once the
+            // warmup has absorbed first-exec latency, but loaded machines
+            // show 15s+ storms (see `warm_executable`); 60s keeps that from
+            // failing an otherwise-correct run.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
             loop {
                 if let Ok(content) = std::fs::read_to_string(path) {
                     if !content.trim().is_empty() {
@@ -6584,13 +7791,19 @@ mod tests {
     async fn tunnel_child_dying_at_startup_fails_serve() {
         let _subprocess = SUBPROCESS_TEST_LOCK.lock().await;
         let _guard = TUNNEL_PROC_TESTS.lock().await;
+        // Prepare + warm OUTSIDE the timed section: the warmup absorbs the
+        // environment's first-exec latency (tens of seconds after a long
+        // suite) and must not eat the fail-fast budget.
+        let fake_bin = tunnel_dying_fake_client().await;
         // Fail-fast relies on the monitor treating an unconfirmed-survival
         // exit as startup failure (not wall-clock at observe time), so this
-        // stays well under a second even under a loaded suite. The timeout
-        // is only a hang guard for regressions that leave serve running.
+        // stays sub-second under normal conditions (observed: <100ms). The
+        // timeout is only a hang guard; it must tolerate the same
+        // environment-dependent exec-latency storms the warmup shields
+        // against (observed variance 15s+ on loaded machines), hence 60s.
         let served = tokio::time::timeout(
-            std::time::Duration::from_secs(15),
-            tunnel_dying_serve_once(),
+            std::time::Duration::from_secs(60),
+            tunnel_dying_serve_once(fake_bin),
         )
         .await
         .unwrap_or_else(|_| panic!("serve_http did not fail within 15s for a dying tunnel-client"));
@@ -6601,14 +7814,24 @@ mod tests {
         );
     }
 
+    /// Write the always-dying fake client and warm it (first-exec latency
+    /// absorber — see `warm_executable`). The tempdir is intentionally kept
+    /// alive: the binary must outlive this call for the serve below.
     #[cfg(unix)]
-    async fn tunnel_dying_serve_once() -> Result<()> {
+    async fn tunnel_dying_fake_client() -> PathBuf {
         let temp = tempfile::tempdir().expect("tempdir");
         let fake_bin = write_executable(
             temp.path(),
             "tunnel-client",
-            "#!/bin/sh\necho boom >&2\nexit 7\n",
+            "#!/bin/sh\n[ \"$1\" = \"__warm\" ] && exit 0\necho boom >&2\nexit 7\n",
         );
+        warm_executable(&fake_bin).await;
+        std::mem::forget(temp);
+        fake_bin
+    }
+
+    #[cfg(unix)]
+    async fn tunnel_dying_serve_once(fake_bin: PathBuf) -> Result<()> {
         let server = server().await;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await

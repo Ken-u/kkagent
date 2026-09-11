@@ -5,23 +5,145 @@ use kkagent_tools::{Tool, ToolContext};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone)]
-pub(super) struct CollaborationStore(kkagent_core::transcript::SharedSqlite);
+pub(super) struct CollaborationStore {
+    db: kkagent_core::transcript::SharedSqlite,
+    /// Per-instance (per-DB) schema flag: the process can host several
+    /// transcript databases (tests use one each), so a process-wide static
+    /// would let one DB's schema stand in for another's.
+    schema_ready: Arc<std::sync::atomic::AtomicBool>,
+}
 
 impl CollaborationStore {
     pub fn new(db: &TranscriptDb) -> Self {
-        Self(db.shared())
+        Self {
+            db: db.shared(),
+            schema_ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    /// Create the table and add the `stored_at` bookkeeping column when the
+    /// database predates it (issues/mcp_serve_task_issues.md #7). Runs once
+    /// per store instance; clones share the flag through `Arc`.
+    fn ensure_schema(&self) -> Result<(), String> {
+        use std::sync::atomic::Ordering;
+        if self.schema_ready.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        let db = self.db.lock().map_err(|e| e.to_string())?;
+        db.execute_batch("CREATE TABLE IF NOT EXISTS mcp_collaboration (kind TEXT NOT NULL, id TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY(kind,id))")
+            .map_err(|e| e.to_string())?;
+        let has_stored_at = db
+            .prepare("PRAGMA table_info(mcp_collaboration)")
+            .and_then(|mut stmt| {
+                stmt.query_map([], |r| r.get::<_, String>(1))
+                    .map(|rows| rows.filter_map(Result::ok).any(|name| name == "stored_at"))
+            })
+            .map_err(|e| e.to_string())?;
+        if !has_stored_at {
+            // Two processes (mcp serve + TUI) share this database; a racing
+            // first-use may have added the column between our PRAGMA check
+            // and the ALTER. "duplicate column name" is then success.
+            if let Err(e) = db.execute_batch(
+                "ALTER TABLE mcp_collaboration ADD COLUMN stored_at INTEGER NOT NULL DEFAULT 0",
+            ) {
+                let duplicate = e.to_string().to_lowercase().contains("duplicate column");
+                if !duplicate {
+                    return Err(e.to_string());
+                }
+            }
+        }
+        drop(db);
+        self.schema_ready.store(true, Ordering::Relaxed);
+        Ok(())
     }
 
     pub fn put(&self, kind: &str, id: &str, value: &Value) -> Result<(), String> {
-        let db = self.0.lock().map_err(|e| e.to_string())?;
-        db.execute_batch("CREATE TABLE IF NOT EXISTS mcp_collaboration (kind TEXT NOT NULL, id TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY(kind,id))").map_err(|e| e.to_string())?;
-        db.execute("INSERT INTO mcp_collaboration VALUES (?1,?2,?3) ON CONFLICT(kind,id) DO UPDATE SET value=excluded.value", [kind, id, &value.to_string()]).map_err(|e| e.to_string())?;
+        self.put_with_meta(kind, id, value, None, None)
+    }
+
+    /// Insert with retention (issue #7): `ttl` expires rows lazily on the
+    /// next write/read of the kind, `cap` keeps at most that many rows
+    /// (newest kept, oldest pruned) after each insert. `None` keeps the old
+    /// keep-forever behavior for low-churn kinds (`plan`, `task`).
+    pub fn put_with_meta(
+        &self,
+        kind: &str,
+        id: &str,
+        value: &Value,
+        ttl: Option<std::time::Duration>,
+        cap: Option<i64>,
+    ) -> Result<(), String> {
+        self.ensure_schema()?;
+        let db = self.db.lock().map_err(|e| e.to_string())?;
+        db.execute(
+            "INSERT INTO mcp_collaboration VALUES (?1,?2,?3,?4) ON CONFLICT(kind,id) DO UPDATE SET value=excluded.value, stored_at=excluded.stored_at",
+            rusqlite::params![kind, id, &value.to_string(), now_unix_millis()],
+        )
+        .map_err(|e| e.to_string())?;
+        if let Some(ttl) = ttl {
+            let cutoff = now_unix_millis() - ttl.as_millis() as i64;
+            db.execute(
+                "DELETE FROM mcp_collaboration WHERE kind=?1 AND stored_at>0 AND stored_at<?2",
+                rusqlite::params![kind, cutoff],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        if let Some(cap) = cap {
+            // Keep the newest `cap` rows: walk newest-first and delete
+            // everything after the offset (the oldest overflow).
+            db.execute(
+                "DELETE FROM mcp_collaboration WHERE kind=?1 AND id IN (SELECT id FROM mcp_collaboration WHERE kind=?1 ORDER BY stored_at DESC, id DESC LIMIT -1 OFFSET ?2)",
+                rusqlite::params![kind, cap.max(0)],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
+    /// Primary-key point lookup; `None` when missing. Replaces the
+    /// full-table `list` scan in the `request_id` idempotency check
+    /// (issue #7). Expiry is write-side only (`put_with_meta` prunes by
+    /// cutoff / cap) so `task` / `plan` rows written through plain `put`
+    /// never age out of point lookups.
+    pub fn get(&self, kind: &str, id: &str) -> Result<Option<Value>, String> {
+        self.ensure_schema()?;
+        let db = self.db.lock().map_err(|e| e.to_string())?;
+        let row = db
+            .query_row(
+                "SELECT value FROM mcp_collaboration WHERE kind=?1 AND id=?2",
+                rusqlite::params![kind, id],
+                |r| r.get::<_, String>(0),
+            )
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => None,
+                other => Some(other),
+            });
+        match row {
+            Ok(value) => Ok(Some(
+                serde_json::from_str(&value).map_err(|e| e.to_string())?,
+            )),
+            Err(None) => Ok(None),
+            Err(Some(e)) => Err(e.to_string()),
+        }
+    }
+
+    /// Delete one row; used by tests and by callers that must drop a record
+    /// explicitly (e.g. pruning a poisoned request entry).
+    #[allow(dead_code)]
+    pub fn delete(&self, kind: &str, id: &str) -> Result<(), String> {
+        self.ensure_schema()?;
+        let db = self.db.lock().map_err(|e| e.to_string())?;
+        db.execute(
+            "DELETE FROM mcp_collaboration WHERE kind=?1 AND id=?2",
+            rusqlite::params![kind, id],
+        )
+        .map_err(|e| e.to_string())?;
         Ok(())
     }
 
     pub fn list(&self, kind: &str) -> Result<Vec<(String, Value)>, String> {
-        let db = self.0.lock().map_err(|e| e.to_string())?;
-        db.execute_batch("CREATE TABLE IF NOT EXISTS mcp_collaboration (kind TEXT NOT NULL, id TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY(kind,id))").map_err(|e| e.to_string())?;
+        self.ensure_schema()?;
+        let db = self.db.lock().map_err(|e| e.to_string())?;
         let mut stmt = db
             .prepare("SELECT id,value FROM mcp_collaboration WHERE kind=?1 ORDER BY id")
             .map_err(|e| e.to_string())?;
@@ -36,6 +158,13 @@ impl CollaborationStore {
         })
         .collect()
     }
+}
+
+fn now_unix_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -67,11 +196,22 @@ pub(super) struct TaskRecord {
     /// Persisted so resumed MCP tasks keep routing decisions after restart.
     #[serde(default)]
     pub via_standalone: bool,
+    /// Persisted (issue #3 follow-up): whether the standalone session ever
+    /// received `session.prompt`. After a restart this tells cancel-safe
+    /// deletion and queue-watcher re-arming apart from "turn was interrupted
+    /// mid-flight".
+    #[serde(default)]
+    pub prompted: bool,
 }
 
 impl TaskRecord {
     pub fn into_task(self) -> McpTask {
+        let isolated = self.branch.is_some();
         let interrupted = !self.phase.terminal();
+        // Only shared-server sessions can outlive this process; the in-process
+        // runner dies with it. Flagged so `reconcile_restarted_tasks` probes
+        // the standalone session once instead of trusting the Failed guess.
+        let restart_pending = interrupted && self.via_standalone;
         McpTask {
             id: self.id,
             session_id: self.session_id,
@@ -87,7 +227,7 @@ impl TaskRecord {
                     branch,
                 }
             })),
-            isolated: false,
+            isolated,
             run_dir: Mutex::new(self.run_dir),
             base_commit: StdMutex::new(self.base_commit),
             via_standalone: self.via_standalone,
@@ -103,6 +243,12 @@ impl TaskRecord {
             } else {
                 self.phase
             }),
+            cancel_requested_at: StdMutex::new(None),
+            cancel_lock: Mutex::new(()),
+            admission_permit: StdMutex::new(None),
+            prompted: AtomicBool::new(self.prompted),
+            progress_notify: Notify::new(),
+            restart_pending: AtomicBool::new(restart_pending),
             progress: StdMutex::new(self.progress),
             recent_events: StdMutex::new(self.recent_events),
             pending_question: StdMutex::new(None),
@@ -357,6 +503,7 @@ pub(super) async fn persist_task(store: &CollaborationStore, task: &McpTask) -> 
             .unwrap_or_else(|e| e.into_inner())
             .clone(),
         via_standalone: task.via_standalone,
+        prompted: task.prompted.load(Ordering::SeqCst),
     };
     store.put(
         "task",
@@ -607,14 +754,14 @@ impl McpServer {
             progress: Progress::default(),
             // Historical sessions live on the shared server when MCP is attached.
             via_standalone: self.rpc.is_some(),
+            // Historical sessions already have transcript content: never let
+            // the cancel-before-prompt path consider them empty shells.
+            prompted: true,
         }
         .into_task();
         let task = Arc::new(task);
         self.persist_task(&task).await?;
-        self.tasks
-            .lock()
-            .await
-            .insert(task.id.clone(), task.clone());
+        self.insert_task(task.clone()).await;
         Ok(task)
     }
 }
@@ -654,6 +801,7 @@ pub(super) fn extend_definitions(definitions: &mut Vec<Value>) {
             }
             "get_progress" => {
                 tool["inputSchema"]["properties"]["after_event"] = json!({"type":"integer","minimum":0,"description":"Return only newer recent events; events_lost signals a retention gap"});
+                tool["inputSchema"]["properties"]["wait_ms"] = json!({"type":"integer","minimum":0,"maximum":MAX_PROGRESS_WAIT_MS,"description":"Long poll: block up to this many milliseconds until the status changes (recommended over tight polling); 0 returns immediately"});
             }
             "write_plan" => {
                 tool["description"]=json!("Persist a versioned orchestrator plan. Reusing plan_id creates an immutable new version. get_plan reads any version. delegate/continue_task explicitly apply a selected version; editing never changes running work implicitly.");
@@ -669,6 +817,20 @@ pub(super) fn extend_definitions(definitions: &mut Vec<Value>) {
     ] {
         definitions.push(json!({"name":name,"description":description,"inputSchema":{"type":"object","properties":properties,"required":required,"additionalProperties":false},"annotations":{"readOnlyHint":true,"destructiveHint":false,"openWorldHint":false}}));
     }
+    definitions.push(json!({
+        "name": "worktrees",
+        "description": "Inventory (action=list) or discard (action=discard, task_id required) task worktrees. Discard removes the worktree directory — uncommitted changes in it are lost, so record a review decision first or pass force=true; the branch itself is kept.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["list", "discard"]},
+                "task_id": {"type": "string", "description": "Required for action=discard"},
+                "force": {"type": "boolean", "description": "Allow discarding a worktree whose review is still pending"},
+            },
+            "additionalProperties": false,
+        },
+        "annotations": {"readOnlyHint": false, "destructiveHint": true, "openWorldHint": false},
+    }));
 }
 
 /// A change detector, not an authentication token. Include untracked file bytes
@@ -755,6 +917,64 @@ pub(super) async fn review_snapshot(dir: &Path) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration as StdDuration;
+
+    #[test]
+    fn request_records_expire_and_cap_prune() {
+        let db = TranscriptDb::open_in_memory().unwrap();
+        let store = CollaborationStore::new(&db);
+        // Expiry (issue #7): a record written with a 50ms TTL disappears at
+        // the next write of the same kind after it went stale.
+        store
+            .put_with_meta(
+                "request",
+                "a",
+                &json!({"v": 1}),
+                Some(StdDuration::from_millis(50)),
+                None,
+            )
+            .unwrap();
+        assert!(store.get("request", "a").unwrap().is_some());
+        std::thread::sleep(StdDuration::from_millis(80));
+        store
+            .put_with_meta(
+                "request",
+                "b",
+                &json!({"v": 2}),
+                Some(StdDuration::from_millis(50)),
+                None,
+            )
+            .unwrap();
+        assert!(
+            store.get("request", "a").unwrap().is_none(),
+            "expired record must be gone"
+        );
+        assert!(store.get("request", "b").unwrap().is_some());
+        // Cap (issue #7): the oldest rows beyond the cap are pruned.
+        store.put("request", "cap-a", &json!({})).unwrap();
+        store.put("request", "cap-b", &json!({})).unwrap();
+        store
+            .put_with_meta("request", "cap-c", &json!({}), None, Some(2))
+            .unwrap();
+        assert!(store.get("request", "cap-a").unwrap().is_none());
+        assert!(store.get("request", "cap-b").unwrap().is_some());
+        assert!(store.get("request", "cap-c").unwrap().is_some());
+        // task/plan rows written through plain `put` never age out of get.
+        store
+            .put("task", "t1", &json!({"phase": "completed"}))
+            .unwrap();
+        std::thread::sleep(StdDuration::from_millis(5));
+        store
+            .put_with_meta(
+                "request",
+                "t2",
+                &json!({}),
+                Some(StdDuration::from_millis(1)),
+                None,
+            )
+            .unwrap();
+        assert!(store.get("task", "t1").unwrap().is_some());
+    }
 
     fn server_at(dir: &Path, db: TranscriptDb) -> Arc<McpServer> {
         Arc::new(
