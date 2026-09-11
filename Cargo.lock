@@ -1452,7 +1452,7 @@ dependencies = [
 
 [[package]]
 name = "kkagent"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1492,7 +1492,7 @@ dependencies = [
 
 [[package]]
 name = "kkagent-acp"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1510,7 +1510,7 @@ dependencies = [
 
 [[package]]
 name = "kkagent-client"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "futures",
@@ -1525,7 +1525,7 @@ dependencies = [
 
 [[package]]
 name = "kkagent-config"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "dirs",
@@ -1540,7 +1540,7 @@ dependencies = [
 
 [[package]]
 name = "kkagent-core"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1573,7 +1573,7 @@ dependencies = [
 
 [[package]]
 name = "kkagent-di"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "parking_lot",
@@ -1582,7 +1582,7 @@ dependencies = [
 
 [[package]]
 name = "kkagent-kaos"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1595,7 +1595,7 @@ dependencies = [
 
 [[package]]
 name = "kkagent-llm"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1616,7 +1616,7 @@ dependencies = [
 
 [[package]]
 name = "kkagent-mcp"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1643,7 +1643,7 @@ dependencies = [
 
 [[package]]
 name = "kkagent-oauth"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1663,7 +1663,7 @@ dependencies = [
 
 [[package]]
 name = "kkagent-protocol"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1678,7 +1678,7 @@ dependencies = [
 
 [[package]]
 name = "kkagent-rpc"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1705,7 +1705,7 @@ dependencies = [
 
 [[package]]
 name = "kkagent-telemetry"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1723,7 +1723,7 @@ dependencies = [
 
 [[package]]
 name = "kkagent-tools"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1756,7 +1756,7 @@ dependencies = [
 
 [[package]]
 name = "kkagent-tui"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1786,7 +1786,7 @@ dependencies = [
 
 [[package]]
 name = "kkagent-wire"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "chrono",
