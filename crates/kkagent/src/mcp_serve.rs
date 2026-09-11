@@ -1051,11 +1051,9 @@ async fn spawn_tunnel_child(
     })
 }
 
-/// Startup window: a client exiting within it fails `serve_http` (the tunnel
-/// is unusable and likely misconfigured). Generous enough to absorb slow
-/// fork+exec under load — the flake mode of the fixed probe this replaces —
-/// and overridable via `KKAGENT_TUNNEL_STARTUP_WINDOW_SECS` for tests on
-/// pathologically slow file systems.
+/// Startup window: the client must still be alive when first observed past
+/// this age for the tunnel to count as "up". Overridable via
+/// `KKAGENT_TUNNEL_STARTUP_WINDOW_SECS` for slow environments.
 fn tunnel_startup_window() -> std::time::Duration {
     let secs = std::env::var("KKAGENT_TUNNEL_STARTUP_WINDOW_SECS")
         .ok()
@@ -1065,9 +1063,17 @@ fn tunnel_startup_window() -> std::time::Duration {
 }
 
 /// Reap the tunnel client in the background; the HTTP server keeps serving
-/// locally even when the tunnel goes down. Exits during the startup window
-/// are reported through `startup_failure` so the server fails instead of
-/// serving an unreachable tunnel; later exits are degraded-service warnings.
+/// locally even when the tunnel goes down. Exits before the monitor has
+/// confirmed survival past the startup window fail `serve_http` (unreachable
+/// tunnel); exits after that confirmation are degraded-service warnings.
+///
+/// Survival is tracked by whether we ever observed the child still running
+/// past the window — **not** by wall-clock at the moment we notice an exit.
+/// Under a loaded test suite the monitor's first poll can be delayed far
+/// past an instant child death; comparing observe-time to the window would
+/// mis-classify that as a late exit, leave `serve_http` running, and hang
+/// the fail-fast test for its full timeout. Holding the startup sender until
+/// survival is confirmed closes that race.
 ///
 /// Holds only a weak handle: when `serve_http` is dropped/aborted its strong
 /// reference goes away, the `Child` is dropped with it and `kill_on_drop`
@@ -1080,7 +1086,7 @@ fn spawn_tunnel_monitor(
     let started = std::time::Instant::now();
     tokio::spawn(async move {
         loop {
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             // Upgrade failed ⇒ the server is gone; kill_on_drop fired.
             let Some(child) = child.upgrade() else {
                 break;
@@ -1092,22 +1098,22 @@ fn spawn_tunnel_monitor(
                 Some(running) => match running.try_wait() {
                     Ok(None) => {
                         if started.elapsed() >= tunnel_startup_window() {
-                            // Survived startup: drop the sender so the
-                            // server stops waiting on it; later exits are
-                            // just warnings.
+                            // Observed still-alive past the window: drop the
+                            // sender so later exits are just warnings.
                             startup_failure = None;
                         }
                     }
                     Ok(Some(status)) => {
-                        if started.elapsed() < tunnel_startup_window() {
-                            if let Some(sender) = startup_failure.take() {
-                                let _ = sender.send(Err(anyhow!(
-                                    "tunnel-client exited during startup ({status}); check \
-                                     CONTROL_PLANE_API_KEY, the tunnel id, and outbound access \
-                                     to api.openai.com:443 (diagnose with `tunnel-client doctor \
-                                     --explain`)"
-                                )));
-                            }
+                        // Sender still present ⇒ we never confirmed survival,
+                        // so this is a startup failure even if the monitor
+                        // was starved past the wall-clock window.
+                        if let Some(sender) = startup_failure.take() {
+                            let _ = sender.send(Err(anyhow!(
+                                "tunnel-client exited during startup ({status}); check \
+                                 CONTROL_PLANE_API_KEY, the tunnel id, and outbound access \
+                                 to api.openai.com:443 (diagnose with `tunnel-client doctor \
+                                 --explain`)"
+                            )));
                         } else {
                             eprintln!(
                                 "kkagent mcp: WARNING tunnel-client exited ({status}); the \
@@ -6578,32 +6584,16 @@ mod tests {
     async fn tunnel_child_dying_at_startup_fails_serve() {
         let _subprocess = SUBPROCESS_TEST_LOCK.lock().await;
         let _guard = TUNNEL_PROC_TESTS.lock().await;
-        // The window must EXCEED this test's 150s timeout: the failure mode
-        // under a loaded `cargo test --workspace` is monitor starvation (its
-        // first tick delayed far past the child's instant exit), and any
-        // window shorter than the delay makes the monitor classify that exit
-        // as a *late* one — serve never fails, the test burns its whole
-        // timeout. With window > timeout, the late-exit branch is
-        // unreachable inside the test: whenever the monitor finally gets
-        // polled, the observed exit still lands "during startup" and
-        // fail-fast proceeds as designed. Slow fork+exec headroom comes for
-        // free. The guard removes the override even on panic.
-        struct RemoveOnDrop(&'static str);
-        impl Drop for RemoveOnDrop {
-            fn drop(&mut self) {
-                std::env::remove_var(self.0);
-            }
-        }
-        std::env::set_var("KKAGENT_TUNNEL_STARTUP_WINDOW_SECS", "300");
-        let _window_override = RemoveOnDrop("KKAGENT_TUNNEL_STARTUP_WINDOW_SECS");
+        // Fail-fast relies on the monitor treating an unconfirmed-survival
+        // exit as startup failure (not wall-clock at observe time), so this
+        // stays well under a second even under a loaded suite. The timeout
+        // is only a hang guard for regressions that leave serve running.
         let served = tokio::time::timeout(
-            std::time::Duration::from_secs(150),
+            std::time::Duration::from_secs(15),
             tunnel_dying_serve_once(),
         )
         .await
-        .unwrap_or_else(|_| {
-            panic!("serve_http did not fail within 150s for a dying tunnel-client")
-        });
+        .unwrap_or_else(|_| panic!("serve_http did not fail within 15s for a dying tunnel-client"));
         let error = served.expect_err("dead client must fail serve_http");
         assert!(
             error.to_string().contains("exited during startup"),

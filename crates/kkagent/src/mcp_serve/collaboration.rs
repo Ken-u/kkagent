@@ -1028,8 +1028,15 @@ mod tests {
             .output()
             .is_ok()
         {
-            let grep = call(&server, "Grep", json!({"pattern":"searchable"})).await;
-            assert_eq!(grep["isError"], false);
+            // Under a contested `cargo test --workspace`, the first rg spawn
+            // can fail transiently even with SUBPROCESS_TEST_LOCK (other
+            // crates still spawn in parallel). One retry is enough.
+            let mut grep = call(&server, "Grep", json!({"pattern":"searchable"})).await;
+            if grep["isError"] == true {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                grep = call(&server, "Grep", json!({"pattern":"searchable"})).await;
+            }
+            assert_eq!(grep["isError"], false, "{grep}");
             assert!(grep["content"][0]["text"].as_str().unwrap().contains("1:"));
             assert!(grep.get("structuredContent").is_none());
         }
