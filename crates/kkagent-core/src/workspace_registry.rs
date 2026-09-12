@@ -540,6 +540,52 @@ mod tests {
     }
 
     #[test]
+    fn refresh_all_tracked_hashes_absorbs_session_own_mutations() {
+        use crate::session::Session;
+        use kkagent_protocol::PermissionMode;
+
+        let root = temp_registry();
+        let work = root.join("ws");
+        fs::create_dir_all(&work).unwrap();
+        let file = work.join("bash-target.txt");
+        fs::write(&file, b"v1").unwrap();
+        let gone = work.join("deleted-by-bash.txt");
+        fs::write(&gone, b"bye").unwrap();
+
+        let mut sess = Session::new(
+            "sess-r".into(),
+            work.clone(),
+            PermissionMode::Auto,
+            "default".into(),
+        );
+        sess.record_read_content_hash(&file, file_content_hash(&file).unwrap());
+        sess.record_read_content_hash(&gone, file_content_hash(&gone).unwrap());
+
+        // Simulate this session's own Bash rewriting one file and deleting another.
+        fs::write(&file, b"v2-by-bash").unwrap();
+        fs::remove_file(&gone).unwrap();
+        sess.refresh_all_tracked_hashes();
+
+        // The mutation this session itself caused must not trip the gate...
+        assert!(
+            sess.check_stale_before_write(&file).is_none(),
+            "own Bash mutation must not be reported as an external change"
+        );
+        // ...and the deleted file's entry is dropped instead of rejecting.
+        assert!(
+            sess.check_stale_before_write(&gone).is_none(),
+            "tracked entry for a deleted file should be dropped"
+        );
+
+        // A change that happens *after* the last snapshot is still external.
+        fs::write(&file, b"v3-external").unwrap();
+        let reject = sess.check_stale_before_write(&file).unwrap();
+        assert!(reject.contains("modified externally"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn session_soft_and_strong_reminders_and_stale_hash_flow() {
         use crate::session::Session;
         use kkagent_protocol::PermissionMode;

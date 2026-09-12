@@ -115,6 +115,17 @@ fn global_file_tracker() -> &'static FileConflictTracker {
     TRACKER.get_or_init(FileConflictTracker::new)
 }
 
+/// Tools whose successful execution may rewrite arbitrary workspace files
+/// without going through Read/Edit/Write, so all tracked file hashes must be
+/// re-snapshotted afterwards to keep the stale-file gate accurate.
+fn tool_may_mutate_workspace(name: &str) -> bool {
+    match name {
+        "Bash" => true,
+        "Agent" | "AgentSwarm" => true,
+        n => n.starts_with("mcp__"),
+    }
+}
+
 pub struct AgentLoop {
     config: Arc<AppConfig>,
     tools: Arc<ToolRegistry>,
@@ -2149,6 +2160,12 @@ impl AgentLoop {
                             let path = session.resolve_tracked_path(path_str);
                             session.refresh_tracked_file_hash(&path);
                         }
+                    } else if tool_may_mutate_workspace(&name) {
+                        // Bash / subagents / MCP tools may have rewritten any
+                        // file this session previously Read; re-snapshot so
+                        // the stale-file gate judges real external changes,
+                        // not this session's own mutations.
+                        session.refresh_all_tracked_hashes();
                     }
                 }
 
@@ -2197,6 +2214,9 @@ impl AgentLoop {
                             }),
                         )
                         .await;
+                    // Hooks may rewrite workspace files outside Read/Edit/Write
+                    // tracking; re-snapshot so the stale gate stays truthful.
+                    session.refresh_all_tracked_hashes();
                 }
 
                 let _ = self

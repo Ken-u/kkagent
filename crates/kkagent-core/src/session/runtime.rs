@@ -187,6 +187,16 @@ pub struct SessionPlanState {
     pub content: Option<String>,
 }
 
+/// A file this session last Read (or successfully wrote), with the
+/// full-content SHA-256 hex observed at that time. The path is kept so the
+/// snapshot can be re-taken from disk after tools that may have mutated the
+/// workspace outside the Read/Edit/Write tracking (Bash, subagents, hooks).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrackedFileHash {
+    pub path: PathBuf,
+    pub hash: String,
+}
+
 pub struct Session {
     pub id: String,
     pub title: Option<String>,
@@ -259,8 +269,9 @@ pub struct Session {
     pub concurrent_write_warned: bool,
     /// First Bash already ran the concurrent-session check.
     pub bash_concurrent_checked: bool,
-    /// Paths last Read (or successfully written) → full-content SHA-256 hex.
-    pub read_file_hashes: HashMap<String, String>,
+    /// Tracked files last Read (or successfully written) with the full-content
+    /// SHA-256 hex observed at that time. Keyed by `file_track_key`.
+    pub read_file_hashes: HashMap<String, TrackedFileHash>,
     /// A tool asked to stop the turn but also queued a delivery message the
     /// model has not seen answered yet (e.g. Goal complete → summarize).
     /// The agent loop grants exactly one extra model pass before ending.
@@ -1168,7 +1179,13 @@ impl Session {
 
     pub fn record_read_content_hash(&mut self, path: &std::path::Path, hash: String) {
         let key = crate::workspace_registry::file_track_key(&self.working_dir, path);
-        self.read_file_hashes.insert(key, hash);
+        self.read_file_hashes.insert(
+            key,
+            TrackedFileHash {
+                path: path.to_path_buf(),
+                hash,
+            },
+        );
     }
 
     pub fn refresh_tracked_file_hash(&mut self, path: &std::path::Path) {
@@ -1184,10 +1201,44 @@ impl Session {
         }
     }
 
+    /// Re-snapshot every tracked file from disk after a tool that may have
+    /// mutated the workspace without going through Read/Edit/Write (Bash,
+    /// subagents, MCP tools, hooks). This keeps the stale-file gate honest:
+    /// the snapshot always reflects what this session last observed on disk,
+    /// so we no longer false-reject a follow-up Edit/Write with a
+    /// "modified externally" error purely because our own Bash/subagent
+    /// changed the file. Entries for deleted files are dropped.
+    pub fn refresh_all_tracked_hashes(&mut self) {
+        let keys: Vec<String> = self.read_file_hashes.keys().cloned().collect();
+        for key in keys {
+            let Some(tracked) = self.read_file_hashes.get(&key) else {
+                continue;
+            };
+            let path = tracked.path.clone();
+            match crate::workspace_registry::file_content_hash(&path) {
+                Ok(hash) => {
+                    if let Some(entry) = self.read_file_hashes.get_mut(&key) {
+                        entry.hash = hash;
+                    }
+                }
+                Err(_) if !path.exists() => {
+                    self.read_file_hashes.remove(&key);
+                }
+                Err(error) => {
+                    tracing::debug!(
+                        %error,
+                        path = %path.display(),
+                        "failed to refresh tracked file hash after workspace mutation"
+                    );
+                }
+            }
+        }
+    }
+
     /// Server-side stale-file gate. `None` means allow.
     pub fn check_stale_before_write(&self, path: &std::path::Path) -> Option<String> {
         let key = crate::workspace_registry::file_track_key(&self.working_dir, path);
-        let expected = self.read_file_hashes.get(&key)?;
+        let expected = &self.read_file_hashes.get(&key)?.hash;
         crate::workspace_registry::stale_write_rejection(path, expected)
     }
 
