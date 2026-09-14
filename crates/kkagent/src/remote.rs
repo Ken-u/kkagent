@@ -89,7 +89,18 @@ impl SshControlMaster {
     pub async fn establish(host: &str) -> Result<Self> {
         let socket_dir = kkagent_config::default_config_dir().join("ssh");
         std::fs::create_dir_all(&socket_dir)?;
-        let socket_path = socket_dir.join(format!("ctrl-{host}"));
+        // Sanitize host for use as a filename (replace @ : / with -)
+        let safe_host: String = host
+            .chars()
+            .map(|c| {
+                if c.is_alphanumeric() || c == '.' || c == '-' {
+                    c
+                } else {
+                    '-'
+                }
+            })
+            .collect();
+        let socket_path = socket_dir.join(format!("ctrl-{safe_host}"));
 
         // If a ControlMaster already exists and is alive, reuse it.
         if socket_path.exists() {
@@ -184,20 +195,53 @@ impl Drop for SshControlMaster {
 // Remote Server Ensure
 // ---------------------------------------------------------------------------
 
+/// Build an SSH command that reuses the ControlMaster connection.
+fn ssh_via_control(ssh_socket: &Path, host: &str) -> Command {
+    let mut cmd = Command::new("ssh");
+    cmd.arg("-S")
+        .arg(ssh_socket)
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg(host);
+    cmd
+}
+
+/// Shell preamble that ensures `kkagent` is on PATH even in a
+/// non-interactive SSH session (which skips .bashrc/.zshrc).
+const REMOTE_PATH_PREAMBLE: &str = concat!(
+    "export PATH=\"$HOME/.cargo/bin:$HOME/.local/bin:$HOME/bin:",
+    "/usr/local/bin:/usr/bin:/bin:$PATH\"; "
+);
+
 /// Check whether a remote kkagent server is running; start one if not.
 ///
 /// Returns Ok(()) when the remote server is known to be reachable.
 pub async fn ensure_remote_server(ssh_socket: &Path, host: &str) -> Result<()> {
-    // Try to reach the remote server via a quick bridge probe.
-    let probe = Command::new("ssh")
-        .arg("-S")
-        .arg(ssh_socket)
-        .arg("-o")
-        .arg("BatchMode=yes")
-        .arg(host)
-        .arg("kkagent")
-        .arg("server")
-        .arg("status")
+    // First, verify kkagent exists on the remote host.
+    let which = ssh_via_control(ssh_socket, host)
+        .arg(format!(
+            "{REMOTE_PATH_PREAMBLE}command -v kkagent || echo __NOT_FOUND__"
+        ))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await?;
+
+    let which_out = String::from_utf8_lossy(&which.stdout);
+    if which_out.contains("__NOT_FOUND__") || !which.status.success() {
+        anyhow::bail!(
+            "kkagent is not installed on {host} (not found in PATH).\n\
+             Install it on the remote host first, e.g.:\n  \
+             ssh {host} 'curl -fsSL https://your-install-url | sh'"
+        );
+    }
+    let remote_kkagent = which_out.trim().to_string();
+    eprintln!("Remote kkagent found at: {remote_kkagent}");
+
+    // Try to reach the remote server via a status probe.
+    let probe = ssh_via_control(ssh_socket, host)
+        .arg(format!("{REMOTE_PATH_PREAMBLE}kkagent server status"))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -205,58 +249,69 @@ pub async fn ensure_remote_server(ssh_socket: &Path, host: &str) -> Result<()> {
         .await?;
 
     if probe.status.success() {
-        eprintln!("Remote kkagent server on {host} is running");
+        eprintln!("Remote kkagent server on {host} is already running");
         return Ok(());
     }
 
     eprintln!("Starting remote kkagent server on {host}...");
 
     // Start a daemonized server on the remote host.
-    let start = Command::new("ssh")
-        .arg("-S")
-        .arg(ssh_socket)
-        .arg("-o")
-        .arg("BatchMode=yes")
-        .arg(host)
-        .args([
-            "sh",
-            "-c",
-            "nohup kkagent server </dev/null >/dev/null 2>&1 &",
-        ])
+    // SSH remote commands are executed by the user's login shell, so we pass
+    // the entire pipeline as a single string.  The `&` backgrounds the server
+    // and `disown` detaches it from the shell job table.
+    let start_cmd = format!(
+        "{REMOTE_PATH_PREAMBLE}\
+         nohup kkagent server </dev/null >\"$HOME/.kkagent/server-start.log\" 2>&1 & disown"
+    );
+    let start = ssh_via_control(ssh_socket, host)
+        .arg(&start_cmd)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .status()
+        .output()
         .await?;
 
-    if !start.success() {
-        anyhow::bail!("failed to start remote kkagent server on {host}");
+    if !start.status.success() {
+        let stderr = String::from_utf8_lossy(&start.stderr);
+        anyhow::bail!("failed to start remote kkagent server on {host}: {stderr}");
     }
 
     // Wait for the remote server to become ready.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    let mut delay = Duration::from_millis(200);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let mut delay = Duration::from_millis(300);
     loop {
-        let check = Command::new("ssh")
-            .arg("-S")
-            .arg(ssh_socket)
-            .arg("-o")
-            .arg("BatchMode=yes")
-            .arg(host)
-            .arg("kkagent")
-            .arg("server")
-            .arg("status")
+        let check = ssh_via_control(ssh_socket, host)
+            .arg(format!("{REMOTE_PATH_PREAMBLE}kkagent server status"))
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
             .await;
-        if check.is_ok_and(|s| s.success()) {
-            eprintln!("Remote kkagent server on {host} is ready");
-            return Ok(());
+        match &check {
+            Ok(output) if output.status.success() => {
+                eprintln!("Remote kkagent server on {host} is ready");
+                return Ok(());
+            }
+            _ => {}
         }
         if tokio::time::Instant::now() > deadline {
-            anyhow::bail!("remote kkagent server on {host} did not become ready within 10s");
+            // Try to read the startup log for diagnostics.
+            let log = ssh_via_control(ssh_socket, host)
+                .arg(format!(
+                    "{REMOTE_PATH_PREAMBLE}tail -20 \"$HOME/.kkagent/server-start.log\" 2>/dev/null || echo '(no log)'"
+                ))
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .output()
+                .await
+                .ok()
+                .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+                .unwrap_or_default();
+            anyhow::bail!(
+                "remote kkagent server on {host} did not become ready within 15s\n\
+                 Remote startup log:\n{log}"
+            );
         }
         tokio::time::sleep(delay).await;
         delay = (delay * 2).min(Duration::from_millis(1000));
@@ -336,6 +391,10 @@ impl RemoteServerConnection {
             let _ = old_child.kill().await;
         }
 
+        // The remote command is passed as a single string so SSH hands it
+        // to the user's login shell verbatim; PATH preamble ensures kkagent
+        // is found even in non-interactive SSH sessions.
+        let remote_cmd = format!("{REMOTE_PATH_PREAMBLE}exec kkagent bridge --stdio");
         let mut cmd = Command::new("ssh");
         cmd.arg("-S")
             .arg(&self.ssh_socket)
@@ -346,9 +405,7 @@ impl RemoteServerConnection {
             .arg("-o")
             .arg("ServerAliveCountMax=3")
             .arg(&self.host)
-            .arg("kkagent")
-            .arg("bridge")
-            .arg("--stdio")
+            .arg(&remote_cmd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
