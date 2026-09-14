@@ -240,6 +240,14 @@ impl TranscriptDb {
         Ok(db)
     }
 
+    /// Wrap a connection that was already migrated by a prior `from_shared`
+    /// call on the same `SharedSqlite`. Skips all DDL / FTS checks, making
+    /// it effectively free. Use only when another `TranscriptDb` sharing the
+    /// same connection has already run `migrate`.
+    pub fn wrap_shared(conn: SharedSqlite) -> Self {
+        Self { conn }
+    }
+
     /// Absolute path of the main database file backing this connection, if
     /// it is a real file (not `:memory:`).
     fn database_path(&self) -> anyhow::Result<Option<std::path::PathBuf>> {
@@ -265,6 +273,11 @@ impl TranscriptDb {
         Self::open(&db_path)
     }
 
+    /// Bump this whenever the transcript schema changes. `migrate` skips all
+    /// DDL (and the expensive FTS population check) when the on-disk version
+    /// already matches, turning a ~1.4 s cold-open of a large DB into <1 ms.
+    const SCHEMA_VERSION: i64 = 1;
+
     fn migrate(&self) -> anyhow::Result<()> {
         // Serialize schema creation both in-process (global mutex) and
         // cross-process (advisory file lock next to the db). Without this,
@@ -281,6 +294,18 @@ impl TranscriptDb {
             }
             None => None, // :memory: connections never race another process
         };
+
+        // Fast path: skip all DDL + FTS checks when schema is already current.
+        // PRAGMA user_version lives in the DB header (page 1) and never
+        // triggers a WAL checkpoint, so this read is effectively free.
+        {
+            let conn = self.lock()?;
+            let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+            if version >= Self::SCHEMA_VERSION {
+                return Ok(());
+            }
+        }
+
         let conn = self.lock()?;
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
@@ -354,6 +379,9 @@ impl TranscriptDb {
         }
         drop(conn);
         self.ensure_fts_populated()?;
+        // Mark schema as current so subsequent opens skip everything above.
+        let conn = self.lock()?;
+        conn.execute_batch(&format!("PRAGMA user_version = {}", Self::SCHEMA_VERSION))?;
         Ok(())
     }
 
@@ -702,6 +730,21 @@ impl TranscriptDb {
             sessions.push(row?);
         }
         Ok(sessions)
+    }
+
+    /// Return the most recently updated non-archived, non-empty session whose
+    /// `working_dir` matches `dir` (exact string comparison after converting
+    /// the path to a string). Returns `None` when no qualifying session exists.
+    pub fn latest_session_for_dir(&self, dir: &std::path::Path) -> anyhow::Result<Option<String>> {
+        let dir_str = dir.to_string_lossy();
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT session_id FROM sessions
+             WHERE working_dir = ?1 AND is_archived = 0 AND message_count > 0
+             ORDER BY updated_at DESC LIMIT 1",
+        )?;
+        let mut rows = stmt.query_map(params![dir_str.as_ref()], |row| row.get(0))?;
+        Ok(rows.next().and_then(|r| r.ok()))
     }
 
     /// Resolve a session by exact id or unique id prefix (same semantics as

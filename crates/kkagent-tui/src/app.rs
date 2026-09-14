@@ -1682,6 +1682,119 @@ impl TuiApp {
 
     pub async fn run(mut self, resume: Option<Option<String>>) -> anyhow::Result<()> {
         let startup_started = std::time::Instant::now();
+
+        // Enter the terminal immediately so the user sees the TUI while the
+        // server finishes initialising (in-process mode) and the session RPC
+        // completes. A panic in the event loop unwinds past the teardown at
+        // the bottom of this function; the guard restores the terminal from
+        // the panic hook so the shell stays usable.
+        crate::panic_guard::install();
+        crate::panic_guard::set_active(true);
+        enable_raw_mode().map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to enter raw mode (is stdin a TTY?): {}. \
+                 Run kkagent in a real terminal, or use `kkagent -p \"...\"` for non-interactive mode.",
+                e
+            )
+        })?;
+        let mut stdout = io::stdout();
+        if self.use_alt_screen {
+            if let Err(e) = execute!(stdout, EnterAlternateScreen, EnableBracketedPaste) {
+                let _ = disable_raw_mode();
+                crate::panic_guard::set_active(false);
+                return Err(e.into());
+            }
+        } else if let Err(e) = execute!(stdout, EnableBracketedPaste) {
+            let _ = disable_raw_mode();
+            crate::panic_guard::set_active(false);
+            return Err(e.into());
+        }
+        if let Err(e) = self.mouse_mode.enable(&mut stdout) {
+            if self.use_alt_screen {
+                let _ = execute!(stdout, DisableBracketedPaste, LeaveAlternateScreen);
+            } else {
+                let _ = execute!(stdout, DisableBracketedPaste);
+            }
+            let _ = disable_raw_mode();
+            crate::panic_guard::set_active(false);
+            return Err(e.into());
+        }
+        let backend = CrosstermBackend::new(stdout);
+        let mut terminal = match Terminal::new(backend) {
+            Ok(t) => t,
+            Err(e) => {
+                let _ = disable_raw_mode();
+                crate::panic_guard::set_active(false);
+                return Err(e.into());
+            }
+        };
+        tracing::info!(
+            elapsed_ms = startup_started.elapsed().as_millis() as u64,
+            alt_screen = self.use_alt_screen,
+            "TUI terminal ready"
+        );
+
+        // Paint the loading frame so the user sees the TUI instantly, even if
+        // the server is still initialising in the background.
+        let _ = self.draw_frame(&mut terminal);
+
+        // Session init + main loop. Extracted so terminal cleanup below
+        // always executes regardless of whether init or the loop fails.
+        let result = self
+            .run_with_session(&mut terminal, resume, startup_started)
+            .await;
+
+        // --- cleanup (always runs) ---
+        let sid = self.state.session_id.clone();
+        let empty = !session_has_retained_io(&self.state.messages);
+
+        if let Some(ref id) = sid {
+            if !self.allows_background_detach {
+                let _ = self.client.interrupt(id).await;
+            }
+            if empty {
+                let _ = self.discard_session_record(id).await;
+            }
+        }
+
+        crate::panic_guard::set_active(false);
+        let _ = disable_raw_mode();
+        let _ = self.mouse_mode.disable(terminal.backend_mut());
+        if self.use_alt_screen {
+            let _ = execute!(
+                terminal.backend_mut(),
+                DisableBracketedPaste,
+                LeaveAlternateScreen
+            );
+        } else {
+            let _ = execute!(terminal.backend_mut(), DisableBracketedPaste);
+        }
+        let _ = terminal.show_cursor();
+
+        if let Some(id) = sid {
+            if !empty {
+                println!();
+                println!("Session: {}", id);
+                println!("Resume:  kkagent --resume {}", id);
+                println!();
+            }
+        }
+
+        result
+    }
+
+    /// Session initialisation, startup checks, and the main event loop.
+    ///
+    /// Separated from [`run`] so terminal cleanup always executes after
+    /// return, even when a server RPC (workspace trust, session creation)
+    /// fails before the main loop starts.
+    async fn run_with_session(
+        &mut self,
+        terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+        resume: Option<Option<String>>,
+        startup_started: std::time::Instant,
+    ) -> anyhow::Result<()> {
+        // Workspace trust: the server needs this before sessions.create.
         let startup_trust = if self.config.sandbox.is_disabled() {
             None
         } else {
@@ -1696,13 +1809,14 @@ impl TuiApp {
                 .await?;
         }
 
-        // Create / resume session BEFORE taking over the terminal, so RPC
-        // failures don't leave the user's shell stuck in raw/alternate mode.
         let cwd = self.state.working_dir.to_string_lossy().into_owned();
         match resume {
             Some(Some(id)) => {
                 if let Err(e) = self.resume_session(&id).await {
-                    eprintln!("Resume failed ({}): {}. Starting a new session.", id, e);
+                    self.system_message(format!(
+                        "Resume failed ({}): {}. Starting a new session.",
+                        id, e
+                    ));
                     let session_id = self
                         .client
                         .create_session(Some(&cwd), Some(self.state.permission_mode))
@@ -1714,7 +1828,6 @@ impl TuiApp {
                 }
             }
             Some(None) => {
-                // `-r` / `--resume` with no id: show the session picker once we enter the UI loop.
                 self.state.startup_session_picker = true;
                 let session_id = self
                     .client
@@ -1741,8 +1854,6 @@ impl TuiApp {
             "TUI session ready"
         );
 
-        // With sandboxing enabled, startup review or static config must have
-        // established trust before the server creates this session.
         let cwd_path = std::path::PathBuf::from(&cwd);
         if !self.config.sandbox.is_disabled()
             && self.config.workspace_trust.matching(&cwd_path).is_none()
@@ -1753,7 +1864,6 @@ impl TuiApp {
             ));
         }
 
-        // Validate optional keybinding overrides without locking the user out.
         if let Err(e) = crate::pi::keybindings::validate_overrides(&self.config.ui.keybindings) {
             self.system_message(format!(
                 "Keybinding config warning: {e} — defaults kept for interrupt/submit"
@@ -1766,9 +1876,6 @@ impl TuiApp {
             self.system_message(hint);
         }
 
-        // Surface config-schema migration notes performed by the embedded
-        // server during startup (same process). Empty in remote/server mode —
-        // those deployments log the same lines instead.
         for notice in kkagent_config::take_startup_notices() {
             self.system_message(notice);
         }
@@ -1776,18 +1883,17 @@ impl TuiApp {
             self.jobs.spawn_version_check();
         }
 
-        // Sync CLI / config plan mode onto the server session (create starts with plan_mode=false).
         if self.state.plan_mode {
             if let Some(ref sid) = self.state.session_id.clone() {
                 if let Err(e) = self.client.set_plan_mode(sid, true).await {
-                    eprintln!("Failed to enable plan mode: {}", e);
+                    self.system_message(format!("Failed to enable plan mode: {e}"));
                 }
             }
         }
 
-        // Skills / sessions / MCP status are useful, but none are required for the
-        // first interactive frame. Fetch on a request-only client so slow disks
-        // or MCP handshakes never hold the alternate screen hostage.
+        // Skills / sessions / MCP status are useful, but none are required for
+        // the first interactive frame. Fetch on a request-only client so slow
+        // disks or MCP handshakes never hold the alternate screen hostage.
         let requester = self.client.requester();
         self.jobs.spawn_rpc(
             requester.clone(),
@@ -1818,94 +1924,7 @@ impl TuiApp {
             );
         }
 
-        // A panic in the event loop unwinds past the teardown at the bottom of
-        // this function; the guard restores the terminal from the panic hook
-        // so the shell stays usable (see panic_guard for the thread gating).
-        crate::panic_guard::install();
-        crate::panic_guard::set_active(true);
-        enable_raw_mode().map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to enter raw mode (is stdin a TTY?): {}. \
-                 Run kkagent in a real terminal, or use `kkagent -p \"...\"` for non-interactive mode.",
-                e
-            )
-        })?;
-        let mut stdout = io::stdout();
-        // Capture mouse so the wheel and in-app drag-select stay inside the TUI.
-        // Capture remains on for the whole session (no disable-on-click hacks).
-        // `KKAGENT_MOUSE_MODE=off` disables mouse reporting.
-        if self.use_alt_screen {
-            if let Err(e) = execute!(stdout, EnterAlternateScreen, EnableBracketedPaste) {
-                let _ = disable_raw_mode();
-                return Err(e.into());
-            }
-        } else if let Err(e) = execute!(stdout, EnableBracketedPaste) {
-            let _ = disable_raw_mode();
-            return Err(e.into());
-        }
-        tracing::info!(
-            elapsed_ms = startup_started.elapsed().as_millis() as u64,
-            alt_screen = self.use_alt_screen,
-            "TUI first frame ready"
-        );
-        if let Err(e) = self.mouse_mode.enable(&mut stdout) {
-            if self.use_alt_screen {
-                let _ = execute!(stdout, DisableBracketedPaste, LeaveAlternateScreen);
-            } else {
-                let _ = execute!(stdout, DisableBracketedPaste);
-            }
-            let _ = disable_raw_mode();
-            return Err(e.into());
-        }
-        let backend = CrosstermBackend::new(stdout);
-        let mut terminal = match Terminal::new(backend) {
-            Ok(t) => t,
-            Err(e) => {
-                let _ = disable_raw_mode();
-                return Err(e.into());
-            }
-        };
-
-        let result = self.main_loop(&mut terminal).await;
-        let sid = self.state.session_id.clone();
-        let empty = !session_has_retained_io(&self.state.messages);
-
-        // In-process mode: interrupt before aborting the paired server task.
-        // Standalone / --connect: leave turns running so Ctrl+B and Background quit work.
-        if let Some(ref id) = sid {
-            if !self.allows_background_detach {
-                let _ = self.client.interrupt(id).await;
-            }
-            if empty {
-                let _ = self.discard_session_record(id).await;
-            }
-        }
-
-        // Always restore the terminal, even if the loop failed.
-        crate::panic_guard::set_active(false);
-        let _ = disable_raw_mode();
-        let _ = self.mouse_mode.disable(terminal.backend_mut());
-        if self.use_alt_screen {
-            let _ = execute!(
-                terminal.backend_mut(),
-                DisableBracketedPaste,
-                LeaveAlternateScreen
-            );
-        } else {
-            let _ = execute!(terminal.backend_mut(), DisableBracketedPaste);
-        }
-        let _ = terminal.show_cursor();
-
-        if let Some(id) = sid {
-            if !empty {
-                println!();
-                println!("Session: {}", id);
-                println!("Resume:  kkagent --resume {}", id);
-                println!();
-            }
-        }
-
-        result
+        self.main_loop(terminal).await
     }
 
     async fn main_loop(

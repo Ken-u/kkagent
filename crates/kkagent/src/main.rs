@@ -1140,15 +1140,23 @@ async fn run_tui(
         (RpcClient::new(client_stream, event_tx), Some(handle), false)
     };
 
-    let runtime_sandbox_mode = match rpc_client.call("runtime.status", None).await {
-        Ok(status) => status
-            .get("sandbox")
-            .and_then(|sandbox| sandbox.get("mode"))
-            .and_then(|mode| mode.as_str())
-            .map(str::to_string),
-        Err(error) => {
-            tracing::warn!(%error, "failed to read the server sandbox status");
-            None
+    // In-process servers share our config, so runtime.status is redundant and
+    // would block until build_server_state finishes (~1 s on large DBs).
+    // Only query for standalone / remote servers whose config may differ.
+    let is_inprocess = server_handle.is_some();
+    let runtime_sandbox_mode = if is_inprocess {
+        None
+    } else {
+        match rpc_client.call("runtime.status", None).await {
+            Ok(status) => status
+                .get("sandbox")
+                .and_then(|sandbox| sandbox.get("mode"))
+                .and_then(|mode| mode.as_str())
+                .map(str::to_string),
+            Err(error) => {
+                tracing::warn!(%error, "failed to read the server sandbox status");
+                None
+            }
         }
     };
 
@@ -1196,19 +1204,25 @@ fn maybe_auto_resume(resume: &mut Option<Option<String>>, server_alive: bool) {
         return;
     }
     let Some(session_id) = kkagent_config::load_active_session() else {
+        // No active-session marker at all; fall back to the most recent
+        // session in the current working directory so the user always gets
+        // back to where they left off in this project.
+        fallback_to_workspace_latest(resume);
         return;
     };
     if server_alive {
         if !session_exists(&session_id) {
             tracing::warn!(%session_id, "Active-session marker references a non-existent session; clearing it");
             kkagent_config::clear_active_session();
+            fallback_to_workspace_latest(resume);
             return;
         }
         if session_resume_unavailable_here(&session_id) {
             // Starting fresh in another directory is expected, not an error:
             // skip the resume quietly and keep the marker so the original
             // directory can still auto-resume this session later.
-            tracing::info!(%session_id, "Active session belongs to an unavailable working directory; starting a new session");
+            tracing::info!(%session_id, "Active session belongs to an unavailable working directory");
+            fallback_to_workspace_latest(resume);
             return;
         }
         tracing::info!(%session_id, "Auto-resuming session from active-session");
@@ -1219,16 +1233,43 @@ fn maybe_auto_resume(resume: &mut Option<Option<String>>, server_alive: bool) {
     kkagent_config::clear_active_session();
     if !session_exists(&session_id) {
         tracing::warn!(%session_id, "Active-session marker references a non-existent session; starting fresh");
+        fallback_to_workspace_latest(resume);
         return;
     }
     if session_resume_unavailable_here(&session_id) {
         tracing::info!(%session_id, "Active session belongs to an unavailable working directory; starting fresh");
+        fallback_to_workspace_latest(resume);
         return;
     }
     eprintln!(
         "Previous standalone server is gone; in-flight tasks were lost. Restoring conversation history for session {session_id}."
     );
     *resume = Some(Some(session_id));
+}
+
+/// When the global `active-session` marker does not point to a usable session
+/// for the current working directory, fall back to the most recent non-empty
+/// session that was created in this directory. This keeps the "resume where I
+/// left off" UX working even when the user opens TUIs in multiple projects.
+fn fallback_to_workspace_latest(resume: &mut Option<Option<String>>) {
+    let Ok(cwd) = std::env::current_dir() else {
+        return;
+    };
+    let Ok(db) = TranscriptDb::open_default() else {
+        return;
+    };
+    match db.latest_session_for_dir(&cwd) {
+        Ok(Some(session_id)) => {
+            tracing::info!(%session_id, dir = %cwd.display(), "Falling back to latest workspace session");
+            *resume = Some(Some(session_id));
+        }
+        Ok(None) => {
+            tracing::debug!(dir = %cwd.display(), "No previous sessions for this workspace");
+        }
+        Err(error) => {
+            tracing::warn!(%error, "Failed to query latest workspace session");
+        }
+    }
 }
 
 /// Whether resuming `session_id` from the current directory would be rejected by
@@ -6763,7 +6804,8 @@ async fn build_server_state_with_shutdown(
     }
     // One Connection for transcript + durable HTTP + subagents (avoid triple open/busy_timeout).
     let transcript = TranscriptDb::from_shared(shared_sqlite.clone())?;
-    let db_for_tool_results = TranscriptDb::from_shared(shared_sqlite.clone())?;
+    // Second handle shares the already-migrated connection — skip DDL.
+    let db_for_tool_results = TranscriptDb::wrap_shared(shared_sqlite.clone());
     let durable_http = kkagent_rpc::DurableHttpStore::from_shared(shared_sqlite.clone())?;
     let subagents = Arc::new(SubagentManager::from_shared(4, shared_sqlite)?);
     // Legacy cleanup: old builds persisted subagent runs as real sessions,
