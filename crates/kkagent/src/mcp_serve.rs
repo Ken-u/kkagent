@@ -16,7 +16,8 @@
 //!   kkagent session in the workspace); returns `task_id` immediately. kkagent
 //!   decides model, tools, and worktree isolation itself.
 //! - `get_progress` — status poll: queued / running / waiting_input /
-//!   waiting_permission / completed / failed / cancelled.
+//!   waiting_permission / completed / failed / cancelled, plus the agent's
+//!   live todo-list progress (from TodoList tool usage) when present.
 //! - `continue_task` — send a new instruction or a structured decision into
 //!   an EXISTING task, waking / continuing its agent loop: answer a pending
 //!   question (explicit option ids / free text / dismissal), approve or
@@ -418,6 +419,13 @@ struct McpTask {
     progress: StdMutex<Progress>,
     /// Timestamps of the last model / tool activity, for get_progress.
     activity: StdMutex<ActivityStamp>,
+    /// Latest todo list snapshot emitted by the session (the TodoList tool).
+    /// Surfaced through `get_progress` so an orchestrator can track the
+    /// agent's sub-step plan without reading the transcript.
+    todos: StdMutex<Vec<kkagent_protocol::TodoItemEvent>>,
+    /// Bumped on every todo update so a `get_progress` long-poll can wake on
+    /// sub-step progress even when the phase is unchanged.
+    todo_version: std::sync::atomic::AtomicU64,
     recent_events: StdMutex<Vec<String>>,
     pending_question: StdMutex<Option<QuestionPayload>>,
     pending_approval: StdMutex<Option<ApprovalRequest>>,
@@ -618,6 +626,56 @@ impl McpTask {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .snapshot()
+    }
+
+    /// Todo progress for `get_progress`: counts by status plus the full item
+    /// list. `None` when the session never touched the TodoList tool (so the
+    /// field is simply absent rather than an empty payload).
+    fn todo_snapshot(&self) -> Option<Value> {
+        let todos = self.todos.lock().unwrap_or_else(|e| e.into_inner());
+        if todos.is_empty() {
+            return None;
+        }
+        let count = |status: &str| todos.iter().filter(|t| t.status == status).count();
+        let current = todos
+            .iter()
+            .find(|t| t.status == "in_progress")
+            .map(|t| t.content.clone());
+        Some(json!({
+            "total": todos.len(),
+            "pending": count("pending"),
+            "in_progress": count("in_progress"),
+            "completed": count("completed"),
+            "cancelled": count("cancelled"),
+            "current": current,
+            "items": todos
+                .iter()
+                .map(|t| json!({"id": t.id, "content": t.content, "status": t.status}))
+                .collect::<Vec<_>>(),
+        }))
+    }
+
+    /// One-line todo summary for the `get_progress` text body, e.g.
+    /// `todos: 2/5 done, 1 in_progress (current: write tests)`.
+    fn todo_summary_line(&self) -> Option<String> {
+        let todos = self.todos.lock().unwrap_or_else(|e| e.into_inner());
+        if todos.is_empty() {
+            return None;
+        }
+        let count = |status: &str| todos.iter().filter(|t| t.status == status).count();
+        let current = todos
+            .iter()
+            .find(|t| t.status == "in_progress")
+            .map(|t| format!(" (current: {})", clip_chars(&t.content, 80)))
+            .unwrap_or_default();
+        Some(format!(
+            "todos: {}/{} done, {} in_progress, {} pending{}",
+            count("completed"),
+            todos.len(),
+            count("in_progress"),
+            count("pending"),
+            current
+        ))
     }
 
     fn summary_snapshot(&self) -> TaskSummary {
@@ -2912,6 +2970,8 @@ impl McpServer {
             restart_pending: AtomicBool::new(false),
             progress: StdMutex::new(Progress::default()),
             activity: StdMutex::new(ActivityStamp::default()),
+            todos: StdMutex::new(Vec::new()),
+            todo_version: std::sync::atomic::AtomicU64::new(0),
             recent_events: StdMutex::new(Vec::new()),
             pending_question: StdMutex::new(None),
             pending_approval: StdMutex::new(None),
@@ -3024,6 +3084,7 @@ impl McpServer {
             .min(MAX_PROGRESS_WAIT_MS);
         if wait_ms > 0 && !task.phase().terminal() {
             let deadline = tokio::time::Instant::now() + Duration::from_millis(wait_ms);
+            let start_todo_version = task.todo_version.load(Ordering::SeqCst);
             loop {
                 let notified = task.progress_notify.notified();
                 tokio::pin!(notified);
@@ -3031,7 +3092,10 @@ impl McpServer {
                 // not lost (enable() registers the waker without polling).
                 notified.as_mut().enable();
                 let phase = task.phase();
-                if phase.terminal() || task.cancel_requested() {
+                if phase.terminal()
+                    || task.cancel_requested()
+                    || task.todo_version.load(Ordering::SeqCst) != start_todo_version
+                {
                     break;
                 }
                 tokio::select! {
@@ -3119,6 +3183,7 @@ impl McpServer {
                 "tool_input_display": a.tool_input_display,
             })),
             "pending_instruction_count": pending_instruction_count,
+            "todos": task.todo_snapshot(),
             "plan_id": plan_ref.as_ref().and_then(|p| p.get("plan_id").cloned()),
             "plan_version": plan_ref.as_ref().and_then(|p| p.get("plan_version").cloned()),
             "plan_title": task.plan_title,
@@ -3154,6 +3219,9 @@ impl McpServer {
         }
         if let Some(error) = task.error.lock().unwrap_or_else(|e| e.into_inner()).clone() {
             text.push_str(&format!("; error: {error}"));
+        }
+        if let Some(todos) = task.todo_summary_line() {
+            text.push_str(&format!("; {todos}"));
         }
         Ok((text, Some(payload)))
     }
@@ -4669,6 +4737,21 @@ fn handle_task_event(task: &Arc<McpTask>, event: AgentEvent) {
                 request.tool_name, request.action
             ));
         }
+        AgentEvent::TodoUpdated { items, .. } => {
+            *task.todos.lock().unwrap_or_else(|e| e.into_inner()) = items.clone();
+            task.todo_version.fetch_add(1, Ordering::SeqCst);
+            let count = |status: &str| items.iter().filter(|t| t.status == status).count();
+            task.push_event(format!(
+                "todo: {}/{} done, {} in_progress",
+                count("completed"),
+                items.len(),
+                count("in_progress")
+            ));
+            // Todo progress can change without a phase change; wake long-poll
+            // waiters so sub-step progress is observable in near real time.
+            // Placed after push_event so woken pollers see the event text.
+            task.progress_notify.notify_waiters();
+        }
         AgentEvent::TurnStart { .. } => {
             if !task.phase().terminal() {
                 task.set_phase(TaskPhase::Running);
@@ -5205,7 +5288,7 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "get_progress",
-            "description": "Poll a background task: status (queued | running | cancelling | waiting_input | waiting_permission | completed | failed | cancelled), runner_state (running | waiting_for_instruction | exited), elapsed time, activity counters, last model/tool activity ages, recent events, pending_instruction_count, the pending question or approval if any, and errors. Pass wait_ms (up to 10000) to long-poll until the status changes instead of re-polling on your own schedule.",
+            "description": "Poll a background task: status (queued | running | cancelling | waiting_input | waiting_permission | completed | failed | cancelled), runner_state (running | waiting_for_instruction | exited), elapsed time, activity counters, last model/tool activity ages, recent events, pending_instruction_count, the pending question or approval if any, the todo-list progress (todos: per-status counts, the current in_progress item, and the full item list) when the agent has used the TodoList tool, and errors. Pass wait_ms (up to 10000) to long-poll until the status OR todo progress changes instead of re-polling on your own schedule.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -5560,6 +5643,131 @@ mod tests {
         task.set_phase(TaskPhase::Completed);
         assert_eq!(task.runner_state(), "exited");
         let _ = server;
+    }
+
+    /// Todo progress is captured from `TodoUpdated` events and surfaced
+    /// through `get_progress` (payload + text line + long-poll wake).
+    #[tokio::test]
+    async fn get_progress_reports_todo_snapshot_and_wakes_on_update() {
+        let server = server().await;
+        let task = Arc::new(
+            TaskRecord {
+                id: "t-todos".into(),
+                session_id: "sess-todos".into(),
+                resume: false,
+                description: "d".into(),
+                prompt: "p".into(),
+                workspace: PathBuf::from("/tmp"),
+                run_dir: PathBuf::from("/tmp"),
+                branch: None,
+                base_commit: None,
+                plan_title: None,
+                plan: None,
+                plan_ref: None,
+                phase: TaskPhase::Queued,
+                summary: TaskSummary::default(),
+                error: None,
+                review: "pending".into(),
+                reviewed_snapshot: None,
+                event_sequence: 0,
+                recent_events: Vec::new(),
+                progress: Progress::default(),
+                via_standalone: true,
+                prompted: true,
+            }
+            .into_task(),
+        );
+        task.set_phase(TaskPhase::Running);
+        server.insert_task(Arc::clone(&task)).await;
+
+        // Before the agent touches TodoList the field is simply absent.
+        let (text, payload) = server
+            .tool_get_progress(&json!({"task_id": "t-todos"}))
+            .await
+            .expect("progress ok");
+        assert_eq!(payload.expect("structured")["todos"], Value::Null);
+        assert!(!text.contains("todos:"));
+
+        let event = |items: Vec<kkagent_protocol::TodoItemEvent>| AgentEvent::TodoUpdated {
+            session_id: "sess-todos".into(),
+            items,
+        };
+        let item = |id: &str, content: &str, status: &str| kkagent_protocol::TodoItemEvent {
+            id: id.into(),
+            content: content.into(),
+            status: status.into(),
+        };
+        // Long poll first: the todo update (no phase change) must wake it.
+        let waiter = {
+            let server = Arc::clone(&server);
+            tokio::spawn(async move {
+                server
+                    .tool_get_progress(&json!({"task_id": "t-todos", "wait_ms": 5_000}))
+                    .await
+                    .expect("long-poll progress ok")
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        handle_task_event(
+            &task,
+            event(vec![
+                item("a", "First", "completed"),
+                item("b", "Second", "in_progress"),
+                item("c", "Third", "pending"),
+            ]),
+        );
+        let started = Instant::now();
+        let (text, payload) = waiter.await.expect("waiter joined");
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "todo update must wake the long poll, took {:?}",
+            started.elapsed()
+        );
+        let payload = payload.expect("structured");
+        let todos = &payload["todos"];
+        assert_eq!(todos["total"], 3);
+        assert_eq!(todos["completed"], 1);
+        assert_eq!(todos["in_progress"], 1);
+        assert_eq!(todos["pending"], 1);
+        assert_eq!(todos["cancelled"], 0);
+        assert_eq!(todos["current"], "Second");
+        assert_eq!(todos["items"][0]["id"], "a");
+        assert_eq!(todos["items"][0]["status"], "completed");
+        assert!(text.contains("todos: 1/3 done, 1 in_progress"));
+        assert!(text.contains("(current: Second)"));
+        // Events also record the progress line for after_event polling.
+        assert!(payload["recent_events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e.as_str().unwrap().contains("todo: 1/3 done")));
+
+        // Subsequent updates replace the snapshot in place.
+        handle_task_event(
+            &task,
+            event(vec![
+                item("a", "First", "completed"),
+                item("b", "Second", "completed"),
+                item("c", "Third", "in_progress"),
+            ]),
+        );
+        let (text, payload) = server
+            .tool_get_progress(&json!({"task_id": "t-todos"}))
+            .await
+            .expect("progress ok");
+        let todos = payload.expect("structured")["todos"].clone();
+        assert_eq!(todos["completed"], 2);
+        assert_eq!(todos["current"], "Third");
+        assert!(text.contains("todos: 2/3 done, 1 in_progress"));
+
+        // A cleared list reports empty and the payload field goes back to null.
+        handle_task_event(&task, event(Vec::new()));
+        let (text, payload) = server
+            .tool_get_progress(&json!({"task_id": "t-todos"}))
+            .await
+            .expect("progress ok");
+        assert_eq!(payload.expect("structured")["todos"], Value::Null);
+        assert!(!text.contains("todos:"));
     }
 
     /// In-process cancel (issue #2 contract, local path): terminal

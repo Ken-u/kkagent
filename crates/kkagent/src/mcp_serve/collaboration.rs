@@ -250,6 +250,8 @@ impl TaskRecord {
             progress_notify: Notify::new(),
             restart_pending: AtomicBool::new(restart_pending),
             progress: StdMutex::new(self.progress),
+            todos: StdMutex::new(Vec::new()),
+            todo_version: std::sync::atomic::AtomicU64::new(0),
             recent_events: StdMutex::new(self.recent_events),
             pending_question: StdMutex::new(None),
             pending_approval: StdMutex::new(None),
