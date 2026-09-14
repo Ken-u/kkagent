@@ -86,7 +86,10 @@ impl SshControlMaster {
     /// This spawns `ssh -M -N -S <socket>` with the terminal attached so
     /// the user can complete any authentication prompts (password, passphrase,
     /// 2FA, keyboard-interactive).
-    pub async fn establish(host: &str) -> Result<Self> {
+    ///
+    /// `port` overrides the SSH port; `None` defers to `~/.ssh/config` or
+    /// the OpenSSH default (22).
+    pub async fn establish(host: &str, port: Option<u16>) -> Result<Self> {
         let socket_dir = kkagent_config::default_config_dir().join("ssh");
         std::fs::create_dir_all(&socket_dir)?;
         // Sanitize host for use as a filename (replace @ : / with -)
@@ -100,20 +103,25 @@ impl SshControlMaster {
                 }
             })
             .collect();
-        let socket_path = socket_dir.join(format!("ctrl-{safe_host}"));
+        let port_suffix = port.map(|p| format!("-{p}")).unwrap_or_default();
+        let socket_path = socket_dir.join(format!("ctrl-{safe_host}{port_suffix}"));
 
         // If a ControlMaster already exists and is alive, reuse it.
         if socket_path.exists() {
-            let check = Command::new("ssh")
+            let mut check = Command::new("ssh");
+            check
                 .args(["-S", &socket_path.to_string_lossy()])
-                .args(["-O", "check"])
+                .args(["-O", "check"]);
+            if let Some(p) = port {
+                check.args(["-p", &p.to_string()]);
+            }
+            check
                 .arg(host)
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .await;
-            if check.is_ok_and(|s| s.success()) {
+                .stderr(Stdio::null());
+            let status = check.status().await;
+            if status.is_ok_and(|s| s.success()) {
                 eprintln!("Reusing existing SSH connection to {host}");
                 return Ok(Self {
                     _host: host.to_string(),
@@ -126,8 +134,8 @@ impl SshControlMaster {
 
         eprintln!("Establishing SSH connection to {host}...");
 
-        let child = Command::new("ssh")
-            .arg("-M") // ControlMaster
+        let mut cmd = Command::new("ssh");
+        cmd.arg("-M") // ControlMaster
             .arg("-N") // no remote command
             .arg("-S")
             .arg(&socket_path)
@@ -136,7 +144,11 @@ impl SshControlMaster {
             .arg("-o")
             .arg("ServerAliveInterval=30")
             .arg("-o")
-            .arg("ServerAliveCountMax=3")
+            .arg("ServerAliveCountMax=3");
+        if let Some(p) = port {
+            cmd.args(["-p", &p.to_string()]);
+        }
+        let child = cmd
             .arg(host)
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())

@@ -163,6 +163,9 @@ enum Commands {
         host: String,
         /// Remote workspace path (default: home directory)
         path: Option<String>,
+        /// SSH port (default: use ~/.ssh/config or 22)
+        #[arg(short = 'P', long)]
+        port: Option<u16>,
     },
     /// Expose kkagent as an MCP (Model Context Protocol) server
     Mcp {
@@ -586,13 +589,14 @@ async fn run(cli: Cli) -> Result<()> {
         Some(Commands::Bridge { .. }) => {
             unreachable!("bridge handled before config startup")
         }
-        Some(Commands::Ssh { host, path }) => {
+        Some(Commands::Ssh { host, path, port }) => {
             run_ssh(
                 config,
                 config_path,
                 permission_mode,
                 host,
                 path,
+                port,
                 cli.no_alt_screen,
             )
             .await
@@ -2025,10 +2029,11 @@ async fn run_ssh(
     permission_mode: PermissionMode,
     host: String,
     path: Option<String>,
+    port: Option<u16>,
     no_alt_screen: bool,
 ) -> Result<()> {
     // 1. Establish/reuse authenticated SSH connection via ControlMaster.
-    let ctrl = remote::SshControlMaster::establish(&host).await?;
+    let ctrl = remote::SshControlMaster::establish(&host, port).await?;
 
     // 2. Ensure remote kkagent server is running.
     remote::ensure_remote_server(ctrl.socket_path(), &host).await?;
