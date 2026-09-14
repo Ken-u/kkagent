@@ -117,6 +117,9 @@ pub struct AppConfig {
     /// Optional SSH remote execution target (`[remote]`).
     #[serde(default)]
     pub remote: RemoteConfig,
+    /// Named remote workspace servers (`[servers.NAME]`).
+    #[serde(default)]
+    pub servers: HashMap<String, RemoteWorkspaceServerConfig>,
     /// Plugin system behavior (`[plugins]`).
     #[serde(default)]
     pub plugins: PluginsConfig,
@@ -327,6 +330,30 @@ pub struct RemoteConfig {
 
 fn default_ssh_port() -> u16 {
     22
+}
+
+/// Named remote workspace server (`[servers.NAME]` in config.toml).
+///
+/// Declares a persistent remote kkagent server reachable via SSH.
+/// The `host` value uses system OpenSSH host semantics and may reference
+/// entries in `~/.ssh/config`.
+///
+/// ```toml
+/// [servers.build]
+/// transport = "ssh"
+/// host = "build01"
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteWorkspaceServerConfig {
+    /// Transport type; currently only "ssh" is supported.
+    #[serde(default = "default_ssh_transport")]
+    pub transport: String,
+    /// SSH host (uses system OpenSSH host names / ~/.ssh/config).
+    pub host: String,
+}
+
+fn default_ssh_transport() -> String {
+    "ssh".into()
 }
 
 /// Standalone RPC server preferences (`[server]` in config.toml).

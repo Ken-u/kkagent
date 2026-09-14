@@ -39,6 +39,7 @@ mod diagnostics;
 mod headless;
 mod mcp_serve;
 mod onboarding;
+mod remote;
 use diagnostics::RunDiagnostics;
 use onboarding::{run_config, run_doctor, run_init};
 
@@ -147,6 +148,22 @@ enum Commands {
     },
     /// Serve Agent Client Protocol over stdio (IDE bridge)
     Acp,
+    /// Lightweight stdio bridge to a local kkagent server (used by SSH remote workspace)
+    Bridge {
+        /// Read/write NDJSON RPC frames on stdin/stdout
+        #[arg(long)]
+        stdio: bool,
+        /// Local endpoint to bridge to (default: server.sock)
+        #[arg(long)]
+        listen: Option<String>,
+    },
+    /// Open a remote workspace via SSH
+    Ssh {
+        /// SSH host (uses system OpenSSH host semantics / ~/.ssh/config)
+        host: String,
+        /// Remote workspace path (default: home directory)
+        path: Option<String>,
+    },
     /// Expose kkagent as an MCP (Model Context Protocol) server
     Mcp {
         #[command(subcommand)]
@@ -377,6 +394,8 @@ fn runtime_mode(cli: &Cli) -> &'static str {
     match (&cli.command, &cli.prompt) {
         (Some(Commands::Server { .. }), _) => "server",
         (Some(Commands::Acp), _) => "acp",
+        (Some(Commands::Bridge { .. }), _) => "bridge",
+        (Some(Commands::Ssh { .. }), _) => "ssh",
         (Some(Commands::Mcp { .. }), _) => "mcp",
         (Some(Commands::Auth { .. }), _) => "auth",
         (Some(Commands::Init { .. }), _) => "init",
@@ -461,6 +480,14 @@ async fn run(cli: Cli) -> Result<()> {
             return run_export_session(session_id, output.as_deref(), *json);
         }
         _ => {}
+    }
+
+    // Bridge is a pure proxy; it needs no config, no provider, no sandbox.
+    if let Some(Commands::Bridge { stdio, listen }) = &cli.command {
+        if !stdio {
+            anyhow::bail!("bridge currently requires --stdio");
+        }
+        return run_bridge_stdio(listen.clone()).await;
     }
 
     validate_runtime_cli(&cli)?;
@@ -555,6 +582,20 @@ async fn run(cli: Cli) -> Result<()> {
             let state = build_server_state(Arc::new(config), config_path).await?;
             let server = kkagent_acp::AcpServer::with_host(Arc::new(AgentAcpHost { state }));
             server.serve_stdio().await
+        }
+        Some(Commands::Bridge { .. }) => {
+            unreachable!("bridge handled before config startup")
+        }
+        Some(Commands::Ssh { host, path }) => {
+            run_ssh(
+                config,
+                config_path,
+                permission_mode,
+                host,
+                path,
+                cli.no_alt_screen,
+            )
+            .await
         }
         Some(Commands::Mcp {
             command: McpCommand::Stop,
@@ -654,7 +695,7 @@ fn print_completions(shell: &str) -> Result<()> {
 #   eval "$(kkagent completions bash)"
 _kkagent() {{
   local cur="${{COMP_WORDS[COMP_CWORD]}}"
-  local cmds="server acp mcp auth init config doctor completions"
+  local cmds="server acp bridge ssh mcp auth init config doctor completions"
   if [[ ${{COMP_CWORD}} -eq 1 ]]; then
     COMPREPLY=( $(compgen -W "$cmds --help --version --config --yolo --auto --plan --prompt --resume --connect --no-alt-screen --dump-system-prompt" -- "$cur") )
   elif [[ ${{COMP_WORDS[1]}} == server ]]; then
@@ -681,14 +722,14 @@ _arguments \
   '--connect[Connect to server]:endpoint:' \
   '--no-alt-screen[Keep primary screen]' \
   '--dump-system-prompt[Print the composed system prompt and exit]' \
-  '1:command:(server acp mcp auth init config doctor completions export-session)'
+  '1:command:(server acp bridge ssh mcp auth init config doctor completions export-session)'
 "#
             );
         }
         "fish" => {
             println!(
                 r#"# kkagent fish completion — save to ~/.config/fish/completions/kkagent.fish
-complete -c kkagent -n '__fish_use_subcommand' -a 'server acp mcp auth init config doctor completions'
+complete -c kkagent -n '__fish_use_subcommand' -a 'server acp bridge ssh mcp auth init config doctor completions'
 complete -c kkagent -l config -r
 complete -c kkagent -l yolo
 complete -c kkagent -l auto
@@ -708,7 +749,7 @@ complete -c kkagent -l dump-system-prompt
 #   kkagent completions powershell | Out-String | Invoke-Expression
 Register-ArgumentCompleter -CommandName kkagent -ScriptBlock {{
   param($wordToComplete, $commandAst, $cursorPosition)
-  $cmds = @('server','acp','mcp','auth','init','config','doctor','completions')
+  $cmds = @('server','acp','bridge','ssh','mcp','auth','init','config','doctor','completions')
   $cmds | Where-Object {{ $_ -like "$wordToComplete*" }} | ForEach-Object {{
     [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterValue', $_)
   }}
@@ -1972,6 +2013,89 @@ async fn run_mcp_status(json: bool) -> Result<()> {
         None => println!("kkagent mcp daemon is not running"),
     }
     Ok(())
+}
+
+async fn run_bridge_stdio(listen: Option<String>) -> Result<()> {
+    remote::run_bridge(listen).await
+}
+
+async fn run_ssh(
+    config: AppConfig,
+    config_path: PathBuf,
+    permission_mode: PermissionMode,
+    host: String,
+    path: Option<String>,
+    no_alt_screen: bool,
+) -> Result<()> {
+    // 1. Establish/reuse authenticated SSH connection via ControlMaster.
+    let ctrl = remote::SshControlMaster::establish(&host).await?;
+
+    // 2. Ensure remote kkagent server is running.
+    remote::ensure_remote_server(ctrl.socket_path(), &host).await?;
+
+    // 3. Connect to the local server (or spawn one).
+    let socket_path = kkagent_config::default_server_socket_path();
+    let local_stream = match connect_or_spawn_standalone(&config_path).await {
+        Ok(stream) => stream,
+        Err(e) => {
+            anyhow::bail!(
+                "Cannot start local kkagent server (required for remote workspace routing): {e}"
+            );
+        }
+    };
+
+    let (event_tx, _event_rx) = mpsc::channel::<Frame>(256);
+    let setup_client = RpcClient::new(local_stream, event_tx);
+
+    // 4. Register the remote server and workspace in the local server.
+    let remote_path = path.as_deref().unwrap_or("~");
+    let workspace_key = format!("{host}:{remote_path}");
+
+    let register_result = setup_client
+        .call(
+            "remote.register",
+            Some(serde_json::json!({
+                "server_id": host,
+                "host": host,
+                "ssh_socket": ctrl.socket_path().to_string_lossy(),
+                "workspace": remote_path,
+            })),
+        )
+        .await;
+
+    match register_result {
+        Ok(_) => {
+            eprintln!("Remote workspace {workspace_key} registered");
+        }
+        Err(e) => {
+            tracing::warn!(
+                "remote.register failed (server may not support remote workspaces yet): {e}"
+            );
+        }
+    }
+
+    // 5. Open TUI connected to the local server, targeting the remote workspace.
+    drop(setup_client);
+
+    // Reconnect for the actual TUI session.
+    let tui_stream = kkagent_rpc::transport::uds::connect_uds(&socket_path).await?;
+    let (tui_event_tx, tui_event_rx) = mpsc::channel::<Frame>(256);
+    let rpc_client = RpcClient::new(tui_stream, tui_event_tx);
+
+    let mut tui_config = config;
+    tui_config.default_permission_mode = Some(permission_mode.to_string());
+
+    let client = KkagentClient::new(rpc_client, tui_event_rx);
+    let mut app = kkagent_tui::TuiApp::new(tui_config, client);
+    app.set_remote_connection(true);
+    app.set_allows_background_detach(true);
+    app.set_config_path(config_path);
+    app.set_use_alt_screen(!no_alt_screen);
+
+    // Start with a remote workspace session.
+    // The session will be created targeting the remote workspace.
+    app.set_remote_workspace(Some(workspace_key));
+    app.run(None).await
 }
 
 async fn run_server_stop(listen: Option<String>) -> Result<()> {
@@ -5288,6 +5412,8 @@ struct ServerState {
     /// Parent-session subagent lifecycle summaries for reattach.
     pending_subagents: Mutex<HashMap<String, Vec<PendingSubagentUi>>>,
     background_tasks: Mutex<Vec<AbortHandle>>,
+    /// Remote server connections and workspace routing.
+    remote: Arc<remote::RemoteRegistry>,
     turn_locks: SessionTurnLocks,
     /// Recent session.prompt idempotency keys → first-seen time.
     prompt_idempotency: Mutex<HashMap<String, std::time::Instant>>,
@@ -7017,6 +7143,7 @@ async fn build_server_state_with_shutdown(
         prompt_queues: Mutex::new(HashMap::new()),
         pending_subagents: Mutex::new(HashMap::new()),
         background_tasks: Mutex::new(background_tasks),
+        remote: Arc::new(remote::RemoteRegistry::new()),
         turn_locks: SessionTurnLocks::default(),
         prompt_idempotency: Mutex::new(HashMap::new()),
         persistence_durable,
@@ -7173,6 +7300,55 @@ fn permission_mode_from_config(config: &AppConfig) -> PermissionMode {
         .effective_permission_mode()
         .parse()
         .unwrap_or(PermissionMode::Manual)
+}
+
+/// Start a background task that drains remote events and fans them out to
+/// all connected TUI/RPC clients, translating remote session IDs to opaque
+/// external IDs.
+fn start_remote_event_forwarder(registry: Arc<remote::RemoteRegistry>, state: Arc<ServerState>) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static STARTED: AtomicBool = AtomicBool::new(false);
+    if STARTED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+
+    tokio::spawn(async move {
+        let mut rx = match registry.remote_event_rx.lock().await.take() {
+            Some(rx) => rx,
+            None => return,
+        };
+
+        while let Some((server_id, frame)) = rx.recv().await {
+            // Translate session IDs in the event.
+            let frame = match &frame {
+                Frame::Event { data, .. } => {
+                    if let Some(remote_sid) = data.get("session_id").and_then(|v| v.as_str()) {
+                        if let Some(external_id) = registry
+                            .translate_remote_session_id(&server_id, remote_sid)
+                            .await
+                        {
+                            remote::translate_event_session_id(&frame, &external_id)
+                        } else {
+                            frame
+                        }
+                    } else {
+                        frame
+                    }
+                }
+                _ => frame,
+            };
+
+            // Fan out to all connected clients.
+            let subs = state
+                .rpc_event_subscribers
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            for tx in subs.values() {
+                let _ = tx.try_send(frame.clone());
+            }
+        }
+    });
 }
 
 fn http_session_json(session: &Session) -> serde_json::Value {
@@ -8160,10 +8336,24 @@ async fn handle_rpc_call(
     params: Option<serde_json::Value>,
     rpc_event_tx: mpsc::Sender<Frame>,
 ) -> Result<serde_json::Value, (i32, String)> {
+    // Remote session routing: if this is a session-scoped method and the session
+    // belongs to a remote server, forward the call transparently.
+    if remote::SESSION_SCOPED_METHODS.contains(&method) {
+        if let Some(session_id) = remote::extract_session_id(&params) {
+            if let Some(route) = state.remote.session_route(&session_id).await {
+                return state
+                    .remote
+                    .forward_session_call(&route, method, params)
+                    .await;
+            }
+        }
+    }
+
     match method {
         "runtime.status" => {
             let sandbox = state.sandbox_snapshot();
             Ok(serde_json::json!({
+                "version": env!("CARGO_PKG_VERSION"),
                 "sandbox": {
                     "mode": sandbox.mode_name(),
                     "network": sandbox.network,
@@ -8302,6 +8492,84 @@ async fn handle_rpc_call(
             }
             Ok(response)
         }
+        // ----- Remote workspace management -----
+        "remote.register" => {
+            let value =
+                params.ok_or_else(|| (-32602, "Missing remote.register params".to_string()))?;
+            let server_id = value
+                .get("server_id")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| (-32602, "Missing server_id".to_string()))?
+                .to_string();
+            let host = value
+                .get("host")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| (-32602, "Missing host".to_string()))?
+                .to_string();
+            let ssh_socket = value
+                .get("ssh_socket")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| (-32602, "Missing ssh_socket".to_string()))?;
+            let workspace = value
+                .get("workspace")
+                .and_then(|v| v.as_str())
+                .unwrap_or("~")
+                .to_string();
+
+            let ssh_socket_path = std::path::PathBuf::from(ssh_socket);
+            let workspace_key = format!("{host}:{workspace}");
+
+            // Check if this server is already registered.
+            let existing = state.remote.connection(&server_id).await;
+            let conn = if let Some(conn) = existing {
+                conn
+            } else {
+                let conn = state
+                    .remote
+                    .add_server(server_id.clone(), host.clone(), ssh_socket_path)
+                    .await;
+                // Connect the bridge.
+                if let Err(e) = conn.connect().await {
+                    tracing::warn!(%e, "initial bridge connect to {host} failed");
+                }
+                conn
+            };
+
+            state
+                .remote
+                .register_workspace(&workspace_key, &server_id)
+                .await;
+
+            // Start event forwarding if not already running.
+            start_remote_event_forwarder(state.remote.clone(), state.clone());
+
+            Ok(serde_json::json!({
+                "ok": true,
+                "server_id": server_id,
+                "workspace_key": workspace_key,
+                "state": format!("{:?}", conn.connection_state()),
+            }))
+        }
+        "remote.status" => {
+            let workspaces = state.remote.list_workspaces().await;
+            Ok(serde_json::json!({
+                "workspaces": workspaces,
+            }))
+        }
+        "remote.reconnect" => {
+            let value =
+                params.ok_or_else(|| (-32602, "Missing remote.reconnect params".to_string()))?;
+            let server_id = value
+                .get("server_id")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| (-32602, "Missing server_id".to_string()))?;
+            state
+                .remote
+                .reconnect(server_id)
+                .await
+                .map_err(|e| (-32003, e.to_string()))?;
+            Ok(serde_json::json!({"ok": true}))
+        }
         "workspace.trust" => {
             let value = params.ok_or_else(|| (-32602, "Missing workspace trust".to_string()))?;
             let trust: kkagent_config::WorkspaceTrust = serde_json::from_value(value)
@@ -8313,7 +8581,6 @@ async fn handle_rpc_call(
             Ok(serde_json::json!({"ok": true, "workspace": workspace}))
         }
         "sessions.create" => {
-            let session_id = uuid::Uuid::new_v4().to_string();
             let requested_workspace = params
                 .as_ref()
                 .and_then(|p| p.get("workspace"))
@@ -8321,6 +8588,26 @@ async fn handle_rpc_call(
                 .filter(|value| !value.trim().is_empty())
                 .ok_or_else(|| (-32602, "Missing workspace".to_string()))?
                 .to_string();
+
+            // Check if this workspace belongs to a remote server.
+            if let Some(server_id) = state.remote.workspace_server(&requested_workspace).await {
+                // Extract just the remote path from the workspace key (host:path).
+                let remote_path = requested_workspace
+                    .find(':')
+                    .map(|i| &requested_workspace[i + 1..])
+                    .unwrap_or(&requested_workspace);
+                let remote_params = serde_json::json!({
+                    "workspace": remote_path,
+                    "permission_mode": params.as_ref().and_then(|p| p.get("permission_mode")).cloned(),
+                });
+                let (_external_id, result) = state
+                    .remote
+                    .create_remote_session(&server_id, remote_params)
+                    .await?;
+                return Ok(result);
+            }
+
+            let session_id = uuid::Uuid::new_v4().to_string();
             let workspace = std::fs::canonicalize(&requested_workspace).map_err(|error| {
                 (
                     -32602,

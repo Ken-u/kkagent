@@ -104,6 +104,8 @@ pub struct TuiApp {
     jobs: crate::async_jobs::AsyncJobHub,
     use_alt_screen: bool,
     remote_connection: bool,
+    /// Remote workspace key (e.g. "build01:/data/aosp") for remote session creation.
+    remote_workspace: Option<String>,
     /// Standalone / --connect mode: Ctrl+B detaches without killing the server.
     allows_background_detach: bool,
     connection_alerted: bool,
@@ -1626,6 +1628,7 @@ impl TuiApp {
             jobs: crate::async_jobs::AsyncJobHub::new(),
             use_alt_screen: true,
             remote_connection: false,
+            remote_workspace: None,
             allows_background_detach: false,
             connection_alerted: false,
             last_tick_at: std::time::Instant::now(),
@@ -1640,6 +1643,13 @@ impl TuiApp {
 
     pub fn set_remote_connection(&mut self, enabled: bool) {
         self.remote_connection = enabled;
+    }
+
+    /// Set a remote workspace key (e.g. "build01:/data/aosp") for session creation.
+    /// When set, sessions are created targeting this remote workspace instead of
+    /// the local working directory.
+    pub fn set_remote_workspace(&mut self, workspace: Option<String>) {
+        self.remote_workspace = workspace;
     }
 
     pub fn set_allows_background_detach(&mut self, enabled: bool) {
