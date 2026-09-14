@@ -2069,16 +2069,18 @@ async fn run_ssh(
         )
         .await;
 
-    match register_result {
-        Ok(_) => {
+    let remote_config = match register_result {
+        Ok(ref v) => {
             eprintln!("Remote workspace {workspace_key} registered");
+            v.get("remote_config").cloned()
         }
         Err(e) => {
             tracing::warn!(
                 "remote.register failed (server may not support remote workspaces yet): {e}"
             );
+            None
         }
-    }
+    };
 
     // 5. Open TUI connected to the local server, targeting the remote workspace.
     drop(setup_client);
@@ -2090,6 +2092,26 @@ async fn run_ssh(
 
     let mut tui_config = config;
     tui_config.default_permission_mode = Some(permission_mode.to_string());
+
+    // Overlay the remote server's model/provider config so the TUI shows
+    // models available on the remote host, not the local machine.
+    if let Some(rc) = remote_config.as_ref().and_then(|v| v.as_object()) {
+        if let Some(models) = rc.get("models") {
+            if let Ok(m) = serde_json::from_value(models.clone()) {
+                tui_config.models = m;
+            }
+        }
+        if let Some(providers) = rc.get("providers") {
+            if let Ok(p) = serde_json::from_value(providers.clone()) {
+                tui_config.providers = p;
+            }
+        }
+        if let Some(default_model) = rc.get("default_model") {
+            if let Ok(dm) = serde_json::from_value(default_model.clone()) {
+                tui_config.default_model = dm;
+            }
+        }
+    }
 
     let client = KkagentClient::new(rpc_client, tui_event_rx);
     let mut app = kkagent_tui::TuiApp::new(tui_config, client);
@@ -8358,7 +8380,12 @@ async fn handle_rpc_call(
     match method {
         "runtime.status" => {
             let sandbox = state.sandbox_snapshot();
-            Ok(serde_json::json!({
+            let include_config = params
+                .as_ref()
+                .and_then(|p| p.get("include_config"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let mut result = serde_json::json!({
                 "version": env!("CARGO_PKG_VERSION"),
                 "sandbox": {
                     "mode": sandbox.mode_name(),
@@ -8369,7 +8396,16 @@ async fn handle_rpc_call(
                 "client_count": state.client_count(),
                 "uptime_secs": state.started_at.elapsed().as_secs(),
                 "pid": std::process::id(),
-            }))
+            });
+            if include_config {
+                let cfg = state.config();
+                result["config"] = serde_json::json!({
+                    "models": cfg.models,
+                    "providers": cfg.providers,
+                    "default_model": cfg.default_model,
+                });
+            }
+            Ok(result)
         }
         "runtime.http.start" => {
             let value =
@@ -8549,11 +8585,23 @@ async fn handle_rpc_call(
             // Start event forwarding if not already running.
             start_remote_event_forwarder(state.remote.clone(), state.clone());
 
+            // Query the remote server config so the TUI can display remote
+            // models/providers instead of the local ones.
+            let remote_config = conn
+                .call(
+                    "runtime.status",
+                    Some(serde_json::json!({"include_config": true})),
+                )
+                .await
+                .ok()
+                .and_then(|v| v.get("config").cloned());
+
             Ok(serde_json::json!({
                 "ok": true,
                 "server_id": server_id,
                 "workspace_key": workspace_key,
                 "state": format!("{:?}", conn.connection_state()),
+                "remote_config": remote_config,
             }))
         }
         "remote.status" => {

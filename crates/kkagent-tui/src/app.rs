@@ -1647,9 +1647,26 @@ impl TuiApp {
 
     /// Set a remote workspace key (e.g. "build01:/data/aosp") for session creation.
     /// When set, sessions are created targeting this remote workspace instead of
-    /// the local working directory.
+    /// the local working directory.  Also updates the displayed working directory
+    /// to the remote path so the TUI chrome shows the correct location.
     pub fn set_remote_workspace(&mut self, workspace: Option<String>) {
+        if let Some(ref ws) = workspace {
+            let remote_path = ws.find(':').map(|i| &ws[i + 1..]).unwrap_or(ws);
+            let p = std::path::PathBuf::from(remote_path);
+            self.state.working_dir = p.clone();
+            self.state.primary_workspace = p;
+        }
         self.remote_workspace = workspace;
+    }
+
+    /// Returns the workspace argument for `sessions.create`.  For remote
+    /// workspaces this is the full `host:path` key so the server can route
+    /// to the correct remote server; for local sessions it is the working
+    /// directory path.
+    fn effective_workspace(&self) -> String {
+        self.remote_workspace
+            .clone()
+            .unwrap_or_else(|| self.state.working_dir.to_string_lossy().into_owned())
     }
 
     pub fn set_allows_background_detach(&mut self, enabled: bool) {
@@ -1805,25 +1822,24 @@ impl TuiApp {
         startup_started: std::time::Instant,
     ) -> anyhow::Result<()> {
         // Workspace trust: the server needs this before sessions.create.
-        let startup_trust = if self.config.sandbox.is_disabled() {
-            None
-        } else {
-            self.config
-                .workspace_trust
-                .matching(&self.state.working_dir)
-                .cloned()
-        };
-        if let Some(trust) = startup_trust {
-            self.client
-                .rpc_call("workspace.trust", Some(serde_json::to_value(trust)?))
-                .await?;
+        // Skip for remote workspaces — trust is managed by the remote server.
+        if self.remote_workspace.is_none() {
+            let startup_trust = if self.config.sandbox.is_disabled() {
+                None
+            } else {
+                self.config
+                    .workspace_trust
+                    .matching(&self.state.working_dir)
+                    .cloned()
+            };
+            if let Some(trust) = startup_trust {
+                self.client
+                    .rpc_call("workspace.trust", Some(serde_json::to_value(trust)?))
+                    .await?;
+            }
         }
 
-        let cwd = if let Some(ref rw) = self.remote_workspace {
-            rw.clone()
-        } else {
-            self.state.working_dir.to_string_lossy().into_owned()
-        };
+        let cwd = self.effective_workspace();
         match resume {
             Some(Some(id)) => {
                 if let Err(e) = self.resume_session(&id).await {
@@ -1868,14 +1884,16 @@ impl TuiApp {
             "TUI session ready"
         );
 
-        let cwd_path = std::path::PathBuf::from(&cwd);
-        if !self.config.sandbox.is_disabled()
-            && self.config.workspace_trust.matching(&cwd_path).is_none()
-        {
-            self.system_message(format!(
-                "Untrusted workspace {}. Restart kkagent and complete the workspace trust review.",
-                cwd_path.display()
-            ));
+        if self.remote_workspace.is_none() {
+            let cwd_path = std::path::PathBuf::from(&cwd);
+            if !self.config.sandbox.is_disabled()
+                && self.config.workspace_trust.matching(&cwd_path).is_none()
+            {
+                self.system_message(format!(
+                    "Untrusted workspace {}. Restart kkagent and complete the workspace trust review.",
+                    cwd_path.display()
+                ));
+            }
         }
 
         if let Err(e) = crate::pi::keybindings::validate_overrides(&self.config.ui.keybindings) {
@@ -2351,12 +2369,10 @@ impl TuiApp {
                             // isn't left stranded with an empty TUI.
                             let needs_fallback = self.state.session_id.is_none();
                             if needs_fallback {
+                                let ew = self.effective_workspace();
                                 match self
                                     .client
-                                    .create_session(
-                                        Some(&self.state.working_dir.to_string_lossy()),
-                                        Some(self.state.permission_mode),
-                                    )
+                                    .create_session(Some(&ew), Some(self.state.permission_mode))
                                     .await
                                 {
                                     Ok(session_id) => {
@@ -10564,10 +10580,10 @@ impl TuiApp {
                 if let Some(id) = fallback {
                     self.resume_session(&id).await?;
                 } else {
-                    let cwd = self.state.working_dir.to_string_lossy().into_owned();
+                    let ew = self.effective_workspace();
                     let session_id = self
                         .client
-                        .create_session(Some(&cwd), Some(self.state.permission_mode))
+                        .create_session(Some(&ew), Some(self.state.permission_mode))
                         .await?;
                     self.state.messages.clear();
                     self.state.active_assistant_message = None;
@@ -10632,10 +10648,10 @@ impl TuiApp {
                     if let Some(id) = fallback {
                         self.resume_session(&id).await?;
                     } else {
-                        let cwd = self.state.working_dir.to_string_lossy().into_owned();
+                        let ew = self.effective_workspace();
                         let session_id = self
                             .client
-                            .create_session(Some(&cwd), Some(self.state.permission_mode))
+                            .create_session(Some(&ew), Some(self.state.permission_mode))
                             .await?;
                         self.state.messages.clear();
                         self.state.active_assistant_message = None;
@@ -11338,10 +11354,10 @@ impl TuiApp {
                 self.state.reset_context_usage_stats();
                 self.state.render_cache.invalidate_all();
                 self.state.transcript_layout_cache.invalidate();
-                let cwd = self.state.working_dir.to_string_lossy().into_owned();
+                let ew = self.effective_workspace();
                 let session_id = self
                     .client
-                    .create_session(Some(&cwd), Some(self.state.permission_mode))
+                    .create_session(Some(&ew), Some(self.state.permission_mode))
                     .await?;
                 self.bind_config_default_model();
                 if self.state.plan_mode {
