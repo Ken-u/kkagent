@@ -371,7 +371,8 @@ async fn main() -> Result<()> {
         return run_dump_system_prompt(cli.config.as_deref()).await;
     }
 
-    let is_tui = cli.command.is_none() && cli.prompt.is_none();
+    let is_tui = (cli.command.is_none() && cli.prompt.is_none())
+        || matches!(cli.command, Some(Commands::Ssh { .. }));
     let is_server = matches!(cli.command, Some(Commands::Server { .. }));
 
     // Detect an unusable kkagent home (e.g. `~/.kkagent` being a regular file)

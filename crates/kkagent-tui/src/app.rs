@@ -1819,7 +1819,11 @@ impl TuiApp {
                 .await?;
         }
 
-        let cwd = self.state.working_dir.to_string_lossy().into_owned();
+        let cwd = if let Some(ref rw) = self.remote_workspace {
+            rw.clone()
+        } else {
+            self.state.working_dir.to_string_lossy().into_owned()
+        };
         match resume {
             Some(Some(id)) => {
                 if let Err(e) = self.resume_session(&id).await {
