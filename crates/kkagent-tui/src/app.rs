@@ -1645,13 +1645,16 @@ impl TuiApp {
         self.remote_connection = enabled;
     }
 
-    /// Set a remote workspace key (e.g. "build01:/data/aosp") for session creation.
+    /// Set a remote workspace key (e.g. "build01:/data/aosp" or
+    /// "build01:2222:/data/aosp" with an explicit port) for session creation.
     /// When set, sessions are created targeting this remote workspace instead of
     /// the local working directory.  Also updates the displayed working directory
     /// to the remote path so the TUI chrome shows the correct location.
     pub fn set_remote_workspace(&mut self, workspace: Option<String>) {
         if let Some(ref ws) = workspace {
-            let remote_path = ws.find(':').map(|i| &ws[i + 1..]).unwrap_or(ws);
+            // The remote path is everything after the LAST ':' — the host
+            // part may itself contain a colon when a port is included.
+            let remote_path = ws.rfind(':').map(|i| &ws[i + 1..]).unwrap_or(ws);
             let p = std::path::PathBuf::from(remote_path);
             self.state.working_dir = p.clone();
             self.state.primary_workspace = p;

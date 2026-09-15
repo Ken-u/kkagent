@@ -225,10 +225,28 @@ const REMOTE_PATH_PREAMBLE: &str = concat!(
     "/usr/local/bin:/usr/bin:/bin:$PATH\"; "
 );
 
+/// Expand a leading `~` using the remote host's home directory and normalize
+/// the result (strip trailing slash) for use as a remote workspace path.
+pub fn expand_remote_tilde(path: &str, remote_home: &Path) -> String {
+    let expanded = if path == "~" {
+        remote_home.to_string_lossy().into_owned()
+    } else if let Some(rest) = path.strip_prefix("~/") {
+        remote_home.join(rest).to_string_lossy().into_owned()
+    } else {
+        path.to_string()
+    };
+    if expanded.len() > 1 {
+        expanded.trim_end_matches('/').to_string()
+    } else {
+        expanded
+    }
+}
+
 /// Check whether a remote kkagent server is running; start one if not.
 ///
-/// Returns Ok(()) when the remote server is known to be reachable.
-pub async fn ensure_remote_server(ssh_socket: &Path, host: &str) -> Result<()> {
+/// Returns the absolute remote home directory (resolved shell-side via
+/// `$HOME`, so `~` workspace paths can be expanded correctly).
+pub async fn ensure_remote_server(ssh_socket: &Path, host: &str) -> Result<PathBuf> {
     // First, verify kkagent exists on the remote host.
     let which = ssh_via_control(ssh_socket, host)
         .arg(format!(
@@ -251,6 +269,20 @@ pub async fn ensure_remote_server(ssh_socket: &Path, host: &str) -> Result<()> {
     let remote_kkagent = which_out.trim().to_string();
     eprintln!("Remote kkagent found at: {remote_kkagent}");
 
+    // Resolve the remote home directory so `~` workspace paths can be
+    // expanded to an absolute path before any session is created.
+    let home_out = ssh_via_control(ssh_socket, host)
+        .arg(format!("{REMOTE_PATH_PREAMBLE}printf '%s' \"$HOME\""))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await?;
+    let remote_home = PathBuf::from(String::from_utf8_lossy(&home_out.stdout).trim());
+    if !home_out.status.success() || remote_home.as_os_str().is_empty() {
+        anyhow::bail!("cannot resolve remote home directory on {host}");
+    }
+
     // Try to reach the remote server via a status probe.
     let probe = ssh_via_control(ssh_socket, host)
         .arg(format!("{REMOTE_PATH_PREAMBLE}kkagent server status"))
@@ -262,18 +294,19 @@ pub async fn ensure_remote_server(ssh_socket: &Path, host: &str) -> Result<()> {
 
     if probe.status.success() {
         eprintln!("Remote kkagent server on {host} is already running");
-        return Ok(());
+        return Ok(remote_home);
     }
 
     eprintln!("Starting remote kkagent server on {host}...");
 
     // Start a daemonized server on the remote host.
-    // SSH remote commands are executed by the user's login shell, so we pass
-    // the entire pipeline as a single string.  The `&` backgrounds the server
-    // and `disown` detaches it from the shell job table.
+    // SSH remote commands are executed by the user's login shell. We cannot
+    // rely on `disown` (dash and other minimal shells lack it), so the server
+    // is started in a plain background subshell; `nohup` plus stdin/stdout
+    // redirection already keeps it alive after the SSH session closes.
     let start_cmd = format!(
         "{REMOTE_PATH_PREAMBLE}\
-         nohup kkagent server </dev/null >\"$HOME/.kkagent/server-start.log\" 2>&1 & disown"
+         nohup kkagent server </dev/null >\"$HOME/.kkagent/server-start.log\" 2>&1 &"
     );
     let start = ssh_via_control(ssh_socket, host)
         .arg(&start_cmd)
@@ -302,7 +335,7 @@ pub async fn ensure_remote_server(ssh_socket: &Path, host: &str) -> Result<()> {
         match &check {
             Ok(output) if output.status.success() => {
                 eprintln!("Remote kkagent server on {host} is ready");
-                return Ok(());
+                return Ok(remote_home);
             }
             _ => {}
         }
@@ -360,8 +393,14 @@ pub struct RemoteServerConnection {
     remote_event_tx: mpsc::Sender<(String, Frame)>,
     /// Handle to the SSH bridge child process.
     bridge_child: Mutex<Option<Child>>,
-    /// Background reconnect task handle.
-    reconnect_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Serializes `connect()` so a scheduled reconnect and an explicit
+    /// reconnect (e.g. `remote.register` from a fresh `kk ssh`) can never
+    /// race each other into two live bridges.
+    connect_lock: tokio::sync::Mutex<()>,
+    /// Bumped on every `connect()`; stale forwarder/reconnect tasks from a
+    /// superseded bridge compare against it and stand down instead of
+    /// clobbering connection state.
+    epoch: AtomicU64,
 }
 
 impl RemoteServerConnection {
@@ -381,12 +420,18 @@ impl RemoteServerConnection {
             rpc_client: RwLock::new(None),
             remote_event_tx,
             bridge_child: Mutex::new(None),
-            reconnect_handle: Mutex::new(None),
+            connect_lock: tokio::sync::Mutex::new(()),
+            epoch: AtomicU64::new(0),
         })
     }
 
     pub fn connection_state(&self) -> RemoteConnectionState {
         self.state_rx.borrow().clone()
+    }
+
+    /// The ControlMaster socket this connection bridges through.
+    pub fn ssh_socket(&self) -> &Path {
+        &self.ssh_socket
     }
 
     #[allow(dead_code)]
@@ -396,6 +441,9 @@ impl RemoteServerConnection {
 
     /// Establish (or re-establish) the SSH bridge connection.
     pub async fn connect(self: &Arc<Self>) -> Result<()> {
+        // Serialize concurrent connect attempts (scheduled reconnect vs
+        // explicit remote.register reconnect).
+        let _connect_guard = self.connect_lock.lock().await;
         self.state.send_replace(RemoteConnectionState::Connecting);
 
         // Kill any existing bridge child.
@@ -521,11 +569,18 @@ impl RemoteServerConnection {
         let server_id = self.server_id.clone();
         let event_fwd_tx = self.remote_event_tx.clone();
         let conn = Arc::clone(self);
+        // Tag this bridge generation so a forwarder from a superseded bridge
+        // cannot clobber connection state or schedule a competing reconnect.
+        let bridge_epoch = self.epoch.fetch_add(1, Ordering::SeqCst) + 1;
         tokio::spawn(async move {
             while let Some(frame) = event_rx.recv().await {
                 if event_fwd_tx.send((server_id.clone(), frame)).await.is_err() {
                     break;
                 }
+            }
+            // A newer connect() superseded this bridge; it owns state now.
+            if conn.epoch.load(Ordering::SeqCst) != bridge_epoch {
+                return;
             }
             // Event stream ended → remote disconnected.
             let reason = match rpc_client.connection_state() {
@@ -569,11 +624,16 @@ impl RemoteServerConnection {
     /// Try to reconnect in the background using BatchMode=yes (no password).
     fn schedule_reconnect(self: &Arc<Self>) {
         let conn = Arc::clone(self);
-        let handle = tokio::spawn(async move {
+        tokio::spawn(async move {
+            let epoch_at_schedule = conn.epoch.load(Ordering::SeqCst);
             let mut delay = Duration::from_secs(2);
             let max_delay = Duration::from_secs(60);
 
             for attempt in 1u32.. {
+                // A newer connect() superseded this schedule; stand down.
+                if conn.epoch.load(Ordering::SeqCst) != epoch_at_schedule {
+                    return;
+                }
                 tokio::time::sleep(delay).await;
 
                 // Check if the SSH ControlMaster socket is still alive.
@@ -613,12 +673,25 @@ impl RemoteServerConnection {
                             attempt,
                             "background SSH reconnect failed (may need interactive auth)"
                         );
-                        conn.state
-                            .send_replace(RemoteConnectionState::AuthenticationRequired);
+                        // Only surface this if the connection is still the one
+                        // we were scheduled for.
+                        if conn.epoch.load(Ordering::SeqCst) == epoch_at_schedule
+                            && matches!(
+                                conn.connection_state(),
+                                RemoteConnectionState::Disconnected { .. }
+                            )
+                        {
+                            conn.state
+                                .send_replace(RemoteConnectionState::AuthenticationRequired);
+                        }
                         return;
                     }
                 }
 
+                // A newer connect() superseded this schedule while we waited.
+                if conn.epoch.load(Ordering::SeqCst) != epoch_at_schedule {
+                    return;
+                }
                 tracing::info!(host = %conn.host, attempt, "attempting bridge reconnect");
                 match conn.connect().await {
                     Ok(()) => {
@@ -633,11 +706,6 @@ impl RemoteServerConnection {
                 delay = (delay * 2).min(max_delay);
             }
         });
-        // Fire-and-forget; store handle so we can cancel if needed.
-        let conn = Arc::clone(self);
-        tokio::spawn(async move {
-            *conn.reconnect_handle.lock().await = Some(handle);
-        });
     }
 }
 
@@ -648,8 +716,9 @@ impl RemoteServerConnection {
 /// Manages all remote server connections and workspace/session routing.
 pub struct RemoteRegistry {
     connections: RwLock<HashMap<String, Arc<RemoteServerConnection>>>,
-    /// Maps workspace paths to server IDs. Local workspaces are not in this map.
-    workspace_owners: RwLock<HashMap<String, String>>,
+    /// Maps workspace keys to their owning remote server and the remote-side
+    /// path. Local workspaces are not in this map.
+    workspace_owners: RwLock<HashMap<String, WorkspaceRoute>>,
     /// Maps external (opaque) session IDs to (server_id, remote_session_id).
     session_routes: RwLock<HashMap<String, SessionRoute>>,
     /// Channel that receives events from all remote servers.
@@ -662,6 +731,14 @@ pub struct RemoteRegistry {
 pub struct SessionRoute {
     pub server_id: String,
     pub remote_session_id: String,
+}
+
+/// Routing entry for a remote workspace: which server owns it and what path
+/// the remote server should use for it.
+#[derive(Debug, Clone)]
+pub struct WorkspaceRoute {
+    pub server_id: String,
+    pub remote_path: String,
 }
 
 /// Information about a remote workspace.
@@ -721,15 +798,23 @@ impl RemoteRegistry {
     }
 
     /// Register a workspace as belonging to a remote server.
-    pub async fn register_workspace(&self, workspace_key: &str, server_id: &str) {
-        self.workspace_owners
-            .write()
-            .await
-            .insert(workspace_key.to_string(), server_id.to_string());
+    pub async fn register_workspace(
+        &self,
+        workspace_key: &str,
+        server_id: &str,
+        remote_path: &str,
+    ) {
+        self.workspace_owners.write().await.insert(
+            workspace_key.to_string(),
+            WorkspaceRoute {
+                server_id: server_id.to_string(),
+                remote_path: remote_path.to_string(),
+            },
+        );
     }
 
-    /// Get the server ID that owns a workspace, or None for local.
-    pub async fn workspace_server(&self, workspace_key: &str) -> Option<String> {
+    /// Get the route that owns a workspace, or None for local.
+    pub async fn workspace_route(&self, workspace_key: &str) -> Option<WorkspaceRoute> {
         self.workspace_owners
             .read()
             .await
@@ -760,12 +845,12 @@ impl RemoteRegistry {
         let owners = self.workspace_owners.read().await;
         let conns = self.connections.read().await;
         let mut result = Vec::new();
-        for (path, server_id) in owners.iter() {
-            if let Some(conn) = conns.get(server_id) {
+        for route in owners.values() {
+            if let Some(conn) = conns.get(&route.server_id) {
                 result.push(RemoteWorkspaceInfo {
-                    server_id: server_id.clone(),
+                    server_id: route.server_id.clone(),
                     host: conn.host.clone(),
-                    path: path.clone(),
+                    path: route.remote_path.clone(),
                     state: format!("{:?}", conn.connection_state()),
                 });
             }
@@ -887,7 +972,6 @@ impl RemoteRegistry {
     }
 
     /// List remote sessions (merge into sessions.list response).
-    #[allow(dead_code)]
     pub async fn list_remote_sessions(&self, limit: usize) -> Vec<serde_json::Value> {
         let conns = self.connections.read().await;
         let routes = self.session_routes.read().await;
@@ -934,19 +1018,25 @@ impl RemoteRegistry {
 // Event Translation
 // ---------------------------------------------------------------------------
 
-/// Translate session IDs in a remote event frame to local opaque IDs.
-pub fn translate_event_session_id(frame: &Frame, external_session_id: &str) -> Frame {
+/// Translate remote session IDs in an event frame to the local opaque ID.
+///
+/// Both `data.session_id` and `scope` may carry the remote session ID; the
+/// scope matters for clients subscribed with `Listen { scope }`.
+pub fn translate_event_session_id(
+    frame: &Frame,
+    remote_session_id: &str,
+    external_session_id: &str,
+) -> Frame {
     match frame {
         Frame::Event { event, scope, data } => {
             let mut data = data.clone();
             if let Some(obj) = data.as_object_mut() {
-                if obj.contains_key("session_id") {
+                if obj.get("session_id").and_then(|v| v.as_str()) == Some(remote_session_id) {
                     obj.insert("session_id".into(), serde_json::json!(external_session_id));
                 }
             }
             let scope = scope.as_ref().map(|s| {
-                // If scope is the remote session ID, replace with external ID.
-                if s == external_session_id {
+                if s == remote_session_id {
                     external_session_id.to_string()
                 } else {
                     s.clone()
@@ -1062,6 +1152,71 @@ fn check_version_compatibility(local: &str, remote: &str, host: &str) {
         eprintln!(
             "⚠ Remote kkagent on {host} is {remote} (local: {local}). \
              Major/minor version mismatch — upgrade the remote kkagent."
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn translate_event_rewrites_scope_and_data_session_id() {
+        let frame = Frame::Event {
+            event: "message.updated".into(),
+            scope: Some("remote-abc".into()),
+            data: serde_json::json!({"session_id": "remote-abc", "n": 1}),
+        };
+        let translated = translate_event_session_id(&frame, "remote-abc", "r1-external");
+        match translated {
+            Frame::Event { scope, data, .. } => {
+                assert_eq!(scope.as_deref(), Some("r1-external"));
+                assert_eq!(data["session_id"], "r1-external");
+                assert_eq!(data["n"], 1);
+            }
+            other => panic!("unexpected frame: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn translate_event_leaves_foreign_scope_alone() {
+        let frame = Frame::Event {
+            event: "server.status".into(),
+            scope: Some("other-scope".into()),
+            data: serde_json::json!({"session_id": "remote-abc"}),
+        };
+        let translated = translate_event_session_id(&frame, "remote-abc", "r1-external");
+        match translated {
+            Frame::Event { scope, data, .. } => {
+                assert_eq!(scope.as_deref(), Some("other-scope"));
+                assert_eq!(data["session_id"], "r1-external");
+            }
+            other => panic!("unexpected frame: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn expand_remote_tilde_handles_all_forms() {
+        let home = Path::new("/home/dev");
+        assert_eq!(expand_remote_tilde("~", home), "/home/dev");
+        assert_eq!(expand_remote_tilde("~/code", home), "/home/dev/code");
+        assert_eq!(expand_remote_tilde("~/code/", home), "/home/dev/code");
+        // Absolute paths are only normalized, never joined with home.
+        assert_eq!(expand_remote_tilde("/data/aosp/", home), "/data/aosp");
+        assert_eq!(expand_remote_tilde("/data/aosp", home), "/data/aosp");
+        assert_eq!(expand_remote_tilde("~other", home), "~other");
+    }
+
+    #[test]
+    fn extract_session_id_reads_params() {
+        assert_eq!(
+            extract_session_id(&Some(serde_json::json!({"session_id": "s1"}))),
+            Some("s1".to_string())
+        );
+        assert_eq!(extract_session_id(&None), None);
+        assert_eq!(
+            extract_session_id(&Some(serde_json::json!({"other": 1}))),
+            None
         );
     }
 }

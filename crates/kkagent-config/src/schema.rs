@@ -336,7 +336,8 @@ fn default_ssh_port() -> u16 {
 ///
 /// Declares a persistent remote kkagent server reachable via SSH.
 /// The `host` value uses system OpenSSH host semantics and may reference
-/// entries in `~/.ssh/config`.
+/// entries in `~/.ssh/config`.  `kk ssh NAME` resolves `NAME` through this
+/// section, so `kk ssh build` connects to the host declared below.
 ///
 /// ```toml
 /// [servers.build]

@@ -2033,11 +2033,25 @@ async fn run_ssh(
     port: Option<u16>,
     no_alt_screen: bool,
 ) -> Result<()> {
+    // Resolve server-name aliases: `kk ssh build` looks up [servers.build]
+    // in the config and connects to its declared host.
+    let (host, port) = match config.servers.get(&host) {
+        Some(entry) if entry.transport == "ssh" => (entry.host.clone(), port),
+        Some(entry) => {
+            anyhow::bail!(
+                "server '{host}' uses unsupported transport '{}' (only 'ssh' is supported)",
+                entry.transport
+            );
+        }
+        None => (host, port),
+    };
+
     // 1. Establish/reuse authenticated SSH connection via ControlMaster.
     let ctrl = remote::SshControlMaster::establish(&host, port).await?;
 
-    // 2. Ensure remote kkagent server is running.
-    remote::ensure_remote_server(ctrl.socket_path(), &host).await?;
+    // 2. Ensure remote kkagent server is running (also resolves remote $HOME
+    //    so `~` workspace paths expand to an absolute path).
+    let remote_home = remote::ensure_remote_server(ctrl.socket_path(), &host).await?;
 
     // 3. Connect to the local server (or spawn one).
     let socket_path = kkagent_config::default_server_socket_path();
@@ -2054,14 +2068,23 @@ async fn run_ssh(
     let setup_client = RpcClient::new(local_stream, event_tx);
 
     // 4. Register the remote server and workspace in the local server.
-    let remote_path = path.as_deref().unwrap_or("~");
-    let workspace_key = format!("{host}:{remote_path}");
+    // Expand `~` against the remote home so the workspace key is stable and
+    // the remote server receives a path it can use directly.
+    let remote_path = remote::expand_remote_tilde(path.as_deref().unwrap_or("~"), &remote_home);
+    // Disambiguate server_id when the same host is reached on different
+    // ports or via different ssh_config aliases; plain hosts keep the
+    // readable id "host".
+    let server_id = match port {
+        Some(p) => format!("{host}:{p}"),
+        None => host.clone(),
+    };
+    let workspace_key = format!("{server_id}:{remote_path}");
 
     let register_result = setup_client
         .call(
             "remote.register",
             Some(serde_json::json!({
-                "server_id": host,
+                "server_id": server_id,
                 "host": host,
                 "ssh_socket": ctrl.socket_path().to_string_lossy(),
                 "workspace": remote_path,
@@ -7355,7 +7378,7 @@ fn start_remote_event_forwarder(registry: Arc<remote::RemoteRegistry>, state: Ar
                             .translate_remote_session_id(&server_id, remote_sid)
                             .await
                         {
-                            remote::translate_event_session_id(&frame, &external_id)
+                            remote::translate_event_session_id(&frame, remote_sid, &external_id)
                         } else {
                             frame
                         }
@@ -8561,9 +8584,29 @@ async fn handle_rpc_call(
             let ssh_socket_path = std::path::PathBuf::from(ssh_socket);
             let workspace_key = format!("{host}:{workspace}");
 
-            // Check if this server is already registered.
+            // Reuse the registered connection only when the ControlMaster
+            // socket still matches; a stale entry from an older `kk ssh`
+            // (different port or replaced master) must not be kept.
             let existing = state.remote.connection(&server_id).await;
-            let conn = if let Some(conn) = existing {
+            let reuse = existing.as_ref().is_some_and(|conn| {
+                conn.ssh_socket() == ssh_socket_path
+                    && matches!(
+                        conn.connection_state(),
+                        remote::RemoteConnectionState::Connected
+                            | remote::RemoteConnectionState::Connecting
+                    )
+            });
+            let conn = if let Some(conn) = existing.filter(|_| reuse) {
+                // Same ControlMaster, but the bridge may have dropped while
+                // the SSH master stayed alive — reconnect before continuing.
+                if !matches!(
+                    conn.connection_state(),
+                    remote::RemoteConnectionState::Connected
+                ) {
+                    if let Err(e) = conn.connect().await {
+                        tracing::warn!(%e, "bridge reconnect to {host} failed");
+                    }
+                }
                 conn
             } else {
                 let conn = state
@@ -8579,7 +8622,7 @@ async fn handle_rpc_call(
 
             state
                 .remote
-                .register_workspace(&workspace_key, &server_id)
+                .register_workspace(&workspace_key, &server_id, &workspace)
                 .await;
 
             // Start event forwarding if not already running.
@@ -8644,19 +8687,14 @@ async fn handle_rpc_call(
                 .to_string();
 
             // Check if this workspace belongs to a remote server.
-            if let Some(server_id) = state.remote.workspace_server(&requested_workspace).await {
-                // Extract just the remote path from the workspace key (host:path).
-                let remote_path = requested_workspace
-                    .find(':')
-                    .map(|i| &requested_workspace[i + 1..])
-                    .unwrap_or(&requested_workspace);
+            if let Some(route) = state.remote.workspace_route(&requested_workspace).await {
                 let remote_params = serde_json::json!({
-                    "workspace": remote_path,
+                    "workspace": route.remote_path,
                     "permission_mode": params.as_ref().and_then(|p| p.get("permission_mode")).cloned(),
                 });
                 let (_external_id, result) = state
                     .remote
-                    .create_remote_session(&server_id, remote_params)
+                    .create_remote_session(&route.server_id, remote_params)
                     .await?;
                 return Ok(result);
             }
@@ -8902,6 +8940,11 @@ async fn handle_rpc_call(
                             })
                         })
                         .collect();
+                    let mut list = list;
+                    // Append sessions that live on remote servers so the
+                    // TUI resume picker can offer them (opaque IDs already
+                    // routed by forward_session_call).
+                    list.extend(state.remote.list_remote_sessions(limit).await);
                     return Ok(serde_json::json!({"sessions": list}));
                 }
             }
@@ -8941,6 +8984,8 @@ async fn handle_rpc_call(
                     })
                 })
                 .collect();
+            let mut list = list;
+            list.extend(state.remote.list_remote_sessions(limit).await);
             Ok(serde_json::json!({"sessions": list}))
         }
         "sessions.status" => {
