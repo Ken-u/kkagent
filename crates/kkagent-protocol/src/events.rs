@@ -226,6 +226,21 @@ pub enum AgentEvent {
         messages: Vec<serde_json::Value>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
+        /// Archived fork created before compaction (when available).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        archive_session_id: Option<String>,
+        /// Pre-compaction messages so TUI can build a foldable history entry.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pre_compaction_messages: Option<Vec<serde_json::Value>>,
+    },
+    /// Auto-compaction completed inside the agent loop; TUI should build a
+    /// foldable compaction history entry and replace its transcript display.
+    AutoCompactCompleted {
+        session_id: String,
+        archive_session_id: String,
+        compacted_count: u64,
+        pre_compaction_messages: Vec<serde_json::Value>,
+        post_compaction_messages: Vec<serde_json::Value>,
     },
     /// Skill loaded via `/skill:…` or the Skill tool (kimi `skill.activated`).
     SkillActivated {
@@ -296,6 +311,7 @@ impl AgentEvent {
             | Self::BtwEnd { session_id, .. }
             | Self::McpAuthRequired { session_id, .. }
             | Self::CompactCompleted { session_id, .. }
+            | Self::AutoCompactCompleted { session_id, .. }
             | Self::SkillActivated { session_id, .. }
             | Self::SessionConfigChanged { session_id, .. }
             | Self::ToolCancelled { session_id, .. } => session_id,

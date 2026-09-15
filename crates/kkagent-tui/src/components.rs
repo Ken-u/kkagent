@@ -12,8 +12,9 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::{
-    AppMode, AppState, DisplayPart, ListPickerState, MessageRole, PendingApproval, PendingQuestion,
-    TaskDetailState, TodoItem, ToolExpandHit, ToolExpandTarget, ToolHistorySummary,
+    AppMode, AppState, CompactionHistorySummary, DisplayPart, ListPickerState, MessageRole,
+    PendingApproval, PendingQuestion, TaskDetailState, TodoItem, ToolExpandHit, ToolExpandTarget,
+    ToolHistorySummary,
 };
 use crate::git_badge;
 use crate::i18n::{self, Locale};
@@ -689,7 +690,8 @@ fn tool_expand_target_message(target: ToolExpandTarget) -> usize {
     match target {
         ToolExpandTarget::Part { message, .. }
         | ToolExpandTarget::Legacy { message, .. }
-        | ToolExpandTarget::Plan { message } => message,
+        | ToolExpandTarget::Plan { message }
+        | ToolExpandTarget::Compaction { message, .. } => message,
     }
 }
 
@@ -880,6 +882,12 @@ fn hash_display_message(message: &crate::app::DisplayMessage, hasher: &mut impl 
             DisplayPart::SkillActivation { name, args } => {
                 name.hash(hasher);
                 args.hash(hasher);
+            }
+            DisplayPart::CompactionHistory(history) => {
+                history.compacted_count.hash(hasher);
+                history.expanded.hash(hasher);
+                history.user_overridden.hash(hasher);
+                history.messages.len().hash(hasher);
             }
         }
     }
@@ -1333,6 +1341,22 @@ fn build_transcript_lines_range(
                                 first_bullet = false;
                                 rendered_any = true;
                             }
+                            DisplayPart::CompactionHistory(history) => {
+                                let line = render_compaction_history_lines(
+                                    &mut lines, history, width, theme,
+                                );
+                                if interactive_tools {
+                                    tool_expand_hits.push(ToolExpandHit {
+                                        line,
+                                        target: ToolExpandTarget::Compaction {
+                                            message: msg_idx,
+                                            part: part_idx,
+                                        },
+                                    });
+                                }
+                                first_bullet = false;
+                                rendered_any = true;
+                            }
                         }
                     }
                 } else {
@@ -1689,6 +1713,48 @@ fn render_tool_history_lines(
             let mut shown = tc.clone();
             shown.collapsed = false;
             let _ = render_tool_call_lines(lines, &shown, width, theme, false, false);
+        }
+    }
+    hint_line
+}
+
+fn render_compaction_history_lines(
+    lines: &mut Vec<Line<'static>>,
+    history: &CompactionHistorySummary,
+    width: u16,
+    theme: &Theme,
+) -> usize {
+    let hint = if history.expanded {
+        "ctrl+o 折叠"
+    } else {
+        "ctrl+o 展开"
+    };
+    let hint_line = lines.len();
+    lines.push(Line::from(vec![
+        Span::styled(
+            format!("… {} 条消息已压缩", history.compacted_count),
+            Style::default().fg(theme.text_muted),
+        ),
+        Span::styled(format!(" ({hint})"), Style::default().fg(theme.text_dim)),
+    ]));
+
+    if history.expanded {
+        for msg in &history.messages {
+            let role_label = match &msg.role {
+                MessageRole::User => "user",
+                MessageRole::Assistant => "assistant",
+                MessageRole::System => "system",
+                MessageRole::Plan => "plan",
+                MessageRole::Skill => "skill",
+            };
+            let truncated: String = msg.content.chars().take(width as usize).collect();
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("  [{role_label}] "),
+                    Style::default().fg(theme.text_dim),
+                ),
+                Span::styled(truncated, Style::default().fg(theme.text_muted)),
+            ]));
         }
     }
     hint_line

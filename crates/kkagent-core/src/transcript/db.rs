@@ -110,6 +110,10 @@ pub struct SessionRecord {
     pub updated_at: String,
     pub message_count: u32,
     pub is_archived: bool,
+    /// Points to an archived fork created before compaction. The archived
+    /// session retains the full pre-compaction transcript so undo/fork can
+    /// transparently reach earlier turns.
+    pub parent_session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -276,7 +280,7 @@ impl TranscriptDb {
     /// Bump this whenever the transcript schema changes. `migrate` skips all
     /// DDL (and the expensive FTS population check) when the on-disk version
     /// already matches, turning a ~1.4 s cold-open of a large DB into <1 ms.
-    const SCHEMA_VERSION: i64 = 1;
+    const SCHEMA_VERSION: i64 = 2;
 
     fn migrate(&self) -> anyhow::Result<()> {
         // Serialize schema creation both in-process (global mutex) and
@@ -376,6 +380,16 @@ impl TranscriptDb {
         )?;
         if !has_fallback_model {
             conn.execute("ALTER TABLE sessions ADD COLUMN fallback_model TEXT", [])?;
+        }
+        let has_parent_session_id: bool = conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM pragma_table_info('sessions') WHERE name = 'parent_session_id'
+            )",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_parent_session_id {
+            conn.execute("ALTER TABLE sessions ADD COLUMN parent_session_id TEXT", [])?;
         }
         drop(conn);
         self.ensure_fts_populated()?;
@@ -708,7 +722,7 @@ impl TranscriptDb {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
             "SELECT session_id, title, model, fallback_model, working_dir, created_at, updated_at,
-                    message_count, is_archived
+                    message_count, is_archived, parent_session_id
              FROM sessions WHERE is_archived = 0
              ORDER BY updated_at DESC LIMIT ?1",
         )?;
@@ -723,6 +737,7 @@ impl TranscriptDb {
                 updated_at: row.get(6)?,
                 message_count: row.get(7)?,
                 is_archived: row.get::<_, i32>(8)? != 0,
+                parent_session_id: row.get(9)?,
             })
         })?;
         let mut sessions = Vec::new();
@@ -758,7 +773,7 @@ impl TranscriptDb {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
             "SELECT session_id, title, model, fallback_model, working_dir, created_at, updated_at,
-                    message_count, is_archived
+                    message_count, is_archived, parent_session_id
              FROM sessions WHERE is_archived = 0 AND substr(session_id, 1, ?2) = ?1
              ORDER BY updated_at DESC",
         )?;
@@ -775,6 +790,7 @@ impl TranscriptDb {
                     updated_at: row.get(6)?,
                     message_count: row.get(7)?,
                     is_archived: row.get::<_, i32>(8)? != 0,
+                    parent_session_id: row.get(9)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -815,7 +831,7 @@ impl TranscriptDb {
                 .join(",");
             let sql = format!(
                 "SELECT session_id, title, model, fallback_model, working_dir, created_at, updated_at,
-                        message_count, is_archived
+                        message_count, is_archived, parent_session_id
                  FROM sessions WHERE session_id IN ({placeholders})"
             );
             let mut stmt = conn.prepare(&sql)?;
@@ -830,6 +846,7 @@ impl TranscriptDb {
                     updated_at: row.get(6)?,
                     message_count: row.get(7)?,
                     is_archived: row.get::<_, i32>(8)? != 0,
+                    parent_session_id: row.get(9)?,
                 })
             })?;
             for row in rows {
@@ -844,7 +861,7 @@ impl TranscriptDb {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
             "SELECT session_id, title, model, fallback_model, working_dir, created_at, updated_at,
-                    message_count, is_archived
+                    message_count, is_archived, parent_session_id
              FROM sessions WHERE session_id = ?1",
         )?;
         let mut rows = stmt.query_map(params![session_id], |row| {
@@ -858,6 +875,7 @@ impl TranscriptDb {
                 updated_at: row.get(6)?,
                 message_count: row.get(7)?,
                 is_archived: row.get::<_, i32>(8)? != 0,
+                parent_session_id: row.get(9)?,
             })
         })?;
         Ok(rows.next().and_then(|r| r.ok()))
@@ -967,6 +985,19 @@ impl TranscriptDb {
         let changed = self.lock()?.execute(
             "UPDATE sessions SET is_archived = ?1, updated_at = ?2 WHERE session_id = ?3",
             params![archived, Utc::now().to_rfc3339(), session_id],
+        )?;
+        if changed == 0 {
+            anyhow::bail!("session not found: {session_id}");
+        }
+        Ok(())
+    }
+
+    /// Link a session to an archived pre-compaction fork so undo/fork can
+    /// transparently reach earlier turns.
+    pub fn set_parent_session_id(&self, session_id: &str, parent_id: &str) -> anyhow::Result<()> {
+        let changed = self.lock()?.execute(
+            "UPDATE sessions SET parent_session_id = ?1, updated_at = ?2 WHERE session_id = ?3",
+            params![parent_id, Utc::now().to_rfc3339(), session_id],
         )?;
         if changed == 0 {
             anyhow::bail!("session not found: {session_id}");

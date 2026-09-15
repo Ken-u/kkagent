@@ -691,6 +691,8 @@ pub struct HistoryEditTurn {
     pub turn_index: usize,
     pub message_index: usize,
     pub text: String,
+    /// When set, this turn belongs to an archived parent session (pre-compaction).
+    pub source_session_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -843,6 +845,18 @@ pub enum DisplayPart {
         name: String,
         args: Option<String>,
     },
+    /// Foldable compaction history entry — shows pre-compaction messages when expanded.
+    CompactionHistory(CompactionHistorySummary),
+}
+
+#[derive(Debug, Clone)]
+pub struct CompactionHistorySummary {
+    pub compacted_count: u32,
+    pub archive_session_id: Option<String>,
+    pub expanded: bool,
+    /// A mouse click makes this item independent from the global Ctrl-O mode.
+    pub user_overridden: bool,
+    pub messages: Vec<DisplayMessage>,
 }
 
 #[derive(Debug, Clone)]
@@ -869,6 +883,11 @@ pub enum ToolExpandTarget {
     /// Transcript plan.md block (summary line ↔ full document box).
     Plan {
         message: usize,
+    },
+    /// Compaction history fold/expand toggle.
+    Compaction {
+        message: usize,
+        part: usize,
     },
 }
 
@@ -1436,6 +1455,9 @@ impl AppState {
                         tool.collapsed = !self.tool_output_expanded;
                     }
                     DisplayPart::ToolHistory(history) if !history.user_overridden => {
+                        history.expanded = self.tool_output_expanded;
+                    }
+                    DisplayPart::CompactionHistory(history) if !history.user_overridden => {
                         history.expanded = self.tool_output_expanded;
                     }
                     _ => {}
@@ -3460,7 +3482,8 @@ impl TuiApp {
         let Some(message) = self.state.messages.get_mut(match hit.target {
             ToolExpandTarget::Part { message, .. }
             | ToolExpandTarget::Legacy { message, .. }
-            | ToolExpandTarget::Plan { message } => message,
+            | ToolExpandTarget::Plan { message }
+            | ToolExpandTarget::Compaction { message, .. } => message,
         }) else {
             return false;
         };
@@ -3471,6 +3494,12 @@ impl TuiApp {
                 }
                 self.state.plan_transcript_collapsed = !self.state.plan_transcript_collapsed;
                 self.state.plan_transcript_overridden = true;
+            }
+            ToolExpandTarget::Compaction { part, .. } => {
+                if let Some(DisplayPart::CompactionHistory(history)) = message.parts.get_mut(part) {
+                    history.expanded = !history.expanded;
+                    history.user_overridden = true;
+                }
             }
             ToolExpandTarget::Part { part, .. } => match message.parts.get_mut(part) {
                 Some(DisplayPart::Tool(tool)) => {
@@ -5465,6 +5494,28 @@ impl TuiApp {
         let params = serde_json::json!({"session_id": sid, "count": count});
         match self.client.rpc_call("session.undo", Some(params)).await {
             Ok(data) => {
+                // If the undo crossed a compaction boundary, the server
+                // returns a fork_session_id — switch to it seamlessly.
+                if let Some(fork_id) = data.get("fork_session_id").and_then(|v| v.as_str()) {
+                    let fork_id = fork_id.to_string();
+                    self.link_open_sessions(&sid, &fork_id);
+                    self.state
+                        .tab_strip
+                        .ensure_tab(&fork_id, "undo (pre-compact)".to_string());
+                    self.state.pending_resume_prefill = None;
+                    let _ = self
+                        .client
+                        .rpc_call(
+                            "session.resume",
+                            Some(serde_json::json!({"session_id": fork_id})),
+                        )
+                        .await;
+                    self.system_message(
+                        "Undo crossed compaction boundary — forked to new session".into(),
+                    );
+                    return Ok(());
+                }
+
                 let undone = data.get("undone").and_then(|v| v.as_u64()).unwrap_or(0);
                 if let Some(msgs) = data.get("messages").and_then(|v| v.as_array()) {
                     self.state.messages = transcript_messages_to_display(msgs);
@@ -5525,14 +5576,22 @@ impl TuiApp {
         }
         let items = turns
             .iter()
-            .map(|turn| ListPickerItem {
-                id: turn.message_index.to_string(),
-                label: format!(
-                    "#{}  {}",
-                    turn.turn_index + 1,
-                    history_turn_summary(&turn.text, 72)
-                ),
-                detail: String::new(),
+            .map(|turn| {
+                let suffix = if turn.source_session_id.is_some() {
+                    " (压缩前)"
+                } else {
+                    ""
+                };
+                ListPickerItem {
+                    id: turn.message_index.to_string(),
+                    label: format!(
+                        "#{}  {}{}",
+                        turn.turn_index + 1,
+                        history_turn_summary(&turn.text, 72),
+                        suffix,
+                    ),
+                    detail: String::new(),
+                }
             })
             .collect::<Vec<_>>();
         let selected = items.len().saturating_sub(1);
@@ -5550,24 +5609,30 @@ impl TuiApp {
     }
 
     async fn fork_and_edit_turn(&mut self, turn: HistoryEditTurn) -> anyhow::Result<()> {
-        let source_id = self
+        let current_id = self
             .state
             .session_id
             .clone()
             .ok_or_else(|| anyhow::anyhow!("No active session"))?;
+        // If the turn comes from an archived session, fork that instead.
+        let source_id = turn
+            .source_session_id
+            .as_deref()
+            .unwrap_or(&current_id)
+            .to_string();
         let source_title = self
             .state
             .workspace_sessions
             .entries
             .iter()
-            .find(|entry| entry.id == source_id)
+            .find(|entry| entry.id == current_id)
             .map(|entry| entry.title.as_str())
             .or_else(|| {
                 self.state
                     .tab_strip
                     .tabs
                     .iter()
-                    .find(|tab| tab.id == source_id)
+                    .find(|tab| tab.id == current_id)
                     .map(|tab| tab.title.as_str())
             })
             .filter(|title| !title.trim().is_empty())
@@ -5592,7 +5657,7 @@ impl TuiApp {
             .to_string();
 
         self.clear_list_pickers();
-        self.link_open_sessions(&source_id, &target_id);
+        self.link_open_sessions(&current_id, &target_id);
         self.state
             .tab_strip
             .ensure_tab(&target_id, format!("edit #{}", turn.turn_index + 1));
@@ -6836,6 +6901,9 @@ impl TuiApp {
                     DisplayPart::SkillActivation { name, args } => {
                         conv += ((name.len() + args.as_ref().map(|a| a.len()).unwrap_or(0)) as u64)
                             .div_ceil(4);
+                    }
+                    DisplayPart::CompactionHistory(_) => {
+                        // Compacted messages are no longer in the active context.
                     }
                 }
             }
@@ -9293,7 +9361,43 @@ impl TuiApp {
         }
 
         if let Some(msgs) = data.get("messages").and_then(|v| v.as_array()) {
-            self.state.messages = transcript_messages_to_display(msgs);
+            let post_display = transcript_messages_to_display(msgs);
+
+            // Restore foldable compaction history from the archived parent session.
+            if let Some(archived) = data.get("archived_messages").and_then(|v| v.as_array()) {
+                let parent_id = data
+                    .get("parent_session_id")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                let pre_display = transcript_messages_to_display(archived);
+                let compacted_count = pre_display.len().saturating_sub(post_display.len()) as u32;
+                if compacted_count > 0 {
+                    let compaction_part =
+                        DisplayPart::CompactionHistory(CompactionHistorySummary {
+                            compacted_count,
+                            archive_session_id: parent_id,
+                            expanded: false,
+                            user_overridden: false,
+                            messages: pre_display,
+                        });
+                    let compaction_msg = DisplayMessage {
+                        role: MessageRole::System,
+                        content: String::new(),
+                        thinking: None,
+                        parts: vec![compaction_part],
+                        tool_calls: Vec::new(),
+                        delivery: crate::prompt_queue::DeliveryState::Sent,
+                        idempotency_key: None,
+                    };
+                    let mut new_messages = vec![compaction_msg];
+                    new_messages.extend(post_display);
+                    self.state.messages = new_messages;
+                } else {
+                    self.state.messages = post_display;
+                }
+            } else {
+                self.state.messages = post_display;
+            }
             self.state.apply_tool_output_mode();
             self.state.active_assistant_message = None;
         }
@@ -13691,6 +13795,8 @@ impl TuiApp {
                         kept_user_message_count,
                         messages,
                         error,
+                        archive_session_id,
+                        pre_compaction_messages,
                         ..
                     } => {
                         if let Some(err) = error {
@@ -13698,7 +13804,34 @@ impl TuiApp {
                                 "Compact failed: {err} — current prompt kept; try /compact again or continue."
                             ));
                         } else {
-                            self.state.messages = transcript_messages_to_display(&messages);
+                            let post_display = transcript_messages_to_display(&messages);
+                            if let Some(pre_msgs) = pre_compaction_messages {
+                                let pre_display = transcript_messages_to_display(&pre_msgs);
+                                let compacted_count =
+                                    pre_display.len().saturating_sub(post_display.len()) as u32;
+                                let compaction_part =
+                                    DisplayPart::CompactionHistory(CompactionHistorySummary {
+                                        compacted_count,
+                                        archive_session_id: archive_session_id.clone(),
+                                        expanded: false,
+                                        user_overridden: false,
+                                        messages: pre_display,
+                                    });
+                                let compaction_msg = DisplayMessage {
+                                    role: MessageRole::System,
+                                    content: String::new(),
+                                    thinking: None,
+                                    parts: vec![compaction_part],
+                                    tool_calls: Vec::new(),
+                                    delivery: crate::prompt_queue::DeliveryState::Sent,
+                                    idempotency_key: None,
+                                };
+                                let mut new_messages = vec![compaction_msg];
+                                new_messages.extend(post_display);
+                                self.state.messages = new_messages;
+                            } else {
+                                self.state.messages = post_display;
+                            }
                             self.state.apply_tool_output_mode();
                             self.state.active_assistant_message = None;
                             self.state.follow_bottom = true;
@@ -13792,6 +13925,57 @@ impl TuiApp {
                     }
                     // Durable post-persist signal for MCP; TUI already settled on TurnEnd.
                     AgentEvent::TurnCommitted { .. } => {}
+                    // Auto-compaction completed inside agent loop — handled
+                    // below in the same way as CompactCompleted once the
+                    // tui-handle todo is implemented.
+                    AgentEvent::AutoCompactCompleted {
+                        archive_session_id,
+                        compacted_count,
+                        pre_compaction_messages,
+                        post_compaction_messages,
+                        ..
+                    } => {
+                        // Build compaction history + replace display messages.
+                        // (Full implementation in tui-handle todo.)
+                        let pre_display = transcript_messages_to_display(&pre_compaction_messages);
+                        let post_display =
+                            transcript_messages_to_display(&post_compaction_messages);
+
+                        let compaction_part =
+                            DisplayPart::CompactionHistory(CompactionHistorySummary {
+                                compacted_count: compacted_count as u32,
+                                archive_session_id: if archive_session_id.is_empty() {
+                                    None
+                                } else {
+                                    Some(archive_session_id)
+                                },
+                                expanded: false,
+                                user_overridden: false,
+                                messages: pre_display,
+                            });
+                        let compaction_msg = DisplayMessage {
+                            role: MessageRole::System,
+                            content: String::new(),
+                            thinking: None,
+                            parts: vec![compaction_part],
+                            tool_calls: Vec::new(),
+                            delivery: crate::prompt_queue::DeliveryState::Sent,
+                            idempotency_key: None,
+                        };
+                        let mut new_messages = vec![compaction_msg];
+                        new_messages.extend(post_display);
+                        self.state.messages = new_messages;
+                        self.state.apply_tool_output_mode();
+                        self.state.active_assistant_message = None;
+                        self.state.follow_bottom = true;
+                        self.state.scroll_up = 0;
+                        self.state.approx_tokens = self
+                            .state
+                            .messages
+                            .iter()
+                            .map(|m| m.content.len() as u64 / 4)
+                            .sum::<u64>();
+                    }
                 }
             }
         }
@@ -14655,15 +14839,27 @@ fn history_edit_turns_from_json(data: &serde_json::Value) -> Vec<HistoryEditTurn
             let turn_index = usize::try_from(value.get("turn_index")?.as_u64()?).ok()?;
             let message_index = usize::try_from(value.get("message_index")?.as_u64()?).ok()?;
             let text = value.get("text")?.as_str()?.trim().to_string();
+            let source_session_id = value
+                .get("source_session_id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
             (!text.is_empty()).then_some(HistoryEditTurn {
                 turn_index,
                 message_index,
                 text,
+                source_session_id,
             })
         })
         .collect::<Vec<_>>();
-    turns.sort_by_key(|turn| (turn.turn_index, turn.message_index));
-    turns.dedup_by_key(|turn| turn.message_index);
+    // Archived turns (with source_session_id) sort first, then current turns.
+    turns.sort_by_key(|turn| {
+        (
+            turn.source_session_id.is_none(),
+            turn.turn_index,
+            turn.message_index,
+        )
+    });
+    turns.dedup_by_key(|turn| (turn.source_session_id.clone(), turn.message_index));
     turns
 }
 
@@ -18412,6 +18608,8 @@ mod app_state_tests {
                 kept_user_message_count: 1,
                 messages,
                 error: None,
+                archive_session_id: None,
+                pre_compaction_messages: None,
             })
             .unwrap(),
         });

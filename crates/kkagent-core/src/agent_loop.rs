@@ -2788,6 +2788,19 @@ impl AgentLoop {
             })
             .await;
 
+        // Snapshot pre-compaction messages for the TUI and archive fork.
+        let pre_compaction_messages: Vec<serde_json::Value> = session
+            .messages
+            .iter()
+            .filter_map(|m| serde_json::to_value(m).ok())
+            .collect();
+        let pre_count = session.messages.len();
+
+        // Fork the current session to an archived copy so undo/fork can
+        // transparently reach turns that existed before compaction.
+        let archive_session_id =
+            fork_before_compact(&self.transcript_db, session).unwrap_or_default();
+
         // Session model alias wins over the global default for auto compaction
         // summaries unless a dedicated compaction/secondary model is set.
         let session_model_alias = session.get_model_alias();
@@ -2815,13 +2828,36 @@ impl AgentLoop {
         session.token_counter.clamp_measured_to(after);
         session.last_compacted_tokens = Some(after);
         tracing::info!(
-            "Compacted session {}: kept_users={} summarizer_dropped={} est_tokens {}→{}",
+            "Compacted session {}: kept_users={} summarizer_dropped={} est_tokens {}→{} archive={}",
             session.id,
             result.kept_user_message_count,
             result.summarizer_dropped_count,
             used,
-            after
+            after,
+            if archive_session_id.is_empty() {
+                "-"
+            } else {
+                &archive_session_id
+            },
         );
+
+        // Notify TUI with both pre- and post-compaction messages so the
+        // transcript can show a foldable compaction history entry.
+        let post_compaction_messages: Vec<serde_json::Value> = session
+            .messages
+            .iter()
+            .filter_map(|m| serde_json::to_value(m).ok())
+            .collect();
+        let _ = self
+            .event_tx
+            .send(AgentEvent::AutoCompactCompleted {
+                session_id: session.id.clone(),
+                archive_session_id: archive_session_id.clone(),
+                compacted_count: pre_count.saturating_sub(session.messages.len()) as u64,
+                pre_compaction_messages,
+                post_compaction_messages,
+            })
+            .await;
 
         let _ = self
             .event_tx
@@ -3774,6 +3810,41 @@ fn describe_tool_action(name: &str, input: &serde_json::Value) -> String {
             format!("{}  {}", name, short)
         }
     }
+}
+
+/// Fork the current session to an archived copy before compaction so that
+/// undo/fork can transparently reach earlier turns. Returns the archive
+/// session id on success, or an empty string when the transcript DB is
+/// unavailable or the fork fails (non-fatal — compaction still proceeds).
+fn fork_before_compact(db: &Option<TranscriptDb>, session: &Session) -> Option<String> {
+    let db = db.as_ref()?;
+    // Ensure the current transcript is fully persisted before forking.
+    let serialized: Vec<(String, String)> = session
+        .messages
+        .iter()
+        .filter_map(|m| {
+            let json = serde_json::to_string(&m.content).ok()?;
+            Some((m.role.clone(), json))
+        })
+        .collect();
+    if let Err(error) = db.replace_messages(&session.id, &serialized, None) {
+        tracing::warn!("pre-compact persist failed (fork skipped): {error}");
+        return None;
+    }
+
+    let short_id = &uuid::Uuid::new_v4().to_string()[..8];
+    let archive_id = format!("{}::compact-{}", session.id, short_id);
+    if let Err(error) = db.fork_session(&session.id, &archive_id, None, None) {
+        tracing::warn!("pre-compact fork failed: {error}");
+        return None;
+    }
+    if let Err(error) = db.set_archived(&archive_id, true) {
+        tracing::warn!("failed to archive compaction fork {archive_id}: {error}");
+    }
+    if let Err(error) = db.set_parent_session_id(&session.id, &archive_id) {
+        tracing::warn!("failed to set parent_session_id on {}: {error}", session.id);
+    }
+    Some(archive_id)
 }
 
 #[cfg(test)]

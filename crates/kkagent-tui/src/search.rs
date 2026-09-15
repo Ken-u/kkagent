@@ -230,6 +230,10 @@ fn message_search_text(msg: &DisplayMessage) -> String {
                     out.push_str(a);
                 }
             }
+            DisplayPart::CompactionHistory(history) => {
+                out.push('\n');
+                out.push_str(&format!("{} messages compacted", history.compacted_count));
+            }
         }
     }
     out

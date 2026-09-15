@@ -6384,6 +6384,31 @@ impl ServerState {
         if let Some(subagents) = self.pending_subagents_for_session(session_id).await {
             extra.insert("pending_subagents".into(), subagents);
         }
+
+        // Include archived parent session data so the TUI can rebuild
+        // the foldable CompactionHistory on resume.
+        {
+            let db = self.transcript.lock().await;
+            if let Ok(Some(record)) = db.get_session(session_id) {
+                if let Some(ref parent_id) = record.parent_session_id {
+                    extra.insert(
+                        "parent_session_id".into(),
+                        serde_json::Value::String(parent_id.clone()),
+                    );
+                    if let Ok(parent_records) = db.load_messages(parent_id) {
+                        let parent_messages = messages_from_records(&parent_records);
+                        let archived: Vec<serde_json::Value> = parent_messages
+                            .iter()
+                            .filter_map(|m| serde_json::to_value(m).ok())
+                            .collect();
+                        extra.insert(
+                            "archived_messages".into(),
+                            serde_json::Value::Array(archived),
+                        );
+                    }
+                }
+            }
+        }
         extra
     }
 
@@ -6697,6 +6722,10 @@ impl ServerState {
             }
             AgentEvent::CompactCompleted { session_id, .. } => {
                 self.set_reconnect_status(session_id, SessionStatus::Idle)
+                    .await;
+            }
+            AgentEvent::AutoCompactCompleted { session_id, .. } => {
+                self.set_reconnect_status(session_id, SessionStatus::Thinking)
                     .await;
             }
             _ => {}
@@ -9832,19 +9861,41 @@ async fn handle_rpc_call(
             let session = sessions
                 .get(session_id)
                 .ok_or_else(|| (-32602, format!("Session not found: {session_id}")))?;
-            let turns = kkagent_core::editable_turns(&session.messages)
-                .into_iter()
-                .map(|turn| {
-                    serde_json::json!({
-                        "turn_index": turn.turn_index,
-                        "message_index": turn.message_index,
-                        "text": turn.text,
-                    })
-                })
-                .collect::<Vec<_>>();
+
+            // Transparently prepend turns from the archived parent session
+            // so undo/fork can reach pre-compaction history.
+            let mut all_turns = Vec::<serde_json::Value>::new();
+            {
+                let db = state.transcript.lock().await;
+                if let Ok(Some(record)) = db.get_session(session_id) {
+                    if let Some(parent_id) = &record.parent_session_id {
+                        if let Ok(parent_records) = db.load_messages(parent_id) {
+                            let parent_messages = messages_from_records(&parent_records);
+                            let parent_editable = kkagent_core::editable_turns(&parent_messages);
+                            for turn in parent_editable {
+                                all_turns.push(serde_json::json!({
+                                    "turn_index": turn.turn_index,
+                                    "message_index": turn.message_index,
+                                    "text": turn.text,
+                                    "source_session_id": parent_id,
+                                }));
+                            }
+                        }
+                    }
+                }
+            }
+
+            let current_turns = kkagent_core::editable_turns(&session.messages);
+            for turn in current_turns {
+                all_turns.push(serde_json::json!({
+                    "turn_index": turn.turn_index,
+                    "message_index": turn.message_index,
+                    "text": turn.text,
+                }));
+            }
             Ok(serde_json::json!({
                 "session_id": session_id,
-                "turns": turns,
+                "turns": all_turns,
             }))
         }
         "session.prompt" | "session.steer" => {
@@ -11173,11 +11224,66 @@ async fn handle_rpc_call(
                     .get_mut(&session_id)
                     .ok_or_else(|| (-32602, format!("Session not found: {}", session_id)))?;
                 let result = kkagent_core::UndoService::undo_turns(session, count);
-                if result.undone_turns == 0 {
-                    return Err((-32000, "Nothing to undo".into()));
-                }
                 (result.undone_turns, result.message_count)
             };
+
+            // If nothing could be undone in the current session and there is a
+            // parent (archived) session, cross the compaction boundary by
+            // forking from the parent.
+            if undone == 0 {
+                let parent_id = {
+                    let db = state.transcript.lock().await;
+                    db.get_session(&session_id)
+                        .ok()
+                        .flatten()
+                        .and_then(|r| r.parent_session_id)
+                };
+                if let Some(parent_id) = parent_id {
+                    // Fork the archived session so the user lands on a full
+                    // pre-compaction branch. message_limit targets the last
+                    // N user turns from the end.
+                    let parent_messages = {
+                        let db = state.transcript.lock().await;
+                        db.load_messages(&parent_id)
+                            .map(|r| messages_from_records(&r))
+                            .unwrap_or_default()
+                    };
+                    let parent_turns = kkagent_core::editable_turns(&parent_messages);
+                    let remaining = count.saturating_sub(undone);
+                    let target_turn_idx = parent_turns.len().saturating_sub(remaining);
+                    let message_limit = parent_turns
+                        .get(target_turn_idx)
+                        .map(|t| t.message_index)
+                        .unwrap_or(parent_messages.len());
+
+                    let fork_id = format!(
+                        "{}::undo-{}",
+                        session_id,
+                        &uuid::Uuid::new_v4().to_string()[..8]
+                    );
+                    let db = state.transcript.lock().await;
+                    match db.fork_session_with_message_limit(
+                        &parent_id,
+                        &fork_id,
+                        None,
+                        message_limit,
+                    ) {
+                        Ok(()) => {
+                            return Ok(serde_json::json!({
+                                "ok": true,
+                                "undone": 0,
+                                "message_count": keep,
+                                "fork_session_id": fork_id,
+                            }));
+                        }
+                        Err(error) => {
+                            tracing::warn!("undo cross-compact fork failed: {error}");
+                        }
+                    }
+                }
+                return Err((-32000, "Nothing to undo".into()));
+            }
+
             {
                 let db = state.transcript.lock().await;
                 let _ = db.truncate_messages(&session_id, keep);
@@ -11779,6 +11885,29 @@ async fn handle_rpc_call(
                 .unwrap_or_default(),
             });
 
+            // Fork the session to an archived copy before compaction so
+            // undo/fork can transparently reach earlier turns.
+            let pre_compaction_messages: Vec<serde_json::Value> = messages
+                .iter()
+                .filter_map(|m| serde_json::to_value(m).ok())
+                .collect();
+            let archive_session_id = {
+                let db = state.transcript.lock().await;
+                let short = &uuid::Uuid::new_v4().to_string()[..8];
+                let archive_id = format!("{session_id}::compact-{short}");
+                match db.fork_session(&session_id, &archive_id, None, None) {
+                    Ok(()) => {
+                        let _ = db.set_archived(&archive_id, true);
+                        let _ = db.set_parent_session_id(&session_id, &archive_id);
+                        Some(archive_id)
+                    }
+                    Err(error) => {
+                        tracing::warn!("pre-compact fork failed: {error}");
+                        None
+                    }
+                }
+            };
+
             let state_clone = state.clone();
             let sid = session_id.clone();
             tokio::spawn(async move {
@@ -11821,6 +11950,8 @@ async fn handle_rpc_call(
                         kept_user_message_count: 0,
                         messages: Vec::new(),
                         error: Some(format!("Failed to persist compacted history: {err}")),
+                        archive_session_id: archive_session_id.clone(),
+                        pre_compaction_messages: None,
                     }
                 } else {
                     {
@@ -11847,6 +11978,8 @@ async fn handle_rpc_call(
                         kept_user_message_count: result.kept_user_message_count as u64,
                         messages: messages_json,
                         error: None,
+                        archive_session_id: archive_session_id.clone(),
+                        pre_compaction_messages: Some(pre_compaction_messages),
                     }
                 };
 
@@ -13195,6 +13328,7 @@ mod runtime_http_tests {
             updated_at: "1970-01-01T00:00:00Z".into(),
             message_count: 1,
             is_archived: false,
+            parent_session_id: None,
         };
 
         let item = http_session_list_item(summary, Some(&record));
