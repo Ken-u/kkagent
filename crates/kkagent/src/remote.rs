@@ -840,6 +840,17 @@ impl RemoteRegistry {
         self.connections.read().await.get(server_id).cloned()
     }
 
+    /// Get the first available connected remote server (for commands that
+    /// don't know a specific server ID).
+    pub async fn first_connection(&self) -> Option<Arc<RemoteServerConnection>> {
+        self.connections
+            .read()
+            .await
+            .values()
+            .find(|c| matches!(c.connection_state(), RemoteConnectionState::Connected))
+            .cloned()
+    }
+
     /// List all registered remote workspaces.
     pub async fn list_workspaces(&self) -> Vec<RemoteWorkspaceInfo> {
         let owners = self.workspace_owners.read().await;

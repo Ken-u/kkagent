@@ -8659,14 +8659,21 @@ async fn handle_rpc_call(
 
             // Query the remote server config so the TUI can display remote
             // models/providers instead of the local ones.
-            let remote_config = conn
+            let remote_config = match conn
                 .call(
                     "runtime.status",
                     Some(serde_json::json!({"include_config": true})),
                 )
                 .await
-                .ok()
-                .and_then(|v| v.get("config").cloned());
+            {
+                Ok(v) => v.get("config").cloned(),
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to fetch remote config from {host} (TUI will retry via remote.config): {}", e.1
+                    );
+                    None
+                }
+            };
 
             Ok(serde_json::json!({
                 "ok": true,
@@ -8681,6 +8688,34 @@ async fn handle_rpc_call(
             Ok(serde_json::json!({
                 "workspaces": workspaces,
             }))
+        }
+        // Fetch model/provider config from a remote server so the TUI can
+        // display the correct model list for SSH connections.
+        "remote.config" => {
+            let server_id = params
+                .as_ref()
+                .and_then(|p| p.get("server_id"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            // Find the first connected remote server if no server_id specified.
+            let conn = if let Some(ref id) = server_id {
+                state.remote.connection(id).await
+            } else {
+                state.remote.first_connection().await
+            };
+            let conn = conn.ok_or_else(|| (-32003, "No remote server connected".to_string()))?;
+            let result = conn
+                .call(
+                    "runtime.status",
+                    Some(serde_json::json!({"include_config": true})),
+                )
+                .await
+                .map_err(|e| (-32003, format!("Failed to fetch remote config: {}", e.1)))?;
+            let config = result
+                .get("config")
+                .cloned()
+                .unwrap_or(serde_json::json!({}));
+            Ok(config)
         }
         "remote.reconnect" => {
             let value =

@@ -1846,6 +1846,12 @@ impl TuiApp {
         resume: Option<Option<String>>,
         startup_started: std::time::Instant,
     ) -> anyhow::Result<()> {
+        // Remote mode: fetch models/providers/default_model from the remote
+        // server so the TUI shows the correct model list for SSH sessions.
+        if self.remote_connection {
+            self.sync_remote_config().await;
+        }
+
         // Workspace trust: the server needs this before sessions.create.
         // Skip for remote workspaces — trust is managed by the remote server.
         if self.remote_workspace.is_none() {
@@ -8640,6 +8646,41 @@ impl TuiApp {
                 self.system_message(format!(
                     "Reload failed (server: {server_error}; local: {local_error})"
                 ));
+            }
+        }
+        // In remote mode, re-overlay with remote models/providers so /reload
+        // does not replace the remote model list with the local one.
+        if self.remote_connection {
+            self.sync_remote_config().await;
+        }
+    }
+
+    /// Fetch models/providers/default_model from the remote server and overlay
+    /// them onto the local TUI config.
+    async fn sync_remote_config(&mut self) {
+        match self.client.rpc_call("remote.config", None).await {
+            Ok(rc) => {
+                if let Some(obj) = rc.as_object() {
+                    if let Some(models) = obj.get("models") {
+                        if let Ok(m) = serde_json::from_value(models.clone()) {
+                            self.config.models = m;
+                        }
+                    }
+                    if let Some(providers) = obj.get("providers") {
+                        if let Ok(p) = serde_json::from_value(providers.clone()) {
+                            self.config.providers = p;
+                        }
+                    }
+                    if let Some(default_model) = obj.get("default_model") {
+                        if let Ok(dm) = serde_json::from_value(default_model.clone()) {
+                            self.config.default_model = dm;
+                        }
+                    }
+                    tracing::debug!(models = self.config.models.len(), "Remote config synced");
+                }
+            }
+            Err(error) => {
+                tracing::warn!("Failed to fetch remote config: {error}");
             }
         }
     }
