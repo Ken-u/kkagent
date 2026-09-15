@@ -157,7 +157,7 @@ impl TodoListTool {
                 "Current task: {}\nFocus on this task and its necessary dependencies. \
 Take the next concrete action once you have enough information; defer details of pending tasks. \
 After completing and verifying this task, or identifying a blocker, update progress and choose the next unblocked task. \
-Updates without id act on this task.",
+Updates without id match an exact unique title first, otherwise act on this task.",
                 item.title
             ),
             (0, _) if pending > 0 => {
@@ -208,7 +208,7 @@ Read TodoList for IDs before acting on a specific task; defer details of the oth
         }).collect()
     }
 
-    /// The unique in_progress task; omit-id updates resolve against this.
+    /// The unique in_progress task, used when neither ID nor title selects a target.
     fn current_task_id(todos: &[TodoItem]) -> Result<String, String> {
         let mut current = todos.iter().filter(|t| t.status == "in_progress");
         match (current.next(), current.next()) {
@@ -232,27 +232,44 @@ Read TodoList for IDs before acting on a specific task; defer details of the oth
             // Resolve targets against the list as it looks when the call
             // arrives, before anything is applied.
             let mut targets = Vec::with_capacity(updates.len());
-            let mut idless_seen = false;
+            let mut current_fallbacks = 0;
             for update in &updates {
                 let id = match update.id.as_deref().map(str::trim) {
                     Some(id) if !id.is_empty() => id.to_string(),
                     _ => {
-                        if idless_seen {
-                            return Err(
-                                "Only one update may omit id; it targets the current in_progress task"
-                                    .into(),
-                            );
+                        let matched = if let Some(title) = &update.title {
+                            let title = Self::checked_title(title)?;
+                            let mut matches = todos.iter().filter(|t| t.title == title);
+                            match (matches.next(), matches.next()) {
+                                (Some(item), None) => Some(item.id.clone()),
+                                (Some(_), Some(_)) => return Err(format!(
+                                    "Ambiguous todo title: {title}. Read TodoList and pass an explicit id."
+                                )),
+                                (None, _) => None,
+                            }
+                        } else {
+                            None
+                        };
+                        if let Some(id) = matched {
+                            id
+                        } else {
+                            current_fallbacks += 1;
+                            Self::current_task_id(todos)?
                         }
-                        idless_seen = true;
-                        Self::current_task_id(&next)?
                     }
                 };
                 targets.push(id);
             }
+            if current_fallbacks > 1 {
+                return Err(
+                    "Multiple updates have no id or matching title. Use exact existing titles or read TodoList for IDs; use add for new tasks. Only one update may fall back to the current in_progress task."
+                        .into(),
+                );
+            }
             let mut seen = HashSet::new();
             for (update, id) in updates.into_iter().zip(targets) {
                 if !seen.insert(id.clone()) {
-                    return Err(format!("Duplicate update for todo id: {id}"));
+                    return Err(format!("Duplicate update for todo id: {id}. Use exact existing titles or explicit IDs for different tasks; use add for new tasks."));
                 }
                 if update.title.is_none() && update.status.is_none() {
                     return Err("Each update needs a title or status".into());
@@ -306,8 +323,10 @@ impl Tool for TodoListTool {
         "Manage a structured TODO list for tracking progress on multi-step tasks. \
 IDs are short random tokens a model cannot guess, so a mistaken id fails safely instead of \
 editing the wrong task; they appear only in read results. Complete, cancel, or edit the \
-current task with updates:[{status?,title?}] — omit id to target the task that is in_progress \
-(at most one such update per call); pass an id from a read only when acting on another task. \
+tasks with updates:[{id?,status?,title?}]. Without id, an exact unique existing title selects \
+a task, allowing batch updates by title. Otherwise, at most one update per call targets the \
+current in_progress task (including renaming it). Duplicate titles require an explicit id. \
+To rename another task, pass its id from a read. Use add for new tasks. \
 add appends tasks; todos creates or replaces the whole list (include unchanged items, \
 preserving their ids); todos: [] clears. Do not combine todos with updates/add. \
 Updates and add may be combined atomically. Keep task titles brief and at most one task \
@@ -338,12 +357,12 @@ Writes return progress and the current focus/candidate without IDs; reads return
                 },
                 "updates": {
                     "type": "array",
-                    "description": "Preferred for progress updates. Omit id to act on the current in_progress task (at most one such update per call); include id from a read for any other task. Use cancelled to drop a task.",
+                    "description": "Preferred for progress updates. Without id, match an exact unique existing title first; otherwise at most one update falls back to the current in_progress task. Use explicit IDs for duplicate titles or renaming other tasks; use add for new tasks. Use cancelled to drop a task.",
                     "items": {
                         "type": "object",
                         "properties": {
-                            "id": {"type": "string", "description": "Stable ID from a read; omit to target the current in_progress task."},
-                            "title": {"type": "string"},
+                            "id": {"type": "string", "description": "Stable ID from a read; omit to match an exact unique title, or fall back to the current in_progress task."},
+                            "title": {"type": "string", "description": "With id: new title. Without id: exact existing title selects the task; an unmatched title renames the current task."},
                             "status": {"type": "string", "enum": ["pending", "in_progress", "done", "cancelled"]}
                         },
                         "additionalProperties": false
@@ -588,9 +607,9 @@ mod tests {
         assert!(advanced.content.contains("Second"));
         assert!(advanced
             .content
-            .contains("Updates without id act on this task"));
+            .contains("Updates without id match an exact unique title first"));
 
-        // Only one update may omit id.
+        // Two updates resolving to the same current task are rejected.
         let two_idless = run(
             &tool,
             json!({"updates": [{"status": "done"}, {"title": "Renamed"}]}),
@@ -617,6 +636,105 @@ mod tests {
         let ambiguous = run(&tool, json!({"updates": [{"status": "pending"}]})).await;
         assert!(ambiguous.is_error);
         assert_eq!(items(&run(&tool, json!({})).await).len(), 4);
+    }
+
+    #[tokio::test]
+    async fn title_batches_advance_tasks_and_preserve_ids() {
+        let tool = TodoListTool::new();
+        let created = run(
+            &tool,
+            json!({"todos": [
+                {"title": "审核 5 个 SSH 提交的完整 diff", "status": "in_progress"},
+                {"title": "修复 SSH 并验证", "status": "pending"},
+                {"title": "Later", "status": "pending"}
+            ]}),
+        )
+        .await;
+        let updated = run(
+            &tool,
+            json!({"updates": [
+                {"title": "审核 5 个 SSH 提交的完整 diff", "status": "done"},
+                {"title": "  修复 SSH 并验证  ", "status": "in_progress"}
+            ]}),
+        )
+        .await;
+        assert!(!updated.is_error, "{}", updated.content);
+        let before = items(&created);
+        let after = items(&updated);
+        assert_eq!(after[0].status, "completed");
+        assert_eq!(after[1].status, "in_progress");
+        assert_eq!(after[2].content, before[2].content);
+        assert_eq!(after[2].status, before[2].status);
+        for (old, new) in before.iter().zip(&after) {
+            assert_eq!(old.id, new.id);
+        }
+        // Targets are resolved before writes, even when the current task is renamed.
+        let renamed = run(
+            &tool,
+            json!({"updates": [
+                {"title": "修复中: run_ssh 收尾", "status": "done"},
+                {"title": "Later", "status": "in_progress"}
+            ]}),
+        )
+        .await;
+        assert!(!renamed.is_error, "{}", renamed.content);
+        assert_eq!(items(&renamed)[1].id, before[1].id);
+        assert_eq!(items(&renamed)[1].content, "修复中: run_ssh 收尾");
+        assert_eq!(items(&renamed)[2].status, "in_progress");
+        // Exact titles also work with no current task.
+        assert!(
+            !run(
+                &tool,
+                json!({"updates": [{"title": "Later", "status": "done"}]})
+            )
+            .await
+            .is_error
+        );
+        assert!(
+            !run(
+                &tool,
+                json!({"updates": [{"title": "Later", "status": "pending"}]})
+            )
+            .await
+            .is_error
+        );
+    }
+
+    #[tokio::test]
+    async fn ambiguous_title_batches_are_atomic_and_ids_disambiguate() {
+        let tool = TodoListTool::new();
+        let created = run(
+            &tool,
+            json!({"todos": [
+                {"title": "Current", "status": "in_progress"},
+                {"title": "Same", "status": "pending"},
+                {"title": "Same", "status": "pending"}
+            ]}),
+        )
+        .await;
+        let original = items(&created);
+        for updates in [
+            json!([{"title": "Current", "status": "done"}, {"title": "Same", "status": "in_progress"}]),
+            json!([{"title": "Current", "status": "done"}, {"title": "Missing", "status": "in_progress"}]),
+            json!([{"title": "Missing A", "status": "done"}, {"title": "Missing B", "status": "in_progress"}]),
+            json!([{"title": "Current", "status": "done"}, {"id": original[0].id, "status": "pending"}]),
+            json!([{"title": "Current", "status": "bogus"}]),
+        ] {
+            let result = run(&tool, json!({"updates": updates})).await;
+            assert!(result.is_error, "{}", result.content);
+            assert_eq!(run(&tool, json!({})).await.data, created.data);
+        }
+        let explicit = run(
+            &tool,
+            json!({"updates": [
+                {"title": "Current", "status": "done"},
+                {"id": original[2].id, "title": "Same", "status": "in_progress"}
+            ]}),
+        )
+        .await;
+        assert!(!explicit.is_error, "{}", explicit.content);
+        assert_eq!(items(&explicit)[1].status, "pending");
+        assert_eq!(items(&explicit)[2].status, "in_progress");
     }
 
     #[tokio::test]

@@ -34,21 +34,23 @@ Kimi provider 原生支持 `messages[].tools`：加载的 schema 追加在历史
 
 ## TodoList
 
-TodoList 支持增量更新。首次建清单可以传 `todos`；日常推进优先使用 `updates`，省略 `id` 即操作当前 `in_progress` 任务（完成、取消、改名都不需要记 ID），操作非当前任务时才从读取结果中带 ID；`add` 追加任务，避免反复生成整份清单。
+TodoList 支持增量更新。首次建清单可以传 `todos`；日常推进优先使用 `updates`，省略 `id` 时先按唯一且完全相同的 `title` 匹配已有任务，支持按标题批量推进；未匹配标题或未提供标题时，回退到当前 `in_progress` 任务（每次最多一条）。重名任务或非当前任务改名时需要从读取结果中带 ID；`add` 追加任务，避免反复生成整份清单。
 
 | 参数 | 用途 |
 |---|---|
 | 无参数 `{}` | 读取完整清单、状态和 ID。 |
-| `updates: [{id?, status?, title?}]` | 只修改指定字段；每项至少提供 `status` 或 `title`。省略 `id` 目标为当前 `in_progress` 任务，每次调用最多一个省略 `id` 的更新。 |
+| `updates: [{id?, status?, title?}]` | 只修改指定字段；每项至少提供 `status` 或 `title`。省略 `id` 优先按唯一标题匹配；每次最多一条未匹配更新回退到当前任务。所有目标按调用前的清单解析，重复目标或重名标题会整批拒绝。 |
 | `add: [{title, status?}]` | 追加任务，由工具生成 ID；默认状态为 `pending`。 |
 | `todos: [{id?, title, status}]` | 创建或整体替换清单，必须包含要保留的任务；空数组清空。 |
 
-例如，完成当前项并追加一个后续事项：
+例如，按已有标题完成当前项并启动下一项：
 
 ```json
 {
-  "updates": [{"id": "从工具返回中取得的实际ID", "status": "done"}],
-  "add": [{"title": "检查边界条件"}]
+  "updates": [
+    {"title": "审核完整 diff", "status": "done"},
+    {"title": "检查边界条件", "status": "in_progress"}
+  ]
 }
 ```
 
