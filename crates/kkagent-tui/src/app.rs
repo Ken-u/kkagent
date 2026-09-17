@@ -8769,11 +8769,22 @@ impl TuiApp {
                 } else {
                     ""
                 };
+                let times = {
+                    let created = crate::chrome::parse_session_epoch_millis(s.get("created_at"));
+                    let updated = crate::chrome::parse_session_epoch_millis(s.get("updated_at"));
+                    let now_ms = chrono::Utc::now().timestamp_millis();
+                    crate::chrome::session_time_note(created, updated, now_ms)
+                };
+                let detail = if times.is_empty() {
+                    format!("{fork}{mark}")
+                } else {
+                    format!("{fork}{mark} · {times}")
+                };
                 entries.push(SessionPickerEntry {
                     item: ListPickerItem {
                         id: id.clone(),
                         label: format!("{short} — {title}"),
-                        detail: format!("{fork}{mark}"),
+                        detail,
                     },
                     workspace: work.to_string(),
                     same_workspace,
@@ -16011,6 +16022,63 @@ mod app_state_tests {
         assert!(picker.items.is_empty());
         assert!(picker.title.contains("Tab show all"));
         assert_eq!(app.state.session_picker_entries.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn session_picker_detail_shows_created_and_updated_times() {
+        let mut app = test_tui_app();
+        let workspace = app.state.working_dir.to_string_lossy().into_owned();
+        app.state.session_id = Some("timed-session".into());
+        app.replace_list_picker(ListPickerState {
+            kind: ListPickerKind::Session,
+            title: String::new(),
+            items: Vec::new(),
+            selected: 0,
+            filter: String::new(),
+            all_items: Vec::new(),
+        });
+        // created 10 minutes before `updated`, updated 2 minutes before now.
+        let updated = chrono::Utc::now().timestamp_millis() - 2 * 60_000;
+        let created = updated - 10 * 60_000;
+        app.apply_session_picker_list(serde_json::json!({
+            "sessions": [{
+                "session_id": "timed-session",
+                "working_dir": workspace,
+                "title": "timed",
+                "is_custom_title": true,
+                "empty": false,
+                "created_at": created,
+                "updated_at": updated
+            }]
+        }));
+
+        let picker = app.state.list_picker.as_ref().unwrap();
+        assert_eq!(picker.items.len(), 1);
+        let detail = &picker.items[0].detail;
+        assert!(detail.contains("created "), "{detail:?}");
+        // Hour-boundary safe: the created annotation is a HH:MM time and the
+        // update age is the coarse relative `2m`.
+        let time_part = detail
+            .split("created ")
+            .nth(1)
+            .and_then(|rest| rest.split(' ').next())
+            .unwrap_or_default();
+        assert_eq!(time_part.len(), 5, "{detail:?}");
+        assert_eq!(time_part.as_bytes()[2], b':', "{detail:?}");
+        assert!(detail.contains("updated 2m"), "{detail:?}");
+
+        // Sessions without timestamps keep the plain detail line.
+        app.apply_session_picker_list(serde_json::json!({
+            "sessions": [{
+                "session_id": "timed-session",
+                "working_dir": workspace,
+                "title": "timed",
+                "is_custom_title": true,
+                "empty": false
+            }]
+        }));
+        let picker = app.state.list_picker.as_ref().unwrap();
+        assert!(!picker.items[0].detail.contains("created "));
     }
 
     #[tokio::test]

@@ -226,6 +226,92 @@ pub struct WorkspaceSessionEntry {
     pub primary_workspace: bool,
 }
 
+/// Parse a `sessions.list` timestamp into epoch milliseconds. The disk store
+/// serializes integers (epoch millis), the transcript-DB fallback serializes
+/// RFC3339 strings, and remote servers pass either through.
+pub fn parse_session_epoch_millis(value: Option<&serde_json::Value>) -> Option<i64> {
+    fn normalize_epoch(raw: i64) -> i64 {
+        // Seconds hit ~1.7e9 today; millis ~1.7e12. The 1e11 threshold stays
+        // valid until the year 5138 in seconds.
+        if raw.abs() < 100_000_000_000 {
+            raw.saturating_mul(1000)
+        } else {
+            raw
+        }
+    }
+    match value? {
+        serde_json::Value::Number(n) => n
+            .as_i64()
+            .or_else(|| n.as_f64().map(|f| f as i64))
+            .map(normalize_epoch),
+        serde_json::Value::String(s) => {
+            let s = s.trim();
+            if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+                Some(dt.timestamp_millis())
+            } else {
+                s.parse::<i64>().ok().map(normalize_epoch)
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Compact absolute local time: today → `HH:MM`, this year → `MM-DD HH:MM`,
+/// otherwise `YYYY-MM-DD`.
+fn compact_local_time(millis: i64, now_ms: i64) -> String {
+    use chrono::Datelike;
+    let Some(dt) = chrono::DateTime::from_timestamp_millis(millis) else {
+        return String::new();
+    };
+    let local = dt.with_timezone(&chrono::Local);
+    let today_local = chrono::DateTime::from_timestamp_millis(now_ms)
+        .map(|now| now.with_timezone(&chrono::Local))
+        .unwrap_or(local);
+    if local.date_naive() == today_local.date_naive() {
+        local.format("%H:%M").to_string()
+    } else if local.year() == today_local.year() {
+        local.format("%m-%d %H:%M").to_string()
+    } else {
+        local.format("%Y-%m-%d").to_string()
+    }
+}
+
+/// Coarse relative age: `now`, `5m`, `3h`, `2d`; older sessions fall back to
+/// the compact absolute date.
+fn relative_age(millis: i64, now_ms: i64) -> String {
+    let diff_ms = (now_ms - millis).max(0);
+    let mins = diff_ms / 60_000;
+    if mins < 1 {
+        "now".into()
+    } else if mins < 60 {
+        format!("{mins}m")
+    } else if mins < 24 * 60 {
+        format!("{}h", mins / 60)
+    } else if mins < 7 * 24 * 60 {
+        format!("{}d", mins / (24 * 60))
+    } else {
+        compact_local_time(millis, now_ms)
+    }
+}
+
+/// Time annotation rendered after the active session title, e.g.
+/// `created 14:03 · updated 5m`. Empty when no timestamp is known.
+pub fn session_time_note(created_at: Option<i64>, updated_at: Option<i64>, now_ms: i64) -> String {
+    let Some(created) = created_at else {
+        return updated_at
+            .map(|updated| format!("updated {}", relative_age(updated, now_ms)))
+            .unwrap_or_default();
+    };
+    let mut note = format!("created {}", compact_local_time(created, now_ms));
+    if let Some(updated) = updated_at {
+        // A freshly created session has nothing to add for "updated".
+        if updated > created {
+            note.push_str(&format!(" · updated {}", relative_age(updated, now_ms)));
+        }
+    }
+    note
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct WorkspaceSessionStrip {
     pub entries: Vec<WorkspaceSessionEntry>,
@@ -1195,6 +1281,77 @@ mod tests {
                 .map(|entry| entry.id.as_str())
                 .collect::<Vec<_>>(),
             ["local-a", "local-b", "other-a", "other-b"]
+        );
+    }
+
+    fn json(v: serde_json::Value) -> Option<serde_json::Value> {
+        Some(v)
+    }
+
+    #[test]
+    fn parse_epoch_accepts_millis_seconds_rfc3339_and_numeric_strings() {
+        let now = 1_700_000_000_000_i64;
+        assert_eq!(
+            parse_session_epoch_millis(json(serde_json::json!(now)).as_ref()),
+            Some(now)
+        );
+        // Seconds are normalized up to millis.
+        assert_eq!(
+            parse_session_epoch_millis(json(serde_json::json!(now / 1000)).as_ref()),
+            Some(now)
+        );
+        // RFC3339 string (transcript DB fallback) converts to epoch millis.
+        assert_eq!(
+            parse_session_epoch_millis(json(serde_json::json!("2023-11-14T22:13:20Z")).as_ref()),
+            Some(now)
+        );
+        // Numeric string (remote pass-through variants).
+        assert_eq!(
+            parse_session_epoch_millis(json(serde_json::json!(now.to_string())).as_ref()),
+            Some(now)
+        );
+        assert_eq!(parse_session_epoch_millis(None), None);
+        assert_eq!(
+            parse_session_epoch_millis(json(serde_json::json!(null)).as_ref()),
+            None
+        );
+        assert_eq!(
+            parse_session_epoch_millis(json(serde_json::json!("not-a-date")).as_ref()),
+            None
+        );
+    }
+
+    #[test]
+    fn time_note_shows_absolute_creation_and_relative_update() {
+        // 2023-11-14 22:13:20 UTC — epoch 1_700_000_000_000.
+        let created = 1_700_000_000_000_i64;
+        let now = created + 5 * 60_000;
+        assert_eq!(
+            session_time_note(Some(created), Some(created), now),
+            format!("created {}", compact_local_time(created, now))
+        );
+        assert_eq!(
+            session_time_note(Some(created), Some(created + 3 * 60_000), now),
+            format!("created {} · updated 2m", compact_local_time(created, now))
+        );
+        assert_eq!(
+            session_time_note(None, Some(created + 3 * 60_000), now),
+            "updated 2m"
+        );
+        assert_eq!(session_time_note(None, None, now), "");
+    }
+
+    #[test]
+    fn relative_age_progresses_through_now_minutes_hours_days() {
+        let base = 1_700_000_000_000_i64;
+        assert_eq!(relative_age(base, base), "now");
+        assert_eq!(relative_age(base - 5 * 60_000, base), "5m");
+        assert_eq!(relative_age(base - 3 * 3_600_000, base), "3h");
+        assert_eq!(relative_age(base - 2 * 86_400_000, base), "2d");
+        // Beyond a week falls back to the absolute date.
+        assert_eq!(
+            relative_age(base - 30 * 86_400_000, base),
+            compact_local_time(base - 30 * 86_400_000, base)
         );
     }
 }
