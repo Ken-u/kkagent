@@ -20,6 +20,10 @@ pub const SLOW_OP_NOTICE_MS: u64 = 150;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum JobChannel {
     SessionsList,
+    /// Session picker fetches (`/sessions`): same RPC as `SessionsList` but a
+    /// separate channel so periodic footer strip refreshes can never route
+    /// their (smaller, workspace-independent) response into the open picker.
+    SessionsPicker,
     SessionPreview,
     SessionResume,
     SessionHistory,
@@ -38,11 +42,11 @@ pub enum JobChannel {
     PluginAction,
     Generic,
 }
-
 impl JobChannel {
     pub fn label(self) -> &'static str {
         match self {
             Self::SessionsList => "Loading sessions",
+            Self::SessionsPicker => "Loading sessions",
             Self::SessionPreview => "Loading preview",
             Self::SessionResume => "Switching session",
             Self::SessionHistory => "Loading earlier messages",
@@ -828,7 +832,7 @@ impl AsyncJobHub {
         let notice = self.notices.remove(idx);
         let channel = notice.channel?;
         let method = notice.retry_method.or_else(|| match channel {
-            JobChannel::SessionsList => Some("sessions.list".into()),
+            JobChannel::SessionsList | JobChannel::SessionsPicker => Some("sessions.list".into()),
             JobChannel::McpStatus => Some("mcp.status".into()),
             JobChannel::SkillsList => Some("skills.list".into()),
             JobChannel::SessionPreview => Some("session.preview".into()),

@@ -2719,22 +2719,15 @@ impl TuiApp {
     fn apply_rpc_job_ok(
         &mut self,
         channel: crate::async_jobs::JobChannel,
-        method: &str,
+        #[allow(unused_variables)] method: &str,
         data: serde_json::Value,
     ) {
         match channel {
             crate::async_jobs::JobChannel::SessionsList => {
-                if method == "sessions.list"
-                    && self
-                        .state
-                        .list_picker
-                        .as_ref()
-                        .is_some_and(|p| p.kind == ListPickerKind::Session)
-                {
-                    self.apply_session_picker_list(data);
-                } else {
-                    self.apply_workspace_sessions_list(Some(data));
-                }
+                self.apply_workspace_sessions_list(Some(data));
+            }
+            crate::async_jobs::JobChannel::SessionsPicker => {
+                self.apply_session_picker_list(data);
             }
             crate::async_jobs::JobChannel::SkillsList => {
                 self.apply_skills_list(Some(data));
@@ -2783,6 +2776,7 @@ impl TuiApp {
         let retryable = matches!(
             channel,
             crate::async_jobs::JobChannel::SessionsList
+                | crate::async_jobs::JobChannel::SessionsPicker
                 | crate::async_jobs::JobChannel::McpStatus
                 | crate::async_jobs::JobChannel::SkillsList
                 | crate::async_jobs::JobChannel::SessionPreview
@@ -2800,6 +2794,7 @@ impl TuiApp {
         if matches!(
             channel,
             crate::async_jobs::JobChannel::SessionsList
+                | crate::async_jobs::JobChannel::SessionsPicker
                 | crate::async_jobs::JobChannel::McpStatus
                 | crate::async_jobs::JobChannel::SkillsList
         ) && self.jobs.can_auto_retry(0)
@@ -8707,9 +8702,13 @@ impl TuiApp {
             });
         }
         self.state.session_delete_confirm = None;
+        // Dedicated channel: a concurrent footer strip refresh on
+        // `SessionsList` must not land here (its limit-80 response is not
+        // workspace-scoped the way the picker list needs and used to clobber
+        // the freshly loaded entries mid-browse).
         self.jobs.spawn_rpc(
             self.client.requester(),
-            crate::async_jobs::JobChannel::SessionsList,
+            crate::async_jobs::JobChannel::SessionsPicker,
             "sessions.list",
             Some(serde_json::json!({"limit": 1000})),
             Some("Loading sessions".into()),
@@ -16079,6 +16078,58 @@ mod app_state_tests {
         }));
         let picker = app.state.list_picker.as_ref().unwrap();
         assert!(!picker.items[0].detail.contains("created "));
+    }
+
+    #[tokio::test]
+    async fn footer_strip_refresh_does_not_clobber_an_open_session_picker() {
+        let mut app = test_tui_app();
+        let workspace = app.state.working_dir.to_string_lossy().into_owned();
+        app.state.session_id = Some("session-a".into());
+        app.replace_list_picker(ListPickerState {
+            kind: ListPickerKind::Session,
+            title: String::new(),
+            items: Vec::new(),
+            selected: 0,
+            filter: String::new(),
+            all_items: Vec::new(),
+        });
+        // Picker list loaded with several same-workspace sessions.
+        app.apply_rpc_job_ok(
+            crate::async_jobs::JobChannel::SessionsPicker,
+            "sessions.list",
+            serde_json::json!({
+                "sessions": [
+                    {"session_id": "session-a", "working_dir": workspace, "title": "a",
+                     "is_custom_title": true, "empty": false},
+                    {"session_id": "session-b", "working_dir": workspace, "title": "b",
+                     "is_custom_title": true, "empty": false}
+                ]
+            }),
+        );
+        assert_eq!(
+            app.state.list_picker.as_ref().unwrap().items.len(),
+            2,
+            "picker must show both same-workspace sessions"
+        );
+
+        // A periodic footer strip refresh (separate channel, different limit)
+        // lands while the picker is open: it updates the strip, never the picker.
+        app.apply_rpc_job_ok(
+            crate::async_jobs::JobChannel::SessionsList,
+            "sessions.list",
+            serde_json::json!({
+                "sessions": [
+                    {"session_id": "session-a", "working_dir": workspace, "title": "a",
+                     "is_custom_title": true, "empty": false}
+                ]
+            }),
+        );
+        assert_eq!(
+            app.state.list_picker.as_ref().unwrap().items.len(),
+            2,
+            "footer refresh must not rebuild the open picker"
+        );
+        assert!(!app.state.workspace_sessions.entries.is_empty());
     }
 
     #[tokio::test]
