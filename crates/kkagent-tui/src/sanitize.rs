@@ -12,9 +12,13 @@
 
 /// One-line, allocation-light cleaner for untrusted terminal-bound text.
 ///
-/// - Passes through: `\t`, `\n`, `\r` (renderers split lines themselves; `\r`
-///   is kept so `lines()`-based height math is unchanged), and all
-///   printable/graphic characters including wide CJK and emoji.
+/// - Passes through `\t`, `\n` and all printable/graphic characters including
+///   wide CJK and emoji.
+/// - `\r` and `\r\n` are normalized to `\n`. A bare CR reaching the terminal
+///   is a carriage return that rewinds the cursor and corrupts the frame
+///   (progress bars emit them); renderers that split on `\n` would otherwise
+///   keep the raw CR embedded inside a line. Collapsing on `\n` also makes
+///   `\n`-splitting and `lines()`-splitting agree on the line count.
 /// - Recognized escape sequences (CSI/OSC/DCS/SOS/PM/APC, and ESC-prefixed
 ///   two-byte codes like `ESC 7` / `ESC M` / `ESC ( B`) are removed whole, so
 ///   nothing partial ever reaches the terminal.
@@ -36,7 +40,14 @@ pub fn sanitize_text(input: &str) -> std::borrow::Cow<'_, str> {
                 SequenceResult::Removed => {}
                 SequenceResult::BareEsc => out.push('\u{fffd}'),
             },
-            '\t' | '\n' | '\r' => out.push(ch),
+            '\t' | '\n' => out.push(ch),
+            '\r' => {
+                out.push('\n');
+                // Collapse CRLF into a single line break.
+                if matches!(chars.peek(), Some(&(_, '\n'))) {
+                    chars.next();
+                }
+            }
             c if (c as u32) < 0x20 || (0x7f..=0x9f).contains(&(c as u32)) => {
                 out.push('\u{fffd}');
             }
@@ -48,13 +59,13 @@ pub fn sanitize_text(input: &str) -> std::borrow::Cow<'_, str> {
 
 /// Fast path: bytes that never need rewriting let us skip allocation.
 fn needs_cleaning(input: &str) -> bool {
-    // ESC and C0 (minus \t \n \r) are ASCII; DEL/C1 start at 0x7f. Checking
+    // ESC and C0 (minus \t \n) are ASCII; DEL/C1 start at 0x7f. Checking
     // bytes is sufficient: multi-byte UTF-8 sequences all have the high bit
     // set but never decode into the 0x7f..=0x9f *character* range (those C1
     // codepoints encode as two bytes starting with 0xC2).
-    input.bytes().any(|b| {
-        b == 0x1b || (b < 0x20 && b != b'\t' && b != b'\n' && b != b'\r') || b == 0x7f || b == 0xc2
-    })
+    input
+        .bytes()
+        .any(|b| b == 0x1b || (b < 0x20 && b != b'\t' && b != b'\n') || b == 0x7f || b == 0xc2)
 }
 
 /// Consume an escape sequence started by an already-consumed ESC.
@@ -175,9 +186,25 @@ mod tests {
     fn newlines_tabs_survive() {
         // No byte triggers the cleaning path: stays borrowed, zero alloc.
         assert!(matches!(
-            sanitize_text("line1\nline2\r\n\tindented"),
+            sanitize_text("line1\nline2\ttabbed"),
             std::borrow::Cow::Borrowed(_)
         ));
+    }
+
+    #[test]
+    fn carriage_returns_normalize_to_line_breaks() {
+        // Lone CR (progress-bar overwrite) becomes a line break, never a raw
+        // CR that would rewind the terminal cursor.
+        assert_eq!(
+            owned("\r[##  ] 50%\r[####]100%"),
+            "\n[##  ] 50%\n[####]100%"
+        );
+        // CRLF collapses into a single break.
+        assert_eq!(owned("a\r\nb"), "a\nb");
+        assert_eq!(
+            owned("line1\nline2\r\n\tindented"),
+            "line1\nline2\n\tindented"
+        );
     }
 
     #[test]

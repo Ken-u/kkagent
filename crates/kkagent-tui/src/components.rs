@@ -3715,6 +3715,49 @@ fn wrap_to_width(s: &str, width: usize) -> Vec<String> {
     out
 }
 
+/// Max scroll offset for the task-detail output pane under `area`.
+/// Shared by the renderer and key handlers so ↑ / PgUp leave follow-bottom
+/// from the real bottom instead of a `u16::MAX` sentinel.
+pub fn task_detail_max_scroll(detail: &TaskDetailState, area: Rect) -> u16 {
+    let panel_area = popup_rect(area, 92, 40);
+    if panel_area.width == 0 || panel_area.height == 0 {
+        return 0;
+    }
+    let inner = panel_area.inner(Margin::new(1, 1));
+    let width = inner.width as usize;
+    let header_height = task_detail_header_height(detail, width);
+    let footer_height = 1u16;
+    let output_area_height = inner
+        .height
+        .saturating_sub(header_height)
+        .saturating_sub(footer_height);
+    let wrapped = wrap_to_width(&detail.output, width);
+    (wrapped.len() as u16).saturating_sub(output_area_height)
+}
+
+/// Header rows for cmd / desc / log (fully wrapped, no truncation) plus the
+/// blank separator before scrolling output.
+fn task_detail_header_height(detail: &TaskDetailState, width: usize) -> u16 {
+    let mut rows = wrap_to_width(&format!("cmd: {}", detail.command), width).len()
+        + wrap_to_width(&format!("desc: {}", detail.description), width).len();
+    if !detail.log_path.is_empty() {
+        rows += wrap_to_width(&format!("log: {}", detail.log_path), width).len();
+    }
+    rows as u16 + 1 // blank line before output
+}
+
+fn push_wrapped_field(
+    lines: &mut Vec<Line<'_>>,
+    label: &str,
+    value: &str,
+    width: usize,
+    style: Style,
+) {
+    for row in wrap_to_width(&format!("{label}{value}"), width) {
+        lines.push(Line::from(Span::styled(row, style)));
+    }
+}
+
 fn render_task_detail(f: &mut Frame, area: Rect, detail: &TaskDetailState, theme: &Theme) {
     let panel_area = popup_rect(area, 92, 40);
     if panel_area.width == 0 || panel_area.height == 0 {
@@ -3736,25 +3779,36 @@ fn render_task_detail(f: &mut Frame, area: Rect, detail: &TaskDetailState, theme
     );
 
     let inner = panel_area.inner(Margin::new(1, 1));
-    // Fixed header + footer, scrolling output between them.
+    let width = inner.width as usize;
+    // Fixed header + footer, scrolling output between them. Long commands /
+    // paths wrap instead of truncating — this panel exists so the user can
+    // read everything.
     let footer_height = 1u16;
-    let header_lines = vec![
-        Line::from(Span::styled(
-            format!(
-                "cmd: {}",
-                truncate_display_width(&detail.command, inner.width as usize)
-            ),
-            Style::default().fg(theme.text),
-        )),
-        Line::from(Span::styled(
-            format!(
-                "desc: {}",
-                truncate_display_width(&detail.description, inner.width as usize)
-            ),
-            Style::default().fg(theme.text_dim),
-        )),
-        Line::from(""),
-    ];
+    let mut header_lines: Vec<Line> = Vec::new();
+    push_wrapped_field(
+        &mut header_lines,
+        "cmd: ",
+        &detail.command,
+        width,
+        Style::default().fg(theme.text),
+    );
+    push_wrapped_field(
+        &mut header_lines,
+        "desc: ",
+        &detail.description,
+        width,
+        Style::default().fg(theme.text_dim),
+    );
+    if !detail.log_path.is_empty() {
+        push_wrapped_field(
+            &mut header_lines,
+            "log: ",
+            &detail.log_path,
+            width,
+            Style::default().fg(theme.text_muted),
+        );
+    }
+    header_lines.push(Line::from(""));
     let header_height = header_lines.len() as u16;
     let output_area_height = inner
         .height
@@ -3762,9 +3816,13 @@ fn render_task_detail(f: &mut Frame, area: Rect, detail: &TaskDetailState, theme
         .saturating_sub(footer_height);
 
     // Pre-wrap output so scroll offsets count wrapped lines consistently.
-    let wrapped = wrap_to_width(&detail.output, inner.width as usize);
+    let wrapped = wrap_to_width(&detail.output, width);
     let max_scroll = (wrapped.len() as u16).saturating_sub(output_area_height);
-    let scroll = detail.scroll.min(max_scroll);
+    let scroll = if detail.follow_bottom {
+        max_scroll
+    } else {
+        detail.scroll.min(max_scroll)
+    };
     let visible: Vec<Line> = wrapped
         .iter()
         .skip(scroll as usize)
@@ -4070,6 +4128,10 @@ fn push_wrapped_prefixed_with_continuation_indent(
     continuation_indent: usize,
 ) {
     let width = width as usize;
+    // Last hop to the terminal: strip escape bytes and normalize CR from
+    // untrusted text (system messages, local-shell output) before wrapping.
+    let sanitized = crate::sanitize::sanitize_text(text);
+    let text = sanitized.as_ref();
     let first_width = width.saturating_sub(UnicodeWidthStr::width(prefix)).max(1);
     let continuation_indent = continuation_indent.min(width.saturating_sub(1));
     let continuation_width = width.saturating_sub(continuation_indent).max(1);

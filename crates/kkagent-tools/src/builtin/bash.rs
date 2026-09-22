@@ -11,6 +11,10 @@ use uuid::Uuid;
 use crate::{Tool, ToolContext, ToolOutput};
 
 const MAX_OUTPUT: usize = 50_000;
+/// Cap for TUI `/ps` detail (`snapshot_detail`): enough for a long `cargo test`
+/// log without loading multi-hundred-MB files into the panel. When the on-disk
+/// log is larger, the response notes the path so the user can open the rest.
+const DETAIL_OUTPUT_MAX_BYTES: u64 = 5 * 1024 * 1024;
 pub const DEFAULT_TIMEOUT_S: u64 = 120; // 2 minutes foreground default
 const MAX_TIMEOUT_S: u64 = 300; // 5 minutes foreground
 const MIN_TIMEOUT_S: u64 = 1; // clamp zero/undersized timeouts to 1s to avoid instant kills
@@ -141,7 +145,11 @@ pub struct BackgroundJobDetail {
     pub elapsed_secs: u64,
     pub exit_code: Option<i32>,
     pub running: bool,
+    /// Prefer the on-disk log (may be longer than the in-memory rolling
+    /// window). Truncated only when larger than [`DETAIL_OUTPUT_MAX_BYTES`].
     pub output: String,
+    /// Absolute path of the append-only log file (empty when unavailable).
+    pub log_path: String,
 }
 
 /// Tracks background / detached shell processes for Bash tool polling.
@@ -426,8 +434,12 @@ impl BackgroundShellManager {
     }
 
     /// Full snapshot of one background job (for in-panel output view).
+    /// Prefers the on-disk log so `/ps` can show more than the in-memory
+    /// rolling window.
     pub async fn snapshot_detail(&self, id: &str) -> Option<BackgroundJobDetail> {
         let job = self.jobs.lock().await.get(id)?.clone();
+        let (output, log_path) =
+            load_readable_output(&job.output_log, &job.output, DETAIL_OUTPUT_MAX_BYTES).await;
         Some(BackgroundJobDetail {
             id: id.to_string(),
             description: job.description,
@@ -436,7 +448,8 @@ impl BackgroundShellManager {
             elapsed_secs: job.started_at.elapsed().as_secs(),
             exit_code: job.exit_code,
             running: job.status == ShellStatus::Running,
-            output: job.output,
+            output,
+            log_path,
         })
     }
 
@@ -1491,6 +1504,29 @@ fn truncate_chars(s: &str, max: usize) -> String {
     }
 }
 
+/// Load output for the TUI `/ps` detail panel: prefer the on-disk append log
+/// (full history past the in-memory rolling window), fall back to memory when
+/// the file is empty/missing. Caps at `max_bytes` and appends the log path
+/// when truncated so the user can still open the remainder.
+async fn load_readable_output(
+    log: &crate::output_log::OutputLog,
+    memory_fallback: &str,
+    max_bytes: u64,
+) -> (String, String) {
+    let log_path = log.path().display().to_string();
+    let (content, next, total) = log.read_from_limited(0, max_bytes).await;
+    if total == 0 {
+        return (memory_fallback.to_string(), log_path);
+    }
+    let mut out = content;
+    if next < total {
+        out.push_str(&format!(
+            "\n\n... truncated for display ({next}/{total} bytes shown). Full log: {log_path}\n"
+        ));
+    }
+    (out, log_path)
+}
+
 /// Keep the trailing `max` characters of `s`, prefixing a marker when
 /// something was dropped. Mirrors `task_notify::excerpt`'s tail semantics so
 /// polling and push notifications show the same end of a long-running job's
@@ -2012,6 +2048,27 @@ mod tests {
             "in-memory buffer must stay bounded, got {} bytes",
             output.len()
         );
+
+        // TUI `/ps` detail must still surface the early bytes that fell out of
+        // the rolling window, via the on-disk append log.
+        let detail = manager.snapshot_detail(id).await.expect("detail exists");
+        assert!(
+            detail.output.len() > output.len(),
+            "disk-backed detail must be longer than the memory window"
+        );
+        assert!(
+            !detail.log_path.is_empty(),
+            "detail must expose the log path for the TUI"
+        );
+        let (disk_all, total) = manager
+            .output_log(id)
+            .await
+            .expect("log handle")
+            .read_from(0)
+            .await;
+        assert_eq!(total, disk_all.len() as u64);
+        assert!(disk_all.ends_with("LATEST-MARKER\n"));
+        assert!(disk_all.starts_with('x'));
     }
 
     #[cfg(unix)]

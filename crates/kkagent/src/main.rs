@@ -12198,6 +12198,7 @@ async fn handle_rpc_call(
                     "exit_code": job.exit_code,
                     "running": job.running,
                     "output": job.output,
+                    "log_path": job.log_path,
                 })),
                 None => Err((-32000, format!("Unknown task: {task_id}"))),
             }
