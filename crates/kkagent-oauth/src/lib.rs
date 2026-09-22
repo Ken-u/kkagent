@@ -32,10 +32,7 @@ pub fn kimi_identity_headers() -> std::collections::HashMap<String, String> {
     let device_name = std::env::var("COMPUTERNAME")
         .or_else(|_| std::env::var("HOSTNAME"))
         .unwrap_or_else(|_| "unknown".into());
-    let device_id_path = dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".kkagent")
-        .join("device_id");
+    let device_id_path = kkagent_config::default_config_dir().join("device_id");
     let device_id = std::fs::read_to_string(&device_id_path)
         .ok()
         .map(|value| value.trim().to_string())
@@ -416,10 +413,7 @@ pub struct FileTokenStorage {
 
 impl FileTokenStorage {
     pub fn default_path() -> PathBuf {
-        dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(".kkagent")
-            .join("oauth-tokens.json")
+        kkagent_config::default_config_dir().join("oauth-tokens.json")
     }
 
     pub fn new(path: impl AsRef<Path>) -> Self {
@@ -438,9 +432,7 @@ impl FileTokenStorage {
             anyhow::bail!("invalid OAuth credential key: {key}");
         }
         Ok(Self::new(
-            dirs::home_dir()
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join(".kkagent")
+            kkagent_config::default_config_dir()
                 .join("credentials")
                 .join(format!("{key}.json")),
         ))
@@ -677,3 +669,6 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 }
+
+// Keep unit tests out of the real ~/.kkagent home.
+kkagent_config::install_test_home!();

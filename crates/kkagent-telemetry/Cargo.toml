@@ -16,3 +16,7 @@ uuid = { workspace = true }
 dirs = { workspace = true }
 async-trait = { workspace = true }
 kkagent-di = { workspace = true }
+kkagent-config = { workspace = true }
+
+[dev-dependencies]
+ctor = "0.2"

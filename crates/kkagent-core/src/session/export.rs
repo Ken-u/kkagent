@@ -231,10 +231,7 @@ pub fn export_session_debug_bundle(
     let log_src = audit_src
         .parent()
         .map(|p| p.join("kkagent.log"))
-        .unwrap_or_else(|| {
-            let home = std::env::var_os("HOME").unwrap_or_default();
-            PathBuf::from(home).join(".kkagent").join("kkagent.log")
-        });
+        .unwrap_or_else(|| kkagent_config::default_config_dir().join("kkagent.log"));
     let mut log_line_count = None;
     if log_src.is_file() {
         let window = session_activity_window(&summary.id);

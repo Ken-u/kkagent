@@ -5384,8 +5384,6 @@ struct ServerState {
     shared_config: StdRwLock<Arc<AppConfig>>,
     /// Absolute path used for `/reload` / `config.reload`.
     config_path: PathBuf,
-    /// User home directory; session wire dirs (incl. goal snapshots) live under it.
-    home_dir: PathBuf,
     sandbox_policy: StdRwLock<kkagent_tools::sandbox::SandboxPolicy>,
     workspace_trust: StdRwLock<kkagent_config::WorkspaceTrustStore>,
     sessions: Mutex<HashMap<String, Session>>,
@@ -5957,15 +5955,14 @@ impl ServerState {
     fn goal_file(&self, session_id: &str) -> PathBuf {
         if !is_safe_session_id(session_id) {
             // Path traversal guard: fall back to a sanitized placeholder.
-            return self.home_dir.join(".kkagent").join("goal-invalid.json");
+            return kkagent_config::default_config_dir().join("goal-invalid.json");
         }
         let dir = kkagent_core::session::store::SessionStore::open_default()
             .get(session_id)
             .ok()
             .map(|summary| PathBuf::from(summary.session_dir));
         dir.unwrap_or_else(|| {
-            self.home_dir
-                .join(".kkagent")
+            kkagent_config::default_config_dir()
                 .join("sessions")
                 .join(session_id)
         })
@@ -7142,10 +7139,11 @@ async fn build_server_state_with_shutdown(
     let di_root = ServiceContainer::new("kkagent-root");
     let telemetry = TelemetryService::new();
     telemetry.add_appender(Arc::new(ConsoleAppender)).await;
-    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
     telemetry
         .add_appender(Arc::new(FileAppender::new(
-            home.join(".kkagent").join("telemetry").join("events.jsonl"),
+            kkagent_config::default_config_dir()
+                .join("telemetry")
+                .join("events.jsonl"),
         )))
         .await;
     let cloud_opts = CloudAppenderOptions {
@@ -7178,7 +7176,6 @@ async fn build_server_state_with_shutdown(
     let state = Arc::new(ServerState {
         shared_config: StdRwLock::new(config.clone()),
         config_path,
-        home_dir: home.clone(),
         sandbox_policy: StdRwLock::new(sandbox_policy),
         workspace_trust: StdRwLock::new(config.workspace_trust.clone()),
         sessions: Mutex::new(HashMap::new()),
@@ -7670,8 +7667,9 @@ async fn spawn_session_agent_turn(
     let (agent_event_tx, mut agent_event_rx) = mpsc::channel::<AgentEvent>(256);
 
     let event_state = state.clone();
-    let home_dir = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-    let wire_dir = home_dir.join(".kkagent").join("sessions").join(&session_id);
+    let wire_dir = kkagent_config::default_config_dir()
+        .join("sessions")
+        .join(&session_id);
     let wire = kkagent_wire::WireJournal::open(&wire_dir);
     let telemetry_fwd = state.telemetry.clone();
     tokio::spawn(async move {

@@ -16,3 +16,6 @@ pub use http::{
 };
 pub use server::RpcServer;
 pub use transport::*;
+
+// Keep unit tests out of the real ~/.kkagent home.
+kkagent_core::install_test_home!();

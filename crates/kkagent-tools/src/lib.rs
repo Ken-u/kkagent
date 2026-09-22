@@ -641,3 +641,6 @@ mod disclosure_tests {
         assert_eq!(select["properties"]["tools"]["minItems"], 1);
     }
 }
+
+// Keep unit tests out of the real ~/.kkagent home.
+kkagent_config::install_test_home!();

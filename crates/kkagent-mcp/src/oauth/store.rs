@@ -33,16 +33,18 @@ pub struct DiscoveryState {
     pub registration_endpoint: Option<String>,
 }
 
-/// File-backed OAuth credential store under `~/.kkagent/credentials/mcp/`.
+/// File-backed OAuth credential store under the kkagent home
+/// (`…/credentials/mcp/`).
 pub struct McpOAuthStore {
     root: PathBuf,
 }
 
 impl McpOAuthStore {
     pub fn default_location() -> Self {
-        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
         Self {
-            root: home.join(".kkagent").join("credentials").join("mcp"),
+            root: kkagent_config::default_config_dir()
+                .join("credentials")
+                .join("mcp"),
         }
     }
 

@@ -29,7 +29,6 @@ pub struct CloudAppenderOptions {
 
 impl Default for CloudAppenderOptions {
     fn default() -> Self {
-        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
         Self {
             endpoint: std::env::var("KKAGENT_TELEMETRY_ENDPOINT")
                 .unwrap_or_else(|_| "https://telemetry.kkagent.local/v1/events".into()),
@@ -43,7 +42,7 @@ impl Default for CloudAppenderOptions {
             flush_threshold: 50,
             flush_interval_ms: 30_000,
             request_timeout_ms: 10_000,
-            spill_dir: home.join(".kkagent").join("telemetry"),
+            spill_dir: kkagent_config::default_config_dir().join("telemetry"),
         }
     }
 }

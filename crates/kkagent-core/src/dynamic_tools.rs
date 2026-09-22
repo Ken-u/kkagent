@@ -265,7 +265,10 @@ pub fn apply_select_tools(
     if !already.is_empty() {
         lines.push(format!("Already available: {}", already.join(", ")));
     }
-    let all_loadable_names: Vec<String> = loadable.iter().cloned().collect();
+    // Collect + sort so suggestion order does not depend on HashSet iteration
+    // order (which is randomized per process by the default hasher).
+    let mut all_loadable_names: Vec<String> = loadable.iter().cloned().collect();
+    all_loadable_names.sort();
     for name in &unknown {
         let suggestions = suggest_similar_tools(name, &all_loadable_names, 3);
         if suggestions.is_empty() {
@@ -392,13 +395,21 @@ fn bm25_score(query: &str, document: &str, all_names: &[&str]) -> f64 {
 /// Return the top-N most similar tool names from `candidates` for `query`,
 /// filtered to a minimum score threshold.
 fn suggest_similar_tools(query: &str, candidates: &[String], top_n: usize) -> Vec<String> {
-    let all_refs: Vec<&str> = candidates.iter().map(|s| s.as_str()).collect();
-    let mut scored: Vec<(f64, &str)> = candidates
+    // Sort so IDF corpus order and tie-breaks are independent of HashSet
+    // iteration (Rust randomizes hasher seeds per process).
+    let mut ordered = candidates.to_vec();
+    ordered.sort();
+    let all_refs: Vec<&str> = ordered.iter().map(|s| s.as_str()).collect();
+    let mut scored: Vec<(f64, &str)> = ordered
         .iter()
         .map(|c| (bm25_score(query, c, &all_refs), c.as_str()))
         .filter(|(s, _)| *s > 0.5)
         .collect();
-    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    scored.sort_by(|a, b| {
+        b.0.partial_cmp(&a.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.1.cmp(b.1))
+    });
     scored
         .into_iter()
         .take(top_n)
@@ -457,8 +468,12 @@ mod tests {
     }
 
     fn session() -> Session {
-        Session::new(
-            "dyn-tools".into(),
+        // Must not use Session::new: Startup source indexes into the real
+        // ~/.kkagent store. A fixed id ("dyn-tools") made every parallel test
+        // contend on the same session_dir / state.json, which surfaced as
+        // intermittent failures under `cargo test --workspace` (upload.sh).
+        Session::for_subagent(
+            format!("dyn-tools-{}", uuid::Uuid::new_v4().simple()),
             std::env::temp_dir(),
             PermissionMode::Auto,
             "test-model".into(),

@@ -32,6 +32,7 @@ pub mod swarm;
 pub mod system_reminder;
 /// Test isolation helpers — redirects the kkagent home during `cargo test`.
 /// No-op outside test binaries that opt in via `install_test_home!`.
+/// Implementation lives in `kkagent_config::test_isolation`.
 pub mod test_isolation;
 pub mod token_counting;
 pub mod tool_dedupe;

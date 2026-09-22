@@ -35,3 +35,6 @@ pub mod workspace_trust;
 
 pub use app::TuiApp;
 pub use workspace_trust::ensure_workspace_trust;
+
+// Keep unit tests out of the real ~/.kkagent home.
+kkagent_core::install_test_home!();

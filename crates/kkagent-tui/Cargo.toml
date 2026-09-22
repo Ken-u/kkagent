@@ -35,3 +35,4 @@ semver = { workspace = true }
 
 [dev-dependencies]
 kkagent-rpc = { workspace = true }
+ctor = "0.2"

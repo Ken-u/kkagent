@@ -13,3 +13,7 @@ pub use skills::SkillsManager;
 pub use tool_bridge::{
     qualified_tool_name as qualify_namespaced_tool_name, qualify_mcp_tool_name, register_mcp_tools,
 };
+
+// Keep unit tests out of the real ~/.kkagent home.
+// tools/mcp don't depend on kkagent-core; install via config.
+kkagent_config::install_test_home!();

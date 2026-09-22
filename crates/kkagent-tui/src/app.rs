@@ -7541,9 +7541,7 @@ impl TuiApp {
             .checked_div(max)
             .unwrap_or(0)
             .min(100);
-        let home = dirs::home_dir()
-            .unwrap_or_else(|| std::path::PathBuf::from("."))
-            .join(".kkagent");
+        let home = kkagent_config::default_config_dir();
         let items = vec![
             ListPickerItem {
                 id: "version".into(),
@@ -12322,19 +12320,16 @@ impl TuiApp {
                 }
             }
             "export-md" => {
-                let path = dirs::home_dir()
-                    .unwrap_or_else(|| std::path::PathBuf::from("."))
-                    .join(".kkagent")
-                    .join(format!(
-                        "export-{}.md",
-                        self.state
-                            .session_id
-                            .as_deref()
-                            .unwrap_or("session")
-                            .chars()
-                            .take(8)
-                            .collect::<String>()
-                    ));
+                let path = kkagent_config::default_config_dir().join(format!(
+                    "export-{}.md",
+                    self.state
+                        .session_id
+                        .as_deref()
+                        .unwrap_or("session")
+                        .chars()
+                        .take(8)
+                        .collect::<String>()
+                ));
                 let mut md = String::from("# kkagent session export\n\n");
                 for msg in &self.state.messages {
                     let role = match msg.role {

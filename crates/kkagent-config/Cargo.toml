@@ -13,3 +13,6 @@ dirs = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
+# Used by `install_test_home!` so every crate's test binary can redirect
+# `default_config_dir()` away from the real `~/.kkagent` before tests run.
+ctor = "0.2"

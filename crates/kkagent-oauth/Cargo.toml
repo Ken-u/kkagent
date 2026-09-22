@@ -18,3 +18,7 @@ sha2 = "0.10"
 base64 = { workspace = true }
 rand = "0.8"
 url = "2"
+kkagent-config = { workspace = true }
+
+[dev-dependencies]
+ctor = "0.2"

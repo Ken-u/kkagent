@@ -895,11 +895,7 @@ fn backend_error_status(error: String) -> StatusCode {
 }
 
 fn dirs_home() -> String {
-    dirs::home_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join(".kkagent")
-        .display()
-        .to_string()
+    kkagent_config::default_config_dir().display().to_string()
 }
 
 fn kkagent_llm_catalog_stub() -> Vec<Value> {

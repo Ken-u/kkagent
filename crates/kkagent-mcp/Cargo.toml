@@ -25,3 +25,6 @@ chrono = { workspace = true }
 url = "2"
 http = "1"
 bytes = { workspace = true }
+
+[dev-dependencies]
+ctor = "0.2"

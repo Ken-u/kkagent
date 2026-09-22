@@ -68,10 +68,7 @@ impl ToolchainConfig {
         if let Some(root) = self.root.as_deref().filter(|s| !s.trim().is_empty()) {
             return expand_tilde(root);
         }
-        dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(".kkagent")
-            .join("toolchains")
+        crate::default_config_dir().join("toolchains")
     }
 
     /// Merge user overrides onto built-in profile defaults.

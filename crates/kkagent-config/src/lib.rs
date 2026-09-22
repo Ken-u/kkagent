@@ -2,6 +2,8 @@ pub mod loader;
 pub mod migrate;
 pub mod plugin_policy;
 pub mod schema;
+/// No-op outside test binaries that opt in via `install_test_home!`.
+pub mod test_isolation;
 pub mod toolchain;
 pub mod workspace_trust;
 
@@ -19,3 +21,6 @@ pub use workspace_trust::{
     git_environment, git_metadata_accessible, workspace_trust_path, WorkspaceTrust,
     WorkspaceTrustStore,
 };
+
+// Keep this crate's own tests out of the real ~/.kkagent home.
+crate::install_test_home!();
