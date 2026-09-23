@@ -3031,10 +3031,11 @@ async fn run_dump_system_prompt(config_path: Option<&Path>) -> Result<()> {
 
     let (skills, plugins) = {
         let plugins_dir = kkagent_config::default_config_dir().join("plugins");
+        let skill_dirs = skill_search_dirs(&config);
         tokio::join!(
             kkagent_tools::SkillCatalog::configured(
                 &working_dir,
-                &config.extra_skill_dirs,
+                &skill_dirs,
                 config.merge_all_available_skills,
             ),
             kkagent_core::PluginManager::discover(&plugins_dir),
@@ -3045,6 +3046,7 @@ async fn run_dump_system_prompt(config_path: Option<&Path>) -> Result<()> {
     // `Session::for_subagent` construction time.
     kkagent_core::plugin_overrides::sync_system_prompt_override(&plugins).await;
     skills.set_disabled(config.disabled_skills.clone()).await;
+    seed_marketplace_skill_state(&skills, &plugins).await;
 
     let mut session = Session::for_subagent(
         "dump-system-prompt".to_string(),
@@ -6843,6 +6845,36 @@ async fn combined_mcp_servers(
     configs
 }
 
+/// Skill search roots beyond the built-in user/project ones: the user's
+/// `extra_skill_dirs` plus the marketplace's managed skill packages.
+fn skill_search_dirs(config: &AppConfig) -> Vec<String> {
+    let mut dirs = config.extra_skill_dirs.clone();
+    dirs.push(marketplace_skills_dir().display().to_string());
+    dirs
+}
+
+fn marketplace_skills_dir() -> PathBuf {
+    kkagent_config::default_config_dir()
+        .join("plugins")
+        .join("skills")
+}
+
+/// Marketplace-installed skills the user switched off live in the installed
+/// records, not `disabled_skills`; seed them into the catalog so a restart
+/// keeps them hidden from sessions.
+async fn seed_marketplace_skill_state(
+    skills: &kkagent_tools::SkillCatalog,
+    plugins: &kkagent_core::PluginManager,
+) {
+    let disabled = plugins.disabled_skill_ids().await.unwrap_or_else(|error| {
+        tracing::warn!(%error, "cannot read marketplace skill records");
+        Vec::new()
+    });
+    for name in disabled {
+        skills.set_skill_enabled(&name, false).await;
+    }
+}
+
 fn configured_plugin_marketplace_catalogs(
     config: &AppConfig,
 ) -> Vec<kkagent_config::PluginMarketplaceCatalog> {
@@ -7106,7 +7138,7 @@ async fn build_server_state_with_shutdown(
     hooks_mgr.load_from_app_config(&config.hooks).await;
     let cron_path = kkagent_config::default_config_dir().join("cron.json");
     let mcp_connect = mcp.clone();
-    let extra_skill_dirs = config.extra_skill_dirs.clone();
+    let extra_skill_dirs = skill_search_dirs(&config);
     let merge_all_available_skills = config.merge_all_available_skills;
     let mut background_tasks = Vec::new();
 
@@ -7145,6 +7177,7 @@ async fn build_server_state_with_shutdown(
     let hooks = Arc::new(hooks_mgr);
     let skills = Arc::new(skills);
     skills.set_disabled(config.disabled_skills.clone()).await;
+    seed_marketplace_skill_state(&skills, &plugins).await;
     let cron = Arc::new(cron);
     let goal_managers: Mutex<HashMap<String, Arc<kkagent_protocol::goal::GoalManager>>> =
         Mutex::new(HashMap::new());
@@ -11879,11 +11912,20 @@ async fn handle_rpc_call(
                 .and_then(|value| value.as_str())
                 .ok_or_else(|| (-32602, "Missing plugin id".into()))?;
             let enabled = method == "plugins.enable";
-            state
+            let kind = state
                 .plugins
                 .set_enabled(id, enabled)
                 .await
                 .map_err(|error| (-32000, error.to_string()))?;
+            if kind == kkagent_core::plugin_marketplace::MarketplaceKind::Skill {
+                // The record is what the marketplace lists, but the running
+                // skill catalog decides what a session can load — keep both in
+                // step, and let the config mirror the catalog.
+                state.skills.set_skill_enabled(id, enabled).await;
+                persist_disabled_extensions(&state)
+                    .await
+                    .map_err(|error| (-32000, error))?;
+            }
             let (mcp_servers, tools) = refresh_plugin_mcp(&state)
                 .await
                 .map_err(|error| (-32000, error.to_string()))?;

@@ -17,6 +17,20 @@ async fn official_marketplace_catalog_loads() {
     assert!(catalog.plugins.iter().any(|p| p.id == "kk-web-override"));
     assert!(catalog.plugins.iter().any(|p| p.id == "kk-web-brave"));
 
+    // The skill example must be typed as a skill and carry a SKILL.md.
+    let skill = catalog
+        .plugins
+        .iter()
+        .find(|p| p.id == "kk-changelog")
+        .expect("official skill example");
+    assert_eq!(skill.kind, kkagent_core::MarketplaceKind::Skill);
+    assert!(
+        std::path::PathBuf::from(&skill.source)
+            .join("SKILL.md")
+            .is_file(),
+        "skill example needs a SKILL.md"
+    );
+
     // The override example must parse as a valid plugin manifest with the
     // expected override wiring. `source` is already resolved to an absolute
     // path by `load_marketplace`.

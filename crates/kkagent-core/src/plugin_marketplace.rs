@@ -1,4 +1,7 @@
 //! KK plugin marketplace catalogs, managed installation, and persisted state.
+//!
+//! A catalog entry installs either a plugin (`kk.plugin.json` manifest, under
+//! `plugins/managed/`) or a skill (`SKILL.md`, under `plugins/skills/`).
 
 use anyhow::{Context, Result};
 use futures::StreamExt;
@@ -8,10 +11,23 @@ use std::path::{Path, PathBuf};
 
 const INSTALLED_VERSION: u32 = 1;
 const MARKETPLACES_VERSION: u32 = 1;
+const SKILL_MANIFEST: &str = "SKILL.md";
 const MAX_CATALOG_BYTES: usize = 4 * 1024 * 1024;
 const MAX_ARCHIVE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_EXTRACTED_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_ARCHIVE_FILES: usize = 10_000;
+
+/// What a catalog entry installs as. `plugin` packages carry a
+/// `kk.plugin.json` manifest and land in `plugins/managed/`; `skill` packages
+/// carry a `SKILL.md` and land in `plugins/skills/`, which the server adds to
+/// its skill search roots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MarketplaceKind {
+    #[default]
+    Plugin,
+    Skill,
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct PluginMarketplace {
@@ -27,6 +43,8 @@ pub struct PluginMarketplaceEntry {
     #[serde(default)]
     pub display_name: String,
     pub source: String,
+    #[serde(default)]
+    pub kind: MarketplaceKind,
     #[serde(default)]
     pub tier: Option<String>,
     #[serde(default)]
@@ -67,6 +85,10 @@ pub struct InstalledPluginRecord {
     pub source: String,
     pub enabled: bool,
     pub installed_at: String,
+    /// `skill` for marketplace-installed skills; `plugin` (the default) keeps
+    /// pre-0.4 state files readable.
+    #[serde(default)]
+    pub kind: MarketplaceKind,
     #[serde(default)]
     pub updated_at: Option<String>,
     #[serde(default)]
@@ -169,13 +191,17 @@ pub async fn load_marketplace(source: &str, work_dir: &Path) -> Result<PluginMar
             anyhow::bail!("duplicate marketplace plugin id {}", raw_entry.id)
         }
         if let Some(entry_type) = raw_entry.entry_type.as_deref() {
-            if entry_type != "plugin" {
+            if !matches!(entry_type, "plugin" | "skill") {
                 anyhow::bail!(
                     "marketplace plugin {} has unsupported type {entry_type}",
                     raw_entry.id
                 )
             }
         }
+        let kind = match raw_entry.entry_type.as_deref() {
+            Some("skill") => MarketplaceKind::Skill,
+            _ => MarketplaceKind::Plugin,
+        };
         if let Some(tier) = raw_entry.tier.as_deref() {
             if !matches!(tier, "official" | "curated") {
                 anyhow::bail!(
@@ -200,6 +226,7 @@ pub async fn load_marketplace(source: &str, work_dir: &Path) -> Result<PluginMar
                 .filter(|value| !value.trim().is_empty())
                 .unwrap_or_else(|| raw_entry.id.clone()),
             source: resolve_entry_source(source, &location)?,
+            kind,
             id: raw_entry.id,
             tier: raw_entry.tier,
             version: raw_entry.version,
@@ -335,12 +362,13 @@ pub async fn install_plugin(
     marketplace: Option<(&str, &PluginMarketplaceEntry)>,
 ) -> Result<InstalledPluginRecord> {
     tokio::fs::create_dir_all(plugins_dir).await?;
+    let declared = marketplace.map(|(_, entry)| entry.kind);
     let download_staging = plugins_dir.join(format!(".download-{}", uuid::Uuid::new_v4()));
     let mut cleanup_download = false;
     let source_root_result: Result<PathBuf> = async {
         if is_http_source(source) {
             cleanup_download = true;
-            materialize_http_plugin(source, download_staging.clone()).await
+            materialize_http_plugin(source, download_staging.clone(), declared).await
         } else {
             let path = source_path(source)?;
             let metadata = tokio::fs::metadata(&path)
@@ -354,7 +382,7 @@ pub async fn install_plugin(
                 if archive.len() > MAX_ARCHIVE_BYTES {
                     anyhow::bail!("plugin archive exceeds 64 MiB")
                 }
-                extract_archive(archive, download_staging.clone(), None).await
+                extract_archive(archive, download_staging.clone(), None, declared).await
             }
         }
     }
@@ -377,7 +405,11 @@ pub async fn install_plugin(
     result
 }
 
-pub async fn set_plugin_enabled(plugins_dir: &Path, id: &str, enabled: bool) -> Result<()> {
+pub async fn set_plugin_enabled(
+    plugins_dir: &Path,
+    id: &str,
+    enabled: bool,
+) -> Result<MarketplaceKind> {
     super::plugin::validate_plugin_name(id)?;
     let mut installed = read_installed(plugins_dir).await?;
     let record = installed
@@ -387,18 +419,38 @@ pub async fn set_plugin_enabled(plugins_dir: &Path, id: &str, enabled: bool) -> 
         .ok_or_else(|| anyhow::anyhow!("plugin {id} is not managed by the marketplace"))?;
     record.enabled = enabled;
     record.updated_at = Some(chrono::Utc::now().to_rfc3339());
-    write_installed(plugins_dir, &installed).await
+    let kind = record.kind;
+    write_installed(plugins_dir, &installed).await?;
+    Ok(kind)
 }
 
 pub async fn remove_plugin(plugins_dir: &Path, id: &str) -> Result<()> {
     super::plugin::validate_plugin_name(id)?;
     let mut installed = read_installed(plugins_dir).await?;
-    let old_len = installed.plugins.len();
-    installed.plugins.retain(|record| record.id != id);
-    if installed.plugins.len() == old_len {
-        anyhow::bail!("plugin {id} is not managed by the marketplace")
+    let record = installed
+        .plugins
+        .iter()
+        .find(|record| record.id == id)
+        .ok_or_else(|| anyhow::anyhow!("plugin {id} is not managed by the marketplace"))?
+        .clone();
+    if record.kind == MarketplaceKind::Skill {
+        // Unlike a plugin — whose leftover directory stays invisible while
+        // installed.json exists — skills are discovered by directory scan, so
+        // an uninstalled skill must be taken off disk to stop loading.
+        let skill_root = managed_skills_dir(plugins_dir).join(id);
+        let target = PathBuf::from(&record.root);
+        if target == skill_root {
+            let _ = tokio::fs::remove_dir_all(&skill_root).await;
+        }
     }
+    installed.plugins.retain(|record| record.id != id);
     write_installed(plugins_dir, &installed).await
+}
+
+/// Marketplace-installed skills live here so they never collide with the
+/// user's own `~/.kkagent/skills/` packages.
+pub fn managed_skills_dir(plugins_dir: &Path) -> PathBuf {
+    plugins_dir.join("skills")
 }
 
 fn resolve_catalog_location(source: &str, work_dir: &Path) -> Result<CatalogLocation> {
@@ -536,12 +588,17 @@ fn marketplace_catalog_fallbacks(url: &reqwest::Url) -> Vec<reqwest::Url> {
         .collect()
 }
 
-async fn materialize_http_plugin(source: &str, destination: PathBuf) -> Result<PathBuf> {
+async fn materialize_http_plugin(
+    source: &str,
+    destination: PathBuf,
+    declared: Option<MarketplaceKind>,
+) -> Result<PathBuf> {
     let mut last_error = None;
     for attempt in forge_download_attempts(source)? {
         match download_bytes(&attempt.download_url).await {
             Ok(archive) => {
-                match extract_archive(archive, destination.clone(), attempt.subdir).await {
+                match extract_archive(archive, destination.clone(), attempt.subdir, declared).await
+                {
                     Ok(root) => return Ok(root),
                     Err(error) => last_error = Some(error),
                 }
@@ -756,9 +813,10 @@ async fn extract_archive(
     bytes: Vec<u8>,
     destination: PathBuf,
     subdir: Option<String>,
+    declared: Option<MarketplaceKind>,
 ) -> Result<PathBuf> {
     tokio::task::spawn_blocking(move || {
-        extract_archive_blocking(bytes, &destination, subdir.as_deref())
+        extract_archive_blocking(bytes, &destination, subdir.as_deref(), declared)
     })
     .await?
 }
@@ -767,6 +825,7 @@ fn extract_archive_blocking(
     bytes: Vec<u8>,
     destination: &Path,
     subdir: Option<&str>,
+    declared: Option<MarketplaceKind>,
 ) -> Result<PathBuf> {
     std::fs::create_dir_all(destination)?;
     let mut archive = zip::ZipArchive::new(Cursor::new(bytes)).context("invalid plugin ZIP")?;
@@ -809,7 +868,7 @@ fn extract_archive_blocking(
         Some(subdir) => resolve_archive_subdir(destination, subdir)?,
         None => destination.to_path_buf(),
     };
-    detect_plugin_root(&search_root)
+    detect_package_root(&search_root, declared)
 }
 
 fn resolve_archive_subdir(extracted: &Path, subdir: &str) -> Result<PathBuf> {
@@ -846,12 +905,31 @@ fn resolve_archive_subdir(extracted: &Path, subdir: &str) -> Result<PathBuf> {
         .ok_or_else(|| anyhow::anyhow!("plugin archive has no subdirectory {subdir}"))
 }
 
-fn detect_plugin_root(extracted: &Path) -> Result<PathBuf> {
-    let mut candidates = Vec::new();
-    find_manifest_roots(extracted, extracted, 0, &mut candidates)?;
+fn detect_package_root(extracted: &Path, declared: Option<MarketplaceKind>) -> Result<PathBuf> {
+    let (label, mut candidates) = match declared {
+        Some(MarketplaceKind::Skill) => (
+            "SKILL.md",
+            find_package_roots(extracted, MarketplaceKind::Skill)?,
+        ),
+        Some(MarketplaceKind::Plugin) => (
+            "kk.plugin.json manifest",
+            find_package_roots(extracted, MarketplaceKind::Plugin)?,
+        ),
+        None => {
+            let plugins = find_package_roots(extracted, MarketplaceKind::Plugin)?;
+            if plugins.is_empty() {
+                (
+                    "SKILL.md",
+                    find_package_roots(extracted, MarketplaceKind::Skill)?,
+                )
+            } else {
+                ("kk.plugin.json manifest", plugins)
+            }
+        }
+    };
     candidates.sort_by_key(|path| path.components().count());
     let Some(root) = candidates.first() else {
-        anyhow::bail!("plugin archive has no kk.plugin.json manifest")
+        anyhow::bail!("plugin archive has no {label}")
     };
     let depth = root.components().count();
     if candidates
@@ -864,16 +942,28 @@ fn detect_plugin_root(extracted: &Path) -> Result<PathBuf> {
     Ok(root.clone())
 }
 
-fn find_manifest_roots(
+/// Shallowest-first search for package roots of `kind` inside `root`.
+fn find_package_roots(root: &Path, kind: MarketplaceKind) -> Result<Vec<PathBuf>> {
+    let mut out = Vec::new();
+    collect_package_roots(root, root, 0, kind, &mut out)?;
+    Ok(out)
+}
+
+fn collect_package_roots(
     root: &Path,
     current: &Path,
     depth: usize,
+    kind: MarketplaceKind,
     out: &mut Vec<PathBuf>,
 ) -> Result<()> {
     if depth > 8 {
         return Ok(());
     }
-    if super::plugin::select_manifest(current).is_some() {
+    let is_package = match kind {
+        MarketplaceKind::Plugin => super::plugin::select_manifest(current).is_some(),
+        MarketplaceKind::Skill => current.join(SKILL_MANIFEST).is_file(),
+    };
+    if is_package {
         out.push(current.to_path_buf());
         return Ok(());
     }
@@ -885,7 +975,7 @@ fn find_manifest_roots(
             anyhow::bail!("plugin archive contains a symbolic link")
         }
         if metadata.is_dir() && path.starts_with(root) {
-            find_manifest_roots(root, &path, depth + 1, out)?;
+            collect_package_roots(root, &path, depth + 1, kind, out)?;
         }
     }
     Ok(())
@@ -897,39 +987,47 @@ async fn install_from_directory(
     source_root: &Path,
     marketplace: Option<(&str, &PluginMarketplaceEntry)>,
 ) -> Result<InstalledPluginRecord> {
-    let manifest_path = super::plugin::select_manifest(source_root)
-        .ok_or_else(|| anyhow::anyhow!("plugin source has no kk.plugin.json manifest"))?;
-    let manifest_text = tokio::fs::read_to_string(&manifest_path).await?;
-    let manifest: super::plugin::PluginManifest = serde_json::from_str(&manifest_text)?;
-    super::plugin::validate_plugin_name(&manifest.name)?;
+    let kind = match marketplace {
+        Some((_, entry)) => entry.kind,
+        None if super::plugin::select_manifest(source_root).is_some() => MarketplaceKind::Plugin,
+        None => MarketplaceKind::Skill,
+    };
+    let (name, version) = match kind {
+        MarketplaceKind::Plugin => {
+            let manifest_path = super::plugin::select_manifest(source_root)
+                .ok_or_else(|| anyhow::anyhow!("plugin source has no kk.plugin.json manifest"))?;
+            let manifest_text = tokio::fs::read_to_string(&manifest_path).await?;
+            let manifest: super::plugin::PluginManifest = serde_json::from_str(&manifest_text)?;
+            super::plugin::validate_plugin_name(&manifest.name)?;
+            let version = (!manifest.version.is_empty()).then_some(manifest.version);
+            (manifest.name, version)
+        }
+        MarketplaceKind::Skill => read_skill_package(source_root).await?,
+    };
     if let Some((_, entry)) = marketplace {
-        if entry.id != manifest.name {
+        if entry.id != name {
             anyhow::bail!(
-                "marketplace id {} does not match plugin manifest name {}",
+                "marketplace id {} does not match {} name {}",
                 entry.id,
-                manifest.name
+                kind.label(),
+                name
             )
         }
     }
 
-    let managed_dir = plugins_dir.join("managed");
-    tokio::fs::create_dir_all(&managed_dir).await?;
-    let target = managed_dir.join(&manifest.name);
-    let staging = managed_dir.join(format!(
-        ".staging-{}-{}",
-        manifest.name,
-        uuid::Uuid::new_v4()
-    ));
+    let packages_dir = match kind {
+        MarketplaceKind::Plugin => plugins_dir.join("managed"),
+        MarketplaceKind::Skill => managed_skills_dir(plugins_dir),
+    };
+    tokio::fs::create_dir_all(&packages_dir).await?;
+    let target = packages_dir.join(&name);
+    let staging = packages_dir.join(format!(".staging-{}-{}", name, uuid::Uuid::new_v4()));
     if let Err(error) = copy_directory(source_root, &staging).await {
         let _ = tokio::fs::remove_dir_all(&staging).await;
         return Err(error);
     }
 
-    let backup = managed_dir.join(format!(
-        ".backup-{}-{}",
-        manifest.name,
-        uuid::Uuid::new_v4()
-    ));
+    let backup = packages_dir.join(format!(".backup-{}-{}", name, uuid::Uuid::new_v4()));
     let had_target = tokio::fs::metadata(&target).await.is_ok();
     if had_target {
         tokio::fs::rename(&target, &backup).await?;
@@ -946,17 +1044,18 @@ async fn install_from_directory(
     let previous = installed
         .plugins
         .iter()
-        .find(|record| record.id == manifest.name)
+        .find(|record| record.id == name)
         .cloned();
     let now = chrono::Utc::now().to_rfc3339();
     let record = InstalledPluginRecord {
-        id: manifest.name.clone(),
+        id: name.clone(),
         root: target.display().to_string(),
         source: source_kind(original_source).into(),
         enabled: previous
             .as_ref()
             .map(|record| record.enabled)
             .unwrap_or(true),
+        kind,
         installed_at: previous
             .as_ref()
             .map(|record| record.installed_at.clone())
@@ -977,7 +1076,7 @@ async fn install_from_directory(
                     .as_ref()
                     .and_then(|record| record.marketplace_version.clone())
             }),
-        version: (!manifest.version.is_empty()).then_some(manifest.version),
+        version,
     };
     installed
         .plugins
@@ -995,6 +1094,43 @@ async fn install_from_directory(
         let _ = tokio::fs::remove_dir_all(backup).await;
     }
     Ok(record)
+}
+
+impl MarketplaceKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Plugin => "plugin",
+            Self::Skill => "skill",
+        }
+    }
+}
+
+/// Read a skill package's identity from its `SKILL.md` frontmatter, falling
+/// back to the directory name. The name doubles as the installed directory, so
+/// it must satisfy the plugin id rules too.
+async fn read_skill_package(root: &Path) -> Result<(String, Option<String>)> {
+    let manifest = root.join(SKILL_MANIFEST);
+    if !manifest.is_file() {
+        anyhow::bail!("skill source {} has no {SKILL_MANIFEST}", root.display());
+    }
+    let text = tokio::fs::read_to_string(&manifest).await?;
+    let metadata = kkagent_tools::builtin::skill::parse_frontmatter(&text);
+    let name = metadata
+        .name
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            root.file_name()
+                .and_then(|value| value.to_str())
+                .map(str::to_string)
+        });
+    let name =
+        name.ok_or_else(|| anyhow::anyhow!("cannot derive a skill name from {}", root.display()))?;
+    super::plugin::validate_plugin_name(&name)?;
+    let version = metadata
+        .version
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    Ok((name, version))
 }
 
 fn source_kind(source: &str) -> &'static str {
@@ -1279,6 +1415,143 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn installs_updates_and_removes_a_marketplace_skill() {
+        let root = temp_dir();
+        let source = root.join("source").join("release-notes");
+        tokio::fs::create_dir_all(source.join("references"))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            source.join("SKILL.md"),
+            "---\nname: release-notes\ndescription: Draft notes\nversion: 1.0.0\n---\nDraft them.",
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(source.join("references/checklist.md"), "Checklist")
+            .await
+            .unwrap();
+        let catalog_path = root.join("marketplace.json");
+        let catalog_text = |version: &str| {
+            let entry_source = serde_json::to_string(source.to_str().unwrap()).unwrap();
+            format!(
+                r#"{{"plugins":[{{"id":"release-notes","type":"skill","version":"{version}","source":{entry_source}}}]}}"#
+            )
+        };
+        tokio::fs::write(&catalog_path, catalog_text("1.0.0"))
+            .await
+            .unwrap();
+
+        let catalog = load_marketplace("marketplace.json", &root).await.unwrap();
+        assert_eq!(catalog.plugins[0].kind, MarketplaceKind::Skill);
+
+        let plugins = root.join("plugins");
+        let record = install_plugin(
+            &plugins,
+            &catalog.plugins[0].source,
+            Some((&catalog.source, &catalog.plugins[0])),
+        )
+        .await
+        .unwrap();
+        assert_eq!(record.kind, MarketplaceKind::Skill);
+        assert_eq!(record.version.as_deref(), Some("1.0.0"));
+        let installed_skill = managed_skills_dir(&plugins).join("release-notes");
+        assert!(installed_skill.join("SKILL.md").is_file());
+        assert!(installed_skill.join("references/checklist.md").is_file());
+
+        // A skill is not a plugin: discovery must not surface it as one.
+        let manager = crate::plugin::PluginManager::discover(&plugins).await;
+        assert!(manager.list().await.is_empty());
+        let refreshed = manager
+            .marketplace("marketplace.json", &root)
+            .await
+            .unwrap();
+        assert!(refreshed.plugins[0].installed);
+        assert!(!refreshed.plugins[0].update_available);
+
+        // Bumping both the package and the catalog entry reads as an update.
+        tokio::fs::write(
+            source.join("SKILL.md"),
+            "---\nname: release-notes\nversion: 2.0.0\n---\nNewer.",
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(&catalog_path, catalog_text("2.0.0"))
+            .await
+            .unwrap();
+        let refreshed = manager
+            .marketplace("marketplace.json", &root)
+            .await
+            .unwrap();
+        assert!(refreshed.plugins[0].update_available);
+        let updated = manager.update("release-notes").await.unwrap();
+        assert_eq!(updated.version.as_deref(), Some("2.0.0"));
+        assert_eq!(updated.kind, MarketplaceKind::Skill);
+
+        // Disabling records the kind so the server can mirror it into the
+        // skill catalog.
+        assert_eq!(
+            set_plugin_enabled(&plugins, "release-notes", false)
+                .await
+                .unwrap(),
+            MarketplaceKind::Skill
+        );
+        assert!(!read_installed(&plugins).await.unwrap().plugins[0].enabled);
+
+        // Unlike plugins, an uninstalled skill has to leave the disk or the
+        // catalog would keep discovering it.
+        remove_plugin(&plugins, "release-notes").await.unwrap();
+        assert!(read_installed(&plugins).await.unwrap().plugins.is_empty());
+        assert!(!installed_skill.exists());
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    #[tokio::test]
+    async fn skill_entry_without_a_skill_md_fails() {
+        let root = temp_dir();
+        let source = root.join("source").join("not-a-skill");
+        tokio::fs::create_dir_all(&source).await.unwrap();
+        tokio::fs::write(source.join("README.md"), "nothing here")
+            .await
+            .unwrap();
+        tokio::fs::write(
+            root.join("marketplace.json"),
+            format!(
+                r#"{{"plugins":[{{"id":"not-a-skill","type":"skill","source":{}}}]}}"#,
+                serde_json::to_string(source.to_str().unwrap()).unwrap()
+            ),
+        )
+        .await
+        .unwrap();
+        let catalog = load_marketplace("marketplace.json", &root).await.unwrap();
+        let error = install_plugin(
+            &root.join("plugins"),
+            &catalog.plugins[0].source,
+            Some((&catalog.source, &catalog.plugins[0])),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("SKILL.md"), "{error}");
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    #[tokio::test]
+    async fn rejects_unknown_marketplace_entry_types() {
+        let root = temp_dir();
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        tokio::fs::write(
+            root.join("marketplace.json"),
+            r#"{"plugins":[{"id":"mystery","type":"theme","source":"./mystery"}]}"#,
+        )
+        .await
+        .unwrap();
+        let error = load_marketplace("marketplace.json", &root)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("unsupported type theme"));
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    #[tokio::test]
     async fn rejects_archive_path_traversal() {
         let root = temp_dir();
         let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
@@ -1287,7 +1560,7 @@ mod tests {
             .unwrap();
         writer.write_all(b"unsafe").unwrap();
         let archive = writer.finish().unwrap().into_inner();
-        let error = extract_archive(archive, root.join("extract"), None)
+        let error = extract_archive(archive, root.join("extract"), None, None)
             .await
             .unwrap_err();
         assert!(error.to_string().contains("unsafe path"));
@@ -1475,9 +1748,14 @@ mod tests {
             writer.write_all(body).unwrap();
         }
         let archive = writer.finish().unwrap().into_inner();
-        let extracted = extract_archive(archive, root.join("extract"), Some("codesearch".into()))
-            .await
-            .unwrap();
+        let extracted = extract_archive(
+            archive,
+            root.join("extract"),
+            Some("codesearch".into()),
+            None,
+        )
+        .await
+        .unwrap();
         assert!(extracted.join("kk.plugin.json").is_file());
         assert!(extracted.ends_with("codesearch"));
         let _ = tokio::fs::remove_dir_all(root).await;

@@ -399,6 +399,7 @@ impl PluginManager {
         let mut roots: Vec<(PathBuf, bool, bool, Option<String>)> = installed
             .plugins
             .iter()
+            .filter(|record| record.kind == crate::plugin_marketplace::MarketplaceKind::Plugin)
             .map(|record| {
                 (
                     PathBuf::from(&record.root),
@@ -413,6 +414,10 @@ impl PluginManager {
         let mut rd = tokio::fs::read_dir(&self.plugins_dir).await?;
         while let Some(entry) = rd.next_entry().await? {
             let path = entry.path();
+            if entry.file_name() == "skills" {
+                // Marketplace-installed skills; loaded by the skill catalog.
+                continue;
+            }
             if path.is_dir() && entry.file_name() == "managed" {
                 if !has_installed_state {
                     let mut managed = tokio::fs::read_dir(&path).await?;
@@ -929,11 +934,45 @@ impl PluginManager {
             .any(|record| record.id == id))
     }
 
-    pub async fn set_enabled(&self, id: &str, enabled: bool) -> anyhow::Result<()> {
+    /// The kind a marketplace-managed id was installed as, when it is managed.
+    pub async fn installed_kind(
+        &self,
+        id: &str,
+    ) -> anyhow::Result<Option<crate::plugin_marketplace::MarketplaceKind>> {
+        validate_plugin_name(id)?;
+        Ok(crate::plugin_marketplace::read_installed(&self.plugins_dir)
+            .await?
+            .plugins
+            .into_iter()
+            .find(|record| record.id == id)
+            .map(|record| record.kind))
+    }
+
+    /// Marketplace-installed skills the user switched off. The skill catalog
+    /// has its own disabled set (config-backed), so the server seeds this one
+    /// at startup to keep the marketplace view and the loaded skills in sync.
+    pub async fn disabled_skill_ids(&self) -> anyhow::Result<Vec<String>> {
+        Ok(crate::plugin_marketplace::read_installed(&self.plugins_dir)
+            .await?
+            .plugins
+            .into_iter()
+            .filter(|record| {
+                record.kind == crate::plugin_marketplace::MarketplaceKind::Skill && !record.enabled
+            })
+            .map(|record| record.id)
+            .collect())
+    }
+
+    pub async fn set_enabled(
+        &self,
+        id: &str,
+        enabled: bool,
+    ) -> anyhow::Result<crate::plugin_marketplace::MarketplaceKind> {
         let _guard = self.mutation.lock().await;
-        crate::plugin_marketplace::set_plugin_enabled(&self.plugins_dir, id, enabled).await?;
+        let kind =
+            crate::plugin_marketplace::set_plugin_enabled(&self.plugins_dir, id, enabled).await?;
         self.reload().await?;
-        Ok(())
+        Ok(kind)
     }
 
     pub async fn remove(&self, id: &str) -> anyhow::Result<()> {

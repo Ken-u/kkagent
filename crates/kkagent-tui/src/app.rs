@@ -8113,13 +8113,16 @@ impl TuiApp {
                 ListPickerItem {
                     id: id.into(),
                     label: name.into(),
-                    detail: format!("{version} · {status}"),
+                    detail: match plugin.get("kind").and_then(|value| value.as_str()) {
+                        Some("skill") => format!("{version} · skill · {status}"),
+                        _ => format!("{version} · {status}"),
+                    },
                 }
             })
             .collect::<Vec<_>>();
         self.replace_list_picker(ListPickerState {
             kind: ListPickerKind::PluginMarketplaceEntries,
-            title: " Marketplace plugins · Enter details · Esc back ".into(),
+            title: " Marketplace plugins & skills · Enter details · Esc back ".into(),
             all_items: items.clone(),
             items,
             selected: 0,
@@ -8163,16 +8166,17 @@ impl TuiApp {
             .get("updateAvailable")
             .and_then(|value| value.as_bool())
             .unwrap_or(false);
+        let is_skill = plugin.get("kind").and_then(|value| value.as_str()) == Some("skill");
+        let noun = if is_skill { "skill" } else { "plugin" };
         let mut items = vec![ListPickerItem {
             id: if update { "update" } else { "install" }.into(),
             label: if update {
-                "Update plugin"
+                format!("Update {noun}")
             } else if installed {
-                "Reinstall plugin"
+                format!("Reinstall {noun}")
             } else {
-                "Install plugin"
-            }
-            .into(),
+                format!("Install {noun}")
+            },
             detail: plugin
                 .get("version")
                 .and_then(|value| value.as_str())

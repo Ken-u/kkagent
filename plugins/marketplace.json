@@ -60,6 +60,16 @@
       "description": "Official example internal-subagent plugin: kk model + tool allowlist + plugin-private lazy MCP for wiki lookup.",
       "keywords": ["subagent", "internal", "mcp", "wiki", "example"],
       "source": "./official/kk-wiki-agent"
+    },
+    {
+      "id": "kk-changelog",
+      "type": "skill",
+      "tier": "official",
+      "displayName": "KK Changelog",
+      "version": "1.0.0",
+      "description": "Official example skill: drafts changelog entries and release notes from the git history since the last tag.",
+      "keywords": ["skill", "changelog", "release-notes", "example"],
+      "source": "./official/kk-changelog"
     }
   ]
 }

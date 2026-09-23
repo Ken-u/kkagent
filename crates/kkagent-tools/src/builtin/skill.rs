@@ -367,15 +367,18 @@ async fn read_bounded_utf8(path: &Path, limit: u64) -> anyhow::Result<String> {
     Ok(tokio::fs::read_to_string(path).await?)
 }
 
-#[derive(Default)]
-struct SkillMetadata {
-    name: Option<String>,
-    description: Option<String>,
-    version: Option<String>,
-    triggers: Vec<String>,
+#[derive(Debug, Default, Clone)]
+pub struct SkillMetadata {
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub version: Option<String>,
+    pub triggers: Vec<String>,
 }
 
-fn parse_frontmatter(content: &str) -> SkillMetadata {
+/// Parse the leading `---` frontmatter block of a `SKILL.md`. Public so the
+/// marketplace can validate a skill package with the same rules the catalog
+/// discovers it by.
+pub fn parse_frontmatter(content: &str) -> SkillMetadata {
     let mut lines = content.lines();
     if lines.next().map(str::trim) != Some("---") {
         return SkillMetadata::default();

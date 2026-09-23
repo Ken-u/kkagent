@@ -279,7 +279,7 @@ triggers: [review, release]
 
 Skill 名只能包含 ASCII 字母、数字、`-`、`_`。`SKILL.md` 最大 256 KiB；目录中的资源会被列给模型，`Skill` 工具可用 `resource` 参数读取最大 1 MiB 的 UTF-8 文本资源，并阻止绝对路径、`..` 和符号链接逃逸。每次列出或加载都会重新扫描，因此编辑无需重启。
 
-同名优先级为项目 `.kkagent` > 项目 `.agents` > 项目 `.kimi` > `extra_skill_dirs` > 用户目录。独立 Server 会按每个 Session workspace 单独发现。Skill 不会绕过工具权限；`merge_all_available_skills = true` 会增加初始上下文占用。
+同名优先级为项目 `.kkagent` > 项目 `.agents` > 项目 `.kimi` > 插件市场安装的 Skill（`~/.kkagent/plugins/skills/`）> `extra_skill_dirs` > 用户目录。独立 Server 会按每个 Session workspace 单独发现。Skill 不会绕过工具权限；`merge_all_available_skills = true` 会增加初始上下文占用。
 
 ## Hooks
 
@@ -498,16 +498,29 @@ Marketplace JSON 至少包含 `id` 和 `source`：
   "plugins": [
     {
       "id": "code-search",
+      "type": "plugin",
       "tier": "curated",
       "displayName": "Code Search",
       "version": "1.2.0",
       "description": "Search remote source indexes",
       "keywords": ["code-search"],
       "source": "./code-search"
+    },
+    {
+      "id": "release-notes",
+      "type": "skill",
+      "tier": "curated",
+      "displayName": "Release Notes",
+      "version": "1.0.0",
+      "description": "Draft release notes from the git history",
+      "keywords": ["skill", "changelog"],
+      "source": "./release-notes"
     }
   ]
 }
 ```
+
+`type` 省略时按 `plugin` 处理，只接受 `plugin` 与 `skill` 两种。
 
 本地 marketplace 的 `source` 支持相对目录或 ZIP、绝对路径和 `file://`；远程
 marketplace 的相对 `source` 应指向 ZIP。也支持普通 HTTP(S) ZIP，以及 GitHub /
@@ -519,6 +532,15 @@ release tag 和 commit URL。多插件单体仓库用 `tree/<branch>/<plugin-dir
 验证 `kk.plugin.json` 后复制到 `~/.kkagent/plugins/managed/<id>/`，再原子更新
 `~/.kkagent/plugins/installed.json`；失败时恢复原版本。ZIP 下载限制为 64 MiB、解压后
 限制为 256 MiB/10000 个文件，并拒绝路径逃逸与符号链接。
+
+`type = "skill"` 的条目安装的是 Skill 包而不是插件：源目录（或 ZIP、forge 子目录）
+必须带 `SKILL.md`，其中的 `name` 必须等于条目 `id`，`version` 用作已安装版本号。
+安装位置是 `~/.kkagent/plugins/skills/<id>/`，Server 会把该目录追加到 Skill 搜索
+路径（位于用户 `~/.kkagent/skills/` 之后、项目 `.kkagent/skills/` 之前，因此项目内
+同名 Skill 会覆盖市场安装的版本）。同一份 `installed.json` 用 `kind` 字段区分两类
+记录；禁用记录只写在本条 `enabled` 上，因此移除市场安装的 Skill 会连同目录一起删除
+（插件的目录会保留）。未显式声明 `type` 时，直接安装（`/plugins install <源>`）按
+包内容自动判断：有 `kk.plugin.json` 装成插件，否则有 `SKILL.md` 装成 Skill。
 
 直接执行 `/plugins` 会打开多级管理弹窗：首页可进入已安装插件、插件市场，也可添加
 marketplace、从本地目录/ZIP/GitHub 来源安装或重新加载。选择 marketplace 后会先显示
