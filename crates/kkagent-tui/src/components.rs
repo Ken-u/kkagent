@@ -1795,46 +1795,30 @@ fn render_subagent_strip(f: &mut Frame, area: Rect, state: &AppState, theme: &Th
 }
 
 fn todo_panel_height(state: &AppState, terminal_width: u16) -> u16 {
-    if !todo_panel_visible(state) {
-        return 0;
-    }
-    // separator + title + rows (+ optional overflow hint)
-    let rows = if state.todos_expanded {
-        state.todos.len()
-    } else {
-        state.todos.len().min(TODO_MAX_VISIBLE)
-    };
-    let toggle_hint = state.todos.len() > TODO_MAX_VISIBLE;
-    if !is_narrow(terminal_width) {
-        return (2 + rows + usize::from(toggle_hint)) as u16;
-    }
-
-    let content_width = terminal_width.saturating_sub(4).max(1) as usize;
-    let visible = if state.todos_expanded {
-        (0..state.todos.len()).collect::<Vec<_>>()
-    } else {
-        select_visible_todos(&state.todos).indices
-    };
-    let wrapped_rows = visible.iter().fold(0u16, |height, index| {
-        let width = state
-            .todos
-            .get(*index)
-            .map(|todo| UnicodeWidthStr::width(todo.content.as_str()))
-            .unwrap_or(0);
-        height.saturating_add(width.max(1).div_ceil(content_width) as u16)
-    });
-    2u16.saturating_add(wrapped_rows)
-        .saturating_add(u16::from(toggle_hint))
+    todo_panel_lines(state, terminal_width, &Theme::default())
+        .len()
+        .min(u16::MAX as usize) as u16
 }
 
 fn render_todo_panel(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     if area.height == 0 || !todo_panel_visible(state) {
         return;
     }
+    f.render_widget(Clear, area);
+    f.render_widget(
+        Paragraph::new(todo_panel_lines(state, area.width, theme)),
+        area,
+    );
+}
+
+fn todo_panel_lines(state: &AppState, width: u16, theme: &Theme) -> Vec<Line<'static>> {
+    if width == 0 || !todo_panel_visible(state) {
+        return Vec::new();
+    }
 
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::from(Span::styled(
-        "─".repeat(area.width as usize),
+        "─".repeat(width as usize),
         Style::default().fg(theme.border),
     )));
     lines.push(Line::from(Span::styled(
@@ -1889,10 +1873,11 @@ fn render_todo_panel(f: &mut Frame, area: Rect, state: &AppState, theme: &Theme)
         )));
     }
 
-    f.render_widget(
-        Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false }),
-        area,
-    );
+    lines
+        .into_iter()
+        .flat_map(|line| crate::markdown::wrap_spans(&line.spans, width as usize))
+        .map(Line::from)
+        .collect()
 }
 
 fn todo_panel_visible(state: &AppState) -> bool {
@@ -1927,11 +1912,15 @@ fn todo_row_line(todo: &TodoItem, theme: &Theme) -> Line<'static> {
             Style::default().fg(theme.text),
         ),
     };
+    let content = crate::sanitize::sanitize_text(&todo.content)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
     Line::from(vec![
         Span::raw("  "),
         Span::styled(marker.to_string(), marker_style),
         Span::raw(" "),
-        Span::styled(todo.content.clone(), title_style),
+        Span::styled(content, title_style),
     ])
 }
 
@@ -4882,6 +4871,127 @@ mod render_smoke {
             .collect();
         state.todos_expanded = true;
         assert_eq!(todo_panel_height(&state, 80), 9);
+    }
+
+    #[test]
+    fn expanded_todos_do_not_emit_carriage_returns() {
+        use ratatui::{backend::CrosstermBackend, TerminalOptions, Viewport};
+
+        let mut state = AppState::new(PermissionMode::Manual, false);
+        state.todos = vec![TodoItem {
+            id: "one".into(),
+            content: "审核\r 5\r 个\r SSH\r 提交的完整\r diff".into(),
+            status: "completed".into(),
+        }];
+        let mut output = Vec::new();
+        {
+            let mut terminal = Terminal::with_options(
+                CrosstermBackend::new(&mut output),
+                TerminalOptions {
+                    viewport: Viewport::Fixed(Rect::new(0, 0, 100, 24)),
+                },
+            )
+            .unwrap();
+            terminal
+                .draw(|frame| render_ui(frame, &mut state, &AppConfig::default()))
+                .unwrap();
+            state.todos_expanded = true;
+            terminal
+                .draw(|frame| render_ui(frame, &mut state, &AppConfig::default()))
+                .unwrap();
+        }
+        assert!(
+            !output.contains(&b'\r'),
+            "raw carriage return in terminal output: {:?}",
+            String::from_utf8_lossy(&output)
+        );
+    }
+
+    #[test]
+    fn todo_labels_strip_escapes_and_flatten_layout_controls() {
+        let todo = TodoItem {
+            id: "one".into(),
+            content: "审核\r 5\r\n 个\n SSH\t 提交\x1b[2J的完整\x1b]0;injected\x07 diff\0".into(),
+            status: "completed".into(),
+        };
+        let line = todo_row_line(&todo, &Theme::default());
+        assert_eq!(line.to_string(), "  ✓ 审核 5 个 SSH 提交的完整 diff�");
+        assert!(!line.to_string().chars().any(char::is_control));
+        assert!(line
+            .spans
+            .last()
+            .unwrap()
+            .style
+            .add_modifier
+            .contains(Modifier::CROSSED_OUT));
+    }
+
+    #[test]
+    fn long_todo_rows_contribute_wrapped_height() {
+        let mut state = AppState::new(PermissionMode::Manual, false);
+        state.todos = vec![TodoItem {
+            id: "one".into(),
+            content: format!("{}END", "检查\r Unicode e\u{301} mixed text ".repeat(6)),
+            status: "in_progress".into(),
+        }];
+        assert!(todo_panel_height(&state, 80) > 3);
+        for width in [20, 40, 48, 80, 120] {
+            let height = todo_panel_height(&state, width);
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|frame| {
+                    let area = frame.area();
+                    render_todo_panel(frame, area, &state, &Theme::default());
+                })
+                .unwrap();
+            let rows = buffer_rows(terminal.backend().buffer());
+            assert!(rows.last().unwrap().contains("END"), "{width}: {rows:?}");
+            assert!(rows.iter().all(|row| !row.chars().any(char::is_control)));
+        }
+    }
+
+    #[test]
+    fn opening_todos_replaces_transcript_cells_and_keeps_input_visible() {
+        for (width, height) in [(32, 16), (80, 24), (120, 32)] {
+            let mut state = AppState::new(PermissionMode::Manual, false);
+            state.messages.push(DisplayMessage {
+                role: MessageRole::Assistant,
+                content: "TRANSCRIPT_ONLY\n\n".repeat(30),
+                thinking: None,
+                parts: Vec::new(),
+                tool_calls: Vec::new(),
+                delivery: crate::prompt_queue::DeliveryState::Sent,
+                idempotency_key: None,
+            });
+            state.todos = (0..4)
+                .map(|index| TodoItem {
+                    id: index.to_string(),
+                    content: format!("任务\r {index}\r TASK_END"),
+                    status: "completed".into(),
+                })
+                .collect();
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            for expanded in [false, true, false, true] {
+                state.todos_expanded = expanded;
+                terminal
+                    .draw(|frame| render_ui(frame, &mut state, &AppConfig::default()))
+                    .unwrap();
+                let rows = buffer_rows(terminal.backend().buffer());
+                assert!(rows.iter().any(|row| row.contains("message")), "{rows:?}");
+                if expanded {
+                    let title = rows.iter().position(|row| row.contains("Todo")).unwrap();
+                    assert!(!rows[title..]
+                        .iter()
+                        .any(|row| row.contains("TRANSCRIPT_ONLY")));
+                    assert_eq!(
+                        rows.iter().filter(|row| row.contains("TASK_END")).count(),
+                        4
+                    );
+                } else {
+                    assert!(!rows.iter().any(|row| row.contains("TASK_END")));
+                }
+            }
+        }
     }
 
     #[test]

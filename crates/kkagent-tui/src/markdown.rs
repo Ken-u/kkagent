@@ -1007,7 +1007,7 @@ fn find_trailing_line_comment(line: &str, hash: bool, c_style: bool) -> Option<u
     None
 }
 
-fn wrap_spans(spans: &[Span<'static>], max_width: usize) -> Vec<Vec<Span<'static>>> {
+pub(crate) fn wrap_spans(spans: &[Span<'static>], max_width: usize) -> Vec<Vec<Span<'static>>> {
     if max_width == 0 {
         return vec![spans.to_vec()];
     }
