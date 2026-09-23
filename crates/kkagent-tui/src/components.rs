@@ -4410,7 +4410,9 @@ fn render_question_panel(f: &mut Frame, area: Rect, question: &mut PendingQuesti
     }
 
     lines.push(Line::from(""));
-    let hint = if question.allow_multiple {
+    let hint = if question.submitting {
+        "  Sending answer… esc interrupt · Ctrl-C quit"
+    } else if question.allow_multiple {
         if panel_width < 42 {
             "  1-9 / space · enter · esc"
         } else {
@@ -4584,6 +4586,7 @@ mod render_smoke {
             allow_multiple: false,
             selected: 0,
             free_text: String::new(),
+            submitting: false,
         }
     }
 
@@ -4655,6 +4658,26 @@ mod render_smoke {
         assert!(rendered.contains("wrap onto another"), "{rendered:?}");
         assert!(rendered.contains("OPTION_TAIL"), "{rendered:?}");
         assert!(rendered.contains("enter confirm"), "{rendered:?}");
+    }
+
+    #[test]
+    fn question_modal_shows_in_flight_answer_controls() {
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let mut question = pending_question("Continue?", Vec::new());
+        question.allow_free_text = true;
+        question.free_text = "keep my answer".into();
+        question.submitting = true;
+        terminal
+            .draw(|frame| {
+                render_question_panel(frame, frame.area(), &mut question, &Theme::default());
+            })
+            .unwrap();
+        let rendered = buffer_text(&terminal);
+        assert!(rendered.contains("keep my answer"));
+        assert!(rendered.contains("Sending answer"));
+        assert!(rendered.contains("esc interrupt"));
+        assert!(rendered.contains("Ctrl-C quit"));
+        assert!(!rendered.contains("enter confirm"));
     }
 
     #[test]
@@ -5328,6 +5351,7 @@ mod render_smoke {
             selected: 0,
             toggled: vec![false, false],
             free_text: String::new(),
+            submitting: false,
         });
         terminal
             .draw(|frame| render_ui(frame, &mut state, &AppConfig::default()))

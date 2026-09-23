@@ -1203,6 +1203,7 @@ pub struct PendingQuestion {
     pub selected: usize,
     pub toggled: Vec<bool>,
     pub free_text: String,
+    pub submitting: bool,
 }
 
 impl AppState {
@@ -2356,6 +2357,7 @@ impl TuiApp {
                 outcome.payload,
                 crate::async_jobs::JobPayload::LocalShell { .. }
                     | crate::async_jobs::JobPayload::Prompt { .. }
+                    | crate::async_jobs::JobPayload::QuestionReply { .. }
                     | crate::async_jobs::JobPayload::PluginAction { .. }
             );
             // Local shells and prompts from different sessions may complete out of
@@ -2620,6 +2622,14 @@ impl TuiApp {
                             }
                         }
                     }
+                }
+                crate::async_jobs::JobPayload::QuestionReply {
+                    session_id,
+                    response,
+                    result,
+                } => {
+                    self.jobs.mark_done(channel, generation);
+                    self.apply_question_reply(&session_id, response, result);
                 }
                 crate::async_jobs::JobPayload::LocalShell { command, result } => {
                     self.jobs.mark_done(channel, generation);
@@ -3779,6 +3789,7 @@ impl TuiApp {
         if !matches!(self.state.status, SessionStatus::Idle)
             && matches!(key.code, KeyCode::Esc)
             && !visible_approval_pending
+            && self.state.question_pending.is_none()
         {
             if let Some(sid) = self.state.session_id.clone() {
                 match self.client.interrupt_with_source(&sid, "tui-esc").await {
@@ -3951,9 +3962,11 @@ impl TuiApp {
             return Ok(());
         }
 
-        // Handle question panel (only when no visible approval modal).
-        if self.state.question_pending.is_some() {
-            return self.handle_question_key(key).await;
+        // Ctrl+C must reach quit handling even while an answer is in flight.
+        if self.state.question_pending.is_some()
+            && !(key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
+        {
+            return self.handle_question_key(key);
         }
 
         // Subagents browser overlay (`/agents`)
@@ -9277,6 +9290,7 @@ impl TuiApp {
                 }
             }
         }
+        let refreshing_current = self.state.session_id.as_deref() == Some(sid.as_str());
         self.state.session_id = Some(sid.clone());
         // Resuming a session re-opens its tab: clear any closed-tab tombstone
         // so subsequent refreshes show the indicator again.
@@ -9325,7 +9339,9 @@ impl TuiApp {
                 SessionStatus::Idle
             });
         self.state.approval_pending = self.state.parked_approvals.remove(&sid);
-        self.state.question_pending = self.state.parked_questions.remove(&sid);
+        if !refreshing_current || self.state.question_pending.is_none() {
+            self.state.question_pending = self.state.parked_questions.remove(&sid);
+        }
         if let Some(value) = data.get("pending_approval") {
             self.state.approval_pending = if value.is_null() {
                 None
@@ -9349,6 +9365,14 @@ impl TuiApp {
                 serde_json::from_value::<kkagent_protocol::QuestionPayload>(value.clone())
                     .ok()
                     .map(|question| {
+                        if let Some(pending) = self
+                            .state
+                            .question_pending
+                            .take()
+                            .filter(|pending| pending.question_id == question.question_id)
+                        {
+                            return pending;
+                        }
                         let options: Vec<(String, String)> = question
                             .options
                             .into_iter()
@@ -9364,6 +9388,7 @@ impl TuiApp {
                             selected: 0,
                             toggled,
                             free_text: String::new(),
+                            submitting: false,
                         }
                     })
             };
@@ -12854,17 +12879,34 @@ impl TuiApp {
         Ok(())
     }
 
-    async fn handle_question_key(&mut self, key: KeyEvent) -> anyhow::Result<()> {
+    fn handle_question_key(&mut self, key: KeyEvent) -> anyhow::Result<()> {
         let Some(ref mut q) = self.state.question_pending else {
             return Ok(());
         };
+        if q.submitting {
+            if key.code == KeyCode::Esc && self.state.status != SessionStatus::Cancelling {
+                if let Some(sid) = self.state.session_id.clone() {
+                    self.jobs.spawn_rpc(
+                        self.client.requester(),
+                        crate::async_jobs::JobChannel::Interrupt,
+                        "session.interrupt",
+                        Some(serde_json::json!({"session_id": sid, "source": "tui-esc"})),
+                        None,
+                        false,
+                    );
+                    self.state.status = SessionStatus::Cancelling;
+                    self.sync_active_session_status();
+                }
+            }
+            return Ok(());
+        }
         let n = q.options.len();
         let free_row = if q.allow_free_text { 1 } else { 0 };
         let max_row = n.saturating_add(free_row).saturating_sub(1);
 
         match key.code {
             KeyCode::Esc => {
-                self.respond_question(true).await?;
+                self.respond_question(true);
             }
             KeyCode::Up if q.selected > 0 => {
                 q.selected -= 1;
@@ -12878,7 +12920,8 @@ impl TuiApp {
                 }
             }
             KeyCode::Enter => {
-                if !q.allow_multiple && q.selected < n && !q.toggled.iter().any(|t| *t) {
+                if !q.allow_multiple && q.selected < n {
+                    q.toggled.fill(false);
                     if let Some(t) = q.toggled.get_mut(q.selected) {
                         *t = true;
                     }
@@ -12891,15 +12934,27 @@ impl TuiApp {
                     // Require at least one selection or free text for multi.
                     return Ok(());
                 }
-                self.respond_question(false).await?;
+                self.respond_question(false);
             }
-            KeyCode::Char(c) if q.allow_free_text && q.selected >= n => {
+            KeyCode::Char(c)
+                if q.allow_free_text
+                    && q.selected >= n
+                    && !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
                 q.free_text.push(c);
             }
             KeyCode::Backspace if q.allow_free_text && q.selected >= n => {
                 q.free_text.pop();
             }
-            KeyCode::Char(c) if c.is_ascii_digit() && n > 0 => {
+            KeyCode::Char(c)
+                if ('1'..='9').contains(&c)
+                    && n > 0
+                    && !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
                 let idx = (c as u8 - b'1') as usize;
                 if idx < n {
                     if q.allow_multiple {
@@ -12913,7 +12968,7 @@ impl TuiApp {
                         if let Some(t) = q.toggled.get_mut(idx) {
                             *t = true;
                         }
-                        self.respond_question(false).await?;
+                        self.respond_question(false);
                     }
                 }
             }
@@ -12922,71 +12977,108 @@ impl TuiApp {
         Ok(())
     }
 
-    async fn respond_question(&mut self, cancelled: bool) -> anyhow::Result<()> {
-        let Some(q) = self.state.question_pending.take() else {
-            return Ok(());
-        };
+    fn respond_question(&mut self, cancelled: bool) {
         let Some(sid) = self.state.session_id.clone() else {
             self.system_message("No session for question.".into());
-            return Ok(());
+            return;
         };
-
-        let selected_option_ids: Vec<String> = q
+        let Some(q) = self.state.question_pending.as_mut() else {
+            return;
+        };
+        if q.submitting {
+            return;
+        }
+        let selected_option_ids = q
             .options
             .iter()
             .zip(q.toggled.iter())
             .filter_map(|((id, _), on)| if *on { Some(id.clone()) } else { None })
             .collect();
-        let answer_preview = {
-            let labels: Vec<&str> = q
-                .options
-                .iter()
-                .zip(q.toggled.iter())
-                .filter_map(|((_, label), on)| if *on { Some(label.as_str()) } else { None })
-                .collect();
-            let mut parts = labels;
-            let free = q.free_text.trim();
-            if !free.is_empty() {
-                parts.push(free);
-            }
-            parts.join(", ")
+        let free_text = q.free_text.trim();
+        let response = kkagent_protocol::QuestionResponse {
+            question_id: q.question_id.clone(),
+            selected_option_ids,
+            free_text: (!free_text.is_empty()).then(|| free_text.to_string()),
+            cancelled,
         };
-        let free_text = {
-            let t = q.free_text.trim();
-            if t.is_empty() {
-                None
-            } else {
-                Some(t.to_string())
-            }
-        };
+        q.submitting = true;
+        self.state.quit_confirm = false;
+        self.jobs
+            .spawn_question_reply(self.client.requester(), sid, response);
+    }
 
-        if let Err(e) = self
-            .client
-            .respond_question(
-                &sid,
-                kkagent_protocol::QuestionResponse {
-                    question_id: q.question_id.clone(),
-                    selected_option_ids,
-                    free_text,
-                    cancelled,
-                },
-            )
-            .await
-        {
-            self.state.question_pending = Some(q);
-            self.system_message(format!("Question reply failed: {}", e));
-        } else if cancelled {
-            self.state.status = SessionStatus::Cancelling;
-            self.sync_active_session_status();
+    fn apply_question_reply(
+        &mut self,
+        session_id: &str,
+        response: kkagent_protocol::QuestionResponse,
+        result: Result<(), String>,
+    ) {
+        let is_current = self.state.session_id.as_deref() == Some(session_id);
+        let pending = if is_current {
+            self.state.question_pending.as_mut()
         } else {
-            let preview: String = answer_preview.chars().take(80).collect();
-            self.system_message(format!("Answered: {preview}"));
-            // AskUserQuestion itself does not emit Thinking; keep the spinner alive
-            // until the next StatusUpdate / tool event arrives.
-            self.state.status = SessionStatus::Thinking;
-            self.sync_active_session_status();
+            self.state.parked_questions.get_mut(session_id)
+        };
+        let Some(question) = pending.filter(|q| q.question_id == response.question_id) else {
+            return;
+        };
+        if let Err(error) = result {
+            question.submitting = false;
+            let message = format!("Question reply failed ({session_id}): {error}");
+            if is_current {
+                self.system_message(message.clone());
+            }
+            self.jobs.push_error(None, None, message, false, 0);
+            return;
         }
-        Ok(())
+        let mut parts: Vec<&str> = question
+            .options
+            .iter()
+            .filter(|(id, _)| response.selected_option_ids.contains(id))
+            .map(|(_, label)| label.as_str())
+            .collect();
+        if let Some(free_text) = response.free_text.as_deref() {
+            parts.push(free_text);
+        }
+        let preview: String = parts.join(", ").chars().take(80).collect();
+        let status = if response.cancelled {
+            SessionStatus::Cancelling
+        } else {
+            SessionStatus::Thinking
+        };
+        if is_current {
+            self.state.question_pending = None;
+            if !response.cancelled {
+                self.system_message(format!("Answered: {preview}"));
+            }
+            // Events may have already advanced the turn before its reply arrives.
+            if self.state.status == SessionStatus::WaitingQuestion {
+                self.state.status = status;
+                self.sync_active_session_status();
+            }
+        } else {
+            self.state.parked_questions.remove(session_id);
+            if let Some(runtime) = self.state.session_runtime_states.get_mut(session_id) {
+                if runtime.status == SessionStatus::WaitingQuestion {
+                    runtime.status = status;
+                }
+            }
+        }
+        let status = if is_current {
+            self.state.status
+        } else {
+            status
+        };
+        for tab in &mut self.state.tab_strip.tabs {
+            if tab.id == session_id && tab.status == SessionStatus::WaitingQuestion {
+                tab.status = status;
+            }
+        }
+        for entry in &mut self.state.workspace_sessions.entries {
+            if entry.id == session_id && entry.status == SessionStatus::WaitingQuestion {
+                entry.status = status;
+            }
+        }
     }
 
     fn handle_server_event(&mut self, frame: Frame) {
@@ -13103,6 +13195,7 @@ impl TuiApp {
                                     selected: 0,
                                     toggled,
                                     free_text: String::new(),
+                                    submitting: false,
                                 },
                             );
                             self.state.tab_strip.ensure_tab(&evt_sid, "needs question");
@@ -13394,6 +13487,7 @@ impl TuiApp {
                             selected: 0,
                             toggled,
                             free_text: String::new(),
+                            submitting: false,
                         };
                         self.state.question_pending = Some(pending);
                         self.state.status = SessionStatus::WaitingQuestion;
@@ -17042,6 +17136,390 @@ mod app_state_tests {
     }
 
     #[tokio::test]
+    async fn question_reply_does_not_block_event_delivery() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let (client_transport, server_transport) =
+            kkagent_rpc::transport::memory::create_memory_pair();
+        let (event_tx, event_rx) = tokio::sync::mpsc::channel(1);
+        let rpc = kkagent_rpc::RpcClient::new(client_transport, event_tx);
+        let client = kkagent_client::KkagentClient::new(rpc, event_rx);
+        let server = tokio::spawn(async move {
+            let (read, mut write) = tokio::io::split(server_transport);
+            let mut line = String::new();
+            BufReader::new(read).read_line(&mut line).await.unwrap();
+            let Frame::Call { id, method, params } = serde_json::from_str(&line).unwrap() else {
+                panic!("expected question reply");
+            };
+            assert_eq!(method, "question.respond");
+            assert_eq!(params.unwrap()["free_text"], "继续执行");
+            for _ in 0..2 {
+                write
+                    .write_all(&kkagent_rpc::codec::NdjsonCodec::encode(&Frame::Event {
+                        event: "agent".into(),
+                        scope: None,
+                        data: serde_json::to_value(AgentEvent::MessageDelta {
+                            session_id: "background".into(),
+                            text: "background progress".into(),
+                        })
+                        .unwrap(),
+                    }))
+                    .await
+                    .unwrap();
+            }
+            write
+                .write_all(&kkagent_rpc::codec::NdjsonCodec::encode(&Frame::Result {
+                    id,
+                    data: serde_json::json!({"ok": true}),
+                }))
+                .await
+                .unwrap();
+            std::future::pending::<()>().await;
+        });
+        let mut app = TuiApp::new(AppConfig::default(), client);
+        app.state.session_id = Some("question-session".into());
+        app.state.status = SessionStatus::WaitingQuestion;
+        app.state.question_pending = Some(PendingQuestion {
+            question_id: "q-1".into(),
+            text: "How should we continue?".into(),
+            options: Vec::new(),
+            allow_free_text: true,
+            allow_multiple: false,
+            selected: 0,
+            toggled: Vec::new(),
+            free_text: "继续执行".into(),
+            submitting: false,
+        });
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        )
+        .await;
+        if result.is_err() {
+            server.abort();
+        }
+        result
+            .expect("Enter must not wait for an RPC result behind queued events")
+            .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert_eq!(
+            app.jobs
+                .current_generation(crate::async_jobs::JobChannel::QuestionReply),
+            1
+        );
+        assert!(app.state.question_pending.as_ref().unwrap().submitting);
+        app.handle_key(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert!(app.force_full_redraw);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                while let Ok(event) = app.client.event_rx.try_recv() {
+                    app.handle_server_event(event);
+                }
+                app.drain_job_results().await;
+                if app.state.question_pending.is_none() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(app.state.status, SessionStatus::Thinking);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn question_panel_does_not_swallow_ctrl_c() {
+        let mut app = test_tui_app();
+        app.state.session_id = Some("question-session".into());
+        app.state.status = SessionStatus::WaitingQuestion;
+        app.state.question_pending = Some(PendingQuestion {
+            question_id: "q-1".into(),
+            text: "How should we continue?".into(),
+            options: Vec::new(),
+            allow_free_text: true,
+            allow_multiple: false,
+            selected: 0,
+            toggled: Vec::new(),
+            free_text: "keep my answer".into(),
+            submitting: false,
+        });
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+        assert!(app.state.quit_confirm);
+        assert_eq!(
+            app.state.question_pending.as_ref().unwrap().free_text,
+            "keep my answer"
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+        assert!(app.state.quit_dialog.is_some());
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert!(app.state.question_pending.as_ref().unwrap().submitting);
+        for _ in 0..2 {
+            app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
+                .await
+                .unwrap();
+        }
+        assert!(app.state.quit_dialog.is_some());
+        assert_eq!(
+            app.state.question_pending.as_ref().unwrap().free_text,
+            "keep my answer"
+        );
+    }
+
+    fn question_reply_app() -> TuiApp {
+        let mut app = test_tui_app();
+        app.state.session_id = Some("question-session".into());
+        app.state.status = SessionStatus::WaitingQuestion;
+        app.state.question_pending = Some(PendingQuestion {
+            question_id: "q-1".into(),
+            text: "How should we continue?".into(),
+            options: vec![("yes".into(), "Yes".into())],
+            allow_free_text: true,
+            allow_multiple: true,
+            selected: 1,
+            toggled: vec![true],
+            free_text: "keep my answer".into(),
+            submitting: false,
+        });
+        app
+    }
+
+    fn question_reply_response() -> kkagent_protocol::QuestionResponse {
+        kkagent_protocol::QuestionResponse {
+            question_id: "q-1".into(),
+            selected_option_ids: vec!["yes".into()],
+            free_text: Some("keep my answer".into()),
+            cancelled: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn question_reply_failure_keeps_draft_and_allows_retry() {
+        let mut app = question_reply_app();
+        app.respond_question(false);
+        app.apply_question_reply(
+            "question-session",
+            question_reply_response(),
+            Err("offline".into()),
+        );
+        let question = app.state.question_pending.as_ref().unwrap();
+        assert!(!question.submitting);
+        assert_eq!(question.free_text, "keep my answer");
+        assert_eq!(question.toggled, [true]);
+        assert_eq!(question.selected, 1);
+        app.handle_question_key(KeyEvent::new(KeyCode::Char('!'), KeyModifiers::NONE))
+            .unwrap();
+        app.handle_question_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(
+            app.state.question_pending.as_ref().unwrap().free_text,
+            "keep my answer!"
+        );
+        assert!(app.state.question_pending.as_ref().unwrap().submitting);
+        assert_eq!(
+            app.jobs
+                .current_generation(crate::async_jobs::JobChannel::QuestionReply),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn question_reply_retry_uses_the_new_single_selection() {
+        let mut app = question_reply_app();
+        let question = app.state.question_pending.as_mut().unwrap();
+        question.options.push(("no".into(), "No".into()));
+        question.toggled = vec![true, false];
+        question.allow_multiple = false;
+        question.selected = 0;
+        app.respond_question(false);
+        app.apply_question_reply(
+            "question-session",
+            question_reply_response(),
+            Err("offline".into()),
+        );
+        app.handle_question_key(KeyEvent::new(KeyCode::Char('0'), KeyModifiers::NONE))
+            .unwrap();
+        app.handle_question_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+            .unwrap();
+        app.handle_question_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(
+            app.state.question_pending.as_ref().unwrap().toggled,
+            [false, true]
+        );
+    }
+
+    #[tokio::test]
+    async fn question_escape_cancels_then_interrupts_without_waiting() {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+
+        let (client_transport, server_transport) =
+            kkagent_rpc::transport::memory::create_memory_pair();
+        let (event_tx, event_rx) = tokio::sync::mpsc::channel(1);
+        let mut app = question_reply_app();
+        app.client = kkagent_client::KkagentClient::new(
+            kkagent_rpc::RpcClient::new(client_transport, event_tx),
+            event_rx,
+        );
+        let mut reader = BufReader::new(server_transport);
+        for method in ["question.respond", "session.interrupt"] {
+            tokio::time::timeout(
+                std::time::Duration::from_millis(250),
+                app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            )
+            .await
+            .expect("Esc must not wait for RPC")
+            .unwrap();
+            let mut line = String::new();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                reader.read_line(&mut line),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let Frame::Call {
+                method: actual,
+                params,
+                ..
+            } = serde_json::from_str(&line).unwrap()
+            else {
+                panic!("expected RPC call");
+            };
+            assert_eq!(actual, method);
+            let params = params.unwrap();
+            assert_eq!(params["session_id"], "question-session");
+            if method == "question.respond" {
+                assert_eq!(params["cancelled"], true);
+            } else {
+                assert_eq!(params["source"], "tui-esc");
+            }
+        }
+        assert_eq!(app.state.status, SessionStatus::Cancelling);
+    }
+
+    #[tokio::test]
+    async fn question_reply_ignores_new_questions_and_finished_turns() {
+        for result in [Ok(()), Err("offline".into())] {
+            let mut app = question_reply_app();
+            app.state.question_pending.as_mut().unwrap().question_id = "q-2".into();
+            app.apply_question_reply(
+                "question-session",
+                question_reply_response(),
+                result.clone(),
+            );
+            assert_eq!(
+                app.state.question_pending.as_ref().unwrap().question_id,
+                "q-2"
+            );
+            assert_eq!(app.state.status, SessionStatus::WaitingQuestion);
+            app.handle_server_event(Frame::Event {
+                event: "agent".into(),
+                scope: None,
+                data: serde_json::to_value(AgentEvent::TurnEnd {
+                    session_id: "question-session".into(),
+                })
+                .unwrap(),
+            });
+            app.apply_question_reply("question-session", question_reply_response(), result);
+            assert!(app.state.question_pending.is_none());
+            assert_eq!(app.state.status, SessionStatus::Idle);
+        }
+    }
+
+    #[tokio::test]
+    async fn question_reply_does_not_regress_newer_status() {
+        for status in [
+            SessionStatus::ToolExecuting,
+            SessionStatus::WaitingApproval,
+            SessionStatus::Cancelling,
+        ] {
+            let mut app = question_reply_app();
+            app.state.status = status;
+            app.apply_question_reply("question-session", question_reply_response(), Ok(()));
+            assert!(app.state.question_pending.is_none());
+            assert_eq!(app.state.status, status);
+        }
+    }
+
+    #[tokio::test]
+    async fn question_reply_updates_only_its_parked_session() {
+        for result in [Ok(()), Err("offline".into())] {
+            let mut app = question_reply_app();
+            app.respond_question(false);
+            let question = app.state.question_pending.take().unwrap();
+            app.state
+                .parked_questions
+                .insert("question-session".into(), question);
+            app.state.session_runtime_states.insert(
+                "question-session".into(),
+                SessionRuntimeState::capture(&app.state),
+            );
+            app.state.session_id = Some("other-session".into());
+            app.state.status = SessionStatus::Idle;
+            app.apply_question_reply(
+                "question-session",
+                question_reply_response(),
+                result.clone(),
+            );
+            assert_eq!(app.state.status, SessionStatus::Idle);
+            assert!(app.state.question_pending.is_none());
+            if result.is_ok() {
+                assert!(!app.state.parked_questions.contains_key("question-session"));
+                assert_eq!(
+                    app.state.session_runtime_states["question-session"].status,
+                    SessionStatus::Thinking
+                );
+            } else {
+                let question = &app.state.parked_questions["question-session"];
+                assert!(!question.submitting);
+                assert_eq!(question.free_text, "keep my answer");
+                assert_eq!(
+                    app.state.session_runtime_states["question-session"].status,
+                    SessionStatus::WaitingQuestion
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn question_resume_keeps_in_flight_answer_and_selection() {
+        let mut app = question_reply_app();
+        app.respond_question(false);
+        app.apply_session_resume_data(
+            "question-session",
+            serde_json::json!({
+                "session_id": "question-session", "messages": [], "turn_active": true,
+                "pending_question": {
+                    "question_id": "q-1", "text": "How should we continue?",
+                    "options": [{"id": "yes", "label": "Yes"}],
+                    "allow_free_text": true, "allow_multiple": true
+                }
+            }),
+        )
+        .await
+        .unwrap();
+        let question = app.state.question_pending.as_ref().unwrap();
+        assert!(question.submitting);
+        assert_eq!(question.free_text, "keep my answer");
+        assert_eq!(question.toggled, [true]);
+        assert_eq!(question.selected, 1);
+    }
+
+    #[tokio::test]
     async fn resume_restores_ask_user_question_panel() {
         let mut app = test_tui_app();
         app.apply_session_resume_data(
@@ -17481,6 +17959,7 @@ mod app_state_tests {
             selected: 0,
             toggled: vec![false],
             free_text: String::new(),
+            submitting: false,
         });
         app.state.btw_hid_approval = true;
 
@@ -17513,6 +17992,7 @@ mod app_state_tests {
                 selected: 0,
                 toggled: Vec::new(),
                 free_text: String::new(),
+                submitting: false,
             },
         );
         app.handle_server_event(Frame::Event {

@@ -32,6 +32,7 @@ pub enum JobChannel {
     McpStatus,
     McpList,
     Prompt,
+    QuestionReply,
     Compact,
     Interrupt,
     LocalShell,
@@ -53,6 +54,7 @@ impl JobChannel {
             Self::McpStatus => "Connecting MCP",
             Self::McpList => "Loading MCP",
             Self::Prompt => "Sending prompt",
+            Self::QuestionReply => "Sending answer",
             Self::Compact => "Compacting",
             Self::Interrupt => "Interrupting",
             Self::LocalShell => "Running shell",
@@ -91,6 +93,11 @@ pub enum JobPayload {
         /// fails with a transient busy error instead of losing it.
         text: String,
         images: Vec<(String, String)>,
+        result: Result<(), String>,
+    },
+    QuestionReply {
+        session_id: String,
+        response: kkagent_protocol::QuestionResponse,
         result: Result<(), String>,
     },
     LocalShell {
@@ -551,6 +558,57 @@ impl AsyncJobHub {
             });
         });
         generation
+    }
+
+    pub fn spawn_question_reply(
+        &mut self,
+        requester: KkagentRequester,
+        session_id: String,
+        response: kkagent_protocol::QuestionResponse,
+    ) {
+        let channel = JobChannel::QuestionReply;
+        let generation = self.next_generation(channel);
+        let started = Instant::now();
+        self.pending.insert(
+            channel,
+            PendingJob {
+                channel,
+                generation,
+                label: channel.label().into(),
+                started,
+                retryable: false,
+                retry_method: None,
+                retry_params: None,
+            },
+        );
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let params = serde_json::json!({
+                "session_id": session_id,
+                "question_id": response.question_id,
+                "selected_option_ids": response.selected_option_ids,
+                "free_text": response.free_text,
+                "cancelled": response.cancelled,
+            });
+            let result = requester
+                .rpc_call("question.respond", Some(params))
+                .await
+                .map(|_| ())
+                .map_err(|error| error.to_string());
+            if let Err(error) = &result {
+                tracing::warn!(%session_id, question_id = %response.question_id, %error, "question reply failed");
+            }
+            let _ = tx.send(JobOutcome {
+                channel,
+                generation,
+                started,
+                payload: JobPayload::QuestionReply {
+                    session_id,
+                    response,
+                    result,
+                },
+            });
+        });
     }
 
     pub fn spawn_prompt(
