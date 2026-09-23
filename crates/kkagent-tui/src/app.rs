@@ -1824,7 +1824,7 @@ impl TuiApp {
 
         if let Some(ref id) = sid {
             if !self.allows_background_detach {
-                let _ = self.client.interrupt(id).await;
+                let _ = self.client.interrupt_with_source(id, "tui-exit").await;
             }
             if empty {
                 let _ = self.discard_session_record(id).await;
@@ -2257,9 +2257,9 @@ impl TuiApp {
         Ok(())
     }
 
-    fn draw_frame(
+    fn draw_frame<W: io::Write>(
         &mut self,
-        terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+        terminal: &mut Terminal<CrosstermBackend<W>>,
     ) -> anyhow::Result<()> {
         // Keep the panic-guard owner fresh: tokio may migrate this task to
         // another worker thread between awaits, and the guard only restores
@@ -2997,7 +2997,7 @@ impl TuiApp {
             0 => {
                 // Terminate: interrupt then exit (server stays up).
                 if let Some(sid) = self.state.session_id.clone() {
-                    if let Err(error) = self.client.interrupt(&sid).await {
+                    if let Err(error) = self.client.interrupt_with_source(&sid, "tui-quit").await {
                         self.system_message(format!("Failed to interrupt turn: {error}"));
                     } else {
                         self.state.status = SessionStatus::Cancelling;
@@ -3781,7 +3781,7 @@ impl TuiApp {
             && !visible_approval_pending
         {
             if let Some(sid) = self.state.session_id.clone() {
-                match self.client.interrupt(&sid).await {
+                match self.client.interrupt_with_source(&sid, "tui-esc").await {
                     Ok(()) => {
                         self.system_message("Interrupted — cancelling in-flight tools…".into());
                     }
@@ -4489,7 +4489,11 @@ impl TuiApp {
                 if self.can_close_current_session_tab() {
                     if session_status_has_active_agent_loop(self.state.status) {
                         if let Some(sid) = self.state.session_id.clone() {
-                            match self.client.interrupt(&sid).await {
+                            match self
+                                .client
+                                .interrupt_with_source(&sid, "tui-close-tab")
+                                .await
+                            {
                                 Ok(()) => {
                                     self.state.status = SessionStatus::Cancelling;
                                     self.state.status_bar.status = SessionStatus::Cancelling;
@@ -4524,7 +4528,7 @@ impl TuiApp {
                 if self.state.status != SessionStatus::Idle {
                     if let Some(sid) = &self.state.session_id {
                         self.state.status = SessionStatus::Cancelling;
-                        self.client.interrupt(sid).await?;
+                        self.client.interrupt_with_source(sid, "tui-esc").await?;
                         self.system_message(
                             "Cancelling… partial output kept. After idle: edit & retry, or /fork."
                                 .into(),
@@ -10729,7 +10733,10 @@ impl TuiApp {
         if self.state.session_id.as_deref() == Some(deleted_id.as_str())
             && !matches!(self.state.status, SessionStatus::Idle)
         {
-            let _ = self.client.interrupt(&deleted_id).await;
+            let _ = self
+                .client
+                .interrupt_with_source(&deleted_id, "tui-delete-session")
+                .await;
         }
 
         let params = serde_json::json!({"session_id": deleted_id});
@@ -17940,6 +17947,114 @@ mod app_state_tests {
         assert_eq!(app.state.todos[0].content, "finish");
         assert_eq!(app.state.status, SessionStatus::Idle);
         assert!(!app.state.background_session_events.contains_key("a"));
+    }
+
+    #[tokio::test]
+    async fn background_todo_update_does_not_replace_active_todos() {
+        let mut app = test_tui_app();
+        app.state.session_id = Some("active".into());
+        app.state.todos = vec![TodoItem {
+            id: "active-todo".into(),
+            content: "active task".into(),
+            status: "in_progress".into(),
+        }];
+        let mut background = AppState::new(PermissionMode::Manual, false);
+        background.session_id = Some("background".into());
+        background.todos = vec![TodoItem {
+            id: "old-background-todo".into(),
+            content: "old background task".into(),
+            status: "pending".into(),
+        }];
+        app.state.session_runtime_states.insert(
+            "background".into(),
+            SessionRuntimeState::capture(&background),
+        );
+
+        app.handle_server_event(Frame::Event {
+            event: "agent".into(),
+            scope: None,
+            data: serde_json::to_value(AgentEvent::TodoUpdated {
+                session_id: "background".into(),
+                items: vec![kkagent_protocol::TodoItemEvent {
+                    id: "background-todo".into(),
+                    content: "background task".into(),
+                    status: "in_progress".into(),
+                }],
+            })
+            .unwrap(),
+        });
+
+        assert_eq!(app.state.todos.len(), 1);
+        assert_eq!(app.state.todos[0].content, "active task");
+        assert_eq!(app.state.background_session_events["background"].len(), 1);
+
+        let cached = app
+            .state
+            .session_runtime_states
+            .remove("background")
+            .unwrap();
+        app.activate_cached_session("background", cached, std::time::Instant::now());
+        assert_eq!(app.state.todos[0].content, "background task");
+    }
+
+    #[tokio::test]
+    async fn ctrl_t_and_f5_render_resumed_todos_without_control_characters() {
+        use ratatui::{layout::Rect, TerminalOptions, Viewport};
+
+        let mut app = test_tui_app();
+        app.apply_session_resume_data(
+            "todo-session",
+            serde_json::json!({
+                "session_id": "todo-session",
+                "messages": [],
+                "todos": [
+                    {"id": "one", "status": "completed", "content": "审核\r 5\r 个\r SSH\r 提交的完整\r diff"},
+                    {"id": "two", "status": "completed", "content": "修复全部问题并通过最小验证"},
+                    {"id": "three", "status": "completed", "content": "完整检查\r\r:\r fmt\r \r+\r clippy\r \r+\r test\r 全部通过"},
+                    {"id": "four", "status": "completed", "content": "创建本地提交\r 4df0bb9"}
+                ]
+            }),
+        )
+        .await
+        .unwrap();
+        let mut output = Vec::new();
+        {
+            let mut terminal = Terminal::with_options(
+                CrosstermBackend::new(&mut output),
+                TerminalOptions {
+                    viewport: Viewport::Fixed(Rect::new(0, 0, 100, 24)),
+                },
+            )
+            .unwrap();
+            app.draw_frame(&mut terminal).unwrap();
+            for _ in 0..2 {
+                app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL))
+                    .await
+                    .unwrap();
+                assert!(app.state.todos_expanded);
+                app.draw_frame(&mut terminal).unwrap();
+                app.handle_key(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE))
+                    .await
+                    .unwrap();
+                assert!(app.force_full_redraw);
+                app.draw_frame(&mut terminal).unwrap();
+                app.force_full_redraw = false;
+                app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL))
+                    .await
+                    .unwrap();
+                assert!(!app.state.todos_expanded);
+                app.draw_frame(&mut terminal).unwrap();
+            }
+        }
+        assert_eq!(app.state.session_id.as_deref(), Some("todo-session"));
+        assert!(app.state.todos[0].content.contains('\r'));
+        assert!(output.contains(&0x1b));
+        assert!(
+            !output
+                .iter()
+                .any(|byte| matches!(byte, b'\r' | b'\n' | b'\t')),
+            "terminal payload contains raw layout controls"
+        );
     }
 
     #[tokio::test]

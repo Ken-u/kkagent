@@ -478,7 +478,7 @@ impl<'a> Driver<'a> {
     }
 
     async fn interrupt(&mut self) {
-        let params = serde_json::json!({"session_id": self.session_id});
+        let params = serde_json::json!({"session_id": self.session_id, "source": "headless"});
         let _ = self
             .requester
             .rpc_call("session.interrupt", Some(params))

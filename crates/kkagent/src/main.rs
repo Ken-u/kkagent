@@ -3234,6 +3234,11 @@ async fn ensure_session_loaded(state: &Arc<ServerState>, session_id: &str) -> Re
         .await
         .insert(session_id.to_string(), session.interrupted.clone());
     state
+        .interrupt_sources
+        .lock()
+        .await
+        .insert(session_id.to_string(), session.interrupt_source.clone());
+    state
         .model_aliases
         .lock()
         .await
@@ -3285,6 +3290,7 @@ async fn remove_session_runtime(state: &Arc<ServerState>, session_id: &str) {
     }
     let removed = state.sessions.lock().await.remove(session_id);
     state.interrupt_flags.lock().await.remove(session_id);
+    state.interrupt_sources.lock().await.remove(session_id);
     state.model_aliases.lock().await.remove(session_id);
     state.fallback_models.lock().await.remove(session_id);
     state.permission_modes.lock().await.remove(session_id);
@@ -3511,6 +3517,11 @@ impl kkagent_acp::AcpHost for AgentAcpHost {
             .await
             .insert(session_id.to_string(), session.interrupted.clone());
         self.state
+            .interrupt_sources
+            .lock()
+            .await
+            .insert(session_id.to_string(), session.interrupt_source.clone());
+        self.state
             .model_aliases
             .lock()
             .await
@@ -3655,6 +3666,11 @@ impl kkagent_acp::AcpHost for AgentAcpHost {
             .cloned()
             .ok_or_else(|| "session not found".to_string())?;
         flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(slot) = self.state.interrupt_sources.lock().await.get(session_id) {
+            if let Ok(mut guard) = slot.lock() {
+                *guard = Some("acp-cancel".into());
+            }
+        }
         if let Some(handle) = self.state.abort_registry.lock().await.remove(session_id) {
             handle.abort();
         }
@@ -4090,6 +4106,11 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
             .await
             .insert(id.clone(), session.interrupted.clone());
         self.state
+            .interrupt_sources
+            .lock()
+            .await
+            .insert(id.clone(), session.interrupt_source.clone());
+        self.state
             .model_aliases
             .lock()
             .await
@@ -4229,6 +4250,7 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
             }
         }
         self.state.interrupt_flags.lock().await.remove(id);
+        self.state.interrupt_sources.lock().await.remove(id);
         self.state.model_aliases.lock().await.remove(id);
         self.state.fallback_models.lock().await.remove(id);
         self.state.permission_modes.lock().await.remove(id);
@@ -4449,7 +4471,7 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
         http_rpc(
             &self.state,
             "session.interrupt",
-            serde_json::json!({"session_id": id}),
+            serde_json::json!({"session_id": id, "source": "http"}),
         )
         .await
     }
@@ -4702,6 +4724,17 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
             .cloned()
         {
             flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        if let Some(slot) = self
+            .state
+            .interrupt_sources
+            .lock()
+            .await
+            .get(&turn.session_id)
+        {
+            if let Ok(mut guard) = slot.lock() {
+                *guard = Some("task-cancel".into());
+            }
         }
         if let Some(handle) = self
             .state
@@ -5397,6 +5430,10 @@ struct ServerState {
     active_btw_sessions: Mutex<HashMap<String, ActiveBtwSession>>,
     /// Interrupt flags remain reachable while the session is out of `sessions` during a turn.
     interrupt_flags: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    /// Shared `Session::interrupt_source` slots — mirrors `interrupt_flags` so
+    /// the RPC layer can attribute a cancellation while the agent loop owns
+    /// the session (consumed there for the "Turn interrupted" log).
+    interrupt_sources: Mutex<HashMap<String, Arc<std::sync::Mutex<Option<String>>>>>,
     /// Model alias handles — reachable mid-turn when session is removed from `sessions`.
     model_aliases: Mutex<HashMap<String, Arc<std::sync::Mutex<String>>>>,
     /// Session fallback policy handles — reachable while a turn owns the Session.
@@ -7184,6 +7221,7 @@ async fn build_server_state_with_shutdown(
         steer_mailboxes: Mutex::new(HashMap::new()),
         active_btw_sessions: Mutex::new(HashMap::new()),
         interrupt_flags: Mutex::new(HashMap::new()),
+        interrupt_sources: Mutex::new(HashMap::new()),
         model_aliases: Mutex::new(HashMap::new()),
         fallback_models: Mutex::new(HashMap::new()),
         permission_modes: Mutex::new(HashMap::new()),
@@ -8815,6 +8853,11 @@ async fn handle_rpc_call(
                 .await
                 .insert(session_id.clone(), session.interrupted.clone());
             state
+                .interrupt_sources
+                .lock()
+                .await
+                .insert(session_id.clone(), session.interrupt_source.clone());
+            state
                 .model_aliases
                 .lock()
                 .await
@@ -9749,6 +9792,11 @@ async fn handle_rpc_call(
                 .await
                 .insert(session_id.clone(), session.interrupted.clone());
             state
+                .interrupt_sources
+                .lock()
+                .await
+                .insert(session_id.clone(), session.interrupt_source.clone());
+            state
                 .model_aliases
                 .lock()
                 .await
@@ -10506,6 +10554,16 @@ async fn handle_rpc_call(
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| (-32602, "Missing session_id".into()))?
                 .to_string();
+            // Optional caller identity (`tui-esc`, `mcp-stop`, `http`, …)
+            // surfaced in the "Turn interrupted" log and TurnEnd hook payload.
+            let source = params
+                .as_ref()
+                .and_then(|p| p.get("source"))
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| "rpc".to_string());
 
             // Always flip the cooperative cancel flag first (works while session is out of the map).
             if let Some(flag) = state.interrupt_flags.lock().await.get(&session_id) {
@@ -10517,7 +10575,14 @@ async fn handle_rpc_call(
                 .set_reconnect_status(&session_id, SessionStatus::Cancelling)
                 .await;
             if let Some(session) = state.sessions.lock().await.get(&session_id) {
-                session.request_interrupt();
+                session.request_interrupt_with_source(&source);
+            }
+            // Session is mid-turn and owned by the agent loop: record the
+            // source on the shared handle so it survives the map round-trip.
+            if let Some(slot) = state.interrupt_sources.lock().await.get(&session_id) {
+                if let Ok(mut guard) = slot.lock() {
+                    *guard = Some(source.clone());
+                }
             }
             // Abort LLM stream task if still registered (no-op once tools are running).
             if let Some(handle) = state.abort_registry.lock().await.remove(&session_id) {
@@ -10525,7 +10590,12 @@ async fn handle_rpc_call(
             }
             // Kill any background Bash jobs owned by this session.
             state.bash_shells.cancel_session(&session_id).await;
-            Ok(serde_json::json!({"ok": true}))
+            tracing::info!(
+                "Interrupt requested for session {} (source: {})",
+                session_id,
+                source
+            );
+            Ok(serde_json::json!({"ok": true, "source": source}))
         }
         "session.btw" => {
             let session_id = params
@@ -13480,6 +13550,11 @@ mod runtime_http_tests {
             .lock()
             .await
             .insert(session_id.into(), session.interrupted.clone());
+        state
+            .interrupt_sources
+            .lock()
+            .await
+            .insert(session_id.into(), session.interrupt_source.clone());
         state
             .approval_txs
             .lock()

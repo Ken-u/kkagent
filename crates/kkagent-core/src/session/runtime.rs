@@ -232,6 +232,11 @@ pub struct Session {
     pub steer_mailbox: SessionSteerMailbox,
     /// Set by session.interrupt — agent loop checks between stream/tool steps.
     pub interrupted: Arc<AtomicBool>,
+    /// Who requested the last interrupt (e.g. `tui-esc`, `mcp-stop`,
+    /// `http`). Shared like `interrupted` so the RPC handler can record it
+    /// while the agent loop owns the session; consumed by the agent loop for
+    /// the "Turn interrupted" log.
+    pub interrupt_source: Arc<std::sync::Mutex<Option<String>>>,
     /// Index of the current turn's user message (set by `begin_turn`).
     turn_message_start: Option<usize>,
     /// File mutations during the in-flight turn.
@@ -318,7 +323,8 @@ impl Session {
     /// Inherit the parent's interrupt flag so an Esc at the root propagates
     /// into every nested subagent session (issues/subagent_issues.md #5).
     /// The child shares the same `Arc<AtomicBool>`: parent interrupts
-    /// interrupt all descendants immediately.
+    /// interrupt all descendants immediately. `interrupt_source` stays
+    /// per-session; the root loop that finalizes the turn logs the source.
     pub fn inherit_interrupted(&mut self, parent: Arc<AtomicBool>) {
         self.interrupted = parent;
     }
@@ -448,6 +454,7 @@ impl Session {
             question_tx,
             steer_mailbox: SessionSteerMailbox::default(),
             interrupted: Arc::new(AtomicBool::new(false)),
+            interrupt_source: Arc::new(std::sync::Mutex::new(None)),
             turn_message_start: None,
             current_turn_changes: Vec::new(),
             undo_stack: Vec::new(),
@@ -823,10 +830,31 @@ impl Session {
 
     pub fn clear_interrupt(&self) {
         self.interrupted.store(false, Ordering::SeqCst);
+        if let Ok(mut source) = self.interrupt_source.lock() {
+            *source = None;
+        }
     }
 
     pub fn request_interrupt(&self) {
         self.interrupted.store(true, Ordering::SeqCst);
+    }
+
+    /// Flag the turn for cancellation and attribute it to `source` (caller
+    /// identity, e.g. `tui-esc` / `mcp-stop` / `http`). The source is consumed
+    /// by the agent loop when the interrupted turn is finalized.
+    pub fn request_interrupt_with_source(&self, source: &str) {
+        self.interrupted.store(true, Ordering::SeqCst);
+        if let Ok(mut slot) = self.interrupt_source.lock() {
+            *slot = Some(source.to_string());
+        }
+    }
+
+    /// Pop the recorded interrupt source, if any.
+    pub fn take_interrupt_source(&self) -> Option<String> {
+        self.interrupt_source
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
     }
 
     pub fn is_interrupted(&self) -> bool {
@@ -2212,6 +2240,28 @@ mod working_directory_tests {
         assert_eq!(restored.content.as_deref(), Some("# Legacy plan\n"));
         assert!(legacy.exists());
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn interrupt_source_roundtrip_and_clear() {
+        let session = Session::new(
+            format!("interrupt-source-{}", uuid::Uuid::new_v4()),
+            std::env::temp_dir(),
+            PermissionMode::Manual,
+            "test-model".into(),
+        );
+        assert!(session.take_interrupt_source().is_none());
+
+        session.request_interrupt_with_source("mcp-stop");
+        assert!(session.is_interrupted());
+        assert_eq!(session.take_interrupt_source().as_deref(), Some("mcp-stop"));
+        // Consumed on take — a stale source cannot leak into the next turn.
+        assert!(session.take_interrupt_source().is_none());
+
+        session.request_interrupt_with_source("tui-esc");
+        session.clear_interrupt();
+        assert!(!session.is_interrupted());
+        assert!(session.take_interrupt_source().is_none());
     }
 
     #[test]

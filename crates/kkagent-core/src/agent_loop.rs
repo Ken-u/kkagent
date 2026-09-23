@@ -2627,7 +2627,17 @@ impl AgentLoop {
     ) -> anyhow::Result<()> {
         let _ = session.close_and_apply_steers()?;
         let session_id = session.id.clone();
-        tracing::info!("Turn interrupted for session {}", session_id);
+        // Attribute the cancellation when the caller recorded a source
+        // (`tui-esc` / `mcp-stop` / `http` / …); empty otherwise.
+        let source = session.take_interrupt_source();
+        match &source {
+            Some(src) => tracing::info!(
+                "Turn interrupted for session {} (source: {})",
+                session_id,
+                src
+            ),
+            None => tracing::info!("Turn interrupted for session {}", session_id),
+        }
         session.note_turn_cancelled();
         let _ = self
             .event_tx
@@ -2651,6 +2661,7 @@ impl AgentLoop {
                         "session_id": session_id,
                         "workspace": session.working_dir,
                         "interrupted": true,
+                        "interrupt_source": source,
                     }),
                 )
                 .await;

@@ -1748,7 +1748,15 @@ async fn interrupt_session(
         .interrupt_session(&id)
         .await
         .map_err(backend_error_status)?;
-    state.publish(json!({"type": "session.interrupted", "session_id": id}));
+    let source = result
+        .get("source")
+        .and_then(|v| v.as_str())
+        .unwrap_or("http");
+    state.publish(json!({
+        "type": "session.interrupted",
+        "session_id": id,
+        "source": source,
+    }));
     Ok(Json(result))
 }
 

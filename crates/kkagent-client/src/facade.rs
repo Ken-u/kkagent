@@ -126,7 +126,17 @@ impl KkagentClient {
     }
 
     pub async fn interrupt(&self, session_id: &str) -> anyhow::Result<()> {
-        let params = serde_json::json!({"session_id": session_id});
+        self.interrupt_with_source(session_id, "tui").await
+    }
+
+    /// `source` is a short caller identity (`tui-esc`, `tui-quit`, …) surfaced
+    /// in the agent loop's "Turn interrupted" log and TurnEnd hook payload.
+    pub async fn interrupt_with_source(
+        &self,
+        session_id: &str,
+        source: &str,
+    ) -> anyhow::Result<()> {
+        let params = serde_json::json!({"session_id": session_id, "source": source});
         self.rpc
             .call("session.interrupt", Some(params))
             .await
