@@ -87,10 +87,11 @@ display_name = "Coding model"
 support_efforts = ["low", "medium", "high"]
 default_effort = "medium"
 # first_token_timeout_ms = 60000  # 等首字；0 禁用；未设置继承 provider / 默认 60s
-# 以下实验选项默认关闭，只建议为需要兼容处理的模型单独开启。
+# 以下为按模型配置的兼容与恢复实验选项；partial-stream 重试在 -p 中默认开启。
 # experimental_adaptive_thinking = true
 # experimental_visible_empty_retries = 1
 # experimental_bad_toolcall_auto_retries = 2
+# experimental_retry_partial_stream_errors = true
 # experimental_vision_proxy = true  # 让该模型为非 vision 主模型充当多模态读图代理
 ```
 
@@ -100,7 +101,9 @@ default_effort = "medium"
 
 流式 LLM 请求默认没有总超时（旧的固定 300s 总超时会截断长时间生成，已在流式路径移除）：等待首字受 `first_token_timeout_ms` 约束，之后若连续 180 秒没有收到任何数据会被逐读空闲超时中断（provider 级 `read_timeout_ms` 可调整，`0` 禁用）。需要恢复总超时兜底时，为 Provider 配置 `request_timeout_ms`（`0` 或不设置表示禁用）。
 
-`experimental_adaptive_thinking` 仅影响 Anthropic 请求：开启后发送 `thinking.type = "adaptive"`，并通过 `output_config.effort` 转发当前 thinking effort。`experimental_visible_empty_retries` 指定 tool result 后遇到“无正文且无新 tool call”的成功响应时最多重试几次；thinking-only 也属于这种响应。重试只重新请求模型，不会再次执行已经完成的工具。`experimental_bad_toolcall_auto_retries` 指定模型返回的 tool call 参数不是合法 JSON 对象、被服务端以 HTTP 400 拒绝时，自动回滚该条 assistant 小步骤并重新请求模型的次数；回滚只丢弃这一步及其后的 tool result，不会反向恢复已发生的工具副作用。重试次数耗尽后仍按原有行为停下来等待 `continue`。三个选项都按模型配置，未设置时保持原有行为。
+`experimental_adaptive_thinking` 仅影响 Anthropic 请求：开启后发送 `thinking.type = "adaptive"`，并通过 `output_config.effort` 转发当前 thinking effort。`experimental_visible_empty_retries` 指定 tool result 后遇到“无正文且无新 tool call”的成功响应时最多重试几次；thinking-only 也属于这种响应。重试只重新请求模型，不会再次执行已经完成的工具。`experimental_bad_toolcall_auto_retries` 指定模型返回的 tool call 参数不是合法 JSON 对象、被服务端以 HTTP 400 拒绝时，自动回滚该条 assistant 小步骤并重新请求模型的次数；回滚只丢弃这一步及其后的 tool result，不会反向恢复已发生的工具副作用。重试次数耗尽后仍按原有行为停下来等待 `continue`。这些选项都按模型配置。
+
+`experimental_retry_partial_stream_errors` 允许流在已收到文本、thinking 或 tool call 片段后断开时，继续使用 `max_attempts_per_step` 和现有退避重试；未配置时普通交互默认关闭，`-p` 模式默认开启。设为 `false` 可在 `-p` 中关闭，设为 `true` 则在普通交互中也启用。启用后，单次模型请求的增量会暂存到流正常结束；失败尝试的片段会丢弃，避免重试后的自动化输出混入重复或截断文本。
 
 `experimental_vision_proxy` 让一个**具备图像输入能力**（`image_in` 等）的模型为非 vision 主模型充当多模态读图代理。配置时在某个 vision 模型上设置该 flag，整个配置最多一个。当主模型声明无图像输入能力时，Agent loop 在每轮请求前把消息中的图像块替换为该代理模型生成的文字描述（逐字转写文字、描述布局与 UI、报告图表数据），**替换是永久性的**——session 历史中的 base64 图片块被丢弃，只保留描述文本，节省内存和上下文预算。原始文件路径仍保留在消息文本中（用户 `<image-attached>` 标记或 ReadMediaFile 工具结果），切回 vision 模型后模型可重新调用 ReadMediaFile 读取原图。描述按图像 SHA-256 缓存，重复发送同一张图只调用一次代理。非 vision 主模型此前被隐藏的 `ReadMediaFile` 工具也会重新可见。
 

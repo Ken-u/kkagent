@@ -110,6 +110,33 @@ async fn send_buffered_delta(
     let _ = event_tx.send(event).await;
 }
 
+async fn send_or_defer_delta(
+    event_tx: &mpsc::Sender<AgentEvent>,
+    session_id: &str,
+    delta: Option<(StreamDeltaKind, String)>,
+    deferred: &mut Vec<(StreamDeltaKind, String)>,
+    defer: bool,
+) {
+    let Some(delta) = delta else {
+        return;
+    };
+    if defer {
+        deferred.push(delta);
+    } else {
+        send_buffered_delta(event_tx, session_id, Some(delta)).await;
+    }
+}
+
+async fn flush_deferred_deltas(
+    event_tx: &mpsc::Sender<AgentEvent>,
+    session_id: &str,
+    deferred: &mut Vec<(StreamDeltaKind, String)>,
+) {
+    for delta in deferred.drain(..) {
+        send_buffered_delta(event_tx, session_id, Some(delta)).await;
+    }
+}
+
 fn global_file_tracker() -> &'static FileConflictTracker {
     static TRACKER: OnceLock<FileConflictTracker> = OnceLock::new();
     TRACKER.get_or_init(FileConflictTracker::new)
@@ -128,6 +155,7 @@ fn tool_may_mutate_workspace(name: &str) -> bool {
 
 pub struct AgentLoop {
     config: Arc<AppConfig>,
+    headless_mode: bool,
     tools: Arc<ToolRegistry>,
     permission: Arc<Mutex<PermissionChain>>,
     event_tx: mpsc::Sender<AgentEvent>,
@@ -286,6 +314,12 @@ impl AgentLoop {
         self
     }
 
+    /// Enable headless defaults for experimental recovery behavior.
+    pub fn with_headless_mode(mut self, headless_mode: bool) -> Self {
+        self.headless_mode = headless_mode;
+        self
+    }
+
     pub fn with_goal_manager(mut self, goal_mgr: Arc<GoalManager>) -> Self {
         self.goal_mgr = Some(goal_mgr);
         self
@@ -352,6 +386,7 @@ impl AgentLoop {
     ) -> Self {
         Self {
             config,
+            headless_mode: false,
             tools,
             permission,
             event_tx,
@@ -727,6 +762,9 @@ impl AgentLoop {
                 .config
                 .resolve_model(&active_model_alias)
                 .ok_or_else(|| anyhow::anyhow!("Model '{}' not found", active_model_alias))?;
+            let retry_partial_stream_errors = model_config
+                .experimental_retry_partial_stream_errors
+                .unwrap_or(self.headless_mode);
             let active_capability = ModelCapability::from_model(model_config);
             if using_fallback
                 && !active_capability.vision
@@ -850,6 +888,7 @@ impl AgentLoop {
             let mut active_tools: HashMap<String, (PendingToolCall, String)> = HashMap::new();
             let mut got_message_end = false;
             let mut delta_buffer = StreamDeltaBuffer::default();
+            let mut deferred_deltas = Vec::new();
 
             loop {
                 if session.is_interrupted() {
@@ -858,7 +897,15 @@ impl AgentLoop {
                         h.abort();
                     }
                     let pending = delta_buffer.take();
-                    send_buffered_delta(&self.event_tx, &session_id, pending).await;
+                    send_or_defer_delta(
+                        &self.event_tx,
+                        &session_id,
+                        pending,
+                        &mut deferred_deltas,
+                        retry_partial_stream_errors,
+                    )
+                    .await;
+                    flush_deferred_deltas(&self.event_tx, &session_id, &mut deferred_deltas).await;
                     break;
                 }
 
@@ -867,16 +914,37 @@ impl AgentLoop {
                         StreamEvent::TextDelta(text) => {
                             assistant_text.push_str(&text);
                             let ready = delta_buffer.push(StreamDeltaKind::Message, text);
-                            send_buffered_delta(&self.event_tx, &session_id, ready).await;
+                            send_or_defer_delta(
+                                &self.event_tx,
+                                &session_id,
+                                ready,
+                                &mut deferred_deltas,
+                                retry_partial_stream_errors,
+                            )
+                            .await;
                         }
                         StreamEvent::ThinkingDelta(text) => {
                             thinking_text.push_str(&text);
                             let ready = delta_buffer.push(StreamDeltaKind::Thinking, text);
-                            send_buffered_delta(&self.event_tx, &session_id, ready).await;
+                            send_or_defer_delta(
+                                &self.event_tx,
+                                &session_id,
+                                ready,
+                                &mut deferred_deltas,
+                                retry_partial_stream_errors,
+                            )
+                            .await;
                         }
                         StreamEvent::ToolUseStart { id, name } => {
                             let pending = delta_buffer.take();
-                            send_buffered_delta(&self.event_tx, &session_id, pending).await;
+                            send_or_defer_delta(
+                                &self.event_tx,
+                                &session_id,
+                                pending,
+                                &mut deferred_deltas,
+                                retry_partial_stream_errors,
+                            )
+                            .await;
                             tracing::info!("Tool use start: {} ({})", name, id);
                             active_tools.insert(
                                 id.clone(),
@@ -893,7 +961,14 @@ impl AgentLoop {
                         }
                         StreamEvent::ToolUseInputDelta { id, delta } => {
                             let pending = delta_buffer.take();
-                            send_buffered_delta(&self.event_tx, &session_id, pending).await;
+                            send_or_defer_delta(
+                                &self.event_tx,
+                                &session_id,
+                                pending,
+                                &mut deferred_deltas,
+                                retry_partial_stream_errors,
+                            )
+                            .await;
                             if let Some((_, input)) = active_tools.get_mut(&id) {
                                 input.push_str(&delta);
                             } else {
@@ -902,7 +977,14 @@ impl AgentLoop {
                         }
                         StreamEvent::ToolUseEnd { id } => {
                             let pending = delta_buffer.take();
-                            send_buffered_delta(&self.event_tx, &session_id, pending).await;
+                            send_or_defer_delta(
+                                &self.event_tx,
+                                &session_id,
+                                pending,
+                                &mut deferred_deltas,
+                                retry_partial_stream_errors,
+                            )
+                            .await;
                             if let Some((mut tool, input)) = active_tools.remove(&id) {
                                 (tool.input, tool.input_error) = parse_tool_arguments(&input);
                                 tracing::info!(
@@ -924,7 +1006,14 @@ impl AgentLoop {
                             stop_reason: reason,
                         } => {
                             let pending = delta_buffer.take();
-                            send_buffered_delta(&self.event_tx, &session_id, pending).await;
+                            send_or_defer_delta(
+                                &self.event_tx,
+                                &session_id,
+                                pending,
+                                &mut deferred_deltas,
+                                retry_partial_stream_errors,
+                            )
+                            .await;
                             for (_, (mut tool, input)) in active_tools.drain() {
                                 (tool.input, tool.input_error) = parse_tool_arguments(&input);
                                 tool_calls.push(tool);
@@ -974,7 +1063,14 @@ impl AgentLoop {
                         }
                         StreamEvent::Error(msg) => {
                             let pending = delta_buffer.take();
-                            send_buffered_delta(&self.event_tx, &session_id, pending).await;
+                            send_or_defer_delta(
+                                &self.event_tx,
+                                &session_id,
+                                pending,
+                                &mut deferred_deltas,
+                                retry_partial_stream_errors,
+                            )
+                            .await;
                             if msg.contains(kkagent_llm::FIRST_TOKEN_TIMEOUT_MARKER) {
                                 tracing::warn!(
                                     model = %model_config.model,
@@ -991,7 +1087,14 @@ impl AgentLoop {
                             retry_after,
                         } => {
                             let pending = delta_buffer.take();
-                            send_buffered_delta(&self.event_tx, &session_id, pending).await;
+                            send_or_defer_delta(
+                                &self.event_tx,
+                                &session_id,
+                                pending,
+                                &mut deferred_deltas,
+                                retry_partial_stream_errors,
+                            )
+                            .await;
                             tracing::warn!(
                                 retry_after_seconds = retry_after.map(|delay| delay.as_secs_f64()),
                                 "LLM rate limited: {message}"
@@ -1004,7 +1107,14 @@ impl AgentLoop {
                     },
                     Ok(None) => {
                         let pending = delta_buffer.take();
-                        send_buffered_delta(&self.event_tx, &session_id, pending).await;
+                        send_or_defer_delta(
+                            &self.event_tx,
+                            &session_id,
+                            pending,
+                            &mut deferred_deltas,
+                            retry_partial_stream_errors,
+                        )
+                        .await;
                         // `session.interrupt` aborts the stream task, which closes
                         // this channel. Re-read the flag so we don't treat the
                         // abort as an empty/incomplete stream and enter retry.
@@ -1016,7 +1126,14 @@ impl AgentLoop {
                     Err(_) => {
                         if delta_buffer.is_due() {
                             let pending = delta_buffer.take();
-                            send_buffered_delta(&self.event_tx, &session_id, pending).await;
+                            send_or_defer_delta(
+                                &self.event_tx,
+                                &session_id,
+                                pending,
+                                &mut deferred_deltas,
+                                retry_partial_stream_errors,
+                            )
+                            .await;
                         }
                         continue; // timeout — re-check interrupt
                     }
@@ -1039,6 +1156,10 @@ impl AgentLoop {
             let empty =
                 assistant_text.is_empty() && thinking_text.is_empty() && tool_calls.is_empty();
             let failed = stream_failed || !got_message_end;
+            let retryable_failed_stream = failed && (empty || retry_partial_stream_errors);
+            if !failed {
+                flush_deferred_deltas(&self.event_tx, &session_id, &mut deferred_deltas).await;
+            }
             let visible_empty = assistant_text.trim().is_empty() && tool_calls.is_empty();
             if !failed
                 && follows_tool_result
@@ -1193,7 +1314,7 @@ impl AgentLoop {
                     continue;
                 }
             }
-            if failed && empty && failure_retries + 1 < max_attempts {
+            if retryable_failed_stream && failure_retries + 1 < max_attempts {
                 failure_retries += 1;
                 tracing::warn!(
                     "LLM step retry {}/{} ({})",
@@ -1229,12 +1350,14 @@ impl AgentLoop {
                 )
                 .await
                 {
+                    flush_deferred_deltas(&self.event_tx, &session_id, &mut deferred_deltas).await;
                     interrupted = true;
                     break;
                 }
+                deferred_deltas.clear();
                 continue;
             }
-            if failed && empty && using_fallback {
+            if retryable_failed_stream && using_fallback {
                 // The fallback also exhausted its retry budget: switch back to
                 // the primary model for one final round before giving up. The
                 // session model stays on the fallback so later turns resume
@@ -1266,6 +1389,7 @@ impl AgentLoop {
                 using_fallback = false;
                 switched_back = true;
                 failure_retries = 0;
+                deferred_deltas.clear();
                 visible_empty_retries = 0;
                 visible_empty_retry_limit = primary_model_config.experimental_visible_empty_retries;
                 bad_toolcall_retries = 0;
@@ -1273,7 +1397,7 @@ impl AgentLoop {
                     primary_model_config.experimental_bad_toolcall_auto_retries;
                 continue;
             }
-            if failed && empty && !using_fallback && !fallback_used {
+            if retryable_failed_stream && !using_fallback && !fallback_used {
                 if let Some(fallback_alias) = fallback_model_alias.as_ref() {
                     let reason = last_stream_error
                         .clone()
@@ -1306,6 +1430,7 @@ impl AgentLoop {
                     // instead of re-failing the primary model every round.
                     session.set_model_alias(fallback_alias.clone());
                     failure_retries = 0;
+                    deferred_deltas.clear();
                     visible_empty_retries = 0;
                     visible_empty_retry_limit = self
                         .config
@@ -4067,6 +4192,7 @@ mod retry_tests {
                 experimental_vision_proxy: false,
                 experimental_visible_empty_retries: 0,
                 experimental_bad_toolcall_auto_retries: 0,
+                experimental_retry_partial_stream_errors: None,
                 first_token_timeout_ms: Some(0),
             },
         );
@@ -4492,6 +4618,7 @@ mod retry_tests {
                 experimental_vision_proxy: false,
                 experimental_visible_empty_retries: 0,
                 experimental_bad_toolcall_auto_retries: 0,
+                experimental_retry_partial_stream_errors: None,
                 first_token_timeout_ms: None,
             },
         );
@@ -4621,6 +4748,7 @@ mod retry_tests {
                 experimental_vision_proxy: false,
                 experimental_visible_empty_retries: 0,
                 experimental_bad_toolcall_auto_retries: 1,
+                experimental_retry_partial_stream_errors: None,
                 first_token_timeout_ms: None,
             },
         );
@@ -4800,6 +4928,7 @@ mod retry_tests {
                     experimental_vision_proxy: false,
                     experimental_visible_empty_retries: 0,
                     experimental_bad_toolcall_auto_retries: 0,
+                    experimental_retry_partial_stream_errors: None,
                     first_token_timeout_ms: None,
                 },
             );
@@ -4913,6 +5042,7 @@ mod retry_tests {
                     experimental_vision_proxy: false,
                     experimental_visible_empty_retries: 0,
                     experimental_bad_toolcall_auto_retries: 0,
+                    experimental_retry_partial_stream_errors: None,
                     first_token_timeout_ms: None,
                 },
             );
@@ -5041,6 +5171,7 @@ mod retry_tests {
                     experimental_vision_proxy: false,
                     experimental_visible_empty_retries: 0,
                     experimental_bad_toolcall_auto_retries: 0,
+                    experimental_retry_partial_stream_errors: None,
                     first_token_timeout_ms: None,
                 },
             );
@@ -5212,6 +5343,7 @@ mod retry_tests {
                 experimental_vision_proxy: false,
                 experimental_visible_empty_retries: 0,
                 experimental_bad_toolcall_auto_retries: 0,
+                experimental_retry_partial_stream_errors: None,
                 first_token_timeout_ms: None,
             },
         );
@@ -5388,6 +5520,7 @@ mod retry_tests {
                 experimental_vision_proxy: false,
                 experimental_visible_empty_retries: 0,
                 experimental_bad_toolcall_auto_retries: 0,
+                experimental_retry_partial_stream_errors: None,
                 first_token_timeout_ms: None,
             },
         );
@@ -5467,6 +5600,7 @@ mod retry_tests {
                 experimental_vision_proxy: false,
                 experimental_visible_empty_retries: 0,
                 experimental_bad_toolcall_auto_retries: 0,
+                experimental_retry_partial_stream_errors: None,
                 first_token_timeout_ms: None,
             },
         );
@@ -5921,6 +6055,7 @@ mod retry_tests {
                 experimental_vision_proxy: false,
                 experimental_visible_empty_retries: 0,
                 experimental_bad_toolcall_auto_retries: 0,
+                experimental_retry_partial_stream_errors: None,
                 first_token_timeout_ms: None,
             },
         );
@@ -6026,6 +6161,7 @@ mod retry_tests {
                 experimental_vision_proxy: false,
                 experimental_visible_empty_retries: 1,
                 experimental_bad_toolcall_auto_retries: 0,
+                experimental_retry_partial_stream_errors: None,
                 first_token_timeout_ms: None,
             },
         );
@@ -6075,6 +6211,138 @@ mod retry_tests {
             1,
             "the recovery retry must not execute the completed tool again"
         );
+        std::fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn retries_partial_stream_errors_by_default_in_headless_mode() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let partial =
+                "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"partial thinking\"}}]}\n\n";
+            let complete =
+                "data: {\"choices\":[{\"delta\":{\"content\":\"recovered output\"}}]}\n\n\
+                            data: [DONE]\n\n";
+            for (body, truncated) in [(partial, true), (complete, false)] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0_u8; 16_384];
+                let _ = socket.read(&mut request).await.unwrap();
+                let content_length = body.len() + if truncated { 128 } else { 0 };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {content_length}\r\nconnection: close\r\n\r\n{body}"
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+
+        let mut config = AppConfig {
+            default_model: Some("test/model".into()),
+            loop_control: Some(LoopControlConfig {
+                max_attempts_per_step: 2,
+                retry_base_seconds: 0,
+                reserved_context_size: 1_000,
+                max_steps_per_turn: 4,
+                auto_compact: false,
+                compact_keep_last: 4,
+                token_counting: "estimated".into(),
+                ..Default::default()
+            }),
+            ..AppConfig::default()
+        };
+        config.providers.insert(
+            "test".into(),
+            ProviderConfig {
+                provider_type: "openai-chat".into(),
+                api_key: Some("token".into()),
+                api_key_env: None,
+                base_url: Some(base_url),
+                custom_headers: HashMap::new(),
+                oauth: None,
+                first_token_timeout_ms: None,
+                request_timeout_ms: None,
+                read_timeout_ms: None,
+                extra_fields: Default::default(),
+            },
+        );
+        config.models.insert(
+            "test/model".into(),
+            ModelConfig {
+                provider: "test".into(),
+                model: "test-model".into(),
+                max_context_size: Some(16_000),
+                max_output_size: Some(1_000),
+                capabilities: vec!["tool_use".into()],
+                display_name: None,
+                support_efforts: Vec::new(),
+                default_effort: None,
+                pricing: None,
+                experimental_adaptive_thinking: false,
+                experimental_vision_proxy: false,
+                experimental_visible_empty_retries: 0,
+                experimental_bad_toolcall_auto_retries: 0,
+                experimental_retry_partial_stream_errors: None,
+                first_token_timeout_ms: None,
+            },
+        );
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let loop_ = AgentLoop::new(
+            Arc::new(config),
+            Arc::new(ToolRegistry::new()),
+            Arc::new(Mutex::new(PermissionChain::new(
+                PermissionMode::Auto,
+                Vec::new(),
+            ))),
+            event_tx,
+            Arc::new(Mutex::new(HashMap::new())),
+        )
+        .with_headless_mode(true);
+        let workspace = std::env::temp_dir().join(format!(
+            "kkagent-partial-stream-retry-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let mut session = Session::new(
+            "partial-stream-retry-test".into(),
+            workspace.clone(),
+            PermissionMode::Auto,
+            "test/model".into(),
+        );
+        session.add_user_message("finish the response".into());
+
+        loop_.run_turn(&mut session).await.unwrap();
+        server.await.unwrap();
+
+        let events: Vec<_> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::LlmRetry {
+                retry_number: 1,
+                ..
+            }
+        )));
+        let message_deltas: String = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::MessageDelta { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(message_deltas, "recovered output");
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ThinkingDelta { text, .. } if text.contains("partial thinking")
+        )));
+        assert!(session.messages.iter().any(|message| {
+            message.content.iter().any(
+                |content| matches!(content, ChatContent::Text { text } if text == "recovered output"),
+            )
+        }));
+        assert!(!session.messages.iter().any(|message| {
+            message.content.iter().any(
+                |content| matches!(content, ChatContent::Thinking { thinking } if thinking.contains("partial thinking")),
+            )
+        }));
         std::fs::remove_dir_all(workspace).unwrap();
     }
 
@@ -6138,6 +6406,7 @@ mod retry_tests {
                 experimental_vision_proxy: false,
                 experimental_visible_empty_retries: 0,
                 experimental_bad_toolcall_auto_retries: 0,
+                experimental_retry_partial_stream_errors: None,
                 first_token_timeout_ms: None,
             },
         );
@@ -6334,6 +6603,7 @@ mod retry_tests {
                 experimental_vision_proxy: false,
                 experimental_visible_empty_retries: 0,
                 experimental_bad_toolcall_auto_retries: 0,
+                experimental_retry_partial_stream_errors: None,
                 first_token_timeout_ms: None,
             },
         );
@@ -6589,6 +6859,7 @@ mod retry_tests {
                 experimental_vision_proxy: false,
                 experimental_visible_empty_retries: 0,
                 experimental_bad_toolcall_auto_retries: 0,
+                experimental_retry_partial_stream_errors: None,
                 first_token_timeout_ms: None,
             },
         );

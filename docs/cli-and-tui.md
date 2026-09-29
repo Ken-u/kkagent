@@ -47,6 +47,8 @@ answer=$(kkagent -p "总结 README" 2>kkagent.err)
 
 最终回答写到 stdout，诊断日志写到 stderr。有写入需求时按风险显式选择 `-y`；无人值守脚本不应默认使用 `--auto`。
 
+当模型未显式设置 `experimental_retry_partial_stream_errors` 时，`-p` 会在流式响应已有部分内容后遇到断连时继续按 `max_attempts_per_step` 重试；可在模型配置中设为 `false` 关闭。
+
 ## 调试系统提示词
 
 ```bash

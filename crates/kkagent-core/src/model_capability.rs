@@ -70,6 +70,7 @@ mod tests {
             experimental_vision_proxy: false,
             experimental_visible_empty_retries: 0,
             experimental_bad_toolcall_auto_retries: 0,
+            experimental_retry_partial_stream_errors: None,
             first_token_timeout_ms: None,
         };
         let c = ModelCapability::from_model(&m);
@@ -95,6 +96,7 @@ mod tests {
             experimental_vision_proxy: false,
             experimental_visible_empty_retries: 0,
             experimental_bad_toolcall_auto_retries: 0,
+            experimental_retry_partial_stream_errors: None,
             first_token_timeout_ms: None,
         };
         let c = ModelCapability::from_model(&m);

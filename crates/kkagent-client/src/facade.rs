@@ -89,9 +89,26 @@ impl KkagentClient {
         text: &str,
         images: &[(String, String)],
     ) -> anyhow::Result<()> {
+        self.send_prompt_with_mode(session_id, text, images, false)
+            .await
+    }
+
+    pub async fn send_headless_prompt(&self, session_id: &str, text: &str) -> anyhow::Result<()> {
+        self.send_prompt_with_mode(session_id, text, &[], true)
+            .await
+    }
+
+    async fn send_prompt_with_mode(
+        &self,
+        session_id: &str,
+        text: &str,
+        images: &[(String, String)],
+        headless_mode: bool,
+    ) -> anyhow::Result<()> {
         let params = serde_json::json!({
             "session_id": session_id,
             "text": text,
+            "headless_mode": headless_mode,
             "images": images.iter().map(|(media_type, data)| serde_json::json!({
                 "media_type": media_type,
                 "data": data,
@@ -110,9 +127,24 @@ impl KkagentClient {
         text: &str,
         images: &[(String, String)],
     ) -> anyhow::Result<()> {
+        self.steer_with_mode(session_id, text, images, false).await
+    }
+
+    pub async fn steer_headless(&self, session_id: &str, text: &str) -> anyhow::Result<()> {
+        self.steer_with_mode(session_id, text, &[], true).await
+    }
+
+    async fn steer_with_mode(
+        &self,
+        session_id: &str,
+        text: &str,
+        images: &[(String, String)],
+        headless_mode: bool,
+    ) -> anyhow::Result<()> {
         let params = serde_json::json!({
             "session_id": session_id,
             "text": text,
+            "headless_mode": headless_mode,
             "images": images.iter().map(|(media_type, data)| serde_json::json!({
                 "media_type": media_type,
                 "data": data,

@@ -620,6 +620,10 @@ pub struct ModelConfig {
     /// Experimental: auto-retry after rolling back a malformed tool call (non-JSON arguments).
     #[serde(default)]
     pub experimental_bad_toolcall_auto_retries: u32,
+    /// Experimental: retry a failed/incomplete stream even after it emitted partial content.
+    /// Unset keeps interactive behavior unchanged; headless (`-p`) enables it by default.
+    #[serde(default)]
+    pub experimental_retry_partial_stream_errors: Option<bool>,
     /// Wait this many milliseconds for the first meaningful stream chunk.
     /// `0` disables; unset inherits provider / default (60s). See [`resolve_first_token_timeout`].
     #[serde(default)]
@@ -1879,6 +1883,7 @@ mod tests {
                 experimental_vision_proxy: false,
                 experimental_visible_empty_retries: 0,
                 experimental_bad_toolcall_auto_retries: 0,
+                experimental_retry_partial_stream_errors: None,
                 first_token_timeout_ms: None,
             },
         );
@@ -1901,6 +1906,7 @@ mod tests {
             experimental_vision_proxy: false,
             experimental_visible_empty_retries: 0,
             experimental_bad_toolcall_auto_retries: 0,
+            experimental_retry_partial_stream_errors: None,
             first_token_timeout_ms: None,
         };
         let mut provider = ProviderConfig {
@@ -2041,6 +2047,7 @@ fallback = "quality"
                 experimental_vision_proxy: false,
                 experimental_visible_empty_retries: 0,
                 experimental_bad_toolcall_auto_retries: 0,
+                experimental_retry_partial_stream_errors: None,
                 first_token_timeout_ms: None,
             },
         );
@@ -2060,6 +2067,7 @@ fallback = "quality"
                 experimental_vision_proxy: false,
                 experimental_visible_empty_retries: 0,
                 experimental_bad_toolcall_auto_retries: 0,
+                experimental_retry_partial_stream_errors: None,
                 first_token_timeout_ms: None,
             },
         );
@@ -2107,6 +2115,7 @@ fallback = "quality"
                 experimental_vision_proxy: false,
                 experimental_visible_empty_retries: 0,
                 experimental_bad_toolcall_auto_retries: 0,
+                experimental_retry_partial_stream_errors: None,
                 first_token_timeout_ms: None,
             },
         );
@@ -2126,6 +2135,7 @@ fallback = "quality"
                 experimental_vision_proxy: false,
                 experimental_visible_empty_retries: 0,
                 experimental_bad_toolcall_auto_retries: 0,
+                experimental_retry_partial_stream_errors: None,
                 first_token_timeout_ms: None,
             },
         );
@@ -2167,6 +2177,7 @@ fallback = "quality"
                 experimental_vision_proxy: false,
                 experimental_visible_empty_retries: 0,
                 experimental_bad_toolcall_auto_retries: 0,
+                experimental_retry_partial_stream_errors: None,
                 first_token_timeout_ms: None,
             },
         );
@@ -2380,12 +2391,27 @@ model = "claude-opus-4-8"
 experimental_adaptive_thinking = true
 experimental_visible_empty_retries = 1
 experimental_bad_toolcall_auto_retries = 2
+experimental_retry_partial_stream_errors = true
 "#,
         )
         .unwrap();
         assert!(model.experimental_adaptive_thinking);
         assert_eq!(model.experimental_visible_empty_retries, 1);
         assert_eq!(model.experimental_bad_toolcall_auto_retries, 2);
+        assert_eq!(model.experimental_retry_partial_stream_errors, Some(true));
+
+        let disabled: ModelConfig = toml::from_str(
+            r#"
+provider = "local"
+model = "claude-opus-4-8"
+experimental_retry_partial_stream_errors = false
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            disabled.experimental_retry_partial_stream_errors,
+            Some(false)
+        );
     }
 
     #[test]
@@ -2536,6 +2562,7 @@ plugin_marketplaces = [
                 experimental_vision_proxy: false,
                 experimental_visible_empty_retries: 0,
                 experimental_bad_toolcall_auto_retries: 0,
+                experimental_retry_partial_stream_errors: None,
                 first_token_timeout_ms: None,
             },
         );

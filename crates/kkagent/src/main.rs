@@ -1078,6 +1078,7 @@ async fn provision_managed_kimi_config(
                 experimental_vision_proxy: false,
                 experimental_visible_empty_retries: 0,
                 experimental_bad_toolcall_auto_retries: 0,
+                experimental_retry_partial_stream_errors: None,
                 first_token_timeout_ms: None,
             },
         );
@@ -2442,6 +2443,7 @@ async fn session_goal_rpc(
     let mut params = serde_json::json!({
         "session_id": session_id,
         "action": action,
+        "headless_mode": true,
     });
     if let Some(obj) = objective {
         params
@@ -7728,6 +7730,15 @@ async fn spawn_session_agent_turn(
     session_id: String,
     turn_permit: tokio::sync::OwnedSemaphorePermit,
 ) -> Result<(), (i32, String)> {
+    spawn_session_agent_turn_with_mode(state, session_id, turn_permit, false).await
+}
+
+async fn spawn_session_agent_turn_with_mode(
+    state: Arc<ServerState>,
+    session_id: String,
+    turn_permit: tokio::sync::OwnedSemaphorePermit,
+    headless_mode: bool,
+) -> Result<(), (i32, String)> {
     let steer_mailbox = state
         .steer_mailboxes
         .lock()
@@ -7989,6 +8000,7 @@ async fn spawn_session_agent_turn(
                 agent_event_tx.clone(),
                 state_clone.abort_registry.clone(),
             )
+            .with_headless_mode(headless_mode)
             .with_hooks(state_clone.hooks.clone())
             .with_goal_manager(state_clone.goal_for(&sid).await)
             .with_tool_result_store(state_clone.tool_result_store.clone())
@@ -10014,6 +10026,11 @@ async fn handle_rpc_call(
         }
         "session.prompt" | "session.steer" => {
             let steer_requested = method == "session.steer";
+            let headless_mode = params
+                .as_ref()
+                .and_then(|p| p.get("headless_mode"))
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false);
             let session_id = params
                 .as_ref()
                 .and_then(|p| p.get("session_id"))
@@ -10241,10 +10258,16 @@ async fn handle_rpc_call(
                 }
             }
 
-            spawn_session_agent_turn(state, session_id, turn_permit).await?;
+            spawn_session_agent_turn_with_mode(state, session_id, turn_permit, headless_mode)
+                .await?;
             Ok(serde_json::json!({"ok": true}))
         }
         "session.goal" => {
+            let headless_mode = params
+                .as_ref()
+                .and_then(|p| p.get("headless_mode"))
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false);
             let session_id = params
                 .as_ref()
                 .and_then(|p| p.get("session_id"))
@@ -10332,10 +10355,11 @@ async fn handle_rpc_call(
                         }
                         match state.turn_locks.try_acquire(&session_id).await {
                             Ok(turn_permit) => {
-                                let _ = spawn_session_agent_turn(
+                                let _ = spawn_session_agent_turn_with_mode(
                                     state.clone(),
                                     session_id,
                                     turn_permit,
+                                    headless_mode,
                                 )
                                 .await;
                             }
@@ -10573,7 +10597,13 @@ async fn handle_rpc_call(
                     // delivered the goal prompt into the running turn's
                     // mailbox.
                     if let Ok(turn_permit) = turn_permit {
-                        spawn_session_agent_turn(state.clone(), session_id, turn_permit).await?;
+                        spawn_session_agent_turn_with_mode(
+                            state.clone(),
+                            session_id,
+                            turn_permit,
+                            headless_mode,
+                        )
+                        .await?;
                     }
                     Ok(body)
                 }

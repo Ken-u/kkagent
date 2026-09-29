@@ -461,7 +461,7 @@ impl<'a> Driver<'a> {
         self.max_turns_exceeded = false;
         self.turn_active = true;
         self.client
-            .send_prompt(&self.session_id, text)
+            .send_headless_prompt(&self.session_id, text)
             .await
             .map_err(|err| anyhow!("failed to send prompt: {err:#}"))
     }
@@ -470,9 +470,8 @@ impl<'a> Driver<'a> {
         if text.trim().is_empty() {
             return Ok(());
         }
-        let images: [(String, String); 0] = [];
         self.client
-            .steer(&self.session_id, text, &images)
+            .steer_headless(&self.session_id, text)
             .await
             .map_err(|err| anyhow!("failed to steer: {err:#}"))
     }
