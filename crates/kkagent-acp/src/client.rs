@@ -1803,13 +1803,13 @@ fn summarize_object_output(map: &serde_json::Map<String, Value>) -> Option<Strin
         .get("truncated")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let (count, singular, plural) = if let Some(n) = map.get("totalMatches").and_then(Value::as_u64)
-    {
-        (n, "match", "matches")
-    } else if let Some(n) = map.get("totalFiles").and_then(Value::as_u64) {
-        (n, "file", "files")
-    } else {
-        return None;
+    let (count, singular, plural) = match map.get("totalMatches").and_then(Value::as_u64) {
+        Some(n) => (n, "match", "matches"),
+        None => (
+            map.get("totalFiles").and_then(Value::as_u64)?,
+            "file",
+            "files",
+        ),
     };
     let noun = if count == 1 { singular } else { plural };
     let suffix = if truncated { " (truncated)" } else { "" };
