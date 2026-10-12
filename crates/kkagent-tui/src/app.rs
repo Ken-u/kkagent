@@ -241,6 +241,12 @@ pub struct AppState {
     pub plugin_slash_commands: Vec<SlashSuggestion>,
     /// Maps `plugin:<command>` → rendered prompt template.
     pub plugin_command_templates: std::collections::HashMap<String, (String, Option<String>)>,
+    /// ACP agents of enabled plugins, selectable in `/model` (`acp:<id>`).
+    pub acp_agents: Vec<AcpAgentEntry>,
+    /// The model and thinking level the external agent of an ACP session last
+    /// reported (`AgentEvent::AcpAgentState`). `None` before its first turn
+    /// and on ordinary models.
+    pub acp_agent_info: Option<AcpAgentInfo>,
     /// `@` file path autocomplete popup
     pub file_menu: Option<FileMenuState>,
     /// Model / session list picker overlay
@@ -453,6 +459,7 @@ pub struct SessionRuntimeState {
     pub todos: Vec<TodoItem>,
     pub subagents: crate::subagents::SubagentStore,
     pub model_alias: Option<String>,
+    pub acp_agent_info: Option<AcpAgentInfo>,
     pub goal: Option<crate::chrome::GoalIndicator>,
     pub last_tool_name: Option<String>,
     pub plan_document: Option<PlanDocument>,
@@ -499,6 +506,7 @@ impl SessionRuntimeState {
             todos: state.todos.clone(),
             subagents: state.subagents.clone(),
             model_alias: state.model_alias.clone(),
+            acp_agent_info: state.acp_agent_info.clone(),
             goal: state.goal.clone(),
             last_tool_name: state.last_tool_name.clone(),
             plan_document: state.plan_document.clone(),
@@ -534,6 +542,7 @@ impl SessionRuntimeState {
         state.todos = self.todos;
         state.subagents = self.subagents;
         state.model_alias = self.model_alias;
+        state.acp_agent_info = self.acp_agent_info;
         state.goal = self.goal;
         state.last_tool_name = self.last_tool_name;
         state.plan_document = self.plan_document;
@@ -1206,6 +1215,183 @@ pub struct PendingQuestion {
     pub submitting: bool,
 }
 
+/// An ACP agent an enabled plugin declares (`transport: "acp"`); it can run a
+/// whole session when picked in `/model` (alias `acp:<id>`). Mirrors the
+/// `acp_agents` entries of the server's `plugins.list`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcpAgentEntry {
+    /// `<plugin>.<name>`: the id inside the `acp:<id>` alias.
+    pub id: String,
+    /// Short display name, e.g. `cursor`.
+    pub agent: String,
+    pub description: String,
+}
+
+impl AcpAgentEntry {
+    /// The model alias that selects this agent.
+    pub fn alias(&self) -> String {
+        kkagent_config::acp_alias(&self.id)
+    }
+
+    /// [`Self::alias`] asking the agent for a thinking level as well.
+    pub fn alias_with_effort(&self, effort: Option<&str>) -> String {
+        kkagent_config::acp_alias_with_effort(&self.id, effort)
+    }
+}
+
+/// What the external agent behind an ACP session reported about itself on its
+/// last turn (`AgentEvent::AcpAgentState`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AcpAgentInfo {
+    /// The agent's display name, as the footer shows it (`cursor`).
+    pub agent: String,
+    /// The model it runs, as it names it (`claude-sonnet-5-5`).
+    pub model: Option<String>,
+    /// The thinking level it is on.
+    pub thought_level: Option<String>,
+    /// The thinking levels it lets a client choose from; empty when it does
+    /// not let clients choose at all.
+    pub thought_levels: Vec<String>,
+}
+
+/// What a thinking level means, for the picker of an ACP agent.
+fn acp_effort_detail(level: &str) -> &'static str {
+    match level {
+        "none" => "no reasoning tokens",
+        "minimal" => "barely any reasoning",
+        "low" => "light reasoning",
+        "medium" => "balanced",
+        "high" => "deep reasoning",
+        "xhigh" => "extra-deep reasoning",
+        "max" => "maximum reasoning",
+        _ => "",
+    }
+}
+
+/// Why `/effort` can do nothing for an ACP agent that offers no thinking
+/// level to choose from.
+fn acp_no_thinking_choice(agent: &str, info: Option<&AcpAgentInfo>) -> String {
+    let on = info
+        .and_then(|info| info.thought_level.as_deref())
+        .map(|level| format!(" (it is on '{level}')"))
+        .unwrap_or_default();
+    format!(
+        "The {agent} agent does not let clients choose a thinking level{on}; \
+         change it in the agent's own settings."
+    )
+}
+
+/// The alias to use for a model the user picked: re-picking the ACP agent a
+/// session already runs on keeps the thinking level asked of it.
+fn keep_acp_effort(current: Option<&str>, picked: String) -> String {
+    let Some(current) = current else {
+        return picked;
+    };
+    let same_agent = matches!(
+        (
+            kkagent_config::acp_agent_id(current),
+            kkagent_config::acp_agent_id(&picked)
+        ),
+        (Some(a), Some(b)) if a == b
+    );
+    match kkagent_config::acp_alias_effort(current) {
+        Some(effort) if same_agent && kkagent_config::acp_alias_effort(&picked).is_none() => {
+            kkagent_config::acp_alias_with_effort(
+                kkagent_config::acp_agent_id(&picked).unwrap_or_default(),
+                Some(effort),
+            )
+        }
+        _ => picked,
+    }
+}
+
+/// How the argument of `/model <arg>` resolved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ModelArg {
+    /// A configured `[models]` alias.
+    Configured(String),
+    /// The alias (`acp:<id>`) of an ACP agent a plugin offers.
+    Acp(String),
+    /// A short agent name shared by several ACP agents (their aliases).
+    Ambiguous(Vec<String>),
+    Unknown,
+}
+
+/// Short display name of the ACP agent behind `alias` (`acp:kk-cursor-agent.cursor`
+/// → `cursor`): the name the plugin lists it under, else the part of the id
+/// after the plugin name. `None` when `alias` is not an ACP alias.
+pub(crate) fn acp_agent_display_name(agents: &[AcpAgentEntry], alias: &str) -> Option<String> {
+    let id = kkagent_config::acp_agent_id(alias)?;
+    if let Some(agent) = agents.iter().find(|agent| agent.id == id) {
+        return Some(agent.agent.clone());
+    }
+    Some(id.split_once('.').map_or(id, |(_, name)| name).to_string())
+}
+
+/// One-line blurb of an ACP agent for the model picker: the first sentence or
+/// clause of the plugin's description (written for the delegating model, so
+/// it tends to run long), at most 72 characters.
+fn acp_agent_blurb(description: &str) -> String {
+    const MAX_CHARS: usize = 72;
+    let line = description.trim().lines().next().unwrap_or_default();
+    let end = [". ", ": "]
+        .iter()
+        .filter_map(|separator| line.find(separator))
+        .min()
+        .unwrap_or(line.len());
+    let clause = line[..end].trim().trim_end_matches('.');
+    if clause.chars().count() <= MAX_CHARS {
+        return clause.to_string();
+    }
+    let mut cut: String = clause.chars().take(MAX_CHARS - 1).collect();
+    cut.push('…');
+    cut
+}
+
+/// The ACP agents in a `plugins.list` result (disabled plugins list none).
+fn acp_agents_from_plugins_list(data: &serde_json::Value) -> Vec<AcpAgentEntry> {
+    let mut agents = Vec::new();
+    let plugins = data.get("plugins").and_then(|v| v.as_array());
+    for plugin in plugins.into_iter().flatten() {
+        if !plugin
+            .get("enabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let list = plugin
+            .get("acp_agents")
+            .or_else(|| plugin.get("acpAgents"))
+            .and_then(|v| v.as_array());
+        for entry in list.into_iter().flatten() {
+            let text = |key: &str| {
+                entry
+                    .get(key)
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+            };
+            let Some(id) = text("id") else {
+                continue;
+            };
+            let agent = text("agent")
+                .or_else(|| text("name"))
+                .map(str::to_string)
+                .or_else(|| acp_agent_display_name(&[], &kkagent_config::acp_alias(id)))
+                .unwrap_or_else(|| id.to_string());
+            agents.push(AcpAgentEntry {
+                id: id.to_string(),
+                agent,
+                description: text("description").unwrap_or_default().to_string(),
+            });
+        }
+    }
+    agents.sort_by(|a, b| a.id.cmp(&b.id));
+    agents.dedup_by(|a, b| a.id == b.id);
+    agents
+}
+
 impl AppState {
     pub fn new(permission_mode: PermissionMode, plan_mode: bool) -> Self {
         let working_dir = std::env::current_dir()
@@ -1268,6 +1454,8 @@ impl AppState {
             skill_command_map: std::collections::HashMap::new(),
             plugin_slash_commands: Vec::new(),
             plugin_command_templates: std::collections::HashMap::new(),
+            acp_agents: Vec::new(),
+            acp_agent_info: None,
             file_menu: None,
             list_picker: None,
             list_picker_stack: Vec::new(),
@@ -1653,6 +1841,59 @@ impl AppState {
             due_at: std::time::Instant::now() + std::time::Duration::from_millis(100),
         });
     }
+
+    /// Display name of the external ACP agent this session runs on, `None`
+    /// for sessions on ordinary models.
+    pub fn acp_agent_name(&self) -> Option<String> {
+        acp_agent_display_name(&self.acp_agents, self.model_alias.as_deref()?)
+    }
+
+    /// Point the session at `alias` (`None`: no model yet). What was learned
+    /// about an external agent is dropped when the session leaves it; a
+    /// thinking level asked of the same agent shows at once, and the agent
+    /// confirms it (or says why not) when its next turn starts.
+    pub fn adopt_model_alias(&mut self, alias: Option<String>) {
+        let agent_of = |alias: &Option<String>| {
+            alias
+                .as_deref()
+                .and_then(kkagent_config::acp_agent_id)
+                .map(str::to_string)
+        };
+        let effort_of = |alias: &Option<String>| {
+            alias
+                .as_deref()
+                .and_then(kkagent_config::acp_alias_effort)
+                .map(str::to_ascii_lowercase)
+        };
+        let agent = agent_of(&alias);
+        if agent.is_none() || agent != agent_of(&self.model_alias) {
+            self.acp_agent_info = None;
+        } else if let Some(info) = self.acp_agent_info.as_mut() {
+            let asked = effort_of(&alias);
+            if asked.is_some()
+                && asked != effort_of(&self.model_alias)
+                && !info.thought_levels.is_empty()
+            {
+                info.thought_level = asked;
+            }
+        }
+        self.model_alias = alias;
+    }
+
+    /// The thinking level of an ACP session: the one its agent reported, or
+    /// the one asked of it before it has reported any. `None` on ordinary
+    /// models and for agents without a thinking level.
+    pub fn acp_thought_level(&self) -> Option<String> {
+        self.acp_agent_name()?;
+        match &self.acp_agent_info {
+            Some(info) => info.thought_level.clone(),
+            None => self
+                .model_alias
+                .as_deref()
+                .and_then(kkagent_config::acp_alias_effort)
+                .map(str::to_ascii_lowercase),
+        }
+    }
 }
 
 impl TuiApp {
@@ -1727,7 +1968,8 @@ impl TuiApp {
 
     /// New sessions inherit the global config default until `/model` overrides them.
     fn bind_config_default_model(&mut self) {
-        self.state.model_alias = self.config.default_model_alias().map(|s| s.to_string());
+        self.state
+            .adopt_model_alias(self.config.default_model_alias().map(|s| s.to_string()));
     }
 
     /// Apply a user-triggered plan-mode change without letting a transient RPC
@@ -4968,7 +5210,7 @@ impl TuiApp {
             self.state.session_picker_preview = None;
             self.state.session_delete_confirm = None;
             match item.name.as_str() {
-                "model" => self.open_model_picker(),
+                "model" => self.open_model_picker().await,
                 "sessions" | "resume" => self.open_session_picker().await?,
                 "tasks" | "task" | "ps" => self.open_tasks_panel().await?,
                 "cron" => self.open_cron_picker().await?,
@@ -5515,10 +5757,22 @@ impl TuiApp {
                 self.state.thinking_text.clear();
                 self.state.follow_bottom = true;
                 self.state.scroll_up = 0;
-                self.system_message(format!(
-                    "Undid {} turn(s). File changes restored where possible (redo not available; fork to keep branch).",
-                    undone
-                ));
+                let warnings = response_warnings(&data);
+                if warnings.is_empty() {
+                    self.system_message(format!(
+                        "Undid {} turn(s). File changes restored where possible (redo not available; fork to keep branch).",
+                        undone
+                    ));
+                } else {
+                    // Something the undo could not revert: say so instead of
+                    // claiming the files are back.
+                    self.system_message(format!(
+                        "Undid {undone} turn(s) (redo not available; fork to keep branch)."
+                    ));
+                    for warning in warnings {
+                        self.system_message(warning);
+                    }
+                }
             }
             Err(e) => self.system_message(format!("Undo failed: {}", e)),
         }
@@ -5700,7 +5954,7 @@ impl TuiApp {
                 id => {
                     self.state.list_picker_stack.push(picker);
                     match id {
-                        "model" => self.open_model_picker(),
+                        "model" => self.open_model_picker().await,
                         "permission" => self.open_permission_picker(),
                         "effort" => self.open_effort_picker(),
                         "provider" => self.open_provider_picker(),
@@ -5721,7 +5975,7 @@ impl TuiApp {
                 self.open_model_picker_for_provider(&item.id);
             }
             ListPickerKind::Effort => {
-                self.apply_effort_level(&item.id);
+                self.apply_effort_level(&item.id).await;
                 self.clear_list_pickers();
             }
             ListPickerKind::Browse => {
@@ -6173,8 +6427,54 @@ impl TuiApp {
         Ok(())
     }
 
+    /// Resolve the argument of `/model <arg>`: a configured alias first, then
+    /// an ACP agent by its `acp:<id>` alias, its bare `<id>`, or its short
+    /// name (`cursor`) when that is unambiguous. An ACP agent may be followed
+    /// by `#<level>` to ask it for a thinking level (`/model cursor#max`).
+    fn resolve_model_arg(&self, arg: &str) -> ModelArg {
+        let arg = arg.trim();
+        if self.config.resolve_model(arg).is_some() {
+            return ModelArg::Configured(arg.to_string());
+        }
+        let (name, effort) = match arg.split_once(kkagent_config::ACP_ALIAS_EFFORT_SEPARATOR) {
+            Some((name, effort)) => (name.trim(), Some(effort.trim().to_ascii_lowercase())),
+            None => (arg, None),
+        };
+        let effort = effort.filter(|effort| !effort.is_empty());
+        if effort
+            .as_deref()
+            .is_some_and(|effort| !kkagent_config::is_valid_acp_effort(effort))
+        {
+            return ModelArg::Unknown;
+        }
+        let alias_of = |agent: &AcpAgentEntry| agent.alias_with_effort(effort.as_deref());
+        let agents = &self.state.acp_agents;
+        let by_id = |id: &str| agents.iter().find(|agent| agent.id == id);
+        if let Some(id) = kkagent_config::acp_agent_id(name) {
+            return by_id(id).map_or(ModelArg::Unknown, |agent| ModelArg::Acp(alias_of(agent)));
+        }
+        if let Some(agent) = by_id(name) {
+            return ModelArg::Acp(alias_of(agent));
+        }
+        let mut named: Vec<String> = agents
+            .iter()
+            .filter(|agent| agent.agent.eq_ignore_ascii_case(name))
+            .map(alias_of)
+            .collect();
+        match named.len() {
+            0 => ModelArg::Unknown,
+            1 => ModelArg::Acp(named.remove(0)),
+            _ => ModelArg::Ambiguous(named),
+        }
+    }
+
     /// Local precheck before switching models — surfaces missing capabilities early.
     fn model_capability_precheck(&self, alias: &str) -> Option<String> {
+        if kkagent_config::acp_agent_id(alias).is_some() {
+            // An external agent owns its tools and context; none of the
+            // configured-model capabilities apply.
+            return None;
+        }
         let Some((model, _)) = self.config.resolve_model(alias) else {
             return Some(format!("Unknown model alias: {alias}"));
         };
@@ -6342,11 +6642,15 @@ impl TuiApp {
         });
     }
 
-    fn open_model_picker(&mut self) {
+    async fn open_model_picker(&mut self) {
+        self.refresh_acp_agents().await;
         self.open_model_picker_for_provider("");
     }
 
     async fn apply_model_selection(&mut self, model: String) {
+        // Picking the ACP agent the session already runs on keeps the
+        // thinking level asked of it.
+        let model = keep_acp_effort(self.state.model_alias.as_deref(), model);
         // Bind model to this session only; keep config default for /new.
         if let Some(warn) = self.model_capability_precheck(&model) {
             self.system_message(warn);
@@ -6359,8 +6663,22 @@ impl TuiApp {
                 return;
             }
         }
-        self.state.model_alias = Some(model.clone());
+        self.state.adopt_model_alias(Some(model.clone()));
         self.clear_list_pickers();
+
+        if let Some(agent) = acp_agent_display_name(&self.state.acp_agents, &model) {
+            // Fallback models only exist for configured models, so there is
+            // no fallback policy to settle here.
+            self.system_message(format!(
+                "Model set to: {model} (ACP). This session now runs on the external agent '{agent}': \
+                 its tools, sandbox and MCP servers are its own; kkagent only shows its output and \
+                 relays the permission, question and plan prompts it sends (whether it asks for \
+                 permission follows its own approval settings). Its model is whichever it is set \
+                 to (the footer shows it after the first message); /effort changes its thinking \
+                 level. Prompts sent while it works are queued until the turn ends (Esc interrupts)."
+            ));
+            return;
+        }
 
         if model_matches_global_fallback(&self.config, &model) {
             self.open_fallback_decision_picker();
@@ -6493,7 +6811,7 @@ impl TuiApp {
             .collect();
         names.sort();
         let mut selected = 0;
-        let items: Vec<ListPickerItem> = names
+        let mut items: Vec<ListPickerItem> = names
             .into_iter()
             .enumerate()
             .map(|(i, name)| {
@@ -6519,6 +6837,24 @@ impl TuiApp {
                 }
             })
             .collect();
+        // ACP agents of enabled plugins run the whole session on the external
+        // agent; they belong to no provider, so only the unfiltered list has them.
+        if provider.is_empty() {
+            for agent in &self.state.acp_agents {
+                let alias = agent.alias();
+                // The session's alias may carry a thinking level (`#max`).
+                if kkagent_config::acp_agent_id(&current) == Some(agent.id.as_str()) {
+                    selected = items.len();
+                }
+                let blurb = acp_agent_blurb(&agent.description);
+                let about = if blurb.is_empty() { &agent.id } else { &blurb };
+                items.push(ListPickerItem {
+                    label: alias.clone(),
+                    id: alias,
+                    detail: format!("ACP agent · {about}"),
+                });
+            }
+        }
         let title = if provider.is_empty() {
             " Select model ".into()
         } else {
@@ -6592,18 +6928,27 @@ impl TuiApp {
             .as_deref()
             .or_else(|| self.config.default_model_alias())
             .unwrap_or("-");
-        let effort = self
-            .config
-            .thinking
-            .as_ref()
-            .map(|t| {
-                if t.enabled {
-                    format!("on ({})", t.effort.as_deref().unwrap_or("high"))
-                } else {
-                    "off".into()
-                }
-            })
-            .unwrap_or_else(|| "off".into());
+        let effort = match self.state.acp_agent_name() {
+            // An external agent has a thinking level of its own.
+            Some(agent) => format!(
+                "{agent}: {}",
+                self.state
+                    .acp_thought_level()
+                    .unwrap_or_else(|| "agent default".into())
+            ),
+            None => self
+                .config
+                .thinking
+                .as_ref()
+                .map(|t| {
+                    if t.enabled {
+                        format!("on ({})", t.effort.as_deref().unwrap_or("high"))
+                    } else {
+                        "off".into()
+                    }
+                })
+                .unwrap_or_else(|| "off".into()),
+        };
         let items = vec![
             ListPickerItem {
                 id: "model".into(),
@@ -6667,6 +7012,10 @@ impl TuiApp {
     }
 
     fn open_effort_picker(&mut self) {
+        if let Some(agent) = self.state.acp_agent_name() {
+            self.open_acp_effort_picker(&agent);
+            return;
+        }
         let current = self
             .config
             .thinking
@@ -6743,7 +7092,108 @@ impl TuiApp {
         });
     }
 
-    fn apply_effort_level(&mut self, level: &str) {
+    /// The thinking levels of the external agent behind an ACP session: the
+    /// ones it offers, or the usual ladder before it has said.
+    fn open_acp_effort_picker(&mut self, agent: &str) {
+        let info = self.state.acp_agent_info.as_ref();
+        if info.is_some_and(|info| info.thought_levels.is_empty()) {
+            let message = acp_no_thinking_choice(agent, info);
+            self.system_message(message);
+            return;
+        }
+        let levels: Vec<String> = match info {
+            Some(info) => info.thought_levels.clone(),
+            None => ["none", "minimal", "low", "medium", "high", "xhigh", "max"]
+                .iter()
+                .map(|level| (*level).to_string())
+                .collect(),
+        };
+        let current = self.state.acp_thought_level().unwrap_or_default();
+        let mut selected = 0;
+        let items: Vec<ListPickerItem> = levels
+            .iter()
+            .enumerate()
+            .map(|(index, level)| {
+                if level.eq_ignore_ascii_case(&current) {
+                    selected = index;
+                }
+                ListPickerItem {
+                    id: level.clone(),
+                    label: level.clone(),
+                    detail: acp_effort_detail(level).into(),
+                }
+            })
+            .collect();
+        self.replace_list_picker(ListPickerState {
+            kind: ListPickerKind::Effort,
+            title: format!(" Thinking effort · {agent} "),
+            items,
+            selected,
+            filter: String::new(),
+            all_items: Vec::new(),
+        });
+    }
+
+    /// `/effort` on a session that runs on an external ACP agent: ask the
+    /// agent for `level` through the session's alias (`acp:<id>#<level>`).
+    /// The agent applies it when the next turn starts and says so if it
+    /// cannot (see `AgentEvent::AcpAgentState`).
+    async fn apply_acp_effort(&mut self, agent: &str, level: &str) {
+        let Some(alias) = self.state.model_alias.clone() else {
+            return;
+        };
+        let Some(agent_id) = kkagent_config::acp_agent_id(&alias).map(str::to_string) else {
+            return;
+        };
+        let asked = level.trim().to_ascii_lowercase();
+        // kkagent's `off` is the lowest level the agent has, if it has one.
+        let level = if asked == "off" {
+            "none"
+        } else {
+            asked.as_str()
+        };
+        if !kkagent_config::is_valid_acp_effort(level) {
+            self.system_message(format!("Unknown thinking level: {asked}"));
+            return;
+        }
+        if let Some(info) = self.state.acp_agent_info.as_ref() {
+            if info.thought_levels.is_empty() {
+                let message = acp_no_thinking_choice(agent, Some(info));
+                self.system_message(message);
+                return;
+            }
+            if !info
+                .thought_levels
+                .iter()
+                .any(|offered| offered.eq_ignore_ascii_case(level))
+            {
+                self.system_message(format!(
+                    "The {agent} agent has no thinking level '{asked}' (it offers: {}).",
+                    info.thought_levels.join(", ")
+                ));
+                return;
+            }
+        }
+        let new_alias = kkagent_config::acp_alias_with_effort(&agent_id, Some(level));
+        if let Some(session_id) = self.state.session_id.clone() {
+            if let Err(error) = self.client.set_model(&session_id, &new_alias).await {
+                self.system_message(format!(
+                    "Failed to set the thinking level on server: {error}"
+                ));
+                return;
+            }
+        }
+        self.state.adopt_model_alias(Some(new_alias));
+        self.system_message(format!(
+            "Thinking effort for the {agent} agent: {level} (applied with your next message)."
+        ));
+    }
+
+    async fn apply_effort_level(&mut self, level: &str) {
+        if let Some(agent) = self.state.acp_agent_name() {
+            self.apply_acp_effort(&agent, level).await;
+            return;
+        }
         let normalized = level.trim().to_lowercase();
         match normalized.as_str() {
             "off" => {
@@ -7701,7 +8151,7 @@ impl TuiApp {
         // Prefer opening the real UI for picker-backed commands.
         match name {
             "__shortcuts__" => self.open_shortcuts_picker(),
-            "model" => self.open_model_picker(),
+            "model" => self.open_model_picker().await,
             "permission" => self.open_permission_picker(),
             "config" => self.open_config_picker(),
             "provider" | "providers" => self.open_provider_picker(),
@@ -9719,7 +10169,7 @@ impl TuiApp {
 
         if let Some(model) = data.get("model").and_then(|v| v.as_str()) {
             if !model.is_empty() {
-                self.state.model_alias = Some(model.to_string());
+                self.state.adopt_model_alias(Some(model.to_string()));
             }
         }
         if let Some(perm) = data
@@ -11061,7 +11511,15 @@ impl TuiApp {
         );
         crate::draft_store::clear_draft(&session_id);
         self.enqueue_prompt_queue_sync();
-        self.system_message("Steer sent — applying at the next model step.".into());
+        if self.state.acp_agent_name().is_some() {
+            // The external agent cannot take new input mid-turn: the server
+            // holds the message back until the turn is over.
+            self.system_message(
+                "ACP 后端不支持运行中插话:已排队,本轮结束后发送(Esc 可中断本轮)。".into(),
+            );
+        } else {
+            self.system_message("Steer sent — applying at the next model step.".into());
+        }
         Ok(())
     }
 
@@ -11630,14 +12088,27 @@ impl TuiApp {
             "model" => {
                 if args.is_empty() {
                     self.begin_root_picker();
-                    self.open_model_picker();
-                } else if self.config.resolve_model(&args).is_some() {
-                    self.apply_model_selection(args.clone()).await;
+                    self.open_model_picker().await;
                 } else {
-                    self.system_message(format!(
-                        "Unknown model '{}'. Use /model to pick from the list.",
-                        args
-                    ));
+                    self.refresh_acp_agents().await;
+                    match self.resolve_model_arg(&args) {
+                        ModelArg::Configured(alias) | ModelArg::Acp(alias) => {
+                            self.apply_model_selection(alias).await;
+                        }
+                        ModelArg::Ambiguous(aliases) => {
+                            self.system_message(format!(
+                                "'{}' matches several ACP agents ({}). Use the full alias.",
+                                args.trim(),
+                                aliases.join(", ")
+                            ));
+                        }
+                        ModelArg::Unknown => {
+                            self.system_message(format!(
+                                "Unknown model '{}'. Use /model to pick from the list.",
+                                args
+                            ));
+                        }
+                    }
                 }
             }
             "effort" | "thinking" => {
@@ -11651,12 +12122,19 @@ impl TuiApp {
                     } else {
                         effort
                     };
-                    match effort.as_str() {
-                        "off" | "none" | "minimal" | "low" | "medium" | "high" | "xhigh"
-                        | "max" => self.apply_effort_level(&effort),
-                        _ => self.system_message(
-                            "Usage: /effort [off|none|minimal|low|medium|high|xhigh|max]".into(),
-                        ),
+                    if self.state.acp_agent_name().is_some() {
+                        // An external agent names its own levels; the check
+                        // against them is `apply_effort_level`'s.
+                        self.apply_effort_level(&effort).await;
+                    } else {
+                        match effort.as_str() {
+                            "off" | "none" | "minimal" | "low" | "medium" | "high" | "xhigh"
+                            | "max" => self.apply_effort_level(&effort).await,
+                            _ => self.system_message(
+                                "Usage: /effort [off|none|minimal|low|medium|high|xhigh|max]"
+                                    .into(),
+                            ),
+                        }
                     }
                 }
             }
@@ -12400,6 +12878,15 @@ impl TuiApp {
         Some(out)
     }
 
+    /// Re-read the plugins' ACP agents: plugins can be enabled, disabled or
+    /// reloaded after startup, and `/model` must offer what exists now. A
+    /// failed call keeps the previous list.
+    async fn refresh_acp_agents(&mut self) {
+        if let Ok(data) = self.client.rpc_call("plugins.list", None).await {
+            self.apply_plugins_list(Some(data));
+        }
+    }
+
     async fn refresh_skill_commands(&mut self) -> anyhow::Result<()> {
         let data = self.client.rpc_call("skills.list", None).await.ok();
         self.apply_skills_list(data);
@@ -12442,13 +12929,15 @@ impl TuiApp {
         self.state.skill_command_map = map;
     }
 
-    /// Rebuild plugin slash-command state from a `plugins.list` RPC result.
-    /// Full definitions (with `promptTemplate`) become executable commands;
-    /// legacy bare names still surface in completion with a hint.
+    /// Rebuild plugin-derived state (slash commands, ACP agents for `/model`)
+    /// from a `plugins.list` RPC result. Full command definitions (with
+    /// `promptTemplate`) become executable commands; legacy bare names still
+    /// surface in completion with a hint.
     fn apply_plugins_list(&mut self, data: Option<serde_json::Value>) {
         let Some(data) = data else {
             return;
         };
+        self.state.acp_agents = acp_agents_from_plugins_list(&data);
         let mut commands = Vec::new();
         let mut templates = std::collections::HashMap::new();
         if let Some(arr) = data.get("plugins").and_then(|v| v.as_array()) {
@@ -12460,7 +12949,13 @@ impl TuiApp {
                 {
                     continue;
                 }
-                let Some(list) = plugin.get("slashCommands").and_then(|v| v.as_array()) else {
+                // The server serializes `slash_commands`; `slashCommands` is the
+                // manifest spelling.
+                let Some(list) = plugin
+                    .get("slash_commands")
+                    .or_else(|| plugin.get("slashCommands"))
+                    .and_then(|v| v.as_array())
+                else {
                     continue;
                 };
                 for entry in list {
@@ -13988,7 +14483,7 @@ impl TuiApp {
                             self.state.permission_mode = mode;
                         }
                         if let Some(ref m) = model {
-                            self.state.model_alias = Some(m.clone());
+                            self.state.adopt_model_alias(Some(m.clone()));
                         }
                         if let Some(enabled) = plan_mode {
                             self.state.on_plan_mode_changed(enabled);
@@ -14012,6 +14507,24 @@ impl TuiApp {
                                 "Session settings synced from {src}: {}",
                                 bits.join(", ")
                             ));
+                        }
+                    }
+                    AgentEvent::AcpAgentState {
+                        agent,
+                        model,
+                        thought_level,
+                        thought_levels,
+                        note,
+                        ..
+                    } => {
+                        self.state.acp_agent_info = Some(AcpAgentInfo {
+                            agent,
+                            model,
+                            thought_level,
+                            thought_levels,
+                        });
+                        if let Some(note) = note {
+                            self.system_message(note);
                         }
                     }
                     AgentEvent::ToolCancelled {
@@ -14257,6 +14770,20 @@ fn progress_bar(used: u64, max: u64, width: usize) -> String {
         out.push('░');
     }
     out
+}
+
+/// The `warnings` strings of an undo / restore response (absent when the
+/// server had nothing to warn about).
+fn response_warnings(data: &serde_json::Value) -> Vec<String> {
+    data.get("warnings")
+        .and_then(|value| value.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|warning| warning.as_str())
+        .map(str::trim)
+        .filter(|warning| !warning.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 pub(crate) fn summarize_tool_input(input: &serde_json::Value) -> String {
@@ -19536,5 +20063,789 @@ mod app_state_tests {
         // …and coming back: the captured snapshot must restore it.
         captured.restore(&mut state);
         assert!(state.last_step_usage.is_some());
+    }
+}
+
+#[cfg(test)]
+mod acp_model_tests {
+    use super::*;
+    use futures::FutureExt;
+    use serde_json::{json, Value};
+    use std::sync::{Arc, Mutex};
+
+    type Calls = Arc<Mutex<Vec<(String, Value)>>>;
+
+    const CURSOR: &str = "acp:kk-cursor-agent.cursor";
+
+    /// A `plugins.list` result as the server sends it: snake_case keys.
+    fn plugins_list() -> Value {
+        json!({"plugins": [
+            {
+                "name": "kk-cursor-agent",
+                "enabled": true,
+                "slash_commands": [{"name": "ask", "description": "Ask", "promptTemplate": "{{args}}"}],
+                "acp_agents": [{
+                    "id": "kk-cursor-agent.cursor",
+                    "agent": "cursor",
+                    "name": "cursor",
+                    "description": "Cursor CLI agent driven over ACP"
+                }]
+            },
+            {
+                "name": "off-plugin",
+                "enabled": false,
+                "slash_commands": [],
+                "acp_agents": [{"id": "off-plugin.gone", "agent": "gone", "name": "gone", "description": ""}]
+            },
+            {"name": "plain-plugin", "enabled": true, "slash_commands": [], "acp_agents": []}
+        ]})
+    }
+
+    fn config_with_a_model() -> AppConfig {
+        let mut config = AppConfig::default();
+        config.providers.insert(
+            "test".into(),
+            serde_json::from_value(json!({
+                "type": "openai-chat", "api_key": "test", "base_url": "http://127.0.0.1:9"
+            }))
+            .unwrap(),
+        );
+        config.models.insert(
+            "test/model".into(),
+            serde_json::from_value(json!({
+                "provider": "test", "model": "test-model", "max_context_size": 128000,
+                "max_output_size": 1000, "capabilities": ["tool_use"]
+            }))
+            .unwrap(),
+        );
+        config
+    }
+
+    /// A TUI wired to a stub server that answers `plugins`, accepts the model
+    /// / fallback / steer calls, replies to `session.undo` with `undo` and
+    /// records every call.
+    fn app_with_server(plugins: Value, undo: Value) -> (TuiApp, Calls) {
+        let (client_transport, server_transport) =
+            kkagent_rpc::transport::memory::create_memory_pair();
+        let (event_tx, event_rx) = tokio::sync::mpsc::channel(16);
+        let rpc = kkagent_rpc::RpcClient::new(client_transport, event_tx);
+        let client = kkagent_client::KkagentClient::new(rpc, event_rx);
+        let calls: Calls = Arc::default();
+        let recorded = calls.clone();
+        let handler: kkagent_rpc::server::RequestHandler =
+            Arc::new(move |_id, method, params, _event_tx| {
+                recorded
+                    .lock()
+                    .unwrap()
+                    .push((method.clone(), params.clone().unwrap_or_default()));
+                let (plugins, undo) = (plugins.clone(), undo.clone());
+                async move {
+                    match method.as_str() {
+                        "plugins.list" => Ok(plugins),
+                        "session.undo" => Ok(undo),
+                        "session.set_model" | "session.set_fallback_model" | "session.steer" => {
+                            Ok(json!({"ok": true}))
+                        }
+                        other => Err((-32601, format!("unexpected RPC method: {other}"))),
+                    }
+                }
+                .boxed()
+            });
+        tokio::spawn(async move {
+            kkagent_rpc::RpcServer::new(handler)
+                .serve(server_transport)
+                .await;
+        });
+        let mut app = TuiApp::new(config_with_a_model(), client);
+        app.state.session_id = Some("s".into());
+        app.state.model_alias = Some("test/model".into());
+        app.state.status = SessionStatus::Idle;
+        (app, calls)
+    }
+
+    fn calls_to(calls: &Calls, method: &str) -> Vec<Value> {
+        calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(name, _)| name == method)
+            .map(|(_, params)| params.clone())
+            .collect()
+    }
+
+    fn system_texts(app: &TuiApp) -> Vec<String> {
+        app.state
+            .messages
+            .iter()
+            .filter(|message| message.role == MessageRole::System)
+            .map(|message| message.content.clone())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn plugins_list_feeds_acp_agents_and_either_slash_command_spelling() {
+        let (mut app, _calls) = app_with_server(plugins_list(), json!({}));
+
+        app.apply_plugins_list(Some(plugins_list()));
+        // Only enabled plugins contribute agents.
+        assert_eq!(
+            app.state.acp_agents,
+            vec![AcpAgentEntry {
+                id: "kk-cursor-agent.cursor".into(),
+                agent: "cursor".into(),
+                description: "Cursor CLI agent driven over ACP".into(),
+            }]
+        );
+        assert_eq!(app.state.acp_agents[0].alias(), CURSOR);
+        // The server's snake_case `slash_commands` are read ...
+        let commands = |app: &TuiApp| {
+            app.state
+                .plugin_slash_commands
+                .iter()
+                .map(|command| command.name.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(commands(&app), ["plugin:ask"]);
+        // ... and so is the manifest spelling.
+        app.apply_plugins_list(Some(json!({"plugins": [{
+            "name": "p", "enabled": true, "slashCommands": ["legacy"]
+        }]})));
+        assert_eq!(commands(&app), ["plugin:legacy"]);
+        assert!(app.state.acp_agents.is_empty(), "stale agents are dropped");
+
+        // A failed refresh keeps what was known.
+        app.apply_plugins_list(Some(plugins_list()));
+        app.apply_plugins_list(None);
+        assert_eq!(app.state.acp_agents.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn model_picker_offers_acp_agents_after_the_configured_models() {
+        let (mut app, calls) = app_with_server(plugins_list(), json!({}));
+
+        app.open_model_picker().await;
+        assert_eq!(calls_to(&calls, "plugins.list").len(), 1, "refreshed first");
+        let picker = app.state.list_picker.as_ref().expect("picker");
+        let ids: Vec<&str> = picker.items.iter().map(|item| item.id.as_str()).collect();
+        assert_eq!(ids, ["test/model", CURSOR]);
+        let acp = &picker.items[1];
+        assert_eq!(acp.label, CURSOR);
+        assert_eq!(acp.detail, "ACP agent · Cursor CLI agent driven over ACP");
+        assert_eq!(picker.selected, 0, "the current model stays selected");
+
+        // On an ACP session the agent's row is the selected one.
+        app.state.model_alias = Some(CURSOR.into());
+        app.open_model_picker().await;
+        let picker = app.state.list_picker.as_ref().expect("picker");
+        assert_eq!(picker.items[picker.selected].id, CURSOR);
+
+        // Picking it switches the session over the RPC.
+        app.apply_model_selection(CURSOR.into()).await;
+        assert_eq!(
+            calls_to(&calls, "session.set_model"),
+            [json!({"session_id": "s", "model": CURSOR})]
+        );
+        assert_eq!(app.state.model_alias.as_deref(), Some(CURSOR));
+    }
+
+    #[tokio::test]
+    async fn model_command_takes_an_acp_agent_by_alias_id_or_short_name() {
+        for arg in [CURSOR, "kk-cursor-agent.cursor", "cursor", "CURSOR"] {
+            let (mut app, calls) = app_with_server(plugins_list(), json!({}));
+            app.handle_slash_command(&format!("/model {arg}"))
+                .await
+                .unwrap();
+            assert_eq!(
+                calls_to(&calls, "session.set_model"),
+                [json!({"session_id": "s", "model": CURSOR})],
+                "/model {arg}"
+            );
+            assert_eq!(
+                app.state.model_alias.as_deref(),
+                Some(CURSOR),
+                "/model {arg}"
+            );
+            assert_eq!(app.state.acp_agent_name().as_deref(), Some("cursor"));
+        }
+
+        // Configured models keep working and win over an agent's short name.
+        let (mut app, calls) = app_with_server(plugins_list(), json!({}));
+        app.handle_slash_command("/model test/model").await.unwrap();
+        assert_eq!(
+            calls_to(&calls, "session.set_model"),
+            [json!({"session_id": "s", "model": "test/model"})]
+        );
+        assert_eq!(app.state.acp_agent_name(), None);
+    }
+
+    #[tokio::test]
+    async fn model_command_rejects_unknown_and_ambiguous_acp_agents() {
+        let mut two = plugins_list();
+        two["plugins"].as_array_mut().unwrap().push(json!({
+            "name": "other-cursor", "enabled": true, "slash_commands": [],
+            "acp_agents": [{"id": "other-cursor.cursor", "agent": "cursor", "name": "cursor", "description": ""}]
+        }));
+        let (mut app, calls) = app_with_server(two, json!({}));
+
+        // The short name is shared: the user has to be explicit.
+        app.handle_slash_command("/model cursor").await.unwrap();
+        let notes = system_texts(&app);
+        assert!(
+            notes.iter().any(|note| note.contains("several ACP agents")
+                && note.contains(CURSOR)
+                && note.contains("acp:other-cursor.cursor")),
+            "{notes:?}"
+        );
+        // The full alias still works.
+        app.handle_slash_command("/model acp:other-cursor.cursor")
+            .await
+            .unwrap();
+        assert_eq!(
+            app.state.model_alias.as_deref(),
+            Some("acp:other-cursor.cursor")
+        );
+
+        // Unknown agents / disabled plugins never reach the server.
+        for arg in ["acp:off-plugin.gone", "acp:nope.nope", "gone", "nothing"] {
+            app.handle_slash_command(&format!("/model {arg}"))
+                .await
+                .unwrap();
+            assert!(
+                system_texts(&app)
+                    .last()
+                    .is_some_and(|note| note.starts_with(&format!("Unknown model '{arg}'"))),
+                "{arg}: {:?}",
+                system_texts(&app)
+            );
+        }
+        assert_eq!(calls_to(&calls, "session.set_model").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn switching_to_an_acp_agent_explains_what_changes() {
+        let (mut app, calls) = app_with_server(plugins_list(), json!({}));
+        app.handle_slash_command("/model cursor").await.unwrap();
+
+        let notes = system_texts(&app);
+        let note = notes.last().expect("a switch notice");
+        assert!(
+            note.starts_with(&format!("Model set to: {CURSOR} (ACP)")),
+            "{note}"
+        );
+        assert!(note.contains("external agent 'cursor'"), "{note}");
+        assert!(note.contains("tools, sandbox and MCP"), "{note}");
+        assert!(note.contains("queued"), "{note}");
+        // No configured-model checks or fallback bookkeeping for an agent.
+        assert!(
+            notes
+                .iter()
+                .all(|note| !note.contains("Unknown model alias")),
+            "{notes:?}"
+        );
+        assert!(calls_to(&calls, "session.set_fallback_model").is_empty());
+        assert_eq!(app.model_capability_precheck(CURSOR), None);
+
+        // Back on a configured model the usual flow (fallback reset) runs again.
+        app.handle_slash_command("/model test/model").await.unwrap();
+        assert_eq!(calls_to(&calls, "session.set_fallback_model").len(), 1);
+        assert!(system_texts(&app)
+            .last()
+            .is_some_and(|note| note.starts_with("Model set to: test/model")));
+        assert_eq!(app.state.acp_agent_name(), None);
+    }
+
+    #[tokio::test]
+    async fn steering_an_acp_session_says_the_message_is_queued() {
+        let (mut app, calls) = app_with_server(plugins_list(), json!({}));
+        app.state.model_alias = Some(CURSOR.into());
+        app.state.status = SessionStatus::Thinking;
+        app.state.input.set_text("change direction".into());
+
+        app.submit_steer_input().await.unwrap();
+        let note = system_texts(&app).last().cloned().unwrap();
+        assert!(
+            note.contains("不支持运行中插话") && note.contains("本轮结束后发送"),
+            "{note}"
+        );
+        assert!(!note.contains("applying at the next model step"), "{note}");
+
+        // Ordinary sessions keep the in-turn steer wording.
+        app.state.model_alias = Some("test/model".into());
+        app.state.input.set_text("and again".into());
+        app.submit_steer_input().await.unwrap();
+        let note = system_texts(&app).last().cloned().unwrap();
+        assert!(note.contains("applying at the next model step"), "{note}");
+
+        // Both messages reached the server as steers.
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while calls_to(&calls, "session.steer").len() < 2 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("steers delivered");
+    }
+
+    #[tokio::test]
+    async fn undo_reports_what_it_could_not_revert() {
+        let surviving = json!([{"role": "user", "content": [{"type": "text", "text": "kept"}]}]);
+        let warning = "The undone turn(s) ran on the external ACP agent 'cursor': kkagent cannot \
+                       revert the file changes it made.";
+
+        let (mut app, _calls) = app_with_server(
+            plugins_list(),
+            json!({"undone": 1, "messages": surviving, "warnings": [warning]}),
+        );
+        app.undo_turns(1).await.unwrap();
+        let notes = system_texts(&app);
+        assert!(notes.iter().any(|note| note == warning), "{notes:?}");
+        assert!(
+            notes
+                .iter()
+                .all(|note| !note.contains("File changes restored")),
+            "must not claim the files came back: {notes:?}"
+        );
+        assert!(notes.iter().any(|note| note.starts_with("Undid 1 turn(s)")));
+
+        // Nothing to warn about: the usual wording.
+        let (mut app, _calls) =
+            app_with_server(plugins_list(), json!({"undone": 1, "messages": surviving}));
+        app.undo_turns(1).await.unwrap();
+        assert!(system_texts(&app)
+            .iter()
+            .any(|note| note.contains("File changes restored where possible")));
+    }
+
+    #[test]
+    fn resumed_acp_turns_hide_the_harness_only_activity_summary() {
+        let message = |role: &str, text: &str| json!({"role": role, "content": [{"type": "text", "text": text}]});
+        // What an ACP turn leaves in the transcript: prompt, reply, summary.
+        let summary =
+            "<system-reminder>\n[acp-activity agent=kk-cursor-agent.cursor name=cursor]\n\
+                       The external agent \"cursor\" ran these tools while answering the previous \
+                       message.\n- edit · Edit a.rs (completed) — a.rs\n</system-reminder>";
+        let shown = transcript_messages_to_display(&[
+            message("user", "rename the module"),
+            message("assistant", "done"),
+            message("user", summary),
+        ]);
+        assert_eq!(shown.len(), 2, "the summary is not a visible message");
+        assert_eq!(shown[0].role, MessageRole::User);
+        assert_eq!(shown[0].content, "rename the module");
+        assert_eq!(shown[1].role, MessageRole::Assistant);
+        assert_eq!(shown[1].content, "done");
+    }
+
+    #[test]
+    fn picker_blurbs_keep_the_first_clause_of_long_plugin_descriptions() {
+        // Descriptions of delegation plugins are written for the model.
+        assert_eq!(
+            acp_agent_blurb(
+                "Delegate one-shot code tasks to Cursor: codebase-wide scans and research, \
+                 large refactors, batch test writing, deep review."
+            ),
+            "Delegate one-shot code tasks to Cursor"
+        );
+        assert_eq!(
+            acp_agent_blurb("Delegate one-shot tasks to OpenAI Codex. Reach for it first when …"),
+            "Delegate one-shot tasks to OpenAI Codex"
+        );
+        assert_eq!(acp_agent_blurb("Stub ACP agent"), "Stub ACP agent");
+        assert_eq!(acp_agent_blurb("  \n"), "");
+        let long = acp_agent_blurb(&"x".repeat(200));
+        assert_eq!(long.chars().count(), 72);
+        assert!(long.ends_with('…'));
+        // Multi-byte text is cut on character boundaries.
+        let wide = acp_agent_blurb(&"外部代理".repeat(40));
+        assert_eq!(wide.chars().count(), 72);
+    }
+
+    #[test]
+    fn acp_display_names_fall_back_to_the_id_when_the_plugin_list_is_unknown() {
+        assert_eq!(
+            acp_agent_display_name(&[], CURSOR).as_deref(),
+            Some("cursor")
+        );
+        assert_eq!(
+            acp_agent_display_name(&[], "acp:solo").as_deref(),
+            Some("solo")
+        );
+        assert_eq!(acp_agent_display_name(&[], "test/model"), None);
+        assert_eq!(acp_agent_display_name(&[], "acp:"), None);
+        let known = [AcpAgentEntry {
+            id: "kk-cursor-agent.cursor".into(),
+            agent: "Cursor CLI".into(),
+            description: String::new(),
+        }];
+        assert_eq!(
+            acp_agent_display_name(&known, CURSOR).as_deref(),
+            Some("Cursor CLI")
+        );
+    }
+
+    // -- Thinking level of the external agent -------------------------------
+
+    const CURSOR_MAX: &str = "acp:kk-cursor-agent.cursor#max";
+
+    fn reported(model: Option<&str>, level: Option<&str>, levels: &[&str]) -> AcpAgentInfo {
+        AcpAgentInfo {
+            agent: "cursor".into(),
+            model: model.map(str::to_string),
+            thought_level: level.map(str::to_string),
+            thought_levels: levels.iter().map(|level| level.to_string()).collect(),
+        }
+    }
+
+    const CURSOR_LEVELS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
+
+    /// An app on the Cursor agent that has reported its model and levels.
+    fn app_on_cursor(alias: &str) -> (TuiApp, Calls) {
+        let (mut app, calls) = app_with_server(plugins_list(), json!({}));
+        app.apply_plugins_list(Some(plugins_list()));
+        app.state.model_alias = Some(alias.into());
+        app.state.acp_agent_info = Some(reported(
+            Some("claude-sonnet-5-5"),
+            Some("high"),
+            &CURSOR_LEVELS,
+        ));
+        (app, calls)
+    }
+
+    fn agent_state_frame(note: Option<&str>) -> Frame {
+        Frame::Event {
+            event: "agent".into(),
+            scope: None,
+            data: serde_json::to_value(AgentEvent::AcpAgentState {
+                session_id: "s".into(),
+                agent: "cursor".into(),
+                model: Some("claude-sonnet-5-5".into()),
+                thought_level: Some("low".into()),
+                thought_levels: CURSOR_LEVELS
+                    .iter()
+                    .map(|level| level.to_string())
+                    .collect(),
+                note: note.map(str::to_string),
+            })
+            .unwrap(),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_agent_state_event_feeds_the_footer_data_and_shows_its_note() {
+        let (mut app, _calls) = app_with_server(plugins_list(), json!({}));
+        app.state.model_alias = Some(CURSOR_MAX.into());
+        // Before the agent reported, the level asked of it is what shows.
+        assert_eq!(app.state.acp_thought_level().as_deref(), Some("max"));
+
+        app.handle_server_event(agent_state_frame(Some("cursor has no level 'minimal'")));
+        assert_eq!(
+            app.state.acp_agent_info,
+            Some(reported(
+                Some("claude-sonnet-5-5"),
+                Some("low"),
+                &CURSOR_LEVELS
+            ))
+        );
+        // What the agent is on beats what was asked of it.
+        assert_eq!(app.state.acp_thought_level().as_deref(), Some("low"));
+        assert_eq!(system_texts(&app), ["cursor has no level 'minimal'"]);
+
+        // Without a note nothing is added to the transcript.
+        app.handle_server_event(agent_state_frame(None));
+        assert_eq!(system_texts(&app).len(), 1);
+
+        // Leaving the agent forgets what it reported; so does a plain model.
+        app.state.adopt_model_alias(Some("test/model".into()));
+        assert_eq!(app.state.acp_agent_info, None);
+        assert_eq!(app.state.acp_thought_level(), None);
+    }
+
+    #[test]
+    fn adopting_an_alias_keeps_or_drops_what_the_agent_reported() {
+        let mut state = AppState::new(PermissionMode::Manual, false);
+        state.adopt_model_alias(Some(CURSOR.into()));
+        state.acp_agent_info = Some(reported(Some("m"), Some("high"), &CURSOR_LEVELS));
+
+        // The same agent with a new level: shown at once, rest kept.
+        state.adopt_model_alias(Some(CURSOR_MAX.into()));
+        assert_eq!(state.acp_thought_level().as_deref(), Some("max"));
+        assert_eq!(
+            state
+                .acp_agent_info
+                .as_ref()
+                .and_then(|info| info.model.as_deref()),
+            Some("m")
+        );
+        // The same alias again (an echo of the change) changes nothing, not
+        // even a level the agent had to substitute meanwhile.
+        state.acp_agent_info.as_mut().unwrap().thought_level = Some("xhigh".into());
+        state.adopt_model_alias(Some(CURSOR_MAX.into()));
+        assert_eq!(state.acp_thought_level().as_deref(), Some("xhigh"));
+        // Without a level in the alias the agent's own report stays.
+        state.adopt_model_alias(Some(CURSOR.into()));
+        assert_eq!(state.acp_thought_level().as_deref(), Some("xhigh"));
+
+        // An agent that offers no levels is never shown on one it cannot take.
+        state.acp_agent_info = Some(reported(None, None, &[]));
+        state.adopt_model_alias(Some(CURSOR_MAX.into()));
+        assert_eq!(state.acp_thought_level(), None);
+
+        // Another agent, or an ordinary model, starts from scratch.
+        state.adopt_model_alias(Some("acp:other.agent".into()));
+        assert_eq!(state.acp_agent_info, None);
+        state.acp_agent_info = Some(reported(None, Some("high"), &CURSOR_LEVELS));
+        state.adopt_model_alias(Some("test/model".into()));
+        assert_eq!(state.acp_agent_info, None);
+    }
+
+    #[tokio::test]
+    async fn effort_on_an_acp_session_asks_the_agent_through_the_alias() {
+        let (mut app, calls) = app_on_cursor(CURSOR);
+        app.handle_slash_command("/effort max").await.unwrap();
+
+        assert_eq!(
+            calls_to(&calls, "session.set_model"),
+            [json!({"session_id": "s", "model": CURSOR_MAX})]
+        );
+        assert_eq!(app.state.model_alias.as_deref(), Some(CURSOR_MAX));
+        assert_eq!(app.state.acp_thought_level().as_deref(), Some("max"));
+        // kkagent's own thinking setting is not what changed.
+        assert!(app.config.thinking.is_none());
+        let note = system_texts(&app).last().cloned().unwrap();
+        assert!(
+            note.contains("cursor agent: max") && note.contains("next message"),
+            "{note}"
+        );
+
+        // Levels are matched without regard to case, `on` means high, and
+        // asking for the current level again is harmless.
+        app.handle_slash_command("/effort LOW").await.unwrap();
+        app.handle_slash_command("/effort on").await.unwrap();
+        let models: Vec<Value> = calls_to(&calls, "session.set_model")
+            .iter()
+            .map(|call| call["model"].clone())
+            .collect();
+        assert_eq!(
+            models,
+            [
+                json!(CURSOR_MAX),
+                json!("acp:kk-cursor-agent.cursor#low"),
+                json!("acp:kk-cursor-agent.cursor#high")
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn effort_on_an_acp_session_checks_the_levels_the_agent_offers() {
+        let (mut app, calls) = app_on_cursor(CURSOR);
+        for (arg, expected) in [
+            (
+                "minimal",
+                "The cursor agent has no thinking level 'minimal' \
+                 (it offers: low, medium, high, xhigh, max).",
+            ),
+            (
+                "off",
+                "The cursor agent has no thinking level 'off' \
+                 (it offers: low, medium, high, xhigh, max).",
+            ),
+            ("very high", "Unknown thinking level: very high"),
+        ] {
+            app.handle_slash_command(&format!("/effort {arg}"))
+                .await
+                .unwrap();
+            assert_eq!(
+                system_texts(&app).last().unwrap(),
+                expected,
+                "/effort {arg}"
+            );
+        }
+        assert!(calls_to(&calls, "session.set_model").is_empty());
+        assert_eq!(app.state.model_alias.as_deref(), Some(CURSOR));
+    }
+
+    #[tokio::test]
+    async fn effort_says_so_when_the_agent_offers_no_thinking_level() {
+        let (mut app, calls) = app_on_cursor(CURSOR);
+        app.state.acp_agent_info = Some(reported(Some("gpt-6.1-sol"), Some("high"), &[]));
+
+        for command in ["/effort max", "/effort"] {
+            app.handle_slash_command(command).await.unwrap();
+            assert_eq!(
+                system_texts(&app).last().unwrap(),
+                "The cursor agent does not let clients choose a thinking level \
+                 (it is on 'high'); change it in the agent's own settings.",
+                "{command}"
+            );
+        }
+        assert!(app.state.list_picker.is_none(), "nothing to pick from");
+        assert!(calls_to(&calls, "session.set_model").is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_effort_picker_lists_the_agents_levels_and_applies_the_choice() {
+        let (mut app, calls) = app_on_cursor(CURSOR);
+        app.handle_slash_command("/effort").await.unwrap();
+
+        let picker = app.state.list_picker.as_ref().expect("picker");
+        assert!(picker.title.contains("cursor"), "{}", picker.title);
+        let ids: Vec<&str> = picker.items.iter().map(|item| item.id.as_str()).collect();
+        assert_eq!(ids, CURSOR_LEVELS);
+        assert_eq!(
+            picker.items[picker.selected].id, "high",
+            "the current level"
+        );
+
+        // Pick `xhigh`.
+        app.state.list_picker.as_mut().unwrap().selected = 3;
+        app.apply_list_picker().await.unwrap();
+        assert_eq!(
+            calls_to(&calls, "session.set_model"),
+            [json!({"session_id": "s", "model": "acp:kk-cursor-agent.cursor#xhigh"})]
+        );
+        assert!(app.state.list_picker.is_none());
+        assert_eq!(app.state.acp_thought_level().as_deref(), Some("xhigh"));
+    }
+
+    #[tokio::test]
+    async fn before_the_agent_reported_the_effort_picker_offers_the_usual_ladder() {
+        let (mut app, calls) = app_with_server(plugins_list(), json!({}));
+        app.apply_plugins_list(Some(plugins_list()));
+        app.state.model_alias = Some("acp:kk-cursor-agent.cursor#medium".into());
+        app.handle_slash_command("/effort").await.unwrap();
+
+        let picker = app.state.list_picker.as_ref().expect("picker");
+        let ids: Vec<&str> = picker.items.iter().map(|item| item.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["none", "minimal", "low", "medium", "high", "xhigh", "max"]
+        );
+        assert_eq!(picker.items[picker.selected].id, "medium");
+
+        // Without a report any plain level name is passed on; the agent
+        // maps or refuses it when its turn starts.
+        app.clear_list_pickers();
+        app.handle_slash_command("/effort minimal").await.unwrap();
+        assert_eq!(
+            calls_to(&calls, "session.set_model"),
+            [json!({"session_id": "s", "model": "acp:kk-cursor-agent.cursor#minimal"})]
+        );
+    }
+
+    #[tokio::test]
+    async fn effort_on_an_ordinary_model_is_unchanged() {
+        let (mut app, calls) = app_with_server(plugins_list(), json!({}));
+        app.handle_slash_command("/effort high").await.unwrap();
+        assert_eq!(
+            app.config
+                .thinking
+                .as_ref()
+                .and_then(|t| t.effort.as_deref()),
+            Some("high")
+        );
+        app.handle_slash_command("/effort nonsense").await.unwrap();
+        assert!(system_texts(&app)
+            .last()
+            .is_some_and(|note| note.starts_with("Usage: /effort")));
+        assert!(calls_to(&calls, "session.set_model").is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_model_command_takes_a_thinking_level_after_the_agent() {
+        for arg in [
+            "cursor#max",
+            "acp:kk-cursor-agent.cursor#max",
+            "kk-cursor-agent.cursor#MAX",
+            "cursor # max",
+        ] {
+            let (mut app, calls) = app_with_server(plugins_list(), json!({}));
+            app.handle_slash_command(&format!("/model {arg}"))
+                .await
+                .unwrap();
+            assert_eq!(
+                calls_to(&calls, "session.set_model"),
+                [json!({"session_id": "s", "model": CURSOR_MAX})],
+                "/model {arg}"
+            );
+            assert_eq!(app.state.acp_thought_level().as_deref(), Some("max"));
+        }
+
+        // A level that is not a plain level name is refused before the server.
+        let (mut app, calls) = app_with_server(plugins_list(), json!({}));
+        app.handle_slash_command("/model cursor#very high")
+            .await
+            .unwrap();
+        assert!(calls_to(&calls, "session.set_model").is_empty());
+        assert!(system_texts(&app)
+            .last()
+            .is_some_and(|note| note.starts_with("Unknown model 'cursor#very high'")));
+
+        // The ambiguity hint keeps the level.
+        let mut two = plugins_list();
+        two["plugins"].as_array_mut().unwrap().push(json!({
+            "name": "other-cursor", "enabled": true, "slash_commands": [],
+            "acp_agents": [{"id": "other-cursor.cursor", "agent": "cursor", "name": "cursor", "description": ""}]
+        }));
+        let (mut app, _calls) = app_with_server(two, json!({}));
+        app.handle_slash_command("/model cursor#max").await.unwrap();
+        let note = system_texts(&app).last().cloned().unwrap();
+        assert!(
+            note.contains(CURSOR_MAX) && note.contains("acp:other-cursor.cursor#max"),
+            "{note}"
+        );
+    }
+
+    #[tokio::test]
+    async fn picking_the_agent_again_keeps_its_thinking_level() {
+        let (mut app, calls) = app_on_cursor(CURSOR_MAX);
+
+        // The model picker still marks the agent the session is on.
+        app.open_model_picker().await;
+        let picker = app.state.list_picker.as_ref().expect("picker");
+        assert_eq!(picker.items[picker.selected].id, CURSOR);
+
+        app.apply_model_selection(CURSOR.into()).await;
+        assert_eq!(
+            calls_to(&calls, "session.set_model"),
+            [json!({"session_id": "s", "model": CURSOR_MAX})]
+        );
+        assert_eq!(app.state.model_alias.as_deref(), Some(CURSOR_MAX));
+        assert_eq!(
+            app.state
+                .acp_agent_info
+                .as_ref()
+                .and_then(|info| info.model.as_deref()),
+            Some("claude-sonnet-5-5"),
+            "the agent is the same, so is what it reported"
+        );
+
+        // Another model and back starts the agent from its own default.
+        app.apply_model_selection("test/model".into()).await;
+        app.apply_model_selection(CURSOR.into()).await;
+        assert_eq!(app.state.model_alias.as_deref(), Some(CURSOR));
+        assert_eq!(app.state.acp_agent_info, None);
+    }
+
+    #[tokio::test]
+    async fn the_config_picker_shows_the_agents_thinking_level() {
+        let (mut app, _calls) = app_on_cursor(CURSOR);
+        app.open_config_picker();
+        let picker = app.state.list_picker.as_ref().expect("picker");
+        let thinking = picker
+            .items
+            .iter()
+            .find(|item| item.id == "effort")
+            .unwrap();
+        assert_eq!(thinking.detail, "cursor: high");
+
+        app.state.acp_agent_info = None;
+        app.open_config_picker();
+        let picker = app.state.list_picker.as_ref().expect("picker");
+        let thinking = picker
+            .items
+            .iter()
+            .find(|item| item.id == "effort")
+            .unwrap();
+        assert_eq!(thinking.detail, "cursor: agent default");
     }
 }

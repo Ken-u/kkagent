@@ -90,7 +90,7 @@ Footer 第一行的模型槽位跟随当前视图：切进子 agent 视图（`/a
 
 - 会话：`/new`、`/clear`、`/sessions`、`/resume`、`/compact`、`/undo`、`/title`、`/status`、`/usage`。
 - 模式：`/permission`、`/yolo`、`/auto`、`/plan`、`/model`、`/effort`、`/thinking`、`/provider`。
-- `/effort [off|on|none|minimal|low|medium|high|xhigh|max]`：查看或设置思考强度。带参数直接生效（`on` 等价 `high`）；无参数打开选择器，优先展示当前模型 `support_efforts` 声明的等级。写入 `[thinking].effort`，优先级高于模型级 `default_effort`。
+- `/effort [off|on|none|minimal|low|medium|high|xhigh|max]`：查看或设置思考强度。带参数直接生效（`on` 等价 `high`）；无参数打开选择器，优先展示当前模型 `support_efforts` 声明的等级。写入 `[thinking].effort`，优先级高于模型级 `default_effort`。会话运行在外部 ACP agent 上时，`/effort` 改的是外部 agent 的思考等级，见[ACP 外部 agent 会话](#acp-外部-agent-会话)。
 - 扩展：`/mcp`、`/skills`、`/plugins`（多级弹窗管理已安装插件、marketplace 与安装来源）、`/plugins marketplace [source]`、`/plugins install <id-or-source>`、`/plugins update|enable|disable|remove|info <id>`、`/plugins reload`、`/tasks`、`/cron`（浏览/删除定时任务；也支持 `/cron list`、`/cron delete <id>`）、`/agents`（子 agent 状态与活动日志；正文不再灌入子 agent 输出）、`/goal`、`/swarm`、`/web`、`/prompts`。
 - `/goal <objective>`：创建目标；`/goal status|pause|resume|cancel` 管理状态；`/goal budget <turns|tokens|milliseconds|seconds|minutes|hours> <正整数|off>` 调整或清除单项硬预算。
 - 工具：`/init`、`/config`、`/auth`、`/reload`（同步热重载 TUI + server 配置，含新增模型；MCP/hooks 仍可能需重启）、`/add-dir`、`/btw`、`/fork`、`/search`、`/copy`、`/debug`。
@@ -99,10 +99,26 @@ Footer 第一行的模型槽位跟随当前视图：切进子 agent 视图（`/a
 - `/sessions`：仅列出当前 workspace 中有内容的会话（正在查看的空会话仍可见）；离开空会话会自动丢弃记录。
 - Footer session 条按 TUI 启动时的 workspace 稳定分组，该 workspace 的 session 始终排在其他 workspace 前面；子 agent 只占一个 `agents 当前运行数/总数` 聚合入口，点击后在 `/agents` 中选择具体 transcript。
 - `/sessions` 删除：`Ctrl+D` 后 ↑↓ 选 No/Yes（默认 No），Enter 确认。
-- `/model`：切换会话主模型。若选中的模型等于顶层 `fallback_model`，会继续弹出选择框，可为本次会话禁用 fallback，或另选一个不同的 fallback 模型。
+- `/model [名称]`：切换会话主模型；无参数打开选择器。若选中的模型等于顶层 `fallback_model`，会继续弹出选择框，可为本次会话禁用 fallback，或另选一个不同的 fallback 模型。已启用插件里声明了 `transport: "acp"` 的外部 agent（如官方 `kk-cursor-agent`）会自动作为 `acp:<插件>.<名称>` 出现在列表里，详见下文[ACP 外部 agent 会话](#acp-外部-agent-会话)。参数按「配置别名 → 完整 `acp:` 别名 → 插件 id → 唯一匹配的 agent 短名（如 `/model cursor`）」解析，短名有歧义时会列出完整别名；agent 后面可以接 `#等级`（如 `/model cursor#max`）同时指定外部 agent 的思考等级。
 - 帮助与退出：`/help`、`/release-notes`、`/feedback`、`/info`、`/exit`、`/quit`、`/q`。
 
 部分命令仅展示状态或排队执行；输入 `/help` 可查看当前版本的参数提示。
+
+## ACP 外部 agent 会话
+
+在 `/model` 里选中 `acp:` 项（例如 `/model cursor`）后，这个会话的每一轮都由外部 ACP agent（如 Cursor CLI 的 `agent acp`）执行，TUI 只作为前端：
+
+- 文本、思考、工具卡片（工具名形如 `cursor/execute`）和 Todo 面板照常显示；外部 agent 发来的权限请求、`ask_question` 提问和 `create_plan` 计划评审会弹成与普通会话相同的卡片，答案回传给它。权限按当前权限模式处理（`manual` 弹审批，`yolo` 只询问敏感命令/文件，`auto` 自动放行）；外部 agent 自己不发请求的操作（如 Cursor CLI 配置为 `approvalMode: unrestricted` 时）kkagent 无从拦截。
+- 外部 agent 自己管理工具、沙箱、MCP 和上下文，所以 footer 显示 `cursor · ACP`、`● sandbox:external` 和 `context: external`，不再显示上下文百分比；kkagent 的内建工具、skills、`/goal` 与自动压缩对它不生效。
+- **模型与思考等级由外部 agent 决定**：kkagent 不能替它换模型，也不会读写 `config.toml` 里的 `[models]`、`[thinking]`。第一条消息发出后，footer 会在 `cursor · ACP` 后显示 agent 实际在用的模型和思考等级（如 `claude-sonnet-5-5  thinking: high`，窄屏为 `claude-sonnet-5-5 · think:high`），数据来自 agent 自己的汇报。要换模型请在 agent 一侧改（Cursor CLI 里的 `/model`，或 `~/.cursor/cli-config.json`；Codex 里的 `~/.codex/config.toml`）。
+- **`/effort` 控制外部 agent 的思考等级**：`/effort`（选择器，列出 agent 提供的等级）或 `/effort max`；等价于 `/model cursor#max`。等级写进会话的模型别名（`acp:kk-cursor-agent.cursor#max`），随会话保存，下一条消息发送前由 kkagent 通过 ACP 的 `session/set_config_option` 设给 agent。agent 提供的等级不含你选的那一档时，已汇报过等级的会话会直接拒绝并列出可选项；尚未汇报时会就近取最接近的一档并说明（如 `minimal` → `low`）。`/effort off` 等于 `none`，多数 agent 没有这一档。
+- 并非所有外部 agent 都允许客户端选择思考等级：Cursor CLI 需要它提供的 `thought_level` 选项（kkagent 在 `initialize` 里声明 `parameterizedModelPicker` 后即会提供），Codex 的 `codex-acp`（实测 1.10.0）对 `~/.codex/config.toml` 里自定义的模型不提供，此时 `/effort` 只会提示「该 agent 不允许客户端选择思考等级」，等级请在 agent 自己的配置里改。
+- 副作用：Cursor CLI 把「模型 + 思考等级」保存在 `~/.cursor/cli-config.json`（全局），所以在 kkagent 里改等级也会改变你之后直接使用 Cursor CLI 时该模型的默认等级。
+- Plan 模式（`Shift+Tab`）与外部 agent 的 plan 模式同步；计划被接受后退出 Plan 模式，随后的消息按普通模式执行。
+- 外部 agent 没有「运行中插话」：运行中 `Enter` 与 `Ctrl+S` 都只是排队，本轮结束后作为下一条消息发送（TUI 提示「已排队」）；`Esc` 会先发 `session/cancel`，8 秒内没有响应则回收该进程，保留已输出的部分文本，下一轮自动重启。
+- 会话转录保持普通结构（用户消息、助手文本，外加一条对 UI 隐藏的活动摘要），可随时 `/model` 切回普通模型接管同一会话，也可再切回外部 agent；`/export-md`、`/copy`、`/fork` 照常可用。
+- `/undo`、`/edit` 与历史恢复只回退对话：外部 agent 改动的文件不会恢复，TUI 会在回退后追加一条警告，请自行用 git 处理。
+- 图片附件不会转发给外部 agent；`/btw` 在这类会话里回退到默认模型。
 
 ## 连接独立 Server
 

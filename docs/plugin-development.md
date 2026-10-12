@@ -290,6 +290,88 @@ provider 取值与 wire 格式要求见 [configuration.md 的 Web 搜索](config
 - 多个插件声明同名限定名时先注册者生效，冲突写入诊断日志。
 - `acp` 型的 agent 需自行完成认证（`agent login` 或环境变量注入凭据），kkagent 不代管。
 
+### 作为会话后端使用（`/model`）
+
+`transport: "acp"` 的子 Agent 除了被 `Agent` 工具委派，还会**自动**出现在 `/model`
+里，别名为 `acp:<plugin-id>.<name>`（如官方插件的 `acp:kk-cursor-agent.cursor`）。
+只有已启用的插件才会列出，不需要改 `config.toml`；`[models]` 里不允许使用以
+`acp:` 开头的别名。
+
+选中后，该会话的**每一轮**都交给外部 agent 执行，kkagent 的前端（TUI、HTTP、ACP
+桥）负责展示和交互：
+
+- 文本、思考、工具卡片（工具名为 `<agent>/<kind>`，如 `cursor/edit`）与 Todo 面板
+  照常显示；
+- 外部 agent 的 `session/request_permission`、`cursor/ask_question`、
+  `cursor/create_plan` 会转给用户：权限按会话权限模式处理（`manual` 弹审批，
+  `yolo` 只对敏感命令/文件询问，`auto` 自动放行），提问逐个弹出，计划以
+  「执行 / 修改意见 / 拒绝」评审卡呈现；
+- Plan 模式与 ACP 会话模式同步（kkagent `plan` ↔ ACP `plan`，否则 `agent`），每轮
+  发送前对齐；
+- 切回普通模型随时可用，原有的子 Agent 用法不受影响。
+
+与子 Agent 委派相比，作为会话后端时：
+
+| | 子 Agent（`Agent` 工具） | 会话后端（`/model`） |
+|---|---|---|
+| 权限 | `autoApprove` 决定 | **忽略** `autoApprove`，按会话权限模式 |
+| `promptPrefix` | 追加在委派 prompt 前 | **忽略** |
+| `timeoutSecs` | 单个请求总超时 | 空闲超时（等待用户交互期间不计时），缺省 600 秒 |
+| 进程 | 每次委派一个 | 每个（会话, agent）一个；空闲 30 分钟回收，崩溃后下一轮自动重启 |
+
+注意事项：
+
+- 外部 agent 是否发出权限请求由它自己的审批设置决定。Cursor CLI 在
+  `~/.cursor/cli-config.json` 中 `approvalMode` 为 `unrestricted` 时不会发
+  `session/request_permission`，kkagent 看不到也拦不住；需要逐项确认请改为
+  `allowlist`。
+- kkagent 的内建工具、MCP、skills、沙箱、自动压缩、`/goal` 与 token
+  用量统计都不作用于外部 agent（它自己管理工具与上下文）；`/compact` 只压缩
+  kkagent 侧的转录。图片附件不会转发，前言里以占位符代替。
+- ACP 没有「运行中插话」原语：运行中的 Ctrl-S / `session.steer` 会排队，等本轮
+  结束后作为下一轮发送，不会打断正在执行的工具；要立即改方向请 Esc 中断后重发。
+- 回合进行中切换模型，下一轮才生效。
+
+**模型与思考等级**：外部 agent 用什么模型由它自己决定（Cursor CLI 的
+`~/.cursor/cli-config.json` 或其 `/model`；Codex 的 `~/.codex/config.toml`），kkagent
+不会替它换模型，也没有对应的配置层。kkagent 做两件事：
+
+- **汇报**：每个 ACP 回合开始时，kkagent 读出 agent 在 `session/new` 里报告的当前模型和
+  思考等级，以 `acp_agent_state` 事件（见 [server-api.md](server-api.md#acp-外部-agent-模型)）
+  发给前端，TUI 的 footer 据此显示 `claude-sonnet-5-5  thinking: high`。
+- **设置思考等级**：别名可以带等级后缀 `acp:<plugin-id>.<name>#<等级>`（如
+  `acp:kk-cursor-agent.cursor#max`；等级只能由字母、数字和 `-` `_` `.` 组成，最长 32
+  字符）。TUI 的 `/effort` 与 `/model cursor#max` 就是改这个后缀，它随会话保存，
+  每个回合发给 agent 之前，kkagent 把它通过 `session/set_config_option` 设给 agent
+  的「思考等级」选项（`category: "thought_level"`；选项 id 因模型而异，kkagent 按
+  category 找，不依赖 id）。没有后缀就不动 agent 的设置。
+
+  为了让 Cursor CLI 把思考等级作为独立选项提供（而不是把「模型 + 等级」拼成固定的
+  变体 id），kkagent 在 ACP `initialize` 里声明
+  `clientCapabilities._meta.parameterizedModelPicker = true`；只有会话后端这样声明，
+  子 Agent 委派不变。
+
+  请求的等级 agent 没有时，kkagent 取最接近的一档（顺序 `none` < `minimal` < `low` <
+  `medium` < `high` < `xhigh` < `max` < `ultra`，距离相同取较低的一档）并在聊天里说明；
+  agent 不提供思考等级选项（例如实测 `codex-acp` 对 `~/.codex/config.toml` 里自定义的
+  模型）、或拒绝了设置时，同样只提示一次，回合照常进行。agent 重启或会话重建后，等级
+  回到 agent 自己的默认，下一回合开始前再设一次。
+
+  注意副作用：Cursor CLI 把模型与思考等级保存在 `~/.cursor/cli-config.json`（全局），
+  `session/set_config_option` 会改写它，所以在 kkagent 里调整等级也会改变之后直接
+  运行 Cursor CLI 时该模型的默认等级。
+
+**会话可移植**：每个 ACP 回合在转录里只留三条消息——用户消息、助手最终文本，以及
+一条 harness-only 的活动摘要（`[acp-activity agent=<id> name=<name>]`，逐行列出
+工具类别、标题、状态与路径，不含工具输入输出和 diff）。不写 `ToolUse` 块，所以
+任何模型都能接管同一个会话（它看得到问答和活动摘要，文件的真实状态让它自己用
+Read / `git diff` 查）；切回外部 agent 时，kkagent 把它没见过的消息压成有界前言带过去；
+`/undo`、`/edit`、`/compact` 等改写历史的操作之后会重建外部 agent 的会话。
+`/export-md`、`/copy` 与 HTTP 导出照常可用。
+
+`/undo`、`/edit` 与 `session.restore` 只回退对话：外部 agent 改动的文件不在 kkagent
+的快照里，不会恢复，TUI 会在回退时给出警告，请自行用 git 处理。
+
 ## 本地测试与调试
 
 1. **安装**：`/plugins install /absolute/path/to/plugin-dir`（也接受 ZIP / `file://` /

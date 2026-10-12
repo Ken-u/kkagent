@@ -219,6 +219,43 @@ impl PermissionChain {
         (PermissionDecision::Ask, "fallback-ask")
     }
 
+    /// Evaluate a permission request raised by an *external* agent (ACP
+    /// backend). The chain is the same as for built-in tools — user rules,
+    /// session approvals and the permission mode all apply — keyed by the
+    /// namespaced `tool_name` (`cursor/execute`). The sensitive-file and
+    /// git-control gates, which only know the built-in tool names, are applied
+    /// through the built-in tool of the same `kind` so `yolo` keeps asking
+    /// before an external agent touches secrets. `input` carries `path`
+    /// and/or `command` like built-in tool inputs do.
+    pub fn evaluate_external(
+        &self,
+        tool_name: &str,
+        kind: Option<&str>,
+        input: &serde_json::Value,
+        working_dir: &Path,
+        plan_mode: bool,
+        plan_file: Option<&Path>,
+    ) -> (PermissionDecision, &'static str) {
+        let (decision, source) =
+            self.evaluate_sourced(tool_name, input, working_dir, plan_mode, plan_file);
+        if decision != PermissionDecision::Approve || source != "yolo-mode-approve" {
+            return (decision, source);
+        }
+        let builtin = match kind.map(str::trim).unwrap_or_default() {
+            "execute" => "Bash",
+            "read" | "search" | "fetch" => "Read",
+            "edit" | "delete" | "move" => "Write",
+            _ => return (decision, source),
+        };
+        if has_sensitive_file_access(builtin, input) {
+            return (PermissionDecision::Ask, "sensitive-file-access");
+        }
+        if accesses_git_control_path(builtin, input) {
+            return (PermissionDecision::Ask, "git-control-path");
+        }
+        (decision, source)
+    }
+
     pub fn record_session_approval(&mut self, tool_name: &str, input: &serde_json::Value) {
         let key = format!("{}:{}", tool_name, approval_pattern(tool_name, input));
         if !self.session_approved.contains(&key) {
@@ -863,5 +900,112 @@ mod tests {
             None,
         );
         assert_eq!(decision, PermissionDecision::Approve);
+    }
+
+    fn external(
+        chain: &PermissionChain,
+        kind: &str,
+        input: serde_json::Value,
+    ) -> (PermissionDecision, &'static str) {
+        chain.evaluate_external(
+            &format!("cursor/{kind}"),
+            Some(kind),
+            &input,
+            Path::new("/tmp/ws"),
+            false,
+            None,
+        )
+    }
+
+    #[test]
+    fn external_requests_ask_in_manual_and_follow_session_approvals() {
+        let mut chain = PermissionChain::new(PermissionMode::Manual, vec![]);
+        let input = serde_json::json!({"command": "ls"});
+        assert_eq!(
+            external(&chain, "execute", input.clone()).0,
+            PermissionDecision::Ask
+        );
+        chain.record_session_approval("cursor/execute", &input);
+        assert_eq!(
+            external(&chain, "execute", input).0,
+            PermissionDecision::Approve
+        );
+        // The approval is keyed by the namespaced tool, not by `Bash`.
+        assert_eq!(
+            chain.evaluate(
+                "Bash",
+                &serde_json::json!({"command": "ls"}),
+                Path::new("/tmp/ws"),
+                false,
+                None
+            ),
+            PermissionDecision::Ask
+        );
+    }
+
+    #[test]
+    fn external_requests_in_yolo_still_ask_for_secrets_and_git_internals() {
+        let chain = PermissionChain::new(PermissionMode::Yolo, vec![]);
+        assert_eq!(
+            external(
+                &chain,
+                "execute",
+                serde_json::json!({"command": "cargo test"})
+            ),
+            (PermissionDecision::Approve, "yolo-mode-approve")
+        );
+        assert_eq!(
+            external(
+                &chain,
+                "execute",
+                serde_json::json!({"command": "cat .env"})
+            ),
+            (PermissionDecision::Ask, "sensitive-file-access")
+        );
+        assert_eq!(
+            external(
+                &chain,
+                "read",
+                serde_json::json!({"path": "/home/u/.ssh/id_rsa"})
+            ),
+            (PermissionDecision::Ask, "sensitive-file-access")
+        );
+        assert_eq!(
+            external(
+                &chain,
+                "edit",
+                serde_json::json!({"path": "repo/.git/config"})
+            ),
+            (PermissionDecision::Ask, "git-control-path")
+        );
+        // Kinds without a built-in analogue are not second-guessed.
+        assert_eq!(
+            external(&chain, "think", serde_json::json!({"command": "cat .env"})).0,
+            PermissionDecision::Approve
+        );
+    }
+
+    #[test]
+    fn external_requests_in_auto_approve_but_honor_user_deny_rules() {
+        let chain = PermissionChain::new(PermissionMode::Auto, vec![]);
+        assert_eq!(
+            external(
+                &chain,
+                "execute",
+                serde_json::json!({"command": "cat .env"})
+            )
+            .0,
+            PermissionDecision::Approve
+        );
+        let deny = PermissionRule {
+            decision: "deny".into(),
+            pattern: "cursor/execute".into(),
+            scope: None,
+        };
+        let chain = PermissionChain::new(PermissionMode::Auto, vec![deny]);
+        assert!(matches!(
+            external(&chain, "execute", serde_json::json!({"command": "ls"})).0,
+            PermissionDecision::Deny(_)
+        ));
     }
 }

@@ -30,6 +30,8 @@ use crate::transcript::TranscriptDb;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
+mod acp_turn;
+
 const STREAM_DELTA_FLUSH_INTERVAL: Duration = Duration::from_millis(16);
 const STREAM_DELTA_FLUSH_BYTES: usize = 64;
 const STREAM_INTERRUPT_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -174,6 +176,9 @@ pub struct AgentLoop {
     transcript_db: Option<TranscriptDb>,
     /// Vision-proxy description cache shared across turns (see `vision_proxy`).
     vision_cache: Arc<Mutex<crate::vision_proxy::VisionCache>>,
+    /// Backends for sessions whose model is an `acp:<plugin>.<agent>` alias
+    /// (see `acp_turn`). Without it such sessions fail with a readable error.
+    acp_backends: Option<Arc<crate::acp_backend::AcpBackendHub>>,
 }
 
 /// Spills oversized tool results to `<config_dir>/tool-results/` and, when a
@@ -325,6 +330,13 @@ impl AgentLoop {
         self
     }
 
+    /// Attach the hub that runs turns of `acp:` model aliases on external
+    /// ACP agents.
+    pub fn with_acp_backends(mut self, hub: Arc<crate::acp_backend::AcpBackendHub>) -> Self {
+        self.acp_backends = Some(hub);
+        self
+    }
+
     async fn emit_goal_updated(&self, session: &Session, change: &str) {
         let Some(goal_mgr) = &self.goal_mgr else {
             return;
@@ -397,6 +409,7 @@ impl AgentLoop {
             tool_result_store: None,
             transcript_db: None,
             vision_cache: Arc::new(Mutex::new(Default::default())),
+            acp_backends: None,
         }
     }
 
@@ -414,7 +427,13 @@ impl AgentLoop {
                 match self.run_turn_step(session).await? {
                     TurnStep::Done => {
                         self.sync_requested_plan_mode(session).await?;
-                        if let Some(goal_mgr) = &self.goal_mgr {
+                        // /goal runs on kkagent's own model loop; an ACP agent
+                        // manages its own continuation.
+                        if let Some(goal_mgr) = self
+                            .goal_mgr
+                            .as_ref()
+                            .filter(|_| !acp_backed_session(session))
+                        {
                             if goal_mgr.should_continue().await
                                 && goal_continuations < MAX_GOAL_CONTINUATIONS
                                 && !session.is_interrupted()
@@ -449,7 +468,11 @@ impl AgentLoop {
                         self.finish_turn(session, true).await?;
                         self.sync_requested_plan_mode(session).await?;
                         // Step-cap: still allow goal continuation with a fresh turn budget.
-                        if let Some(goal_mgr) = &self.goal_mgr {
+                        if let Some(goal_mgr) = self
+                            .goal_mgr
+                            .as_ref()
+                            .filter(|_| !acp_backed_session(session))
+                        {
                             if goal_mgr.should_continue().await
                                 && goal_continuations < MAX_GOAL_CONTINUATIONS
                                 && !session.is_interrupted()
@@ -532,6 +555,12 @@ impl AgentLoop {
                 alias
             }
         };
+        // `acp:<plugin>.<agent>` aliases run the whole step on an external ACP
+        // agent instead of an LLM provider (see `acp_turn`).
+        if let Some(agent_id) = kkagent_config::acp_agent_id(&model_alias) {
+            let effort = kkagent_config::acp_alias_effort(&model_alias);
+            return self.run_acp_turn_step(session, agent_id, effort).await;
+        }
         let (primary_model_config, primary_provider_config) = self
             .config
             .resolve_model(&model_alias)
@@ -3905,6 +3934,12 @@ async fn send_llm_retry_notice(
 fn duration_ceil_seconds(duration: Duration) -> u64 {
     let milliseconds = duration.as_millis();
     u64::try_from(milliseconds.saturating_add(999) / 1_000).unwrap_or(u64::MAX)
+}
+
+/// True while the session's model is an `acp:` alias (turns run on an
+/// external ACP agent).
+fn acp_backed_session(session: &Session) -> bool {
+    kkagent_config::acp_agent_id(&session.get_model_alias()).is_some()
 }
 
 fn describe_tool_action(name: &str, input: &serde_json::Value) -> String {

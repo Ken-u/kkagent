@@ -25,7 +25,7 @@ use crate::subagent_runtime::SubagentMirrorContext;
 
 /// Resolve the command for an external subagent: explicit manifest command,
 /// else the Cursor CLI default (`agent acp`).
-fn resolve_command(config: &PluginSubagentTransportConfig) -> Vec<String> {
+pub(crate) fn resolve_command(config: &PluginSubagentTransportConfig) -> Vec<String> {
     if config.command.is_empty() {
         vec!["agent".into(), "acp".into()]
     } else {
@@ -117,6 +117,11 @@ async fn run_acp_subagent(
         } else {
             PermissionPolicy::Deny
         }),
+        // Delegated subagents run unattended: no host handler, the
+        // permission policy above answers every request.
+        handler: None,
+        // The delegated run never changes the agent's model settings.
+        parameterized_model_picker: false,
     };
     if let Some(mode) = &spec.transport_config.mode {
         // Remember the requested mode via an env hint for agents that support
@@ -254,6 +259,7 @@ async fn run_prompt(
                         title,
                         tool_kind,
                         status,
+                        ..
                     } => {
                         // Cursor sometimes emits tool_call updates without a
                         // title (notably bare "completed" updates). Fall back
@@ -293,7 +299,12 @@ async fn run_prompt(
                             },
                         }
                     }
-                    ExternalProgress::Plan { .. } | ExternalProgress::Unknown { .. } => continue,
+                    // Delegated subagents only mirror text and tool activity.
+                    ExternalProgress::Plan { .. }
+                    | ExternalProgress::Unknown { .. }
+                    | ExternalProgress::Thought { .. }
+                    | ExternalProgress::Todos { .. }
+                    | ExternalProgress::ModeChanged { .. } => continue,
                 };
                 m.parent_event_tx
                     .send(AgentEvent::SubagentChildEvent {

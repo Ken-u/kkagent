@@ -474,6 +474,15 @@ wiki/知识库）。类型以限定名 `<plugin-id>.<name>` 进入 `Agent` 工�
 `plugins/official/kk-cursor-agent/`（acp）与 `plugins/official/kk-wiki-agent/`
 （internal）。
 
+`transport: "acp"` 的子 Agent 还会自动出现在 `/model` 里（别名
+`acp:<plugin-id>.<name>`，如 `acp:kk-cursor-agent.cursor`，无需任何配置）：选中后
+整个会话改由外部 agent 执行，kkagent 的 TUI 负责渲染文本、思考、工具卡片和 Todo，
+并把外部 agent 的权限请求、`ask_question`、`create_plan` 转给用户；外部 agent 用的模型
+由它自己决定，TUI 只显示它汇报的模型与思考等级，`/effort` 可调整思考等级；会话转录保持
+普通结构，随时可以切回普通模型接管，`/export-md` 照常可用。与委派用法的差异（
+`autoApprove` / `promptPrefix` 不生效、空闲超时、steer 排队、`/undo` 不回退外部
+改动等）见[插件开发指南 · 作为会话后端使用](plugin-development.md#作为会话后端使用model)。
+
 
 ### 插件市场
 

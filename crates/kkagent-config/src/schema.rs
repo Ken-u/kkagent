@@ -211,6 +211,91 @@ pub fn is_symbolic_model_alias(token: &str) -> bool {
     )
 }
 
+/// Prefix of the runtime-only model aliases that run a session's turns on an
+/// external ACP agent declared by a plugin (`acp:<plugin>.<name>`, e.g.
+/// `acp:kk-cursor-agent.cursor`). They never exist in `[models]`; the prefix
+/// is reserved so a configured alias can't shadow one.
+pub const ACP_ALIAS_PREFIX: &str = "acp:";
+
+/// Separates the agent id from the thinking level asked of the external
+/// agent in an ACP alias: `acp:<plugin>.<name>#<level>`.
+pub const ACP_ALIAS_EFFORT_SEPARATOR: char = '#';
+
+/// Longest thinking level an ACP alias may carry.
+const ACP_ALIAS_EFFORT_MAX_LEN: usize = 32;
+
+/// Whether `level` can be written after the `#` of an ACP alias: the names
+/// agents give their thinking levels (`low`, `xhigh`, `x-high`, `think_2`).
+pub fn is_valid_acp_effort(level: &str) -> bool {
+    !level.is_empty()
+        && level.len() <= ACP_ALIAS_EFFORT_MAX_LEN
+        && level
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+/// Split an ACP alias into its agent id and the optional thinking level. A
+/// level that is not a plain level name makes the whole alias invalid.
+fn split_acp_alias(alias: &str) -> Option<(&str, Option<&str>)> {
+    let alias = alias.trim();
+    let prefix = alias.get(..ACP_ALIAS_PREFIX.len())?;
+    if !prefix.eq_ignore_ascii_case(ACP_ALIAS_PREFIX) {
+        return None;
+    }
+    let rest = alias[ACP_ALIAS_PREFIX.len()..].trim();
+    let (id, effort) = match rest.split_once(ACP_ALIAS_EFFORT_SEPARATOR) {
+        Some((id, effort)) => (id.trim(), Some(effort.trim()).filter(|e| !e.is_empty())),
+        None => (rest, None),
+    };
+    if id.is_empty() || effort.is_some_and(|effort| !is_valid_acp_effort(effort)) {
+        return None;
+    }
+    Some((id, effort))
+}
+
+/// `acp:<plugin>.<name>` → `<plugin>.<name>`. Returns `None` for ordinary
+/// aliases and for an empty agent id. The prefix match ignores ASCII case,
+/// the agent id is returned as written. A thinking level
+/// (`acp:<plugin>.<name>#max`) is not part of the id; see
+/// [`acp_alias_effort`].
+pub fn acp_agent_id(alias: &str) -> Option<&str> {
+    split_acp_alias(alias).map(|(id, _)| id)
+}
+
+/// The thinking level an ACP alias asks of the external agent
+/// (`acp:cursor.agent#max` → `max`), if any. `None` leaves the agent on its
+/// own default.
+pub fn acp_alias_effort(alias: &str) -> Option<&str> {
+    split_acp_alias(alias).and_then(|(_, effort)| effort)
+}
+
+/// The model alias that selects the ACP agent `agent_id` (`<plugin>.<name>`).
+pub fn acp_alias(agent_id: &str) -> String {
+    format!("{ACP_ALIAS_PREFIX}{}", agent_id.trim())
+}
+
+/// [`acp_alias`] plus the thinking level to request from the agent (`None`
+/// or blank: the agent's own default). The level is lower-cased.
+pub fn acp_alias_with_effort(agent_id: &str, effort: Option<&str>) -> String {
+    let alias = acp_alias(agent_id);
+    match effort.map(str::trim).filter(|effort| !effort.is_empty()) {
+        Some(effort) => format!(
+            "{alias}{ACP_ALIAS_EFFORT_SEPARATOR}{}",
+            effort.to_ascii_lowercase()
+        ),
+        None => alias,
+    }
+}
+
+/// True when `alias` starts with the reserved `acp:` prefix (even if the id
+/// part is empty), i.e. it may not be used as a `[models]` key.
+pub fn has_acp_alias_prefix(alias: &str) -> bool {
+    alias
+        .trim()
+        .get(..ACP_ALIAS_PREFIX.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(ACP_ALIAS_PREFIX))
+}
+
 fn normalize_subagent_profile(profile: &str) -> String {
     let key = profile.trim().to_ascii_lowercase();
     if key == "agent" || key.is_empty() {
@@ -1576,6 +1661,12 @@ impl AppConfig {
                      (quality/balance/fast/current); rename it in [models]"
                 );
             }
+            if has_acp_alias_prefix(alias) {
+                anyhow::bail!(
+                    "model alias '{alias}' uses the reserved '{ACP_ALIAS_PREFIX}' prefix \
+                     (runtime aliases of ACP agents declared by plugins); rename it in [models]"
+                );
+            }
         }
         let mut seen_profiles: Vec<String> = Vec::new();
         for (profile, alias) in &self.subagent.default_models {
@@ -2334,6 +2425,101 @@ fallback = "quality"
             .unwrap_err()
             .to_string()
             .contains("collides with a reserved symbolic token"));
+    }
+
+    #[test]
+    fn acp_alias_helpers_parse_and_build_aliases() {
+        assert_eq!(
+            acp_agent_id("acp:kk-cursor-agent.cursor"),
+            Some("kk-cursor-agent.cursor")
+        );
+        assert_eq!(
+            acp_agent_id("  ACP: codex.delegate "),
+            Some("codex.delegate")
+        );
+        assert_eq!(acp_agent_id("acp:"), None);
+        assert_eq!(acp_agent_id("acp:   "), None);
+        assert_eq!(acp_agent_id("test/model"), None);
+        assert_eq!(acp_agent_id("é"), None);
+        assert_eq!(
+            acp_alias(" kk-cursor-agent.cursor "),
+            "acp:kk-cursor-agent.cursor"
+        );
+        assert!(has_acp_alias_prefix("acp:"));
+        assert!(has_acp_alias_prefix("ACP:x"));
+        assert!(!has_acp_alias_prefix("acpx"));
+    }
+
+    #[test]
+    fn acp_alias_carries_an_optional_thinking_level() {
+        // The level is not part of the agent id.
+        assert_eq!(
+            acp_agent_id("acp:kk-cursor-agent.cursor#max"),
+            Some("kk-cursor-agent.cursor")
+        );
+        assert_eq!(
+            acp_alias_effort("acp:kk-cursor-agent.cursor#max"),
+            Some("max")
+        );
+        assert_eq!(
+            acp_alias_effort(" ACP: kk-cursor-agent.cursor # xhigh "),
+            Some("xhigh")
+        );
+        assert_eq!(acp_alias_effort("acp:kk-cursor-agent.cursor"), None);
+        assert_eq!(acp_alias_effort("acp:kk-cursor-agent.cursor#"), None);
+        assert_eq!(acp_alias_effort("test/model"), None);
+        // No agent, no alias.
+        assert_eq!(acp_agent_id("acp:#max"), None);
+        assert_eq!(acp_alias_effort("acp:#max"), None);
+        // A level that is not a plain level name is not an alias either, so it
+        // never reaches a session.
+        for bad in [
+            "acp:codex.delegate#very high",
+            "acp:codex.delegate#max#min",
+            "acp:codex.delegate#m\u{e4}x",
+            "acp:codex.delegate#max\nx",
+        ] {
+            assert_eq!(acp_agent_id(bad), None, "{bad:?}");
+            assert_eq!(acp_alias_effort(bad), None, "{bad:?}");
+            assert!(has_acp_alias_prefix(bad), "{bad:?}");
+        }
+        let too_long = format!("acp:codex.delegate#{}", "x".repeat(33));
+        assert_eq!(acp_agent_id(&too_long), None);
+        assert!(is_valid_acp_effort("xhigh") && is_valid_acp_effort("x-high_2.1"));
+        assert!(!is_valid_acp_effort("") && !is_valid_acp_effort("a b"));
+
+        assert_eq!(
+            acp_alias_with_effort("kk-cursor-agent.cursor", Some(" Max ")),
+            "acp:kk-cursor-agent.cursor#max"
+        );
+        assert_eq!(
+            acp_alias_with_effort("kk-cursor-agent.cursor", None),
+            "acp:kk-cursor-agent.cursor"
+        );
+        assert_eq!(
+            acp_alias_with_effort("kk-cursor-agent.cursor", Some("  ")),
+            "acp:kk-cursor-agent.cursor"
+        );
+        let alias = acp_alias_with_effort("codex.delegate", Some("high"));
+        assert_eq!(acp_agent_id(&alias), Some("codex.delegate"));
+        assert_eq!(acp_alias_effort(&alias), Some("high"));
+    }
+
+    #[test]
+    fn validates_acp_prefix_is_reserved_for_model_aliases() {
+        let mut config = valid_config();
+        config.models.insert(
+            "acp:kk-cursor-agent.cursor".into(),
+            config.models.get("test/model").cloned().unwrap(),
+        );
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("reserved 'acp:' prefix"), "{error}");
+
+        // `default_model` can't point at a runtime ACP alias either: it must
+        // exist in [models], and [models] can't hold one.
+        let mut config = valid_config();
+        config.default_model = Some("acp:kk-cursor-agent.cursor".into());
+        assert!(config.validate().is_err());
     }
 
     #[test]

@@ -281,6 +281,12 @@ pub struct Session {
     /// model has not seen answered yet (e.g. Goal complete → summarize).
     /// The agent loop grants exactly one extra model pass before ending.
     pub pending_final_response: bool,
+    /// Notes about the last undo / restore that the user must see (for
+    /// example: file changes made by an external ACP agent cannot be
+    /// reverted). Collected by [`Session::undo_last_turn`] and
+    /// [`Session::restore_keeping_user_message`], consumed with
+    /// [`Session::take_undo_warnings`].
+    undo_warnings: Vec<String>,
 }
 
 impl Session {
@@ -477,6 +483,7 @@ impl Session {
             bash_concurrent_checked: false,
             read_file_hashes: HashMap::new(),
             pending_final_response: false,
+            undo_warnings: Vec::new(),
         }
     }
 
@@ -794,10 +801,35 @@ impl Session {
         }
 
         if let Some(index) = cp.message_start_index {
+            self.note_external_agent_turns(index);
             self.messages.truncate(index);
             self.persisted_message_count = self.persisted_message_count.min(self.messages.len());
         }
         Ok(self.messages.len())
+    }
+
+    /// Remember a warning for every external ACP agent that ran a turn among
+    /// `messages[from..]`, which an undo / restore is about to drop: kkagent
+    /// restores files only from the snapshots of its own Write/Edit tools, so
+    /// whatever such an agent changed stays on disk.
+    fn note_external_agent_turns(&mut self, from: usize) {
+        let from = from.min(self.messages.len());
+        for agent in crate::acp_backend::external_agents_in(&self.messages[from..]) {
+            let warning = format!(
+                "The undone turn(s) ran on the external ACP agent '{agent}': kkagent cannot \
+                 revert the file changes it made. Check `git status` / `git diff` and revert \
+                 them manually if needed."
+            );
+            if !self.undo_warnings.contains(&warning) {
+                self.undo_warnings.push(warning);
+            }
+        }
+    }
+
+    /// Warnings collected by the undo / restore calls since the last call of
+    /// this method (empty when everything could be reverted).
+    pub fn take_undo_warnings(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.undo_warnings)
     }
 
     /// Restore workspace + transcript to the end of the user turn that starts
@@ -818,6 +850,7 @@ impl Session {
         let end = next_user_turn_start(&self.messages, user_message_index);
         if self.messages.len() > end {
             reverse_mutating_tools(&self.messages[end..], &self.working_dir);
+            self.note_external_agent_turns(end);
             self.messages.truncate(end);
             self.persisted_message_count = self.persisted_message_count.min(self.messages.len());
         }
@@ -2351,6 +2384,111 @@ mod working_directory_tests {
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "v1\n");
         assert_eq!(session.messages.len(), 2);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn acp_turn_messages(user_text: &str) -> Vec<ChatMessage> {
+        let text = |role: &str, text: String| ChatMessage {
+            role: role.into(),
+            content: vec![ChatContent::Text { text }],
+            tools: None,
+        };
+        vec![
+            text("user", user_text.into()),
+            text("assistant", "done".into()),
+            text(
+                "user",
+                crate::acp_backend::format_activity_summary(
+                    "stub-plugin.stub",
+                    "stub",
+                    &[crate::acp_backend::ToolActivity {
+                        kind: "edit".into(),
+                        title: "Edit a.rs".into(),
+                        status: "completed".into(),
+                        locations: vec!["a.rs".into()],
+                    }],
+                )
+                .unwrap(),
+            ),
+        ]
+    }
+
+    /// Record `messages` as one committed turn (what the agent loop does).
+    fn commit_turn_of(session: &mut Session, messages: Vec<ChatMessage>) {
+        let mut messages = messages.into_iter();
+        session.messages.push(messages.next().unwrap());
+        session.begin_turn();
+        session.messages.extend(messages);
+        session.commit_turn();
+    }
+
+    #[test]
+    fn undoing_an_external_agent_turn_warns_that_its_files_stay() {
+        let mut session = Session::for_subagent(
+            format!("undo-acp-{}", uuid::Uuid::new_v4().simple()),
+            std::env::temp_dir(),
+            PermissionMode::Manual,
+            "acp:stub-plugin.stub".into(),
+        );
+        commit_turn_of(&mut session, acp_turn_messages("q1"));
+
+        session.undo_last_turn().unwrap();
+        assert!(session.messages.is_empty());
+        let warnings = session.take_undo_warnings();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("'stub'") && warnings[0].contains("git"),
+            "{warnings:?}"
+        );
+        assert!(session.take_undo_warnings().is_empty(), "taken once");
+    }
+
+    #[test]
+    fn undoing_regular_turns_does_not_warn() {
+        let mut session = Session::for_subagent(
+            format!("undo-plain-{}", uuid::Uuid::new_v4().simple()),
+            std::env::temp_dir(),
+            PermissionMode::Manual,
+            "test-model".into(),
+        );
+        let mut plain = acp_turn_messages("q1");
+        plain.pop(); // no activity summary: a turn without an external agent
+        commit_turn_of(&mut session, plain);
+
+        session.undo_last_turn().unwrap();
+        assert!(session.take_undo_warnings().is_empty());
+    }
+
+    #[test]
+    fn restoring_to_an_earlier_turn_warns_about_dropped_external_turns() {
+        let mut session = Session::for_subagent(
+            format!("restore-acp-{}", uuid::Uuid::new_v4().simple()),
+            std::env::temp_dir(),
+            PermissionMode::Manual,
+            "test-model".into(),
+        );
+        let mut first = acp_turn_messages("q1");
+        first.pop();
+        commit_turn_of(&mut session, first);
+        commit_turn_of(&mut session, acp_turn_messages("q2"));
+
+        let (undone, kept) = session.restore_keeping_user_message(0).unwrap();
+        assert_eq!((undone, kept), (1, 2));
+        let warnings = session.take_undo_warnings();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("'stub'"));
+    }
+
+    #[test]
+    fn external_agent_summaries_are_not_user_turns() {
+        let mut session = Session::for_subagent(
+            format!("turns-acp-{}", uuid::Uuid::new_v4().simple()),
+            std::env::temp_dir(),
+            PermissionMode::Manual,
+            "acp:stub-plugin.stub".into(),
+        );
+        commit_turn_of(&mut session, acp_turn_messages("q1"));
+        commit_turn_of(&mut session, acp_turn_messages("q2"));
+        assert_eq!(session.user_turn_starts(), vec![0, 3]);
     }
 
     #[tokio::test]

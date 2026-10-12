@@ -121,6 +121,36 @@ WebSocket 是广播流；慢客户端会收到 `resync_required`，随后应从�
 
 这是内部版本化接口；外部 Node 集成优先使用 HTTP/WS SDK，编辑器集成优先使用 ACP。
 
+## ACP 外部 agent 模型
+
+已启用插件里声明了 `transport: "acp"` 的子 Agent（如官方 `kk-cursor-agent`）可以作为**会话后端**使用，模型别名为 `acp:<插件 id>.<agent 名>`，例如 `acp:kk-cursor-agent.cursor`。别名只在运行时有效：不需要 `config.toml`，`[models]` 里也不允许使用以 `acp:` 开头的别名。
+
+- **发现**：`GET /api/v1/modelCatalog`（别名 `/models`）与 `kkagent acp` 桥的 `models/list` 会在配置模型之后追加 ACP 项，按 `kind == "acp"` 区分：
+
+  ```json
+  {"id": "acp:kk-cursor-agent.cursor", "alias": "acp:kk-cursor-agent.cursor",
+   "model": "kk-cursor-agent.cursor", "provider": "acp", "kind": "acp",
+   "display_name": "cursor", "description": "Cursor CLI agent driven over ACP …"}
+  ```
+
+  本地 RPC `plugins.list` 里每个插件带 `acp_agents: [{id, agent, name, description}]`；插件被禁用时该数组为空，ACP 项随之消失。
+- **思考等级**：别名可以带后缀 `#<等级>`：`acp:kk-cursor-agent.cursor#max`。等级只能由字母、数字和 `-` `_` `.` 组成（最长 32 字符），否则别名无效；没有后缀就不改外部 agent 自己的设置。后缀属于别名本身，所以 `session.set_model`、会话持久化和 `session_config_changed` 里的 `model` 都带着它；`/model` 列表里的 ACP 项永远不带后缀。每个回合开始时，kkagent 把后缀里的等级设给外部 agent（取它提供的最接近的一档，设不上时只提示一次）。
+- **选择**：本地 RPC `session.set_model` 和 `kkagent acp` 桥的 `session/set_model` 接受该别名（可带上述后缀）；对应插件不存在或已禁用时返回可读错误（提示改用 `/model` 选择其它模型）。持久化会话里保存的 `acp:` 别名在插件被禁用后，下一个回合起点同样给出该错误，切到普通模型不受影响。
+- **运行**：此后该会话的每个 `session.prompt` 回合由外部 agent 执行，事件流与普通会话一致：`message_delta`、`thinking_delta`、`tool_call` / `tool_result`（`tool_name` 为 `<agent>/<kind>`，如 `cursor/execute`）、`todo_updated`、`plan_file_updated`、`turn_end`。外部 agent 的权限请求、提问和计划评审以普通的 `approval_requested` / `question_asked` 事件出现，用 `approval.respond` / `question.respond` 回答；计划评审是 `tool_name: "ExitPlanMode"` 的审批，`selected_label` 取 `执行` / `修改意见` / `拒绝`。被用户或策略拒绝的工具调用以 `is_error: true` 的 `tool_result` 结束。权限请求是否出现取决于外部 agent 自己的审批设置。
+- **`acp_agent_state` 事件**：每个 ACP 回合开始时（工具与文本事件之前）发一次，描述外部 agent 此刻的状态：
+
+  ```json
+  {"type": "acp_agent_state", "session_id": "…", "agent": "cursor",
+   "model": "claude-sonnet-5-5", "thought_level": "high",
+   "thought_levels": ["low", "medium", "high", "xhigh", "max"],
+   "note": "…"}
+  ```
+
+  `model`、`thought_level`、`thought_levels`、`note` 没有内容时省略；没有 `thought_levels` 表示 agent 不让客户端选择等级（等级只能在 agent 自己的配置里改）。`note` 只在值得告诉用户时出现（请求的等级被换成最接近的一档、agent 不支持或拒绝了设置），同一个请求不会重复提示。旧客户端可以忽略这个事件。
+- **steer**：运行中的 `session.steer` 照常返回 `steered: true`，但外部 agent 没有「运行中插话」，内容会排队到本轮结束后作为下一轮发送。`session.interrupt` 先发 `session/cancel`，8 秒内没有响应则回收外部进程。
+- **转录**：每个 ACP 回合写入用户消息、助手最终文本和一条 harness-only 的活动摘要，不含 `ToolUse` 块，所以同一个会话随时可以换回普通模型（反之外部 agent 会收到它没见过的消息作为前言）。
+- **撤销警告**：被 `session.undo` / `session.restore` 回退的回合里含外部 agent 的回合时，响应多一个 `warnings: [string]`（外部 agent 改动的文件不会回退）；没有这类回合时不出现该字段，旧客户端不受影响。
+
 ## 错误处理
 
 - `401`：token 缺失或错误。

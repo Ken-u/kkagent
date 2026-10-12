@@ -63,7 +63,7 @@ pub const BUILTIN_SLASH_COMMANDS: &[SlashCommand] = &[
     SlashCommand {
         name: "model",
         aliases: &[],
-        description: "Show or switch LLM model",
+        description: "Show or switch LLM model / ACP agent",
         priority: 100,
         argument_hint: Some("<model>"),
     },

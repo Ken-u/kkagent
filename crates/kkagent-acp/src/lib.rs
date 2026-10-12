@@ -23,8 +23,13 @@ use tokio::task::JoinSet;
 pub use auth::{auth_methods, AuthTokenStore};
 pub use builtins::builtin_command_list;
 pub use client::{
-    AcpClient, AcpClientOptions, ExternalProgress, InitializeResult, PermissionPolicy,
-    PromptOutcome, DEFAULT_REQUEST_TIMEOUT,
+    base_model_id, config_option_by_category, current_model_of, current_model_raw_of,
+    parse_config_options, variant_level_of, AcpAskOption, AcpAskQuestion, AcpAskQuestionOutcome,
+    AcpAskQuestionRequest, AcpClient, AcpClientOptions, AcpConfigOption, AcpConfigValue,
+    AcpCreatePlanOutcome, AcpCreatePlanRequest, AcpPermissionChoice, AcpPermissionOption,
+    AcpPermissionOutcome, AcpPermissionRequest, AcpPlanTodo, AcpQuestionAnswer, AcpRequestHandler,
+    AcpSessionInfo, ExternalProgress, InitializeResult, PermissionPolicy, PromptOutcome,
+    DEFAULT_REQUEST_TIMEOUT,
 };
 pub use types::*;
 

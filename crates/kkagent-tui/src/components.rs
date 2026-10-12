@@ -2479,12 +2479,16 @@ fn render_footer(
         Style::default().fg(theme.text),
     ));
 
-    if thinking_label(config).is_some() {
+    // kkagent's own thinking effort does not reach an external ACP agent:
+    // show the model and thinking level the agent reported instead.
+    let thinking = if state.acp_agent_name().is_some() {
+        acp_detail_label(state)
+    } else {
+        thinking_label(config)
+    };
+    if let Some(label) = thinking {
         left.push(Span::raw("  "));
-        left.push(Span::styled(
-            thinking_label(config).unwrap(),
-            Style::default().fg(theme.text_dim),
-        ));
+        left.push(Span::styled(label, Style::default().fg(theme.text_dim)));
     }
 
     {
@@ -2611,7 +2615,11 @@ fn render_footer(
     sync_footer_session_entries(state);
     let context = format_context(state, config);
     let ctx_w = UnicodeWidthStr::width(context.as_str());
-    let (sandbox, sandbox_color) = sandbox_indicator(&config.sandbox.mode, theme);
+    let (sandbox, sandbox_color) = if state.acp_agent_name().is_some() {
+        external_sandbox_indicator(theme)
+    } else {
+        sandbox_indicator(&config.sandbox.mode, theme)
+    };
     let sandbox_w = UnicodeWidthStr::width(sandbox);
     let gap = 2usize;
     let right_w = sandbox_w.saturating_add(gap).saturating_add(ctx_w);
@@ -2676,6 +2684,9 @@ fn render_narrow_footer(
         status_parts.push("plan".to_string());
     }
     status_parts.push(model_label(state, config));
+    if let Some(detail) = acp_detail_compact(state) {
+        status_parts.push(detail);
+    }
     if let Some(ref goal) = state.status_bar.goal {
         let label = if goal.status == "active" {
             format!("goal {}", goal.description)
@@ -2738,7 +2749,11 @@ fn render_narrow_footer(
     };
 
     let context = format_context_compact(state, config);
-    let (sandbox, sandbox_color) = sandbox_indicator_compact(&config.sandbox.mode, theme);
+    let (sandbox, sandbox_color) = if state.acp_agent_name().is_some() {
+        external_sandbox_indicator_compact(theme)
+    } else {
+        sandbox_indicator_compact(&config.sandbox.mode, theme)
+    };
     let right = if area.width >= 32 {
         format!("{sandbox}  {context}")
     } else {
@@ -3047,6 +3062,10 @@ fn model_label(state: &AppState, config: &AppConfig) -> String {
             return label;
         }
     }
+    // A session on an external ACP agent: name the agent, not the raw alias.
+    if let Some(agent) = state.acp_agent_name() {
+        return format!("{agent} · ACP");
+    }
     let alias = state
         .model_alias
         .as_deref()
@@ -3060,6 +3079,37 @@ fn model_label(state: &AppState, config: &AppConfig) -> String {
     } else {
         alias.to_string()
     }
+}
+
+/// What an external ACP agent runs on, as it reported it: its model and
+/// thinking level (`claude-sonnet-5-5  thinking: high`). `None` off ACP,
+/// before its first turn when nothing was asked of it, and while a
+/// subagent's view owns the footer.
+fn acp_detail_label(state: &AppState) -> Option<String> {
+    acp_detail_parts(state, "thinking: ").map(|parts| parts.join("  "))
+}
+
+/// [`acp_detail_label`] for the narrow footer (`claude-sonnet-5-5 · think:high`).
+fn acp_detail_compact(state: &AppState) -> Option<String> {
+    acp_detail_parts(state, "think:").map(|parts| parts.join(" · "))
+}
+
+fn acp_detail_parts(state: &AppState, level_prefix: &str) -> Option<Vec<String>> {
+    if state.active_subagent_view.is_some() || state.acp_agent_name().is_none() {
+        return None;
+    }
+    let mut parts = Vec::new();
+    if let Some(model) = state
+        .acp_agent_info
+        .as_ref()
+        .and_then(|info| info.model.as_deref())
+    {
+        parts.push(model.to_string());
+    }
+    if let Some(level) = state.acp_thought_level() {
+        parts.push(format!("{level_prefix}{level}"));
+    }
+    (!parts.is_empty()).then_some(parts)
 }
 
 fn thinking_label(config: &AppConfig) -> Option<String> {
@@ -3081,6 +3131,16 @@ fn sandbox_indicator(mode: &str, theme: &Theme) -> (&'static str, Color) {
     }
 }
 
+/// An external ACP agent runs its tools in its own environment: kkagent's
+/// `[sandbox]` setting does not apply, so don't show it as if it did.
+fn external_sandbox_indicator(theme: &Theme) -> (&'static str, Color) {
+    ("● sandbox:external", theme.warning)
+}
+
+fn external_sandbox_indicator_compact(theme: &Theme) -> (&'static str, Color) {
+    ("sbx:ext", theme.warning)
+}
+
 fn sandbox_indicator_compact(mode: &str, theme: &Theme) -> (&'static str, Color) {
     match mode.trim().to_ascii_lowercase().as_str() {
         "disabled" | "off" | "none" => ("sbx:off", theme.error),
@@ -3093,6 +3153,10 @@ fn sandbox_indicator_compact(mode: &str, theme: &Theme) -> (&'static str, Color)
 }
 
 fn format_context(state: &AppState, config: &AppConfig) -> String {
+    if state.acp_agent_name().is_some() {
+        // The external agent manages (and never reports) its own context.
+        return "context: external".to_string();
+    }
     let max = state
         .model_alias
         .as_deref()
@@ -3131,6 +3195,9 @@ fn format_context(state: &AppState, config: &AppConfig) -> String {
 }
 
 fn format_context_compact(state: &AppState, config: &AppConfig) -> String {
+    if state.acp_agent_name().is_some() {
+        return "ctx:ext".to_string();
+    }
     let max = state
         .model_alias
         .as_deref()
@@ -5999,5 +6066,112 @@ mod render_smoke {
         highlight_byte_span(&mut line, 0, 3, sel);
         assert_eq!(line.spans.len(), 2);
         assert_eq!(line.spans[1].style.bg, Some(Color::Blue));
+    }
+
+    fn footer_text(state: &mut AppState, config: &AppConfig, width: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+        terminal
+            .draw(|frame| render_ui(frame, state, config))
+            .unwrap();
+        buffer_rows(terminal.backend().buffer()).join("\n")
+    }
+
+    #[test]
+    fn footer_names_the_external_agent_of_an_acp_session() {
+        let config = AppConfig::default();
+        let mut state = AppState::new(PermissionMode::Manual, false);
+        state.model_alias = Some("acp:kk-cursor-agent.cursor".into());
+
+        // Wide footer: the agent, not the raw alias; kkagent's sandbox and
+        // context numbers do not describe an external agent.
+        let wide = footer_text(&mut state, &config, 120);
+        assert!(wide.contains("cursor · ACP"), "{wide}");
+        assert!(wide.contains("sandbox:external"), "{wide}");
+        assert!(wide.contains("context: external"), "{wide}");
+        assert!(!wide.contains("acp:kk-cursor-agent"), "{wide}");
+
+        // Narrow footer says the same, compactly.
+        let narrow = footer_text(&mut state, &config, 40);
+        assert!(narrow.contains("cursor · ACP"), "{narrow}");
+        assert!(narrow.contains("sbx:ext"), "{narrow}");
+        assert!(narrow.contains("ctx:ext"), "{narrow}");
+
+        // The plugin's own display name wins once the agent list is known.
+        state.acp_agents = vec![crate::app::AcpAgentEntry {
+            id: "kk-cursor-agent.cursor".into(),
+            agent: "Cursor CLI".into(),
+            description: String::new(),
+        }];
+        let named = footer_text(&mut state, &config, 120);
+        assert!(named.contains("Cursor CLI · ACP"), "{named}");
+
+        // Back on an ordinary model nothing ACP-specific is left.
+        state.model_alias = Some("plain-model".into());
+        let plain = footer_text(&mut state, &config, 120);
+        assert!(!plain.contains("ACP"), "{plain}");
+        assert!(!plain.contains("external"), "{plain}");
+        assert!(plain.contains("plain-model"), "{plain}");
+        assert!(plain.contains("context:"), "{plain}");
+    }
+
+    #[test]
+    fn footer_shows_the_model_and_thinking_level_of_an_acp_agent() {
+        let info = |model: Option<&str>, level: Option<&str>| crate::app::AcpAgentInfo {
+            agent: "cursor".into(),
+            model: model.map(str::to_string),
+            thought_level: level.map(str::to_string),
+            thought_levels: vec!["low".into(), "high".into(), "max".into()],
+        };
+        // kkagent's own thinking setting says nothing about an external agent.
+        let config = AppConfig {
+            thinking: Some(kkagent_config::ThinkingConfig {
+                enabled: true,
+                effort: Some("low".into()),
+                keep: None,
+            }),
+            ..AppConfig::default()
+        };
+        let mut state = AppState::new(PermissionMode::Manual, false);
+        state.model_alias = Some("acp:kk-cursor-agent.cursor".into());
+
+        // Nothing asked, nothing reported: nothing to show.
+        let unknown = footer_text(&mut state, &config, 120);
+        assert!(unknown.contains("cursor · ACP"), "{unknown}");
+        assert!(!unknown.contains("thinking:"), "{unknown}");
+
+        // The level asked for shows before the agent has reported.
+        state.model_alias = Some("acp:kk-cursor-agent.cursor#max".into());
+        let asked = footer_text(&mut state, &config, 120);
+        assert!(asked.contains("cursor · ACP  thinking: max"), "{asked}");
+
+        // Once it reported, its own model and level are shown.
+        state.acp_agent_info = Some(info(Some("claude-sonnet-5-5"), Some("high")));
+        let wide = footer_text(&mut state, &config, 120);
+        assert!(
+            wide.contains("cursor · ACP  claude-sonnet-5-5  thinking: high"),
+            "{wide}"
+        );
+        assert!(!wide.contains("thinking: low"), "{wide}");
+        assert!(!wide.contains("thinking: max"), "{wide}");
+        let narrow = footer_text(&mut state, &config, 47);
+        assert!(
+            narrow.contains("cursor · ACP · claude-sonnet-5-5 · think:high"),
+            "{narrow}"
+        );
+
+        // An agent without a thinking level shows just its model.
+        state.acp_agent_info = Some(info(Some("gpt-6.1-sol"), None));
+        let model_only = footer_text(&mut state, &config, 120);
+        assert!(
+            model_only.contains("cursor · ACP  gpt-6.1-sol"),
+            "{model_only}"
+        );
+        assert!(!model_only.contains("thinking:"), "{model_only}");
+
+        // Ordinary models keep kkagent's own thinking label.
+        state.model_alias = Some("plain-model".into());
+        state.acp_agent_info = None;
+        let plain = footer_text(&mut state, &config, 120);
+        assert!(plain.contains("plain-model  thinking: low"), "{plain}");
     }
 }

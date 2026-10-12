@@ -2735,6 +2735,7 @@ async fn run_server(
             init_shutdown,
             init_http_security,
             None,
+            None,
         )
         .await
         {
@@ -3314,6 +3315,8 @@ async fn remove_session_runtime(state: &Arc<ServerState>, session_id: &str) {
     // still races in afterwards instead of leaking an undrainable entry.
     state.bash_shells.cancel_session(session_id).await;
     kkagent_tools::task_notify::global_hub().forget_session(session_id);
+    // The external ACP agents of this session (one process each) stop with it.
+    state.acp_backends.close_session(session_id).await;
     if let Some(session) = removed {
         session.services.on_close(SessionCloseReason::Exit).await;
     }
@@ -3710,9 +3713,9 @@ impl kkagent_acp::AcpHost for AgentAcpHost {
     }
 
     async fn set_model(&self, session_id: &str, model: &str) -> Result<(), String> {
-        if self.state.config().resolve_model(model).is_none() {
-            return Err(format!("unknown model alias: {model}"));
-        }
+        self.state
+            .validate_model_alias(model, format!("unknown model alias: {model}"))
+            .await?;
         let aliases = self.state.model_aliases.lock().await;
         let alias = aliases
             .get(session_id)
@@ -3863,7 +3866,7 @@ impl kkagent_acp::AcpHost for AgentAcpHost {
     }
 
     async fn list_models(&self) -> serde_json::Value {
-        let models = self
+        let mut models = self
             .state
             .config()
             .models
@@ -3877,6 +3880,7 @@ impl kkagent_acp::AcpHost for AgentAcpHost {
                 })
             })
             .collect::<Vec<_>>();
+        models.extend(self.state.acp_model_entries().await);
         serde_json::json!({"models": models})
     }
 
@@ -4638,6 +4642,7 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
                 "responses_api": e.responses_api,
             }));
         }
+        models.extend(self.state.acp_model_entries().await);
         serde_json::json!({"models": models})
     }
 
@@ -5394,6 +5399,7 @@ async fn run_http_turn(
         state.abort_registry.clone(),
     )
     .with_hooks(state.hooks.clone())
+    .with_acp_backends(state.acp_backends.clone())
     .with_goal_manager(state.goal_for(session.id.as_str()).await)
     .with_tool_result_store(state.tool_result_store.clone())
     .with_transcript_db(state.transcript.lock().await.clone());
@@ -5485,6 +5491,10 @@ struct ServerState {
     /// (`/plugins reload` etc.) so the next turn's `WebTool` picks them up.
     web: tokio::sync::RwLock<Arc<kkagent_tools::WebServicesConfig>>,
     plugins: Arc<kkagent_core::PluginManager>,
+    /// External ACP agents (plugin subagents with `transport: "acp"`) that
+    /// run whole sessions for `acp:<plugin>.<agent>` model aliases. One
+    /// process per (session, agent), released with the session.
+    acp_backends: Arc<kkagent_core::acp_backend::AcpBackendHub>,
     telemetry: kkagent_telemetry::TelemetryServiceHandle,
     events: tokio::sync::broadcast::Sender<serde_json::Value>,
     /// In-flight AskUserQuestion payloads (keyed by question_id) for HTTP + TUI resume.
@@ -5592,6 +5602,50 @@ impl ActiveBtwSession {
 }
 
 impl ServerState {
+    /// Accept `alias` as a session model: a configured model, or an ACP agent
+    /// that an enabled plugin declares (`acp:<plugin>.<agent>`). `unknown`
+    /// is the caller's message for an alias that is neither.
+    async fn validate_model_alias(&self, alias: &str, unknown: String) -> Result<(), String> {
+        if self.config().resolve_model(alias).is_some() {
+            return Ok(());
+        }
+        match kkagent_config::acp_agent_id(alias) {
+            Some(agent_id) => self
+                .acp_backends
+                .resolve(agent_id)
+                .await
+                .map(|_| ())
+                .map_err(|error| error.to_string()),
+            None if kkagent_config::has_acp_alias_prefix(alias) => Err(format!(
+                "Invalid ACP model alias '{alias}': expected acp:<plugin>.<agent>[#<thinking level>]"
+            )),
+            None => Err(unknown),
+        }
+    }
+
+    /// `/model` entries for the ACP agents of enabled plugins, in the shape
+    /// the model lists of the ACP / HTTP surfaces use.
+    async fn acp_model_entries(&self) -> Vec<serde_json::Value> {
+        self.plugins
+            .list()
+            .await
+            .into_iter()
+            .flat_map(|plugin| plugin.acp_agents)
+            .map(|agent| {
+                let alias = agent.alias();
+                serde_json::json!({
+                    "id": alias,
+                    "alias": alias,
+                    "model": agent.id,
+                    "provider": "acp",
+                    "kind": "acp",
+                    "display_name": agent.agent,
+                    "description": agent.description,
+                })
+            })
+            .collect()
+    }
+
     fn config(&self) -> Arc<AppConfig> {
         self.shared_config
             .read()
@@ -6772,6 +6826,7 @@ impl ServerState {
 
     async fn shutdown(&self) {
         self.http_runtime.abort().await;
+        self.acp_backends.close_all().await;
         for (_, handle) in self.abort_registry.lock().await.drain() {
             handle.abort();
         }
@@ -7042,6 +7097,7 @@ async fn build_server_state(
         shutdown_tx,
         kkagent_rpc::HttpSecurityOptions::default(),
         None,
+        None,
     )
     .await
 }
@@ -7057,6 +7113,10 @@ async fn build_server_state_with_shutdown(
     // unique temp path so they neither race the shared schema nor touch
     // the user's real transcript data.
     transcript_db_override: Option<PathBuf>,
+    // Test-only override for the plugin directory (production: `<config
+    // dir>/plugins`), so tests can declare plugins without touching the
+    // user's real ones.
+    plugins_dir_override: Option<PathBuf>,
 ) -> Result<Arc<ServerState>> {
     let startup_started = std::time::Instant::now();
     let (events, _) = tokio::sync::broadcast::channel(1024);
@@ -7112,7 +7172,8 @@ async fn build_server_state_with_shutdown(
         });
     }
 
-    let plugins_dir = kkagent_config::default_config_dir().join("plugins");
+    let plugins_dir = plugins_dir_override
+        .unwrap_or_else(|| kkagent_config::default_config_dir().join("plugins"));
     let plugins = kkagent_core::PluginManager::discover(&plugins_dir).await;
     // Install any plugin base-prompt replacement before sessions are created.
     kkagent_core::plugin_overrides::sync_system_prompt_override(&plugins).await;
@@ -7245,6 +7306,7 @@ async fn build_server_state_with_shutdown(
     });
     background_tasks.push(task.abort_handle());
 
+    let acp_backends = kkagent_core::acp_backend::AcpBackendHub::new(plugins.clone());
     let state = Arc::new(ServerState {
         shared_config: StdRwLock::new(config.clone()),
         config_path,
@@ -7283,6 +7345,7 @@ async fn build_server_state_with_shutdown(
         skills,
         web,
         plugins,
+        acp_backends,
         telemetry: telemetry.clone(),
         events,
         pending_questions: Mutex::new(HashMap::new()),
@@ -7838,9 +7901,10 @@ async fn spawn_session_agent_turn_with_mode(
             .or_else(|| state.config().default_model_alias().map(|s| s.to_string()))
             .ok_or_else(|| (-32000, "No default_model in config".into()))?
     };
-    if state.config().resolve_model(&model_alias).is_none() {
-        return Err((-32000, format!("Model '{model_alias}' not found")));
-    }
+    state
+        .validate_model_alias(&model_alias, format!("Model '{model_alias}' not found"))
+        .await
+        .map_err(|error| (-32000, error))?;
 
     let permission_rules = state
         .config()
@@ -8002,6 +8066,7 @@ async fn spawn_session_agent_turn_with_mode(
             )
             .with_headless_mode(headless_mode)
             .with_hooks(state_clone.hooks.clone())
+            .with_acp_backends(state_clone.acp_backends.clone())
             .with_goal_manager(state_clone.goal_for(&sid).await)
             .with_tool_result_store(state_clone.tool_result_store.clone())
             .with_transcript_db(state_clone.transcript.lock().await.clone()),
@@ -11190,9 +11255,10 @@ async fn handle_rpc_call(
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| (-32602, "Missing model".into()))?
                 .to_string();
-            if state.config().resolve_model(&model).is_none() {
-                return Err((-32602, format!("Unknown model: {}", model)));
-            }
+            state
+                .validate_model_alias(&model, format!("Unknown model: {model}"))
+                .await
+                .map_err(|error| (-32602, error))?;
             // Always update the shared Arc (works mid-turn while session is out of the map).
             let mut updated = false;
             if let Some(arc) = state.model_aliases.lock().await.get(&session_id) {
@@ -11384,13 +11450,13 @@ async fn handle_rpc_call(
                 .and_then(|v| v.as_u64())
                 .unwrap_or(1) as usize;
 
-            let (undone, keep) = {
+            let (undone, keep, warnings) = {
                 let mut sessions = state.sessions.lock().await;
                 let session = sessions
                     .get_mut(&session_id)
                     .ok_or_else(|| (-32602, format!("Session not found: {}", session_id)))?;
                 let result = kkagent_core::UndoService::undo_turns(session, count);
-                (result.undone_turns, result.message_count)
+                (result.undone_turns, result.message_count, result.warnings)
             };
 
             // If nothing could be undone in the current session and there is a
@@ -11461,12 +11527,16 @@ async fn handle_rpc_call(
                     .map(|s| s.messages.clone())
                     .unwrap_or_default()
             };
-            Ok(serde_json::json!({
+            let mut response = serde_json::json!({
                 "ok": true,
                 "undone": undone,
                 "message_count": keep,
                 "messages": messages,
-            }))
+            });
+            if !warnings.is_empty() {
+                response["warnings"] = serde_json::json!(warnings);
+            }
+            Ok(response)
         }
         "session.restore" => {
             let session_id = params
@@ -11490,7 +11560,7 @@ async fn handle_rpc_call(
                         (-32000, error)
                     }
                 })?;
-            let (undone, keep, already_current) = {
+            let (undone, keep, already_current, warnings) = {
                 let mut sessions = state.sessions.lock().await;
                 let session = sessions
                     .get_mut(&session_id)
@@ -11500,12 +11570,12 @@ async fn handle_rpc_call(
                     .get(turn_index)
                     .ok_or_else(|| (-32602, format!("Turn not found: {turn_index}")))?;
                 if turn_index + 1 >= starts.len() {
-                    (0usize, session.messages.len(), true)
+                    (0usize, session.messages.len(), true, Vec::new())
                 } else {
                     let (undone, keep) = session
                         .restore_keeping_user_message(keep_index)
                         .map_err(|error| (-32000, error.to_string()))?;
-                    (undone, keep, false)
+                    (undone, keep, false, session.take_undo_warnings())
                 }
             };
             {
@@ -11519,14 +11589,18 @@ async fn handle_rpc_call(
                     .map(|s| s.messages.clone())
                     .unwrap_or_default()
             };
-            Ok(serde_json::json!({
+            let mut response = serde_json::json!({
                 "ok": true,
                 "restored": !already_current,
                 "undone": undone,
                 "turn_index": turn_index,
                 "message_count": keep,
                 "messages": messages,
-            }))
+            });
+            if !warnings.is_empty() {
+                response["warnings"] = serde_json::json!(warnings);
+            }
+            Ok(response)
         }
         "skills.list" => {
             let list = state.skills.list().await;
@@ -13457,21 +13531,346 @@ mod runtime_http_tests {
     /// a SQLite schema (SQLITE_SCHEMA race) nor touch the user's real
     /// `~/.kkagent/transcripts.db`.
     pub(crate) async fn test_server_state() -> Arc<ServerState> {
-        let config = Arc::new(AppConfig::default());
+        test_server_state_with(AppConfig::default(), None).await
+    }
+
+    /// [`test_server_state`] with a given config and, optionally, the plugins
+    /// found in `plugins_dir` instead of whatever the machine has installed.
+    async fn test_server_state_with(
+        config: AppConfig,
+        plugins_dir: Option<PathBuf>,
+    ) -> Arc<ServerState> {
         let (shutdown_tx, _) = watch::channel(false);
         let temp_db_dir =
             std::env::temp_dir().join(format!("kkagent-test-home-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&temp_db_dir).unwrap();
-        let state = build_server_state_with_shutdown(
-            config,
+        build_server_state_with_shutdown(
+            Arc::new(config),
             PathBuf::from("/tmp/kkagent-test-config.toml"),
             shutdown_tx,
             kkagent_rpc::HttpSecurityOptions::default(),
             Some(temp_db_dir.join("transcripts.db")),
+            plugins_dir,
+        )
+        .await
+        .unwrap()
+    }
+
+    /// A plugins dir whose plugin `acp-plug` declares the ACP agent
+    /// `acp-plug.stub` next to an internal subagent (never a `/model` entry).
+    fn acp_plugins_dir() -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("kkagent-test-plugins-{}", uuid::Uuid::new_v4()));
+        let root = dir.join("acp-plug");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("kk.plugin.json"),
+            serde_json::json!({
+                "name": "acp-plug",
+                "subagents": [{
+                    "name": "stub",
+                    "transport": "acp",
+                    "description": "Stub ACP agent",
+                    "transportConfig": { "command": ["stub-agent", "acp"] }
+                }, {
+                    "name": "inner",
+                    "transport": "internal",
+                    "description": "Not an ACP agent"
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        dir
+    }
+
+    /// A config with one ordinary model, `test/model`.
+    fn config_with_a_model() -> AppConfig {
+        let mut config = AppConfig::default();
+        config.providers.insert(
+            "test".into(),
+            serde_json::from_value(serde_json::json!({
+                "type": "openai-chat", "api_key": "test", "base_url": "http://127.0.0.1:9"
+            }))
+            .unwrap(),
+        );
+        config.models.insert(
+            "test/model".into(),
+            serde_json::from_value(serde_json::json!({
+                "provider": "test", "model": "test-model", "max_context_size": 128000,
+                "max_output_size": 1000, "capabilities": ["tool_use"]
+            }))
+            .unwrap(),
+        );
+        config
+    }
+
+    /// Register an idle session (also in the transcript DB, as `session.new`
+    /// does) and return its working directory.
+    async fn register_session(state: &Arc<ServerState>, id: &str, model: &str) -> PathBuf {
+        let workspace =
+            std::env::temp_dir().join(format!("kkagent-acp-session-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace).unwrap();
+        state
+            .transcript
+            .lock()
+            .await
+            .create_session(id, model, &workspace.display().to_string())
+            .unwrap();
+        state.sessions.lock().await.insert(
+            id.into(),
+            Session::new(
+                id.into(),
+                workspace.clone(),
+                PermissionMode::Manual,
+                model.into(),
+            ),
+        );
+        workspace
+    }
+
+    #[tokio::test]
+    async fn validate_model_alias_accepts_configured_models_and_plugin_acp_agents() {
+        let plugins_dir = acp_plugins_dir();
+        let state = test_server_state_with(config_with_a_model(), Some(plugins_dir.clone())).await;
+        let check = |alias: &'static str| {
+            let state = state.clone();
+            async move {
+                state
+                    .validate_model_alias(alias, format!("unknown:{alias}"))
+                    .await
+            }
+        };
+
+        // Ordinary models and the ACP agent a plugin declares.
+        check("test/model").await.unwrap();
+        check("acp:acp-plug.stub").await.unwrap();
+        // The prefix is matched without regard to case.
+        check("ACP:acp-plug.stub").await.unwrap();
+
+        // Unknown plain alias → the caller's own message.
+        assert_eq!(check("nope").await.unwrap_err(), "unknown:nope");
+        // ACP aliases that cannot run: gone agent, non-ACP subagent, no id.
+        for alias in ["acp:acp-plug.gone", "acp:acp-plug.inner", "acp:other.stub"] {
+            let error = check(alias).await.unwrap_err();
+            assert!(
+                error.contains("is not available") && error.contains("/model"),
+                "{alias}: {error}"
+            );
+        }
+        let error = check("acp:").await.unwrap_err();
+        assert!(error.contains("Invalid ACP model alias"), "{error}");
+
+        // A thinking level rides along after '#'; only a plain level name does.
+        check("acp:acp-plug.stub#max").await.unwrap();
+        check("ACP:acp-plug.stub#X-High").await.unwrap();
+        for alias in ["acp:acp-plug.stub#very high", "acp:acp-plug.stub#max#min"] {
+            let error = check(alias).await.unwrap_err();
+            assert!(
+                error.contains("Invalid ACP model alias"),
+                "{alias}: {error}"
+            );
+        }
+        // The agent behind a suffixed alias is still checked.
+        let error = check("acp:acp-plug.gone#max").await.unwrap_err();
+        assert!(error.contains("is not available"), "{error}");
+
+        state.shutdown().await;
+        let _ = std::fs::remove_dir_all(plugins_dir);
+    }
+
+    #[tokio::test]
+    async fn session_set_model_switches_a_session_to_an_acp_agent_and_back() {
+        let plugins_dir = acp_plugins_dir();
+        let state = test_server_state_with(config_with_a_model(), Some(plugins_dir.clone())).await;
+        let workspace = register_session(&state, "acp-switch", "test/model").await;
+        let set_model = |model: &'static str| {
+            let state = state.clone();
+            async move {
+                handle_rpc_call(
+                    state,
+                    "session.set_model",
+                    Some(serde_json::json!({"session_id": "acp-switch", "model": model})),
+                    rpc_event_sink(),
+                )
+                .await
+            }
+        };
+        let current = || {
+            let state = state.clone();
+            async move {
+                let alias = state.sessions.lock().await["acp-switch"].get_model_alias();
+                let stored = state
+                    .transcript
+                    .lock()
+                    .await
+                    .get_session("acp-switch")
+                    .unwrap()
+                    .unwrap()
+                    .model;
+                (alias, stored)
+            }
+        };
+
+        let response = set_model("acp:acp-plug.stub").await.unwrap();
+        assert_eq!(response["model"], "acp:acp-plug.stub");
+        // Live session and the persisted record (what resume restores).
+        assert_eq!(
+            current().await,
+            ("acp:acp-plug.stub".into(), "acp:acp-plug.stub".into())
+        );
+
+        // A plugin that no longer declares the agent is refused, nothing changes.
+        let error = set_model("acp:acp-plug.gone").await.unwrap_err();
+        assert_eq!(error.0, -32602);
+        assert!(error.1.contains("is not available"), "{}", error.1);
+        let error = set_model("nope").await.unwrap_err();
+        assert_eq!((error.0, error.1.as_str()), (-32602, "Unknown model: nope"));
+        assert_eq!(current().await.0, "acp:acp-plug.stub");
+
+        // The thinking level asked of the agent is part of the alias, kept in
+        // the live session and the persisted record alike.
+        let response = set_model("acp:acp-plug.stub#max").await.unwrap();
+        assert_eq!(response["model"], "acp:acp-plug.stub#max");
+        assert_eq!(
+            current().await,
+            (
+                "acp:acp-plug.stub#max".into(),
+                "acp:acp-plug.stub#max".into()
+            )
+        );
+        let error = set_model("acp:acp-plug.stub#very high").await.unwrap_err();
+        assert_eq!(error.0, -32602);
+        assert!(error.1.contains("Invalid ACP model alias"), "{}", error.1);
+        assert_eq!(current().await.0, "acp:acp-plug.stub#max");
+
+        // Back to an ordinary model: the session stays usable.
+        set_model("test/model").await.unwrap();
+        assert_eq!(current().await, ("test/model".into(), "test/model".into()));
+
+        // A fallback model has to be a configured model, never an ACP agent.
+        let error = handle_rpc_call(
+            state.clone(),
+            "session.set_fallback_model",
+            Some(serde_json::json!({
+                "session_id": "acp-switch", "mode": "model", "model": "acp:acp-plug.stub"
+            })),
+            rpc_event_sink(),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.1.contains("Unknown fallback model"), "{}", error.1);
+
+        state.shutdown().await;
+        let _ = std::fs::remove_dir_all(plugins_dir);
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
+    async fn http_models_list_the_acp_agents_of_enabled_plugins() {
+        let plugins_dir = acp_plugins_dir();
+        let state = test_server_state_with(config_with_a_model(), Some(plugins_dir.clone())).await;
+        let backend = AgentHttpBackend {
+            state: state.clone(),
+        };
+        let listed = kkagent_rpc::HttpBackend::list_models(&backend).await;
+        let models = listed["models"].as_array().unwrap();
+
+        let acp: Vec<_> = models.iter().filter(|m| m["kind"] == "acp").collect();
+        assert_eq!(acp.len(), 1, "{models:?}");
+        assert_eq!(acp[0]["alias"], "acp:acp-plug.stub");
+        assert_eq!(acp[0]["id"], "acp:acp-plug.stub");
+        assert_eq!(acp[0]["provider"], "acp");
+        assert_eq!(acp[0]["description"], "Stub ACP agent");
+        // Configured models are still listed, the internal subagent is not.
+        assert!(models.iter().any(|m| m["alias"] == "test/model"));
+        assert!(!models
+            .iter()
+            .any(|m| m["alias"].as_str().is_some_and(|a| a.contains("inner"))));
+
+        state.shutdown().await;
+        let _ = std::fs::remove_dir_all(plugins_dir);
+    }
+
+    #[tokio::test]
+    async fn undoing_an_acp_turn_reports_that_the_agents_file_edits_stay() {
+        let state = test_server_state().await;
+        let workspace = register_session(&state, "acp-undo", "acp:acp-plug.stub").await;
+        {
+            let text = |role: &str, text: String| ChatMessage {
+                role: role.into(),
+                content: vec![ChatContent::Text { text }],
+                tools: None,
+            };
+            let mut sessions = state.sessions.lock().await;
+            let session = sessions.get_mut("acp-undo").unwrap();
+            // What an ACP turn leaves behind: prompt, reply, activity summary.
+            session
+                .messages
+                .push(text("user", "rename the module".into()));
+            session.begin_turn();
+            session.messages.push(text("assistant", "done".into()));
+            session.messages.push(text(
+                "user",
+                kkagent_core::acp_backend::format_activity_summary(
+                    "acp-plug.stub",
+                    "stub",
+                    &[kkagent_core::acp_backend::ToolActivity {
+                        kind: "edit".into(),
+                        title: "Edit lib.rs".into(),
+                        status: "completed".into(),
+                        locations: vec!["lib.rs".into()],
+                    }],
+                )
+                .unwrap(),
+            ));
+            session.commit_turn();
+        }
+
+        let response = handle_rpc_call(
+            state.clone(),
+            "session.undo",
+            Some(serde_json::json!({"session_id": "acp-undo", "count": 1})),
+            rpc_event_sink(),
         )
         .await
         .unwrap();
-        state
+        assert_eq!(response["undone"], 1);
+        let warnings = response["warnings"].as_array().expect("warnings");
+        assert_eq!(warnings.len(), 1, "{response}");
+        let warning = warnings[0].as_str().unwrap();
+        assert!(
+            warning.contains("'stub'") && warning.contains("git"),
+            "{warning}"
+        );
+
+        // An ordinary session reports nothing (the key is omitted entirely).
+        register_session(&state, "plain-undo", "test/model").await;
+        {
+            let mut sessions = state.sessions.lock().await;
+            let session = sessions.get_mut("plain-undo").unwrap();
+            session.add_user_message("hello".into());
+            session.begin_turn();
+            session.messages.push(ChatMessage {
+                role: "assistant".into(),
+                content: vec![ChatContent::Text { text: "hi".into() }],
+                tools: None,
+            });
+            session.commit_turn();
+        }
+        let response = handle_rpc_call(
+            state.clone(),
+            "session.undo",
+            Some(serde_json::json!({"session_id": "plain-undo", "count": 1})),
+            rpc_event_sink(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response["undone"], 1);
+        assert!(response.get("warnings").is_none(), "{response}");
+
+        state.shutdown().await;
+        let _ = std::fs::remove_dir_all(workspace);
     }
 
     pub(crate) fn rpc_event_sink() -> mpsc::Sender<Frame> {

@@ -8,6 +8,9 @@ pub struct UndoResult {
     pub undone_turns: usize,
     pub message_count: usize,
     pub participants: Vec<UndoParticipant>,
+    /// Things the undo could not revert (e.g. an external ACP agent's file
+    /// changes). Empty when everything was restored.
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Default)]
@@ -43,6 +46,7 @@ impl UndoService {
             undone_turns: undone,
             message_count,
             participants: default_undo_participants(),
+            warnings: session.take_undo_warnings(),
         }
     }
 

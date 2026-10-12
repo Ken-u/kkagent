@@ -1500,6 +1500,7 @@ dependencies = [
  "kkagent-config",
  "kkagent-kaos",
  "kkagent-protocol",
+ "libc",
  "serde",
  "serde_json",
  "tempfile",
@@ -1507,6 +1508,7 @@ dependencies = [
  "tracing",
  "uuid",
  "walkdir",
+ "which",
 ]
 
 [[package]]

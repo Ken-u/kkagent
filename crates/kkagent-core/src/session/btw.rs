@@ -271,6 +271,25 @@ impl SessionBtwService {
         } else {
             model_alias.to_string()
         };
+        // A session running on an ACP agent has no LLM provider of its own,
+        // and the agent cannot be asked a side question while it works: answer
+        // with the configured default model and say so.
+        let model_alias = if kkagent_config::has_acp_alias_prefix(&model_alias) {
+            let Some(default_alias) = config.default_model_alias() else {
+                anyhow::bail!(
+                    "/btw needs a regular model, but this session runs on the ACP agent \
+                     '{model_alias}' and no default_model is configured."
+                );
+            };
+            let _ = event_tx
+                .send(StreamEvent::TextDelta(format!(
+                    "(当前会话由 ACP 后端运行,/btw 改用默认模型 {default_alias} 回答)\n\n"
+                )))
+                .await;
+            default_alias.to_string()
+        } else {
+            model_alias
+        };
         let (model_config, provider_config) = config
             .resolve_model(&model_alias)
             .ok_or_else(|| anyhow!("Model '{}' not found", model_alias))?;
@@ -393,6 +412,98 @@ mod tests {
 
         svc.clear(&agents);
         assert_eq!(chat_message_text(&svc.context_snapshot(&later)[0]), "later");
+    }
+
+    fn side_question_config(default_model: Option<&str>) -> AppConfig {
+        use kkagent_config::{ModelConfig, ProviderConfig};
+        let mut config = AppConfig {
+            default_model: default_model.map(str::to_string),
+            ..AppConfig::default()
+        };
+        config.providers.insert(
+            "test".into(),
+            ProviderConfig {
+                provider_type: "openai-chat".into(),
+                api_key: Some("token".into()),
+                api_key_env: None,
+                // Nothing listens here: the request fails right away.
+                base_url: Some("http://127.0.0.1:1".into()),
+                custom_headers: Default::default(),
+                oauth: None,
+                first_token_timeout_ms: None,
+                request_timeout_ms: None,
+                read_timeout_ms: None,
+                extra_fields: Default::default(),
+            },
+        );
+        config.models.insert(
+            "test/model".into(),
+            ModelConfig {
+                provider: "test".into(),
+                model: "test-model".into(),
+                max_context_size: Some(16_000),
+                max_output_size: Some(1_000),
+                capabilities: Vec::new(),
+                display_name: None,
+                support_efforts: Vec::new(),
+                default_effort: None,
+                pricing: None,
+                experimental_adaptive_thinking: false,
+                experimental_vision_proxy: false,
+                experimental_visible_empty_retries: 0,
+                experimental_bad_toolcall_auto_retries: 0,
+                experimental_retry_partial_stream_errors: None,
+                first_token_timeout_ms: None,
+            },
+        );
+        config
+    }
+
+    #[tokio::test]
+    async fn side_question_on_an_acp_session_uses_the_default_model_and_says_so() {
+        let config = side_question_config(Some("test/model"));
+        let (tx, mut rx) = mpsc::channel(16);
+        let result = SessionBtwService::stream_side_question(
+            &config,
+            "acp:stub-plugin.stub",
+            &[],
+            &[],
+            "what is a monad?",
+            tx,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await;
+        assert!(result.is_ok(), "{result:?}");
+        match rx.recv().await {
+            Some(StreamEvent::TextDelta(notice)) => {
+                assert!(
+                    notice.contains("ACP") && notice.contains("test/model"),
+                    "{notice}"
+                );
+            }
+            other => panic!("expected the fallback notice first, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn side_question_on_an_acp_session_needs_a_default_model() {
+        let config = side_question_config(None);
+        let (tx, _rx) = mpsc::channel(16);
+        let error = SessionBtwService::stream_side_question(
+            &config,
+            "acp:stub-plugin.stub",
+            &[],
+            &[],
+            "q",
+            tx,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("needs a regular model"),
+            "{error}"
+        );
     }
 
     #[test]

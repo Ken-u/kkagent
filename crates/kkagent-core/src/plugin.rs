@@ -307,6 +307,41 @@ pub struct PluginInfo {
     /// Full slash-command definitions (templates included) for the TUI.
     #[serde(default)]
     pub slash_commands: Vec<PluginSlashCommand>,
+    /// ACP agents this plugin offers as a session backend (`/model`). Only
+    /// populated while the plugin is enabled.
+    #[serde(default)]
+    pub acp_agents: Vec<AcpAgentInfo>,
+}
+
+/// A plugin-declared `transport: "acp"` agent that can also run a whole
+/// session through `/model` (alias `acp:<id>`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AcpAgentInfo {
+    /// `<plugin>.<name>` — the id inside the `acp:<id>` model alias.
+    pub id: String,
+    /// Display name of the agent (`cursor`), as used in tool names and status.
+    pub agent: String,
+    /// Subagent type name inside the plugin manifest.
+    pub name: String,
+    pub description: String,
+}
+
+impl AcpAgentInfo {
+    fn from_spec(qualified: &str, spec: &PluginSubagentSpec) -> Self {
+        let mut spec = spec.clone();
+        spec.plugin_id = qualified.to_string();
+        Self {
+            id: qualified.to_string(),
+            agent: spec.qualified_name(),
+            name: spec.name.clone(),
+            description: spec.description.clone(),
+        }
+    }
+
+    /// The model alias that selects this agent.
+    pub fn alias(&self) -> String {
+        kkagent_config::acp_alias(&self.id)
+    }
 }
 
 /// Memoized external-subagent aggregation: qualified specs plus conflicts.
@@ -585,6 +620,22 @@ impl PluginManager {
                         .as_deref()
                         .is_some_and(|p| !p.trim().is_empty()),
                 slash_commands: plugin.manifest.slash_commands.clone(),
+                acp_agents: if plugin.enabled {
+                    plugin
+                        .manifest
+                        .subagents
+                        .iter()
+                        .filter(|spec| spec.transport.eq_ignore_ascii_case("acp"))
+                        .map(|spec| {
+                            AcpAgentInfo::from_spec(
+                                &format!("{}.{}", plugin.manifest.name, spec.name),
+                                spec,
+                            )
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                },
             })
             .collect();
         out.sort_by(|a, b| a.name.cmp(&b.name));
@@ -752,6 +803,30 @@ impl PluginManager {
             .iter()
             .find(|spec| spec.name == type_name)
             .cloned()
+    }
+
+    /// Enabled `transport: "acp"` agents that can back a whole session
+    /// (`/model` alias `acp:<id>`), sorted by id. Same aggregation (and
+    /// conflict handling) as [`Self::external_subagents`].
+    pub async fn acp_backends(&self) -> Vec<(String, PluginSubagentSpec)> {
+        self.external_subagents()
+            .await
+            .0
+            .iter()
+            .filter(|(_, spec)| spec.transport.eq_ignore_ascii_case("acp"))
+            .cloned()
+            .collect()
+    }
+
+    /// One ACP backend by id (`<plugin>.<name>`), or `None` when the plugin
+    /// is disabled/removed or the entry isn't an ACP agent.
+    pub async fn acp_backend(&self, agent_id: &str) -> Option<PluginSubagentSpec> {
+        let mut spec = self.external_subagent(agent_id).await?;
+        if !spec.transport.eq_ignore_ascii_case("acp") {
+            return None;
+        }
+        spec.plugin_id = agent_id.to_string();
+        Some(spec)
     }
 
     /// Effective service overrides: first enabled plugin (by id order) that

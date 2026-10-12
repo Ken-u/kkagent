@@ -1,3 +1,4 @@
+pub mod acp_backend;
 pub mod activity_view;
 pub mod agent_loop;
 pub mod audit;
@@ -71,7 +72,8 @@ pub use media_pipeline::{extract_at_paths, resolve_media, MediaLimits, MediaRef}
 pub use model_capability::ModelCapability;
 pub use permission::*;
 pub use plugin::{
-    LoadedPlugin, PluginDiagnostic, PluginInfo, PluginInterface, PluginManager, PluginManifest,
+    AcpAgentInfo, LoadedPlugin, PluginDiagnostic, PluginInfo, PluginInterface, PluginManager,
+    PluginManifest,
 };
 pub use plugin_marketplace::{
     InstalledPluginRecord, MarketplaceKind, PluginMarketplace, PluginMarketplaceEntry,

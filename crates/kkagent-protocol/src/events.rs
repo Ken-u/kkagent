@@ -273,6 +273,30 @@ pub enum AgentEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
     },
+    /// What the external ACP agent behind an `acp:` model alias runs on.
+    /// Sent when each of its turns starts, so clients can show the agent's
+    /// own model and thinking level (kkagent's `[models]` and `/effort` do
+    /// not apply to it; the level is asked for with an `acp:<id>#<level>`
+    /// alias).
+    AcpAgentState {
+        session_id: String,
+        /// Display name of the agent (`cursor`).
+        agent: String,
+        /// Model the agent reported, without variant parameters.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        /// Thinking level in effect.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        thought_level: Option<String>,
+        /// Levels a client may ask for; empty when the agent offers no
+        /// thinking-level setting.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        thought_levels: Vec<String>,
+        /// A remark for the user, e.g. that the requested level was replaced
+        /// by the closest one the agent offers.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
+    },
 }
 
 impl AgentEvent {
@@ -314,7 +338,8 @@ impl AgentEvent {
             | Self::AutoCompactCompleted { session_id, .. }
             | Self::SkillActivated { session_id, .. }
             | Self::SessionConfigChanged { session_id, .. }
-            | Self::ToolCancelled { session_id, .. } => session_id,
+            | Self::ToolCancelled { session_id, .. }
+            | Self::AcpAgentState { session_id, .. } => session_id,
         }
     }
 }
