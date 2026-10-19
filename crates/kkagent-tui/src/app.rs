@@ -1096,6 +1096,9 @@ pub struct ApprovalChoice {
 #[derive(Debug, Clone)]
 pub struct PendingApproval {
     pub approval_id: String,
+    /// Tool call this approval gates. Its `ToolResult` means the server is no
+    /// longer waiting (answered elsewhere, timed out, interrupted).
+    pub tool_call_id: String,
     pub tool_name: String,
     pub action: String,
     pub detail: String,
@@ -13292,6 +13295,49 @@ impl TuiApp {
         self.state.btw_hid_approval = false;
     }
 
+    /// Precondition: `approval_pending` was just emptied because the server no
+    /// longer waits on it. Surface the next queued approval, or fall back from
+    /// the stale `WaitingApproval` status to whatever the session is doing.
+    fn settle_after_approval_removed(&mut self) {
+        if let Some(mut next) = self.state.approval_queue.pop_front() {
+            // BTW owns the surface: keep the next modal folded until it exits.
+            next.hidden = self.state.btw_hid_approval;
+            self.state.approval_pending = Some(next);
+            self.state.status = SessionStatus::WaitingApproval;
+            return;
+        }
+        self.state.btw_hid_approval = false;
+        if self.state.status == SessionStatus::WaitingApproval {
+            self.state.status = if self.state.question_pending.is_some() {
+                SessionStatus::WaitingQuestion
+            } else {
+                SessionStatus::Thinking
+            };
+        }
+    }
+
+    /// Drop approvals gated on `tool_call_id`: its result means the server is
+    /// no longer waiting (timed out, answered by another client, interrupted).
+    /// A stale modal would otherwise swallow Enter forever and hide every
+    /// later approval or question queued behind it.
+    fn drop_approvals_for_tool_call(&mut self, tool_call_id: &str) {
+        if tool_call_id.is_empty() {
+            return;
+        }
+        self.state
+            .approval_queue
+            .retain(|queued| queued.tool_call_id != tool_call_id);
+        if self
+            .state
+            .approval_pending
+            .as_ref()
+            .is_some_and(|pending| pending.tool_call_id == tool_call_id)
+        {
+            self.state.approval_pending = None;
+            self.settle_after_approval_removed();
+        }
+    }
+
     async fn respond_approval_choice(
         &mut self,
         choice: ApprovalChoice,
@@ -13321,6 +13367,8 @@ impl TuiApp {
         }
         let revising_plan = approval.is_plan_review && choice.requires_feedback;
         let resumed_plan_review = approval.resumed_plan_review;
+        // Keep typed revision feedback so an expired approval does not eat it.
+        let stale_feedback = feedback.clone().filter(|_| choice.requires_feedback);
         let response = kkagent_protocol::ApprovalResponse {
             approval_id: approval.approval_id.clone(),
             decision: choice.decision,
@@ -13343,9 +13391,30 @@ impl TuiApp {
         };
 
         if let Err(e) = result {
-            // Restore panel on failure
-            self.state.approval_pending = Some(approval);
-            self.system_message(format!("Approval failed: {}", e));
+            let message = e.to_string();
+            if kkagent_protocol::is_stale_approval_error(&message) {
+                // The server stopped waiting on this approval (timeout,
+                // another client, interrupt). Restoring it would trap every
+                // later Enter on a prompt that can never be answered.
+                self.state
+                    .approval_queue
+                    .retain(|queued| queued.approval_id != approval.approval_id);
+                self.settle_after_approval_removed();
+                let mut notice = String::from("该确认已过期（服务端已超时或已处理），已关闭");
+                if let Some(text) = stale_feedback {
+                    if self.state.input.is_empty() {
+                        self.state.input.set_text(text);
+                        notice.push_str("，修改意见已放回输入框");
+                    }
+                }
+                self.jobs.push_info(notice);
+                self.system_message(format!("Approval expired: {message}"));
+            } else {
+                // Transient failure: restore the panel so the user can retry.
+                self.state.approval_pending = Some(approval);
+                self.jobs.push_info(format!("审批提交失败: {message}"));
+                self.system_message(format!("Approval failed: {}", message));
+            }
         } else {
             let resumed_result = result.ok().flatten();
             if let Some(plan_mode) = resumed_result
@@ -13719,6 +13788,15 @@ impl TuiApp {
                         AgentEvent::CompactCompleted { .. } => {
                             self.state.tab_strip.mark_dirty(&evt_sid, true);
                         }
+                        AgentEvent::ToolResult { tool_call_id, .. }
+                            if self
+                                .state
+                                .parked_approvals
+                                .get(&evt_sid)
+                                .is_some_and(|parked| &parked.tool_call_id == tool_call_id) =>
+                        {
+                            self.state.parked_approvals.remove(&evt_sid);
+                        }
                         AgentEvent::TurnEnd { .. } => {
                             self.state.parked_approvals.remove(&evt_sid);
                             self.state.parked_questions.remove(&evt_sid);
@@ -13898,6 +13976,9 @@ impl TuiApp {
                         is_error,
                         ..
                     } => {
+                        // The gated tool finished, so any approval modal for it
+                        // is stale (e.g. the 900s approval timeout elapsed).
+                        self.drop_approvals_for_tool_call(&tool_call_id);
                         // A steer user message may now be the transcript tail;
                         // update the assistant tool call by id instead of only
                         // inspecting the final display message.
@@ -13959,7 +14040,15 @@ impl TuiApp {
                             }
                         }
                         let pending = pending_approval_from_request(&request, false);
-                        if self.state.approval_pending.is_some() {
+                        let duplicate = self
+                            .state
+                            .approval_pending
+                            .iter()
+                            .chain(self.state.approval_queue.iter())
+                            .any(|known| known.approval_id == pending.approval_id);
+                        if duplicate {
+                            // Replayed request (resume + live event): already shown.
+                        } else if self.state.approval_pending.is_some() {
                             self.state.approval_queue.push_back(pending);
                             self.system_message(format!(
                                 "Approval queued ({} waiting).",
@@ -14849,6 +14938,7 @@ fn pending_approval_from_request(
     };
     PendingApproval {
         approval_id: request.approval_id.clone(),
+        tool_call_id: request.tool_call_id.clone(),
         tool_name: request.tool_name.clone(),
         action: if is_plan_review {
             "按此计划开始执行？".into()
@@ -18197,6 +18287,7 @@ mod app_state_tests {
         (
             PendingApproval {
                 approval_id: "approval-1".into(),
+                tool_call_id: "call-1".into(),
                 tool_name: "ExitPlanMode".into(),
                 action: "review".into(),
                 detail: String::new(),
@@ -18215,6 +18306,7 @@ mod app_state_tests {
     fn pending_bash_approval(id: &str) -> PendingApproval {
         PendingApproval {
             approval_id: id.into(),
+            tool_call_id: format!("call-{id}"),
             tool_name: "Bash".into(),
             action: "run command".into(),
             detail: "cargo check".into(),
@@ -18537,6 +18629,234 @@ mod app_state_tests {
         });
         assert!(!app.state.parked_approvals.contains_key("session-2"));
         assert!(!app.state.parked_questions.contains_key("session-2"));
+    }
+
+    fn tool_result_frame(session_id: &str, tool_call_id: &str) -> Frame {
+        Frame::Event {
+            event: "agent".into(),
+            scope: None,
+            data: serde_json::to_value(AgentEvent::ToolResult {
+                session_id: session_id.into(),
+                tool_call_id: tool_call_id.into(),
+                tool_name: "ExitPlanMode".into(),
+                output: "User rejected the plan. Feedback:\n\napproval timed out after 900 seconds"
+                    .into(),
+                is_error: false,
+            })
+            .unwrap(),
+        }
+    }
+
+    #[tokio::test]
+    async fn timed_out_approval_result_drops_stale_modal_and_promotes_the_next() {
+        let mut app = test_tui_app();
+        app.state.session_id = Some("session-1".into());
+        app.state.status = SessionStatus::WaitingApproval;
+        app.state.approval_pending = Some(pending_bash_approval("approval-1"));
+        app.state
+            .approval_queue
+            .push_back(pending_bash_approval("approval-2"));
+
+        // A result for an unrelated tool call leaves the live modal alone.
+        app.handle_server_event(tool_result_frame("session-1", "call-other"));
+        assert_eq!(
+            app.state
+                .approval_pending
+                .as_ref()
+                .map(|a| a.approval_id.as_str()),
+            Some("approval-1")
+        );
+
+        // The server timed `approval-1` out and moved on: the modal must not
+        // keep swallowing Enter, and the queued approval takes over.
+        app.handle_server_event(tool_result_frame("session-1", "call-approval-1"));
+        assert_eq!(
+            app.state
+                .approval_pending
+                .as_ref()
+                .map(|a| (a.approval_id.as_str(), a.hidden)),
+            Some(("approval-2", false))
+        );
+        assert!(app.state.approval_queue.is_empty());
+        assert_eq!(app.state.status, SessionStatus::WaitingApproval);
+
+        // With a question waiting behind it, the session falls back to it.
+        app.state.question_pending = Some(PendingQuestion {
+            question_id: "question-1".into(),
+            text: "continue?".into(),
+            options: vec![("yes".into(), "Yes".into())],
+            allow_free_text: false,
+            allow_multiple: false,
+            selected: 0,
+            toggled: vec![false],
+            free_text: String::new(),
+            submitting: false,
+        });
+        app.handle_server_event(tool_result_frame("session-1", "call-approval-2"));
+        assert!(app.state.approval_pending.is_none());
+        assert_eq!(app.state.status, SessionStatus::WaitingQuestion);
+    }
+
+    #[tokio::test]
+    async fn timed_out_result_clears_parked_approval_of_background_session() {
+        let mut app = test_tui_app();
+        app.state.session_id = Some("session-1".into());
+        app.state
+            .parked_approvals
+            .insert("session-2".into(), pending_bash_approval("approval-9"));
+
+        app.handle_server_event(tool_result_frame("session-2", "call-other"));
+        assert!(app.state.parked_approvals.contains_key("session-2"));
+
+        app.handle_server_event(tool_result_frame("session-2", "call-approval-9"));
+        assert!(!app.state.parked_approvals.contains_key("session-2"));
+    }
+
+    #[tokio::test]
+    async fn replayed_approval_request_is_not_queued_behind_itself() {
+        let mut app = test_tui_app();
+        app.state.session_id = Some("session-1".into());
+        let request = kkagent_protocol::ApprovalRequest {
+            approval_id: "approval-1".into(),
+            session_id: "session-1".into(),
+            tool_call_id: "call-1".into(),
+            tool_name: "Bash".into(),
+            action: "run".into(),
+            tool_input_display: None,
+            created_at: chrono::Utc::now(),
+        };
+        for _ in 0..2 {
+            app.handle_server_event(Frame::Event {
+                event: "agent".into(),
+                scope: None,
+                data: serde_json::to_value(AgentEvent::ApprovalRequested {
+                    session_id: "session-1".into(),
+                    request: request.clone(),
+                })
+                .unwrap(),
+            });
+        }
+        assert!(app.state.approval_pending.is_some());
+        assert!(app.state.approval_queue.is_empty());
+    }
+
+    #[tokio::test]
+    async fn expired_approval_response_closes_modal_instead_of_trapping_enter() {
+        use futures::FutureExt;
+        use std::sync::Arc;
+
+        let (client_transport, server_transport) =
+            kkagent_rpc::transport::memory::create_memory_pair();
+        let (event_tx, event_rx) = tokio::sync::mpsc::channel(16);
+        let rpc = kkagent_rpc::RpcClient::new(client_transport, event_tx);
+        let client = kkagent_client::KkagentClient::new(rpc, event_rx);
+        let handler: kkagent_rpc::server::RequestHandler =
+            Arc::new(|_id, method, _params, _event_tx| {
+                async move {
+                    assert_eq!(method, "approval.respond");
+                    Err((
+                        -32000,
+                        format!(
+                            "Approval approval-1 {} for session session-1",
+                            kkagent_protocol::APPROVAL_NOT_PENDING
+                        ),
+                    ))
+                }
+                .boxed()
+            });
+        tokio::spawn(async move {
+            kkagent_rpc::RpcServer::new(handler)
+                .serve(server_transport)
+                .await;
+        });
+        let mut app = TuiApp::new(AppConfig::default(), client);
+        app.state.session_id = Some("session-1".into());
+        app.state.status = SessionStatus::WaitingApproval;
+        app.state.on_plan_mode_changed(true);
+        let question = PendingQuestion {
+            question_id: "question-1".into(),
+            text: "continue?".into(),
+            options: vec![("yes".into(), "Yes".into())],
+            allow_free_text: false,
+            allow_multiple: false,
+            selected: 0,
+            toggled: vec![false],
+            free_text: String::new(),
+            submitting: false,
+        };
+        app.state.question_pending = Some(question);
+        let (mut approval, _) = pending_plan_revision();
+        approval.feedback_mode = false;
+        app.state.approval_pending = Some(approval);
+
+        // Enter on the stale "执行" choice used to fail and re-open the same
+        // modal forever, with the question stuck behind it.
+        app.state.approval_pending.as_mut().unwrap().choices =
+            PendingApproval::plan_review_choices(&serde_json::json!({"kind": "plan_review"}));
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        assert!(app.state.approval_pending.is_none());
+        assert_eq!(app.state.status, SessionStatus::WaitingQuestion);
+        assert!(app
+            .jobs
+            .notices
+            .iter()
+            .any(|notice| notice.text.contains("已过期")));
+
+        // The question is reachable again.
+        app.handle_key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert!(app
+            .state
+            .question_pending
+            .as_ref()
+            .is_some_and(|question| question.submitting));
+    }
+
+    #[tokio::test]
+    async fn expired_plan_revision_keeps_typed_feedback_in_the_composer() {
+        use futures::FutureExt;
+        use std::sync::Arc;
+
+        let (client_transport, server_transport) =
+            kkagent_rpc::transport::memory::create_memory_pair();
+        let (event_tx, event_rx) = tokio::sync::mpsc::channel(16);
+        let rpc = kkagent_rpc::RpcClient::new(client_transport, event_tx);
+        let client = kkagent_client::KkagentClient::new(rpc, event_rx);
+        let handler: kkagent_rpc::server::RequestHandler =
+            Arc::new(|_id, _method, _params, _event_tx| {
+                async move {
+                    Err((
+                        -32000,
+                        format!(
+                            "Approval approval-1 {} for session session-1",
+                            kkagent_protocol::APPROVAL_NOT_PENDING
+                        ),
+                    ))
+                }
+                .boxed()
+            });
+        tokio::spawn(async move {
+            kkagent_rpc::RpcServer::new(handler)
+                .serve(server_transport)
+                .await;
+        });
+        let mut app = TuiApp::new(AppConfig::default(), client);
+        app.state.session_id = Some("session-1".into());
+        app.state.status = SessionStatus::WaitingApproval;
+        let (approval, choice) = pending_plan_revision();
+        app.state.approval_pending = Some(approval);
+
+        app.respond_approval_choice(choice, Some("please revise step two".into()))
+            .await
+            .unwrap();
+
+        assert!(app.state.approval_pending.is_none());
+        assert_eq!(app.state.input.text, "please revise step two");
+        assert_eq!(app.state.status, SessionStatus::Thinking);
     }
 
     #[tokio::test]

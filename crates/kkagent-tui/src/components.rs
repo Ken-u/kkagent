@@ -5358,6 +5358,7 @@ mod render_smoke {
                 .set_text("你好👨‍👩‍👧‍👦，这是一段会自动换行的手机输入内容".into());
             state.approval_pending = Some(PendingApproval {
                 approval_id: "approval-mobile".into(),
+                tool_call_id: "call-mobile".into(),
                 tool_name: "Bash".into(),
                 action: "Run a command that needs confirmation on a phone terminal".into(),
                 detail: "command: cargo test --workspace --all-targets".into(),
@@ -5386,6 +5387,7 @@ mod render_smoke {
         let mut state = AppState::new(PermissionMode::Manual, false);
         state.approval_pending = Some(PendingApproval {
             approval_id: "approval-mobile".into(),
+            tool_call_id: "call-mobile".into(),
             tool_name: "Bash".into(),
             action: "Run a command requiring confirmation".into(),
             detail: "A long command detail that wraps instead of leaving the viewport".into(),

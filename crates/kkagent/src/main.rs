@@ -6194,6 +6194,26 @@ impl ServerState {
         pending.remove(session_id);
     }
 
+    /// Drop the remembered approval once its tool call has produced a result.
+    ///
+    /// A result means the waiter is gone: the approval was answered, timed
+    /// out or was interrupted. Keeping it would let a reattaching client
+    /// resurrect a prompt nobody is waiting on, and answering it would be
+    /// silently discarded.
+    async fn clear_pending_tool_approval_for_tool_call(
+        &self,
+        session_id: &str,
+        tool_call_id: &str,
+    ) {
+        let mut pending = self.pending_tool_approvals.lock().await;
+        if pending
+            .get(session_id)
+            .is_some_and(|request| request.tool_call_id == tool_call_id)
+        {
+            pending.remove(session_id);
+        }
+    }
+
     async fn pending_tool_approval_for_session(
         &self,
         session_id: &str,
@@ -6637,6 +6657,8 @@ impl ServerState {
                 is_error,
                 ..
             } => {
+                self.clear_pending_tool_approval_for_tool_call(session_id, tool_call_id)
+                    .await;
                 if !self.session_is_checked_out(session_id).await {
                     return;
                 }
@@ -12595,8 +12617,9 @@ async fn handle_rpc_call(
                             return Err((
                                 -32000,
                                 format!(
-                                    "Approval {} expired or is no longer pending for session {sid}",
-                                    response.approval_id
+                                    "Approval {} {} for session {sid}",
+                                    response.approval_id,
+                                    kkagent_protocol::APPROVAL_NOT_PENDING
                                 ),
                             ));
                         }
@@ -12610,8 +12633,9 @@ async fn handle_rpc_call(
                             (
                                 -32000,
                                 format!(
-                                    "Approval {} expired or is no longer pending",
-                                    response.approval_id
+                                    "Approval {} {}",
+                                    response.approval_id,
+                                    kkagent_protocol::APPROVAL_NOT_PENDING
                                 ),
                             )
                         })?;
@@ -13928,6 +13952,78 @@ mod runtime_http_tests {
         assert!(!session.is_interrupted());
         assert_eq!(message_count, 1);
         assert_eq!(session.messages.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn tool_result_drops_the_timed_out_pending_approval() {
+        let state = test_server_state().await;
+        let request = |approval_id: &str, tool_call_id: &str| kkagent_protocol::ApprovalRequest {
+            approval_id: approval_id.into(),
+            session_id: "plan-session".into(),
+            tool_call_id: tool_call_id.into(),
+            tool_name: "ExitPlanMode".into(),
+            action: "Ready to build with this plan?".into(),
+            tool_input_display: None,
+            created_at: chrono::Utc::now(),
+        };
+        let tool_result = |tool_call_id: &str| AgentEvent::ToolResult {
+            session_id: "plan-session".into(),
+            tool_call_id: tool_call_id.into(),
+            tool_name: "ExitPlanMode".into(),
+            output: "User rejected the plan. Feedback:\n\napproval timed out after 900 seconds"
+                .into(),
+            is_error: false,
+        };
+
+        state
+            .remember_pending_tool_approval(request("approval-1", "call-1"))
+            .await;
+        // A result for an unrelated tool call must not touch the live prompt.
+        state
+            .note_agent_event_for_resume(&tool_result("other-call"))
+            .await;
+        assert!(state
+            .pending_tool_approval_for_session("plan-session")
+            .await
+            .is_some());
+
+        // The waiter timed out and the tool produced its result: nobody is
+        // waiting on `approval-1` any more, so a reattaching client must not
+        // be handed it again.
+        state
+            .note_agent_event_for_resume(&tool_result("call-1"))
+            .await;
+        assert!(state
+            .pending_tool_approval_for_session("plan-session")
+            .await
+            .is_none());
+
+        // The model resubmits the plan: the new approval is remembered and a
+        // late response to the expired one is rejected as stale.
+        state
+            .remember_pending_tool_approval(request("approval-2", "call-2"))
+            .await;
+        let error = handle_rpc_call(
+            state.clone(),
+            "approval.respond",
+            Some(serde_json::json!({
+                "session_id": "plan-session",
+                "approval_id": "approval-1",
+                "decision": "approved"
+            })),
+            rpc_event_sink(),
+        )
+        .await
+        .expect_err("the expired approval must be rejected");
+        assert!(kkagent_protocol::is_stale_approval_error(&error.1));
+        assert_eq!(
+            state
+                .pending_tool_approval_for_session("plan-session")
+                .await
+                .map(|request| request.approval_id),
+            Some("approval-2".to_string())
+        );
+        state.shutdown().await;
     }
 
     #[tokio::test]
