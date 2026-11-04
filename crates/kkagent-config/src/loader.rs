@@ -596,8 +596,55 @@ pub fn default_server_socket_path() -> PathBuf {
     default_config_dir().join("server.sock")
 }
 
-fn active_session_path() -> PathBuf {
-    default_config_dir().join("active-session")
+/// Legacy global marker: the most recently detached session anywhere.
+fn active_session_path_in(config_dir: &Path) -> PathBuf {
+    config_dir.join("active-session")
+}
+
+/// Directory holding one marker file per workspace, so detaching from a
+/// session in project B never overwrites the default session of project A.
+fn workspace_marker_dir_in(config_dir: &Path) -> PathBuf {
+    config_dir.join("active-sessions")
+}
+
+/// Stable, filesystem-safe file name for a workspace marker: a readable slug
+/// of the last path component plus an FNV-1a hash of the full normalized path
+/// (hand-rolled because `DefaultHasher` is not stable across releases).
+fn workspace_marker_name(workspace: &Path) -> String {
+    let resolved = std::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
+    let mut text = resolved.to_string_lossy().replace('\\', "/");
+    if cfg!(windows) {
+        text = text.to_lowercase();
+    }
+    let normalized = if text.len() > 1 {
+        text.trim_end_matches('/')
+    } else {
+        text.as_str()
+    };
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in normalized.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    let slug: String = normalized
+        .rsplit('/')
+        .find(|part| !part.is_empty())
+        .unwrap_or("root")
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(32)
+        .collect();
+    format!("{slug}-{hash:016x}")
+}
+
+fn workspace_marker_path_in(config_dir: &Path, workspace: &Path) -> PathBuf {
+    workspace_marker_dir_in(config_dir).join(workspace_marker_name(workspace))
 }
 
 fn write_active_session_file(path: &Path, session_id: &str) -> Result<()> {
@@ -629,20 +676,87 @@ fn remove_active_session_file(path: &Path) {
     }
 }
 
-/// Persist the session id that `kk` should auto-resume after a TUI detach.
+fn save_active_session_in(config_dir: &Path, workspace: &Path, session_id: &str) -> Result<()> {
+    write_active_session_file(&workspace_marker_path_in(config_dir, workspace), session_id)?;
+    // Keep the legacy global marker in sync: older builds and the "no
+    // per-workspace marker yet" upgrade path still read it.
+    write_active_session_file(&active_session_path_in(config_dir), session_id)
+}
+
+fn load_active_session_in(config_dir: &Path, workspace: &Path) -> Option<String> {
+    read_active_session_file(&workspace_marker_path_in(config_dir, workspace))
+        .or_else(|| read_active_session_file(&active_session_path_in(config_dir)))
+}
+
+/// Remove every marker (global and per-workspace) that points at `session_id`.
+///
+/// A deleted or discarded session must never stay behind as the default
+/// session to auto-resume.
+pub fn clear_active_session_if_in(config_dir: &Path, session_id: &str) {
+    let session_id = session_id.trim();
+    if session_id.is_empty() {
+        return;
+    }
+    let global = active_session_path_in(config_dir);
+    if read_active_session_file(&global).as_deref() == Some(session_id) {
+        remove_active_session_file(&global);
+    }
+    let Ok(entries) = std::fs::read_dir(workspace_marker_dir_in(config_dir)) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if read_active_session_file(&path).as_deref() == Some(session_id) {
+            remove_active_session_file(&path);
+        }
+    }
+}
+
+fn clear_all_active_sessions_in(config_dir: &Path) {
+    remove_active_session_file(&active_session_path_in(config_dir));
+    match std::fs::remove_dir_all(workspace_marker_dir_in(config_dir)) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            tracing::warn!(%error, "failed to clear per-workspace active-session markers");
+        }
+    }
+}
+
+/// Persist the session id that `kk` should auto-resume after a TUI detach,
+/// scoped to the workspace the session belongs to.
+pub fn save_active_session_for_dir(workspace: &Path, session_id: &str) -> Result<()> {
+    ensure_config_dir()?;
+    save_active_session_in(&default_config_dir(), workspace, session_id)
+}
+
+/// Load the session id `kk` should auto-resume in `workspace`: the marker saved
+/// for that workspace, falling back to the legacy global marker.
+pub fn load_active_session_for_dir(workspace: &Path) -> Option<String> {
+    load_active_session_in(&default_config_dir(), workspace)
+}
+
+/// Persist the session id that `kk` should auto-resume after a TUI detach
+/// (legacy global marker only; prefer [`save_active_session_for_dir`]).
 pub fn save_active_session(session_id: &str) -> Result<()> {
     ensure_config_dir()?;
-    write_active_session_file(&active_session_path(), session_id)
+    write_active_session_file(&active_session_path_in(&default_config_dir()), session_id)
 }
 
-/// Load the last detached session id, if any.
+/// Load the last detached session id, if any (legacy global marker).
 pub fn load_active_session() -> Option<String> {
-    read_active_session_file(&active_session_path())
+    read_active_session_file(&active_session_path_in(&default_config_dir()))
 }
 
-/// Clear a stale or intentionally discarded active-session marker.
+/// Clear every marker that points at `session_id`.
+pub fn clear_active_session_if(session_id: &str) {
+    clear_active_session_if_in(&default_config_dir(), session_id)
+}
+
+/// Clear all active-session markers (global and per-workspace), e.g. after the
+/// standalone server was stopped on purpose.
 pub fn clear_active_session() {
-    remove_active_session_file(&active_session_path())
+    clear_all_active_sessions_in(&default_config_dir())
 }
 
 #[cfg(test)]
@@ -810,6 +924,130 @@ mod active_session_tests {
                 .unwrap_or(0)
         ));
         assert!(write_active_session_file(&path, "   ").is_err());
+    }
+
+    fn temp_config_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "kkagent-active-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Detaching in project B must not hide project A's default session.
+    #[test]
+    fn markers_are_scoped_per_workspace() {
+        let config = temp_config_dir("scoped");
+        let proj_a = config.join("proj-a");
+        let proj_b = config.join("proj-b");
+        std::fs::create_dir_all(&proj_a).unwrap();
+        std::fs::create_dir_all(&proj_b).unwrap();
+
+        save_active_session_in(&config, &proj_a, "session-a").unwrap();
+        save_active_session_in(&config, &proj_b, "session-b").unwrap();
+
+        assert_eq!(
+            load_active_session_in(&config, &proj_a).as_deref(),
+            Some("session-a")
+        );
+        assert_eq!(
+            load_active_session_in(&config, &proj_b).as_deref(),
+            Some("session-b")
+        );
+        // The legacy global marker still tracks the most recent detach.
+        assert_eq!(
+            read_active_session_file(&active_session_path_in(&config)).as_deref(),
+            Some("session-b")
+        );
+        let _ = std::fs::remove_dir_all(&config);
+    }
+
+    /// Without a per-workspace marker (upgrade from an older build) the legacy
+    /// global marker is still honoured.
+    #[test]
+    fn load_falls_back_to_legacy_global_marker() {
+        let config = temp_config_dir("legacy");
+        let proj = config.join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        write_active_session_file(&active_session_path_in(&config), "legacy-session").unwrap();
+
+        assert_eq!(
+            load_active_session_in(&config, &proj).as_deref(),
+            Some("legacy-session")
+        );
+        let _ = std::fs::remove_dir_all(&config);
+    }
+
+    /// Deleting/discarding a session drops every marker pointing at it, and
+    /// leaves other workspaces' markers alone.
+    #[test]
+    fn clear_if_removes_only_markers_for_that_session() {
+        let config = temp_config_dir("clear-if");
+        let proj_a = config.join("proj-a");
+        let proj_b = config.join("proj-b");
+        std::fs::create_dir_all(&proj_a).unwrap();
+        std::fs::create_dir_all(&proj_b).unwrap();
+        save_active_session_in(&config, &proj_a, "session-a").unwrap();
+        save_active_session_in(&config, &proj_b, "session-b").unwrap();
+
+        clear_active_session_if_in(&config, "session-a");
+
+        // A's per-workspace marker is gone (and A has no global fallback
+        // either, because the global one now points at B's session).
+        assert_eq!(
+            read_active_session_file(&workspace_marker_path_in(&config, &proj_a)),
+            None
+        );
+        assert_eq!(
+            read_active_session_file(&workspace_marker_path_in(&config, &proj_b)).as_deref(),
+            Some("session-b")
+        );
+
+        clear_active_session_if_in(&config, "session-b");
+        assert_eq!(load_active_session_in(&config, &proj_b), None);
+        assert_eq!(load_active_session_in(&config, &proj_a), None);
+
+        // Empty ids never match anything.
+        save_active_session_in(&config, &proj_a, "session-a").unwrap();
+        clear_active_session_if_in(&config, "  ");
+        assert_eq!(
+            load_active_session_in(&config, &proj_a).as_deref(),
+            Some("session-a")
+        );
+        let _ = std::fs::remove_dir_all(&config);
+    }
+
+    #[test]
+    fn clear_all_removes_global_and_workspace_markers() {
+        let config = temp_config_dir("clear-all");
+        let proj = config.join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        save_active_session_in(&config, &proj, "session-x").unwrap();
+
+        clear_all_active_sessions_in(&config);
+
+        assert_eq!(load_active_session_in(&config, &proj), None);
+        // Clearing when nothing exists is a no-op.
+        clear_all_active_sessions_in(&config);
+        let _ = std::fs::remove_dir_all(&config);
+    }
+
+    #[test]
+    fn workspace_marker_name_is_stable_and_path_safe() {
+        let a = workspace_marker_name(Path::new("/nonexistent/proj/a b"));
+        assert_eq!(
+            a,
+            workspace_marker_name(Path::new("/nonexistent/proj/a b/"))
+        );
+        assert_ne!(a, workspace_marker_name(Path::new("/nonexistent/proj/a-b")));
+        assert!(a.starts_with("a_b-"), "{a}");
+        assert!(!a.contains('/') && !a.contains('\\'));
+        assert!(workspace_marker_name(Path::new("/")).starts_with("root-"));
     }
 }
 

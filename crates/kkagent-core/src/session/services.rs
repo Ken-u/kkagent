@@ -143,12 +143,18 @@ impl SessionServices {
 
     pub async fn on_close(&self, reason: SessionCloseReason) {
         self.lifecycle.fire_will_close(reason).await;
-        let _ = self
-            .tool_policy_gate
-            .session_policy
-            .persist(&self.context.session_dir);
-        let _ = self.cron.persist(&self.context.session_dir);
-        let _ = self.log.flush_to_file(&self.context.session_dir);
+        // A discarded/deleted session's directory has already been removed.
+        // `flush_to_file` re-creates `logs/`, which would resurrect the
+        // directory as an un-indexed ghost that a later auto-resume then
+        // adopts, so nothing may be written back on this path.
+        if reason != SessionCloseReason::Discard {
+            let _ = self
+                .tool_policy_gate
+                .session_policy
+                .persist(&self.context.session_dir);
+            let _ = self.cron.persist(&self.context.session_dir);
+            let _ = self.log.flush_to_file(&self.context.session_dir);
+        }
         self.external_hooks
             .fire(
                 crate::session::external_hooks::SessionHookEvent::SessionEnd,
@@ -157,6 +163,7 @@ impl SessionServices {
                     "reason": match reason {
                         SessionCloseReason::Exit => "exit",
                         SessionCloseReason::Archive => "archive",
+                        SessionCloseReason::Discard => "discard",
                     },
                 }),
             )

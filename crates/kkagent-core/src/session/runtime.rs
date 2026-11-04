@@ -1718,17 +1718,15 @@ fn resolve_session_dir(
             let store = SessionStore::open_default();
             match store.create(id, working_dir) {
                 Ok(summary) => (PathBuf::from(summary.session_dir), workspace_id),
-                Err(_) => {
-                    // Already indexed — reuse.
-                    if let Ok(summary) = store.get(id) {
-                        (PathBuf::from(summary.session_dir), workspace_id)
-                    } else {
-                        let dir = store
-                            .session_dir_for(id, working_dir)
-                            .unwrap_or_else(|_| store.sessions_dir.join(&workspace_id).join(id));
-                        let _ = std::fs::create_dir_all(&dir);
-                        (dir, workspace_id)
-                    }
+                Err(error) => {
+                    let dir = reuse_or_reindex_session_dir(
+                        &store,
+                        id,
+                        working_dir,
+                        &workspace_id,
+                        &error,
+                    );
+                    (dir, workspace_id)
                 }
             }
         }
@@ -1739,17 +1737,76 @@ fn resolve_session_dir(
             } else {
                 match store.create(id, working_dir) {
                     Ok(summary) => (PathBuf::from(summary.session_dir), workspace_id),
-                    Err(_) => {
-                        let dir = store
-                            .session_dir_for(id, working_dir)
-                            .unwrap_or_else(|_| store.sessions_dir.join(&workspace_id).join(id));
-                        let _ = std::fs::create_dir_all(&dir);
+                    Err(error) => {
+                        let dir = reuse_or_reindex_session_dir(
+                            &store,
+                            id,
+                            working_dir,
+                            &workspace_id,
+                            &error,
+                        );
                         (dir, workspace_id)
                     }
                 }
             }
         }
     }
+}
+
+/// `SessionStore::create` refused (typically "already exists"): pick the
+/// directory this session should keep using — and make sure it is indexed.
+///
+/// An on-disk session directory without a live `session_index.jsonl` entry
+/// (tombstoned by a discard whose close handler re-created the directory, or an
+/// index write that was lost) used to be adopted silently and never re-indexed.
+/// The session then kept working but was invisible to `/session`. Re-index it
+/// here so resuming a session always makes it visible again.
+fn reuse_or_reindex_session_dir(
+    store: &SessionStore,
+    id: &str,
+    working_dir: &std::path::Path,
+    workspace_id: &str,
+    create_error: &anyhow::Error,
+) -> PathBuf {
+    // Already indexed — reuse.
+    if let Ok(summary) = store.get(id) {
+        return PathBuf::from(summary.session_dir);
+    }
+    match store.backfill(id, working_dir) {
+        Ok(Some(summary)) => {
+            tracing::warn!(
+                session_id = %id,
+                dir = %summary.session_dir,
+                %create_error,
+                "re-indexed an unindexed session directory"
+            );
+            return PathBuf::from(summary.session_dir);
+        }
+        // An index entry appeared concurrently; honour it.
+        Ok(None) => {
+            if let Ok(summary) = store.get(id) {
+                return PathBuf::from(summary.session_dir);
+            }
+        }
+        Err(backfill_error) => {
+            tracing::warn!(
+                session_id = %id,
+                %create_error,
+                %backfill_error,
+                "failed to re-index session directory"
+            );
+        }
+    }
+    let dir = store
+        .session_dir_for(id, working_dir)
+        .unwrap_or_else(|_| store.sessions_dir.join(workspace_id).join(id));
+    let _ = std::fs::create_dir_all(&dir);
+    tracing::warn!(
+        session_id = %id,
+        dir = %dir.display(),
+        "session has no index entry and will not appear in /session until it is re-indexed"
+    );
+    dir
 }
 
 /// Scratch dir for an ephemeral subagent session (OS temp dir, per-run unique
@@ -2659,5 +2716,89 @@ mod working_directory_tests {
             SessionFallbackModel::from_persisted(Some("")),
             SessionFallbackModel::Disabled
         );
+    }
+
+    /// Regression: a session directory that lost its live index entry (tombstoned
+    /// by a discard whose close handler re-created the directory) used to be
+    /// adopted on resume without ever being re-indexed, so the session kept
+    /// working but vanished from `/session`.
+    #[test]
+    fn resume_reindexes_session_dir_that_lost_its_index_entry() {
+        let root =
+            std::env::temp_dir().join(format!("kkagent-reindex-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&root).unwrap();
+        let id = format!("reindex-{}", uuid::Uuid::new_v4().simple());
+
+        let store = SessionStore::open_default();
+        let summary = store.create(&id, &root).unwrap();
+        let dir = PathBuf::from(&summary.session_dir);
+        store.delete(&id).unwrap();
+        // The leftover directory a late `on_close` / state write re-creates.
+        std::fs::create_dir_all(dir.join("logs")).unwrap();
+        std::fs::write(dir.join("messages.jsonl"), "{\"role\":\"user\"}\n").unwrap();
+        assert!(
+            store.get(&id).is_err(),
+            "precondition: session is unindexed"
+        );
+
+        let resumed = Session::resume(
+            id.clone(),
+            root.clone(),
+            PermissionMode::Manual,
+            "test-model".into(),
+        );
+
+        assert_eq!(resumed.services.context.session_dir, dir);
+        assert!(store.get(&id).is_ok(), "resume must re-index the session");
+        assert!(
+            store
+                .list(false, 10_000)
+                .unwrap()
+                .iter()
+                .any(|session| session.id == id),
+            "re-indexed session must be listed by /session"
+        );
+        assert!(
+            dir.join("messages.jsonl").is_file(),
+            "re-indexing must not touch existing history"
+        );
+
+        drop(resumed);
+        let _ = store.delete(&id);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A freshly started session whose index write cannot be reused must not
+    /// silently stay unindexed when the directory already exists.
+    #[test]
+    fn startup_reindexes_existing_unindexed_session_dir() {
+        let root = std::env::temp_dir().join(format!(
+            "kkagent-reindex-startup-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let id = format!("startup-{}", uuid::Uuid::new_v4().simple());
+
+        let store = SessionStore::open_default();
+        let dir = store.session_dir_for(&id, &root).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(
+            store.get(&id).is_err(),
+            "precondition: session is unindexed"
+        );
+
+        let session = Session::new(
+            id.clone(),
+            root.clone(),
+            PermissionMode::Manual,
+            "test-model".into(),
+        );
+
+        assert_eq!(session.services.context.session_dir, dir);
+        assert!(store.get(&id).is_ok(), "startup must index the session");
+
+        drop(session);
+        let _ = store.delete(&id);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

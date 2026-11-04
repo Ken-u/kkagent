@@ -224,10 +224,20 @@ impl SessionStore {
             .find_entry(id)?
             .ok_or_else(|| anyhow::anyhow!("session not found: {id}"))?;
         let dir = PathBuf::from(&entry.session_dir);
+        // Sessions vanishing from `/session` is hard to diagnose after the
+        // fact (the audit log does not cover them), so leave a trace.
+        tracing::info!(
+            session_id = %id,
+            dir = %dir.display(),
+            "deleting session directory and index entry"
+        );
         if dir.is_dir() {
             std::fs::remove_dir_all(&dir)?;
         }
         append_session_index_deletion(&self.home_dir, id)?;
+        // A deleted session must never stay behind as the default session
+        // that the next `kk` start auto-resumes.
+        kkagent_config::clear_active_session_if_in(&self.home_dir, id);
         Ok(())
     }
 
@@ -245,6 +255,10 @@ impl SessionStore {
         }
         let work = normalize_work_dir(work_dir);
         let dir = self.session_dir_for(id, &work)?;
+        // A pre-existing directory holds real history (that is the whole point
+        // of re-indexing it), so a failed backfill must never delete it; only
+        // a directory created here may be cleaned up again.
+        let created_here = !dir.is_dir();
         std::fs::create_dir_all(&dir)?;
         let result = (|| {
             let meta = SessionMetadataService::load_or_create(&dir, id, &work)?;
@@ -258,7 +272,11 @@ impl SessionStore {
             )?;
             anyhow::Ok(Some(summary_from_meta(id, &dir, &work, meta.read())))
         })();
-        cleanup_failed_session_dir(&dir, result)
+        if created_here {
+            cleanup_failed_session_dir(&dir, result)
+        } else {
+            result
+        }
     }
 
     /// Sweep legacy `sub-*` index entries left behind by old builds that
@@ -557,6 +575,58 @@ mod tests {
         assert!(store.backfill("bf1", &work).unwrap().is_none());
         assert!(store.get("bf1").is_ok());
 
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Re-indexing an existing directory must never delete it when the index
+    /// write fails: that directory holds the session's real history.
+    #[test]
+    fn backfill_failure_keeps_preexisting_directory() {
+        let home = std::env::temp_dir().join(format!("kkagent-store-{}", uuid::Uuid::new_v4()));
+        let store = SessionStore::new(&home);
+        let work = home.join("proj");
+        std::fs::create_dir_all(&work).unwrap();
+        // A directory in place of the index file makes every append fail.
+        std::fs::create_dir_all(home.join("session_index.jsonl")).unwrap();
+
+        let existing = store.session_dir_for("keep", &work).unwrap();
+        std::fs::create_dir_all(&existing).unwrap();
+        std::fs::write(existing.join("messages.jsonl"), "{\"role\":\"user\"}\n").unwrap();
+        assert!(store.backfill("keep", &work).is_err());
+        assert!(
+            existing.join("messages.jsonl").is_file(),
+            "failed backfill deleted a pre-existing session directory"
+        );
+
+        // A directory created by the failed backfill itself is still rolled back.
+        let fresh = store.session_dir_for("fresh", &work).unwrap();
+        assert!(store.backfill("fresh", &work).is_err());
+        assert!(!fresh.exists());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Deleting a session also drops any `active-session` marker pointing at
+    /// it, so the next `kk` start cannot auto-resume a deleted session.
+    #[test]
+    fn delete_clears_active_session_markers() {
+        let home = std::env::temp_dir().join(format!("kkagent-store-{}", uuid::Uuid::new_v4()));
+        let store = SessionStore::new(&home);
+        let work = home.join("proj");
+        std::fs::create_dir_all(&work).unwrap();
+        store.create("gone", &work).unwrap();
+        store.create("kept", &work).unwrap();
+
+        let markers = home.join("active-sessions");
+        std::fs::create_dir_all(&markers).unwrap();
+        std::fs::write(home.join("active-session"), "gone").unwrap();
+        std::fs::write(markers.join("proj-a"), "gone").unwrap();
+        std::fs::write(markers.join("proj-b"), "kept").unwrap();
+
+        store.delete("gone").unwrap();
+
+        assert!(!home.join("active-session").exists());
+        assert!(!markers.join("proj-a").exists());
+        assert!(markers.join("proj-b").is_file());
         let _ = std::fs::remove_dir_all(&home);
     }
 

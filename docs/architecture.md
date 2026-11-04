@@ -17,7 +17,7 @@ TUI / prompt / ACP / HTTP+WS
  transcript DB + session journal + files
 ```
 
-`Ctrl+B` 或确认退出时写入 `~/.kkagent/active-session`；下次 `kk` 检测到存活 server 后自动 resume。无客户端且无 active turn 超过 `[server].idle_timeout_secs` 时 server 自动退出；也可用 `kkagent server stop` / `kkagent server status` 管理。
+`Ctrl+B` 或确认退出时按工作目录写入 `~/.kkagent/active-sessions/`（同时更新全局兼容标记 `~/.kkagent/active-session`）；下次在同一目录运行 `kk` 检测到存活 server 后自动 resume。已删除/丢弃的 session 不会被自动 resume，其标记在删除时清除。无客户端且无 active turn 超过 `[server].idle_timeout_secs` 时 server 自动退出；也可用 `kkagent server stop` / `kkagent server status` 管理。
 
 Agent turn 事件（含 Thinking / StatusUpdate / TurnEnd）由 server 扇出到当前所有已连接的 RPC writer；TUI detach 后 turn 继续在 server 内跑，重新 attach 后新连接会立刻收到后续事件（断线窗口内的增量不补发，完整 transcript 靠 resume/history）。`AskUserQuestion` / 工具审批 / `/btw` / compact / 排队 prompt / 子 agent 摘要 / 最近 StatusUpdate 与部分 streaming 缓冲会记在 server，由 `session.resume` 带回。
 

@@ -18,6 +18,10 @@ pub enum SessionCreateSource {
 pub enum SessionCloseReason {
     Exit,
     Archive,
+    /// The session record is being deleted or auto-discarded: its directory is
+    /// already gone, so closing must not persist anything back into it
+    /// (doing so resurrects an un-indexed ghost directory).
+    Discard,
 }
 
 pub type LifecycleHook = Arc<dyn Fn(LifecycleEvent) + Send + Sync>;

@@ -210,6 +210,9 @@ async fn serve(agent: Arc<StubAgent>, input: DuplexStream, output: DuplexStream)
             // A response to one of our reverse requests.
             if let Some(id) = frame.get("id").and_then(Value::as_i64) {
                 if let Some(tx) = lock(&pending).remove(&id) {
+                    // Record the response at the wire reader: cancellation can
+                    // wake the prompt task before it polls this channel.
+                    lock(&agent.replies).push(frame.clone());
                     let _ = tx.send(frame);
                 }
             }
@@ -301,7 +304,6 @@ async fn serve(agent: Arc<StubAgent>, input: DuplexStream, output: DuplexStream)
                     .pop_front()
                     .unwrap_or_else(|| vec![text_chunk("ok")]);
                 tokio::spawn(run_prompt(
-                    agent.clone(),
                     out.clone(),
                     pending.clone(),
                     cancel.clone(),
@@ -323,9 +325,7 @@ async fn serve(agent: Arc<StubAgent>, input: DuplexStream, output: DuplexStream)
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn run_prompt(
-    agent: Arc<StubAgent>,
     out: Out,
     pending: Pending,
     cancel: Arc<tokio::sync::Notify>,
@@ -355,11 +355,7 @@ async fn run_prompt(
                 )
                 .await;
                 tokio::select! {
-                    answer = rx => {
-                        if let Ok(frame) = answer {
-                            lock(&agent.replies).push(frame);
-                        }
-                    }
+                    _ = rx => {}
                     _ = cancel.notified() => {
                         stop_reason = "cancelled";
                         break;

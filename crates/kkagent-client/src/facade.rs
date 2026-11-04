@@ -216,8 +216,16 @@ impl KkagentClient {
     /// delete when the transcript DB or on-disk store still holds messages,
     /// so a fast exit before the transcript finished loading can no longer
     /// tombstone a session that is actually in use.
-    pub async fn discard_session_record(&self, session_id: &str) -> anyhow::Result<()> {
-        let params = serde_json::json!({"session_id": session_id});
+    ///
+    /// `reason` is only recorded in the server log, so a session that later
+    /// turns out to be missing can be traced back to the code path that
+    /// discarded it.
+    pub async fn discard_session_record(
+        &self,
+        session_id: &str,
+        reason: &str,
+    ) -> anyhow::Result<()> {
+        let params = serde_json::json!({"session_id": session_id, "reason": reason});
         self.rpc
             .call("sessions.discard", Some(params))
             .await

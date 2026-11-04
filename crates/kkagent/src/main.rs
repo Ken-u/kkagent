@@ -1247,65 +1247,108 @@ async fn run_tui(
 }
 
 fn maybe_auto_resume(resume: &mut Option<Option<String>>, server_alive: bool) {
+    maybe_auto_resume_in(
+        resume,
+        server_alive,
+        std::env::current_dir().ok().as_deref(),
+    );
+}
+
+/// [`maybe_auto_resume`] with an explicit current directory, so tests don't
+/// depend on the process cwd.
+fn maybe_auto_resume_in(
+    resume: &mut Option<Option<String>>,
+    server_alive: bool,
+    cwd: Option<&std::path::Path>,
+) {
     if resume.is_some() {
         return;
     }
-    let Some(session_id) = kkagent_config::load_active_session() else {
+    // Prefer the marker saved for this workspace so detaching from a session in
+    // another project never hides this project's default session.
+    let marker = match cwd {
+        Some(cwd) => kkagent_config::load_active_session_for_dir(cwd),
+        None => kkagent_config::load_active_session(),
+    };
+    let Some(session_id) = marker else {
         // No active-session marker at all; fall back to the most recent
         // session in the current working directory so the user always gets
         // back to where they left off in this project.
-        fallback_to_workspace_latest(resume);
+        fallback_to_workspace_latest_in(resume, cwd);
         return;
     };
     if server_alive {
-        if !session_exists(&session_id) {
-            tracing::warn!(%session_id, "Active-session marker references a non-existent session; clearing it");
-            kkagent_config::clear_active_session();
-            fallback_to_workspace_latest(resume);
+        if !session_auto_resumable(&session_id) {
+            // Missing, or archived by a delete/discard: it must not become the
+            // default session again, whatever the marker still says.
+            tracing::warn!(%session_id, "Active-session marker references a missing or discarded session; clearing it");
+            kkagent_config::clear_active_session_if(&session_id);
+            fallback_to_workspace_latest_in(resume, cwd);
             return;
         }
-        if session_resume_unavailable_here(&session_id) {
+        if session_resume_unavailable_in_cwd(&session_id, cwd) {
             // Starting fresh in another directory is expected, not an error:
             // skip the resume quietly and keep the marker so the original
             // directory can still auto-resume this session later.
             tracing::info!(%session_id, "Active session belongs to an unavailable working directory");
-            fallback_to_workspace_latest(resume);
+            fallback_to_workspace_latest_in(resume, cwd);
             return;
         }
         tracing::info!(%session_id, "Auto-resuming session from active-session");
         *resume = Some(Some(session_id));
         return;
     }
-    // Stale marker after a dead server: clear it, but still resume history from DB.
-    kkagent_config::clear_active_session();
-    if !session_exists(&session_id) {
-        tracing::warn!(%session_id, "Active-session marker references a non-existent session; starting fresh");
-        fallback_to_workspace_latest(resume);
+    if !session_auto_resumable(&session_id) {
+        kkagent_config::clear_active_session_if(&session_id);
+        tracing::warn!(%session_id, "Active-session marker references a missing or discarded session; starting fresh");
+        fallback_to_workspace_latest_in(resume, cwd);
         return;
     }
-    if session_resume_unavailable_here(&session_id) {
+    if session_resume_unavailable_in_cwd(&session_id, cwd) {
         tracing::info!(%session_id, "Active session belongs to an unavailable working directory; starting fresh");
-        fallback_to_workspace_latest(resume);
+        fallback_to_workspace_latest_in(resume, cwd);
         return;
     }
+    // Only clear the marker after confirming it belongs to this workspace.
+    // A global fallback may instead belong to a different workspace.
+    kkagent_config::clear_active_session_if(&session_id);
     eprintln!(
         "Previous standalone server is gone; in-flight tasks were lost. Restoring conversation history for session {session_id}."
     );
     *resume = Some(Some(session_id));
 }
 
-/// When the global `active-session` marker does not point to a usable session
-/// for the current working directory, fall back to the most recent non-empty
-/// session that was created in this directory. This keeps the "resume where I
-/// left off" UX working even when the user opens TUIs in multiple projects.
-fn fallback_to_workspace_latest(resume: &mut Option<Option<String>>) {
-    let Ok(cwd) = std::env::current_dir() else {
+/// Marker tests need separate homes even when the test harness runs in parallel.
+#[cfg(test)]
+fn run_in_isolated_test_process(test_name: &str) -> bool {
+    const CHILD_VAR: &str = "KKAGENT_ISOLATED_MARKER_TEST";
+    if std::env::var(CHILD_VAR).as_deref() == Ok(test_name) {
+        return false;
+    }
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", test_name, "--nocapture"])
+        .env(CHILD_VAR, test_name)
+        .status()
+        .expect("failed to run isolated marker test");
+    assert!(status.success(), "isolated test {test_name} failed");
+    true
+}
+
+/// When the `active-session` marker does not point to a usable session for the
+/// current working directory, fall back to the most recent non-empty session
+/// that was created in this directory. This keeps the "resume where I left off"
+/// UX working even when the user opens TUIs in multiple projects.
+fn fallback_to_workspace_latest_in(
+    resume: &mut Option<Option<String>>,
+    cwd: Option<&std::path::Path>,
+) {
+    let Some(cwd) = cwd else {
         return;
     };
     let Ok(db) = TranscriptDb::open_default() else {
         return;
     };
-    match db.latest_session_for_dir(&cwd) {
+    match db.latest_session_for_dir(cwd) {
         Ok(Some(session_id)) => {
             tracing::info!(%session_id, dir = %cwd.display(), "Falling back to latest workspace session");
             *resume = Some(Some(session_id));
@@ -1323,15 +1366,16 @@ fn fallback_to_workspace_latest(resume: &mut Option<Option<String>>) {
 /// the server's working-directory check. Auto-resume must stay silent, so we
 /// pre-check with the exact same rules `session.resume` applies and start a new
 /// session instead of surfacing an error to the user. Returns false whenever the
-/// check cannot be performed, leaving the normal resume path in charge.
-fn session_resume_unavailable_here(session_id: &str) -> bool {
-    match std::env::current_dir() {
-        Ok(cwd) => session_resume_unavailable_in(session_id, &cwd),
-        Err(_) => false,
+/// check cannot be performed (including an unknown current directory), leaving
+/// the normal resume path in charge.
+fn session_resume_unavailable_in_cwd(session_id: &str, cwd: Option<&std::path::Path>) -> bool {
+    match cwd {
+        Some(cwd) => session_resume_unavailable_in(session_id, cwd),
+        None => false,
     }
 }
 
-/// Same check as [`session_resume_unavailable_here`] with an explicit current
+/// Same check as [`session_resume_unavailable_in_cwd`] with a known current
 /// directory, so tests don't depend on the process cwd.
 fn session_resume_unavailable_in(session_id: &str, cwd: &std::path::Path) -> bool {
     if !is_safe_session_id(session_id) {
@@ -1353,18 +1397,26 @@ fn session_resume_unavailable_in(session_id: &str, cwd: &std::path::Path) -> boo
     resolve_resume_working_dir(&stored_working_dir, Some(cwd)).is_err()
 }
 
-/// Check whether a session still has a retrievable record (DB or disk store).
-fn session_exists(session_id: &str) -> bool {
-    if is_safe_session_id(session_id) {
-        if let Ok(Some(_)) = TranscriptDb::open_default().and_then(|db| db.get_session(session_id))
-        {
-            return true;
-        }
-        if SessionStore::open_default().get(session_id).is_ok() {
-            return true;
-        }
+/// Whether the session an `active-session` marker points at may be
+/// auto-resumed: it must still have a retrievable record (DB or disk store) and
+/// must not be archived.
+///
+/// Archived is what a delete/discard leaves behind in the transcript DB (the
+/// row is soft-deleted, not purged). Auto-resuming such a session used to
+/// revive a discarded blank session whose index entry was already tombstoned,
+/// producing a session that kept working but never showed up in `/session`.
+fn session_auto_resumable(session_id: &str) -> bool {
+    if !is_safe_session_id(session_id) {
+        return false;
     }
-    false
+    if let Ok(Some(record)) = TranscriptDb::open_default().and_then(|db| db.get_session(session_id))
+    {
+        return !record.is_archived;
+    }
+    SessionStore::open_default()
+        .get(session_id)
+        .map(|summary| !summary.archived)
+        .unwrap_or(false)
 }
 
 fn resolve_listen_path(listen: Option<String>) -> PathBuf {
@@ -3288,7 +3340,12 @@ async fn ensure_session_loaded(state: &Arc<ServerState>, session_id: &str) -> Re
 
 /// Shared teardown for `sessions.delete` / `sessions.discard`: archive the
 /// transcript record, evict in-memory runtime state and close services.
+///
+/// Services are closed with [`SessionCloseReason::Discard`]: the session
+/// directory is already gone, so closing must not write anything back into it,
+/// and no `active-session` marker may keep pointing at the removed session.
 async fn remove_session_runtime(state: &Arc<ServerState>, session_id: &str) {
+    kkagent_config::clear_active_session_if(session_id);
     {
         let db = state.transcript.lock().await;
         let _ = db.archive_session(session_id);
@@ -3318,7 +3375,7 @@ async fn remove_session_runtime(state: &Arc<ServerState>, session_id: &str) {
     // The external ACP agents of this session (one process each) stop with it.
     state.acp_backends.close_session(session_id).await;
     if let Some(session) = removed {
-        session.services.on_close(SessionCloseReason::Exit).await;
+        session.services.on_close(SessionCloseReason::Discard).await;
     }
 }
 
@@ -9368,11 +9425,18 @@ async fn handle_rpc_call(
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| (-32602, "Missing session_id".into()))?
                 .to_string();
+            let reason = params
+                .as_ref()
+                .and_then(|p| p.get("reason"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("unspecified")
+                .to_string();
             let _turn_permit = state
                 .turn_locks
                 .try_acquire(&session_id)
                 .await
                 .map_err(|message| (-32001, message))?;
+            tracing::info!(%session_id, %reason, "sessions.delete: deleting session");
             SessionStore::open_default()
                 .delete(&session_id)
                 .map_err(|e| (-32000, e.to_string()))?;
@@ -9394,6 +9458,12 @@ async fn handle_rpc_call(
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| (-32602, "Missing session_id".into()))?
                 .to_string();
+            let reason = params
+                .as_ref()
+                .and_then(|p| p.get("reason"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("unspecified")
+                .to_string();
             let _turn_permit = state
                 .turn_locks
                 .try_acquire(&session_id)
@@ -9410,6 +9480,7 @@ async fn handle_rpc_call(
                 // Nothing on disk nor in the DB: treat as already discarded
                 // so repeated auto-discards (e.g. resume race retries) stay
                 // idempotent instead of surfacing "session not found".
+                kkagent_config::clear_active_session_if(&session_id);
                 drop(_turn_permit);
                 state.turn_locks.remove(&session_id).await;
                 return Ok(serde_json::json!({
@@ -9425,6 +9496,7 @@ async fn handle_rpc_call(
                     .len()
             };
             if db_messages > 0 {
+                tracing::warn!(%session_id, %reason, db_messages, "sessions.discard: refused, transcript has messages");
                 drop(_turn_permit);
                 return Err((
                     -32000,
@@ -9437,6 +9509,7 @@ async fn handle_rpc_call(
                 let messages_path = Path::new(&summary.session_dir).join("messages.jsonl");
                 if let Ok(text) = std::fs::read_to_string(&messages_path) {
                     if text.lines().any(|line| !line.trim().is_empty()) {
+                        tracing::warn!(%session_id, %reason, "sessions.discard: refused, on-disk transcript is non-empty");
                         drop(_turn_permit);
                         return Err((
                             -32000,
@@ -9447,6 +9520,12 @@ async fn handle_rpc_call(
                     }
                 }
             }
+            tracing::info!(
+                %session_id,
+                %reason,
+                indexed = store_entry.is_some(),
+                "sessions.discard: discarding empty session"
+            );
             if store_entry.is_some() {
                 store
                     .delete(&session_id)
@@ -9886,12 +9965,36 @@ async fn handle_rpc_call(
                 }
                 return Ok(payload);
             }
+            // `Session::resume` re-indexes a session directory that lost its
+            // index entry; remember whether that is what is about to happen.
+            let was_indexed = SessionStore::open_default().get(&session_id).is_ok();
             let mut session = Session::resume(
                 session_id.clone(),
                 resumed_working_dir.clone(),
                 perm_mode,
                 resumed_model,
             );
+            if record.is_archived && !was_indexed {
+                // Soft-deleted (archived in the DB, tombstoned in the index) and
+                // now explicitly resumed: restore it as a normal session instead
+                // of leaving a working-but-invisible one behind.
+                let restored = {
+                    let db = state.transcript.lock().await;
+                    db.set_archived(&session_id, false)
+                };
+                let _ = session.services.metadata.set_archived(false);
+                match restored {
+                    Ok(()) => tracing::warn!(
+                        %session_id,
+                        "session.resume: restored a discarded session record"
+                    ),
+                    Err(error) => tracing::warn!(
+                        %session_id,
+                        %error,
+                        "session.resume: failed to restore a discarded session record"
+                    ),
+                }
+            }
             session.set_fallback_model(SessionFallbackModel::from_persisted(
                 record.fallback_model.as_deref(),
             ));
@@ -13076,6 +13179,113 @@ mod http_path_tests {
         std::fs::remove_dir_all(other_dir).unwrap();
     }
 
+    fn auto_resume_test_session(db: &TranscriptDb, dir: &std::path::Path, tag: &str) -> String {
+        let session_id = format!("auto-{tag}-{}", uuid::Uuid::new_v4().simple());
+        db.create_session(&session_id, "unknown", dir.to_str().unwrap())
+            .unwrap();
+        db.append_message(
+            &session_id,
+            "user",
+            r#"[{"type":"text","text":"hello"}]"#,
+            None,
+        )
+        .unwrap();
+        session_id
+    }
+
+    /// Regression for sessions "vanishing" after a detach: the default session
+    /// must be per workspace, and a discarded (archived) session must never be
+    /// auto-resumed again just because a marker still names it.
+    #[test]
+    fn auto_resume_is_per_workspace_and_skips_discarded_sessions() {
+        if run_in_isolated_test_process(
+            "http_path_tests::auto_resume_is_per_workspace_and_skips_discarded_sessions",
+        ) {
+            return;
+        }
+        let dir_a = std::env::temp_dir().join(format!("kkagent-auto-a-{}", uuid::Uuid::new_v4()));
+        let dir_b = std::env::temp_dir().join(format!("kkagent-auto-b-{}", uuid::Uuid::new_v4()));
+        let dir_c = std::env::temp_dir().join(format!("kkagent-auto-c-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir_a).unwrap();
+        std::fs::create_dir_all(&dir_b).unwrap();
+        std::fs::create_dir_all(&dir_c).unwrap();
+        let db = TranscriptDb::open_default().unwrap();
+        let sid_a = auto_resume_test_session(&db, &dir_a, "a");
+        let sid_b = auto_resume_test_session(&db, &dir_b, "b");
+
+        // Detach in A, then detach in B (which overwrites the legacy global marker).
+        kkagent_config::save_active_session_for_dir(&dir_a, &sid_a).unwrap();
+        kkagent_config::save_active_session_for_dir(&dir_b, &sid_b).unwrap();
+
+        // An unrelated workspace falling back to B's global marker must not
+        // remove B's own marker when the server is unavailable.
+        let mut resume = None;
+        maybe_auto_resume_in(&mut resume, false, Some(&dir_c));
+        assert_eq!(resume, None);
+        assert_eq!(
+            kkagent_config::load_active_session_for_dir(&dir_b).as_deref(),
+            Some(sid_b.as_str())
+        );
+        assert_eq!(
+            kkagent_config::load_active_session().as_deref(),
+            Some(sid_b.as_str())
+        );
+
+        // Back in A, A's own default session still wins.
+        let mut resume = None;
+        maybe_auto_resume_in(&mut resume, true, Some(&dir_a));
+        assert_eq!(resume, Some(Some(sid_a.clone())));
+
+        // A is discarded (soft-deleted: archived in the DB). The marker still
+        // names it, but it must not be revived …
+        db.archive_session(&sid_a).unwrap();
+        assert!(!session_auto_resumable(&sid_a));
+        let mut resume = None;
+        maybe_auto_resume_in(&mut resume, true, Some(&dir_a));
+        assert_eq!(resume, None, "a discarded session was auto-resumed");
+        // … and the dangling marker is gone, so it cannot come back later.
+        assert_ne!(
+            kkagent_config::load_active_session_for_dir(&dir_a).as_deref(),
+            Some(sid_a.as_str())
+        );
+
+        // B's default session was never touched, and A's directory does not
+        // hijack it through the legacy global marker.
+        let mut resume = None;
+        maybe_auto_resume_in(&mut resume, true, Some(&dir_b));
+        assert_eq!(resume, Some(Some(sid_b.clone())));
+        let mut resume = None;
+        maybe_auto_resume_in(&mut resume, true, Some(&dir_a));
+        assert_eq!(resume, None);
+
+        // An explicit `--resume` is never overridden.
+        let mut resume = Some(Some("explicit".to_string()));
+        maybe_auto_resume_in(&mut resume, true, Some(&dir_b));
+        assert_eq!(resume, Some(Some("explicit".to_string())));
+
+        kkagent_config::clear_active_session_if(&sid_a);
+        kkagent_config::clear_active_session_if(&sid_b);
+        std::fs::remove_dir_all(dir_a).unwrap();
+        std::fs::remove_dir_all(dir_b).unwrap();
+        std::fs::remove_dir_all(dir_c).unwrap();
+    }
+
+    #[test]
+    fn session_auto_resumable_requires_a_live_record() {
+        let dir = std::env::temp_dir().join(format!("kkagent-auto-live-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = TranscriptDb::open_default().unwrap();
+        let sid = auto_resume_test_session(&db, &dir, "live");
+
+        assert!(session_auto_resumable(&sid));
+        assert!(!session_auto_resumable("auto-never-existed"));
+        assert!(!session_auto_resumable("../not-a-safe-id"));
+        db.archive_session(&sid).unwrap();
+        assert!(!session_auto_resumable(&sid));
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn transcript_policy_fails_closed_unless_degraded_mode_is_explicit() {
         let directory =
@@ -14921,6 +15131,139 @@ mod discard_rpc_tests {
         .await
         .unwrap();
         assert_eq!(result["idempotent"], serde_json::json!(true));
+    }
+
+    /// Regression: closing a live session while discarding it used to flush its
+    /// logs back into the directory that had just been removed. The resurrected,
+    /// un-indexed directory was then adopted by the next auto-resume and the
+    /// session silently vanished from `/session`.
+    #[tokio::test]
+    async fn discard_of_live_session_does_not_resurrect_directory_or_marker() {
+        if run_in_isolated_test_process(
+            "discard_rpc_tests::discard_of_live_session_does_not_resurrect_directory_or_marker",
+        ) {
+            return;
+        }
+        let state = test_server_state().await;
+        let sid = format!("discard-live-{}", uuid::Uuid::new_v4().simple());
+        let work = std::env::temp_dir().join(format!("kkagent-discard-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&work).unwrap();
+        let session = Session::new(
+            sid.clone(),
+            work.clone(),
+            PermissionMode::Manual,
+            "test-model".into(),
+        );
+        let session_dir = session.services.context.session_dir.clone();
+        assert!(session_dir.is_dir());
+        kkagent_config::save_active_session_for_dir(&work, &sid).unwrap();
+        state.sessions.lock().await.insert(sid.clone(), session);
+
+        let result = handle_rpc_call(
+            state.clone(),
+            "sessions.discard",
+            Some(serde_json::json!({ "session_id": sid, "reason": "test" })),
+            rpc_event_sink(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result["discarded"], serde_json::json!(true));
+
+        assert!(
+            !session_dir.exists(),
+            "closing a discarded session re-created its directory"
+        );
+        assert!(SessionStore::open_default().get(&sid).is_err());
+        assert_ne!(
+            kkagent_config::load_active_session_for_dir(&work).as_deref(),
+            Some(sid.as_str()),
+            "the active-session marker still names the discarded session"
+        );
+        assert!(state.sessions.lock().await.get(&sid).is_none());
+
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// `sessions.delete` must also forget the session's `active-session` marker.
+    #[tokio::test]
+    async fn delete_clears_active_session_marker() {
+        if run_in_isolated_test_process("discard_rpc_tests::delete_clears_active_session_marker") {
+            return;
+        }
+        let state = test_server_state().await;
+        let sid = format!("delete-marker-{}", uuid::Uuid::new_v4().simple());
+        let work = std::env::temp_dir().join(format!("kkagent-delete-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&work).unwrap();
+        let summary = SessionStore::open_default().create(&sid, &work).unwrap();
+        kkagent_config::save_active_session_for_dir(&work, &sid).unwrap();
+
+        handle_rpc_call(
+            state.clone(),
+            "sessions.delete",
+            Some(serde_json::json!({ "session_id": sid, "reason": "test" })),
+            rpc_event_sink(),
+        )
+        .await
+        .unwrap();
+
+        assert!(!Path::new(&summary.session_dir).exists());
+        assert_ne!(
+            kkagent_config::load_active_session_for_dir(&work).as_deref(),
+            Some(sid.as_str())
+        );
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// Explicitly resuming a soft-deleted session (archived in the transcript DB,
+    /// tombstoned in the index, directory left behind) restores it so it shows up
+    /// in `/session` again.
+    #[tokio::test]
+    async fn resume_restores_soft_deleted_session() {
+        let state = test_server_state().await;
+        let sid = format!("resume-restore-{}", uuid::Uuid::new_v4().simple());
+        let work = std::env::temp_dir().join(format!("kkagent-restore-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&work).unwrap();
+        {
+            let db = state.transcript.lock().await;
+            db.create_session(&sid, "test-model", work.to_str().unwrap())
+                .unwrap();
+            db.append_message(&sid, "user", r#"[{"type":"text","text":"hi"}]"#, None)
+                .unwrap();
+            db.archive_session(&sid).unwrap();
+        }
+        // The zombie state: index tombstone plus a directory a late close
+        // handler re-created.
+        let store = SessionStore::open_default();
+        let summary = store.create(&sid, &work).unwrap();
+        store.delete(&sid).unwrap();
+        let dir = PathBuf::from(&summary.session_dir);
+        std::fs::create_dir_all(dir.join("logs")).unwrap();
+        assert!(store.get(&sid).is_err());
+
+        handle_rpc_call(
+            state.clone(),
+            "session.resume",
+            Some(serde_json::json!({ "session_id": sid })),
+            rpc_event_sink(),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            store.get(&sid).is_ok(),
+            "resumed session was not re-indexed"
+        );
+        let record = state
+            .transcript
+            .lock()
+            .await
+            .get_session(&sid)
+            .unwrap()
+            .unwrap();
+        assert!(!record.is_archived, "resumed session is still archived");
+
+        let _ = store.delete(&sid);
+        let _ = std::fs::remove_dir_all(&work);
     }
 }
 

@@ -282,7 +282,7 @@ idle_timeout_secs = 1800
 standalone = true
 ```
 
-默认 `kk`（无参数）会连接 `~/.kkagent/server.sock` 上的独立 server；不存在时自动后台启动。TUI 退出不会杀死该 server。`~/.kkagent/active-session` 记录最近后台化的 session，下次启动自动 resume。
+默认 `kk`（无参数）会连接 `~/.kkagent/server.sock` 上的独立 server；不存在时自动后台启动。TUI 退出不会杀死该 server。`~/.kkagent/active-sessions/` 按工作目录各存一份后台化的 session id（`~/.kkagent/active-session` 保留为最近一次后台化的全局兼容标记），下次在该目录启动时自动 resume；已被删除/丢弃（归档）的 session 不会被自动 resume，对应标记也会随删除一并清除。
 
 ## 系统隔离
 

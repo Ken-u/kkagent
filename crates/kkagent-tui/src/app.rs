@@ -2073,7 +2073,7 @@ impl TuiApp {
                 let _ = self.client.interrupt_with_source(id, "tui-exit").await;
             }
             if empty {
-                let _ = self.discard_session_record(id).await;
+                let _ = self.discard_session_record(id, "tui-exit-empty").await;
             }
         }
 
@@ -2673,7 +2673,7 @@ impl TuiApp {
                                         self.bind_config_default_model();
                                         // Clear the stale marker so the next
                                         // launch doesn't repeat this failure.
-                                        kkagent_config::clear_active_session();
+                                        kkagent_config::clear_active_session_if(&query);
                                         self.system_message(format!(
                                             "Previous session could not be resumed ({err}). Started a new session."
                                         ));
@@ -3148,7 +3148,11 @@ impl TuiApp {
 
     fn persist_active_session_marker(&self) {
         if let Some(sid) = self.state.session_id.as_deref() {
-            if let Err(error) = kkagent_config::save_active_session(sid) {
+            // Scoped to this workspace so detaching here never hides another
+            // project's default session (and vice versa).
+            if let Err(error) =
+                kkagent_config::save_active_session_for_dir(&self.state.working_dir, sid)
+            {
                 tracing::warn!(%error, "failed to save active-session");
             }
         }
@@ -9638,7 +9642,10 @@ impl TuiApp {
         if let Some((cached_id, cached)) = self.take_cached_session_runtime(query) {
             self.activate_cached_session(&cached_id, cached, started_at);
             if let Some(discard_id) = discard_leaving_id {
-                if let Err(error) = self.discard_session_record(&discard_id).await {
+                if let Err(error) = self
+                    .discard_session_record(&discard_id, "tui-switch-session-empty")
+                    .await
+                {
                     self.system_message(format!(
                         "Switched sessions, but could not discard the empty session: {error}"
                     ));
@@ -10349,8 +10356,14 @@ impl TuiApp {
         self.sync_active_session_status();
         // Turn may have finished while detached; drain restored queue immediately.
         self.flush_prompt_queue_if_idle();
-        if let Some(discard_id) = ctx.and_then(|switch| switch.discard_leaving_id) {
-            if let Err(error) = self.discard_session_record(&discard_id).await {
+        if let Some(discard_id) = ctx
+            .and_then(|switch| switch.discard_leaving_id)
+            .filter(|discard_id| discard_id != &sid)
+        {
+            if let Err(error) = self
+                .discard_session_record(&discard_id, "tui-switch-session-empty")
+                .await
+            {
                 self.system_message(format!(
                     "Switched sessions, but could not discard the empty session: {error}"
                 ));
@@ -10436,8 +10449,18 @@ impl TuiApp {
         }
     }
 
-    async fn discard_session_record(&mut self, session_id: &str) -> anyhow::Result<()> {
-        self.client.discard_session_record(session_id).await?;
+    async fn discard_session_record(
+        &mut self,
+        session_id: &str,
+        reason: &str,
+    ) -> anyhow::Result<()> {
+        self.client
+            .discard_session_record(session_id, reason)
+            .await?;
+        // The marker lives in the local config dir, which a remote server's own
+        // cleanup cannot reach. A discarded session must never be the default
+        // session the next `kk` start tries to auto-resume.
+        kkagent_config::clear_active_session_if(session_id);
         self.state.tab_strip.tabs.retain(|t| t.id != session_id);
         self.state
             .workspace_sessions
@@ -11221,9 +11244,10 @@ impl TuiApp {
                 .await;
         }
 
-        let params = serde_json::json!({"session_id": deleted_id});
+        let params = serde_json::json!({"session_id": deleted_id, "reason": "tui-picker-delete"});
         match self.client.rpc_call("sessions.delete", Some(params)).await {
             Ok(_) => {
+                kkagent_config::clear_active_session_if(&deleted_id);
                 self.state.open_session_group.retain(|id| id != &deleted_id);
                 self.state.tab_strip.tabs.retain(|t| t.id != deleted_id);
                 // Tombstone the deleted tab against stale `sessions.list`

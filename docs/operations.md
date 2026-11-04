@@ -11,7 +11,8 @@
 | `~/.kkagent/credentials/kimi-code.json` | Kimi OAuth 凭据。 |
 | `~/.kkagent/kkagent.log` | TUI 文件日志。 |
 | `~/.kkagent/server.sock` | Unix socket，或 Windows 本地 endpoint 文件。 |
-| `~/.kkagent/active-session` | 最近一次 TUI 后台化时保存的 session id，供下次自动 resume。 |
+| `~/.kkagent/active-sessions/` | 每个工作目录一份 TUI 后台化时保存的 session id，供在该目录下次自动 resume；删除/丢弃 session 时对应标记同步清除。 |
+| `~/.kkagent/active-session` | 最近一次 TUI 后台化时保存的 session id（全局兼容标记，无按目录标记时作为回退）。 |
 | `~/.kkagent/config.toml.trust.toml` | TUI 管理的 workspace、外部 Git 元数据和只读全局 Git 配置授权；自定义 `--config` 使用同目录同名 sidecar。 |
 | `~/.kkagent/skills/`、`plugins/`、`hooks.json` | 用户扩展。 |
 | `~/.kkagent/telemetry/events.jsonl` | 本地遥测事件。 |

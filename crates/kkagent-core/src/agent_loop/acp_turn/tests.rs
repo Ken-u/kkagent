@@ -815,8 +815,20 @@ async fn cancelling_an_approval_card_stops_the_turn() {
         .run(Answers::default().approvals(|request| decide(request, ApprovalDecision::Cancelled)))
         .await;
 
-    let reply = &rig.agent.reply_values()[0];
-    assert_eq!(outcome(reply)["outcome"], "cancelled");
+    // The prompt can finish on session/cancel while the reverse-request
+    // response is still in transit to the stub's reader.
+    let replies = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let replies = rig.agent.reply_values();
+            if !replies.is_empty() {
+                break replies;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("approval cancellation response was not received");
+    assert_eq!(outcome(&replies[0])["outcome"], "cancelled");
     assert_eq!(rig.agent.cancels.load(Ordering::SeqCst), 1);
     assert!(errors(&events).iter().any(|m| m == "Interrupted"));
     assert!(has_event(&events, |e| matches!(
