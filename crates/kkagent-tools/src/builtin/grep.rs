@@ -756,9 +756,21 @@ mod tests {
         .await;
         assert!(arrays.content.contains("one.rs") && arrays.content.contains("four.rs"));
         assert!(!arrays.content.contains("three.rs"));
-        // A path outside the workspace is still refused.
-        let outside = grep(&dir, json!({"pattern": "x", "paths": ["a", "/etc"]})).await;
+        // With `path_guard_mode = strict`, every entry of `paths` is checked:
+        // one outside the workspace refuses the whole search. (The default
+        // `warn` mode allows it, so the guard has to be switched on here.)
+        let mut strict = context(&dir);
+        strict.tools_config.path_guard_mode = "strict".into();
+        let outside = GrepTool
+            .execute(json!({"pattern": "x", "paths": ["a", "/etc"]}), &strict)
+            .await
+            .unwrap();
         assert!(outside.is_error, "{}", outside.content);
+        assert!(
+            outside.content.contains("outside the workspace"),
+            "{}",
+            outside.content
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
