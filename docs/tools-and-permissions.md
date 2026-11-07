@@ -71,6 +71,23 @@ ID 是 12 位随机 hex（如 `a4f2c1e93b7d`），只在读取结果里出现；
 
 提示词引导模型最多保持一项 `in_progress`，先处理当前任务及必要依赖，进入后续任务时再展开细节。多项同时进行时，工具保留最近设为进行中的一项，其余退回 `pending` 并在结果中说明。恢复或压缩后如果缺少当前任务状态，模型应读取已保存清单。以上是执行引导，不能保证模型的实际思考范围。
 
+## Grep
+
+`Grep` 基于本机 `rg`，覆盖日常 `rg` / `grep -rn` 用法，不必再绕道 `Bash`：
+
+| 参数 | 对应 rg 选项 |
+|---|---|
+| `pattern`、`fixed_strings`、`word`、`case_insensitive`、`multiline` | 正则；`-F`；`-w`；`-i`；`-U` |
+| `invert_match`、`only_matching`、`max_per_file` | `-v`；`-o`；`-m N` |
+| `output_mode`：`content` / `files_with_matches`（默认）/ `count_matches` | 匹配行；`-l`；`-c`（结果头部给出总数和文件数） |
+| `context` / `context_before` / `context_after` | `-C` / `-B` / `-A` |
+| `path`、`paths[]` | 一个或多个搜索目标，逐个经过工作区路径守卫 |
+| `glob`、`globs[]`、`type` | `--glob`（前缀 `!` 表示排除）；`-t` |
+| `hidden`、`include_ignored` | `--hidden`（仍排除 `.git`）；`--no-ignore` |
+| `head_limit`（默认 200）、`offset` | 结果分页 |
+
+`pattern` 总是以 `-e` 传给 `rg`，以 `-` 开头的模式（如 `--no-verify`）不会被当成选项。`glob` / `path` 传数组、`paths` 传字符串会自动转换成对应的复数形式。
+
 ## 图片输入
 
 模型配置含 `image_in`（也兼容 `vision`、`image`、`multimodal`）时启用完整图片输入：
