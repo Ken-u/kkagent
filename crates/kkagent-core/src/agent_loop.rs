@@ -3785,6 +3785,7 @@ async fn execute_tool_parallel(request: ParallelToolRequest) -> ToolOutput {
         None => return ToolOutput::error(format!("Unknown tool: {}", name)),
     };
 
+    let input = tool.normalize_input(input);
     if let Err(e) =
         kkagent_tools::args_validator::validate_against_schema(&tool.parameters_schema(), &input)
     {

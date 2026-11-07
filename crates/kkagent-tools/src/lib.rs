@@ -77,6 +77,12 @@ pub trait Tool: Send + Sync {
     fn disclosure(&self) -> ToolDisclosure {
         ToolDisclosure::Inline
     }
+    /// Repair common model slips (synonym enum values, `null` ids, numeric ids…)
+    /// before the arguments are validated against `parameters_schema`.
+    /// Must be idempotent; the default leaves the input untouched.
+    fn normalize_input(&self, input: Value) -> Value {
+        input
+    }
     /// Per-call resource accesses (defaults to static inference).
     fn accesses(&self, input: &Value, working_dir: &Path) -> ToolAccesses {
         infer_accesses(self.name(), input, working_dir)

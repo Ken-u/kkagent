@@ -36,6 +36,134 @@ fn pending_status() -> String {
     "pending".into()
 }
 
+/// Canonical status for a model-written spelling (`completed`, `in-progress`,
+/// `todo`, …), or `None` when it is not recognizable.
+fn canonical_status(raw: &str) -> Option<&'static str> {
+    let key = raw.trim().to_ascii_lowercase().replace(['-', ' '], "_");
+    match key.as_str() {
+        "pending" | "todo" | "to_do" | "open" | "not_started" | "queued" | "waiting" | "new"
+        | "planned" => Some("pending"),
+        "in_progress" | "inprogress" | "active" | "started" | "doing" | "running" | "working"
+        | "current" | "wip" | "ongoing" => Some("in_progress"),
+        "done" | "completed" | "complete" | "finished" | "success" | "succeeded" | "closed"
+        | "resolved" => Some("done"),
+        "cancelled" | "canceled" | "skipped" | "dropped" | "abandoned" | "obsolete" => {
+            Some("cancelled")
+        }
+        // `completed_b48c39`: a status with a stray suffix still says "completed".
+        k if k.starts_with("completed") || k.starts_with("done") => Some("done"),
+        _ => None,
+    }
+}
+
+/// Comparison key for titles: case, spacing and punctuation never matter.
+fn title_key(title: &str) -> String {
+    title
+        .chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+/// `3`, `t3`, `#3`, `task-3` → 3. Models guess ordinal ids because ids are
+/// opaque tokens that write results do not echo.
+fn ordinal_id(id: &str) -> Option<usize> {
+    let digits = id.trim_start_matches(|c: char| {
+        c.is_ascii_alphabetic() || matches!(c, '#' | '-' | '_' | ' ' | ':')
+    });
+    if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok().filter(|n| *n >= 1)
+}
+
+fn unfinished(item: &TodoItem) -> bool {
+    !matches!(item.status.as_str(), "done" | "cancelled")
+}
+
+/// The task a model-written `title` refers to: exact text first, then the same
+/// text modulo case/spacing/punctuation, then a unique containment (paraphrased
+/// or truncated titles). Ties prefer unfinished tasks. `skip` excludes tasks
+/// that are already spoken for.
+fn find_by_title<'a>(
+    todos: &'a [TodoItem],
+    title: &str,
+    skip: &dyn Fn(&TodoItem) -> bool,
+) -> Option<&'a TodoItem> {
+    let candidates: Vec<&TodoItem> = todos.iter().filter(|t| !skip(t)).collect();
+    let first = |matches: &dyn Fn(&TodoItem) -> bool| {
+        let found: Vec<&TodoItem> = candidates.iter().copied().filter(|t| matches(t)).collect();
+        found
+            .iter()
+            .copied()
+            .find(|t| unfinished(t))
+            .or_else(|| found.first().copied())
+    };
+    if let Some(hit) = first(&|t| t.title == title) {
+        return Some(hit);
+    }
+    let key = title_key(title);
+    if key.is_empty() {
+        return None;
+    }
+    if let Some(hit) = first(&|t| title_key(&t.title) == key) {
+        return Some(hit);
+    }
+    let mut loose = candidates.iter().copied().filter(|t| {
+        let other = title_key(&t.title);
+        other.chars().count().min(key.chars().count()) >= 8
+            && (other.contains(&key) || key.contains(&other))
+    });
+    match (loose.next(), loose.next()) {
+        (Some(hit), None) => Some(hit),
+        _ => None,
+    }
+}
+
+/// A call's resulting list plus short notes for the model about anything the
+/// tool adjusted on its behalf.
+struct Applied {
+    items: Vec<TodoItem>,
+    notes: Vec<String>,
+}
+
+fn clip(title: &str) -> String {
+    let mut out: String = title.chars().take(60).collect();
+    if title.chars().count() > 60 {
+        out.push('…');
+    }
+    out
+}
+
+/// At most one task is in_progress. `preferred` (the one this call just
+/// started) wins; otherwise the last in list order does.
+fn enforce_single_in_progress(
+    items: &mut [TodoItem],
+    preferred: Option<&str>,
+    notes: &mut Vec<String>,
+) {
+    let active: Vec<usize> = (0..items.len())
+        .filter(|i| items[*i].status == "in_progress")
+        .collect();
+    if active.len() < 2 {
+        return;
+    }
+    let keep = preferred
+        .and_then(|id| active.iter().copied().find(|i| items[*i].id == id))
+        .unwrap_or(*active.last().unwrap());
+    let mut demoted = 0;
+    for i in active {
+        if i != keep {
+            items[i].status = "pending".into();
+            demoted += 1;
+        }
+    }
+    notes.push(format!(
+        "Only one task can be in_progress: kept \"{}\", moved {demoted} other(s) back to pending.",
+        clip(&items[keep].title)
+    ));
+}
+
 /// 12 hex chars: unguessable (a model cannot fabricate an id that hits a real
 /// task, so mistakes fail loudly instead of editing the wrong entry), but far
 /// cheaper in tokens than a full UUID.
@@ -90,13 +218,9 @@ impl TodoListTool {
     }
 
     fn parse_status(raw: &str) -> Result<&'static str, String> {
-        match raw {
-            "pending" => Ok("pending"),
-            "completed" | "done" => Ok("done"),
-            "in_progress" | "in-progress" => Ok("in_progress"),
-            "cancelled" | "canceled" => Ok("cancelled"),
-            _ => Err(format!("Unknown todo status: {raw}")),
-        }
+        canonical_status(raw).ok_or_else(|| {
+            format!("Unknown todo status: {raw}. Use pending, in_progress, done or cancelled.")
+        })
     }
 
     fn display_status(status: &str) -> &'static str {
@@ -142,7 +266,7 @@ impl TodoListTool {
         format!("Current todo list:\n{}", lines.join("\n"))
     }
 
-    fn render_update(todos: &[TodoItem]) -> String {
+    fn render_update(todos: &[TodoItem], notes: &[String]) -> String {
         if todos.is_empty() {
             return "Todo list cleared.".into();
         }
@@ -169,10 +293,77 @@ Read TodoList for IDs before acting on a specific task; defer details of the oth
             (0, _) => "No unfinished todo items remain. Check the result against the user's request before concluding.".into(),
             _ => "Multiple tasks are in_progress. Choose one current task and return the others to pending; only expand the current task and its necessary dependencies.".into(),
         };
+        let notes: String = notes.iter().map(|n| format!("{n}\n")).collect();
         format!(
-            "Todo list updated: {} total, {completed} done, {active_count} in_progress, {pending} pending, {cancelled} cancelled.\n{focus}\nCall TodoList with no arguments to read the full list when needed.",
+            "Todo list updated: {} total, {completed} done, {active_count} in_progress, {pending} pending, {cancelled} cancelled.\n{notes}{focus}\nCall TodoList with no arguments to read the full list when needed.",
             todos.len()
         )
+    }
+
+    /// Repair one `todos` / `updates` / `add` entry in place (see
+    /// [`Tool::normalize_input`]). `seen` tracks ids already used by `todos`.
+    fn normalize_item(
+        kind: &str,
+        item: &mut Value,
+        todos: &[TodoItem],
+        seen: &mut HashSet<String>,
+    ) {
+        if let Value::String(title) = item {
+            if kind != "updates" {
+                *item = json!({ "title": title.clone() });
+            }
+        }
+        let Some(obj) = item.as_object_mut() else {
+            return;
+        };
+        for alias in ["content", "text", "task", "name"] {
+            if let Some(value) = obj.remove(alias) {
+                obj.entry("title").or_insert(value);
+            }
+        }
+        if obj.get("title").is_some_and(Value::is_null) {
+            obj.remove("title");
+        }
+        let id = match obj.remove("id") {
+            Some(Value::String(id)) => id.trim().to_string(),
+            Some(Value::Number(id)) => id.to_string(),
+            _ => String::new(),
+        };
+        if !id.is_empty() && kind != "add" {
+            let known = todos.iter().any(|t| t.id == id);
+            if known {
+                // A full replacement names each task once.
+                if kind != "todos" || seen.insert(id.clone()) {
+                    obj.insert("id".into(), Value::String(id));
+                }
+            } else if kind == "updates" {
+                let ordinal = ordinal_id(&id).filter(|n| *n <= todos.len());
+                if let Some(n) = ordinal {
+                    // `{"id": "3"}` means the third task; its title is the
+                    // selector, not a rename.
+                    obj.insert("id".into(), Value::String(todos[n - 1].id.clone()));
+                    obj.remove("title");
+                } else if !obj.contains_key("title") {
+                    // Nothing else identifies the task: let the caller report it.
+                    obj.insert("id".into(), Value::String(id));
+                }
+            }
+        }
+        match obj.get("status") {
+            Some(Value::String(status)) => {
+                if let Some(canonical) = canonical_status(status) {
+                    obj.insert("status".into(), Value::String(canonical.into()));
+                }
+            }
+            Some(_) => {
+                obj.remove("status");
+            }
+            None => {}
+        }
+        if kind == "todos" && !obj.contains_key("status") {
+            obj.insert("status".into(), Value::String("pending".into()));
+        }
+        obj.retain(|key, _| matches!(key.as_str(), "id" | "title" | "status"));
     }
 
     fn checked_title(title: &str) -> Result<String, String> {
@@ -183,128 +374,208 @@ Read TodoList for IDs before acting on a specific task; defer details of the oth
         Ok(title.into())
     }
 
-    fn replace(todos: &[TodoItem], value: &Value) -> Result<Vec<TodoItem>, String> {
+    /// `todos`: create or replace the whole list. Existing tasks keep their ids
+    /// (named explicitly, else matched by title); unknown ids are ignored.
+    fn replace(todos: &[TodoItem], value: &Value) -> Result<Applied, String> {
         let items: Vec<TodoWrite> =
             serde_json::from_value(value.clone()).map_err(|e| format!("Invalid todos: {e}"))?;
-        let explicit_ids: HashSet<_> = items.iter().filter_map(|t| t.id.clone()).collect();
-        let mut ids = HashSet::new();
-        items.into_iter().map(|item| {
+        let mut claimed: HashSet<String> = HashSet::new();
+        let mut ids: Vec<Option<String>> = items
+            .iter()
+            .map(|item| {
+                item.id
+                    .clone()
+                    .filter(|id| todos.iter().any(|t| &t.id == id) && claimed.insert(id.clone()))
+            })
+            .collect();
+        let mut titles = Vec::with_capacity(items.len());
+        for (item, id) in items.iter().zip(ids.iter_mut()) {
             let title = Self::checked_title(&item.title)?;
-            let status = Self::parse_status(&item.status)?.into();
-            let id = if let Some(id) = item.id {
-                if !todos.iter().any(|t| t.id == id) {
-                    return Err(format!("Unknown todo id: {id}. Omit id for a new item, or read TodoList for current IDs."));
+            if id.is_none() {
+                if let Some(found) = find_by_title(todos, &title, &|t| claimed.contains(&t.id)) {
+                    claimed.insert(found.id.clone());
+                    *id = Some(found.id.clone());
                 }
-                id
-            } else {
-                todos.iter().find(|t| t.title == title && !ids.contains(&t.id) && !explicit_ids.contains(&t.id))
-                    .map(|t| t.id.clone())
-                    .unwrap_or_else(|| fresh_id(&ids))
-            };
-            if !ids.insert(id.clone()) {
-                return Err(format!("Duplicate todo id: {id}"));
             }
-            Ok(TodoItem { id, title, status })
-        }).collect()
-    }
-
-    /// The unique in_progress task, used when neither ID nor title selects a target.
-    fn current_task_id(todos: &[TodoItem]) -> Result<String, String> {
-        let mut current = todos.iter().filter(|t| t.status == "in_progress");
-        match (current.next(), current.next()) {
-            (Some(item), None) => Ok(item.id.clone()),
-            (None, _) => Err(
-                "No task is in_progress; an update without id targets the current task. Read TodoList for IDs to act on a specific task, or add one first."
-                    .into(),
-            ),
-            (Some(_), Some(_)) => Err(
-                "Multiple tasks are in_progress; pass an explicit id to disambiguate".into(),
-            ),
+            titles.push(title);
         }
+        let mut taken: HashSet<String> = todos.iter().map(|t| t.id.clone()).collect();
+        let mut out = Vec::with_capacity(items.len());
+        for ((item, id), title) in items.into_iter().zip(ids).zip(titles) {
+            let id = id.unwrap_or_else(|| {
+                let id = fresh_id(&taken);
+                taken.insert(id.clone());
+                id
+            });
+            out.push(TodoItem {
+                id,
+                title,
+                status: Self::parse_status(&item.status)?.into(),
+            });
+        }
+        let mut notes = Vec::new();
+        enforce_single_in_progress(&mut out, None, &mut notes);
+        Ok(Applied { items: out, notes })
     }
 
-    fn patch(todos: &[TodoItem], input: &Value) -> Result<Vec<TodoItem>, String> {
-        // Stage all changes so a bad ID/status cannot partially update the list.
+    /// The task an update without id or title acts on: the (last) in_progress one.
+    fn current_task_id(todos: &[TodoItem]) -> Result<String, String> {
+        todos
+            .iter()
+            .rev()
+            .find(|t| t.status == "in_progress")
+            .map(|t| t.id.clone())
+            .ok_or_else(|| {
+                "No task is in_progress; an update without id or title targets the current task. Name the task by its exact title, or add it first."
+                    .into()
+            })
+    }
+
+    /// `updates` / `add`: incremental changes. Every target is resolved against
+    /// the list as it arrived; the staged result replaces the list only if the
+    /// whole call is valid.
+    fn patch(todos: &[TodoItem], input: &Value) -> Result<Applied, String> {
+        /// Where an update lands.
+        enum Target {
+            /// An existing task; `rename` when the update's title is the new title.
+            Task { id: String, rename: bool },
+            /// A title that matches nothing yet.
+            Unmatched,
+        }
+
         let mut next = todos.to_vec();
+        let mut notes = Vec::new();
+        let mut started: Option<String> = None;
+        let mut taken: HashSet<String> = next.iter().map(|t| t.id.clone()).collect();
         if let Some(value) = input.get("updates") {
             let updates: Vec<TodoUpdate> = serde_json::from_value(value.clone())
                 .map_err(|e| format!("Invalid updates: {e}"))?;
-            // Resolve targets against the list as it looks when the call
-            // arrives, before anything is applied.
+            // Pass 1: explicit ids and title matches.
             let mut targets = Vec::with_capacity(updates.len());
-            let mut current_fallbacks = 0;
             for update in &updates {
-                let id = match update.id.as_deref().map(str::trim) {
-                    Some(id) if !id.is_empty() => id.to_string(),
-                    _ => {
-                        let matched = if let Some(title) = &update.title {
-                            let title = Self::checked_title(title)?;
-                            let mut matches = todos.iter().filter(|t| t.title == title);
-                            match (matches.next(), matches.next()) {
-                                (Some(item), None) => Some(item.id.clone()),
-                                (Some(_), Some(_)) => return Err(format!(
-                                    "Ambiguous todo title: {title}. Read TodoList and pass an explicit id."
-                                )),
-                                (None, _) => None,
-                            }
-                        } else {
-                            None
-                        };
-                        if let Some(id) = matched {
-                            id
-                        } else {
-                            current_fallbacks += 1;
-                            Self::current_task_id(todos)?
-                        }
-                    }
-                };
-                targets.push(id);
-            }
-            if current_fallbacks > 1 {
-                return Err(
-                    "Multiple updates have no id or matching title. Use exact existing titles or read TodoList for IDs; use add for new tasks. Only one update may fall back to the current in_progress task."
-                        .into(),
-                );
-            }
-            let mut seen = HashSet::new();
-            for (update, id) in updates.into_iter().zip(targets) {
-                if !seen.insert(id.clone()) {
-                    return Err(format!("Duplicate update for todo id: {id}. Use exact existing titles or explicit IDs for different tasks; use add for new tasks."));
-                }
-                if update.title.is_none() && update.status.is_none() {
+                let id = update
+                    .id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty());
+                let title = update
+                    .title
+                    .as_deref()
+                    .map(Self::checked_title)
+                    .transpose()?;
+                if title.is_none() && update.status.is_none() {
                     return Err("Each update needs a title or status".into());
                 }
-                let item = next.iter_mut().find(|t| t.id == id).ok_or_else(|| {
-                    format!("Unknown todo id: {id}. Read TodoList for current IDs.")
-                })?;
-                if let Some(title) = update.title {
-                    item.title = Self::checked_title(&title)?;
-                }
-                if let Some(status) = update.status {
-                    item.status = Self::parse_status(&status)?.into();
+                let target = match (id, &title) {
+                    (Some(id), _) if todos.iter().any(|t| t.id == id) => {
+                        Target::Task { id: id.into(), rename: title.is_some() }
+                    }
+                    (Some(id), None) => {
+                        return Err(format!(
+                            "Unknown todo id: {id}. Name the task by its exact title, or read TodoList for current IDs."
+                        ))
+                    }
+                    (_, Some(title)) => match find_by_title(todos, title, &|_| false) {
+                        Some(found) => Target::Task { id: found.id.clone(), rename: false },
+                        None => Target::Unmatched,
+                    },
+                    (None, None) => {
+                        Target::Task { id: Self::current_task_id(todos)?, rename: false }
+                    }
+                };
+                targets.push(target);
+            }
+            // Pass 2: an unmatched title that is finishing something (done,
+            // cancelled, or a bare rename) is taken to mean the current task,
+            // unless another update already addresses it; everything else is
+            // a new task.
+            let targeted: HashSet<&str> = targets
+                .iter()
+                .filter_map(|t| match t {
+                    Target::Task { id, .. } => Some(id.as_str()),
+                    Target::Unmatched => None,
+                })
+                .collect();
+            let mut current = todos
+                .iter()
+                .rev()
+                .find(|t| t.status == "in_progress" && !targeted.contains(t.id.as_str()))
+                .map(|t| t.id.clone());
+            let mut resolved = Vec::with_capacity(targets.len());
+            for (update, target) in updates.iter().zip(targets) {
+                let finishing = match update.status.as_deref().map(Self::parse_status) {
+                    None => true,
+                    Some(status) => matches!(status?, "done" | "cancelled"),
+                };
+                resolved.push(match target {
+                    Target::Unmatched if finishing && current.is_some() => Target::Task {
+                        id: current.take().unwrap(),
+                        rename: true,
+                    },
+                    other => other,
+                });
+            }
+            for (update, target) in updates.into_iter().zip(resolved) {
+                let status = update
+                    .status
+                    .as_deref()
+                    .map(Self::parse_status)
+                    .transpose()?;
+                let id = match target {
+                    Target::Task { id, rename } => {
+                        let item = next
+                            .iter_mut()
+                            .find(|t| t.id == id)
+                            .ok_or_else(|| format!("Unknown todo id: {id}."))?;
+                        if let (true, Some(title)) = (rename, &update.title) {
+                            item.title = Self::checked_title(title)?;
+                        }
+                        if let Some(status) = status {
+                            item.status = status.into();
+                        }
+                        id
+                    }
+                    Target::Unmatched => {
+                        // `checked_title` ran in pass 1; an unmatched target has a title.
+                        let title = Self::checked_title(update.title.as_deref().unwrap_or(""))?;
+                        let id = fresh_id(&taken);
+                        taken.insert(id.clone());
+                        notes.push(format!(
+                            "Added new task \"{}\": no existing task has that title.",
+                            clip(&title)
+                        ));
+                        next.push(TodoItem {
+                            id: id.clone(),
+                            title,
+                            status: status.unwrap_or("pending").into(),
+                        });
+                        id
+                    }
+                };
+                if status == Some("in_progress") {
+                    started = Some(id);
                 }
             }
         }
         if let Some(value) = input.get("add") {
             let items: Vec<TodoWrite> =
                 serde_json::from_value(value.clone()).map_err(|e| format!("Invalid add: {e}"))?;
-            let mut taken: HashSet<String> = next.iter().map(|t| t.id.clone()).collect();
             for item in items {
-                if item.id.is_some() {
-                    return Err(
-                        "New items in add must omit id; IDs are generated by the tool".into(),
-                    );
-                }
                 let id = fresh_id(&taken);
                 taken.insert(id.clone());
+                let status: &str = Self::parse_status(&item.status)?;
+                if status == "in_progress" {
+                    started = Some(id.clone());
+                }
                 next.push(TodoItem {
                     id,
                     title: Self::checked_title(&item.title)?,
-                    status: Self::parse_status(&item.status)?.into(),
+                    status: status.into(),
                 });
             }
         }
-        Ok(next)
+        enforce_single_in_progress(&mut next, started.as_deref(), &mut notes);
+        Ok(Applied { items: next, notes })
     }
 }
 
@@ -320,19 +591,12 @@ impl Tool for TodoListTool {
         "TodoList"
     }
     fn description(&self) -> &str {
-        "Manage a structured TODO list for tracking progress on multi-step tasks. \
-IDs are short random tokens a model cannot guess, so a mistaken id fails safely instead of \
-editing the wrong task; they appear only in read results. Complete, cancel, or edit the \
-tasks with updates:[{id?,status?,title?}]. Without id, an exact unique existing title selects \
-a task, allowing batch updates by title. Otherwise, at most one update per call targets the \
-current in_progress task (including renaming it). Duplicate titles require an explicit id. \
-To rename another task, pass its id from a read. Use add for new tasks. \
-add appends tasks; todos creates or replaces the whole list (include unchanged items, \
-preserving their ids); todos: [] clears. Do not combine todos with updates/add. \
-Updates and add may be combined atomically. Keep task titles brief and at most one task \
-in_progress. Plan overall order and dependencies, then work on the current task and its \
-necessary dependencies; defer implementation details of pending tasks. \
-Writes return progress and the current focus/candidate without IDs; reads return the full list."
+        "Track progress on multi-step work. Create or revise the list by sending it whole with \
+todos:[{title,status}] (status: pending|in_progress|done|cancelled; unchanged titles keep \
+their identity; at most one in_progress; todos:[] clears). For a small change use \
+updates:[{title,status}] naming an existing task by its exact title (no id needed; an \
+unknown title adds a new task) or add:[{title}] to append. No arguments reads the list \
+with ids. Do not mix todos with updates/add."
     }
     fn parameters_schema(&self) -> Value {
         json!({
@@ -340,16 +604,16 @@ Writes return progress and the current focus/candidate without IDs; reads return
             "properties": {
                 "todos": {
                     "type": "array",
-                    "description": "Create or deliberately replace the complete list, including unchanged items. Prefer updates/add for routine changes. Empty array clears.",
+                    "description": "The complete list (create or revise). Unchanged titles keep their identity. Empty array clears.",
                     "items": {
                         "type": "object",
                         "properties": {
-                            "id": {"type": "string", "description": "Existing stable ID. Omit for new tasks."},
+                            "id": {"type": "string", "description": "Optional existing id from a read."},
                             "title": {"type": "string", "description": "Short actionable title"},
                             "status": {
                                 "type": "string",
                                 "enum": ["pending", "in_progress", "done", "cancelled"],
-                                "description": "Current status. Keep at most one task in_progress; mark done after completing the task and its relevant verification."
+                                "description": "At most one in_progress; done after the task and its verification."
                             }
                         },
                         "required": ["title", "status"]
@@ -357,12 +621,12 @@ Writes return progress and the current focus/candidate without IDs; reads return
                 },
                 "updates": {
                     "type": "array",
-                    "description": "Preferred for progress updates. Without id, match an exact unique existing title first; otherwise at most one update falls back to the current in_progress task. Use explicit IDs for duplicate titles or renaming other tasks; use add for new tasks. Use cancelled to drop a task.",
+                    "description": "Change existing tasks. Name a task by its exact title (or an id from a read); with neither, the current in_progress task is changed.",
                     "items": {
                         "type": "object",
                         "properties": {
-                            "id": {"type": "string", "description": "Stable ID from a read; omit to match an exact unique title, or fall back to the current in_progress task."},
-                            "title": {"type": "string", "description": "With id: new title. Without id: exact existing title selects the task; an unmatched title renames the current task."},
+                            "id": {"type": "string", "description": "Optional id from a read."},
+                            "title": {"type": "string", "description": "Exact existing title selects the task; an unknown title adds a new task (with an id: the new title)."},
                             "status": {"type": "string", "enum": ["pending", "in_progress", "done", "cancelled"]}
                         },
                         "additionalProperties": false
@@ -370,7 +634,7 @@ Writes return progress and the current focus/candidate without IDs; reads return
                 },
                 "add": {
                     "type": "array",
-                    "description": "Append new tasks without rewriting existing tasks. IDs are generated; status defaults to pending.",
+                    "description": "Append new tasks; status defaults to pending.",
                     "items": {
                         "type": "object",
                         "properties": {
@@ -387,7 +651,35 @@ Writes return progress and the current focus/candidate without IDs; reads return
         true
     }
 
+    fn normalize_input(&self, input: Value) -> Value {
+        let mut input = input;
+        let Some(obj) = input.as_object_mut() else {
+            return input;
+        };
+        let todos = self.todos.lock().unwrap();
+        for key in ["todos", "updates", "add"] {
+            let Some(slot) = obj.get_mut(key) else {
+                continue;
+            };
+            // Some models send the array as a JSON string.
+            if let Value::String(text) = slot {
+                if let Ok(array @ Value::Array(_)) = serde_json::from_str::<Value>(text) {
+                    *slot = array;
+                }
+            }
+            let Value::Array(items) = slot else {
+                continue;
+            };
+            let mut seen = HashSet::new();
+            for item in items.iter_mut() {
+                Self::normalize_item(key, item, &todos, &mut seen);
+            }
+        }
+        input
+    }
+
     async fn execute(&self, input: Value, _ctx: &ToolContext) -> anyhow::Result<ToolOutput> {
+        let input = self.normalize_input(input);
         if !input.is_object() {
             return Ok(ToolOutput::error("TodoList arguments must be an object"));
         }
@@ -415,12 +707,15 @@ Writes return progress and the current focus/candidate without IDs; reads return
                 json!({ "items": Self::items_event_json(&todos) }),
             ));
         };
-        match next {
-            Ok(next) => *todos = next,
+        let notes = match next {
+            Ok(applied) => {
+                *todos = applied.items;
+                applied.notes
+            }
             Err(error) => return Ok(ToolOutput::error(error)),
-        }
+        };
         Ok(ToolOutput::success_with_data(
-            Self::render_update(&todos),
+            Self::render_update(&todos, &notes),
             json!({ "items": Self::items_event_json(&todos) }),
         ))
     }
@@ -485,7 +780,7 @@ impl TodoListTool {
                     }
                 }
                 Ok(ToolOutput::success_with_data(
-                    Self::render_update(&todos),
+                    Self::render_update(&todos, &[]),
                     json!({ "items": Self::items_event_json(&todos) }),
                 ))
             }
@@ -609,23 +904,26 @@ mod tests {
             .content
             .contains("Updates without id match an exact unique title first"));
 
-        // Two updates resolving to the same current task are rejected.
-        let two_idless = run(
+        // A second title that matches nothing adds a task instead of
+        // fighting over the current one.
+        let two = run(
             &tool,
             json!({"updates": [{"status": "done"}, {"title": "Renamed"}]}),
         )
         .await;
-        assert!(two_idless.is_error);
-        // Finish the new current task, then an idless update has no target.
-        assert!(
-            !run(&tool, json!({"updates": [{"status": "done"}]}))
-                .await
-                .is_error
-        );
+        assert!(!two.is_error, "{}", two.content);
+        assert!(two.content.contains("Added new task \"Renamed\""));
+        let after = items(&two);
+        assert_eq!(after.len(), 3);
+        assert_eq!(after[1].status, "completed");
+        assert_eq!(after[2].content, "Renamed");
+        assert_eq!(after[2].status, "pending");
+        // Nothing is in_progress now, so an idless update has no target.
         let no_current = run(&tool, json!({"updates": [{"status": "done"}]})).await;
         assert!(no_current.is_error);
-        // With several in_progress tasks, idless updates are ambiguous.
-        run(
+        // Starting several tasks keeps the latest one in_progress; an idless
+        // update then acts on it.
+        let started = run(
             &tool,
             json!({"add": [
                 {"title": "P1", "status": "in_progress"},
@@ -633,9 +931,13 @@ mod tests {
             ]}),
         )
         .await;
-        let ambiguous = run(&tool, json!({"updates": [{"status": "pending"}]})).await;
-        assert!(ambiguous.is_error);
-        assert_eq!(items(&run(&tool, json!({})).await).len(), 4);
+        let started = items(&started);
+        assert_eq!(started[3].status, "pending");
+        assert_eq!(started[4].status, "in_progress");
+        let finished = run(&tool, json!({"updates": [{"status": "done"}]})).await;
+        assert!(!finished.is_error, "{}", finished.content);
+        assert_eq!(items(&finished)[4].status, "completed");
+        assert_eq!(items(&run(&tool, json!({})).await).len(), 5);
     }
 
     #[tokio::test]
@@ -701,7 +1003,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ambiguous_title_batches_are_atomic_and_ids_disambiguate() {
+    async fn duplicate_titles_pick_the_first_unfinished_and_ids_disambiguate() {
         let tool = TodoListTool::new();
         let created = run(
             &tool,
@@ -713,28 +1015,38 @@ mod tests {
         )
         .await;
         let original = items(&created);
-        for updates in [
-            json!([{"title": "Current", "status": "done"}, {"title": "Same", "status": "in_progress"}]),
-            json!([{"title": "Current", "status": "done"}, {"title": "Missing", "status": "in_progress"}]),
-            json!([{"title": "Missing A", "status": "done"}, {"title": "Missing B", "status": "in_progress"}]),
-            json!([{"title": "Current", "status": "done"}, {"id": original[0].id, "status": "pending"}]),
-            json!([{"title": "Current", "status": "bogus"}]),
-        ] {
-            let result = run(&tool, json!({"updates": updates})).await;
-            assert!(result.is_error, "{}", result.content);
-            assert_eq!(run(&tool, json!({})).await.data, created.data);
-        }
-        let explicit = run(
+        // A bogus status still rejects the whole batch.
+        let bogus = run(
+            &tool,
+            json!({"updates": [{"title": "Current", "status": "bogus"}]}),
+        )
+        .await;
+        assert!(bogus.is_error);
+        assert_eq!(run(&tool, json!({})).await.data, created.data);
+        // By title, the first unfinished duplicate is the target.
+        let by_title = run(
             &tool,
             json!({"updates": [
                 {"title": "Current", "status": "done"},
-                {"id": original[2].id, "title": "Same", "status": "in_progress"}
+                {"title": "Same", "status": "in_progress"}
             ]}),
+        )
+        .await;
+        assert!(!by_title.is_error, "{}", by_title.content);
+        assert_eq!(items(&by_title)[1].status, "in_progress");
+        assert_eq!(items(&by_title)[2].status, "pending");
+        // An id picks the other duplicate; only one task stays in_progress.
+        let explicit = run(
+            &tool,
+            json!({"updates": [{"id": original[2].id, "title": "Same", "status": "in_progress"}]}),
         )
         .await;
         assert!(!explicit.is_error, "{}", explicit.content);
         assert_eq!(items(&explicit)[1].status, "pending");
         assert_eq!(items(&explicit)[2].status, "in_progress");
+        assert!(explicit
+            .content
+            .contains("Only one task can be in_progress"));
     }
 
     #[tokio::test]
@@ -791,14 +1103,10 @@ mod tests {
             json!({"updates": [{"id": id, "status": "bogus"}]}),
             json!({"updates": [{"id": id, "title": " "}]}),
             json!({"updates": [{"id": id}]}),
-            json!({"updates": [{"id": id, "status": "done"}, {"id": id, "status": "pending"}]}),
             json!({"updates": null}),
-            json!({"add": [{"title": "New", "id": "invented"}]}),
             json!({"todos": [], "updates": []}),
             json!({"action": "set", "add": []}),
             json!({"todos": [{"title": "Bad", "status": "bogus"}]}),
-            json!({"todos": [{"id": "missing", "title": "Bad", "status": "pending"}]}),
-            json!({"todos": [{"id": id, "title": "A"}, {"id": id, "title": "B"}]}),
             json!({"updates": [{"status": "done"}]}),
             json!({"updates": [{"status": "done"}, {"status": "pending"}]}),
             json!({"updates": [{"id": ""}, {"status": "pending"}]}),
@@ -858,8 +1166,13 @@ mod tests {
         assert!(!pending.content.contains("Later"));
         assert!(initial.iter().all(|t| t.status == "pending"));
         let multiple = run(&tool, json!({"updates": initial.iter().map(|t| json!({"id": t.id, "status": "in_progress"})).collect::<Vec<_>>()})).await;
-        assert!(multiple.content.contains("Multiple tasks are in_progress"));
-        assert!(items(&multiple).iter().all(|t| t.status == "in_progress"));
+        // Only the task started last stays in_progress.
+        assert!(multiple
+            .content
+            .contains("Only one task can be in_progress"));
+        let started = items(&multiple);
+        assert_eq!(started[0].status, "pending");
+        assert_eq!(started[1].status, "in_progress");
         let finished = run(
             &tool,
             json!({"updates": [
@@ -932,6 +1245,277 @@ mod tests {
         assert!(!replaced.is_error);
         assert_eq!(items(&replaced)[0].id, initial[1].id);
         assert_eq!(items(&replaced)[1].id, initial[0].id);
+    }
+
+    /// What the agent loop does before running a call: repair, then validate.
+    fn repaired(tool: &TodoListTool, input: Value) -> Value {
+        let input = tool.normalize_input(input);
+        crate::args_validator::validate_against_schema(&tool.parameters_schema(), &input)
+            .unwrap_or_else(|e| panic!("{}\n{input}", e.message));
+        input
+    }
+
+    #[test]
+    fn model_slips_are_repaired_before_schema_validation() {
+        let tool = TodoListTool::new();
+        // Every shape below failed validation in real sessions.
+        for input in [
+            json!({"todos": [{"status": "completed", "title": "a"}, {"status": "in-progress", "title": "b"}]}),
+            json!({"updates": [{"id": null, "status": "done", "title": "a"}, {"status": "in_progress", "title": "b"}]}),
+            json!({"updates": [{"id": 1, "status": "done"}, {"id": 2, "status": "completed"}]}),
+            json!({"updates": [{"status": "done", "title": "a", "title2": ""}]}),
+            json!({"updates": [{"status": "completed_b48c39", "title": "a"}]}),
+            json!({"updates": "[{\"status\": \"done\", \"title\": \"a\"}]"}),
+            json!({"todos": [{"content": "a"}, {"title": "b"}]}),
+            json!({"todos": ["a", "b"]}),
+            json!({"add": [{"title": "a", "id": "invented", "status": "todo"}]}),
+        ] {
+            repaired(&tool, input);
+        }
+        // Repairs are idempotent.
+        let once = tool.normalize_input(json!({"updates": [{"id": 3, "status": "completed"}]}));
+        assert_eq!(tool.normalize_input(once.clone()), once);
+    }
+
+    #[test]
+    fn status_spellings_map_to_the_four_states() {
+        for (raw, want) in [
+            ("completed", "done"),
+            ("Complete", "done"),
+            ("finished", "done"),
+            ("in-progress", "in_progress"),
+            ("In Progress", "in_progress"),
+            ("doing", "in_progress"),
+            ("todo", "pending"),
+            ("not_started", "pending"),
+            ("canceled", "cancelled"),
+            ("skipped", "cancelled"),
+        ] {
+            assert_eq!(canonical_status(raw), Some(want), "{raw}");
+        }
+        assert_eq!(canonical_status("bogus"), None);
+        assert_eq!(canonical_status(""), None);
+    }
+
+    #[tokio::test]
+    async fn ordinal_and_label_ids_mean_list_positions() {
+        let tool = TodoListTool::new();
+        let created = items(
+            &run(
+                &tool,
+                json!({"todos": [
+                    {"title": "One", "status": "in_progress"},
+                    {"title": "Two", "status": "pending"},
+                    {"title": "Three", "status": "pending"}
+                ]}),
+            )
+            .await,
+        );
+        // `1`, `t2` and `#3` name the first, second and third task; a title
+        // sent next to an ordinal is not a rename.
+        let advanced = run(
+            &tool,
+            json!({"updates": [
+                {"id": "1", "status": "done"},
+                {"id": "t2", "status": "in_progress", "title": "Two (renamed by mistake)"},
+                {"id": 3, "status": "cancelled"}
+            ]}),
+        )
+        .await;
+        assert!(!advanced.is_error, "{}", advanced.content);
+        let after = items(&advanced);
+        assert_eq!(
+            after.iter().map(|t| t.status.as_str()).collect::<Vec<_>>(),
+            ["completed", "in_progress", "cancelled"]
+        );
+        assert_eq!(after[1].content, "Two");
+        for (old, new) in created.iter().zip(&after) {
+            assert_eq!(old.id, new.id);
+        }
+        // Out of range or without a way to resolve it: still an error.
+        for bad in [
+            json!({"updates": [{"id": "9", "status": "done"}]}),
+            json!({"updates": [{"id": "verify-baseline", "status": "done"}]}),
+        ] {
+            let result = run(&tool, bad).await;
+            assert!(result.is_error);
+            assert!(
+                result.content.contains("Unknown todo id"),
+                "{}",
+                result.content
+            );
+        }
+        // An unknown id next to a title falls back to the title.
+        let by_title = run(
+            &tool,
+            json!({"updates": [{"id": "13", "title": "Three", "status": "pending"}]}),
+        )
+        .await;
+        assert!(!by_title.is_error, "{}", by_title.content);
+        assert_eq!(items(&by_title)[2].id, created[2].id);
+        assert_eq!(items(&by_title)[2].status, "pending");
+    }
+
+    #[tokio::test]
+    async fn replacement_labels_are_not_ids() {
+        let tool = TodoListTool::new();
+        // First list written with invented labels `t1`..`t3`.
+        let created = run(
+            &tool,
+            json!({"todos": [
+                {"id": "t1", "status": "done", "title": "Alpha"},
+                {"id": "t2", "status": "in_progress", "title": "Beta"},
+                {"id": "t2", "status": "pending", "title": "Gamma"}
+            ]}),
+        )
+        .await;
+        assert!(!created.is_error, "{}", created.content);
+        let created = items(&created);
+        assert_eq!(created.len(), 3);
+        assert!(created.iter().all(|t| t.id.len() == 12));
+        // Rewriting the list with the same labels keeps the ids by title.
+        let rewritten = run(
+            &tool,
+            json!({"todos": [
+                {"id": "t1", "status": "done", "title": "Alpha"},
+                {"id": "t2", "status": "done", "title": "Beta"},
+                {"id": "t3", "status": "in_progress", "title": "Gamma"}
+            ]}),
+        )
+        .await;
+        let rewritten = items(&rewritten);
+        for (old, new) in created.iter().zip(&rewritten) {
+            assert_eq!(old.id, new.id);
+        }
+        assert_eq!(rewritten[2].status, "in_progress");
+    }
+
+    #[tokio::test]
+    async fn duplicate_updates_for_one_task_merge_with_the_last_winning() {
+        let tool = TodoListTool::new();
+        let id = items(
+            &run(
+                &tool,
+                json!({"add": [{"title": "Only", "status": "in_progress"}]}),
+            )
+            .await,
+        )[0]
+        .id
+        .clone();
+        let merged = run(
+            &tool,
+            json!({"updates": [
+                {"id": id, "status": "done"},
+                {"id": id, "status": "pending", "title": "Only (reopened)"},
+                {"status": "in_progress"}
+            ]}),
+        )
+        .await;
+        assert!(!merged.is_error, "{}", merged.content);
+        let after = items(&merged);
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].content, "Only (reopened)");
+        assert_eq!(after[0].status, "in_progress");
+    }
+
+    #[tokio::test]
+    async fn mirrored_title_updates_follow_the_list_instead_of_failing() {
+        let tool = TodoListTool::new();
+        let created = items(
+            &run(
+                &tool,
+                json!({"todos": [
+                    {"title": "Read spec §4: acceptance criteria", "status": "in_progress"},
+                    {"title": "Run focused tests", "status": "pending"},
+                    {"title": "Report to the user", "status": "pending"}
+                ]}),
+            )
+            .await,
+        );
+        // The models' habit: restate the list with each task's new status.
+        // Case/punctuation differences and extended titles still match; the
+        // finished task keeps its identity even when it is worded differently.
+        let updated = run(
+            &tool,
+            json!({"updates": [
+                {"status": "done", "title": "Read spec §4 and the acceptance list"},
+                {"status": "in_progress", "title": "RUN focused tests!"},
+                {"status": "pending", "title": "Report to the user: findings, risks and next steps"}
+            ]}),
+        )
+        .await;
+        assert!(!updated.is_error, "{}", updated.content);
+        let after = items(&updated);
+        assert_eq!(after.len(), 3, "no duplicates: {after:?}");
+        assert_eq!(
+            after.iter().map(|t| t.status.as_str()).collect::<Vec<_>>(),
+            ["completed", "in_progress", "pending"]
+        );
+        for (old, new) in created.iter().zip(&after) {
+            assert_eq!(old.id, new.id);
+        }
+        // Matching by title leaves the stored title alone; claiming the
+        // current task for an unmatched finishing title renames it.
+        assert_eq!(after[1].content, "Run focused tests");
+        assert_eq!(after[0].content, "Read spec §4 and the acceptance list");
+    }
+
+    #[tokio::test]
+    async fn unmatched_titles_add_tasks_and_a_new_task_takes_over_in_progress() {
+        let tool = TodoListTool::new();
+        let created = items(
+            &run(
+                &tool,
+                json!({"todos": [
+                    {"title": "Alpha", "status": "in_progress"},
+                    {"title": "Beta", "status": "pending"}
+                ]}),
+            )
+            .await,
+        );
+        // A pending title that matches nothing never hijacks the current task.
+        let pending = run(
+            &tool,
+            json!({"updates": [{"status": "pending", "title": "Gamma"}]}),
+        )
+        .await;
+        assert!(!pending.is_error, "{}", pending.content);
+        assert!(pending.content.contains("Added new task \"Gamma\""));
+        let after = items(&pending);
+        assert_eq!(after.len(), 3);
+        assert_eq!(after[0].content, "Alpha");
+        assert_eq!(after[0].status, "in_progress");
+        // Starting a new task moves the old current task back to pending.
+        let started = run(
+            &tool,
+            json!({"updates": [{"status": "in_progress", "title": "Delta"}]}),
+        )
+        .await;
+        let after = items(&started);
+        assert_eq!(after.len(), 4);
+        assert_eq!(after[0].status, "pending");
+        assert_eq!(after[3].content, "Delta");
+        assert_eq!(after[3].status, "in_progress");
+        assert!(started.content.contains("Only one task can be in_progress"));
+        assert_eq!(after[0].id, created[0].id);
+    }
+
+    #[tokio::test]
+    async fn replacement_with_several_in_progress_keeps_the_last() {
+        let tool = TodoListTool::new();
+        let result = run(
+            &tool,
+            json!({"todos": [
+                {"title": "A", "status": "in_progress"},
+                {"title": "B", "status": "in_progress"},
+                {"title": "C", "status": "pending"}
+            ]}),
+        )
+        .await;
+        let after = items(&result);
+        assert_eq!(after[0].status, "pending");
+        assert_eq!(after[1].status, "in_progress");
+        assert!(result.content.contains("Only one task can be in_progress"));
     }
 
     #[test]

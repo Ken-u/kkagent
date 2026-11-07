@@ -115,6 +115,10 @@ impl Tool for OverrideTool {
         self.original.disclosure()
     }
 
+    fn normalize_input(&self, input: Value) -> Value {
+        self.replacement.normalize_input(input)
+    }
+
     fn accesses(&self, input: &Value, working_dir: &Path) -> ToolAccesses {
         self.original.accesses(input, working_dir)
     }
