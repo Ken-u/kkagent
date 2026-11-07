@@ -270,6 +270,36 @@ dynamically_loaded_tools = true
 
 `heavy_dirs` 一旦写出（含空数组）就会替换内置默认值；只想追加时用 `extra_heavy_dirs`。项目级 `.kkagent/config.toml` 也可写同样的 `[tools]` 字段，启动时与全局配置合并。显式定向到重型目录的搜索（例如 Glob `out/soong/**` 或 Grep `path = "out"`）仍会进入该目录。
 
+## 模型专用工具配置（`[model_profiles]`）
+
+不同模型使用工具的习惯差异很大：有的几乎只用 `Bash`，有的更爱 `Read` / `Grep`。`[model_profiles.NAME]` 让每类模型各有一套工具暴露与提示，而不用改全局配置：
+
+```toml
+[model_profiles.shell-first]
+# 适用哪些模型：[models] 别名或上游模型 id，精确匹配或结尾 *（不区分大小写）。
+models = ["oai/glm-5.3", "gpt-6.1*"]
+# 对该模型隐藏的工具（MCP 工具可用 mcp__server__* 模式）。
+hide = ["Cron"]
+# 严格白名单：非空时只提供这些工具（外加始终提供的核心工具）。
+# MCP 工具需要在这里写 mcp__… 模式才会保留。
+# expose = ["Bash", "Read", "Edit", "Write", "Grep", "Glob"]
+
+# 追加到某个工具描述末尾的、只对该模型生效的用法提示。
+[model_profiles.shell-first.tool_hints]
+Bash = "读文件用 Read、搜索用 Grep、列目录用 Glob：它们带行号、输出上限和路径守卫。"
+
+# 模型省略某个参数时使用的默认值，键为 "工具.参数"。
+[model_profiles.shell-first.defaults]
+"Read.limit" = 400
+"Grep.output_mode" = "content"
+```
+
+- **绑定**：一个模型最多匹配一个 profile；多个 profile 的 `models` 同时命中同一模型会在启动校验时报错。没有匹配的 profile 时行为与以前完全一致。
+- **始终提供的工具**：`SelectTools`、`AskUserQuestion`、`TodoList`、`EnterPlanMode`、`ExitPlanMode`、`WritePlan` 不能被 `hide`，也不受 `expose` 限制，避免破坏渐进披露、提问和计划流程。
+- **校验**：`hide` / `expose` / `tool_hints` / `defaults` 里的工具名必须是内置工具或 `mcp__…` 名称，拼写错误会在启动时报错；`defaults` 的键必须形如 `"Tool.param"`，运行时只会填充该工具 schema 里声明过的参数，模型自己给的值优先。
+- **缓存**：工具列表和提示在会话里按当前模型一次性解析，内容固定，不会因为调用而变化；切换到匹配不同 profile 的模型会改变 tools[]，等同于一次提示缓存刷新。
+- 子 Agent 使用了匹配的模型时同样适用，并与子 Agent 自己的工具集合取交集。
+
 ## Standalone Server
 
 ```toml

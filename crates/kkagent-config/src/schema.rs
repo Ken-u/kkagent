@@ -83,6 +83,11 @@ pub struct AppConfig {
     pub providers: HashMap<String, ProviderConfig>,
     #[serde(default)]
     pub models: HashMap<String, ModelConfig>,
+    /// Per-model tool tuning (`[model_profiles.NAME]`): which tools a model
+    /// sees, extra usage hints, parameter defaults. A profile applies to the
+    /// models matched by its `models` patterns.
+    #[serde(default)]
+    pub model_profiles: BTreeMap<String, ModelProfileConfig>,
     #[serde(default)]
     pub thinking: Option<ThinkingConfig>,
     #[serde(default)]
@@ -715,6 +720,216 @@ pub struct ModelConfig {
     pub first_token_timeout_ms: Option<u64>,
 }
 
+/// Tools that stay visible whatever a profile says: disclosure and
+/// interaction primitives the rest of the system relies on (the same set the
+/// session tool policy never hides).
+pub const ALWAYS_EXPOSED_TOOLS: &[&str] = &[
+    "SelectTools",
+    "AskUserQuestion",
+    "TodoList",
+    "ExitPlanMode",
+    "EnterPlanMode",
+    "WritePlan",
+];
+
+/// Every builtin tool a model can be offered; `[model_profiles.*]` entries
+/// naming anything else (apart from `mcp__…` MCP tools) are rejected.
+pub const KNOWN_TOOL_NAMES: &[&str] = &[
+    "Agent",
+    "AgentSwarm",
+    "AskUserQuestion",
+    "Bash",
+    "Cron",
+    "Edit",
+    "EnterPlanMode",
+    "ExitPlanMode",
+    "GenerateImage",
+    "Glob",
+    "Goal",
+    "Grep",
+    "Read",
+    "ReadMediaFile",
+    "SelectTools",
+    "Skill",
+    "TaskOutput",
+    "TodoList",
+    "Web",
+    "Write",
+    "WritePlan",
+];
+
+/// Per-model tool tuning (`[model_profiles.NAME]`).
+///
+/// ```toml
+/// [model_profiles.shell-first]
+/// models = ["oai/glm-5.3", "gpt-6.1*"]   # alias or upstream model id; trailing * allowed
+/// hide = ["Cron"]
+/// [model_profiles.shell-first.tool_hints]
+/// Bash = "Read files with Read and search with Grep: they number lines and cap output."
+/// [model_profiles.shell-first.defaults]
+/// "Read.limit" = 400
+/// ```
+///
+/// The profile is resolved once per model, so the tool list and hints stay
+/// byte-stable for the provider prompt cache.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelProfileConfig {
+    /// Models this profile applies to: a `[models]` alias or an upstream model
+    /// id, exact or with a trailing `*` (case-insensitive).
+    #[serde(default)]
+    pub models: Vec<String>,
+    /// Tools hidden from the model (`mcp__server__*` patterns allowed).
+    #[serde(default)]
+    pub hide: Vec<String>,
+    /// Strict allowlist: when non-empty, only these tools (plus
+    /// [`ALWAYS_EXPOSED_TOOLS`]) are offered. MCP tools need an `mcp__…`
+    /// pattern here to stay visible.
+    #[serde(default)]
+    pub expose: Vec<String>,
+    /// Extra guidance appended to a tool's description for this model.
+    #[serde(default)]
+    pub tool_hints: BTreeMap<String, String>,
+    /// Parameter defaults, `"Tool.param" = value`, used when the model omits
+    /// the parameter.
+    #[serde(default)]
+    pub defaults: BTreeMap<String, serde_json::Value>,
+}
+
+/// Case-insensitive exact match, or prefix match for a trailing `*`.
+fn name_pattern_matches(pattern: &str, name: &str) -> bool {
+    let (pattern, name) = (pattern.trim().to_lowercase(), name.to_lowercase());
+    match pattern.strip_suffix('*') {
+        Some(prefix) => name.starts_with(prefix),
+        None => pattern == name,
+    }
+}
+
+fn is_mcp_tool_name(name: &str) -> bool {
+    name.starts_with("mcp__")
+}
+
+impl ModelProfileConfig {
+    /// Whether this profile applies to the model `alias` / `upstream` id.
+    pub fn matches_model(&self, alias: &str, upstream: Option<&str>) -> bool {
+        self.models.iter().any(|pattern| {
+            name_pattern_matches(pattern, alias)
+                || upstream.is_some_and(|id| name_pattern_matches(pattern, id))
+        })
+    }
+
+    /// Whether the tool `name` is offered to the model under this profile.
+    pub fn exposes_tool(&self, name: &str) -> bool {
+        if ALWAYS_EXPOSED_TOOLS.contains(&name) {
+            return true;
+        }
+        let tool_pattern = |pattern: &String| {
+            if is_mcp_tool_name(pattern) {
+                is_mcp_tool_name(name)
+                    && match pattern.strip_suffix('*') {
+                        Some(prefix) => name.starts_with(prefix),
+                        None => pattern == name,
+                    }
+            } else {
+                pattern == name
+            }
+        };
+        if self.hide.iter().any(tool_pattern) {
+            return false;
+        }
+        self.expose.is_empty() || self.expose.iter().any(tool_pattern)
+    }
+
+    /// The extra hint for `tool`, if the profile has one.
+    pub fn hint_for(&self, tool: &str) -> Option<&str> {
+        self.tool_hints
+            .get(tool)
+            .map(|hint| hint.trim())
+            .filter(|hint| !hint.is_empty())
+    }
+
+    /// Fill the parameters the model left out of `input` with this profile's
+    /// `defaults` for `tool`. Only parameters the tool's schema declares are
+    /// touched, so a mistyped key can never inject an unknown argument.
+    pub fn apply_defaults(
+        &self,
+        tool: &str,
+        schema: &serde_json::Value,
+        input: &mut serde_json::Value,
+    ) {
+        let Some(args) = input.as_object_mut() else {
+            return;
+        };
+        let declared = schema.get("properties").and_then(|p| p.as_object());
+        for (key, value) in &self.defaults {
+            let Some((name, param)) = key.split_once('.') else {
+                continue;
+            };
+            if name != tool || !declared.is_some_and(|props| props.contains_key(param)) {
+                continue;
+            }
+            if args.get(param).is_none_or(serde_json::Value::is_null) {
+                args.insert(param.to_string(), value.clone());
+            }
+        }
+    }
+
+    fn validate(&self, name: &str) -> anyhow::Result<()> {
+        if self.models.iter().any(|m| m.trim().is_empty()) {
+            anyhow::bail!("model_profiles.{name}.models must not contain empty patterns");
+        }
+        let check_tool = |field: &str, tool: &str| -> anyhow::Result<()> {
+            if is_mcp_tool_name(tool) {
+                return Ok(());
+            }
+            if tool.contains('*') {
+                anyhow::bail!(
+                    "model_profiles.{name}.{field}: `{tool}` — wildcards are only for mcp__ tools"
+                );
+            }
+            if !KNOWN_TOOL_NAMES.contains(&tool) {
+                anyhow::bail!(
+                    "model_profiles.{name}.{field} references unknown tool `{tool}` (builtin tools: {}; MCP tools: mcp__server__tool or mcp__server__*)",
+                    KNOWN_TOOL_NAMES.join(", ")
+                );
+            }
+            Ok(())
+        };
+        for tool in &self.hide {
+            check_tool("hide", tool)?;
+            if ALWAYS_EXPOSED_TOOLS.contains(&tool.as_str()) {
+                anyhow::bail!(
+                    "model_profiles.{name}.hide cannot hide `{tool}`: it is always offered ({})",
+                    ALWAYS_EXPOSED_TOOLS.join(", ")
+                );
+            }
+        }
+        for tool in &self.expose {
+            check_tool("expose", tool)?;
+        }
+        for (tool, hint) in &self.tool_hints {
+            check_tool("tool_hints", tool)?;
+            if hint.trim().is_empty() {
+                anyhow::bail!("model_profiles.{name}.tool_hints.{tool} must not be empty");
+            }
+        }
+        for key in self.defaults.keys() {
+            let Some((tool, param)) = key.split_once('.') else {
+                anyhow::bail!(
+                    "model_profiles.{name}.defaults key `{key}` must look like \"Tool.param\""
+                );
+            };
+            if param.is_empty() {
+                anyhow::bail!(
+                    "model_profiles.{name}.defaults key `{key}` must look like \"Tool.param\""
+                );
+            }
+            check_tool("defaults", tool)?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ModelPricing {
     #[serde(default)]
@@ -1093,6 +1308,10 @@ pub struct ToolsConfig {
     /// running in the background, retrievable via `TaskOutput`.
     #[serde(default)]
     pub subagent_timeout_secs: Option<u64>,
+    /// Profile of the model driving this call (runtime only, never read from
+    /// or written to config.toml).
+    #[serde(skip)]
+    pub model_profile: Option<std::sync::Arc<ModelProfileConfig>>,
 }
 
 impl Default for ToolsConfig {
@@ -1105,6 +1324,7 @@ impl Default for ToolsConfig {
             heavy_dirs: None,
             extra_heavy_dirs: Vec::new(),
             subagent_timeout_secs: None,
+            model_profile: None,
         }
     }
 }
@@ -1575,7 +1795,22 @@ impl AppConfig {
                 }
             }
         }
+        for (name, profile) in &self.model_profiles {
+            profile.validate(name)?;
+        }
         for (alias, model) in &self.models {
+            let matching: Vec<&str> = self
+                .model_profiles
+                .iter()
+                .filter(|(_, profile)| profile.matches_model(alias, Some(&model.model)))
+                .map(|(name, _)| name.as_str())
+                .collect();
+            if matching.len() > 1 {
+                anyhow::bail!(
+                    "model {alias} matches several model_profiles ({}); make their `models` patterns disjoint",
+                    matching.join(", ")
+                );
+            }
             if model.model.trim().is_empty() {
                 anyhow::bail!("model {alias} has an empty upstream model id");
             }
@@ -1742,6 +1977,14 @@ impl AppConfig {
             }
         }
         Ok(())
+    }
+
+    /// The `[model_profiles.*]` entry that applies to model `alias`, if any.
+    pub fn model_profile_for(&self, alias: &str) -> Option<&ModelProfileConfig> {
+        let upstream = self.models.get(alias).map(|model| model.model.as_str());
+        self.model_profiles
+            .values()
+            .find(|profile| profile.matches_model(alias, upstream))
     }
 
     pub fn resolve_model(&self, alias: &str) -> Option<(&ModelConfig, &ProviderConfig)> {
@@ -2350,6 +2593,133 @@ fallback = "quality"
             config.resolve_subagent_model("unknown-profile", None, None),
             "test/model"
         );
+    }
+
+    fn profile(toml_text: &str) -> ModelProfileConfig {
+        toml::from_str(toml_text).expect("profile parses")
+    }
+
+    #[test]
+    fn model_profiles_parse_from_toml_and_bind_by_alias_or_upstream_id() {
+        let mut config: AppConfig = toml::from_str(
+            r#"
+            [model_profiles.shell-first]
+            models = ["test/model", "gpt-6.1*"]
+            hide = ["Cron"]
+            [model_profiles.shell-first.tool_hints]
+            Bash = "Read files with Read."
+            [model_profiles.shell-first.defaults]
+            "Read.limit" = 400
+            "Grep.output_mode" = "content"
+            "#,
+        )
+        .unwrap();
+        let profile = &config.model_profiles["shell-first"];
+        assert_eq!(profile.hide, ["Cron"]);
+        assert_eq!(profile.defaults["Read.limit"], serde_json::json!(400));
+        assert_eq!(profile.hint_for("Bash"), Some("Read files with Read."));
+        // Alias match, case-insensitive; upstream-id prefix match; no match.
+        assert!(config.model_profile_for("TEST/model").is_some());
+        config.models = valid_config().models;
+        config.models.get_mut("test/model").unwrap().model = "GPT-6.1-terra".into();
+        config.model_profiles.get_mut("shell-first").unwrap().models = vec!["gpt-6.1*".into()];
+        assert!(config.model_profile_for("test/model").is_some());
+        assert!(config.model_profile_for("other/model").is_none());
+        // Unknown keys are rejected so typos do not silently do nothing.
+        assert!(toml::from_str::<ModelProfileConfig>("hidden = [\"Cron\"]").is_err());
+    }
+
+    #[test]
+    fn profiles_hide_and_expose_tools_but_never_the_core_primitives() {
+        let hide = profile(r#"hide = ["Cron", "mcp__noisy__*", "TodoList"]"#);
+        assert!(!hide.exposes_tool("Cron"));
+        assert!(!hide.exposes_tool("mcp__noisy__search"));
+        assert!(hide.exposes_tool("mcp__other__search"));
+        assert!(hide.exposes_tool("Read"));
+        // Core primitives stay even when listed.
+        assert!(hide.exposes_tool("TodoList"));
+
+        let expose = profile(r#"expose = ["Bash", "Edit", "mcp__github__*"]"#);
+        assert!(expose.exposes_tool("Bash") && expose.exposes_tool("Edit"));
+        assert!(!expose.exposes_tool("Read") && !expose.exposes_tool("Grep"));
+        assert!(expose.exposes_tool("mcp__github__create_issue"));
+        assert!(!expose.exposes_tool("mcp__slack__post"));
+        for core in ALWAYS_EXPOSED_TOOLS {
+            assert!(expose.exposes_tool(core), "{core}");
+        }
+        // No lists: everything is offered.
+        assert!(ModelProfileConfig::default().exposes_tool("Read"));
+    }
+
+    #[test]
+    fn profile_defaults_fill_only_omitted_declared_parameters() {
+        let profile = profile(
+            r#"
+            [defaults]
+            "Read.limit" = 800
+            "Read.bogus" = 1
+            "Grep.output_mode" = "content"
+            "#,
+        );
+        let schema = serde_json::json!({"properties": {"path": {}, "limit": {}}});
+        let mut input = serde_json::json!({"path": "a.rs"});
+        profile.apply_defaults("Read", &schema, &mut input);
+        assert_eq!(input, serde_json::json!({"path": "a.rs", "limit": 800}));
+        // A value the model chose (or an explicit null-free override) wins.
+        let mut chosen = serde_json::json!({"path": "a.rs", "limit": 50});
+        profile.apply_defaults("Read", &schema, &mut chosen);
+        assert_eq!(chosen["limit"], 50);
+        // `null` counts as omitted; other tools' defaults do not leak.
+        let mut nulled = serde_json::json!({"path": "a.rs", "limit": null});
+        profile.apply_defaults("Read", &schema, &mut nulled);
+        assert_eq!(nulled["limit"], 800);
+        let mut other = serde_json::json!({"pattern": "x"});
+        profile.apply_defaults("Glob", &schema, &mut other);
+        assert_eq!(other, serde_json::json!({"pattern": "x"}));
+    }
+
+    #[test]
+    fn validates_model_profiles() {
+        let invalid = |toml_text: &str| {
+            let mut config = valid_config();
+            config.model_profiles.insert("p".into(), profile(toml_text));
+            config.validate().unwrap_err().to_string()
+        };
+        assert!(invalid(r#"hide = ["Reed"]"#).contains("unknown tool `Reed`"));
+        assert!(invalid(r#"expose = ["Bash", "Gerp"]"#).contains("unknown tool `Gerp`"));
+        assert!(invalid(r#"hide = ["SelectTools"]"#).contains("always offered"));
+        assert!(invalid("[tool_hints]\nBash = \"  \"").contains("must not be empty"));
+        assert!(invalid("[tool_hints]\nNope = \"x\"").contains("unknown tool `Nope`"));
+        assert!(invalid("[defaults]\nlimit = 1").contains("must look like"));
+        assert!(invalid("[defaults]\n\"Nope.limit\" = 1").contains("unknown tool `Nope`"));
+        assert!(invalid(r#"hide = ["Re*"]"#).contains("wildcards are only for mcp__"));
+        assert!(invalid(r#"models = [" "]"#).contains("empty patterns"));
+
+        // A valid profile passes, including MCP names and wildcards.
+        let mut config = valid_config();
+        config.model_profiles.insert(
+            "ok".into(),
+            profile(
+                r#"
+                models = ["test/model"]
+                hide = ["Cron", "mcp__noisy__*"]
+                [tool_hints]
+                Bash = "Prefer Read."
+                [defaults]
+                "Read.limit" = 400
+                "#,
+            ),
+        );
+        config.validate().unwrap();
+        // Two profiles claiming one model are ambiguous.
+        config
+            .model_profiles
+            .insert("dup".into(), profile(r#"models = ["test/*"]"#));
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("matches several model_profiles (dup, ok)"));
     }
 
     #[test]

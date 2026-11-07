@@ -619,9 +619,11 @@ impl AgentLoop {
         // Visibility-filtered defs drive both the announcement ledger and the
         // SelectTools loadable set, so session-disabled tools are never
         // announced by name either.
+        let model_profile = self.config.model_profile_for(&model_alias);
         let visible_defs: Vec<_> = all_defs
             .iter()
             .filter(|td| tool_allowed(session, &td.name))
+            .filter(|td| model_profile.is_none_or(|profile| profile.exposes_tool(&td.name)))
             .cloned()
             .collect();
 
@@ -653,6 +655,15 @@ impl AgentLoop {
             })
             .map(crate::dynamic_tools::to_llm_tool_def)
             .collect();
+        // Per-model usage hints are resolved once per model, so the serialized
+        // tools[] stays byte-stable for the provider prompt cache.
+        if let Some(profile) = model_profile {
+            for td in &mut tool_defs {
+                if let Some(hint) = profile.hint_for(&td.name) {
+                    td.description = format!("{}\n{hint}", td.description);
+                }
+            }
+        }
         if !dynamic_tools_enabled {
             tool_defs.retain(|td| td.name != "SelectTools");
         }
@@ -2096,6 +2107,11 @@ impl AgentLoop {
                     let image = self.config.image.clone();
                     let mut tools_config = self.config.tools.clone();
                     tools_config.merge_project_overrides(&session.working_dir);
+                    tools_config.model_profile = self
+                        .config
+                        .model_profile_for(&active_model_alias)
+                        .cloned()
+                        .map(Arc::new);
                     let msg_count = session.messages.len();
                     // Propagate the actually-active model (may be the fallback
                     // mid-turn) so subagents with `model: "current"` inherit
@@ -2250,6 +2266,11 @@ impl AgentLoop {
                             .tool_definitions()
                             .into_iter()
                             .filter(|td| tool_allowed(session, &td.name))
+                            .filter(|td| {
+                                self.config
+                                    .model_profile_for(&self.effective_model_alias(session))
+                                    .is_none_or(|profile| profile.exposes_tool(&td.name))
+                            })
                             .collect::<Vec<_>>(),
                         &requested,
                     );
@@ -3302,10 +3323,31 @@ impl AgentLoop {
             tool_call_id: None,
             interrupted: session.interrupted.clone(),
             plan_file_path: session.plan_file_path.clone(),
-            tools_config: self.config.tools.clone(),
+            tools_config: {
+                let mut tools_config = self.config.tools.clone();
+                tools_config.model_profile = self
+                    .config
+                    .model_profile_for(active_model_alias)
+                    .cloned()
+                    .map(Arc::new);
+                tools_config
+            },
             model_alias: Some(active_model_alias.to_string()),
         })
         .await
+    }
+
+    /// The session's model alias, falling back to the configured default.
+    fn effective_model_alias(&self, session: &Session) -> String {
+        let alias = session.get_model_alias();
+        if alias.is_empty() {
+            self.config
+                .default_model_alias()
+                .unwrap_or("default")
+                .to_string()
+        } else {
+            alias
+        }
     }
 
     async fn run_ask_user_question(
@@ -3774,6 +3816,9 @@ async fn execute_tool_parallel(request: ParallelToolRequest) -> ToolOutput {
         None => return ToolOutput::error(format!("Unknown tool: {}", name)),
     };
 
+    if let Some(profile) = &tools_config.model_profile {
+        profile.apply_defaults(&name, &tool.parameters_schema(), &mut input);
+    }
     let input = tool.normalize_input(input);
     if let Err(e) =
         kkagent_tools::args_validator::validate_against_schema(&tool.parameters_schema(), &input)
@@ -4098,6 +4143,75 @@ mod retry_tests {
             ]
         );
         assert!(read_content_hashes(None, &ToolOutput::success("no data")).is_empty());
+    }
+
+    #[tokio::test]
+    async fn model_profile_defaults_fill_omitted_parameters_before_the_tool_runs() {
+        struct EchoTool;
+        #[async_trait::async_trait]
+        impl kkagent_tools::Tool for EchoTool {
+            fn name(&self) -> &str {
+                "Echo"
+            }
+            fn description(&self) -> &str {
+                "echoes its arguments"
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {"limit": {"type": "integer"}, "text": {"type": "string"}}
+                })
+            }
+            async fn execute(
+                &self,
+                input: serde_json::Value,
+                _ctx: &kkagent_tools::ToolContext,
+            ) -> anyhow::Result<ToolOutput> {
+                Ok(ToolOutput::success(input.to_string()))
+            }
+        }
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(EchoTool));
+        let tools = Arc::new(registry);
+        let profile: kkagent_config::ModelProfileConfig =
+            serde_json::from_value(serde_json::json!({
+                "defaults": {"Echo.limit": 400, "Echo.nope": true, "Other.limit": 1}
+            }))
+            .unwrap();
+        let run = |input: serde_json::Value,
+                   profile: Option<kkagent_config::ModelProfileConfig>| {
+            let tools_config = kkagent_config::ToolsConfig {
+                model_profile: profile.map(Arc::new),
+                ..Default::default()
+            };
+            execute_tool_parallel(ParallelToolRequest {
+                tools: Arc::clone(&tools),
+                hooks: None,
+                working_dir: std::env::temp_dir(),
+                session_id: "s".into(),
+                turn_id: "s:1".into(),
+                image: kkagent_config::ImageConfig::default(),
+                name: "Echo".into(),
+                input,
+                tool_call_id: None,
+                interrupted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                plan_file_path: std::path::PathBuf::new(),
+                tools_config,
+                model_alias: None,
+            })
+        };
+        let echoed = |output: ToolOutput| -> serde_json::Value {
+            assert!(!output.is_error, "{}", output.content);
+            serde_json::from_str(&output.content).unwrap()
+        };
+        // The default fills the omitted parameter; undeclared keys never leak in.
+        let filled = echoed(run(serde_json::json!({"text": "x"}), Some(profile.clone())).await);
+        assert_eq!(filled, serde_json::json!({"text": "x", "limit": 400}));
+        // A value the model chose wins; without a profile nothing is added.
+        let chosen = echoed(run(serde_json::json!({"limit": 5}), Some(profile)).await);
+        assert_eq!(chosen, serde_json::json!({"limit": 5}));
+        let bare = echoed(run(serde_json::json!({"text": "x"}), None).await);
+        assert_eq!(bare, serde_json::json!({"text": "x"}));
     }
 
     #[test]

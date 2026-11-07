@@ -562,6 +562,22 @@ mod disclosure_tests {
         registry
     }
 
+    /// `[model_profiles.*]` validation accepts exactly the tools the registry
+    /// can offer; a new builtin tool must be added to `KNOWN_TOOL_NAMES`.
+    #[test]
+    fn every_registered_builtin_is_a_known_profile_tool() {
+        for definition in full_registry().tool_definitions() {
+            assert!(
+                kkagent_config::KNOWN_TOOL_NAMES.contains(&definition.name.as_str()),
+                "add `{}` to kkagent_config::KNOWN_TOOL_NAMES",
+                definition.name
+            );
+        }
+        for core in kkagent_config::ALWAYS_EXPOSED_TOOLS {
+            assert!(kkagent_config::KNOWN_TOOL_NAMES.contains(core), "{core}");
+        }
+    }
+
     /// Usage-tiered disclosure: hot tools stay Inline; cold tools are name-only
     /// until loaded via SelectTools. Guard against accidental regressions.
     #[test]
