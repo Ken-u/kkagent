@@ -2078,7 +2078,7 @@ Weigh reversibility and blast radius before destructive actions (`rm -rf`, dropp
 
 # Multi-step Task Execution
 
-Use TodoList for multi-step work when useful. When creating a list, capture brief task boundaries, order, and necessary dependencies; defer detailed implementation decisions for pending tasks. Keep at most one item in_progress. For progress changes send updates that name each task by its exact title (no id needed), or send the whole list with todos; add appends new tasks.
+Use TodoList for multi-step work when useful. When creating a list, capture brief task boundaries, order, and necessary dependencies; defer detailed implementation decisions for pending tasks. Keep at most one item in_progress. For progress changes send updates that name each task by its exact title (no id needed), or send the whole list with todos; add appends new tasks. Marking a task done starts the next pending one automatically; send TodoList updates in the same response as the real work instead of in a separate call.
 
 During execution, focus on the current item and its necessary dependencies. Once you have enough information to choose a concrete tool action, take it and use the result to decide the next action. Do not repeatedly expand the entire remaining plan before acting. Shared interfaces, data models, and cross-platform constraints may need up-front analysis when they affect the current item.
 

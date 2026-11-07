@@ -164,6 +164,30 @@ fn enforce_single_in_progress(
     ));
 }
 
+/// When this call finished a task (done/cancelled) and left nothing
+/// in_progress, start the next pending one. Without this the model spends a
+/// second TodoList-only request just to say what it is about to work on.
+/// Only a task finished *by this call* triggers it, so creating a list of
+/// pending tasks never starts anything on its own.
+fn auto_advance(previous: &[TodoItem], next: &mut [TodoItem], notes: &mut Vec<String>) {
+    let finished_now = next.iter().any(|item| {
+        matches!(item.status.as_str(), "done" | "cancelled")
+            && previous
+                .iter()
+                .any(|old| old.id == item.id && unfinished(old))
+    });
+    if !finished_now || next.iter().any(|item| item.status == "in_progress") {
+        return;
+    }
+    if let Some(item) = next.iter_mut().find(|item| item.status == "pending") {
+        item.status = "in_progress".into();
+        notes.push(format!(
+            "Started the next task \"{}\" (in_progress).",
+            clip(&item.title)
+        ));
+    }
+}
+
 /// 12 hex chars: unguessable (a model cannot fabricate an id that hits a real
 /// task, so mistakes fail loudly instead of editing the wrong entry), but far
 /// cheaper in tokens than a full UUID.
@@ -280,7 +304,7 @@ impl TodoListTool {
             (1, Some(item)) => format!(
                 "Current task: {}\nFocus on this task and its necessary dependencies. \
 Take the next concrete action once you have enough information; defer details of pending tasks. \
-After completing and verifying this task, or identifying a blocker, update progress and choose the next unblocked task. \
+When it is finished and verified, mark it done in the same response as your first action on the next task (the next pending task starts automatically), not in a TodoList-only call. \
 Updates without id match an exact unique title first, otherwise act on this task.",
                 item.title
             ),
@@ -595,8 +619,9 @@ impl Tool for TodoListTool {
 todos:[{title,status}] (status: pending|in_progress|done|cancelled; unchanged titles keep \
 their identity; at most one in_progress; todos:[] clears). For a small change use \
 updates:[{title,status}] naming an existing task by its exact title (no id needed; an \
-unknown title adds a new task) or add:[{title}] to append. No arguments reads the list \
-with ids. Do not mix todos with updates/add."
+unknown title adds a new task) or add:[{title}] to append. Marking a task done starts the \
+next pending one. Do not call it alone for bookkeeping: send the update in the same response \
+as the real work. No arguments reads the list with ids. Do not mix todos with updates/add."
     }
     fn parameters_schema(&self) -> Value {
         json!({
@@ -708,7 +733,8 @@ with ids. Do not mix todos with updates/add."
             ));
         };
         let notes = match next {
-            Ok(applied) => {
+            Ok(mut applied) => {
+                auto_advance(&todos, &mut applied.items, &mut applied.notes);
                 *todos = applied.items;
                 applied.notes
             }
@@ -917,8 +943,13 @@ mod tests {
         assert_eq!(after.len(), 3);
         assert_eq!(after[1].status, "completed");
         assert_eq!(after[2].content, "Renamed");
-        assert_eq!(after[2].status, "pending");
-        // Nothing is in_progress now, so an idless update has no target.
+        // Finishing the second task started the next pending one.
+        assert_eq!(after[2].status, "in_progress");
+        assert!(two.content.contains("Started the next task \"Renamed\""));
+        // Finish it too: nothing is in_progress now, so an idless update has
+        // no target.
+        let finished_last = run(&tool, json!({"updates": [{"status": "done"}]})).await;
+        assert!(!finished_last.is_error, "{}", finished_last.content);
         let no_current = run(&tool, json!({"updates": [{"status": "done"}]})).await;
         assert!(no_current.is_error);
         // Starting several tasks keeps the latest one in_progress; an idless
@@ -1516,6 +1547,120 @@ mod tests {
         assert_eq!(after[0].status, "pending");
         assert_eq!(after[1].status, "in_progress");
         assert!(result.content.contains("Only one task can be in_progress"));
+    }
+
+    fn statuses(output: &ToolOutput) -> Vec<String> {
+        items(output).into_iter().map(|t| t.status).collect()
+    }
+
+    #[tokio::test]
+    async fn finishing_a_task_starts_the_next_pending_one() {
+        let tool = TodoListTool::new();
+        run(
+            &tool,
+            json!({"todos": [
+                {"title": "Design", "status": "in_progress"},
+                {"title": "Build", "status": "pending"},
+                {"title": "Verify", "status": "pending"}
+            ]}),
+        )
+        .await;
+
+        let done = run(
+            &tool,
+            json!({"updates": [{"title": "Design", "status": "done"}]}),
+        )
+        .await;
+        assert_eq!(statuses(&done), ["completed", "in_progress", "pending"]);
+        assert!(done.content.contains("Started the next task \"Build\""));
+        assert!(done.content.contains("Current task: Build"));
+
+        // A full-list mirror that forgot to start the next task behaves the same.
+        let mirrored = run(
+            &tool,
+            json!({"todos": [
+                {"title": "Design", "status": "done"},
+                {"title": "Build", "status": "done"},
+                {"title": "Verify", "status": "pending"}
+            ]}),
+        )
+        .await;
+        assert_eq!(
+            statuses(&mirrored),
+            ["completed", "completed", "in_progress"]
+        );
+
+        // Cancelling counts as finishing; the last task done leaves nothing to start.
+        let last = run(
+            &tool,
+            json!({"updates": [{"title": "Verify", "status": "cancelled"}]}),
+        )
+        .await;
+        assert_eq!(statuses(&last), ["completed", "completed", "cancelled"]);
+        assert!(last.content.contains("No unfinished todo items remain"));
+    }
+
+    #[tokio::test]
+    async fn nothing_starts_unless_this_call_finished_a_task() {
+        let tool = TodoListTool::new();
+        // Creating a list never starts anything.
+        let created = run(
+            &tool,
+            json!({"todos": [{"title": "A", "status": "pending"}, {"title": "B", "status": "pending"}]}),
+        )
+        .await;
+        assert_eq!(statuses(&created), ["pending", "pending"]);
+        assert!(!created.content.contains("Started the next task"));
+
+        // Re-sending an already finished task as done is not a new finish.
+        run(
+            &tool,
+            json!({"updates": [{"title": "A", "status": "in_progress"}]}),
+        )
+        .await;
+        let first = run(
+            &tool,
+            json!({"updates": [{"title": "A", "status": "done"}]}),
+        )
+        .await;
+        assert_eq!(statuses(&first), ["completed", "in_progress"]);
+        run(
+            &tool,
+            json!({"updates": [{"title": "B", "status": "pending"}]}),
+        )
+        .await;
+        let again = run(
+            &tool,
+            json!({"updates": [{"title": "A", "status": "done"}]}),
+        )
+        .await;
+        assert!(!again.content.contains("Started the next task"));
+        assert_eq!(statuses(&again), ["completed", "pending"]);
+    }
+
+    #[tokio::test]
+    async fn an_explicitly_started_task_is_not_replaced_by_auto_start() {
+        let tool = TodoListTool::new();
+        run(
+            &tool,
+            json!({"todos": [
+                {"title": "A", "status": "in_progress"},
+                {"title": "B", "status": "pending"},
+                {"title": "C", "status": "pending"}
+            ]}),
+        )
+        .await;
+        // The model finishes A and starts C itself: B stays pending.
+        let result = run(
+            &tool,
+            json!({"updates": [
+                {"title": "A", "status": "done"},
+                {"title": "C", "status": "in_progress"}
+            ]}),
+        )
+        .await;
+        assert_eq!(statuses(&result), ["completed", "pending", "in_progress"]);
+        assert!(!result.content.contains("Started the next task"));
     }
 
     #[test]
