@@ -15186,6 +15186,21 @@ pub(crate) fn summarize_tool_input(input: &serde_json::Value) -> String {
             }
         }
     }
+    // Batch forms (`Read files`, `Grep paths`): list the targets.
+    for key in ["files", "paths"] {
+        if let Some(items) = input.get(key).and_then(|v| v.as_array()) {
+            let names: Vec<&str> = items
+                .iter()
+                .filter_map(|v| {
+                    v.as_str()
+                        .or_else(|| v.get("path").and_then(|p| p.as_str()))
+                })
+                .collect();
+            if !names.is_empty() {
+                return names.join(", ").chars().take(512).collect();
+            }
+        }
+    }
     // Null / empty containers render as nothing: ACP-delegated tool cards
     // carry `input: null` (the protocol only exposes titles, not argument
     // details), and serializing that fallback produced literal "null"
@@ -20729,6 +20744,22 @@ mod app_state_tests {
         );
         // prev_content_lines still updated for continuity.
         assert_eq!(state.prev_content_lines, Some(35));
+    }
+
+    #[test]
+    fn summarize_tool_input_lists_batch_targets() {
+        assert_eq!(
+            summarize_tool_input(&serde_json::json!({"files": [{"path": "a.rs"}, "b.rs"]})),
+            "a.rs, b.rs"
+        );
+        assert_eq!(
+            summarize_tool_input(&serde_json::json!({"pattern": "x", "paths": ["src", "docs"]})),
+            "x"
+        );
+        assert_eq!(
+            summarize_tool_input(&serde_json::json!({"paths": ["src", "docs"]})),
+            "src, docs"
+        );
     }
 
     #[test]

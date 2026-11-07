@@ -256,10 +256,25 @@ pub fn infer_accesses(
 ) -> ToolAccesses {
     match tool_name {
         "Read" | "ReadMediaFile" => {
-            if let Some(p) = input.get("path").and_then(|v| v.as_str()) {
-                tool_accesses::read_file(resolve_tool_path(working_dir, p))
-            } else {
+            // `path` plus the batch form `files: [{path}, ...]`.
+            let mut paths: Vec<&str> = input
+                .get("path")
+                .and_then(|v| v.as_str())
+                .into_iter()
+                .collect();
+            if let Some(files) = input.get("files").and_then(|v| v.as_array()) {
+                paths.extend(files.iter().filter_map(|f| {
+                    f.as_str()
+                        .or_else(|| f.get("path").and_then(|v| v.as_str()))
+                }));
+            }
+            if paths.is_empty() {
                 tool_accesses::all()
+            } else {
+                paths
+                    .into_iter()
+                    .flat_map(|p| tool_accesses::read_file(resolve_tool_path(working_dir, p)))
+                    .collect()
             }
         }
         "Write" => {
@@ -277,12 +292,23 @@ pub fn infer_accesses(
             }
         }
         "Grep" => {
-            let root = input
+            // `path` / `directory` plus the multi-target form `paths: [...]`.
+            let mut roots: Vec<&str> = input
                 .get("path")
                 .or_else(|| input.get("directory"))
                 .and_then(|v| v.as_str())
-                .unwrap_or(".");
-            tool_accesses::search_tree(resolve_tool_path(working_dir, root))
+                .into_iter()
+                .collect();
+            if let Some(paths) = input.get("paths").and_then(|v| v.as_array()) {
+                roots.extend(paths.iter().filter_map(|v| v.as_str()));
+            }
+            if roots.is_empty() {
+                roots.push(".");
+            }
+            roots
+                .into_iter()
+                .flat_map(|root| tool_accesses::search_tree(resolve_tool_path(working_dir, root)))
+                .collect()
         }
         "Glob" => glob_accesses(input, working_dir),
         "Bash" => bash_accesses(input, working_dir),

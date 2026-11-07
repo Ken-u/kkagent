@@ -2299,20 +2299,9 @@ impl AgentLoop {
 
                 if !output.is_error {
                     if name == "Read" {
-                        if let Some(path_str) = input
-                            .as_ref()
-                            .and_then(|v| v.get("path"))
-                            .and_then(|v| v.as_str())
-                        {
-                            if let Some(hash) = output
-                                .data
-                                .as_ref()
-                                .and_then(|d| d.get("content_hash"))
-                                .and_then(|v| v.as_str())
-                            {
-                                let path = session.resolve_tracked_path(path_str);
-                                session.record_read_content_hash(&path, hash.to_string());
-                            }
+                        for (path_str, hash) in read_content_hashes(input.as_ref(), &output) {
+                            let path = session.resolve_tracked_path(&path_str);
+                            session.record_read_content_hash(&path, hash);
                         }
                     } else if name == "Edit" || name == "Write" {
                         if let Some(path_str) = input
@@ -3955,6 +3944,38 @@ fn acp_backed_session(session: &Session) -> bool {
     kkagent_config::acp_agent_id(&session.get_model_alias()).is_some()
 }
 
+/// `(path, content_hash)` for every file a successful `Read` call returned:
+/// the single-file form reports one hash in `data`, the batch form (`files`)
+/// one per entry in `data.files`.
+fn read_content_hashes(
+    input: Option<&serde_json::Value>,
+    output: &ToolOutput,
+) -> Vec<(String, String)> {
+    let Some(data) = output.data.as_ref() else {
+        return Vec::new();
+    };
+    if let Some(files) = data.get("files").and_then(|v| v.as_array()) {
+        return files
+            .iter()
+            .filter_map(|entry| {
+                Some((
+                    entry.get("path")?.as_str()?.to_string(),
+                    entry.get("content_hash")?.as_str()?.to_string(),
+                ))
+            })
+            .collect();
+    }
+    let path = data
+        .get("path")
+        .or_else(|| input.and_then(|v| v.get("path")))
+        .and_then(|v| v.as_str());
+    let hash = data.get("content_hash").and_then(|v| v.as_str());
+    match (path, hash) {
+        (Some(path), Some(hash)) => vec![(path.to_string(), hash.to_string())],
+        _ => Vec::new(),
+    }
+}
+
 fn describe_tool_action(name: &str, input: &serde_json::Value) -> String {
     match name {
         "Read" | "Write" | "Edit" => {
@@ -4040,6 +4061,44 @@ mod retry_tests {
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
     };
+
+    #[test]
+    fn read_content_hashes_cover_single_and_batch_reads() {
+        // Single file: path from the data (or the call input), hash from data.
+        let single = ToolOutput::success_with_data(
+            "x",
+            serde_json::json!({"path": "a.rs", "content_hash": "h1"}),
+        );
+        let input = serde_json::json!({"path": "a.rs"});
+        assert_eq!(
+            read_content_hashes(Some(&input), &single),
+            vec![("a.rs".to_string(), "h1".to_string())]
+        );
+        // Older results without `data.path` fall back to the call input.
+        let legacy = ToolOutput::success_with_data("x", serde_json::json!({"content_hash": "h2"}));
+        assert_eq!(
+            read_content_hashes(Some(&input), &legacy),
+            vec![("a.rs".to_string(), "h2".to_string())]
+        );
+        // Batch: one baseline per file that was read; entries without a hash
+        // (failed files are not listed at all) are ignored.
+        let batch = ToolOutput::success_with_data(
+            "x",
+            serde_json::json!({"files": [
+                {"path": "a.rs", "content_hash": "h1"},
+                {"path": "b.rs", "content_hash": "h3"},
+                {"path": "c.rs"}
+            ]}),
+        );
+        assert_eq!(
+            read_content_hashes(None, &batch),
+            vec![
+                ("a.rs".to_string(), "h1".to_string()),
+                ("b.rs".to_string(), "h3".to_string())
+            ]
+        );
+        assert!(read_content_hashes(None, &ToolOutput::success("no data")).is_empty());
+    }
 
     #[test]
     fn stream_delta_buffer_coalesces_same_kind_to_threshold() {
