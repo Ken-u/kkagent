@@ -419,6 +419,7 @@ impl AgentLoop {
     ) -> futures::future::BoxFuture<'a, anyhow::Result<()>> {
         Box::pin(async move {
             session.steer_mailbox.start_turn();
+            session.batch_hint.reset();
             let _heartbeat = TurnHeartbeat::spawn(self.event_tx.clone(), session.id.clone());
             let mut completed_rounds = 0_u32;
             let mut goal_continuations = 0_u32;
@@ -1638,6 +1639,12 @@ impl AgentLoop {
             }
             let dedupe_reminder = dedupe.reminder.clone();
             let dedupe_force_stop = dedupe.force_stop;
+            let batch_reminder =
+                if model_profile.is_none_or(|profile| profile.behavior.batch_reminder) {
+                    session.batch_hint.observe_step(&call_pairs)
+                } else {
+                    None
+                };
 
             // If AskUserQuestion is present in this step, defer any ExitPlanMode
             // — answer the user's question first, then let the model regenerate.
@@ -2463,6 +2470,12 @@ impl AgentLoop {
             if let Some(reminder) = dedupe_reminder {
                 if let Some((_, output)) = tool_results.last_mut() {
                     output.content.push_str(&reminder);
+                }
+            }
+            // A lone read-only lookup, again: nudge toward batching.
+            if let Some(reminder) = batch_reminder {
+                if let Some((_, output)) = tool_results.last_mut() {
+                    output.content.push_str(reminder);
                 }
             }
 

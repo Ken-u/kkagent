@@ -2,6 +2,7 @@ pub mod acp_backend;
 pub mod activity_view;
 pub mod agent_loop;
 pub mod audit;
+pub mod batch_hint;
 pub mod blob_store;
 pub mod checkpoint_store;
 pub mod context_breakdown;

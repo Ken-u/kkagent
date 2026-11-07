@@ -811,12 +811,25 @@ pub enum BashRouteMode {
 }
 
 /// Per-profile switches for runtime nudges (see `[model_profiles.*.behavior]`).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProfileBehavior {
     /// `"hint"` (default) or `"off"`.
     #[serde(default)]
     pub bash_route: BashRouteMode,
+    /// Remind the model to batch independent read-only lookups into one
+    /// response when it keeps issuing them one per request (default `true`).
+    #[serde(default = "default_true")]
+    pub batch_reminder: bool,
+}
+
+impl Default for ProfileBehavior {
+    fn default() -> Self {
+        Self {
+            bash_route: BashRouteMode::default(),
+            batch_reminder: true,
+        }
+    }
 }
 
 /// Case-insensitive exact match, or prefix match for a trailing `*`.
@@ -2689,6 +2702,21 @@ fallback = "quality"
             toml::from_str::<ModelProfileConfig>("[behavior]\nbash_route = \"block\"").is_err()
         );
         assert!(toml::from_str::<ModelProfileConfig>("[behavior]\nbash_rout = \"off\"").is_err());
+    }
+
+    #[test]
+    fn batch_reminder_is_on_unless_a_profile_turns_it_off() {
+        assert!(ModelProfileConfig::default().behavior.batch_reminder);
+        assert!(
+            profile("[behavior]\nbash_route = \"off\"")
+                .behavior
+                .batch_reminder
+        );
+        assert!(
+            !profile("[behavior]\nbatch_reminder = false")
+                .behavior
+                .batch_reminder
+        );
     }
 
     #[test]

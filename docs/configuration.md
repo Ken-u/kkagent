@@ -297,6 +297,8 @@ Bash = "读文件用 Read、搜索用 Grep、列目录用 Glob：它们带行号
 [model_profiles.shell-first.behavior]
 # Bash 命令只是读文件/搜索/列目录时，结果末尾追加指向 Read/Grep/Glob 的一行提示。
 bash_route = "hint"               # hint | off
+# 模型连续多次每次只发一个只读查询（Read/Grep/Glob/只读 Bash）时，提醒把互不依赖的查询放进同一次响应。
+batch_reminder = true
 ```
 
 - **绑定**：一个模型最多匹配一个 profile；多个 profile 的 `models` 同时命中同一模型会在启动校验时报错。没有匹配的 profile 时行为与以前完全一致。

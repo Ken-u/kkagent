@@ -102,6 +102,12 @@ ID 是 12 位随机 hex（如 `a4f2c1e93b7d`），只在读取结果里出现；
 
 提示只会指向当前模型能调用的工具（被 `[model_profiles.*]` 的 `hide` / `expose` 去掉的工具不会被提到）。想完全关闭，在对应 profile 里写 `[model_profiles.NAME.behavior] bash_route = "off"`；`models = ["*"]` 的 profile 可以对所有模型生效。
 
+## 批量查询提醒
+
+近 30 天约 86% 的 LLM 请求只发一个工具调用，其中大量是互不依赖的只读查询，每个都多花一次完整的 LLM 往返。连续两次请求都只含一个只读查询（`Read` 单文件、`Grep`、`Glob`，或只读的 `Bash`，判断同上节）时，最后一个工具结果末尾会追加一条 `<system-reminder>`，提示把互不依赖的查询放进同一次响应并行执行；之后每 4 次请求才重复一次。一次请求里有多个调用、多文件 `Read`、写入/编辑等真实工作时计数清零，每个用户回合开始时也清零。
+
+用 `[model_profiles.NAME.behavior] batch_reminder = false` 关闭。
+
 ## 图片输入
 
 模型配置含 `image_in`（也兼容 `vision`、`image`、`multimodal`）时启用完整图片输入：

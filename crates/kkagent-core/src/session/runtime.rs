@@ -252,6 +252,8 @@ pub struct Session {
     pub turns_since_todo: u32,
     /// Cross-turn tool dedupe tracker.
     pub tool_dedupe: crate::tool_dedupe::ToolDedupeTracker,
+    /// Streak of single read-only lookups per LLM request (batching nudge).
+    pub batch_hint: crate::batch_hint::BatchHintTracker,
     /// Session token counter (measured anchors + estimates).
     pub token_counter: crate::token_counting::TokenCounter,
     /// Token count right after the last successful compaction (re-compact guard).
@@ -468,6 +470,7 @@ impl Session {
             announced_deferred_tools: std::collections::HashSet::new(),
             turns_since_todo: 0,
             tool_dedupe: crate::tool_dedupe::ToolDedupeTracker::new(),
+            batch_hint: crate::batch_hint::BatchHintTracker::new(),
             token_counter: crate::token_counting::TokenCounter::new(
                 crate::token_counting::TokenCountingStrategy::MeasuredPlusEstimated,
             ),
