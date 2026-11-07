@@ -25,11 +25,13 @@ pub fn analyze_shell_command(command: &str) -> ShellRisk {
         return r;
     }
 
-    // Fallback substring heuristics for obfuscated / unparsed forms
-    let lower = c.to_lowercase();
-    if lower.contains("rm -rf /") || lower.contains("rm -rf /*") {
+    // Token-level scan of the raw text (sees through `sh -c "rm -rf /"` and
+    // `$HOME`), never a substring match: `rm -rf /tmp/x` must stay allowed.
+    if raw_rm_wipes_root(c) {
         return ShellRisk::Dangerous("recursive delete of filesystem root".into());
     }
+    // Fallback substring heuristics for obfuscated / unparsed forms.
+    let lower = c.to_lowercase();
     if lower.contains(":(){") || lower.contains("fork bomb") {
         return ShellRisk::Dangerous("fork bomb".into());
     }
@@ -127,6 +129,65 @@ fn detect_sensitive_path_in_command(command: &str) -> Option<String> {
     None
 }
 
+/// `rm` or an absolute / relative path to it (`/bin/rm`, `\rm`).
+fn is_rm(word: &str) -> bool {
+    let w = word.trim_start_matches('\\');
+    w == "rm" || w.rsplit('/').next() == Some("rm")
+}
+
+/// Whether `arg` names the filesystem root or a home directory *as a whole*
+/// (`/`, `/*`, `~`, `$HOME`, ...). Sub-paths like `/tmp/x` or `~/proj` are not.
+fn is_root_like_target(arg: &str) -> bool {
+    let t = arg.trim_matches(|c: char| matches!(c, '"' | '\'' | '`' | '(' | ')' | ';'));
+    matches!(
+        t,
+        "/" | "/*"
+            | "/."
+            | "~"
+            | "~/"
+            | "~/*"
+            | "$HOME"
+            | "$HOME/"
+            | "$HOME/*"
+            | "${HOME}"
+            | "${HOME}/"
+            | "${HOME}/*"
+    )
+}
+
+fn is_recursive_flag(arg: &str) -> bool {
+    arg == "--recursive"
+        || (arg.starts_with('-')
+            && !arg.starts_with("--")
+            && arg[1..].chars().any(|c| c == 'r' || c == 'R'))
+}
+
+/// Arguments of an `rm` invocation (everything after the command word) that
+/// would wipe the filesystem root or a home directory.
+fn rm_args_wipe_root(args: &[&str]) -> bool {
+    let recursive = args
+        .iter()
+        .any(|a| is_recursive_flag(a) || *a == "--no-preserve-root");
+    recursive && args.iter().any(|a| is_root_like_target(a))
+}
+
+/// Token-level scan of the raw command text, used when the AST cannot see
+/// through quoting (`sh -c "rm -rf /"`) or `$HOME` expansion.
+fn raw_rm_wipes_root(command: &str) -> bool {
+    for stmt in command.split([';', '&', '|', '\n', '(', ')', '`']) {
+        let words: Vec<&str> = stmt
+            .split_whitespace()
+            .map(|w| w.trim_matches(|c: char| matches!(c, '"' | '\'')))
+            .collect();
+        for (i, w) in words.iter().enumerate() {
+            if is_rm(w) && rm_args_wipe_root(&words[i + 1..]) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn walk_dangerous(node: &AstNode) -> Option<ShellRisk> {
     match node {
         AstNode::Script(xs) | AstNode::Pipeline(xs) => {
@@ -144,14 +205,9 @@ fn walk_dangerous(node: &AstNode) -> Option<ShellRisk> {
                 .collect::<Vec<_>>()
                 .join(" ");
             let lower = joined.to_lowercase();
-            if n == "rm"
-                && args.iter().any(|a| a == "-rf" || a == "-fr")
-                && args.iter().any(|a| a == "/" || a == "/*")
-            {
-                return Some(ShellRisk::Dangerous(
-                    "recursive delete of filesystem root".into(),
-                ));
-            }
+            // `rm` on the filesystem root / home is handled by `raw_rm_wipes_root`:
+            // the AST tokenizer splits `$HOME/x` and `"$DIR"/*` into separate
+            // words, which would make `/*` look like a standalone target.
             if n == "mkfs" || n.starts_with("mkfs.") {
                 return Some(ShellRisk::Dangerous("filesystem format".into()));
             }
@@ -259,6 +315,65 @@ mod tests {
             analyze_shell_command("rm -rf /"),
             ShellRisk::Dangerous(_)
         ));
+    }
+
+    #[test]
+    fn rm_of_subpaths_is_not_blocked() {
+        // Regression: a substring match on "rm -rf /" used to block every
+        // absolute-path delete (39 false positives in real sessions).
+        for cmd in [
+            "rm -rf /tmp/di_test",
+            "rm -rf /tmp/newtown_fixture_check && mkdir -p /tmp/newtown_fixture_check",
+            "cd /tmp && rm -rf /tmp/nt-verify.4P6nXw && ls",
+            "rm -rf /Users/me/proj/target",
+            "rm -rf ~/proj/target",
+            "rm -rf $HOME/proj/target",
+            "rm -rf ./build",
+            "rm -fr /var/tmp/x /tmp/y",
+            "rm -rf \"$BUILD_DIR\"/*",
+            "rm -rf \"$HOME\"/proj/target",
+            "rm /tmp/file",
+            "sudo rm -rf /tmp/x",
+        ] {
+            assert!(
+                !matches!(analyze_shell_command(cmd), ShellRisk::Dangerous(_)),
+                "must not be blocked: {cmd}"
+            );
+        }
+        assert!(matches!(
+            analyze_shell_command("rm -rf /tmp/x"),
+            ShellRisk::Caution(_)
+        ));
+    }
+
+    #[test]
+    fn rm_of_root_or_home_is_blocked_in_every_spelling() {
+        for cmd in [
+            "rm -rf /",
+            "rm -rf /*",
+            "rm -fr /",
+            "rm -Rf /",
+            "rm -r -f /",
+            "rm --recursive --force /",
+            "rm -rf --no-preserve-root /",
+            "rm -rf /tmp/x /",
+            "sudo rm -rf /",
+            "/bin/rm -rf /",
+            "rm -rf ~",
+            "rm -rf ~/",
+            "rm -rf $HOME",
+            "rm -rf \"$HOME\"",
+            "rm -rf ${HOME}/*",
+            "sh -c \"rm -rf /\"",
+            "bash -c 'cd /tmp && rm -rf /'",
+            "echo $(rm -rf /)",
+            "ls; rm -rf /",
+        ] {
+            assert!(
+                matches!(analyze_shell_command(cmd), ShellRisk::Dangerous(_)),
+                "must be blocked: {cmd}"
+            );
+        }
     }
 
     #[test]
