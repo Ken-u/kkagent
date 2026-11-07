@@ -16,6 +16,7 @@ use crate::app::{
     PendingApproval, PendingQuestion, TaskDetailState, TodoItem, ToolExpandHit, ToolExpandTarget,
     ToolHistorySummary,
 };
+use crate::fold::{self, FoldPlan, MemberSlot};
 use crate::git_badge;
 use crate::i18n::{self, Locale};
 use crate::panes;
@@ -25,7 +26,7 @@ const TIPS: &[&str] = &[
     "/compact compresses context when it gets long",
     "@ opens file picker — tab to insert a path",
     "ctrl+f searches the transcript",
-    "ctrl+o expands turn tool history",
+    "ctrl+o expands collapsed thinking and turn tool history",
     "tab / ←→ cycle related sessions · ctrl+d close session",
     "ctrl+g toggles the BTW workspace",
     "shift-tab toggles plan mode (scroll locks to plan)",
@@ -691,7 +692,10 @@ fn tool_expand_target_message(target: ToolExpandTarget) -> usize {
         ToolExpandTarget::Part { message, .. }
         | ToolExpandTarget::Legacy { message, .. }
         | ToolExpandTarget::Plan { message }
-        | ToolExpandTarget::Compaction { message, .. } => message,
+        | ToolExpandTarget::Compaction { message, .. }
+        | ToolExpandTarget::Thinking { message }
+        | ToolExpandTarget::Group { message, .. }
+        | ToolExpandTarget::HistoryTool { message, .. } => message,
     }
 }
 
@@ -827,6 +831,13 @@ fn transcript_layout_fingerprint(state: &AppState, width: u16) -> u64 {
         hash_display_message(message, &mut hasher);
     }
 
+    // Group headers summarise members that may live in the (uncached) streaming
+    // tail, so the plan itself is part of the key.
+    let interactive = !browsing_sessions && state.active_subagent_view.is_none();
+    for run in fold_plan_for(state, messages, interactive).runs() {
+        run.hash_into(&mut hasher);
+    }
+
     state.history_loading.hash(&mut hasher);
     if messages.is_empty() && !browsing_sessions {
         (state.tick / 100).hash(&mut hasher);
@@ -851,6 +862,8 @@ fn hash_display_message(message: &crate::app::DisplayMessage, hasher: &mut impl 
         }
         MessageRole::Assistant => {
             message.thinking.hash(hasher);
+            message.thinking_ms.hash(hasher);
+            message.thinking_expanded.hash(hasher);
             if message.parts.is_empty() {
                 message.content.hash(hasher);
                 message.tool_calls.len().hash(hasher);
@@ -1133,6 +1146,7 @@ fn build_transcript_lines_range(
         lines.push(Line::from(""));
     }
 
+    let fold_plan = fold_plan_for(state, messages, interactive_tools);
     let range = message_range.unwrap_or(0..messages.len());
     for (msg_idx, msg) in messages
         .iter()
@@ -1251,24 +1265,60 @@ fn build_transcript_lines_range(
                 // Thinking block (dim), like kimi
                 let thinking_is_in_live_viewport =
                     live_thinking_message_index(state) == Some(msg_idx);
+                let mut first_bullet = true;
+                let mut rendered_any = false;
                 if let Some(thinking) = msg
                     .thinking
                     .as_ref()
                     .filter(|_| !thinking_is_in_live_viewport)
                 {
-                    push_thinking_lines(
+                    let (gate, header) = fold_gate(
+                        &fold_plan,
+                        msg_idx,
+                        MemberSlot::Thinking,
                         &mut lines,
-                        thinking,
+                        &mut tool_expand_hits,
+                        interactive_tools,
                         width,
                         theme,
-                        state.tool_output_expanded,
                     );
+                    if header {
+                        // The header carries its own bullet; text that follows
+                        // still opens the message's bullet flow.
+                        rendered_any = true;
+                    }
+                    if gate != FoldGate::Hidden {
+                        let nested = gate == FoldGate::Nested;
+                        let inner_width = if nested {
+                            width.saturating_sub(NEST_INDENT)
+                        } else {
+                            width
+                        };
+                        // A click detaches this block from the global Ctrl-O mode.
+                        let expanded = msg.thinking_expanded.unwrap_or(state.tool_output_expanded);
+                        let start = lines.len();
+                        let header = push_thinking_lines(
+                            &mut lines,
+                            thinking,
+                            inner_width,
+                            theme,
+                            expanded,
+                            msg.thinking_ms,
+                        );
+                        if nested {
+                            indent_lines(&mut lines, start, NEST_INDENT);
+                        }
+                        if let (true, Some(line)) = (interactive_tools, header) {
+                            tool_expand_hits.push(ToolExpandHit {
+                                line,
+                                target: ToolExpandTarget::Thinking { message: msg_idx },
+                            });
+                        }
+                    }
                 }
 
                 // Chronological parts: tools stay where they were called;
                 // later text (final answer) naturally ends at the bottom.
-                let mut first_bullet = true;
-                let mut rendered_any = false;
 
                 if !msg.parts.is_empty() {
                     for (part_idx, part) in msg.parts.iter().enumerate() {
@@ -1288,36 +1338,89 @@ fn build_transcript_lines_range(
                                 rendered_any = true;
                             }
                             DisplayPart::Tool(tc) => {
-                                if let Some(line) = render_tool_call_lines(
+                                let (gate, header) = fold_gate(
+                                    &fold_plan,
+                                    msg_idx,
+                                    MemberSlot::Part(part_idx),
                                     &mut lines,
-                                    tc,
+                                    &mut tool_expand_hits,
+                                    interactive_tools,
                                     width,
                                     theme,
-                                    first_bullet,
+                                );
+                                if header {
+                                    first_bullet = false;
+                                    rendered_any = true;
+                                }
+                                if gate == FoldGate::Hidden {
+                                    continue;
+                                }
+                                let nested = gate == FoldGate::Nested;
+                                let inner_width = if nested {
+                                    width.saturating_sub(NEST_INDENT)
+                                } else {
+                                    width
+                                };
+                                let start = lines.len();
+                                let hit = render_tool_call_lines(
+                                    &mut lines,
+                                    tc,
+                                    inner_width,
+                                    theme,
+                                    first_bullet || nested,
                                     true,
-                                ) {
-                                    if interactive_tools {
-                                        tool_expand_hits.push(ToolExpandHit {
-                                            line,
-                                            target: ToolExpandTarget::Part {
-                                                message: msg_idx,
-                                                part: part_idx,
-                                            },
-                                        });
-                                    }
+                                );
+                                if nested {
+                                    indent_lines(&mut lines, start, NEST_INDENT);
+                                }
+                                if let (true, Some(line)) = (interactive_tools, hit) {
+                                    tool_expand_hits.push(ToolExpandHit {
+                                        line,
+                                        target: ToolExpandTarget::Part {
+                                            message: msg_idx,
+                                            part: part_idx,
+                                        },
+                                    });
                                 }
                                 first_bullet = false;
                                 rendered_any = true;
                             }
                             DisplayPart::ToolHistory(hist) => {
-                                let line = render_tool_history_lines(
+                                let (gate, header) = fold_gate(
+                                    &fold_plan,
+                                    msg_idx,
+                                    MemberSlot::Part(part_idx),
                                     &mut lines,
-                                    hist,
+                                    &mut tool_expand_hits,
+                                    interactive_tools,
                                     width,
                                     theme,
-                                    locale,
-                                    first_bullet,
                                 );
+                                if header {
+                                    first_bullet = false;
+                                    rendered_any = true;
+                                }
+                                if gate == FoldGate::Hidden {
+                                    continue;
+                                }
+                                let nested = gate == FoldGate::Nested;
+                                let inner_width = if nested {
+                                    width.saturating_sub(NEST_INDENT)
+                                } else {
+                                    width
+                                };
+                                let start = lines.len();
+                                let (line, tool_hits) = render_tool_history_lines(
+                                    &mut lines,
+                                    hist,
+                                    inner_width,
+                                    theme,
+                                    locale,
+                                    first_bullet || nested,
+                                );
+                                if nested {
+                                    indent_lines(&mut lines, start, NEST_INDENT);
+                                }
                                 if interactive_tools {
                                     tool_expand_hits.push(ToolExpandHit {
                                         line,
@@ -1326,6 +1429,16 @@ fn build_transcript_lines_range(
                                             part: part_idx,
                                         },
                                     });
+                                    for (tool, tool_line) in tool_hits {
+                                        tool_expand_hits.push(ToolExpandHit {
+                                            line: tool_line,
+                                            target: ToolExpandTarget::HistoryTool {
+                                                message: msg_idx,
+                                                part: part_idx,
+                                                tool,
+                                            },
+                                        });
+                                    }
                                 }
                                 first_bullet = false;
                                 rendered_any = true;
@@ -1453,49 +1566,135 @@ pub(crate) fn push_assistant_markdown(
     }
 }
 
+/// One-line digest of a finished thinking block. Reasoning summaries label
+/// their steps with `**Title**` (or markdown `# Title`) lines; those are joined
+/// with ` › `. Without headings the first non-empty line stands in.
+pub(crate) fn thinking_headline(thinking: &str) -> String {
+    let mut headings: Vec<String> = Vec::new();
+    let mut first_line: Option<String> = None;
+    for raw in thinking.lines() {
+        let line = raw.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let heading = line
+            .strip_prefix("**")
+            .and_then(|rest| rest.strip_suffix("**"))
+            .filter(|title| !title.is_empty() && !title.contains("**"))
+            .or_else(|| {
+                line.starts_with('#')
+                    .then(|| line.trim_start_matches('#').trim())
+                    .filter(|title| !title.is_empty())
+            });
+        match heading {
+            Some(title) => {
+                let title = title.trim_end_matches([':', '.', '。', '：']).trim();
+                if !title.is_empty() && headings.last().map(String::as_str) != Some(title) {
+                    headings.push(title.to_string());
+                }
+            }
+            None if first_line.is_none() => first_line = Some(line.to_string()),
+            None => {}
+        }
+    }
+    let digest = if headings.is_empty() {
+        first_line.unwrap_or_default()
+    } else {
+        headings.join(" › ")
+    };
+    // Single line, no control bytes: this goes straight to the terminal.
+    let sanitized = crate::sanitize::sanitize_text(&digest);
+    sanitized.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Spans of a one-line fold summary: `● <core> — <detail>  <hint>`.
+///
+/// Information first: `detail` takes whatever room `core` leaves (trimmed with
+/// an ellipsis only when it cannot fit); the toggle `hint` is shown only if it
+/// still fits in full. Never wider than `width` (beyond the bullet itself).
+pub(crate) fn fold_summary_spans(
+    width: u16,
+    theme: &Theme,
+    core: String,
+    detail: &str,
+    hint: &str,
+) -> Vec<Span<'static>> {
+    let dim = Style::default()
+        .fg(theme.text_dim)
+        .add_modifier(Modifier::ITALIC);
+    let muted = Style::default().fg(theme.text_muted);
+    let hint = format!("  {hint}");
+    let hint_cols = UnicodeWidthStr::width(hint.as_str());
+    let avail = (width as usize).saturating_sub(2); // "● " bullet
+
+    let mut spans = vec![Span::styled("● ", Style::default().fg(theme.text_dim))];
+    let core_cols = UnicodeWidthStr::width(core.as_str());
+    if core_cols >= avail {
+        spans.push(Span::styled(truncate_display_width(&core, avail), dim));
+        return spans;
+    }
+    spans.push(Span::styled(core, dim));
+    let mut rest = avail - core_cols;
+    const SEP: &str = " — ";
+    let sep_cols = UnicodeWidthStr::width(SEP);
+    if !detail.is_empty() && rest > sep_cols + 3 {
+        let text = truncate_display_width(detail, rest - sep_cols);
+        rest -= sep_cols + UnicodeWidthStr::width(text.as_str());
+        spans.push(Span::styled(SEP, muted));
+        spans.push(Span::styled(text, muted));
+    }
+    if rest >= hint_cols {
+        spans.push(Span::styled(hint, muted));
+    }
+    spans
+}
+
+/// Render a finished thinking block. Collapsed (the default) it is a single
+/// summary line — duration, size and a headline — so the transcript stays
+/// scannable; expanded it shows the full reasoning under the same header.
+/// Returns the header's line index (the click target for expand/collapse).
 pub(crate) fn push_thinking_lines(
     lines: &mut Vec<Line<'static>>,
     thinking: &str,
     width: u16,
     theme: &Theme,
     expanded: bool,
-) {
-    if thinking.is_empty() {
-        return;
+    thinking_ms: Option<u64>,
+) -> Option<usize> {
+    if thinking.trim().is_empty() {
+        return None;
     }
-    lines.push(Line::from(Span::styled(
-        "● thinking",
-        Style::default()
-            .fg(theme.text_dim)
-            .add_modifier(Modifier::ITALIC),
+    let header_line = lines.len();
+    let non_empty_lines = thinking.lines().filter(|l| !l.trim().is_empty()).count();
+
+    let mut core = format!("{} thinking", if expanded { "▾" } else { "▸" });
+    if let Some(ms) = thinking_ms.filter(|ms| *ms >= 1_000) {
+        core.push_str(&format!(
+            " · {}",
+            crate::i18n::duration_label(crate::i18n::Locale::En, ms)
+        ));
+    }
+    core.push_str(&format!(
+        " · {non_empty_lines} line{}",
+        if non_empty_lines == 1 { "" } else { "s" }
+    ));
+    let (detail, hint) = if expanded {
+        (String::new(), "ctrl+o / click to collapse")
+    } else {
+        (thinking_headline(thinking), "ctrl+o / click to expand")
+    };
+    lines.push(Line::from(fold_summary_spans(
+        width, theme, core, &detail, hint,
     )));
-    let think_lines: Vec<&str> = thinking.lines().collect();
-    let max_show = if expanded { usize::MAX } else { 20 };
-    let show = think_lines.len().min(max_show);
-    for line in &think_lines[..show] {
-        push_wrapped_indented_text(lines, line, width, 2, Style::default().fg(theme.text_muted));
+
+    if expanded {
+        let muted = Style::default().fg(theme.text_muted);
+        for line in thinking.lines() {
+            push_wrapped_indented_text(lines, line, width, 2, muted);
+        }
+        lines.push(Line::from(""));
     }
-    if think_lines.len() > show {
-        push_wrapped_indented_text(
-            lines,
-            &format!(
-                "... ({} more lines, ctrl+o to expand)",
-                think_lines.len() - show
-            ),
-            width,
-            2,
-            Style::default().fg(theme.text_muted),
-        );
-    } else if expanded && think_lines.len() > 20 {
-        push_wrapped_indented_text(
-            lines,
-            "… (ctrl+o to collapse)",
-            width,
-            2,
-            Style::default().fg(theme.text_muted),
-        );
-    }
-    lines.push(Line::from(""));
+    Some(header_line)
 }
 
 fn status_icon(tc: &crate::app::DisplayToolCall) -> &'static str {
@@ -1674,6 +1873,81 @@ fn wrap_display_cols(s: &str, max_width: usize) -> Vec<String> {
     out
 }
 
+/// Columns a group's members are indented under its header.
+const NEST_INDENT: u16 = 2;
+
+/// How an item that can belong to a fold group is drawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FoldGate {
+    /// Not in a group: draw as usual.
+    Standalone,
+    /// Its group is folded: draw nothing (the header stands for it).
+    Hidden,
+    /// Its group is expanded: draw one level in.
+    Nested,
+}
+
+/// Group lookup for the overall transcript; mirrors what the renderer sees.
+fn fold_plan_for(
+    state: &AppState,
+    messages: &[crate::app::DisplayMessage],
+    interactive: bool,
+) -> FoldPlan {
+    fold::plan_folds(
+        messages,
+        live_thinking_message_index(state),
+        state.tool_output_expanded,
+        // Only the main session knows whether a turn is still running.
+        interactive && state.status != SessionStatus::Idle,
+    )
+}
+
+/// Draw the group header when `slot` leads its run and say how the item
+/// itself is drawn. The bool reports that a header line was pushed.
+#[allow(clippy::too_many_arguments)]
+fn fold_gate(
+    plan: &FoldPlan,
+    message: usize,
+    slot: MemberSlot,
+    lines: &mut Vec<Line<'static>>,
+    hits: &mut Vec<ToolExpandHit>,
+    interactive: bool,
+    width: u16,
+    theme: &Theme,
+) -> (FoldGate, bool) {
+    let Some(run) = plan.run_of(message, slot) else {
+        return (FoldGate::Standalone, false);
+    };
+    let mut header = false;
+    if run.is_leader(message, slot) {
+        let line = fold::push_group_header(lines, run, width, theme);
+        if interactive {
+            hits.push(ToolExpandHit {
+                line,
+                target: ToolExpandTarget::Group {
+                    message: run.leader.message,
+                    slot: run.leader.slot.code(),
+                    expanded: run.expanded,
+                },
+            });
+        }
+        header = true;
+    }
+    let gate = if run.expanded {
+        FoldGate::Nested
+    } else {
+        FoldGate::Hidden
+    };
+    (gate, header)
+}
+
+/// Shift already-rendered lines right by `cols` columns.
+fn indent_lines(lines: &mut [Line<'static>], from: usize, cols: u16) {
+    for line in lines.iter_mut().skip(from) {
+        line.spans.insert(0, Span::raw(" ".repeat(cols as usize)));
+    }
+}
+
 fn render_tool_history_lines(
     lines: &mut Vec<Line<'static>>,
     hist: &ToolHistorySummary,
@@ -1681,7 +1955,7 @@ fn render_tool_history_lines(
     theme: &Theme,
     locale: Locale,
     first_bullet: bool,
-) -> usize {
+) -> (usize, Vec<(usize, usize)>) {
     let explore_only = !hist.tools.is_empty()
         && hist
             .tools
@@ -1708,14 +1982,17 @@ fn render_tool_history_lines(
         Span::styled(format!(" ({hint})"), Style::default().fg(theme.text_dim)),
     ]));
 
+    // Second level: the overview lists its tools one line each; each tool then
+    // expands on its own (its click target is returned with the tool index).
+    let mut tool_hits = Vec::new();
     if hist.expanded {
-        for tc in &hist.tools {
-            let mut shown = tc.clone();
-            shown.collapsed = false;
-            let _ = render_tool_call_lines(lines, &shown, width, theme, false, false);
+        for (tool_index, tc) in hist.tools.iter().enumerate() {
+            if let Some(line) = render_tool_call_lines(lines, tc, width, theme, false, true) {
+                tool_hits.push((tool_index, line));
+            }
         }
     }
-    hint_line
+    (hint_line, tool_hits)
 }
 
 fn render_compaction_history_lines(
@@ -4794,30 +5071,131 @@ mod render_smoke {
         assert!(!rendered.contains("choice 0"), "{rendered:?}");
     }
 
+    fn lines_text(lines: &[Line<'static>]) -> String {
+        lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn sample_thinking() -> String {
+        let mut text = String::from("**Reading the failing test**\n");
+        for index in 0..10 {
+            text.push_str(&format!("reason {index}\n"));
+        }
+        text.push_str("**Planning the fix**\nreason final");
+        text
+    }
+
     #[test]
-    fn thinking_uses_the_same_ctrl_o_folding_in_all_views() {
+    fn finished_thinking_collapses_to_one_summary_line() {
+        let theme = Theme::default();
+        let mut lines = Vec::new();
+        let header = push_thinking_lines(
+            &mut lines,
+            &sample_thinking(),
+            120,
+            &theme,
+            false,
+            Some(12_400),
+        );
+
+        assert_eq!(header, Some(0));
+        assert_eq!(lines.len(), 1, "collapsed block must be a single line");
+        let text = lines_text(&lines);
+        assert!(text.starts_with("● ▸ thinking"), "{text:?}");
+        assert!(text.contains("12s"), "duration is kept: {text:?}");
+        assert!(text.contains("13 lines"), "size is kept: {text:?}");
+        assert!(
+            text.contains("Reading the failing test › Planning the fix"),
+            "headings form the headline: {text:?}"
+        );
+        assert!(text.contains("ctrl+o / click to expand"), "{text:?}");
+        assert!(!text.contains("reason 3"), "body stays hidden: {text:?}");
+    }
+
+    #[test]
+    fn expanded_thinking_shows_everything_under_a_collapse_header() {
         let thinking = (0..25)
             .map(|index| format!("reason {index}"))
             .collect::<Vec<_>>()
             .join("\n");
         let theme = Theme::default();
-        let mut collapsed = Vec::new();
-        push_thinking_lines(&mut collapsed, &thinking, 80, &theme, false);
-        let collapsed_text = collapsed
-            .iter()
-            .map(|line| line.to_string())
-            .collect::<String>();
-        assert!(collapsed_text.contains("5 more lines, ctrl+o to expand"));
-        assert!(!collapsed_text.contains("reason 24"));
+        let mut lines = Vec::new();
+        let header = push_thinking_lines(&mut lines, &thinking, 80, &theme, true, None);
 
-        let mut expanded = Vec::new();
-        push_thinking_lines(&mut expanded, &thinking, 80, &theme, true);
-        let expanded_text = expanded
-            .iter()
-            .map(|line| line.to_string())
-            .collect::<String>();
-        assert!(expanded_text.contains("reason 24"));
-        assert!(expanded_text.contains("ctrl+o to collapse"));
+        assert_eq!(header, Some(0));
+        let text = lines_text(&lines);
+        assert!(text.starts_with("● ▾ thinking · 25 lines"), "{text:?}");
+        assert!(text.contains("ctrl+o / click to collapse"), "{text:?}");
+        assert!(text.contains("reason 0") && text.contains("reason 24"));
+        assert!(!text.contains("more lines"), "no truncation: {text:?}");
+    }
+
+    #[test]
+    fn collapsed_thinking_without_headings_falls_back_to_the_first_line() {
+        let theme = Theme::default();
+        let mut lines = Vec::new();
+        push_thinking_lines(
+            &mut lines,
+            "\n  Let me look at the config loader first.\nthen more",
+            100,
+            &theme,
+            false,
+            Some(400),
+        );
+        let text = lines_text(&lines);
+        assert!(
+            text.contains("Let me look at the config loader first."),
+            "{text:?}"
+        );
+        assert!(
+            !text.contains("0s"),
+            "sub-second durations are omitted: {text:?}"
+        );
+        assert!(text.contains("2 lines"), "{text:?}");
+    }
+
+    #[test]
+    fn thinking_headline_extracts_headings_and_strips_control_bytes() {
+        assert_eq!(
+            thinking_headline("**Plan:**\nbody\n# Next step\nbody\n**Plan:**\n**Plan:**"),
+            "Plan › Next step › Plan"
+        );
+        assert_eq!(
+            thinking_headline("text with **inline bold** only"),
+            "text with **inline bold** only"
+        );
+        assert_eq!(thinking_headline("  \n \n"), "");
+        let cleaned = thinking_headline("evil \x1b[31mred\x1b[0m\ttext");
+        assert!(!cleaned.contains('\x1b'), "{cleaned:?}");
+        assert!(!cleaned.contains('\t'), "{cleaned:?}");
+    }
+
+    #[test]
+    fn collapsed_thinking_summary_never_exceeds_the_terminal_width() {
+        let theme = Theme::default();
+        let thinking = format!("**{}**\nbody", "很长的标题 long heading ".repeat(12));
+        for width in [0u16, 1, 2, 5, 12, 20, 28, 40, 60, 100, 200] {
+            for expanded in [false, true] {
+                let mut lines = Vec::new();
+                push_thinking_lines(&mut lines, &thinking, width, &theme, expanded, Some(75_000));
+                let header = lines[0].to_string();
+                assert!(
+                    UnicodeWidthStr::width(header.as_str()) <= (width as usize).max(2),
+                    "width {width} expanded {expanded}: {header:?}"
+                );
+            }
+        }
+        // Headline wins over the hint: at 52 columns the hint is dropped and
+        // the headline is trimmed only because it cannot fit even alone.
+        let mut lines = Vec::new();
+        push_thinking_lines(&mut lines, &thinking, 52, &theme, false, Some(75_000));
+        let header = lines[0].to_string();
+        assert!(header.contains("1.2 min"), "{header:?}");
+        assert!(header.contains("很长的标题"), "{header:?}");
+        assert!(!header.contains("ctrl+o"), "{header:?}");
     }
 
     #[test]
@@ -4828,7 +5206,8 @@ mod render_smoke {
             "你好世界abcdefghij",
             10,
             &Theme::default(),
-            false,
+            true,
+            None,
         );
 
         assert!(lines.len() > 3);
@@ -4839,6 +5218,355 @@ mod render_smoke {
                 line.to_string()
             );
         }
+    }
+
+    fn thinking_state() -> AppState {
+        let mut state = AppState::new(PermissionMode::Manual, false);
+        state.messages.push(DisplayMessage {
+            role: MessageRole::User,
+            content: "fix it".into(),
+            thinking: None,
+            thinking_ms: None,
+            thinking_expanded: None,
+            group_overrides: Vec::new(),
+            parts: Vec::new(),
+            tool_calls: Vec::new(),
+            delivery: crate::prompt_queue::DeliveryState::Sent,
+            idempotency_key: None,
+        });
+        state.messages.push(DisplayMessage {
+            role: MessageRole::Assistant,
+            content: "done".into(),
+            thinking: Some(sample_thinking()),
+            thinking_ms: Some(7_000),
+            thinking_expanded: None,
+            group_overrides: Vec::new(),
+            parts: vec![DisplayPart::Text("done".into())],
+            tool_calls: Vec::new(),
+            delivery: crate::prompt_queue::DeliveryState::Sent,
+            idempotency_key: None,
+        });
+        state
+    }
+
+    #[test]
+    fn transcript_thinking_is_collapsed_by_default_and_clickable() {
+        let mut state = thinking_state();
+        let theme = Theme::default();
+        let lines = build_transcript_lines(&mut state, &theme, 100);
+        let text = lines_text(&lines);
+        assert!(text.contains("▸ thinking · 7s · 13 lines"), "{text:?}");
+        assert!(!text.contains("reason 3"), "{text:?}");
+
+        let hit = state
+            .tool_expand_hits
+            .iter()
+            .find(|hit| matches!(hit.target, ToolExpandTarget::Thinking { message: 1 }))
+            .copied()
+            .expect("thinking summary must be clickable");
+        assert!(
+            lines[hit.line].to_string().contains("▸ thinking"),
+            "{:?}",
+            lines[hit.line].to_string()
+        );
+    }
+
+    #[test]
+    fn ctrl_o_expands_thinking_and_a_click_override_survives_it() {
+        let theme = Theme::default();
+        let mut state = thinking_state();
+
+        // Global Ctrl-O mode expands the block.
+        state.tool_output_expanded = true;
+        let text = lines_text(&build_transcript_lines(&mut state, &theme, 100));
+        assert!(text.contains("▾ thinking"), "{text:?}");
+        assert!(text.contains("reason 3"), "{text:?}");
+
+        // A click collapses just this block and detaches it from Ctrl-O.
+        state.messages[1].thinking_expanded = Some(false);
+        let text = lines_text(&build_transcript_lines(&mut state, &theme, 100));
+        assert!(text.contains("▸ thinking"), "{text:?}");
+        assert!(!text.contains("reason 3"), "{text:?}");
+        for global in [false, true] {
+            state.tool_output_expanded = global;
+            let text = lines_text(&build_transcript_lines(&mut state, &theme, 100));
+            assert!(
+                !text.contains("reason 3"),
+                "override survives Ctrl-O (global={global}): {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn thinking_fold_state_invalidates_the_layout_cache() {
+        let mut state = thinking_state();
+        let before = transcript_layout_fingerprint(&state, 80);
+        state.messages[1].thinking_expanded = Some(true);
+        let after = transcript_layout_fingerprint(&state, 80);
+        assert_ne!(before, after);
+        state.messages[1].thinking_expanded = None;
+        state.messages[1].thinking_ms = Some(9_000);
+        assert_ne!(before, transcript_layout_fingerprint(&state, 80));
+    }
+
+    fn group_tool(name: &str, output: Option<&str>) -> DisplayToolCall {
+        DisplayToolCall {
+            id: format!("id-{name}"),
+            name: name.into(),
+            input_summary: String::new(),
+            output: output.map(str::to_string),
+            is_error: false,
+            collapsed: true,
+            user_overridden: false,
+            started_at: None,
+            stopping: false,
+            queued_behind: None,
+        }
+    }
+
+    fn work_message(
+        thinking: Option<&str>,
+        thinking_ms: Option<u64>,
+        parts: Vec<DisplayPart>,
+    ) -> DisplayMessage {
+        DisplayMessage {
+            role: MessageRole::Assistant,
+            content: String::new(),
+            thinking: thinking.map(str::to_string),
+            thinking_ms,
+            thinking_expanded: None,
+            group_overrides: Vec::new(),
+            parts,
+            tool_calls: Vec::new(),
+            delivery: crate::prompt_queue::DeliveryState::Sent,
+            idempotency_key: None,
+        }
+    }
+
+    /// user → [thinking+Read] → [thinking+Edit, answer]: one run of four items.
+    fn grouped_state() -> AppState {
+        let mut state = thinking_state();
+        state.messages.truncate(1); // keep only the user prompt
+        state.messages.push(work_message(
+            Some("**Reading the failing test**\nreason a\nreason b"),
+            Some(4_000),
+            vec![DisplayPart::Tool(group_tool("Read", Some("ok")))],
+        ));
+        state.messages.push(work_message(
+            Some("**Planning the fix**\nreason c"),
+            Some(6_000),
+            vec![
+                DisplayPart::Tool(group_tool("Edit", Some("ok"))),
+                DisplayPart::Text("all done".into()),
+            ],
+        ));
+        state
+    }
+
+    #[test]
+    fn adjacent_foldables_fold_into_one_group_line() {
+        let mut state = grouped_state();
+        let lines = build_transcript_lines(&mut state, &Theme::default(), 120);
+        let text = lines_text(&lines);
+
+        assert!(
+            text.contains("▸ 2 thoughts · 2 tools · 10s — Read Edit  ctrl+o / click to expand"),
+            "{text:?}"
+        );
+        assert!(
+            !text.contains("▸ thinking"),
+            "members stay hidden: {text:?}"
+        );
+        assert!(!text.contains("reason a"), "{text:?}");
+        assert!(
+            text.contains("all done"),
+            "the answer stays visible: {text:?}"
+        );
+
+        assert_eq!(
+            state.tool_expand_hits.len(),
+            1,
+            "only the header is a target"
+        );
+        let hit = state.tool_expand_hits[0];
+        assert_eq!(
+            hit.target,
+            ToolExpandTarget::Group {
+                message: 1,
+                slot: 0,
+                expanded: false
+            }
+        );
+        assert!(lines[hit.line].to_string().contains("▸ 2 thoughts"));
+    }
+
+    #[test]
+    fn expanded_group_lists_its_members_one_level_in() {
+        let mut state = grouped_state();
+        state.messages[1].set_group_override(0, true);
+        let lines = build_transcript_lines(&mut state, &Theme::default(), 120);
+        let text = lines_text(&lines);
+
+        assert!(
+            text.contains("▾ 2 thoughts · 2 tools · 10s  ctrl+o / click to collapse"),
+            "{text:?}"
+        );
+        // Members are one-line summaries, indented under the header.
+        let summaries: Vec<String> = lines
+            .iter()
+            .map(|line| line.to_string())
+            .filter(|line| line.contains("▸ thinking"))
+            .collect();
+        assert_eq!(summaries.len(), 2, "{text:?}");
+        assert!(
+            summaries[0].starts_with("  ● ▸ thinking · 4s · 3 lines"),
+            "{summaries:?}"
+        );
+        assert!(summaries[0].contains("Reading the failing test"));
+        assert!(summaries[1].contains("Planning the fix"));
+        assert!(!text.contains("reason a"), "level 3 stays folded: {text:?}");
+
+        // Each member keeps its own click target (level 3).
+        let thinking_hits: Vec<_> = state
+            .tool_expand_hits
+            .iter()
+            .filter_map(|hit| match hit.target {
+                ToolExpandTarget::Thinking { message } => Some((message, hit.line)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(thinking_hits.len(), 2);
+        for (_, line) in thinking_hits {
+            assert!(lines[line].to_string().contains("▸ thinking"));
+        }
+    }
+
+    #[test]
+    fn one_member_can_expand_inside_a_group() {
+        let mut state = grouped_state();
+        state.messages[1].set_group_override(0, true);
+        state.messages[2].thinking_expanded = Some(true);
+        let text = lines_text(&build_transcript_lines(&mut state, &Theme::default(), 120));
+        assert!(text.contains("▾ thinking · 6s · 2 lines"), "{text:?}");
+        assert!(text.contains("reason c"), "level 3 opened: {text:?}");
+        assert!(!text.contains("reason a"), "siblings stay folded: {text:?}");
+    }
+
+    #[test]
+    fn global_ctrl_o_opens_the_group_and_every_member() {
+        let mut state = grouped_state();
+        state.tool_output_expanded = true;
+        let text = lines_text(&build_transcript_lines(&mut state, &Theme::default(), 120));
+        assert!(text.contains("▾ 2 thoughts"), "{text:?}");
+        assert!(
+            text.contains("reason a") && text.contains("reason c"),
+            "{text:?}"
+        );
+
+        // A click on the group wins over the global mode.
+        state.messages[1].set_group_override(0, false);
+        let text = lines_text(&build_transcript_lines(&mut state, &Theme::default(), 120));
+        assert!(text.contains("▸ 2 thoughts"), "{text:?}");
+        assert!(!text.contains("reason a"), "{text:?}");
+    }
+
+    #[test]
+    fn a_group_still_growing_shows_its_members_until_text_cuts_it_off() {
+        let mut state = grouped_state();
+        // Drop the answer: the run reaches the end of the transcript.
+        state.messages[2].parts.truncate(1);
+        state.status = SessionStatus::Thinking;
+        let text = lines_text(&build_transcript_lines(&mut state, &Theme::default(), 120));
+        assert!(
+            text.contains("▾ 2 thoughts"),
+            "open run is expanded: {text:?}"
+        );
+        assert!(text.contains("▸ thinking · 4s"), "{text:?}");
+
+        // The turn ends (or text arrives): the group folds by itself.
+        state.status = SessionStatus::Idle;
+        let text = lines_text(&build_transcript_lines(&mut state, &Theme::default(), 120));
+        assert!(text.contains("▸ 2 thoughts"), "{text:?}");
+        assert!(!text.contains("▸ thinking"), "{text:?}");
+    }
+
+    #[test]
+    fn group_header_stays_inside_narrow_terminals() {
+        let theme = Theme::default();
+        for width in [0u16, 1, 6, 14, 24, 40, 80] {
+            let mut state = grouped_state();
+            for expanded in [false, true] {
+                state.messages[1].set_group_override(0, expanded);
+                let lines = build_transcript_lines(&mut state, &theme, width);
+                let hit = state.tool_expand_hits[0];
+                let header = lines[hit.line].to_string();
+                assert!(
+                    UnicodeWidthStr::width(header.as_str()) <= (width as usize).max(2),
+                    "width {width}: {header:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn group_changes_in_the_streaming_tail_invalidate_the_cached_prefix() {
+        let mut state = grouped_state();
+        state.messages[2].parts.truncate(1); // run reaches the tail
+        state.status = SessionStatus::ToolExecuting;
+        state.active_assistant_message = Some(2);
+        let before = transcript_layout_fingerprint(&state, 80);
+        // The tail message is not hashed itself, but the header counts it.
+        state.messages[2]
+            .parts
+            .push(DisplayPart::Tool(group_tool("Bash", None)));
+        assert_ne!(before, transcript_layout_fingerprint(&state, 80));
+    }
+
+    #[test]
+    fn expanded_tool_history_lists_tools_that_expand_individually() {
+        let mut first = group_tool("Read", Some("line one\nline two\nline three"));
+        first.collapsed = true;
+        let mut second = group_tool("Bash", Some("a\nb"));
+        second.collapsed = false;
+        let mut state = AppState::new(PermissionMode::Manual, false);
+        state.messages.push(work_message(
+            None,
+            None,
+            vec![
+                DisplayPart::ToolHistory(ToolHistorySummary {
+                    tool_count: 2,
+                    duration_ms: 3_000,
+                    tokens: 10,
+                    expanded: true,
+                    user_overridden: false,
+                    tools: vec![first, second],
+                }),
+                DisplayPart::Text("done".into()),
+            ],
+        ));
+        let lines = build_transcript_lines(&mut state, &Theme::default(), 100);
+        let text = lines_text(&lines);
+
+        assert!(text.contains("2 tool calls"), "{text:?}");
+        assert!(
+            text.contains("3 more lines, ctrl+o to expand"),
+            "tool 0 is one line: {text:?}"
+        );
+        assert!(!text.contains("line three"), "{text:?}");
+        assert!(
+            text.contains("ctrl+o to collapse"),
+            "tool 1 is open: {text:?}"
+        );
+
+        let targets: Vec<_> = state
+            .tool_expand_hits
+            .iter()
+            .filter_map(|hit| match hit.target {
+                ToolExpandTarget::HistoryTool { part, tool, .. } => Some((part, tool)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(targets, vec![(0, 0), (0, 1)]);
     }
 
     #[test]
@@ -5052,6 +5780,9 @@ mod render_smoke {
                 tool_calls: Vec::new(),
                 delivery: crate::prompt_queue::DeliveryState::Sent,
                 idempotency_key: None,
+                thinking_ms: None,
+                thinking_expanded: None,
+                group_overrides: Vec::new(),
             });
             state.todos = (0..4)
                 .map(|index| TodoItem {
@@ -5097,6 +5828,9 @@ mod render_smoke {
             tool_calls: Vec::new(),
             delivery: crate::prompt_queue::DeliveryState::Sent,
             idempotency_key: None,
+            thinking_ms: None,
+            thinking_expanded: None,
+            group_overrides: Vec::new(),
         });
 
         let lines = build_transcript_lines(&mut state, &Theme::default(), 24);
@@ -5134,6 +5868,9 @@ mod render_smoke {
             tool_calls: Vec::new(),
             delivery: crate::prompt_queue::DeliveryState::Sent,
             idempotency_key: None,
+            thinking_ms: None,
+            thinking_expanded: None,
+            group_overrides: Vec::new(),
         });
 
         terminal
@@ -5184,6 +5921,8 @@ mod render_smoke {
                     stopping: false,
                     queued_behind: None,
                 }),
+                // Text between them keeps the two items out of one fold group.
+                DisplayPart::Text("between".into()),
                 DisplayPart::ToolHistory(ToolHistorySummary {
                     tool_count: 1,
                     duration_ms: 10,
@@ -5196,6 +5935,9 @@ mod render_smoke {
             tool_calls: Vec::new(),
             delivery: crate::prompt_queue::DeliveryState::Sent,
             idempotency_key: None,
+            thinking_ms: None,
+            thinking_expanded: None,
+            group_overrides: Vec::new(),
         });
 
         let theme = Theme::default();
@@ -5234,6 +5976,9 @@ mod render_smoke {
             tool_calls: Vec::new(),
             delivery: crate::prompt_queue::DeliveryState::Sent,
             idempotency_key: None,
+            thinking_ms: None,
+            thinking_expanded: None,
+            group_overrides: Vec::new(),
         });
 
         let lines = build_transcript_lines(&mut state, &theme, width);
@@ -5329,6 +6074,9 @@ mod render_smoke {
             tool_calls: Vec::new(),
             delivery: crate::prompt_queue::DeliveryState::Sent,
             idempotency_key: None,
+            thinking_ms: None,
+            thinking_expanded: None,
+            group_overrides: Vec::new(),
         });
 
         let theme = Theme::default();
@@ -5471,6 +6219,9 @@ mod render_smoke {
             tool_calls: Vec::new(),
             delivery: crate::prompt_queue::DeliveryState::Sent,
             idempotency_key: None,
+            thinking_ms: None,
+            thinking_expanded: None,
+            group_overrides: Vec::new(),
         });
         let before = transcript_layout_fingerprint(&state, 80);
         assert_eq!(before, transcript_layout_fingerprint(&state, 80));
@@ -5491,6 +6242,9 @@ mod render_smoke {
             tool_calls: Vec::new(),
             delivery: crate::prompt_queue::DeliveryState::Sent,
             idempotency_key: None,
+            thinking_ms: None,
+            thinking_expanded: None,
+            group_overrides: Vec::new(),
         });
         state.status = SessionStatus::Thinking;
         let before = transcript_layout_fingerprint(&state, 80);
@@ -5515,6 +6269,9 @@ mod render_smoke {
             tool_calls: Vec::new(),
             delivery: crate::prompt_queue::DeliveryState::Sent,
             idempotency_key: None,
+            thinking_ms: None,
+            thinking_expanded: None,
+            group_overrides: Vec::new(),
         });
         state.status = SessionStatus::Thinking;
         let max_height = 1 + live_thinking_body_height(24);
@@ -5570,6 +6327,9 @@ mod render_smoke {
             tool_calls: Vec::new(),
             delivery: crate::prompt_queue::DeliveryState::Sent,
             idempotency_key: None,
+            thinking_ms: None,
+            thinking_expanded: None,
+            group_overrides: Vec::new(),
         });
         state.messages.push(DisplayMessage {
             role: MessageRole::Assistant,
@@ -5579,6 +6339,9 @@ mod render_smoke {
             tool_calls: Vec::new(),
             delivery: crate::prompt_queue::DeliveryState::Sent,
             idempotency_key: None,
+            thinking_ms: None,
+            thinking_expanded: None,
+            group_overrides: Vec::new(),
         });
         state.active_assistant_message = Some(1);
         state.status = SessionStatus::Thinking;
@@ -5645,8 +6408,10 @@ mod render_smoke {
                 .map(Line::to_string)
                 .collect::<Vec<_>>()
                 .join("\n");
+        // The block is collapsed: the headline shows the first line and the
+        // line count proves the second batch was merged in.
         assert!(merged_text.contains("moved thought"));
-        assert!(merged_text.contains("second thought"));
+        assert!(merged_text.contains("2 lines"), "{merged_text:?}");
         let merged_tail = build_transcript_status_lines(&state, &Theme::default(), 80, 24);
         assert!(!merged_tail
             .iter()
@@ -5676,6 +6441,9 @@ mod render_smoke {
             tool_calls: Vec::new(),
             delivery: crate::prompt_queue::DeliveryState::Sent,
             idempotency_key: None,
+            thinking_ms: None,
+            thinking_expanded: None,
+            group_overrides: Vec::new(),
         });
         state.messages.push(DisplayMessage {
             role: MessageRole::Assistant,
@@ -5685,6 +6453,9 @@ mod render_smoke {
             tool_calls: Vec::new(),
             delivery: crate::prompt_queue::DeliveryState::Sent,
             idempotency_key: None,
+            thinking_ms: None,
+            thinking_expanded: None,
+            group_overrides: Vec::new(),
         });
         state.active_assistant_message = Some(1);
         state.status = SessionStatus::ToolExecuting;
@@ -5712,6 +6483,9 @@ mod render_smoke {
                 tool_calls: Vec::new(),
                 delivery: crate::prompt_queue::DeliveryState::Sent,
                 idempotency_key: None,
+                thinking_ms: None,
+                thinking_expanded: None,
+                group_overrides: Vec::new(),
             },
             DisplayMessage {
                 role: MessageRole::Assistant,
@@ -5721,6 +6495,9 @@ mod render_smoke {
                 tool_calls: Vec::new(),
                 delivery: crate::prompt_queue::DeliveryState::Sent,
                 idempotency_key: None,
+                thinking_ms: None,
+                thinking_expanded: None,
+                group_overrides: Vec::new(),
             },
             DisplayMessage {
                 role: MessageRole::User,
@@ -5730,6 +6507,9 @@ mod render_smoke {
                 tool_calls: Vec::new(),
                 delivery: crate::prompt_queue::DeliveryState::Sent,
                 idempotency_key: None,
+                thinking_ms: None,
+                thinking_expanded: None,
+                group_overrides: Vec::new(),
             },
         ];
         state.active_assistant_message = Some(1);
@@ -5783,6 +6563,9 @@ mod render_smoke {
             tool_calls: Vec::new(),
             delivery: crate::prompt_queue::DeliveryState::Sent,
             idempotency_key: None,
+            thinking_ms: None,
+            thinking_expanded: None,
+            group_overrides: Vec::new(),
         });
         state.messages.push(DisplayMessage {
             role: MessageRole::Assistant,
@@ -5792,6 +6575,9 @@ mod render_smoke {
             tool_calls: Vec::new(),
             delivery: crate::prompt_queue::DeliveryState::Sent,
             idempotency_key: None,
+            thinking_ms: None,
+            thinking_expanded: None,
+            group_overrides: Vec::new(),
         });
         state.active_assistant_message = Some(1);
         state.status = SessionStatus::Thinking;

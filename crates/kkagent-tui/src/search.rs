@@ -283,6 +283,9 @@ mod tests {
             tool_calls: vec![],
             delivery: crate::prompt_queue::DeliveryState::Sent,
             idempotency_key: None,
+            thinking_ms: None,
+            thinking_expanded: None,
+            group_overrides: Vec::new(),
         }];
         let mut s = SearchState {
             query: "login".into(),

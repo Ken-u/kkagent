@@ -4,6 +4,7 @@ pub mod chrome;
 pub mod components;
 pub mod controllers;
 pub mod draft_store;
+mod fold;
 pub mod git_badge;
 pub mod goal_judge_view;
 pub mod i18n;

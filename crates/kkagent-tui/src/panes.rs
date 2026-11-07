@@ -226,12 +226,13 @@ pub fn render_btw(
             lines.push(Line::default());
         }
         push_btw_question(&mut lines, &turn.question, area.width, theme);
-        crate::components::push_thinking_lines(
+        let _ = crate::components::push_thinking_lines(
             &mut lines,
             turn.thinking.as_deref().unwrap_or(""),
             area.width,
             theme,
             expanded,
+            None,
         );
         push_btw_answer(&mut lines, &turn.answer, area.width, theme, render_cache);
     }
@@ -281,12 +282,13 @@ pub fn render_btw(
                 );
             }
         } else {
-            crate::components::push_thinking_lines(
+            let _ = crate::components::push_thinking_lines(
                 &mut lines,
                 &state.current_thinking,
                 area.width,
                 theme,
                 expanded,
+                None,
             );
             push_btw_answer(
                 &mut lines,

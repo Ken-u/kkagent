@@ -41,6 +41,13 @@ pub fn tool_history_collapse_hint(locale: Locale) -> &'static str {
     }
 }
 
+/// Compact duration label ("12s", "1.5 min") for transcript summaries.
+pub fn duration_label(locale: Locale, duration_ms: u64) -> String {
+    match locale {
+        Locale::En => format_duration_en(duration_ms),
+    }
+}
+
 fn format_duration_en(duration_ms: u64) -> String {
     let secs = duration_ms.saturating_add(500) / 1000; // round to nearest second
     if secs < 60 {

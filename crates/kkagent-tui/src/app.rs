@@ -164,6 +164,8 @@ pub struct AppState {
     /// Shown when quitting while a turn is still running (standalone mode).
     pub quit_dialog: Option<QuitDialogState>,
     pub thinking_text: String,
+    /// When the buffered `thinking_text` block started streaming.
+    pub thinking_started_at: Option<std::time::Instant>,
     /// Assistant display message receiving deltas for the current model step.
     pub active_assistant_message: Option<usize>,
     /// 离底部向上滚动的行数；0 = 贴底跟随新消息
@@ -453,6 +455,7 @@ pub struct SessionRuntimeState {
     pub working_dir: std::path::PathBuf,
     pub mode: AppMode,
     pub thinking_text: String,
+    pub thinking_started_at: Option<std::time::Instant>,
     pub active_assistant_message: Option<usize>,
     pub approx_tokens: u64,
     pub approval_queue: std::collections::VecDeque<PendingApproval>,
@@ -500,6 +503,7 @@ impl SessionRuntimeState {
                 state.mode.clone()
             },
             thinking_text: state.thinking_text.clone(),
+            thinking_started_at: state.thinking_started_at,
             active_assistant_message: state.active_assistant_message,
             approx_tokens: state.approx_tokens,
             approval_queue: state.approval_queue.clone(),
@@ -536,6 +540,7 @@ impl SessionRuntimeState {
         state.working_dir = self.working_dir;
         state.mode = self.mode;
         state.thinking_text = self.thinking_text;
+        state.thinking_started_at = self.thinking_started_at;
         state.active_assistant_message = self.active_assistant_message;
         state.approx_tokens = self.approx_tokens;
         state.approval_queue = self.approval_queue;
@@ -855,6 +860,15 @@ pub struct DisplayMessage {
     pub role: MessageRole,
     pub content: String,
     pub thinking: Option<String>,
+    /// Wall-clock time spent streaming `thinking` (summed over blocks); `None`
+    /// for transcripts restored from disk.
+    pub thinking_ms: Option<u64>,
+    /// A mouse click makes this thinking block independent from the global
+    /// Ctrl-O mode: `Some(true)` = expanded, `Some(false)` = collapsed.
+    pub thinking_expanded: Option<bool>,
+    /// Click overrides for auto-folded runs of adjacent foldable items that
+    /// *start* in this message, keyed by the leader slot (see `fold::MemberSlot`).
+    pub group_overrides: Vec<(usize, bool)>,
     /// Chronological assistant segments (text + tools interleaved by event order).
     pub parts: Vec<DisplayPart>,
     /// Legacy parallel list — kept empty for new assistant bubbles; resume may fill both.
@@ -920,6 +934,23 @@ pub enum ToolExpandTarget {
         message: usize,
         part: usize,
     },
+    /// Finished thinking block (one-line summary ↔ full reasoning).
+    Thinking {
+        message: usize,
+    },
+    /// Header of an auto-folded run of adjacent foldable items. `expanded` is
+    /// the state the header was drawn in, so a click flips exactly that.
+    Group {
+        message: usize,
+        slot: usize,
+        expanded: bool,
+    },
+    /// One tool inside an expanded tool-history overview.
+    HistoryTool {
+        message: usize,
+        part: usize,
+        tool: usize,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -930,6 +961,45 @@ pub struct ToolExpandHit {
 }
 
 impl DisplayMessage {
+    /// The user's click override for the fold group led by `slot`, if any.
+    pub fn group_override(&self, slot: usize) -> Option<bool> {
+        self.group_overrides
+            .iter()
+            .find(|(candidate, _)| *candidate == slot)
+            .map(|(_, expanded)| *expanded)
+    }
+
+    pub fn set_group_override(&mut self, slot: usize, expanded: bool) {
+        match self
+            .group_overrides
+            .iter_mut()
+            .find(|(candidate, _)| *candidate == slot)
+        {
+            Some(entry) => entry.1 = expanded,
+            None => self.group_overrides.push((slot, expanded)),
+        }
+    }
+
+    /// Merge a flushed thinking block into this message, adding its streaming
+    /// time to the running total used by the collapsed summary line.
+    pub fn attach_thinking(&mut self, text: String, elapsed_ms: Option<u64>) {
+        if text.is_empty() {
+            return;
+        }
+        match self.thinking.as_mut() {
+            Some(existing) => {
+                if !existing.is_empty() && !existing.ends_with('\n') {
+                    existing.push('\n');
+                }
+                existing.push_str(&text);
+            }
+            None => self.thinking = Some(text),
+        }
+        if let Some(ms) = elapsed_ms {
+            self.thinking_ms = Some(self.thinking_ms.unwrap_or(0).saturating_add(ms));
+        }
+    }
+
     pub fn append_assistant_text(&mut self, text: &str) {
         if let Some(DisplayPart::Text(existing)) = self.parts.last_mut() {
             existing.push_str(text);
@@ -1419,6 +1489,7 @@ impl AppState {
             quit_confirm: false,
             quit_dialog: None,
             thinking_text: String::new(),
+            thinking_started_at: None,
             active_assistant_message: None,
             scroll_up: 0,
             content_lines: 0,
@@ -1569,6 +1640,9 @@ impl AppState {
             tool_calls: Vec::new(),
             delivery: crate::prompt_queue::DeliveryState::Sent,
             idempotency_key: None,
+            thinking_ms: None,
+            thinking_expanded: None,
+            group_overrides: Vec::new(),
         });
         if self.plan_mode {
             if first {
@@ -1658,6 +1732,20 @@ impl AppState {
         self.status_bar.cache_hit = None;
     }
 
+    /// Drain the buffered thinking block together with how long it streamed.
+    /// The duration is `None` when nothing was buffered or no start was seen
+    /// (e.g. a buffer restored from a server snapshot).
+    pub fn take_pending_thinking(&mut self) -> (String, Option<u64>) {
+        let text = std::mem::take(&mut self.thinking_text);
+        let started = self.thinking_started_at.take();
+        let elapsed_ms = if text.is_empty() {
+            None
+        } else {
+            started.map(|started| started.elapsed().as_millis().min(u64::MAX as u128) as u64)
+        };
+        (text, elapsed_ms)
+    }
+
     /// Apply the global tool-output mode to unmodified items in the most recent
     /// `TOOL_EXPAND_TURNS` user turns.
     pub fn apply_tool_output_mode(&mut self) {
@@ -1668,8 +1756,16 @@ impl AppState {
                     DisplayPart::Tool(tool) if !tool.user_overridden => {
                         tool.collapsed = !self.tool_output_expanded;
                     }
-                    DisplayPart::ToolHistory(history) if !history.user_overridden => {
-                        history.expanded = self.tool_output_expanded;
+                    DisplayPart::ToolHistory(history) => {
+                        if !history.user_overridden {
+                            history.expanded = self.tool_output_expanded;
+                        }
+                        // Second level: the tools inside the overview.
+                        for tool in &mut history.tools {
+                            if !tool.user_overridden {
+                                tool.collapsed = !self.tool_output_expanded;
+                            }
+                        }
                     }
                     DisplayPart::CompactionHistory(history) if !history.user_overridden => {
                         history.expanded = self.tool_output_expanded;
@@ -2866,6 +2962,9 @@ impl TuiApp {
                                     tool_calls: Vec::new(),
                                     delivery: crate::prompt_queue::DeliveryState::Sent,
                                     idempotency_key: None,
+                                    thinking_ms: None,
+                                    thinking_expanded: None,
+                                    group_overrides: Vec::new(),
                                 });
                             }
                         }
@@ -2977,6 +3076,9 @@ impl TuiApp {
                     tool_calls: Vec::new(),
                     delivery: crate::prompt_queue::DeliveryState::Sent,
                     idempotency_key: None,
+                    thinking_ms: None,
+                    thinking_expanded: None,
+                    group_overrides: Vec::new(),
                 });
             }
             Err(err) => {
@@ -3752,15 +3854,42 @@ impl TuiApp {
         else {
             return false;
         };
+        let global_expanded = self.state.tool_output_expanded;
         let Some(message) = self.state.messages.get_mut(match hit.target {
             ToolExpandTarget::Part { message, .. }
             | ToolExpandTarget::Legacy { message, .. }
             | ToolExpandTarget::Plan { message }
-            | ToolExpandTarget::Compaction { message, .. } => message,
+            | ToolExpandTarget::Compaction { message, .. }
+            | ToolExpandTarget::Thinking { message }
+            | ToolExpandTarget::Group { message, .. }
+            | ToolExpandTarget::HistoryTool { message, .. } => message,
         }) else {
             return false;
         };
         match hit.target {
+            ToolExpandTarget::Group { slot, expanded, .. } => {
+                if message.role != MessageRole::Assistant {
+                    return false;
+                }
+                message.set_group_override(slot, !expanded);
+            }
+            ToolExpandTarget::HistoryTool { part, tool, .. } => {
+                let Some(DisplayPart::ToolHistory(history)) = message.parts.get_mut(part) else {
+                    return false;
+                };
+                let Some(tool) = history.tools.get_mut(tool) else {
+                    return false;
+                };
+                tool.collapsed = !tool.collapsed;
+                tool.user_overridden = true;
+            }
+            ToolExpandTarget::Thinking { .. } => {
+                if message.role != MessageRole::Assistant || message.thinking.is_none() {
+                    return false;
+                }
+                let current = message.thinking_expanded.unwrap_or(global_expanded);
+                message.thinking_expanded = Some(!current);
+            }
             ToolExpandTarget::Plan { .. } => {
                 if message.role != MessageRole::Plan {
                     return false;
@@ -5782,6 +5911,7 @@ impl TuiApp {
                         .sum::<u64>();
                 }
                 self.state.thinking_text.clear();
+                self.state.thinking_started_at = None;
                 self.state.follow_bottom = true;
                 self.state.scroll_up = 0;
                 let warnings = response_warnings(&data);
@@ -9791,6 +9921,7 @@ impl TuiApp {
         self.state.subagents_panel = None;
         self.state.todos_expanded = false;
         self.state.thinking_text.clear();
+        self.state.thinking_started_at = None;
         self.state.last_tool_name = None;
         self.state.plan_document = None;
         self.state.plan_scroll_to_top = false;
@@ -9911,6 +10042,9 @@ impl TuiApp {
                         tool_calls: Vec::new(),
                         delivery: crate::prompt_queue::DeliveryState::Sent,
                         idempotency_key: None,
+                        thinking_ms: None,
+                        thinking_expanded: None,
+                        group_overrides: Vec::new(),
                     };
                     let mut new_messages = vec![compaction_msg];
                     new_messages.extend(post_display);
@@ -9927,6 +10061,7 @@ impl TuiApp {
         if let Some(live) = data.get("live_ui") {
             if let Some(thinking) = live.get("thinking_text").and_then(|v| v.as_str()) {
                 self.state.thinking_text = thinking.to_string();
+                self.state.thinking_started_at = None;
             }
             if let Some(assistant) = live
                 .get("assistant_text")
@@ -9945,6 +10080,9 @@ impl TuiApp {
                     tool_calls: Vec::new(),
                     delivery: crate::prompt_queue::DeliveryState::Sent,
                     idempotency_key: None,
+                    thinking_ms: None,
+                    thinking_expanded: None,
+                    group_overrides: Vec::new(),
                 };
                 msg.append_assistant_text(assistant);
                 self.state.messages.push(msg);
@@ -10128,6 +10266,9 @@ impl TuiApp {
                         tool_calls: Vec::new(),
                         delivery: crate::prompt_queue::DeliveryState::Queued,
                         idempotency_key: None,
+                        thinking_ms: None,
+                        thinking_expanded: None,
+                        group_overrides: Vec::new(),
                     });
                 }
             }
@@ -11008,6 +11149,9 @@ impl TuiApp {
                     tool_calls: Vec::new(),
                     delivery: crate::prompt_queue::DeliveryState::Sent,
                     idempotency_key: None,
+                    thinking_ms: None,
+                    thinking_expanded: None,
+                    group_overrides: Vec::new(),
                 }],
             });
         }
@@ -11132,6 +11276,9 @@ impl TuiApp {
                     tool_calls: Vec::new(),
                     delivery: crate::prompt_queue::DeliveryState::Sent,
                     idempotency_key: None,
+                    thinking_ms: None,
+                    thinking_expanded: None,
+                    group_overrides: Vec::new(),
                 });
             }
         }
@@ -11543,6 +11690,9 @@ impl TuiApp {
                 tool_calls: Vec::new(),
                 delivery: crate::prompt_queue::DeliveryState::Sending,
                 idempotency_key: Some(idem.clone()),
+                thinking_ms: None,
+                thinking_expanded: None,
+                group_overrides: Vec::new(),
             });
         }
         if let Some(warn) = crate::draft_store::redact_sensitive_preview(&text) {
@@ -11656,6 +11806,9 @@ impl TuiApp {
                 tool_calls: Vec::new(),
                 delivery: crate::prompt_queue::DeliveryState::Queued,
                 idempotency_key: None,
+                thinking_ms: None,
+                thinking_expanded: None,
+                group_overrides: Vec::new(),
             });
             self.system_message(format!(
                 "Queued ({} waiting) — will send after current turn.",
@@ -11677,9 +11830,13 @@ impl TuiApp {
             tool_calls: Vec::new(),
             delivery: crate::prompt_queue::DeliveryState::Sending,
             idempotency_key: Some(idem.clone()),
+            thinking_ms: None,
+            thinking_expanded: None,
+            group_overrides: Vec::new(),
         });
         self.state.status = SessionStatus::Thinking;
         self.state.thinking_text.clear();
+        self.state.thinking_started_at = None;
         self.state.scroll_up = 0;
         self.state.follow_bottom = true;
 
@@ -11732,6 +11889,9 @@ impl TuiApp {
                 tool_calls: Vec::new(),
                 delivery: crate::prompt_queue::DeliveryState::Queued,
                 idempotency_key: None,
+                thinking_ms: None,
+                thinking_expanded: None,
+                group_overrides: Vec::new(),
             });
             self.system_message(format!(
                 "Queued ({} waiting) — will send after current turn.",
@@ -11753,9 +11913,13 @@ impl TuiApp {
             tool_calls: Vec::new(),
             delivery: crate::prompt_queue::DeliveryState::Sending,
             idempotency_key: Some(idem.clone()),
+            thinking_ms: None,
+            thinking_expanded: None,
+            group_overrides: Vec::new(),
         });
         self.state.status = SessionStatus::Thinking;
         self.state.thinking_text.clear();
+        self.state.thinking_started_at = None;
         self.state.scroll_up = 0;
         self.state.follow_bottom = true;
 
@@ -11790,6 +11954,9 @@ impl TuiApp {
             tool_calls: Vec::new(),
             delivery: crate::prompt_queue::DeliveryState::Sent,
             idempotency_key: None,
+            thinking_ms: None,
+            thinking_expanded: None,
+            group_overrides: Vec::new(),
         });
         self.state.follow_bottom = true;
         self.state.scroll_up = 0;
@@ -11910,6 +12077,9 @@ impl TuiApp {
                 tool_calls: Vec::new(),
                 delivery: crate::prompt_queue::DeliveryState::Sending,
                 idempotency_key: Some(idem.clone()),
+                thinking_ms: None,
+                thinking_expanded: None,
+                group_overrides: Vec::new(),
             });
         }
         self.state.status = SessionStatus::Thinking;
@@ -12045,6 +12215,7 @@ impl TuiApp {
                 self.state.subagents_panel = None;
                 self.state.todos_expanded = false;
                 self.state.thinking_text.clear();
+                self.state.thinking_started_at = None;
                 self.state.plan_document = None;
                 self.state.plan_scroll_to_top = false;
                 self.state.status = SessionStatus::Idle;
@@ -13152,6 +13323,9 @@ impl TuiApp {
             tool_calls: Vec::new(),
             delivery: crate::prompt_queue::DeliveryState::Sent,
             idempotency_key: None,
+            thinking_ms: None,
+            thinking_expanded: None,
+            group_overrides: Vec::new(),
         });
     }
 
@@ -13295,6 +13469,9 @@ impl TuiApp {
             tool_calls: Vec::new(),
             delivery: crate::prompt_queue::DeliveryState::Sent,
             idempotency_key: None,
+            thinking_ms: None,
+            thinking_expanded: None,
+            group_overrides: Vec::new(),
         });
     }
 
@@ -13940,13 +14117,17 @@ impl TuiApp {
                                 tool_calls: Vec::new(),
                                 delivery: crate::prompt_queue::DeliveryState::Sent,
                                 idempotency_key,
+                                thinking_ms: None,
+                                thinking_expanded: None,
+                                group_overrides: Vec::new(),
                             });
                         }
                         self.state.follow_bottom = true;
                         self.state.scroll_up = 0;
                     }
                     AgentEvent::MessageDelta { text, .. } => {
-                        let pending_thinking = std::mem::take(&mut self.state.thinking_text);
+                        let (pending_thinking, pending_thinking_ms) =
+                            self.state.take_pending_thinking();
 
                         if let Some(message) = self
                             .state
@@ -13954,28 +14135,23 @@ impl TuiApp {
                             .and_then(|index| self.state.messages.get_mut(index))
                             .filter(|message| message.role == MessageRole::Assistant)
                         {
-                            if !pending_thinking.is_empty() {
-                                match message.thinking.as_mut() {
-                                    Some(existing) => {
-                                        if !existing.is_empty() && !existing.ends_with('\n') {
-                                            existing.push('\n');
-                                        }
-                                        existing.push_str(&pending_thinking);
-                                    }
-                                    None => message.thinking = Some(pending_thinking),
-                                }
-                            }
+                            message.attach_thinking(pending_thinking, pending_thinking_ms);
                             message.append_assistant_text(&text);
                             return;
                         }
                         let mut msg = DisplayMessage {
                             role: MessageRole::Assistant,
                             content: String::new(),
+                            thinking_ms: (!pending_thinking.is_empty())
+                                .then_some(pending_thinking_ms)
+                                .flatten(),
                             thinking: (!pending_thinking.is_empty()).then_some(pending_thinking),
                             parts: Vec::new(),
                             tool_calls: Vec::new(),
                             delivery: crate::prompt_queue::DeliveryState::Sent,
                             idempotency_key: None,
+                            thinking_expanded: None,
+                            group_overrides: Vec::new(),
                         };
                         msg.append_assistant_text(&text);
                         self.state.messages.push(msg);
@@ -13983,6 +14159,9 @@ impl TuiApp {
                             Some(self.state.messages.len().saturating_sub(1));
                     }
                     AgentEvent::ThinkingDelta { text, .. } => {
+                        if self.state.thinking_text.is_empty() {
+                            self.state.thinking_started_at = Some(std::time::Instant::now());
+                        }
                         self.state.thinking_text.push_str(&text);
                     }
                     AgentEvent::ToolCall {
@@ -13993,7 +14172,8 @@ impl TuiApp {
                     } => {
                         self.state.last_tool_name = Some(tool_name.clone());
                         let summary = summarize_tool_input(&input);
-                        let pending_thinking = std::mem::take(&mut self.state.thinking_text);
+                        let (pending_thinking, pending_thinking_ms) =
+                            self.state.take_pending_thinking();
                         let tc = DisplayToolCall {
                             id: tool_call_id,
                             started_at: Some(std::time::Instant::now()),
@@ -14012,28 +14192,23 @@ impl TuiApp {
                             .and_then(|index| self.state.messages.get_mut(index))
                             .filter(|message| message.role == MessageRole::Assistant)
                         {
-                            if !pending_thinking.is_empty() {
-                                match message.thinking.as_mut() {
-                                    Some(existing) => {
-                                        if !existing.is_empty() && !existing.ends_with('\n') {
-                                            existing.push('\n');
-                                        }
-                                        existing.push_str(&pending_thinking);
-                                    }
-                                    None => message.thinking = Some(pending_thinking),
-                                }
-                            }
+                            message.attach_thinking(pending_thinking, pending_thinking_ms);
                             message.push_tool(tc);
                             return;
                         }
                         let mut msg = DisplayMessage {
                             role: MessageRole::Assistant,
                             content: String::new(),
+                            thinking_ms: (!pending_thinking.is_empty())
+                                .then_some(pending_thinking_ms)
+                                .flatten(),
                             thinking: (!pending_thinking.is_empty()).then_some(pending_thinking),
                             parts: Vec::new(),
                             tool_calls: Vec::new(),
                             delivery: crate::prompt_queue::DeliveryState::Sent,
                             idempotency_key: None,
+                            thinking_expanded: None,
+                            group_overrides: Vec::new(),
                         };
                         msg.push_tool(tc);
                         self.state.messages.push(msg);
@@ -14404,24 +14579,27 @@ impl TuiApp {
                         self.clear_pending_interactions();
                         let active_assistant = self.state.active_assistant_message.take();
                         if !self.state.thinking_text.is_empty() {
-                            let t = std::mem::take(&mut self.state.thinking_text);
+                            let (t, t_ms) = self.state.take_pending_thinking();
                             let attached = active_assistant
                                 .and_then(|index| self.state.messages.get_mut(index))
                                 .filter(|message| {
                                     message.role == MessageRole::Assistant
                                         && message.thinking.is_none()
                                 })
-                                .map(|message| message.thinking = Some(t.clone()))
+                                .map(|message| message.attach_thinking(t.clone(), t_ms))
                                 .is_some();
                             if !attached {
                                 self.state.messages.push(DisplayMessage {
                                     role: MessageRole::Assistant,
                                     content: String::new(),
                                     thinking: Some(t),
+                                    thinking_ms: t_ms,
                                     parts: Vec::new(),
                                     tool_calls: Vec::new(),
                                     delivery: crate::prompt_queue::DeliveryState::Sent,
                                     idempotency_key: None,
+                                    thinking_expanded: None,
+                                    group_overrides: Vec::new(),
                                 });
                             }
                         }
@@ -14454,6 +14632,7 @@ impl TuiApp {
                     AgentEvent::TurnStart { .. } => {
                         self.state.active_assistant_message = None;
                         self.state.thinking_text.clear();
+                        self.state.thinking_started_at = None;
                         self.state.turn_started_at = Some(std::time::Instant::now());
                         self.state.tokens_at_turn_start = self.state.approx_tokens;
                         self.jobs.mcp.waiting_for_prompt = false;
@@ -14626,6 +14805,9 @@ impl TuiApp {
                                     tool_calls: Vec::new(),
                                     delivery: crate::prompt_queue::DeliveryState::Sent,
                                     idempotency_key: None,
+                                    thinking_ms: None,
+                                    thinking_expanded: None,
+                                    group_overrides: Vec::new(),
                                 };
                                 let mut new_messages = vec![compaction_msg];
                                 new_messages.extend(post_display);
@@ -14780,6 +14962,9 @@ impl TuiApp {
                             tool_calls: Vec::new(),
                             delivery: crate::prompt_queue::DeliveryState::Sent,
                             idempotency_key: None,
+                            thinking_ms: None,
+                            thinking_expanded: None,
+                            group_overrides: Vec::new(),
                         };
                         let mut new_messages = vec![compaction_msg];
                         new_messages.extend(post_display);
@@ -15161,6 +15346,9 @@ fn collapse_tools_in_turn(
                 tool_calls: Vec::new(),
                 delivery: crate::prompt_queue::DeliveryState::Sent,
                 idempotency_key: None,
+                thinking_ms: None,
+                thinking_expanded: None,
+                group_overrides: Vec::new(),
             },
         );
     }
@@ -15379,6 +15567,9 @@ fn transcript_messages_to_display(msgs: &[serde_json::Value]) -> Vec<DisplayMess
                         tool_calls: Vec::new(),
                         delivery: crate::prompt_queue::DeliveryState::Sent,
                         idempotency_key: None,
+                        thinking_ms: None,
+                        thinking_expanded: None,
+                        group_overrides: Vec::new(),
                     });
                 }
             }
@@ -15448,6 +15639,9 @@ fn transcript_messages_to_display(msgs: &[serde_json::Value]) -> Vec<DisplayMess
                         tool_calls: Vec::new(),
                         delivery: crate::prompt_queue::DeliveryState::Sent,
                         idempotency_key: None,
+                        thinking_ms: None,
+                        thinking_expanded: None,
+                        group_overrides: Vec::new(),
                     });
                 }
             }
@@ -15472,6 +15666,9 @@ fn transcript_messages_to_display(msgs: &[serde_json::Value]) -> Vec<DisplayMess
                         tool_calls: Vec::new(),
                         delivery: crate::prompt_queue::DeliveryState::Sent,
                         idempotency_key: None,
+                        thinking_ms: None,
+                        thinking_expanded: None,
+                        group_overrides: Vec::new(),
                     });
                 }
             }
@@ -16555,6 +16752,9 @@ mod app_state_tests {
             tool_calls: Vec::new(),
             delivery,
             idempotency_key: None,
+            thinking_ms: None,
+            thinking_expanded: None,
+            group_overrides: Vec::new(),
         }
     }
 
@@ -17270,6 +17470,9 @@ mod app_state_tests {
             tool_calls: Vec::new(),
             delivery: crate::prompt_queue::DeliveryState::Sent,
             idempotency_key: None,
+            thinking_ms: None,
+            thinking_expanded: None,
+            group_overrides: Vec::new(),
         });
         app.state.tab_strip.ensure_active("running", "running");
         app.state.tab_strip.ensure_tab("fallback", "fallback");
@@ -17568,6 +17771,9 @@ mod app_state_tests {
                 tool_calls: Vec::new(),
                 delivery: crate::prompt_queue::DeliveryState::Queued,
                 idempotency_key: None,
+                thinking_ms: None,
+                thinking_expanded: None,
+                group_overrides: Vec::new(),
             });
         }
         app.state.input.set_text("editor draft".into());
@@ -17618,6 +17824,9 @@ mod app_state_tests {
             tool_calls: Vec::new(),
             delivery: crate::prompt_queue::DeliveryState::Queued,
             idempotency_key: None,
+            thinking_ms: None,
+            thinking_expanded: None,
+            group_overrides: Vec::new(),
         });
 
         app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL))
@@ -18757,6 +18966,9 @@ mod app_state_tests {
             tool_calls: Vec::new(),
             delivery: crate::prompt_queue::DeliveryState::Queued,
             idempotency_key: None,
+            thinking_ms: None,
+            thinking_expanded: None,
+            group_overrides: Vec::new(),
         });
     }
 
@@ -19526,6 +19738,9 @@ mod app_state_tests {
             tool_calls: Vec::new(),
             delivery: crate::prompt_queue::DeliveryState::Sent,
             idempotency_key: None,
+            thinking_ms: None,
+            thinking_expanded: None,
+            group_overrides: Vec::new(),
         }]));
         assert!(session_has_retained_io(&[DisplayMessage {
             role: MessageRole::User,
@@ -19535,6 +19750,9 @@ mod app_state_tests {
             tool_calls: Vec::new(),
             delivery: crate::prompt_queue::DeliveryState::Sent,
             idempotency_key: None,
+            thinking_ms: None,
+            thinking_expanded: None,
+            group_overrides: Vec::new(),
         }]));
         assert!(!session_has_retained_io(&[DisplayMessage {
             role: MessageRole::User,
@@ -19544,6 +19762,9 @@ mod app_state_tests {
             tool_calls: Vec::new(),
             delivery: crate::prompt_queue::DeliveryState::Sent,
             idempotency_key: None,
+            thinking_ms: None,
+            thinking_expanded: None,
+            group_overrides: Vec::new(),
         }]));
     }
 
@@ -19560,6 +19781,9 @@ mod app_state_tests {
             tool_calls: Vec::new(),
             delivery: crate::prompt_queue::DeliveryState::Sent,
             idempotency_key: None,
+            thinking_ms: None,
+            thinking_expanded: None,
+            group_overrides: Vec::new(),
         });
         app.cache_active_session_state("b");
 
@@ -19573,6 +19797,9 @@ mod app_state_tests {
             tool_calls: Vec::new(),
             delivery: crate::prompt_queue::DeliveryState::Sent,
             idempotency_key: None,
+            thinking_ms: None,
+            thinking_expanded: None,
+            group_overrides: Vec::new(),
         }];
 
         for event in [
@@ -19844,6 +20071,9 @@ mod app_state_tests {
             tool_calls: Vec::new(),
             delivery: crate::prompt_queue::DeliveryState::Sent,
             idempotency_key: None,
+            thinking_ms: None,
+            thinking_expanded: None,
+            group_overrides: Vec::new(),
         });
         let mut asst = DisplayMessage {
             role: MessageRole::Assistant,
@@ -19853,6 +20083,9 @@ mod app_state_tests {
             tool_calls: Vec::new(),
             delivery: crate::prompt_queue::DeliveryState::Sent,
             idempotency_key: None,
+            thinking_ms: None,
+            thinking_expanded: None,
+            group_overrides: Vec::new(),
         };
         asst.parts.push(DisplayPart::Tool(DisplayToolCall {
             id: String::new(),
@@ -19917,6 +20150,9 @@ mod app_state_tests {
             tool_calls: Vec::new(),
             delivery: crate::prompt_queue::DeliveryState::Sent,
             idempotency_key: None,
+            thinking_ms: None,
+            thinking_expanded: None,
+            group_overrides: Vec::new(),
         }
     }
 
@@ -19932,6 +20168,9 @@ mod app_state_tests {
                 tool_calls: Vec::new(),
                 delivery: crate::prompt_queue::DeliveryState::Sent,
                 idempotency_key: None,
+                thinking_ms: None,
+                thinking_expanded: None,
+                group_overrides: Vec::new(),
             });
             app.state.messages.push(tool_history_message(turn));
         }
@@ -19995,6 +20234,9 @@ mod app_state_tests {
             tool_calls: Vec::new(),
             delivery: crate::prompt_queue::DeliveryState::Sent,
             idempotency_key: None,
+            thinking_ms: None,
+            thinking_expanded: None,
+            group_overrides: Vec::new(),
         });
         app.state.messages.push(tool_history_message(0));
         app.state.transcript_area = ratatui::layout::Rect::new(0, 0, 80, 10);
@@ -20058,6 +20300,9 @@ mod app_state_tests {
             tool_calls: Vec::new(),
             delivery: crate::prompt_queue::DeliveryState::Sent,
             idempotency_key: None,
+            thinking_ms: None,
+            thinking_expanded: None,
+            group_overrides: Vec::new(),
         });
         app.state.transcript_area = ratatui::layout::Rect::new(0, 0, 80, 10);
         app.state.content_lines = 10;
@@ -20120,6 +20365,9 @@ mod app_state_tests {
             tool_calls: Vec::new(),
             delivery: crate::prompt_queue::DeliveryState::Sent,
             idempotency_key: None,
+            thinking_ms: None,
+            thinking_expanded: None,
+            group_overrides: Vec::new(),
         });
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal
@@ -20180,6 +20428,9 @@ mod app_state_tests {
             tool_calls: Vec::new(),
             delivery: crate::prompt_queue::DeliveryState::Sent,
             idempotency_key: None,
+            thinking_ms: None,
+            thinking_expanded: None,
+            group_overrides: Vec::new(),
         });
         let mut assistant = tool_history_message(0);
         assistant.parts = assistant
@@ -20297,6 +20548,9 @@ mod app_state_tests {
             tool_calls: Vec::new(),
             delivery: crate::prompt_queue::DeliveryState::Sent,
             idempotency_key: None,
+            thinking_ms: None,
+            thinking_expanded: None,
+            group_overrides: Vec::new(),
         };
         let tc = msg.find_tool_for_result_mut("b", "Bash").unwrap();
         tc.output = Some("second".into());
@@ -20733,6 +20987,269 @@ mod app_state_tests {
         // …and coming back: the captured snapshot must restore it.
         captured.restore(&mut state);
         assert!(state.last_step_usage.is_some());
+    }
+
+    #[tokio::test]
+    async fn thinking_duration_is_recorded_when_the_block_is_flushed() {
+        let mut app = test_tui_app();
+        app.state.session_id = Some("session-thinking".into());
+        app.handle_server_event(agent_event_frame(AgentEvent::TurnStart {
+            session_id: "session-thinking".into(),
+        }));
+        app.handle_server_event(agent_event_frame(AgentEvent::ThinkingDelta {
+            session_id: "session-thinking".into(),
+            text: "**Plan**\nfirst".into(),
+        }));
+        assert!(app.state.thinking_started_at.is_some());
+        // Pretend the block has been streaming for 5s.
+        app.state.thinking_started_at = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(5))
+            .or(app.state.thinking_started_at);
+        app.handle_server_event(agent_event_frame(AgentEvent::ThinkingDelta {
+            session_id: "session-thinking".into(),
+            text: "\nsecond".into(),
+        }));
+        assert!(
+            app.state
+                .thinking_started_at
+                .is_some_and(|started| started.elapsed().as_secs() >= 5),
+            "later deltas must not restart the clock"
+        );
+
+        app.handle_server_event(agent_event_frame(AgentEvent::MessageDelta {
+            session_id: "session-thinking".into(),
+            text: "answer".into(),
+        }));
+        let message = app.state.messages.last().unwrap();
+        assert_eq!(message.thinking.as_deref(), Some("**Plan**\nfirst\nsecond"));
+        assert!(message.thinking_ms.is_some_and(|ms| ms >= 5_000));
+        assert!(app.state.thinking_started_at.is_none());
+        assert!(app.state.thinking_text.is_empty());
+
+        // A second thinking block in the same message adds to the total.
+        app.handle_server_event(agent_event_frame(AgentEvent::ThinkingDelta {
+            session_id: "session-thinking".into(),
+            text: "again".into(),
+        }));
+        app.state.thinking_started_at = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(3))
+            .or(app.state.thinking_started_at);
+        app.handle_server_event(agent_event_frame(AgentEvent::ToolCall {
+            session_id: "session-thinking".into(),
+            tool_call_id: "tool-1".into(),
+            tool_name: "Read".into(),
+            input: serde_json::json!({}),
+        }));
+        let message = app.state.messages.last().unwrap();
+        assert!(message.thinking.as_deref().unwrap().ends_with("again"));
+        assert!(message.thinking_ms.is_some_and(|ms| ms >= 8_000));
+    }
+
+    #[tokio::test]
+    async fn thinking_that_ends_the_turn_keeps_its_duration() {
+        let mut app = test_tui_app();
+        app.state.session_id = Some("session-thinking".into());
+        app.handle_server_event(agent_event_frame(AgentEvent::TurnStart {
+            session_id: "session-thinking".into(),
+        }));
+        app.handle_server_event(agent_event_frame(AgentEvent::ThinkingDelta {
+            session_id: "session-thinking".into(),
+            text: "only thoughts".into(),
+        }));
+        app.state.thinking_started_at = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(4))
+            .or(app.state.thinking_started_at);
+        app.handle_server_event(agent_event_frame(AgentEvent::TurnEnd {
+            session_id: "session-thinking".into(),
+        }));
+
+        let message = app
+            .state
+            .messages
+            .iter()
+            .find(|message| message.thinking.is_some())
+            .expect("thinking-only turn still produces a thinking block");
+        assert!(message.thinking_ms.is_some_and(|ms| ms >= 4_000));
+    }
+
+    #[tokio::test]
+    async fn clicking_a_thinking_summary_toggles_just_that_block() {
+        let mut app = test_tui_app();
+        for index in 0..2 {
+            app.state.messages.push(DisplayMessage {
+                role: MessageRole::Assistant,
+                content: String::new(),
+                thinking: Some(format!("thought {index}")),
+                thinking_ms: None,
+                thinking_expanded: None,
+                group_overrides: Vec::new(),
+                parts: Vec::new(),
+                tool_calls: Vec::new(),
+                delivery: crate::prompt_queue::DeliveryState::Sent,
+                idempotency_key: None,
+            });
+        }
+        app.state.tool_expand_hits = vec![
+            ToolExpandHit {
+                line: 3,
+                target: ToolExpandTarget::Thinking { message: 0 },
+            },
+            ToolExpandHit {
+                line: 9,
+                target: ToolExpandTarget::Thinking { message: 1 },
+            },
+        ];
+
+        // Collapsed by default → the click expands only the clicked block.
+        assert!(app.toggle_clicked_tool_output(9));
+        assert_eq!(app.state.messages[0].thinking_expanded, None);
+        assert_eq!(app.state.messages[1].thinking_expanded, Some(true));
+        assert!(app.toggle_clicked_tool_output(9));
+        assert_eq!(app.state.messages[1].thinking_expanded, Some(false));
+
+        // With the global Ctrl-O mode on, the first click collapses instead.
+        app.toggle_tool_folding();
+        assert!(app.state.tool_output_expanded);
+        assert!(app.toggle_clicked_tool_output(3));
+        assert_eq!(app.state.messages[0].thinking_expanded, Some(false));
+
+        // Lines without a thinking summary are not hits.
+        assert!(!app.toggle_clicked_tool_output(5));
+    }
+
+    fn assistant_with_tools(tools: Vec<DisplayToolCall>) -> DisplayMessage {
+        DisplayMessage {
+            role: MessageRole::Assistant,
+            content: String::new(),
+            thinking: Some("thought".into()),
+            thinking_ms: None,
+            thinking_expanded: None,
+            group_overrides: Vec::new(),
+            parts: tools.into_iter().map(DisplayPart::Tool).collect(),
+            tool_calls: Vec::new(),
+            delivery: crate::prompt_queue::DeliveryState::Sent,
+            idempotency_key: None,
+        }
+    }
+
+    fn plain_tool(name: &str) -> DisplayToolCall {
+        DisplayToolCall {
+            id: format!("id-{name}"),
+            started_at: None,
+            stopping: false,
+            queued_behind: None,
+            name: name.into(),
+            input_summary: String::new(),
+            output: Some("a\nb".into()),
+            is_error: false,
+            collapsed: true,
+            user_overridden: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn clicking_a_group_header_flips_exactly_that_group() {
+        let mut app = test_tui_app();
+        app.state
+            .messages
+            .push(assistant_with_tools(vec![plain_tool("Read")]));
+        app.state.tool_expand_hits = vec![ToolExpandHit {
+            line: 2,
+            target: ToolExpandTarget::Group {
+                message: 0,
+                slot: 0,
+                expanded: false,
+            },
+        }];
+        assert!(app.toggle_clicked_tool_output(2));
+        assert_eq!(app.state.messages[0].group_override(0), Some(true));
+
+        // The next frame draws the header expanded, so the click flips it back.
+        app.state.tool_expand_hits = vec![ToolExpandHit {
+            line: 2,
+            target: ToolExpandTarget::Group {
+                message: 0,
+                slot: 0,
+                expanded: true,
+            },
+        }];
+        assert!(app.toggle_clicked_tool_output(2));
+        assert_eq!(app.state.messages[0].group_override(0), Some(false));
+        assert_eq!(app.state.messages[0].group_overrides.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn clicking_a_tool_inside_a_history_toggles_only_that_tool() {
+        let mut app = test_tui_app();
+        let mut message = assistant_with_tools(Vec::new());
+        message.parts = vec![DisplayPart::ToolHistory(ToolHistorySummary {
+            tool_count: 2,
+            duration_ms: 0,
+            tokens: 0,
+            expanded: true,
+            user_overridden: false,
+            tools: vec![plain_tool("Read"), plain_tool("Bash")],
+        })];
+        app.state.messages.push(message);
+        app.state.tool_expand_hits = vec![ToolExpandHit {
+            line: 4,
+            target: ToolExpandTarget::HistoryTool {
+                message: 0,
+                part: 0,
+                tool: 1,
+            },
+        }];
+        assert!(app.toggle_clicked_tool_output(4));
+        let history = match &app.state.messages[0].parts[0] {
+            DisplayPart::ToolHistory(history) => history,
+            _ => panic!("expected history"),
+        };
+        assert!(history.tools[0].collapsed && !history.tools[0].user_overridden);
+        assert!(!history.tools[1].collapsed && history.tools[1].user_overridden);
+        assert!(history.expanded, "the overview itself is untouched");
+    }
+
+    #[tokio::test]
+    async fn ctrl_o_reaches_tools_inside_histories_but_keeps_clicked_ones() {
+        let mut app = test_tui_app();
+        let mut message = assistant_with_tools(Vec::new());
+        let mut clicked = plain_tool("Bash");
+        clicked.user_overridden = true; // collapsed on purpose
+        message.parts = vec![DisplayPart::ToolHistory(ToolHistorySummary {
+            tool_count: 2,
+            duration_ms: 0,
+            tokens: 0,
+            expanded: false,
+            user_overridden: false,
+            tools: vec![plain_tool("Read"), clicked],
+        })];
+        app.state.messages.push(message);
+
+        app.toggle_tool_folding();
+        let history = match &app.state.messages[0].parts[0] {
+            DisplayPart::ToolHistory(history) => history,
+            _ => panic!("expected history"),
+        };
+        assert!(history.expanded);
+        assert!(!history.tools[0].collapsed, "follows the global mode");
+        assert!(
+            history.tools[1].collapsed,
+            "a clicked tool stays independent"
+        );
+    }
+
+    #[test]
+    fn session_runtime_state_carries_the_thinking_clock() {
+        let mut state = AppState::new(PermissionMode::Manual, false);
+        state.thinking_text = "buffered".into();
+        let started = std::time::Instant::now();
+        state.thinking_started_at = Some(started);
+        let saved = SessionRuntimeState::capture(&state);
+        state.thinking_text.clear();
+        state.thinking_started_at = None;
+        saved.restore(&mut state);
+        assert_eq!(state.thinking_text, "buffered");
+        assert_eq!(state.thinking_started_at, Some(started));
     }
 }
 

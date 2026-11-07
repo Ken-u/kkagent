@@ -145,6 +145,9 @@ impl SubagentUiEntry {
                     tool_calls: Vec::new(),
                     delivery: crate::prompt_queue::DeliveryState::Sent,
                     idempotency_key: None,
+                    thinking_ms: None,
+                    thinking_expanded: None,
+                    group_overrides: Vec::new(),
                 };
                 msg.append_assistant_text(text);
                 self.transcript.push(msg);
@@ -192,6 +195,9 @@ impl SubagentUiEntry {
                     tool_calls: Vec::new(),
                     delivery: crate::prompt_queue::DeliveryState::Sent,
                     idempotency_key: None,
+                    thinking_ms: None,
+                    thinking_expanded: None,
+                    group_overrides: Vec::new(),
                 };
                 msg.push_tool(tc);
                 self.transcript.push(msg);
@@ -357,6 +363,9 @@ impl SubagentStore {
                 tool_calls: Vec::new(),
                 delivery: crate::prompt_queue::DeliveryState::Sent,
                 idempotency_key: None,
+                thinking_ms: None,
+                thinking_expanded: None,
+                group_overrides: Vec::new(),
             });
         }
     }
