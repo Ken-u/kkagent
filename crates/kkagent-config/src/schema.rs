@@ -794,6 +794,29 @@ pub struct ModelProfileConfig {
     /// the parameter.
     #[serde(default)]
     pub defaults: BTreeMap<String, serde_json::Value>,
+    /// Runtime nudges that are on by default; a profile can switch them off.
+    #[serde(default)]
+    pub behavior: ProfileBehavior,
+}
+
+/// What `Bash` does when a command only reads, searches or lists files.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BashRouteMode {
+    /// Run the command, then append a one-line pointer to Read / Grep / Glob.
+    #[default]
+    Hint,
+    /// Never append the pointer.
+    Off,
+}
+
+/// Per-profile switches for runtime nudges (see `[model_profiles.*.behavior]`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProfileBehavior {
+    /// `"hint"` (default) or `"off"`.
+    #[serde(default)]
+    pub bash_route: BashRouteMode,
 }
 
 /// Case-insensitive exact match, or prefix match for a trailing `*`.
@@ -838,6 +861,12 @@ impl ModelProfileConfig {
             return false;
         }
         self.expose.is_empty() || self.expose.iter().any(tool_pattern)
+    }
+
+    /// Whether `Bash` should point read/search/list commands at the dedicated
+    /// tools for this model.
+    pub fn bash_route_enabled(&self) -> bool {
+        self.behavior.bash_route == BashRouteMode::Hint
     }
 
     /// The extra hint for `tool`, if the profile has one.
@@ -2649,6 +2678,17 @@ fallback = "quality"
         }
         // No lists: everything is offered.
         assert!(ModelProfileConfig::default().exposes_tool("Read"));
+    }
+
+    #[test]
+    fn bash_route_hint_is_on_unless_a_profile_turns_it_off() {
+        assert!(ModelProfileConfig::default().bash_route_enabled());
+        assert!(profile("[behavior]\nbash_route = \"hint\"").bash_route_enabled());
+        assert!(!profile("[behavior]\nbash_route = \"off\"").bash_route_enabled());
+        assert!(
+            toml::from_str::<ModelProfileConfig>("[behavior]\nbash_route = \"block\"").is_err()
+        );
+        assert!(toml::from_str::<ModelProfileConfig>("[behavior]\nbash_rout = \"off\"").is_err());
     }
 
     #[test]

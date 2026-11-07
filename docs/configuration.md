@@ -292,6 +292,11 @@ Bash = "读文件用 Read、搜索用 Grep、列目录用 Glob：它们带行号
 [model_profiles.shell-first.defaults]
 "Read.limit" = 400
 "Grep.output_mode" = "content"
+
+# 运行时提示开关（默认全部开启）。
+[model_profiles.shell-first.behavior]
+# Bash 命令只是读文件/搜索/列目录时，结果末尾追加指向 Read/Grep/Glob 的一行提示。
+bash_route = "hint"               # hint | off
 ```
 
 - **绑定**：一个模型最多匹配一个 profile；多个 profile 的 `models` 同时命中同一模型会在启动校验时报错。没有匹配的 profile 时行为与以前完全一致。

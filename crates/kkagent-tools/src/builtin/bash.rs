@@ -704,6 +704,7 @@ for background jobs (shell_id/stop remain as aliases)."
             return Ok(out);
         }
 
+        let route_hint = route_hint(&command, ctx);
         let mut out = self
             .run_foreground(
                 ctx.session_id.clone(),
@@ -718,8 +719,27 @@ for background jobs (shell_id/stop remain as aliases)."
         if !safety_note.is_empty() {
             out.content = format!("{safety_note}{}", out.content);
         }
+        if let Some(hint) = route_hint {
+            out.content.push_str("\n\n");
+            out.content.push_str(hint);
+        }
         Ok(out)
     }
+}
+
+/// The pointer to Read / Grep / Glob for a command that only reads, searches
+/// or lists files — unless this model's profile switched it off or hides the
+/// tool it would name.
+fn route_hint(command: &str, ctx: &ToolContext) -> Option<&'static str> {
+    let profile = ctx.tools_config.model_profile.as_deref();
+    if profile.is_some_and(|profile| !profile.bash_route_enabled()) {
+        return None;
+    }
+    let tool = crate::bash_route::suggest(command)?;
+    if profile.is_some_and(|profile| !profile.exposes_tool(tool.name())) {
+        return None;
+    }
+    Some(tool.hint())
 }
 
 fn resolve_timeout_ms(input: &Value, run_in_background: bool, default_fg_timeout_s: u64) -> u64 {
@@ -1610,6 +1630,55 @@ mod tests {
                 .expect("tempdir for bg output logs")
         });
         crate::output_log::set_root_for_tests(Some(std::sync::Arc::from(dir.path())));
+    }
+
+    async fn run_foreground_text(command: &str, ctx: &ToolContext) -> String {
+        BashTool::default()
+            .execute(json!({"command": command}), ctx)
+            .await
+            .expect("bash executes")
+            .content
+    }
+
+    #[tokio::test]
+    async fn read_search_list_commands_get_a_native_tool_hint() {
+        let ctx = context(None);
+        let out = run_foreground_text("cat Cargo.toml", &ctx).await;
+        assert!(out.contains("[package]"), "{out}");
+        assert!(out.contains("Hint: for plain file reads, Read"), "{out}");
+        assert!(run_foreground_text("ls", &ctx)
+            .await
+            .contains("Hint: for listing"));
+        // Not a pure read/search/list: no hint.
+        assert!(!run_foreground_text("echo hi", &ctx).await.contains("Hint:"));
+        assert!(!run_foreground_text("cat Cargo.toml | wc -l && true", &ctx)
+            .await
+            .contains("Hint:"));
+    }
+
+    #[tokio::test]
+    async fn profile_can_silence_or_retarget_the_native_tool_hint() {
+        let with_profile = |profile: Value| {
+            let mut ctx = context(None);
+            ctx.tools_config.model_profile = Some(Arc::new(
+                serde_json::from_value(profile).expect("profile parses"),
+            ));
+            ctx
+        };
+
+        let off = with_profile(json!({"behavior": {"bash_route": "off"}}));
+        assert!(!run_foreground_text("cat Cargo.toml", &off)
+            .await
+            .contains("Hint:"));
+
+        // The hint never names a tool this model cannot call.
+        let no_read = with_profile(json!({"hide": ["Read"]}));
+        assert!(!run_foreground_text("cat Cargo.toml", &no_read)
+            .await
+            .contains("Hint:"));
+        assert!(run_foreground_text("ls", &no_read)
+            .await
+            .contains("Hint: for listing"));
     }
 
     #[tokio::test]

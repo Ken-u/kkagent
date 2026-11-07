@@ -1,6 +1,7 @@
 pub mod accesses;
 pub mod args_validator;
 pub mod bash_ast;
+pub mod bash_route;
 pub mod builtin;
 pub mod display;
 pub mod git_worktree;

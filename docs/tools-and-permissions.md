@@ -94,6 +94,14 @@ ID 是 12 位随机 hex（如 `a4f2c1e93b7d`），只在读取结果里出现；
 
 `pattern` 总是以 `-e` 传给 `rg`，以 `-` 开头的模式（如 `--no-verify`）不会被当成选项。`glob` / `path` 传数组、`paths` 传字符串会自动转换成对应的复数形式。
 
+## Bash 的读取/搜索/列目录提示
+
+近 30 天约 55% 的 `Bash` 调用其实只是读文件（`cat` / `head` / `tail` / `sed -n`）、搜索（`rg` / `grep -r`）或列目录（`ls` / `find` / `fd`）。这些命令仍然照常执行，只是结果末尾追加一行指向 `Read` / `Grep` / `Glob` 的提示（带行号、输出有上限、可与其它调用并行）。
+
+判断刻意保守：命令含重定向、`&&` / `||` / `;`、后台 `&`、`$(…)`、反引号、heredoc，或管道里出现 `head` / `tail` / `wc` / `sort` / `uniq` / `cut` / `nl` / `grep` / `rg` / `tr` / `column` 之外的命令（如 `xargs`、`tee`、`sed`）时不给提示；`tail -f`、`sed -i`、带 `-exec` / `-delete` 的 `find` 也不会命中。开头的 `cd dir &&` 和 `2>&1` / `2>/dev/null` 会被忽略。后台运行的命令不追加提示。
+
+提示只会指向当前模型能调用的工具（被 `[model_profiles.*]` 的 `hide` / `expose` 去掉的工具不会被提到）。想完全关闭，在对应 profile 里写 `[model_profiles.NAME.behavior] bash_route = "off"`；`models = ["*"]` 的 profile 可以对所有模型生效。
+
 ## 图片输入
 
 模型配置含 `image_in`（也兼容 `vision`、`image`、`multimodal`）时启用完整图片输入：
