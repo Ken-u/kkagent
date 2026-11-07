@@ -97,7 +97,7 @@ jobs:
           - name: macOS x86_64
             os: macos-15-intel
           - name: macOS arm64
-            os: macos-14
+            os: macos-15
           - name: Windows x86_64
             os: windows-2022
     runs-on: ${{ matrix.os }}
@@ -184,7 +184,7 @@ jobs:
             target: x86_64-apple-darwin
             archive: tar
           - name: macOS arm64
-            os: macos-14
+            os: macos-15
             target: aarch64-apple-darwin
             archive: tar
           - name: Windows x86_64
