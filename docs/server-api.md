@@ -66,6 +66,10 @@ curl -sS -H "$AUTH" -H 'Content-Type: application/json' \
 
 发送消息先把 turn 原子写入 SQLite，再返回稳定的 `task_id`。相同 Session、相同 `Idempotency-Key` 和相同正文会返回原任务；同 key 不同正文返回 `409`。最终回答、工具调用、批准请求和状态变化通过 WebSocket 事件流返回。
 
+事件流里的 `error` 表示本轮已经终止（随后是 `status_update: idle` 与 `turn_end`）；`notice` 是不终止本轮的人类可读警告（例如跨会话文件冲突），客户端只需展示，不应据此判定 turn 结束。旧客户端遇到未知事件类型时可直接忽略 `notice`。
+
+`session.interrupt`（HTTP 的 interrupt 与 TUI 的 `Esc` 同语义）只中断当前 turn，不会杀掉会话已有的后台 Bash 任务；需要同时结束它们时在参数里带 `"cancel_background": true`（响应里会回显该值）。用户中断后，后台任务的完成通知不会自动唤醒模型，而是留到该会话的下一次输入。
+
 ## HTTP 路由
 
 | 方法与路径 | 说明 |

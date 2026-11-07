@@ -1896,7 +1896,10 @@ impl AgentLoop {
                                                     let others = conflicts.join(", ");
                                                     let _ = self
                                                         .event_tx
-                                                        .send(AgentEvent::Error {
+                                                        // A warning, not a failure: `Error`
+                                                        // would flip the TUI to idle (and
+                                                        // fail headless runs) mid-turn.
+                                                        .send(AgentEvent::Notice {
                                                             session_id: session.id.clone(),
                                                             message: format!(
                                                                 "File conflict warning: {} also touched by session(s) [{others}]. Continue, switch session, or use a separate worktree.",
@@ -2191,6 +2194,12 @@ impl AgentLoop {
 
             let mut tool_results = Vec::new();
             let mut pending_schema_loads: Vec<String> = Vec::new();
+            // Harness reminders produced while tools run. They must be recorded
+            // AFTER the tool_result message: a user message between an
+            // assistant `tool_use` and its `tool_result` makes providers reject
+            // every later request ("No tool output found for function call"),
+            // and that order is persisted, so even a restart cannot recover.
+            let mut pending_reminders: Vec<String> = Vec::new();
             for (id, name, input, mut output) in resolved {
                 // ExitPlanMode / EnterPlanMode flip plan_mode inside their helpers /
                 // execute paths; mirror to the TUI here.
@@ -2256,7 +2265,7 @@ impl AgentLoop {
                     if let Some(reminder) =
                         session.swarm.enter(crate::swarm::SwarmModeTrigger::Tool)
                     {
-                        session.add_user_message(reminder.into());
+                        pending_reminders.push(reminder.into());
                     }
                 }
 
@@ -2486,6 +2495,9 @@ impl AgentLoop {
 
             // Steer / delivery messages land after tool results (next model turn).
             let has_deliveries = !deliveries.is_empty();
+            for msg in pending_reminders {
+                session.add_user_message(msg);
+            }
             for msg in deliveries {
                 session.add_user_message(msg);
             }
@@ -6554,6 +6566,172 @@ mod retry_tests {
             "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
             body.len()
         )
+    }
+
+    struct StubAgentTool;
+
+    #[async_trait::async_trait]
+    impl kkagent_tools::Tool for StubAgentTool {
+        fn name(&self) -> &str {
+            "Agent"
+        }
+        fn description(&self) -> &str {
+            "stub sub-agent launcher"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+        fn read_only(&self) -> bool {
+            true
+        }
+        async fn execute(
+            &self,
+            _input: serde_json::Value,
+            _ctx: &kkagent_tools::ToolContext,
+        ) -> anyhow::Result<kkagent_tools::ToolOutput> {
+            Ok(kkagent_tools::ToolOutput::success("sub-agent started"))
+        }
+    }
+
+    /// Regression: the swarm-mode reminder raised by the first `Agent` call was
+    /// recorded BEFORE that call's tool_result, i.e. between the assistant
+    /// `tool_use` and its result. Providers reject that order with HTTP 400
+    /// "No tool output found for function call ...", and it was persisted, so
+    /// the session never worked again.
+    #[tokio::test]
+    async fn swarm_reminder_is_recorded_after_the_agent_tool_result() {
+        let round1 = sse(&[
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-agent\",\"type\":\"function\",\"function\":{\"name\":\"Agent\",\"arguments\":\"{}\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n",
+        ]
+        .concat());
+        let round2 = sse(&[
+            "data: {\"choices\":[{\"delta\":{\"content\":\"waiting for the sub-agent\"}}]}\n\n",
+            "data: [DONE]\n\n",
+        ]
+        .concat());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut round = 0;
+            while let Ok((mut socket, _)) = listener.accept().await {
+                round += 1;
+                let mut buf = vec![0u8; 16_384];
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                    use tokio::io::AsyncReadExt;
+                    let _ = socket.read(&mut buf).await;
+                })
+                .await;
+                let response = if round == 1 { &round1 } else { &round2 };
+                use tokio::io::AsyncWriteExt;
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+
+        let mut config = AppConfig {
+            default_model: Some("test/model".into()),
+            loop_control: Some(kkagent_config::LoopControlConfig {
+                max_attempts_per_step: 1,
+                max_steps_per_turn: 10,
+                auto_compact: false,
+                ..Default::default()
+            }),
+            ..AppConfig::default()
+        };
+        config.providers.insert(
+            "test".into(),
+            ProviderConfig {
+                provider_type: "openai-chat".into(),
+                api_key: Some("token".into()),
+                api_key_env: None,
+                base_url: Some(format!("http://{addr}")),
+                custom_headers: HashMap::new(),
+                oauth: None,
+                first_token_timeout_ms: None,
+                request_timeout_ms: None,
+                read_timeout_ms: None,
+                extra_fields: Default::default(),
+            },
+        );
+        config.models.insert(
+            "test/model".into(),
+            ModelConfig {
+                provider: "test".into(),
+                model: "test-model".into(),
+                max_context_size: Some(16_000),
+                max_output_size: Some(1_000),
+                capabilities: vec!["tool_use".into()],
+                display_name: None,
+                support_efforts: Vec::new(),
+                default_effort: None,
+                pricing: None,
+                experimental_adaptive_thinking: false,
+                experimental_vision_proxy: false,
+                experimental_visible_empty_retries: 0,
+                experimental_bad_toolcall_auto_retries: 0,
+                experimental_retry_partial_stream_errors: None,
+                first_token_timeout_ms: None,
+            },
+        );
+        let mut registry = kkagent_tools::ToolRegistry::new();
+        registry.register(Arc::new(StubAgentTool));
+        let (event_tx, _event_rx) = mpsc::channel(256);
+        let loop_ = AgentLoop::new(
+            Arc::new(config),
+            Arc::new(registry),
+            Arc::new(Mutex::new(PermissionChain::new(
+                PermissionMode::Auto,
+                Vec::new(),
+            ))),
+            event_tx,
+            Arc::new(Mutex::new(HashMap::new())),
+        );
+        let workspace =
+            std::env::temp_dir().join(format!("kkagent-swarm-order-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let mut session = Session::new(
+            "swarm-order-test".into(),
+            workspace.clone(),
+            PermissionMode::Auto,
+            "test/model".into(),
+        );
+        session.add_user_message("delegate this".into());
+
+        loop_.run_turn(&mut session).await.unwrap();
+        server.abort();
+
+        let tool_use_at = session
+            .messages
+            .iter()
+            .position(|message| {
+                message.role == "assistant"
+                    && message
+                        .content
+                        .iter()
+                        .any(|block| matches!(block, ChatContent::ToolUse { .. }))
+            })
+            .expect("assistant tool_use recorded");
+        let result_message = &session.messages[tool_use_at + 1];
+        assert!(
+            result_message.content.iter().any(|block| matches!(
+                block,
+                ChatContent::ToolResult { tool_use_id, .. } if tool_use_id == "call-agent"
+            )),
+            "the tool_result must directly follow its tool_use, got {result_message:?}"
+        );
+        let reminder = session
+            .messages
+            .get(tool_use_at + 2)
+            .expect("swarm reminder recorded after the results");
+        assert!(
+            reminder.content.iter().any(|block| matches!(
+                block,
+                ChatContent::Text { text } if text.contains("Swarm mode is active")
+            )),
+            "reminder must follow the results, got {reminder:?}"
+        );
+        std::fs::remove_dir_all(workspace).unwrap();
     }
 
     /// Per-message persistence: within a running turn, every complete message

@@ -614,6 +614,20 @@ for background jobs (shell_id/stop remain as aliases)."
             }
         };
 
+        // The user already pressed Esc: never start the command. Without this
+        // a tool call that was queued behind the interrupted one (parallel
+        // tool batch) would be spawned anyway and only killed on the next
+        // 50ms poll — long enough for a `git commit` or `rm` to take effect.
+        if ctx
+            .interrupted
+            .as_ref()
+            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst))
+        {
+            return Ok(ToolOutput::error(
+                "Interrupted before the command started; it was not run.",
+            ));
+        }
+
         let risk = crate::shell_safety::analyze_shell_command(&command);
         if let crate::shell_safety::ShellRisk::Dangerous(reason) = &risk {
             return Ok(ToolOutput::error(format!(
@@ -1397,31 +1411,30 @@ async fn run_via_kaos(
         Done(Result<kkagent_kaos::ExecResult, kkagent_kaos::KaosError>),
         TimedOut,
         Cancelled,
+        Interrupted,
     }
     let exec = kaos.exec(command, Some(cwd));
-    let outcome = match (timeout_ms, cancel) {
-        (Some(ms), Some(cancel)) => {
-            tokio::select! {
-                r = tokio::time::timeout(std::time::Duration::from_millis(ms), exec) => match r {
-                    Ok(r) => Outcome::Done(r),
-                    Err(_) => Outcome::TimedOut,
-                },
-                _ = cancel.cancelled() => Outcome::Cancelled,
-            }
+    // Every stop condition races the exec itself. An absent timeout / cancel
+    // token / interrupt flag is a future that never completes.
+    let timeout = async {
+        match timeout_ms {
+            Some(ms) => tokio::time::sleep(std::time::Duration::from_millis(ms)).await,
+            None => std::future::pending::<()>().await,
         }
-        (Some(ms), None) => {
-            match tokio::time::timeout(std::time::Duration::from_millis(ms), exec).await {
-                Ok(r) => Outcome::Done(r),
-                Err(_) => Outcome::TimedOut,
-            }
+    };
+    let cancelled = async {
+        match cancel {
+            Some(cancel) => cancel.cancelled().await,
+            None => std::future::pending::<()>().await,
         }
-        (None, Some(cancel)) => {
-            tokio::select! {
-                r = exec => Outcome::Done(r),
-                _ = cancel.cancelled() => Outcome::Cancelled,
-            }
-        }
-        (None, None) => Outcome::Done(exec.await),
+    };
+    let outcome = tokio::select! {
+        r = exec => Outcome::Done(r),
+        _ = timeout => Outcome::TimedOut,
+        _ = cancelled => Outcome::Cancelled,
+        // Esc while a foreground remote command runs: stop waiting at once
+        // instead of blocking the whole turn until the command finishes.
+        _ = wait_for_interrupt(interrupted.cloned()) => Outcome::Interrupted,
     };
     let result = match outcome {
         Outcome::TimedOut => {
@@ -1429,6 +1442,12 @@ async fn run_via_kaos(
                 "Remote command timed out after {}ms ({description})",
                 timeout_ms.unwrap_or_default()
             )));
+        }
+        Outcome::Interrupted => {
+            return Ok(ToolOutput::error(
+                "Interrupted: stopped waiting for the remote command. It may still be \
+                 running on the remote host — kaos/SSH exec cannot be killed remotely.",
+            ));
         }
         Outcome::Cancelled => {
             // kaos/SSH exec has no remote kill: cancellation only stops us
@@ -1708,6 +1727,92 @@ mod tests {
 
         assert!(result.is_error);
         assert!(result.content.contains("interrupted"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn interrupted_session_never_starts_the_command() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let marker = dir.path().join("ran");
+        let interrupted = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let mut ctx = context(Some(interrupted));
+        ctx.working_dir = dir.path().to_path_buf();
+
+        for run_in_background in [false, true] {
+            let result = BashTool::default()
+                .execute(
+                    json!({
+                        "command": format!("touch {}", marker.display()),
+                        "description": "must not run",
+                        "run_in_background": run_in_background,
+                    }),
+                    &ctx,
+                )
+                .await
+                .expect("tool execution");
+
+            assert!(result.is_error, "background={run_in_background}");
+            assert!(
+                result.content.contains("not run"),
+                "background={run_in_background}: {}",
+                result.content
+            );
+        }
+        // Give a (wrongly) spawned shell time to create the marker.
+        tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+        assert!(
+            !marker.exists(),
+            "an already-interrupted session must not spawn the command"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn kaos_foreground_exec_observes_interrupt() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let kaos = kkagent_kaos::KaosHandle::Local(Arc::new(kkagent_kaos::LocalKaos::new(
+            dir.path().to_path_buf(),
+        )));
+        let interrupted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        // Both foreground shapes: with and without a timeout.
+        for timeout_ms in [Some(30_000), None] {
+            interrupted.store(false, std::sync::atomic::Ordering::SeqCst);
+            let trigger = interrupted.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
+                trigger.store(true, std::sync::atomic::Ordering::SeqCst);
+            });
+            let started = std::time::Instant::now();
+            let result = tokio::time::timeout(
+                tokio::time::Duration::from_secs(4),
+                run_via_kaos(
+                    &kaos,
+                    "sleep 3",
+                    dir.path(),
+                    timeout_ms,
+                    Some(&interrupted),
+                    None,
+                    "sleep",
+                    "kaos-test",
+                ),
+            )
+            .await
+            .expect("interrupt must stop the wait promptly")
+            .expect("tool output");
+
+            assert!(result.is_error, "timeout={timeout_ms:?}");
+            assert!(
+                result.content.contains("Interrupted"),
+                "timeout={timeout_ms:?}: {}",
+                result.content
+            );
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(2),
+                "interrupt took {:?}",
+                started.elapsed()
+            );
+        }
     }
 
     #[cfg(unix)]

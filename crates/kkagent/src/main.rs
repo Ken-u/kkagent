@@ -3240,8 +3240,47 @@ async fn run_dump_system_prompt(config_path: Option<&Path>) -> Result<()> {
     Ok(())
 }
 
+/// True when the user's interrupt flag for `session_id` is set. The flag
+/// outlives the interrupted turn and is cleared only when new user input starts
+/// the next one (`Session::clear_interrupt`).
+async fn session_interrupt_requested(state: &ServerState, session_id: &str) -> bool {
+    state
+        .interrupt_flags
+        .lock()
+        .await
+        .get(session_id)
+        .is_some_and(|flag| flag.load(Ordering::SeqCst))
+}
+
+/// True when `session_id` is already live in memory: parked in `sessions`, or
+/// owned by a running turn (its turn permit is held).
+///
+/// A running turn owns its `Session` outside `sessions`, so "not in
+/// `sessions`" alone does NOT mean "not loaded". Treating it that way made
+/// every background-task completion, cron fire or `/model` change that landed
+/// mid-turn resume a second `Session` from the transcript and overwrite the
+/// shared handle maps (interrupt flag, approval / question channels, steer
+/// mailbox) — after which Esc flipped a flag nobody was watching.
+///
+/// The permit is read while the `sessions` lock is held: `checkout_session` /
+/// `checkin_session` both need that lock, so a turn cannot hand its session
+/// back (and release the permit) between the two reads. Keying on the permit
+/// rather than on `in_flight_views` also keeps recovery possible if a turn task
+/// died without checking its session back in (the permit is released on
+/// unwind, the stale view is not), and covers RPCs that take the session out
+/// of the map while holding the permit.
+async fn session_is_live(state: &ServerState, session_id: &str) -> bool {
+    let sessions = state.sessions.lock().await;
+    sessions.contains_key(session_id) || state.turn_locks.is_busy(session_id).await
+}
+
 async fn ensure_session_loaded(state: &Arc<ServerState>, session_id: &str) -> Result<(), String> {
-    if state.sessions.lock().await.contains_key(session_id) {
+    if session_is_live(state, session_id).await {
+        return Ok(());
+    }
+    let _load_gate = state.session_load_gate.lock().await;
+    // Another loader may have finished while this one waited for the gate.
+    if session_is_live(state, session_id).await {
         return Ok(());
     }
     let (record, messages) = {
@@ -5487,6 +5526,11 @@ struct ServerState {
     sandbox_policy: StdRwLock<kkagent_tools::sandbox::SandboxPolicy>,
     workspace_trust: StdRwLock<kkagent_config::WorkspaceTrustStore>,
     sessions: Mutex<HashMap<String, Session>>,
+    /// Serializes `ensure_session_loaded`: two concurrent loaders of the same
+    /// id must not each build a `Session` and overwrite the shared handle maps
+    /// (interrupt flag, approval / question channels, steer mailbox) the
+    /// running turn already points at.
+    session_load_gate: Mutex<()>,
     /// Session approval senders — must not require holding `sessions` lock
     /// (agent loop may be waiting on approval while holding the session).
     approval_txs: Mutex<HashMap<String, mpsc::Sender<kkagent_protocol::ApprovalResponse>>>,
@@ -6014,6 +6058,10 @@ async fn deliver_cron_fire(
                         tracing::warn!("cron fire dropped: session {sid} vanished");
                         return true;
                     };
+                    // A cron fire is a new explicit trigger: an earlier user
+                    // interrupt belongs to the previous turn and must not
+                    // abort this one before it starts.
+                    session.clear_interrupt();
                     session.add_user_message(xml);
                     session.begin_turn();
                 }
@@ -6061,10 +6109,22 @@ async fn deliver_cron_fire(
 /// sessions need no wake — the live turn drains the hub before every model
 /// step and at its final step; the grace wait covers the narrow window where
 /// the hub push races the previous turn's shutdown.
+///
+/// A session the user just interrupted is never woken: Esc means "stop
+/// working", and restarting the model because a background job happened to
+/// finish is exactly the "Esc immediately triggers the next LLM request"
+/// failure. The notification stays pending in the hub and is delivered with
+/// the user's next prompt.
 async fn wake_session_for_task_notifications(state: &Arc<ServerState>, session_id: &str) {
     if let Err(error) = ensure_session_loaded(state, session_id).await {
         tracing::warn!(
             "task-notification wake skipped: session {session_id} cannot be loaded: {error}"
+        );
+        return;
+    }
+    if session_interrupt_requested(state, session_id).await {
+        tracing::debug!(
+            "task-notification wake skipped: session {session_id} was interrupted by the user"
         );
         return;
     }
@@ -6076,6 +6136,10 @@ async fn wake_session_for_task_notifications(state: &Arc<ServerState>, session_i
         // Busy with a live turn: that turn delivers the notification itself.
         return;
     };
+    // The user may have pressed Esc while the grace wait was running.
+    if session_interrupt_requested(state, session_id).await {
+        return;
+    }
     // Spurious-wake guard: the notification may have been consumed
     // synchronously (TaskOutput fetch / sync Agent wait) since the push.
     if !kkagent_tools::task_notify::global_hub().has_pending(session_id) {
@@ -7392,6 +7456,7 @@ async fn build_server_state_with_shutdown(
         sandbox_policy: StdRwLock::new(sandbox_policy),
         workspace_trust: StdRwLock::new(config.workspace_trust.clone()),
         sessions: Mutex::new(HashMap::new()),
+        session_load_gate: Mutex::new(()),
         approval_txs: Mutex::new(HashMap::new()),
         question_txs: Mutex::new(HashMap::new()),
         steer_mailboxes: Mutex::new(HashMap::new()),
@@ -7699,8 +7764,71 @@ fn messages_from_records(records: &[kkagent_core::transcript::MessageRecord]) ->
             kkagent_core::transcript::message_from_transcript(r.role.clone(), &r.content_json)
         })
         .collect();
+    repair_misplaced_tool_results(&mut messages);
     repair_orphan_tool_uses(&mut messages);
     messages
+}
+
+/// Move a tool-result message back next to the assistant `tool_use` it
+/// answers when plain user text was recorded in between.
+///
+/// Older versions injected the swarm-mode reminder between an `Agent` /
+/// `AgentSwarm` tool_use and its tool_result and persisted that order.
+/// Providers reject it ("No tool output found for function call ..."), so such
+/// a session failed every request, even after a restart. The text messages are
+/// kept, just moved after the results.
+fn repair_misplaced_tool_results(messages: &mut Vec<ChatMessage>) {
+    fn is_plain_user_text(message: &ChatMessage) -> bool {
+        message.role == "user"
+            && !message.content.is_empty()
+            && message
+                .content
+                .iter()
+                .all(|block| matches!(block, ChatContent::Text { .. } | ChatContent::Image { .. }))
+    }
+
+    let mut index = 0;
+    while index < messages.len() {
+        let tool_use_ids: std::collections::HashSet<String> = if messages[index].role == "assistant"
+        {
+            messages[index]
+                .content
+                .iter()
+                .filter_map(|block| match block {
+                    ChatContent::ToolUse { id, .. } => Some(id.clone()),
+                    _ => None,
+                })
+                .collect()
+        } else {
+            std::collections::HashSet::new()
+        };
+        if !tool_use_ids.is_empty() {
+            let mut results_at = index + 1;
+            while results_at < messages.len() && is_plain_user_text(&messages[results_at]) {
+                results_at += 1;
+            }
+            let misplaced = results_at > index + 1
+                && messages.get(results_at).is_some_and(|candidate| {
+                    candidate.role == "user"
+                        && candidate.content.iter().any(|block| {
+                            matches!(
+                                block,
+                                ChatContent::ToolResult { tool_use_id, .. }
+                                    if tool_use_ids.contains(tool_use_id)
+                            )
+                        })
+                });
+            if misplaced {
+                tracing::warn!(
+                    moved_over = results_at - index - 1,
+                    "repairing tool_result recorded after unrelated user text"
+                );
+                let results = messages.remove(results_at);
+                messages.insert(index + 1, results);
+            }
+        }
+        index += 1;
+    }
 }
 
 /// Synthesize error tool_results for tool_use blocks left unanswered by a
@@ -10540,6 +10668,7 @@ async fn handle_rpc_call(
                         {
                             let mut sessions = state.sessions.lock().await;
                             if let Some(session) = sessions.get_mut(&session_id) {
+                                session.clear_interrupt();
                                 session.add_user_message(prompt);
                             }
                         }
@@ -10748,6 +10877,9 @@ async fn handle_rpc_call(
                         let mut sessions = state.sessions.lock().await;
                         match sessions.get_mut(&session_id) {
                             Some(session) => {
+                                // Idle session: this starts a fresh turn, so a
+                                // previous Esc must not abort it on arrival.
+                                session.clear_interrupt();
                                 session.add_user_message(prompt);
                                 true
                             }
@@ -10817,6 +10949,16 @@ async fn handle_rpc_call(
                 .filter(|s| !s.is_empty())
                 .map(str::to_string)
                 .unwrap_or_else(|| "rpc".to_string());
+            // Esc / stop interrupts the *turn* only. Background Bash jobs
+            // (dev servers, watchers, long builds) keep running unless the
+            // caller is tearing the whole session down and opts in: killing
+            // them on every Esc made the model relaunch them on its next step
+            // and turned each Esc into another LLM request.
+            let cancel_background = params
+                .as_ref()
+                .and_then(|p| p.get("cancel_background"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
 
             // Always flip the cooperative cancel flag first (works while session is out of the map).
             if let Some(flag) = state.interrupt_flags.lock().await.get(&session_id) {
@@ -10841,14 +10983,21 @@ async fn handle_rpc_call(
             if let Some(handle) = state.abort_registry.lock().await.remove(&session_id) {
                 handle.abort();
             }
-            // Kill any background Bash jobs owned by this session.
-            state.bash_shells.cancel_session(&session_id).await;
+            if cancel_background {
+                // Session teardown: kill the background Bash jobs it owns.
+                state.bash_shells.cancel_session(&session_id).await;
+            }
             tracing::info!(
-                "Interrupt requested for session {} (source: {})",
+                "Interrupt requested for session {} (source: {}, cancel_background: {})",
                 session_id,
-                source
+                source,
+                cancel_background
             );
-            Ok(serde_json::json!({"ok": true, "source": source}))
+            Ok(serde_json::json!({
+                "ok": true,
+                "source": source,
+                "cancel_background": cancel_background,
+            }))
         }
         "session.btw" => {
             let session_id = params
@@ -14309,6 +14458,288 @@ mod runtime_http_tests {
         state.shutdown().await;
     }
 
+    /// Register an idle session the way `sessions.create` / `session.resume`
+    /// do (handle maps + `sessions` entry + transcript row), so the shadow
+    /// loader in `ensure_session_loaded` would succeed if it were reached.
+    async fn register_idle_session(state: &Arc<ServerState>, session_id: &str) -> PathBuf {
+        let workspace = std::env::temp_dir().join(format!("kkagent-esc-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace).unwrap();
+        let session = Session::new(
+            session_id.into(),
+            workspace.clone(),
+            PermissionMode::Yolo,
+            "test-model".into(),
+        );
+        {
+            let db = state.transcript.lock().await;
+            db.create_session(session_id, "test-model", &workspace.to_string_lossy())
+                .unwrap();
+        }
+        state
+            .interrupt_flags
+            .lock()
+            .await
+            .insert(session_id.into(), session.interrupted.clone());
+        state
+            .interrupt_sources
+            .lock()
+            .await
+            .insert(session_id.into(), session.interrupt_source.clone());
+        state
+            .approval_txs
+            .lock()
+            .await
+            .insert(session_id.into(), session.approval_tx.clone());
+        state
+            .question_txs
+            .lock()
+            .await
+            .insert(session_id.into(), session.question_tx.clone());
+        state
+            .steer_mailboxes
+            .lock()
+            .await
+            .insert(session_id.into(), session.steer_mailbox.clone());
+        state
+            .sessions
+            .lock()
+            .await
+            .insert(session_id.into(), session);
+        workspace
+    }
+
+    async fn interrupt_rpc(
+        state: &Arc<ServerState>,
+        session_id: &str,
+        extra: serde_json::Value,
+    ) -> serde_json::Value {
+        let mut params = serde_json::json!({"session_id": session_id, "source": "tui-esc"});
+        if let (Some(base), Some(extra)) = (params.as_object_mut(), extra.as_object()) {
+            for (key, value) in extra {
+                base.insert(key.clone(), value.clone());
+            }
+        }
+        handle_rpc_call(
+            state.clone(),
+            "session.interrupt",
+            Some(params),
+            rpc_event_sink(),
+        )
+        .await
+        .expect("interrupt rpc succeeds")
+    }
+
+    /// Regression: a background-task wake that landed mid-turn used to resume
+    /// a *second* copy of the checked-out session from the transcript and
+    /// overwrite the shared interrupt flag, so the next Esc flipped a flag the
+    /// running turn never read ("Esc can't stop it").
+    #[tokio::test]
+    async fn wake_mid_turn_must_not_detach_the_interrupt_flag() {
+        let state = test_server_state().await;
+        let session_id = "wake-mid-turn";
+        let workspace = register_idle_session(&state, session_id).await;
+
+        // A turn is running: permit held, session checked out of `sessions`.
+        let _permit = state.turn_locks.try_acquire(session_id).await.unwrap();
+        let running = state
+            .checkout_session(session_id)
+            .await
+            .expect("session checked out by the running turn");
+        let handle_before = state.interrupt_flags.lock().await.get(session_id).cloned();
+
+        // A background job finishes mid-turn -> wake hook fires.
+        wake_session_for_task_notifications(&state, session_id).await;
+
+        assert!(
+            !state.sessions.lock().await.contains_key(session_id),
+            "wake must not resume a second copy of a session a turn has checked out"
+        );
+        let handle_after = state.interrupt_flags.lock().await.get(session_id).cloned();
+        assert!(
+            Arc::ptr_eq(
+                handle_before.as_ref().expect("flag registered"),
+                handle_after.as_ref().expect("flag still registered"),
+            ),
+            "the shared interrupt flag must survive a mid-turn wake"
+        );
+
+        interrupt_rpc(&state, session_id, serde_json::json!({})).await;
+        assert!(
+            running.is_interrupted(),
+            "Esc did not reach the running turn: the interrupt flag was detached"
+        );
+
+        state.checkin_session(session_id, running).await;
+        state.shutdown().await;
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    /// Same hazard through every other caller of `ensure_session_loaded`
+    /// (cron fire, `/model`, HTTP helpers): loading is a no-op for a session
+    /// that exists only as a running turn's checked-out copy.
+    #[tokio::test]
+    async fn ensure_session_loaded_is_a_no_op_for_a_running_turn() {
+        let state = test_server_state().await;
+        let session_id = "ensure-mid-turn";
+        let workspace = register_idle_session(&state, session_id).await;
+        let _permit = state.turn_locks.try_acquire(session_id).await.unwrap();
+        let running = state
+            .checkout_session(session_id)
+            .await
+            .expect("checked out");
+
+        ensure_session_loaded(&state, session_id)
+            .await
+            .expect("running session counts as loaded");
+        assert!(!state.sessions.lock().await.contains_key(session_id));
+
+        // A turn task that died without checking in (permit gone, session
+        // lost) must stay recoverable by a reload from the transcript.
+        drop(_permit);
+        drop(running);
+        ensure_session_loaded(&state, session_id)
+            .await
+            .expect("reload after the turn vanished");
+        assert!(state.sessions.lock().await.contains_key(session_id));
+
+        state.shutdown().await;
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    /// Esc means "stop": a background-task completion arriving after the
+    /// interrupt must not restart the model. The notification stays pending
+    /// for the user's next prompt.
+    #[tokio::test]
+    async fn wake_is_skipped_after_a_user_interrupt() {
+        let state = test_server_state().await;
+        let session_id = "wake-after-interrupt";
+        let workspace = register_idle_session(&state, session_id).await;
+        interrupt_rpc(&state, session_id, serde_json::json!({})).await;
+
+        kkagent_tools::task_notify::global_hub().push_notification(
+            session_id,
+            kkagent_tools::task_notify::TaskNotification {
+                task_id: "bg-wake-after-interrupt".into(),
+                kind: kkagent_tools::task_notify::TaskKind::Bash,
+                status: "completed".into(),
+                description: "finished after Esc".into(),
+                summary: None,
+            },
+        );
+        wake_session_for_task_notifications(&state, session_id).await;
+
+        assert!(
+            !state.turn_locks.is_busy(session_id).await,
+            "an interrupted session must not be woken into a new turn"
+        );
+        assert!(
+            state
+                .sessions
+                .lock()
+                .await
+                .get(session_id)
+                .is_some_and(|session| session.is_turn_boundary()),
+            "wake must not begin a turn on an interrupted session"
+        );
+        assert!(
+            kkagent_tools::task_notify::global_hub().has_pending(session_id),
+            "the notification must wait for the next user prompt"
+        );
+
+        kkagent_tools::task_notify::global_hub().forget_session(session_id);
+        state.shutdown().await;
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    /// Esc interrupts the turn only: background Bash jobs (dev servers,
+    /// watchers) survive unless the caller opts into session teardown.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn interrupt_keeps_background_jobs_unless_cancel_requested() {
+        static LOG_ROOT: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+        let logs = LOG_ROOT.get_or_init(|| tempfile::tempdir().expect("bg log dir"));
+        kkagent_tools::output_log::set_root_for_tests(Some(Arc::from(logs.path())));
+
+        let state = test_server_state().await;
+        let session_id = "interrupt-bg-jobs";
+        let workspace = register_idle_session(&state, session_id).await;
+
+        let bash = kkagent_tools::builtin::BashTool::new(
+            state.bash_shells.clone(),
+            kkagent_tools::builtin::BashOptions::default(),
+        );
+        let ctx = kkagent_tools::ToolContext {
+            working_dir: workspace.clone(),
+            session_id: session_id.into(),
+            turn_id: "turn".into(),
+            plan_file_path: None,
+            image: kkagent_config::ImageConfig::default(),
+            tool_call_id: None,
+            interrupted: None,
+            tools_config: kkagent_config::ToolsConfig::default(),
+            model_alias: None,
+        };
+        let started = kkagent_tools::Tool::execute(
+            &bash,
+            serde_json::json!({
+                "command": "sleep 30",
+                "description": "long running dev server",
+                "run_in_background": true,
+            }),
+            &ctx,
+        )
+        .await
+        .expect("background start");
+        assert!(!started.is_error, "{}", started.content);
+        assert_eq!(
+            state
+                .bash_shells
+                .list_running_for_session(session_id)
+                .await
+                .len(),
+            1
+        );
+
+        // Plain Esc: the job keeps running.
+        let reply = interrupt_rpc(&state, session_id, serde_json::json!({})).await;
+        assert_eq!(reply["cancel_background"], false);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            state
+                .bash_shells
+                .list_running_for_session(session_id)
+                .await
+                .len(),
+            1,
+            "Esc must not kill background jobs"
+        );
+
+        // Explicit teardown asks for them to be cancelled.
+        let reply = interrupt_rpc(
+            &state,
+            session_id,
+            serde_json::json!({"cancel_background": true}),
+        )
+        .await;
+        assert_eq!(reply["cancel_background"], true);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !state
+            .bash_shells
+            .list_running_for_session(session_id)
+            .await
+            .is_empty()
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "cancel_background must stop the job"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        state.shutdown().await;
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
     #[tokio::test]
     async fn interrupt_then_next_turn_approval_reaches_the_current_waiter() {
         let state = test_server_state().await;
@@ -14894,6 +15325,74 @@ mod runtime_http_tests {
             }
             other => panic!("expected ToolResult, got {other:?}"),
         }
+    }
+
+    /// Regression: the swarm-mode reminder used to be recorded between an
+    /// `Agent` tool_use and its tool_result. Providers answer that order with
+    /// HTTP 400 "No tool output found for function call", and since it was
+    /// persisted, restarting never helped. Loading must put the results back.
+    #[test]
+    fn repair_misplaced_tool_results_moves_reminder_after_the_results() {
+        let records = vec![
+            msg_record("user", r#"[{"type":"text","text":"go"}]"#),
+            msg_record(
+                "assistant",
+                r#"[{"type":"tool_use","id":"call-agent","name":"Agent","input":{}}]"#,
+            ),
+            msg_record(
+                "user",
+                r#"[{"type":"text","text":"<system-reminder>Swarm mode is active.</system-reminder>"}]"#,
+            ),
+            msg_record(
+                "user",
+                r#"[{"type":"tool_result","tool_use_id":"call-agent","content":"started","is_error":false}]"#,
+            ),
+            msg_record("assistant", r#"[{"type":"text","text":"waiting"}]"#),
+        ];
+        let messages = messages_from_records(&records);
+        assert_eq!(messages.len(), 5, "nothing is dropped");
+        assert_eq!(messages[1].role, "assistant");
+        assert!(
+            matches!(
+                &messages[2].content[0],
+                ChatContent::ToolResult { tool_use_id, .. } if tool_use_id == "call-agent"
+            ),
+            "the tool_result must directly follow its tool_use: {:?}",
+            messages[2]
+        );
+        assert!(
+            matches!(
+                &messages[3].content[0],
+                ChatContent::Text { text } if text.contains("Swarm mode is active")
+            ),
+            "the reminder keeps its place right after the results"
+        );
+        assert_eq!(messages[4].role, "assistant");
+    }
+
+    #[test]
+    fn repair_misplaced_tool_results_leaves_ordinary_transcripts_alone() {
+        let records = vec![
+            msg_record("user", r#"[{"type":"text","text":"go"}]"#),
+            msg_record(
+                "assistant",
+                r#"[{"type":"tool_use","id":"call-1","name":"bash","input":{}}]"#,
+            ),
+            msg_record(
+                "user",
+                r#"[{"type":"tool_result","tool_use_id":"call-1","content":"ok","is_error":false}]"#,
+            ),
+            msg_record("user", r#"[{"type":"text","text":"steer"}]"#),
+            msg_record("assistant", r#"[{"type":"text","text":"done"}]"#),
+        ];
+        let messages = messages_from_records(&records);
+        let roles: Vec<&str> = messages.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(roles, ["user", "assistant", "user", "user", "assistant"]);
+        assert!(matches!(
+            &messages[2].content[0],
+            ChatContent::ToolResult { .. }
+        ));
+        assert!(matches!(&messages[3].content[0], ChatContent::Text { .. }));
     }
 
     #[test]

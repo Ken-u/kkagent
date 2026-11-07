@@ -153,11 +153,14 @@ impl BtwPanelState {
 pub struct QueuePane {
     pub items: Vec<String>,
     pub selected: usize,
+    /// Flushing is paused after an interrupt; Enter on an empty prompt resumes.
+    pub paused: bool,
 }
 
 impl QueuePane {
     pub fn from_prompt_queue(q: &crate::prompt_queue::PromptQueue) -> Self {
         Self {
+            paused: q.held,
             items: q
                 .items
                 .iter()
@@ -409,10 +412,15 @@ pub fn render_queue(f: &mut Frame, area: Rect, pane: &QueuePane, theme: &Theme) 
             })
             .collect()
     };
-    let block = window_block(
-        format!(" queue · {} · Ctrl-S steer ", pane.items.len()),
-        theme,
-    );
+    let title = if pane.paused {
+        format!(
+            " queue · {} · paused after interrupt — Enter to send ",
+            pane.items.len()
+        )
+    } else {
+        format!(" queue · {} · Ctrl-S steer ", pane.items.len())
+    };
+    let block = window_block(title, theme);
     f.render_widget(Paragraph::new(lines).block(block), area);
 }
 

@@ -72,7 +72,7 @@ Footer 第一行的模型槽位跟随当前视图：切进子 agent 视图（`/a
 | 运行中 `Ctrl+S` | 注入 steer，引导模型在下一个模型步骤响应；已有 next-turn 队列时会按队列顺序与当前草稿一并注入。 |
 | `Shift+Enter` | 插入换行；不再用于 steer，避免不同终端无法区分它和普通 Enter。 |
 | `Ctrl+J` | 插入换行。 |
-| `Esc` | 先关闭当前菜单/浮层；无浮层且 turn 运行中时中断生成（留在 TUI）。空闲下连按两次可选择历史提示分叉编辑。 |
+| `Esc` | 先关闭当前菜单/浮层；无浮层且 turn 运行中时中断生成（留在 TUI）：只中断本轮，不会杀掉已经在跑的后台 Bash 任务（dev server、watcher 等，要停请用 `/tasks` 或 `TaskStop`）；已排队的下一轮消息会暂停发送（队列标题显示 paused），按空输入 `Enter` 继续发送，或直接输入新消息。普通工具审批弹窗里 `Esc` 等同于「中断本轮」（要只拒绝这一次工具调用、让模型继续，请选 reject 选项）；Plan 评审弹窗里 `Esc` 仍只折叠弹窗。空闲下连按两次可选择历史提示分叉编辑。 |
 | `Ctrl+B` | 后台化：退出 TUI，standalone server 与进行中的 turn 继续跑；再次 `kk` 自动 resume。有菜单/浮层时只关闭浮层；Plan 模式或 in-process 模式下忽略。 |
 | `Ctrl+C` | 输入非空时清空输入。空输入时第一次请求确认退出；第二次：无 turn 则退出并保留 server；有 turn 时弹窗可选 Terminate / Background / Cancel。不会在第一次按键时中断 turn。 |
 | 空输入时 `Ctrl+D` | 关闭当前会话标签，或在无可关标签时确认退出。 |

@@ -3969,7 +3969,11 @@ impl McpServer {
             match self
                 .rpc_call(
                     "session.interrupt",
-                    json!({ "session_id": task.session_id, "source": "mcp-stop" }),
+                    json!({
+                        "session_id": task.session_id,
+                        "source": "mcp-stop",
+                        "cancel_background": true,
+                    }),
                 )
                 .await
             {

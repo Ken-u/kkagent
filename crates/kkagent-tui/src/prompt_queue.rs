@@ -51,11 +51,33 @@ impl QueuedPrompt {
 pub struct PromptQueue {
     pub items: Vec<QueuedPrompt>,
     pub selected: usize,
+    /// Set when the user interrupted the turn. Queued prompts then stay put
+    /// instead of being flushed the instant the session turns idle: Esc means
+    /// "stop", and sending the next queued prompt right away starts another
+    /// LLM request the user never asked for. Released by a new submit or by
+    /// Enter on an empty composer.
+    pub held: bool,
+    /// The "queue paused" hint was already shown for the current hold.
+    pub held_notified: bool,
 }
 
 impl PromptQueue {
     pub fn is_empty(&self) -> bool {
         self.items.is_empty()
+    }
+
+    /// Pause automatic flushing (after a user interrupt).
+    pub fn hold(&mut self) {
+        if !self.held {
+            self.held = true;
+            self.held_notified = false;
+        }
+    }
+
+    /// Resume automatic flushing.
+    pub fn release(&mut self) {
+        self.held = false;
+        self.held_notified = false;
     }
 
     pub fn push(&mut self, item: QueuedPrompt) {
@@ -120,5 +142,20 @@ mod tests {
         let front = q.pop_front().unwrap();
         assert_eq!(front.text, "a");
         assert_eq!(q.items.len(), 2);
+    }
+
+    #[test]
+    fn hold_is_sticky_until_released() {
+        let mut q = PromptQueue::default();
+        assert!(!q.held);
+        q.hold();
+        assert!(q.held);
+        q.held_notified = true;
+        // A second interrupt must not re-arm the one-time hint.
+        q.hold();
+        assert!(q.held_notified);
+        q.release();
+        assert!(!q.held);
+        assert!(!q.held_notified);
     }
 }

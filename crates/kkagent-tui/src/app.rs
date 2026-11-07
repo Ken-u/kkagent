@@ -2070,7 +2070,10 @@ impl TuiApp {
 
         if let Some(ref id) = sid {
             if !self.allows_background_detach {
-                let _ = self.client.interrupt_with_source(id, "tui-exit").await;
+                let _ = self
+                    .client
+                    .interrupt_and_cancel_background(id, "tui-exit")
+                    .await;
             }
             if empty {
                 let _ = self.discard_session_record(id, "tui-exit-empty").await;
@@ -3256,7 +3259,11 @@ impl TuiApp {
             0 => {
                 // Terminate: interrupt then exit (server stays up).
                 if let Some(sid) = self.state.session_id.clone() {
-                    if let Err(error) = self.client.interrupt_with_source(&sid, "tui-quit").await {
+                    if let Err(error) = self
+                        .client
+                        .interrupt_and_cancel_background(&sid, "tui-quit")
+                        .await
+                    {
                         self.system_message(format!("Failed to interrupt turn: {error}"));
                     } else {
                         self.state.status = SessionStatus::Cancelling;
@@ -4043,6 +4050,7 @@ impl TuiApp {
             if let Some(sid) = self.state.session_id.clone() {
                 match self.client.interrupt_with_source(&sid, "tui-esc").await {
                     Ok(()) => {
+                        self.hold_prompt_queue_after_interrupt();
                         self.system_message("Interrupted — cancelling in-flight tools…".into());
                     }
                     Err(e) => {
@@ -4176,18 +4184,24 @@ impl TuiApp {
                         }
                     }
                 }
+                // Esc stops the turn, like everywhere else. It used to answer
+                // `Rejected`, which only fails this one tool call: the model
+                // got "rejected by user" and its next LLM request started at
+                // once. Declining while letting the model carry on stays one
+                // keypress away via the explicit reject choice.
                 KeyCode::Esc => {
                     self.respond_approval_choice(
                         ApprovalChoice {
-                            label: "reject".into(),
-                            decision: kkagent_protocol::ApprovalDecision::Rejected,
-                            selected_label: "reject".into(),
+                            label: "cancel".into(),
+                            decision: kkagent_protocol::ApprovalDecision::Cancelled,
+                            selected_label: "cancel".into(),
                             requires_feedback: false,
                             scope: None,
                         },
                         None,
                     )
                     .await?;
+                    self.hold_prompt_queue_after_interrupt();
                 }
                 KeyCode::Up if approval.selected > 0 => {
                     approval.selected -= 1;
@@ -4753,7 +4767,7 @@ impl TuiApp {
                         if let Some(sid) = self.state.session_id.clone() {
                             match self
                                 .client
-                                .interrupt_with_source(&sid, "tui-close-tab")
+                                .interrupt_and_cancel_background(&sid, "tui-close-tab")
                                 .await
                             {
                                 Ok(()) => {
@@ -4791,6 +4805,7 @@ impl TuiApp {
                     if let Some(sid) = &self.state.session_id {
                         self.state.status = SessionStatus::Cancelling;
                         self.client.interrupt_with_source(sid, "tui-esc").await?;
+                        self.state.prompt_queue.hold();
                         self.system_message(
                             "Cancelling… partial output kept. After idle: edit & retry, or /fork."
                                 .into(),
@@ -4848,7 +4863,12 @@ impl TuiApp {
             }
             // Enter: submit
             KeyCode::Enter if !key.modifiers.contains(KeyModifiers::SHIFT) => {
-                self.submit_input().await?;
+                // Enter on an empty prompt resumes a queue that was paused by
+                // an interrupt; otherwise it is a normal submit.
+                let resumed = self.resume_held_prompt_queue();
+                if !resumed {
+                    self.submit_input().await?;
+                }
             }
             // Empty input Tab / ← →: cycle related sessions (/new or /fork group)
             KeyCode::Tab
@@ -10091,6 +10111,7 @@ impl TuiApp {
                     selected.min(items.len() - 1)
                 },
                 items: items.clone(),
+                ..Default::default()
             };
             for item in &items {
                 let already = self.state.messages.iter().any(|message| {
@@ -11240,7 +11261,7 @@ impl TuiApp {
         {
             let _ = self
                 .client
-                .interrupt_with_source(&deleted_id, "tui-delete-session")
+                .interrupt_and_cancel_background(&deleted_id, "tui-delete-session")
                 .await;
         }
 
@@ -11602,6 +11623,11 @@ impl TuiApp {
 
         self.state.push_input_history(&text);
 
+        // The user is talking to the agent again (a real prompt, not a slash
+        // command or local shell line): a queue paused by an earlier interrupt
+        // resumes, behind whatever they just sent.
+        self.state.prompt_queue.release();
+
         let busy = matches!(
             self.state.status,
             SessionStatus::Thinking
@@ -11818,8 +11844,42 @@ impl TuiApp {
         }
     }
 
+    /// The user interrupted the current turn: stop auto-sending queued prompts
+    /// until they explicitly resume (new message, or Enter on an empty prompt).
+    /// Without this the queue flushed on the very Idle the interrupt produced,
+    /// so every Esc immediately started the next LLM request.
+    fn hold_prompt_queue_after_interrupt(&mut self) {
+        self.state.prompt_queue.hold();
+    }
+
+    /// Enter on an empty composer while the queue is paused: resume sending.
+    /// Returns true when the key was consumed.
+    fn resume_held_prompt_queue(&mut self) -> bool {
+        if !self.state.prompt_queue.held
+            || self.state.prompt_queue.is_empty()
+            || !self.state.input.is_empty()
+            || !matches!(self.state.status, SessionStatus::Idle)
+        {
+            return false;
+        }
+        self.state.prompt_queue.release();
+        self.flush_prompt_queue_if_idle();
+        true
+    }
+
     fn flush_prompt_queue_if_idle(&mut self) {
         if !matches!(self.state.status, SessionStatus::Idle) {
+            return;
+        }
+        if self.state.prompt_queue.held {
+            if !self.state.prompt_queue.is_empty() && !self.state.prompt_queue.held_notified {
+                self.state.prompt_queue.held_notified = true;
+                self.system_message(
+                    "Queued prompts are paused after the interrupt — press Enter on an \
+                     empty prompt to send them, or type a new message."
+                        .into(),
+                );
+            }
             return;
         }
         let Some(item) = self.state.prompt_queue.pop_front() else {
@@ -13486,6 +13546,7 @@ impl TuiApp {
                         None,
                         false,
                     );
+                    self.state.prompt_queue.hold();
                     self.state.status = SessionStatus::Cancelling;
                     self.sync_active_session_status();
                 }
@@ -13804,6 +13865,15 @@ impl TuiApp {
                                 .set_status(&evt_sid, SessionStatus::Idle);
                             if message != "Interrupted" {
                                 self.state.tab_strip.mark_dirty(&evt_sid, true);
+                            }
+                            if message.starts_with("Interrupted") {
+                                // Same rule as the active session: an interrupted
+                                // turn must not auto-send its queued prompts.
+                                if let Some(runtime) =
+                                    self.state.session_runtime_states.get_mut(&evt_sid)
+                                {
+                                    runtime.prompt_queue.hold();
+                                }
                             }
                         }
                         AgentEvent::LlmRetry { initial: true, .. } => {
@@ -14167,9 +14237,20 @@ impl TuiApp {
                             self.state.usage_turns.drain(0..drain);
                         }
                     }
+                    AgentEvent::Notice { message, .. } => {
+                        // Non-terminal warning: the turn keeps running, so leave
+                        // the status and any pending approval / question alone.
+                        self.system_message(message);
+                    }
                     AgentEvent::Error { message, .. } => {
                         self.clear_pending_interactions();
                         self.state.status = SessionStatus::Idle;
+                        if message.starts_with("Interrupted") {
+                            // The turn was stopped by the user: keep queued
+                            // prompts parked instead of flushing them on the
+                            // Idle this event produces.
+                            self.hold_prompt_queue_after_interrupt();
+                        }
                         if message != "Interrupted" {
                             self.system_message(format!("Error: {}", message));
                             // Non-interrupted Error events are terminal: the
@@ -18542,7 +18623,7 @@ mod app_state_tests {
     }
 
     #[tokio::test]
-    async fn ordinary_approval_escape_rejects_only_the_tool() {
+    async fn ordinary_approval_escape_cancels_the_turn() {
         use futures::FutureExt;
 
         let (client_transport, server_transport) =
@@ -18580,11 +18661,10 @@ mod app_state_tests {
         let params = params.expect("approval params");
         assert_eq!(params["session_id"], serde_json::json!("session-1"));
         assert_eq!(params["approval_id"], serde_json::json!("approval-1"));
-        assert_eq!(params["decision"], serde_json::json!("rejected"));
-        assert!(
-            request_rx.try_recv().is_err(),
-            "Esc must not interrupt the turn"
-        );
+        // Esc stops the turn (`cancelled`); a plain `rejected` only failed the
+        // one tool call and let the model's next LLM request start at once.
+        assert_eq!(params["decision"], serde_json::json!("cancelled"));
+        assert!(app.state.prompt_queue.held, "queued prompts must be parked");
         assert!(app.state.approval_pending.is_none());
         assert_eq!(app.state.status, SessionStatus::Thinking);
     }
@@ -18653,6 +18733,252 @@ mod app_state_tests {
         });
         assert!(!app.state.parked_approvals.contains_key("session-2"));
         assert!(!app.state.parked_questions.contains_key("session-2"));
+    }
+
+    fn agent_event_frame(event: AgentEvent) -> Frame {
+        Frame::Event {
+            event: "agent".into(),
+            scope: None,
+            data: serde_json::to_value(event).unwrap(),
+        }
+    }
+
+    fn queue_prompt(app: &mut TuiApp, session_id: &str, text: &str) {
+        app.state
+            .prompt_queue
+            .push(crate::prompt_queue::QueuedPrompt::next_turn(
+                session_id, text,
+            ));
+        app.state.messages.push(DisplayMessage {
+            role: MessageRole::User,
+            content: text.into(),
+            thinking: None,
+            parts: Vec::new(),
+            tool_calls: Vec::new(),
+            delivery: crate::prompt_queue::DeliveryState::Queued,
+            idempotency_key: None,
+        });
+    }
+
+    fn prompt_job_pending(app: &TuiApp) -> bool {
+        app.jobs
+            .pending
+            .contains_key(&crate::async_jobs::JobChannel::Prompt)
+    }
+
+    /// Regression: the interrupted turn publishes `Error` -> `Idle` ->
+    /// `TurnEnd`, and every one of those used to flush the prompt queue — so
+    /// each Esc immediately started the next queued LLM request.
+    #[tokio::test]
+    async fn interrupted_turn_parks_the_prompt_queue_until_the_user_resumes() {
+        let mut app = test_tui_app();
+        let sid = "session-hold";
+        app.state.session_id = Some(sid.into());
+        app.state.status = SessionStatus::ToolExecuting;
+        queue_prompt(&mut app, sid, "queued before Esc");
+
+        for event in [
+            AgentEvent::Error {
+                session_id: sid.into(),
+                message: "Interrupted".into(),
+            },
+            AgentEvent::StatusUpdate {
+                session_id: sid.into(),
+                status: SessionStatus::Idle,
+            },
+            AgentEvent::TurnEnd {
+                session_id: sid.into(),
+            },
+        ] {
+            app.handle_server_event(agent_event_frame(event));
+        }
+
+        assert_eq!(app.state.status, SessionStatus::Idle);
+        assert!(app.state.prompt_queue.held);
+        assert_eq!(app.state.prompt_queue.items.len(), 1, "queue was flushed");
+        assert!(!prompt_job_pending(&app), "no prompt may be sent after Esc");
+        // The periodic safety-net retry must respect the hold too.
+        app.retry_queued_prompts_if_idle();
+        assert_eq!(app.state.prompt_queue.items.len(), 1);
+        assert!(!prompt_job_pending(&app));
+        assert!(
+            app.state
+                .messages
+                .iter()
+                .any(|m| m.role == MessageRole::System && m.content.contains("paused")),
+            "the user must be told why the queue is not sending"
+        );
+
+        // Enter on an empty composer resumes it.
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert!(!app.state.prompt_queue.held);
+        assert!(app.state.prompt_queue.is_empty());
+        assert!(prompt_job_pending(&app), "resumed queue sends its prompt");
+        assert_eq!(app.state.status, SessionStatus::Thinking);
+    }
+
+    #[tokio::test]
+    async fn typing_a_new_prompt_releases_a_paused_queue() {
+        let mut app = test_tui_app();
+        let sid = "session-release";
+        app.state.session_id = Some(sid.into());
+        app.state.status = SessionStatus::Idle;
+        queue_prompt(&mut app, sid, "old queued");
+        app.state.prompt_queue.hold();
+
+        // A slash command is not a prompt: the queue stays parked.
+        app.state.input.set_text("/help".into());
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert!(app.state.prompt_queue.held);
+        assert!(!prompt_job_pending(&app));
+        // `/help` opened a picker that would swallow the next Enter.
+        app.state.list_picker = None;
+
+        app.state.status = SessionStatus::Idle;
+        app.state.input.set_text("new instruction".into());
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert!(!app.state.prompt_queue.held);
+        assert!(
+            prompt_job_pending(&app),
+            "the new prompt is sent right away"
+        );
+        assert_eq!(
+            app.state.prompt_queue.items.len(),
+            1,
+            "the old item follows the new prompt, it is not dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_interrupt_errors_do_not_park_the_queue() {
+        let mut app = test_tui_app();
+        let sid = "session-error";
+        app.state.session_id = Some(sid.into());
+        app.state.status = SessionStatus::Thinking;
+        queue_prompt(&mut app, sid, "retry me");
+
+        app.handle_server_event(agent_event_frame(AgentEvent::Error {
+            session_id: sid.into(),
+            message: "provider exploded".into(),
+        }));
+        assert!(!app.state.prompt_queue.held);
+        app.handle_server_event(agent_event_frame(AgentEvent::StatusUpdate {
+            session_id: sid.into(),
+            status: SessionStatus::Idle,
+        }));
+        assert!(
+            app.state.prompt_queue.is_empty(),
+            "failure keeps the queue flowing"
+        );
+        assert!(prompt_job_pending(&app));
+    }
+
+    #[tokio::test]
+    async fn interrupting_a_background_session_parks_its_queue() {
+        let mut app = test_tui_app();
+        app.state.session_id = Some("session-main".into());
+        let mut other = AppState::new(PermissionMode::Manual, false);
+        other.session_id = Some("session-bg".into());
+        other
+            .prompt_queue
+            .push(crate::prompt_queue::QueuedPrompt::next_turn(
+                "session-bg",
+                "queued in the background",
+            ));
+        app.state
+            .session_runtime_states
+            .insert("session-bg".into(), SessionRuntimeState::capture(&other));
+
+        app.handle_server_event(agent_event_frame(AgentEvent::Error {
+            session_id: "session-bg".into(),
+            message: "Interrupted".into(),
+        }));
+
+        let runtime = app.state.session_runtime_states.get("session-bg").unwrap();
+        assert!(runtime.prompt_queue.held);
+        assert_eq!(runtime.prompt_queue.items.len(), 1);
+    }
+
+    /// A warning (file conflict) must not read as "the turn is over": the old
+    /// `Error` event reset the status to Idle and dropped the approval modal
+    /// mid-turn, which is how Esc ended up "not stopping" a running tool.
+    #[tokio::test]
+    async fn notice_event_leaves_the_running_turn_alone() {
+        let mut app = test_tui_app();
+        let sid = "session-notice";
+        app.state.session_id = Some(sid.into());
+        app.state.status = SessionStatus::WaitingApproval;
+        app.state.approval_pending = Some(pending_bash_approval("approval-1"));
+        queue_prompt(&mut app, sid, "waiting");
+
+        app.handle_server_event(agent_event_frame(AgentEvent::Notice {
+            session_id: sid.into(),
+            message: "File conflict warning: a.rs also touched by session(s) [other]".into(),
+        }));
+
+        assert_eq!(app.state.status, SessionStatus::WaitingApproval);
+        assert!(app.state.approval_pending.is_some());
+        assert!(!app.state.prompt_queue.held);
+        assert_eq!(app.state.prompt_queue.items.len(), 1);
+        assert!(app.state.messages.iter().any(|m| {
+            m.role == MessageRole::System && m.content.contains("File conflict warning")
+        }));
+        assert!(
+            !app.state
+                .messages
+                .iter()
+                .any(|m| m.content.contains("/export")),
+            "a warning is not a failure: no diagnostics hint"
+        );
+    }
+
+    #[tokio::test]
+    async fn busy_escape_holds_the_queue_after_the_interrupt_is_accepted() {
+        use futures::FutureExt;
+
+        let (client_transport, server_transport) =
+            kkagent_rpc::transport::memory::create_memory_pair();
+        let (event_tx, event_rx) = tokio::sync::mpsc::channel(16);
+        let rpc = kkagent_rpc::RpcClient::new(client_transport, event_tx);
+        let client = kkagent_client::KkagentClient::new(rpc, event_rx);
+        let (request_tx, mut request_rx) = tokio::sync::mpsc::unbounded_channel();
+        let handler: kkagent_rpc::server::RequestHandler =
+            Arc::new(move |_id, method, params, _event_tx| {
+                let request_tx = request_tx.clone();
+                async move {
+                    request_tx.send((method, params)).unwrap();
+                    Ok(serde_json::json!({"ok": true}))
+                }
+                .boxed()
+            });
+        tokio::spawn(async move {
+            kkagent_rpc::RpcServer::new(handler)
+                .serve(server_transport)
+                .await;
+        });
+
+        let mut app = TuiApp::new(AppConfig::default(), client);
+        app.state.session_id = Some("session-esc".into());
+        app.state.status = SessionStatus::ToolExecuting;
+        queue_prompt(&mut app, "session-esc", "next");
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        let (method, params) = request_rx.recv().await.expect("interrupt RPC sent");
+        assert_eq!(method, "session.interrupt");
+        let params = params.expect("interrupt params");
+        assert_eq!(params["source"], "tui-esc");
+        // Esc must never ask the server to kill the session's background jobs.
+        assert!(params.get("cancel_background").is_none());
+        assert!(app.state.prompt_queue.held);
     }
 
     fn tool_result_frame(session_id: &str, tool_call_id: &str) -> Frame {

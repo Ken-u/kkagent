@@ -163,12 +163,38 @@ impl KkagentClient {
 
     /// `source` is a short caller identity (`tui-esc`, `tui-quit`, …) surfaced
     /// in the agent loop's "Turn interrupted" log and TurnEnd hook payload.
+    ///
+    /// Interrupts the running turn only: the session's background Bash jobs
+    /// keep running (this is what Esc uses).
     pub async fn interrupt_with_source(
         &self,
         session_id: &str,
         source: &str,
     ) -> anyhow::Result<()> {
-        let params = serde_json::json!({"session_id": session_id, "source": source});
+        self.interrupt_with_options(session_id, source, false).await
+    }
+
+    /// Interrupt the running turn **and** kill the session's background Bash
+    /// jobs. For explicit teardown (terminate-and-quit, closing the tab,
+    /// deleting the session), never for Esc.
+    pub async fn interrupt_and_cancel_background(
+        &self,
+        session_id: &str,
+        source: &str,
+    ) -> anyhow::Result<()> {
+        self.interrupt_with_options(session_id, source, true).await
+    }
+
+    async fn interrupt_with_options(
+        &self,
+        session_id: &str,
+        source: &str,
+        cancel_background: bool,
+    ) -> anyhow::Result<()> {
+        let mut params = serde_json::json!({"session_id": session_id, "source": source});
+        if cancel_background {
+            params["cancel_background"] = serde_json::Value::Bool(true);
+        }
         self.rpc
             .call("session.interrupt", Some(params))
             .await

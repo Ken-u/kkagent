@@ -96,7 +96,18 @@ pub enum AgentEvent {
         session_id: String,
         question: QuestionPayload,
     },
+    /// Terminal failure of the running turn: consumers treat it as "the turn
+    /// is over" (the TUI drops back to idle, headless runs exit non-zero).
+    /// For a warning that leaves the turn running use [`AgentEvent::Notice`].
     Error {
+        session_id: String,
+        message: String,
+    },
+    /// Non-terminal, human-readable warning (for example a cross-session file
+    /// conflict). The turn keeps running: unlike [`AgentEvent::Error`] it must
+    /// not change the session status, clear pending approvals or fail a
+    /// headless run.
+    Notice {
         session_id: String,
         message: String,
     },
@@ -318,6 +329,7 @@ impl AgentEvent {
             | Self::ApprovalRequested { session_id, .. }
             | Self::QuestionAsked { session_id, .. }
             | Self::Error { session_id, .. }
+            | Self::Notice { session_id, .. }
             | Self::PlanModeChanged { session_id, .. }
             | Self::PlanFileUpdated { session_id, .. }
             | Self::TodoUpdated { session_id, .. }
