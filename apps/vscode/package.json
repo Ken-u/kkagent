@@ -11,6 +11,7 @@
   "activationEvents": [
     "onCommand:kkagent.start",
     "onCommand:kkagent.prompt",
+    "onCommand:kkagent.cancel",
     "onCommand:kkagent.commit",
     "onCommand:kkagent.explain",
     "onCommand:kkagent.fix",
@@ -21,6 +22,7 @@
     "commands": [
       { "command": "kkagent.start", "title": "kkagent: Start ACP bridge" },
       { "command": "kkagent.prompt", "title": "kkagent: Send prompt" },
+      { "command": "kkagent.cancel", "title": "kkagent: Cancel running prompt" },
       { "command": "kkagent.commit", "title": "kkagent: /commit" },
       { "command": "kkagent.explain", "title": "kkagent: /explain" },
       { "command": "kkagent.fix", "title": "kkagent: /fix" },

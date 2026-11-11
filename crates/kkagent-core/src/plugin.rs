@@ -361,6 +361,9 @@ pub struct PluginManager {
     /// a sync lock cannot deadlock the runtime (an async `RwLock` here
     /// historically stalled single-thread test runtimes).
     external_subagents_cache: std::sync::RwLock<Option<ExternalSubagentIndex>>,
+    /// When false the manager never discovers or loads any plugin, even on
+    /// `reload` (`[extensions] load_plugins = false`).
+    enabled: bool,
 }
 
 impl PluginManager {
@@ -375,7 +378,22 @@ impl PluginManager {
             plugins: RwLock::new(HashMap::new()),
             mutation: Mutex::new(()),
             external_subagents_cache: std::sync::RwLock::new(None),
+            enabled: true,
         }
+    }
+
+    /// A manager that never loads plugins: discovery and every later
+    /// `reload` yield an empty set, so no plugin tool override, MCP server,
+    /// subagent, service override or prompt section can ever apply.
+    pub fn disabled(dir: &Path) -> Arc<Self> {
+        let mut manager = Self::new(dir.to_path_buf());
+        manager.enabled = false;
+        Arc::new(manager)
+    }
+
+    /// Whether plugin loading is enabled for this manager.
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
     }
 
     pub async fn discover(dir: &Path) -> Arc<Self> {
@@ -387,6 +405,9 @@ impl PluginManager {
     }
 
     pub async fn reload(&self) -> anyhow::Result<usize> {
+        if !self.enabled {
+            return Ok(0);
+        }
         let discovered = self.scan_dir().await?;
         let count = discovered.len();
         *self.plugins.write().await = discovered;
@@ -1285,6 +1306,45 @@ mod tests {
             Some("code-search"),
             "single-server plugins should expose short tool names"
         );
+
+        let _ = tokio::fs::remove_dir_all(plugins).await;
+    }
+
+    #[tokio::test]
+    async fn disabled_manager_never_loads_plugins() {
+        let plugins = temp_plugins_dir();
+        let root = plugins.join("code-search");
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        tokio::fs::write(
+            root.join(KK_ROOT_MANIFEST),
+            serde_json::json!({
+                "name": "code-search",
+                "version": "1.0.0",
+                "systemPrompt": "PLUGIN PROMPT",
+                "mcpServers": {
+                    "search": {"transport": "stdio", "command": "python3", "args": []}
+                }
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+
+        // Control: the same directory is picked up by a normal manager.
+        let enabled = PluginManager::discover(&plugins).await;
+        assert!(enabled.is_enabled());
+        assert_eq!(enabled.mcp_server_configs().await.len(), 1);
+
+        let disabled = PluginManager::disabled(&plugins);
+        assert!(!disabled.is_enabled());
+        assert!(disabled.mcp_server_configs().await.is_empty());
+        assert!(disabled.list().await.is_empty());
+        assert!(disabled.tool_overrides().await.is_empty());
+        assert!(disabled.external_subagents().await.0.is_empty());
+        assert!(disabled.prompt_append_all().await.is_empty());
+        // Even an explicit reload cannot bring plugins in.
+        assert_eq!(disabled.reload().await.unwrap(), 0);
+        assert!(disabled.mcp_server_configs().await.is_empty());
 
         let _ = tokio::fs::remove_dir_all(plugins).await;
     }

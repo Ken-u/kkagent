@@ -46,6 +46,14 @@ pub async fn run_external_subagent(
     ctx: ExternalRunContext,
 ) -> anyhow::Result<String> {
     match spec.transport.as_str() {
+        // An external ACP agent brings its own tools, sandbox and MCP servers
+        // that kkagent cannot constrain, so it is refused outright when the
+        // launching session runs under a tool allowlist.
+        "acp" if sub_cfg.tool_allowlist.is_some() => anyhow::bail!(
+            "external ACP subagent `{}` is not available: the session runs under a strict \
+             tool allowlist that an external agent process cannot be bound by",
+            spec.name
+        ),
         "acp" => run_acp_subagent(spec, sub_cfg, mirror).await,
         "internal" => {
             crate::internal_subagent::run_internal_subagent(spec, sub_cfg, mirror, ctx).await
@@ -355,6 +363,8 @@ mod tests {
             run_in_background: false,
             depth: 1,
             parent_model: None,
+            tool_allowlist: None,
+            load_project_instructions: true,
         }
     }
 
@@ -388,6 +398,19 @@ mod tests {
             .block_on(async { run_external_subagent(&s, cfg, None, ctx).await })
             .unwrap_err();
         assert!(err.to_string().contains("\"acp\", \"internal\""), "{err}");
+    }
+
+    #[test]
+    fn acp_transport_is_refused_under_a_tool_allowlist() {
+        let s = spec();
+        let mut cfg = test_config("do the thing");
+        cfg.tool_allowlist = Some(kkagent_protocol::ToolAllowlist::new(["Read"]));
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let ctx = ExternalRunContext::detached(Arc::new(kkagent_config::AppConfig::default()));
+        let err = rt
+            .block_on(async { run_external_subagent(&s, cfg, None, ctx).await })
+            .unwrap_err();
+        assert!(err.to_string().contains("strict tool allowlist"), "{err}");
     }
 
     #[test]

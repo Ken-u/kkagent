@@ -131,6 +131,190 @@ pub struct AppConfig {
     /// Subagent delegation limits (`[subagent]`).
     #[serde(default)]
     pub subagent: SubagentSettings,
+    /// Named agent roles (`[agent_roles.NAME]`): system prompt plus a strict
+    /// tool allowlist. Only trusted sources may define roles — project-level
+    /// `.kk/config.toml` files cannot (they reject unknown keys).
+    #[serde(default)]
+    pub agent_roles: BTreeMap<String, AgentRoleConfig>,
+    /// Which workspace-sourced extensions are loaded (`[extensions]`).
+    #[serde(default)]
+    pub extensions: ExtensionsConfig,
+    /// Where sessions, messages and events are stored (`[storage]`).
+    #[serde(default)]
+    pub storage: StorageConfig,
+}
+
+/// How a role's `system_prompt` combines with the built-in system prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SystemPromptMode {
+    /// Add the role prompt after the built-in instructions.
+    #[default]
+    Append,
+    /// Replace the built-in instructions with the role prompt. Workspace
+    /// context (working directory, project instructions, skill catalog) may
+    /// still be added after it, subject to `[extensions]` and the allowlist.
+    Replace,
+}
+
+/// One `[agent_roles.NAME]` entry.
+///
+/// ```toml
+/// [agent_roles.supervisor]
+/// system_prompt = "You coordinate workers and never edit files yourself."
+/// prompt_mode = "replace"
+/// tools = ["Read", "Grep", "host__*"]
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct AgentRoleConfig {
+    /// Role system prompt. Required when `prompt_mode = "replace"`.
+    #[serde(default)]
+    pub system_prompt: Option<String>,
+    /// `append` (default) or `replace`.
+    #[serde(default)]
+    pub prompt_mode: SystemPromptMode,
+    /// Strict tool allowlist: exact tool names or prefix globs ending in `*`
+    /// (`mcp__github__*`). Absent = unrestricted; `[]` = no tools at all.
+    /// Enforced at the tool-call layer and inherited (as a ceiling) by
+    /// subagents; it cannot be widened by plugins or dynamic loading.
+    #[serde(default)]
+    pub tools: Option<Vec<String>>,
+    /// Initial permission mode for sessions in this role
+    /// (`manual`, `yolo` or `auto`).
+    #[serde(default)]
+    pub permission_mode: Option<String>,
+}
+
+impl AgentRoleConfig {
+    fn validate(&self, name: &str) -> anyhow::Result<()> {
+        if name.is_empty()
+            || !name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+        {
+            anyhow::bail!("agent_roles name `{name}` must be non-empty ASCII [A-Za-z0-9_.-]");
+        }
+        if self.prompt_mode == SystemPromptMode::Replace
+            && self
+                .system_prompt
+                .as_deref()
+                .is_none_or(|prompt| prompt.trim().is_empty())
+        {
+            anyhow::bail!(
+                "agent_roles.{name}: prompt_mode = \"replace\" requires a non-empty system_prompt"
+            );
+        }
+        if let Some(mode) = self.permission_mode.as_deref() {
+            if !matches!(mode, "manual" | "yolo" | "auto") {
+                anyhow::bail!(
+                    "agent_roles.{name}.permission_mode must be one of manual, yolo, auto (got {mode})"
+                );
+            }
+        }
+        if let Some(tools) = &self.tools {
+            for pattern in tools {
+                validate_tool_pattern(pattern)
+                    .map_err(|reason| anyhow::anyhow!("agent_roles.{name}.tools: {reason}"))?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A tool pattern is an exact name or a prefix glob whose only `*` is the
+/// final character. Interior wildcards would silently match literally, so they
+/// are rejected up front (fail closed).
+pub fn validate_tool_pattern(pattern: &str) -> Result<(), String> {
+    let trimmed = pattern.trim();
+    if trimmed.is_empty() {
+        return Err("patterns must not be empty".into());
+    }
+    if trimmed != pattern {
+        return Err(format!("pattern `{pattern}` has surrounding whitespace"));
+    }
+    let star_count = pattern.matches('*').count();
+    if star_count > 1 || (star_count == 1 && !pattern.ends_with('*')) {
+        return Err(format!(
+            "pattern `{pattern}` may only use a single trailing `*` wildcard"
+        ));
+    }
+    Ok(())
+}
+
+/// Which workspace-sourced extensions are loaded (`[extensions]`).
+///
+/// Everything defaults to on, matching the historical behavior. Hosts embedding
+/// kkagent as a controlled runtime turn these off so that project files cannot
+/// inject instructions, hooks or plugins. Narrowing is one-way: a CLI flag or a
+/// session parameter can disable an extension but never re-enable one that the
+/// config switched off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExtensionsConfig {
+    /// Inject project instruction files (`AGENTS.md` and friends).
+    #[serde(default = "default_true")]
+    pub load_project_instructions: bool,
+    /// Run hooks from `[[hooks]]`, `~/.kkagent/hooks.json` and the project's
+    /// `hooks.json`.
+    #[serde(default = "default_true")]
+    pub load_hooks: bool,
+    /// Discover and apply plugins (tool overrides, plugin MCP servers, plugin
+    /// subagents, plugin prompt sections).
+    #[serde(default = "default_true")]
+    pub load_plugins: bool,
+}
+
+impl Default for ExtensionsConfig {
+    fn default() -> Self {
+        Self {
+            load_project_instructions: true,
+            load_hooks: true,
+            load_plugins: true,
+        }
+    }
+}
+
+impl ExtensionsConfig {
+    /// Everything disabled.
+    pub fn none() -> Self {
+        Self {
+            load_project_instructions: false,
+            load_hooks: false,
+            load_plugins: false,
+        }
+    }
+
+    /// Combine two settings; an extension stays on only when both allow it.
+    pub fn narrow(self, other: Self) -> Self {
+        Self {
+            load_project_instructions: self.load_project_instructions
+                && other.load_project_instructions,
+            load_hooks: self.load_hooks && other.load_hooks,
+            load_plugins: self.load_plugins && other.load_plugins,
+        }
+    }
+}
+
+/// Storage backend for sessions, messages and events (`[storage]`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum StorageBackend {
+    /// Local SQLite (`transcripts.db`). The historical behavior.
+    #[default]
+    Sqlite,
+    /// The embedding host owns storage and serves it over the host channel
+    /// (`_kkagent/store/*`). Requires the connection to advertise that
+    /// capability; nothing is written to the local transcript database.
+    Host,
+}
+
+/// `[storage]`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct StorageConfig {
+    #[serde(default)]
+    pub backend: StorageBackend,
 }
 
 /// Subagent delegation limits and per-profile defaults (`[subagent]` in
@@ -1840,6 +2024,9 @@ impl AppConfig {
         for (name, profile) in &self.model_profiles {
             profile.validate(name)?;
         }
+        for (name, role) in &self.agent_roles {
+            role.validate(name)?;
+        }
         for (alias, model) in &self.models {
             let matching: Vec<&str> = self
                 .model_profiles
@@ -3331,5 +3518,162 @@ plugin_marketplaces = [
             },
         );
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn host_runtime_sections_default_to_historical_behavior() {
+        let config: AppConfig = toml::from_str("").unwrap();
+        assert!(config.agent_roles.is_empty());
+        assert_eq!(config.extensions, ExtensionsConfig::default());
+        assert!(config.extensions.load_project_instructions);
+        assert!(config.extensions.load_hooks);
+        assert!(config.extensions.load_plugins);
+        assert_eq!(config.storage.backend, StorageBackend::Sqlite);
+    }
+
+    #[test]
+    fn parses_agent_roles_extensions_and_storage() {
+        let config: AppConfig = toml::from_str(
+            r#"
+            [agent_roles.supervisor]
+            system_prompt = "You coordinate workers."
+            prompt_mode = "replace"
+            tools = ["Read", "mcp__gh__*"]
+            permission_mode = "auto"
+
+            [agent_roles.reader]
+            tools = []
+
+            [extensions]
+            load_hooks = false
+
+            [storage]
+            backend = "host"
+            "#,
+        )
+        .unwrap();
+        let supervisor = &config.agent_roles["supervisor"];
+        assert_eq!(supervisor.prompt_mode, SystemPromptMode::Replace);
+        assert_eq!(
+            supervisor.tools.as_deref(),
+            Some(&["Read".to_string(), "mcp__gh__*".to_string()][..])
+        );
+        assert_eq!(config.agent_roles["reader"].tools, Some(Vec::new()));
+        assert_eq!(
+            config.agent_roles["reader"].prompt_mode,
+            SystemPromptMode::Append
+        );
+        assert!(!config.extensions.load_hooks);
+        assert!(config.extensions.load_plugins);
+        assert_eq!(config.storage.backend, StorageBackend::Host);
+    }
+
+    #[test]
+    fn validates_agent_roles() {
+        let invalid = |role: AgentRoleConfig| {
+            let mut config = valid_config();
+            config.agent_roles.insert("r".into(), role);
+            config.validate().unwrap_err().to_string()
+        };
+        assert!(invalid(AgentRoleConfig {
+            prompt_mode: SystemPromptMode::Replace,
+            ..Default::default()
+        })
+        .contains("requires a non-empty system_prompt"));
+        assert!(invalid(AgentRoleConfig {
+            permission_mode: Some("root".into()),
+            ..Default::default()
+        })
+        .contains("permission_mode"));
+        assert!(invalid(AgentRoleConfig {
+            tools: Some(vec!["Re*ad".into()]),
+            ..Default::default()
+        })
+        .contains("trailing `*`"));
+        assert!(invalid(AgentRoleConfig {
+            tools: Some(vec![" ".into()]),
+            ..Default::default()
+        })
+        .contains("must not be empty"));
+
+        let mut config = valid_config();
+        config
+            .agent_roles
+            .insert("bad name".into(), AgentRoleConfig::default());
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("must be non-empty ASCII"));
+
+        let mut config = valid_config();
+        config.agent_roles.insert(
+            "ok".into(),
+            AgentRoleConfig {
+                system_prompt: Some("hi".into()),
+                prompt_mode: SystemPromptMode::Replace,
+                tools: Some(vec!["Read".into(), "mcp__*".into(), "*".into()]),
+                permission_mode: Some("manual".into()),
+            },
+        );
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn unknown_keys_in_new_sections_are_rejected() {
+        assert!(toml::from_str::<AppConfig>(
+            "[extensions]
+load_hook = false"
+        )
+        .is_err());
+        assert!(toml::from_str::<AppConfig>(
+            "[storage]
+backend = \"redis\""
+        )
+        .is_err());
+        assert!(toml::from_str::<AppConfig>(
+            "[agent_roles.x]
+tool = []"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn extensions_narrow_is_one_way() {
+        let all = ExtensionsConfig::default();
+        let no_hooks = ExtensionsConfig {
+            load_hooks: false,
+            ..all
+        };
+        assert_eq!(all.narrow(no_hooks), no_hooks);
+        // A narrower setting is never re-enabled by a wider one.
+        assert_eq!(no_hooks.narrow(all), no_hooks);
+        assert_eq!(
+            all.narrow(ExtensionsConfig::none()),
+            ExtensionsConfig::none()
+        );
+    }
+
+    #[test]
+    fn project_config_cannot_define_roles_or_extensions() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "kkagent-project-config-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(dir.join(".kk")).unwrap();
+        for body in [
+            "[agent_roles.evil]\ntools = [\"*\"]\n",
+            "[extensions]\nload_hooks = true\n",
+            "[storage]\nbackend = \"host\"\n",
+        ] {
+            std::fs::write(dir.join(".kk").join("config.toml"), body).unwrap();
+            let error = load_project_config(&dir).unwrap_err().to_string();
+            assert!(error.contains("unknown field"), "{body}: {error}");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

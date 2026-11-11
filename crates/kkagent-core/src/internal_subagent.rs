@@ -88,6 +88,7 @@ pub async fn run_internal_subagent(
     }
     session.image_config = app_config.image.clone();
     session.attach_workspace_concurrency_guard();
+    session.load_project_instructions = sub_cfg.load_project_instructions;
     session.inject_workspace_instructions().await;
     // Generic subagent addon keeps the built-in framing, then the plugin's
     // own persona on top.
@@ -112,6 +113,12 @@ task with the tools available to you and return a concise final summary.",
 
     // --- Tool registry: core + Web + delegation, then plugin MCP + filter.
     let mut tools = ToolRegistry::new();
+    // Role ceiling inherited from the launching session; set before any
+    // registration so core, Web, delegation and plugin MCP tools are all
+    // filtered through it.
+    if let Some(allowlist) = &sub_cfg.tool_allowlist {
+        tools.set_allowlist(allowlist);
+    }
     register_core_tools(&mut tools);
     if let Some(web_tool) = kkagent_tools::builtin::WebTool::try_new(ctx.web.clone()) {
         tools.register(Arc::new(web_tool));
@@ -132,8 +139,15 @@ task with the tools available to you and return a concise final summary.",
     let max_depth = app_config.subagent.effective_max_depth();
     let depth_manager = nested_manager.clone();
     let host_launch = ctx.launch.clone();
+    let launch_allowlist = sub_cfg.tool_allowlist.clone();
+    let launch_load_instructions = sub_cfg.load_project_instructions;
     let nested_launch: kkagent_tools::builtin::task::SubagentLaunchFn = Arc::new(
         move |mut config: kkagent_protocol::subagent::SubagentConfig, interrupt| {
+            config.tool_allowlist = kkagent_protocol::ToolAllowlist::narrow(
+                config.tool_allowlist.as_ref(),
+                launch_allowlist.as_ref(),
+            );
+            config.load_project_instructions &= launch_load_instructions;
             let manager = depth_manager.clone();
             let agent_id = config.agent_id.clone();
             if let Err(reason) =

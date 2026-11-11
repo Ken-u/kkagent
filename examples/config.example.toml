@@ -118,6 +118,27 @@ max_processes = 128 # Windows Job Object only; Linux/macOS cannot enforce this p
 # effort = "high"
 # keep = "all" # Provider 兼容字符串；不确定时省略
 
+# 嵌入宿主（kkagent acp）：角色 = 系统提示词 + 严格工具白名单（上限，会话参数只能收窄）。
+# 通过 `kkagent acp --role reviewer` 或宿主会话参数 `_meta["kkagent/host"].role` 选用。
+# 角色只能写在用户级配置里；项目 `.kk/config.toml` 里的 [agent_roles] 会被拒绝。
+# [agent_roles.reviewer]
+# system_prompt = "你是只读审查员，只报告问题，不修改文件。"
+# prompt_mode = "append"            # append | replace（replace 必须提供 system_prompt）
+# tools = ["Read", "Grep", "Glob"]  # 精确名或以 * 结尾的前缀；省略 = 不限制；[] = 无工具
+# permission_mode = "manual"        # 可选：manual | yolo | auto
+
+# 项目指令（AGENTS.md）、Hook 与插件的总开关；默认全开。命令行 --no-project-instructions /
+# --no-hooks / --no-plugins 与会话参数只能把它们关掉。
+# [extensions]
+# load_project_instructions = true
+# load_hooks = true
+# load_plugins = true
+
+# 会话存储后端：sqlite（默认，本地 transcripts.db）| host（仅 kkagent acp：由宿主通过
+# `_kkagent/store/*` 提供；宿主不可用时 turn 失败，不会回退本地库）。
+# [storage]
+# backend = "sqlite"
+
 # [[permission.rules]]
 # decision = "allow" # allow | deny | ask
 # pattern = "Read"

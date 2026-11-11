@@ -432,6 +432,21 @@ fn resolve_judge_alias(config: &AppConfig) -> Result<String, String> {
     })
 }
 
+/// Register the read-only evidence tools a judge may use (`Read`, plus
+/// `ReadMediaFile` for screenshots / mockups) when `tool_ceiling` permits them.
+fn register_judge_evidence_tools(
+    tools: &mut ToolRegistry,
+    tool_ceiling: Option<&kkagent_protocol::ToolAllowlist>,
+) {
+    let permitted = |name: &str| tool_ceiling.is_none_or(|ceiling| ceiling.allows(name));
+    if permitted("Read") {
+        tools.register(Arc::new(ReadTool));
+    }
+    if permitted("ReadMediaFile") {
+        tools.register(Arc::new(ReadMediaFileTool));
+    }
+}
+
 /// Run the judge agent. `Ok` means a verdict toolcall was recorded; `Err`
 /// means the judge could not produce a verdict (timeout / no toolcall /
 /// runtime error) and the caller should fail open.
@@ -440,6 +455,7 @@ pub async fn run_goal_judge(
     working_dir: PathBuf,
     goal: &Goal,
     evidence_tail: &[ChatMessage],
+    tool_ceiling: Option<&kkagent_protocol::ToolAllowlist>,
 ) -> Result<GoalJudgeRecord, String> {
     let alias = resolve_judge_alias(&config)?;
     let timeout = std::time::Duration::from_secs(config.goal.judge_timeout_secs.max(5));
@@ -447,9 +463,9 @@ pub async fn run_goal_judge(
     let verdict_slot: Arc<Mutex<Option<JudgeVerdict>>> = Arc::new(Mutex::new(None));
     let mut tools = ToolRegistry::new();
     tools.register(Arc::new(GoalJudgeTool::new(verdict_slot.clone())));
-    tools.register(Arc::new(ReadTool));
-    // Screenshots / mockups are legitimate evidence for visual objectives.
-    tools.register(Arc::new(ReadMediaFileTool));
+    // The judge never reaches beyond the launching session's tool ceiling:
+    // evidence-reading tools are only offered when the role allows them.
+    register_judge_evidence_tools(&mut tools, tool_ceiling);
 
     let (event_tx, _event_rx) = tokio::sync::mpsc::channel(16);
     let judge_loop = AgentLoop::new(
@@ -631,6 +647,7 @@ pub async fn run_goal_judge_discussion(
     goal_mgr: &kkagent_protocol::goal::GoalManager,
     history: &[(String, String)],
     message: &str,
+    tool_ceiling: Option<&kkagent_protocol::ToolAllowlist>,
 ) -> Result<JudgeChatRecord, String> {
     let goal = goal_mgr
         .get_goal()
@@ -642,10 +659,10 @@ pub async fn run_goal_judge_discussion(
     let criterion_slot: Arc<Mutex<Option<CriterionUpdate>>> = Arc::new(Mutex::new(None));
     let mut tools = ToolRegistry::new();
     tools.register(Arc::new(GoalCriterionTool::new(criterion_slot.clone())));
-    tools.register(Arc::new(ReadTool));
     // Visual acceptance criteria are common ("the chart must look like X");
-    // let the judge look at image artifacts while discussing.
-    tools.register(Arc::new(ReadMediaFileTool));
+    // the judge may look at image artifacts while discussing, subject to the
+    // same ceiling as the launching session.
+    register_judge_evidence_tools(&mut tools, tool_ceiling);
 
     let (event_tx, _event_rx) = tokio::sync::mpsc::channel(16);
     let judge_loop = AgentLoop::new(

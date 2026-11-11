@@ -136,6 +136,15 @@ ID 是 12 位随机 hex（如 `a4f2c1e93b7d`），只在读取结果里出现；
 
 启动参数 `-y`、`--auto` 可覆盖新会话模式，TUI 可通过 `/permission`、`/yolo`、`/auto` 切换。配置规则会参与最终决策。
 
+## 严格工具白名单与宿主工具
+
+角色（`[agent_roles.NAME].tools`，见[配置参考](configuration.md#agent-角色agent_rolesname)）和 ACP 会话参数可以给会话设定一份**严格白名单**：精确工具名，或以 `*` 结尾的前缀（`mcp__github__*`、`host__*`）；省略表示不限制，`[]` 表示一个工具也不给。
+
+- 白名单不是权限模式的一种，而是在它**之前**的一道闸：不在白名单内的工具不会注册给模型；模型凭空调用时直接返回「not permitted by this session's role」的错误结果，不执行、不弹审批，`yolo` / `auto` 也不能放行。
+- 多个来源（进程角色、会话选用的角色、会话参数 `toolAllowlist`）取**交集**，只能收窄。
+- 子 Agent、`Task` / `AgentSwarm`、插件外部子 Agent、goal judge 继承父会话的上限；插件 `toolOverrides`、动态加载（`SelectTools`）与 Skill 不能引入白名单之外的工具。
+- 宿主注入的工具（ACP `hostTools`，见[扩展机制](extensions.md#宿主扩展_kkagent)）与其他工具一样受白名单过滤。`approval = "host"` 的宿主工具由宿主自己授权，kkagent 不再询问；`approval = "ask"` 的宿主工具先走上面的权限模式。Plan 模式下非只读的宿主工具被拒绝。宿主工具名不能使用 `mcp__`、`acp:` 前缀，也不能与已有工具重名（不会替换已有工具）。白名单示例里的 `host__*` 只是约定的前缀，宿主可以用任何合法名字。
+
 ## Plan 模式
 
 Plan 模式用于先分析和制定计划。此时写操作仅允许更新当前 session 目录内的 `agents/main/plans/<plan-id>.md`，对源代码的 Write/Edit 会被拒绝。计划 Markdown 第一行必须是一级标题 `# <plan name>`；调用 `ExitPlanMode` 时，文件会按该标题最终命名为 `YYYY-MM-DD_<plan-name>.md`，重名时自动追加 `_2`、`_3`。旧版 `<workspace>/.kkagent/plans/<session-id>.md` 会在恢复时复制迁移，原文件保留。退出 Plan 模式后才进入实施阶段。
@@ -184,6 +193,8 @@ Content-Type: application/json
 ```
 
 也可使用拒绝决定并提供 `feedback`。客户端不应根据工具名盲目自动批准，应检查参数、工作目录和会话 ID。
+
+ACP 客户端收到的是 `session/request_permission`（见[扩展机制](extensions.md#acp)）：选择 `allow_once` / `allow_always` 批准，`reject_*` 拒绝；客户端返回 `cancelled`、`session/cancel` 或连接断开都按拒绝处理，且不会被记住为「始终允许」。
 
 ## Tool call 参数异常恢复
 

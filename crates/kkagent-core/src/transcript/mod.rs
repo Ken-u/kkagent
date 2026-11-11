@@ -99,6 +99,71 @@ pub fn persist_session_delta(
     Ok(())
 }
 
+/// [`persist_session_delta`] against any [`SessionStore`](crate::storage::SessionStore):
+/// the same rewrite / tail-append / auto-title rules, over the replaceable
+/// storage interface. Errors from a host-backed store surface unchanged so the
+/// caller can fail the turn instead of silently dropping data.
+pub async fn persist_session_delta_to_store(
+    store: &dyn crate::storage::SessionStore,
+    session: &mut crate::session::Session,
+) -> anyhow::Result<()> {
+    use crate::storage::{NewMessage, SessionPatch};
+
+    fn encode(messages: &[ChatMessage]) -> anyhow::Result<Vec<NewMessage>> {
+        messages
+            .iter()
+            .map(|message| {
+                Ok(NewMessage {
+                    role: message.role.clone(),
+                    content_json: encode_transcript_content(message)?,
+                })
+            })
+            .collect()
+    }
+
+    if session.transcript_rewrite_required {
+        let replacement = encode(&session.messages)?;
+        store
+            .replace_messages(&session.id, &replacement, None)
+            .await?;
+        session.persisted_message_count = session.messages.len();
+        session.transcript_rewrite_required = false;
+    }
+
+    if session.persisted_message_count < session.messages.len() {
+        let pending = encode(&session.messages[session.persisted_message_count..])?;
+        store.append_messages(&session.id, &pending).await?;
+        session.persisted_message_count = session.messages.len();
+    }
+
+    if session.title.is_none() {
+        if let Some(text) =
+            kkagent_protocol::first_real_user_text(session.messages.iter().filter_map(|m| {
+                if m.role != "user" {
+                    return None;
+                }
+                m.content.iter().find_map(|c| match c {
+                    ChatContent::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+            }))
+        {
+            let title: String = text.chars().take(200).collect();
+            store
+                .update_session(
+                    &session.id,
+                    &SessionPatch {
+                        title: Some(title.clone()),
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            session.title = Some(title);
+        }
+    }
+    Ok(())
+}
+
 fn serialize_transcript_messages(
     messages: &[ChatMessage],
 ) -> anyhow::Result<Vec<(String, String)>> {

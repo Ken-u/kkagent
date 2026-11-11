@@ -81,21 +81,30 @@ class AcpClient {
   async handlePermissionRequest(msg) {
     const params = msg.params || {};
     const kind = params.kind || {};
+    // Official shape first: the call is `toolCall`, the choices carry
+    // `optionId` + `name`. `kind` is a kkagent extension with more detail.
+    const call = params.toolCall || {};
     const detail =
       kind.kind === "command"
         ? `Command: ${kind.command || "(empty)"}`
         : kind.kind === "fetch"
           ? `Fetch: ${kind.url || "(empty)"}`
-          : `Edit: ${kind.file && (kind.file.relative || kind.file.absolute) || "(file)"}`;
-    const options = (params.options || []).map((o) => o.optionKind);
+          : kind.kind === "edit"
+            ? `Edit: ${(kind.file && (kind.file.relative || kind.file.absolute)) || "(file)"}`
+            : `Tool: ${call.title || "(unknown)"}`;
+    const options = (params.options || []).map((o) => ({
+      id: o.optionId || o.optionKind,
+      name: o.name || o.optionId || o.optionKind,
+    }));
     const pick = await vscode.window.showInformationMessage(
       `kkagent permission — ${detail}`,
       { modal: true },
-      ...options
+      ...options.map((o) => o.name)
     );
-    const result = pick
-      ? { outcomeKind: "selected", optionId: pick }
-      : { outcomeKind: "cancelled" };
+    const chosen = options.find((o) => o.name === pick);
+    const result = chosen
+      ? { outcome: { outcome: "selected", optionId: chosen.id } }
+      : { outcome: { outcome: "cancelled" } };
     this.respond(msg.id, result);
   }
 
@@ -144,7 +153,19 @@ class AcpClient {
     );
   }
 
-  call(method, params) {
+  /** Fire-and-forget notification (no id, no response). */
+  notify(method, params) {
+    if (!this.proc.stdin.writable) return;
+    this.proc.stdin.write(
+      JSON.stringify({ jsonrpc: "2.0", method, params: params || {} }) + "\n"
+    );
+  }
+
+  /**
+   * @param {number} [timeoutMs] 0 waits for as long as the agent works (a
+   * prompt turn ends with the turn, or with `session/cancel`).
+   */
+  call(method, params, timeoutMs = 120000) {
     return new Promise((resolve, reject) => {
       if (!this.proc.stdin.writable) {
         reject(new Error("kkagent ACP process not running"));
@@ -155,12 +176,14 @@ class AcpClient {
       this.proc.stdin.write(
         JSON.stringify({ jsonrpc: "2.0", id, method, params: params || {} }) + "\n"
       );
-      setTimeout(() => {
-        if (this.pending.has(String(id))) {
-          this.pending.delete(String(id));
-          reject(new Error(`ACP ${method} timed out`));
-        }
-      }, 120000);
+      if (timeoutMs > 0) {
+        setTimeout(() => {
+          if (this.pending.has(String(id))) {
+            this.pending.delete(String(id));
+            reject(new Error(`ACP ${method} timed out`));
+          }
+        }, timeoutMs);
+      }
     });
   }
 
@@ -221,7 +244,7 @@ class AcpChatChannel {
         break;
       }
       case "tool_call": {
-        const name = update.toolName || "tool";
+        const name = update.title || update.toolName || "tool";
         const line = `\n[${name}]`;
         this.channel.appendLine(line);
         this.toolLines.set(sid, line);
@@ -229,8 +252,12 @@ class AcpChatChannel {
         break;
       }
       case "tool_call_update": {
+        // Official content is `{type: "content", content: {type: "text", ...}}`.
         const content = (update.content || [])
-          .map((b) => (b.type === "text" ? b.text : ""))
+          .map((b) => {
+            const block = b.type === "content" ? b.content || {} : b;
+            return block.type === "text" ? block.text : "";
+          })
           .join("");
         if (content) {
           this.channel.appendLine(String(content).slice(0, 400));
@@ -291,6 +318,14 @@ function activate(context) {
       const text = await vscode.window.showInputBox({ prompt: "Prompt for kkagent" });
       if (!text) return;
       await sendPrompt(text);
+    }),
+
+    vscode.commands.registerCommand("kkagent.cancel", () => {
+      if (acpClient && activeSessionId) {
+        // `session/cancel` is a notification: the running prompt answers
+        // with stopReason "cancelled".
+        acpClient.notify("session/cancel", { sessionId: activeSessionId });
+      }
     }),
 
     vscode.commands.registerCommand("kkagent.commit", async () => {
@@ -358,10 +393,14 @@ async function sendPrompt(text) {
       activeSessionId = created.sessionId;
     }
     try {
-      const res = await acpClient.call("session/prompt", {
-        sessionId: activeSessionId,
-        prompt: [{ type: "text", text }],
-      });
+      const res = await acpClient.call(
+        "session/prompt",
+        {
+          sessionId: activeSessionId,
+          prompt: [{ type: "text", text }],
+        },
+        0
+      );
       vscode.window.setStatusBarMessage(
         `kkagent: turn finished (${res.stopReason || "end_turn"})`,
         4000

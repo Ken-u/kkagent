@@ -371,6 +371,52 @@ scope = "workspace"
 
 `decision` 为 `allow`、`deny` 或 `ask`。`pattern` 支持工具名、`*`、MCP 工具通配和 `Tool(argument-pattern)` 形式。危险命令的硬阻断不会被允许规则绕过。
 
+## Agent 角色（`[agent_roles.NAME]`）
+
+角色把一段系统提示词和一份**严格的工具白名单**绑在一起，供 `kkagent acp --role NAME` 或宿主通过 ACP 会话参数选用（见[扩展机制](extensions.md#宿主扩展_kkagent)）：
+
+```toml
+[agent_roles.reviewer]
+system_prompt = "你是只读审查员，只报告问题，不修改文件。"
+prompt_mode = "append"        # append（默认）：追加在内置提示之后；replace：用角色提示替换内置提示
+tools = ["Read", "Grep", "Glob", "host__*"]   # 精确名或以 * 结尾的前缀；省略 = 不限制；[] = 不给任何工具
+permission_mode = "manual"    # 可选：manual | yolo | auto
+
+[agent_roles.supervisor]
+system_prompt = "你负责协调 worker，自己不改文件。"
+prompt_mode = "replace"       # replace 必须提供非空 system_prompt
+tools = ["host__*"]
+```
+
+- `tools` 是**上限**：会话参数（`toolAllowlist`）只能取交集收窄，不能放宽；插件、动态加载（`SelectTools`）、子 Agent、`acp:` 外部 Agent 模型别名、goal judge 都继承同一上限，不能绕过。白名单在工具调用层强制执行：不在白名单内的工具不会被提供给模型，模型凭空调用也不会执行（返回错误结果），且不会进入审批流程。
+- 严格白名单下 ACP 的 `fs/*` 与 `terminal/*` 方法同样被拒绝（`-32601`），它们不经过工具层；不可能被放行的 `mcp__<server>__*` 对应的会话级 MCP 服务器不会启动。
+- 系统提示词优先级：ACP 会话参数 `systemPrompt` > 会话选用的命名角色 > 进程默认角色（`--role`）。
+- 角色只来自用户级配置（本文件）、命令行和已连接的宿主；**项目级 `<workspace>/.kk/config.toml` 不能定义或选择角色**（含该段落会被拒绝）。角色名限 `[A-Za-z0-9_.-]`；配置有误（未知字段、非法前缀、`replace` 缺提示词）会在启动时报错。
+
+不配置任何角色、也不传 `--role` 时没有白名单，行为与以前完全一致。
+
+## 扩展开关（`[extensions]`）
+
+三类会影响提示词和执行行为的扩展可以整体关闭：
+
+```toml
+[extensions]
+load_project_instructions = true  # 注入 AGENTS.md / .kkagent/AGENTS.md 等项目指令
+load_hooks = true                 # 运行 [[hooks]]、~/.kkagent/hooks.json 与项目 hooks.json
+load_plugins = true               # 发现并应用插件（toolOverride、插件 MCP、插件子 Agent、插件提示段）
+```
+
+命令行 `kkagent acp --no-project-instructions --no-hooks --no-plugins` 与会话参数 `_meta["kkagent/host"].extensions` 只能**关闭**，不能重新打开配置里已经关闭的项；三个开关默认全开。关闭 `load_project_instructions` 只影响项目指令文件，不影响内置系统提示。
+
+## 存储（`[storage]`）
+
+```toml
+[storage]
+backend = "sqlite"   # 默认：本地 ~/.kkagent/transcripts.db；host：由宿主提供
+```
+
+`backend = "host"`（或 `kkagent acp --storage host`）把会话、消息和事件交给已连接的宿主，通过 ACP 通道上的 `_kkagent/store/*` 方法访问。宿主必须在 `initialize` 声明 `store.sessions`；没有宿主、宿主不支持或调用失败时 turn 直接失败，**不会**回退到本地 SQLite，本地库也不会写入任何会话内容。该后端只由 `kkagent acp` 支持：TUI、`kkagent server` 等其他入口读到 `backend = "host"` 会直接报错，而不是悄悄用本地库。默认的 `sqlite` 与以前完全一致。这三段都只能写在用户级配置里，项目级文件含有它们会被拒绝。
+
 ## Hooks
 
 ```toml
@@ -486,7 +532,8 @@ proxy = "auto"                              # auto | none | system，默认 auto
 | `[services.image_gen]` | 生图后端。整体覆盖全局同名段落（详见下节） |
 
 明确**不可**项目化的：`[providers.*]`（凭据属账号级资源）、`permission` / `sandbox`
-（安全边界——clone 陌生仓库不能改变本机的权限模式）。这些写在项目文件里会被拒绝。
+（安全边界——clone 陌生仓库不能改变本机的权限模式），以及 `[agent_roles.*]` / `[extensions]` /
+`[storage]`（角色白名单、扩展开关与存储后端属于信任边界）。这些写在项目文件里会被拒绝。
 
 `default_model` 示例：
 

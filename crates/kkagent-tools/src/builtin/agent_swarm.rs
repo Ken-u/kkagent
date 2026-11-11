@@ -404,6 +404,8 @@ impl AgentSwarmTool {
                     run_in_background: true,
                     depth: 0,
                     parent_model: ctx.model_alias.clone(),
+                    tool_allowlist: None,
+                    load_project_instructions: true,
                 },
                 agent_id: spec.agent_id.clone(),
                 retries: 0,
@@ -964,6 +966,8 @@ mod tests {
             run_in_background: false,
             depth: 0,
             parent_model: None,
+            tool_allowlist: None,
+            load_project_instructions: true,
         };
         auto.manager.spawn(config).await.unwrap();
         auto.manager

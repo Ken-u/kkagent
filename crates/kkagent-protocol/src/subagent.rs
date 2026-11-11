@@ -45,6 +45,22 @@ pub struct SubagentConfig {
     /// model token when resolving this subagent's model.
     #[serde(default)]
     pub parent_model: Option<String>,
+    /// Tool-name ceiling inherited from the launching session's role. The
+    /// launch closure stamps it (intersected with the parent's own ceiling)
+    /// and the subagent runtime applies it to every registry it builds, so a
+    /// restricted session cannot widen its tool surface by delegating.
+    /// `None` means unrestricted (default; older persisted configs).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_allowlist: Option<crate::ToolAllowlist>,
+    /// Whether the subagent may load project instruction files (`AGENTS.md`).
+    /// Stamped from the launching session so `[extensions]` / host overrides
+    /// also bind delegated work. Defaults to on (older persisted configs).
+    #[serde(default = "default_true")]
+    pub load_project_instructions: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -589,6 +605,8 @@ mod tests {
             run_in_background: false,
             depth: 0,
             parent_model: None,
+            tool_allowlist: None,
+            load_project_instructions: true,
         };
         stamp_child_depth(&mut config, 0, 2).unwrap();
         assert_eq!(config.depth, 1);
@@ -642,6 +660,8 @@ mod tests {
                 run_in_background: true,
                 depth: 0,
                 parent_model: None,
+                tool_allowlist: None,
+                load_project_instructions: true,
             })
             .await
             .unwrap();
@@ -677,6 +697,8 @@ mod tests {
             run_in_background: false,
             depth: 0,
             parent_model: None,
+            tool_allowlist: None,
+            load_project_instructions: true,
         };
         {
             let manager = SubagentManager::new_persistent(2, &path).unwrap();

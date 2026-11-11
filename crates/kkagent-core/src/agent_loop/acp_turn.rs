@@ -670,7 +670,7 @@ impl AgentLoop {
                 content: vec![ChatContent::Text { text }],
                 tools: None,
             });
-            self.persist_step(session);
+            self.persist_step(session).await;
         }
         if let Some(summary) = summary {
             session.messages.push(ChatMessage {
@@ -678,7 +678,7 @@ impl AgentLoop {
                 content: vec![ChatContent::Text { text: summary }],
                 tools: None,
             });
-            self.persist_step(session);
+            self.persist_step(session).await;
         }
 
         // The ACP session is a cache of the transcript: keep it only when it
@@ -714,7 +714,11 @@ impl AgentLoop {
 
     /// Report a failure that happened before or instead of a prompt and end
     /// the step cleanly (idle status, steers preserved).
-    async fn acp_fail(&self, session: &mut Session, message: String) -> anyhow::Result<TurnStep> {
+    pub(super) async fn acp_fail(
+        &self,
+        session: &mut Session,
+        message: String,
+    ) -> anyhow::Result<TurnStep> {
         let _ = self
             .event_tx
             .send(AgentEvent::Error {

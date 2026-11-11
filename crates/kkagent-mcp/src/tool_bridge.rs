@@ -226,12 +226,32 @@ impl Tool for McpProxyTool {
 /// Tool names use the shortened namespace (`mcp__<namespace>__<tool>`) while
 /// tool execution keeps addressing the runtime server name.
 pub async fn register_mcp_tools(registry: &mut ToolRegistry, manager: &Arc<McpManager>) {
+    register_mcp_tools_where(registry, manager, |_| true).await;
+}
+
+/// True when `server_name` is the runtime name of a plugin-contributed MCP
+/// server (`plugin-<id>:<server>`).
+pub fn is_plugin_mcp_server(server_name: &str) -> bool {
+    server_name.starts_with(PLUGIN_SERVER_PREFIX)
+}
+
+/// Like [`register_mcp_tools`], registering only tools of servers accepted by
+/// `include_server` (given the runtime server name). Used to leave
+/// plugin-contributed servers out when plugin loading is switched off.
+pub async fn register_mcp_tools_where(
+    registry: &mut ToolRegistry,
+    manager: &Arc<McpManager>,
+    include_server: impl Fn(&str) -> bool,
+) {
     let tools = manager.list_tools().await;
     if tools.is_empty() {
         return;
     }
     let namespaces = build_namespace_map(&manager.configs_snapshot());
     for info in tools {
+        if !include_server(&info.server_name) {
+            continue;
+        }
         let namespace = namespaces
             .get(&info.server_name)
             .cloned()

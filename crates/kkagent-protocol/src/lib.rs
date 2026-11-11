@@ -1,8 +1,10 @@
+pub mod allowlist;
 pub mod approval;
 pub mod events;
 pub mod frame;
 pub mod goal;
 pub mod harness;
+pub mod host;
 pub mod messages;
 pub mod permission;
 pub mod question;
@@ -10,6 +12,7 @@ pub mod session;
 pub mod subagent;
 pub mod tools;
 
+pub use allowlist::*;
 pub use approval::*;
 pub use events::*;
 pub use frame::*;

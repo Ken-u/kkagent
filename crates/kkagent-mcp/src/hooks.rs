@@ -57,6 +57,9 @@ pub struct HookManager {
     configured_hooks: Vec<HookConfig>,
     global_hooks: Vec<HookConfig>,
     default_working_dir: PathBuf,
+    /// When false no hook ever runs: config, global and workspace hook
+    /// sources are all ignored (`[extensions] load_hooks = false`).
+    enabled: bool,
 }
 
 impl HookManager {
@@ -65,10 +68,29 @@ impl HookManager {
             configured_hooks: Vec::new(),
             global_hooks: Vec::new(),
             default_working_dir: working_dir.to_path_buf(),
+            enabled: true,
         }
     }
 
+    /// A manager that never loads or runs any hook. Used when hook loading is
+    /// switched off, so no hook source (config, `~/.kkagent/hooks.json`,
+    /// `<workspace>/.kkagent/hooks.json`) can execute a command.
+    pub fn disabled(working_dir: &Path) -> Self {
+        Self {
+            enabled: false,
+            ..Self::new(working_dir)
+        }
+    }
+
+    /// Whether this manager can run hooks at all.
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
     pub async fn load_from_app_config(&mut self, hooks: &[kkagent_config::HookConfig]) {
+        if !self.enabled {
+            return;
+        }
         self.configured_hooks = hooks
             .iter()
             .filter_map(|hook| {
@@ -87,6 +109,9 @@ impl HookManager {
     /// Load user hooks. Workspace hooks are resolved at fire time so one server
     /// can safely serve multiple workspaces and observe file changes.
     pub async fn discover(&mut self) -> Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
         let path = kkagent_config::default_config_dir().join("hooks.json");
         self.global_hooks = load_hooks_file(&path).await.unwrap_or_else(|error| {
             if path.exists() {
@@ -103,6 +128,9 @@ impl HookManager {
             .and_then(serde_json::Value::as_str)
             .map(PathBuf::from)
             .unwrap_or_else(|| self.default_working_dir.clone());
+        if !self.enabled {
+            return (working_dir, Vec::new());
+        }
         let mut hooks = self.configured_hooks.clone();
         hooks.extend(self.global_hooks.clone());
         let project_path = working_dir.join(".kkagent").join("hooks.json");
@@ -234,6 +262,9 @@ impl HookManager {
     }
 
     pub fn list(&self) -> Vec<HookConfig> {
+        if !self.enabled {
+            return Vec::new();
+        }
         self.configured_hooks
             .iter()
             .chain(&self.global_hooks)
@@ -391,6 +422,66 @@ mod tests {
             .await;
         assert!(hooks.iter().any(|hook| hook.command == "configured"));
         assert!(hooks.iter().any(|hook| hook.command == "project"));
+        std::fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[tokio::test]
+    async fn disabled_manager_loads_and_runs_nothing() {
+        let workspace =
+            std::env::temp_dir().join(format!("kkagent-hooks-off-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(workspace.join(".kkagent")).unwrap();
+        let marker = workspace.join("ran.txt");
+        let hooks_json = serde_json::json!([{
+            "event": "pre_tool_call",
+            "command": "touch",
+            "args": [marker.to_string_lossy()],
+        }]);
+        std::fs::write(
+            workspace.join(".kkagent/hooks.json"),
+            hooks_json.to_string(),
+        )
+        .unwrap();
+
+        let mut manager = HookManager::disabled(&workspace);
+        assert!(!manager.is_enabled());
+        manager
+            .load_from_app_config(&[kkagent_config::HookConfig {
+                event: "pre_tool_call".into(),
+                matcher: None,
+                command: "touch".into(),
+                timeout: 5,
+            }])
+            .await;
+        manager.discover().await.unwrap();
+        assert!(manager.list().is_empty());
+        let (_, hooks) = manager
+            .hooks_for(&serde_json::json!({"workspace": workspace}))
+            .await;
+        assert!(hooks.is_empty(), "workspace hooks must not load");
+
+        let outcome = manager
+            .fire_with_control(
+                HookEvent::PreToolCall,
+                &serde_json::json!({"tool": "Bash", "workspace": workspace}),
+            )
+            .await
+            .unwrap();
+        assert!(!outcome.block);
+        assert!(
+            !marker.exists(),
+            "a disabled manager must never spawn a hook"
+        );
+
+        // The same workspace hook does run through an enabled manager.
+        let enabled = HookManager::new(&workspace);
+        enabled
+            .fire(
+                HookEvent::PreToolCall,
+                &serde_json::json!({"tool": "Bash", "workspace": workspace}),
+            )
+            .await
+            .unwrap();
+        assert!(marker.exists(), "control: enabled manager runs the hook");
         std::fs::remove_dir_all(workspace).unwrap();
     }
 }

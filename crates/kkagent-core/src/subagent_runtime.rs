@@ -91,6 +91,7 @@ fn run_subagent_mirrored_boxed(
         }
         session.image_config = app_config.image.clone();
         session.attach_workspace_concurrency_guard();
+        session.load_project_instructions = sub_cfg.load_project_instructions;
         session.inject_workspace_instructions().await;
         session
             .system_prompt
@@ -107,6 +108,11 @@ fn run_subagent_mirrored_boxed(
         let (event_tx, mut event_rx) = mpsc::channel(256);
 
         let mut tools = ToolRegistry::new();
+        // Role ceiling inherited from the launching session. Applied before
+        // anything is registered so every insertion path is filtered.
+        if let Some(allowlist) = &sub_cfg.tool_allowlist {
+            tools.set_allowlist(allowlist);
+        }
         register_core_tools(&mut tools);
         let nested_manager = Arc::new(SubagentManager::new(
             app_config.subagent.effective_max_concurrent(),
@@ -117,8 +123,16 @@ fn run_subagent_mirrored_boxed(
         let launch_web = web.clone();
         let max_depth = app_config.subagent.effective_max_depth();
         let parent_depth = sub_cfg.depth;
+        let launch_allowlist = sub_cfg.tool_allowlist.clone();
+        let launch_load_instructions = sub_cfg.load_project_instructions;
         let nested_launch: kkagent_tools::builtin::task::SubagentLaunchFn =
             Arc::new(move |mut config, interrupt| {
+                // Children can never exceed their parent's tool ceiling.
+                config.tool_allowlist = kkagent_protocol::ToolAllowlist::narrow(
+                    config.tool_allowlist.as_ref(),
+                    launch_allowlist.as_ref(),
+                );
+                config.load_project_instructions &= launch_load_instructions;
                 let manager = launch_manager.clone();
                 let app_config = launch_config.clone();
                 let web = launch_web.clone();

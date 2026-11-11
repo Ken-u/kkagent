@@ -10,6 +10,17 @@ pub enum PermissionDecision {
     Deny(String),
 }
 
+/// How the permission chain treats one host-injected tool.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostToolPolicy {
+    pub name: String,
+    /// The host authorizes the call itself, so kkagent does not ask again
+    /// (user `deny` rules still apply).
+    pub host_approves: bool,
+    /// Tools that can change state are refused in plan mode.
+    pub read_only: bool,
+}
+
 pub struct PermissionChain {
     /// Live mode handle — shared with the session so `/permission` takes effect mid-turn.
     pub mode: Arc<Mutex<PermissionMode>>,
@@ -21,6 +32,8 @@ pub struct PermissionChain {
     pub session_approved: Vec<String>,
     /// Approvals that expire at the end of the current turn.
     pub turn_approved: Vec<String>,
+    /// Host-injected tools of the session (empty for the default setup).
+    pub host_tools: Vec<HostToolPolicy>,
 }
 
 const SENSITIVE_PATTERNS: &[&str] = &[
@@ -74,11 +87,22 @@ impl PermissionChain {
             persist: !in_tests,
             session_approved: Vec::new(),
             turn_approved: Vec::new(),
+            host_tools: Vec::new(),
         };
         if !in_tests {
             chain.load_persisted_approvals();
         }
         chain
+    }
+
+    /// Declare the session's host-injected tools.
+    pub fn with_host_tools(mut self, host_tools: Vec<HostToolPolicy>) -> Self {
+        self.host_tools = host_tools;
+        self
+    }
+
+    fn host_tool(&self, name: &str) -> Option<&HostToolPolicy> {
+        self.host_tools.iter().find(|tool| tool.name == name)
     }
 
     /// Tests / one-shot runs: never touch the sidecar file.
@@ -138,6 +162,21 @@ impl PermissionChain {
             }
         }
 
+        // 0b. host tools that can change state are not part of plan mode
+        if plan_mode
+            && self
+                .host_tool(tool_name)
+                .is_some_and(|tool| !tool.read_only)
+        {
+            return (
+                PermissionDecision::Deny(format!(
+                    "Plan mode is active. Host tool `{tool_name}` can change state; \
+                     exit plan mode before using it."
+                )),
+                "plan-mode-guard",
+            );
+        }
+
         // 1. auto-mode-ask-user-question-deny
         if mode == PermissionMode::Auto && tool_name == "AskUserQuestion" {
             return (
@@ -162,6 +201,14 @@ impl PermissionChain {
                     "user-deny-rule",
                 );
             }
+        }
+
+        // 2b. host tool whose host authorizes the call itself
+        if self
+            .host_tool(tool_name)
+            .is_some_and(|tool| tool.host_approves)
+        {
+            return (PermissionDecision::Approve, "host-tool-approved");
         }
 
         // 3. auto-mode-approve
@@ -508,6 +555,68 @@ fn accesses_git_control_path(_tool_name: &str, input: &serde_json::Value) -> boo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn host_chain(mode: PermissionMode, rules: Vec<PermissionRule>) -> PermissionChain {
+        PermissionChain::new(mode, rules).with_host_tools(vec![
+            HostToolPolicy {
+                name: "host_deploy".into(),
+                host_approves: true,
+                read_only: false,
+            },
+            HostToolPolicy {
+                name: "host_lookup".into(),
+                host_approves: false,
+                read_only: true,
+            },
+        ])
+    }
+
+    fn eval(chain: &PermissionChain, tool: &str, plan_mode: bool) -> PermissionDecision {
+        chain.evaluate(
+            tool,
+            &serde_json::json!({}),
+            Path::new("."),
+            plan_mode,
+            None,
+        )
+    }
+
+    #[test]
+    fn host_tools_follow_their_declared_approval() {
+        let chain = host_chain(PermissionMode::Manual, vec![]);
+        // The host authorizes this one itself.
+        assert_eq!(
+            eval(&chain, "host_deploy", false),
+            PermissionDecision::Approve
+        );
+        // `ask`: kkagent's own chain decides, which asks in manual mode.
+        assert_eq!(eval(&chain, "host_lookup", false), PermissionDecision::Ask);
+        // An undeclared tool of the same family gets no special treatment.
+        assert_eq!(eval(&chain, "host_other", false), PermissionDecision::Ask);
+    }
+
+    #[test]
+    fn user_deny_rules_and_plan_mode_still_bind_host_tools() {
+        let deny = PermissionRule {
+            decision: "deny".into(),
+            pattern: "host_deploy".into(),
+            scope: None,
+        };
+        let chain = host_chain(PermissionMode::Manual, vec![deny]);
+        assert!(matches!(
+            eval(&chain, "host_deploy", false),
+            PermissionDecision::Deny(_)
+        ));
+        let chain = host_chain(PermissionMode::Auto, vec![]);
+        assert!(matches!(
+            eval(&chain, "host_deploy", true),
+            PermissionDecision::Deny(reason) if reason.contains("Plan mode")
+        ));
+        assert_eq!(
+            eval(&chain, "host_lookup", true),
+            PermissionDecision::Approve
+        );
+    }
 
     #[test]
     fn test_auto_mode_approves_all() {

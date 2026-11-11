@@ -2,9 +2,19 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 
+use kkagent_protocol::ToolAllowlist;
 use serde_json::Value;
 
 use crate::{Tool, ToolAccesses, ToolContext, ToolDisclosure, ToolDisplaySchema, ToolOutput};
+
+/// Why [`ToolRegistry::register_unique`] refused a tool.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum RegisterError {
+    #[error("tool `{0}` is not permitted by the tool allowlist")]
+    NotPermitted(String),
+    #[error("a tool named `{0}` is already registered")]
+    NameTaken(String),
+}
 
 pub struct ToolRegistry {
     /// Name-keyed `BTreeMap`: iteration is deterministically sorted by name,
@@ -12,27 +22,87 @@ pub struct ToolRegistry {
     /// Providers key their prompt cache on that prefix; a `HashMap` would
     /// reshuffle tool order on every register/retain and bust the cache.
     tools: BTreeMap<String, Arc<dyn Tool>>,
+    /// Optional strict ceiling on which tool names may live in this registry.
+    /// Once set it can only be narrowed. Every insertion path funnels through
+    /// it, so plugin overrides, MCP bridging, dynamic loading and host tool
+    /// injection cannot add a tool the role does not allow.
+    allowlist: Option<ToolAllowlist>,
 }
 
 impl ToolRegistry {
     pub fn new() -> Self {
         Self {
             tools: BTreeMap::new(),
+            allowlist: None,
         }
     }
 
+    /// Restrict this registry to `allowlist`. Combined with any existing
+    /// ceiling by intersection (a ceiling can be narrowed, never widened) and
+    /// prunes tools that are no longer permitted.
+    pub fn set_allowlist(&mut self, allowlist: &ToolAllowlist) {
+        let narrowed = match &self.allowlist {
+            Some(existing) => existing.intersect(allowlist),
+            None => allowlist.clone(),
+        };
+        self.tools.retain(|name, _| narrowed.allows(name));
+        self.allowlist = Some(narrowed);
+    }
+
+    /// The active ceiling, if the registry is restricted.
+    pub fn allowlist(&self) -> Option<&ToolAllowlist> {
+        self.allowlist.as_ref()
+    }
+
+    /// Whether a tool named `name` may be listed, fetched or executed.
+    /// Unrestricted registries permit every name.
+    pub fn permits(&self, name: &str) -> bool {
+        self.allowlist
+            .as_ref()
+            .is_none_or(|allowlist| allowlist.allows(name))
+    }
+
+    /// Register a tool. A tool the allowlist does not permit is dropped.
     pub fn register(&mut self, tool: Arc<dyn Tool>) {
-        self.tools.insert(tool.name().to_string(), tool);
+        let name = tool.name().to_string();
+        self.register_at(&name, tool);
+    }
+
+    /// Whether a tool is registered under `name`.
+    pub fn contains(&self, name: &str) -> bool {
+        self.tools.contains_key(name)
+    }
+
+    /// Register a tool only if its name is free. Unlike [`Self::register`]
+    /// this never replaces an existing tool, so an injected tool cannot take
+    /// over a built-in's name. Respects the allowlist like every insertion.
+    pub fn register_unique(&mut self, tool: Arc<dyn Tool>) -> Result<(), RegisterError> {
+        let name = tool.name().to_string();
+        if !self.permits(&name) {
+            return Err(RegisterError::NotPermitted(name));
+        }
+        if self.tools.contains_key(&name) {
+            return Err(RegisterError::NameTaken(name));
+        }
+        self.tools.insert(name, tool);
+        Ok(())
     }
 
     /// Register a tool under an explicit name, replacing any existing entry.
     /// Used by plugin overrides to re-bind a bridged MCP tool onto a
     /// built-in tool's name (the stub keeps the original wire name).
     pub fn register_at(&mut self, name: &str, tool: Arc<dyn Tool>) {
+        if !self.permits(name) {
+            tracing::debug!(tool = name, "tool rejected by registry allowlist");
+            return;
+        }
         self.tools.insert(name.to_string(), tool);
     }
 
     pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
+        if !self.permits(name) {
+            return None;
+        }
         self.tools.get(name).cloned()
     }
 
@@ -178,5 +248,100 @@ mod tests {
             .map(|d| d.name)
             .collect();
         assert_eq!(names, vec!["Beta", "Zulu", "alpha", "mcp__x"]);
+    }
+
+    fn names_of(registry: &ToolRegistry) -> Vec<String> {
+        registry
+            .tool_definitions()
+            .into_iter()
+            .map(|d| d.name)
+            .collect()
+    }
+
+    #[test]
+    fn allowlist_prunes_existing_tools_and_filters_later_registrations() {
+        let mut registry = ToolRegistry::new();
+        for name in ["Read", "Bash", "mcp__gh__issues", "mcp__other__x"] {
+            registry.register(Arc::new(StubTool(name)));
+        }
+        registry.set_allowlist(&ToolAllowlist::new(["Read", "mcp__gh__*"]));
+        assert_eq!(names_of(&registry), vec!["Read", "mcp__gh__issues"]);
+
+        // Later registrations (MCP bridge, host injection) are filtered too.
+        registry.register(Arc::new(StubTool("Bash")));
+        registry.register(Arc::new(StubTool("mcp__gh__prs")));
+        registry.register(Arc::new(StubTool("mcp__other__y")));
+        assert_eq!(
+            names_of(&registry),
+            vec!["Read", "mcp__gh__issues", "mcp__gh__prs"]
+        );
+        assert!(registry.get("Bash").is_none());
+        assert!(registry.get("Read").is_some());
+        assert!(registry.permits("Read"));
+        assert!(!registry.permits("Bash"));
+    }
+
+    #[test]
+    fn register_at_cannot_rebind_a_disallowed_name() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(StubTool("Read")));
+        registry.set_allowlist(&ToolAllowlist::new(["Read"]));
+        // A plugin override re-binding a bridged tool onto `Bash` is refused.
+        registry.register_at("Bash", Arc::new(StubTool("mcp__plugin__bash")));
+        assert!(registry.get("Bash").is_none());
+        assert_eq!(names_of(&registry), vec!["Read"]);
+    }
+
+    #[test]
+    fn allowlist_can_only_be_narrowed() {
+        let mut registry = ToolRegistry::new();
+        for name in ["Read", "Grep", "Bash"] {
+            registry.register(Arc::new(StubTool(name)));
+        }
+        registry.set_allowlist(&ToolAllowlist::new(["Read", "Grep"]));
+        // Attempting to widen back to everything keeps the original ceiling.
+        registry.set_allowlist(&ToolAllowlist::new(["*"]));
+        registry.register(Arc::new(StubTool("Bash")));
+        assert_eq!(names_of(&registry), vec!["Grep", "Read"]);
+        registry.set_allowlist(&ToolAllowlist::new(["Read"]));
+        assert_eq!(names_of(&registry), vec!["Read"]);
+    }
+
+    #[test]
+    fn register_unique_never_replaces_and_respects_the_allowlist() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(StubTool("Bash")));
+        registry.set_allowlist(&ToolAllowlist::new(["Bash", "host_*"]));
+        assert_eq!(
+            registry.register_unique(Arc::new(StubTool("Bash"))),
+            Err(RegisterError::NameTaken("Bash".into()))
+        );
+        assert_eq!(
+            registry.register_unique(Arc::new(StubTool("Read"))),
+            Err(RegisterError::NotPermitted("Read".into()))
+        );
+        assert_eq!(
+            registry.register_unique(Arc::new(StubTool("host_task"))),
+            Ok(())
+        );
+        assert!(registry.contains("host_task"));
+        assert!(!registry.contains("Read"));
+        assert_eq!(names_of(&registry), vec!["Bash", "host_task"]);
+    }
+
+    #[test]
+    fn empty_allowlist_denies_everything() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Arc::new(StubTool("Read")));
+        registry.set_allowlist(&ToolAllowlist::deny_all());
+        registry.register(Arc::new(StubTool("Read")));
+        assert!(names_of(&registry).is_empty());
+    }
+
+    #[test]
+    fn unrestricted_registry_permits_everything() {
+        let registry = ToolRegistry::new();
+        assert!(registry.allowlist().is_none());
+        assert!(registry.permits("whatever"));
     }
 }

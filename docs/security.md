@@ -59,6 +59,20 @@ workspace 模式不限制进程能力（macOS profile 含 `(allow process*)`，s
 
 WebSocket query token 是兼容机制，可能被访问日志记录；普通 HTTP 和 Node SDK 使用 Bearer Header。terminal API 即使有 token 也必须通过 `--allow-terminal-api` 显式打开。
 
+## 宿主与严格角色
+
+把 kkagent 当作被上层进程驱动的 worker 时（`kkagent acp`），宿主、角色和模型各自处在不同的信任层级：
+
+- **工具白名单是上限，只能收窄。** 来源是用户级配置的 `[agent_roles.NAME]` 与命令行 `--role`；ACP 会话参数 `_meta["kkagent/host"].toolAllowlist` 与上限取交集，不能放宽。项目文件、插件、Skill、模型输出都不能定义或扩大白名单，`<workspace>/.kk/config.toml` 里的 `[agent_roles]` / `[extensions]` / `[storage]` 会被拒绝。
+- **在工具调用层强制，多层兜底。** 工具注册表只构造白名单内的工具（模型看不到其他工具）；agent loop 在权限链之前再检查一次，所以模型凭空调用白名单外的工具既不执行也不会弹出审批；子 Agent、`Task` 的各条路径、插件外部子 Agent、goal judge 继承同一上限；`acp:` 外部 Agent 模型别名与动态加载（`SelectTools`）在严格白名单下不可用。
+- **不经过工具层的旁路也被关闭。** 严格白名单的会话拒绝 ACP 的 `fs/*` 与 `terminal/*`（`-32601`）；不可能被白名单放行的 `mcp__<server>__*` 会话级 MCP 服务器不会启动，名字为空或重复的服务器会被拒绝。
+- **宿主工具不遮蔽已有工具。** 宿主注入的工具不能使用 `mcp__`、`acp:` 前缀，也不能与已注册的内置、插件或 MCP 工具同名（同名的宿主工具被忽略，绝不替换已有工具）；它们同样受白名单过滤。`approval = "host"` 表示由宿主自己负责授权与执行，把不可信宿主接入前应清楚这一点：宿主工具的副作用不受 kkagent 权限链和沙箱约束。
+- **取消不授予权限。** `session/request_permission` 的 `cancelled` 结果、`session/cancel`、客户端断开都按拒绝处理，不会被记住为「始终允许」。
+- **宿主存储关闭失败。** `[storage] backend = "host"` 下宿主不可用时 turn 失败，不会写入本地 SQLite；宿主本身需要保护它保存的对话内容。
+- **扩展开关只能关。** `[extensions]`、`--no-project-instructions` / `--no-hooks` / `--no-plugins` 与会话参数 `extensions` 取最严的组合；让不可信仓库的 `AGENTS.md`、Hook 或插件不参与会话，应关闭对应开关。
+
+默认配置（不设 `--role`、没有 `[agent_roles]`、`[storage]` 保持 `sqlite`、三个扩展开关全开）下，以上机制都不改变现有行为。宿主与角色的配置方式见[配置参考](configuration.md#agent-角色agent_rolesname)，协议见[扩展机制](extensions.md#宿主扩展_kkagent)。
+
 ## 凭据和敏感文件
 
 Kimi OAuth 凭据原子写入 `~/.kkagent/credentials/kimi-code.json`，Unix 权限设为 `0600`。文件工具会限制常见 `.env`、私钥和凭据路径，但不要依赖名称检测保护秘密。最可靠方式是让 Agent 用户无法读取不需要的凭据。

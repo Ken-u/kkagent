@@ -23,6 +23,7 @@ use crate::plan_review::{
     format_auto_approved_plan, resolve_exit_plan_approval, PlanReviewDisplay,
 };
 use crate::session::Session;
+use crate::storage::{NewMessage, SessionPatch, SessionStore, SqliteSessionStore};
 use crate::token_counting::TokenCountingStrategy;
 use crate::tool_results::{TOOL_RESULT_MAX_CHARS, TOOL_RESULT_PREVIEW_CHARS};
 use crate::tool_scheduler::{box_start, SchedulerStatus, ToolCallTask, ToolScheduler};
@@ -31,6 +32,8 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 
 mod acp_turn;
+#[cfg(test)]
+mod allowlist_tests;
 
 const STREAM_DELTA_FLUSH_INTERVAL: Duration = Duration::from_millis(16);
 const STREAM_DELTA_FLUSH_BYTES: usize = 64;
@@ -171,9 +174,9 @@ pub struct AgentLoop {
     /// parent's store instead of owning one.
     tool_result_store: Option<Arc<ToolResultStore>>,
     /// When attached, every complete message pushed during a turn is appended
-    /// to the transcript DB at once (never per stream chunk). Cuts the crash
+    /// to the session store at once (never per stream chunk). Cuts the crash
     /// window from a whole turn down to the currently streaming/executing step.
-    transcript_db: Option<TranscriptDb>,
+    session_store: Option<Arc<dyn SessionStore>>,
     /// Vision-proxy description cache shared across turns (see `vision_proxy`).
     vision_cache: Arc<Mutex<crate::vision_proxy::VisionCache>>,
     /// Backends for sessions whose model is an `acp:<plugin>.<agent>` alias
@@ -319,6 +322,13 @@ impl AgentLoop {
         self
     }
 
+    /// Like [`Self::with_hooks`], but `None` runs the loop without any hook
+    /// (sessions that switched hooks off).
+    pub fn with_optional_hooks(mut self, hooks: Option<Arc<kkagent_mcp::HookManager>>) -> Self {
+        self.hooks = hooks;
+        self
+    }
+
     /// Enable headless defaults for experimental recovery behavior.
     pub fn with_headless_mode(mut self, headless_mode: bool) -> Self {
         self.headless_mode = headless_mode;
@@ -367,19 +377,27 @@ impl AgentLoop {
 
     /// Attach a transcript DB for per-message persistence within a turn.
     /// Without it, messages only reach disk when the turn ends (old behavior).
-    pub fn with_transcript_db(mut self, db: TranscriptDb) -> Self {
-        self.transcript_db = Some(db);
+    pub fn with_transcript_db(self, db: TranscriptDb) -> Self {
+        self.with_session_store(Arc::new(SqliteSessionStore::new(db)))
+    }
+
+    /// Attach any [`SessionStore`] (SQLite, memory, host-provided) for
+    /// per-message persistence within a turn.
+    pub fn with_session_store(mut self, store: Arc<dyn SessionStore>) -> Self {
+        self.session_store = Some(store);
         self
     }
 
     /// Persist any not-yet-written messages at a complete-message boundary.
     /// Failures are logged but never abort the turn — same policy as the
     /// turn-end persistence path.
-    fn persist_step(&self, session: &mut Session) {
-        let Some(db) = &self.transcript_db else {
+    async fn persist_step(&self, session: &mut Session) {
+        let Some(store) = &self.session_store else {
             return;
         };
-        if let Err(error) = crate::transcript::persist_session_delta(db, session) {
+        if let Err(error) =
+            crate::transcript::persist_session_delta_to_store(store.as_ref(), session).await
+        {
             tracing::error!(
                 session = %session.id,
                 error = %error,
@@ -407,7 +425,7 @@ impl AgentLoop {
             hooks: None,
             goal_mgr: None,
             tool_result_store: None,
-            transcript_db: None,
+            session_store: None,
             vision_cache: Arc::new(Mutex::new(Default::default())),
             acp_backends: None,
         }
@@ -420,6 +438,7 @@ impl AgentLoop {
         Box::pin(async move {
             session.steer_mailbox.start_turn();
             session.batch_hint.reset();
+            session.step_limit_reached = false;
             let _heartbeat = TurnHeartbeat::spawn(self.event_tx.clone(), session.id.clone());
             let mut completed_rounds = 0_u32;
             let mut goal_continuations = 0_u32;
@@ -492,6 +511,7 @@ impl AgentLoop {
                                 continue;
                             }
                         }
+                        session.step_limit_reached = true;
                         return Ok(());
                     }
                     TurnStep::Continue => {
@@ -559,6 +579,19 @@ impl AgentLoop {
         // `acp:<plugin>.<agent>` aliases run the whole step on an external ACP
         // agent instead of an LLM provider (see `acp_turn`).
         if let Some(agent_id) = kkagent_config::acp_agent_id(&model_alias) {
+            // The external agent owns its tools, sandbox and MCP servers, so a
+            // strict tool allowlist cannot bind it. Fail closed instead of
+            // letting a model alias sidestep the role.
+            if self.tools.allowlist().is_some() {
+                return self
+                    .acp_fail(
+                        session,
+                        "ACP model aliases are not available while a strict tool allowlist \
+                         is active; pick a regular model."
+                            .to_string(),
+                    )
+                    .await;
+            }
             let effort = kkagent_config::acp_alias_effort(&model_alias);
             return self.run_acp_turn_step(session, agent_id, effort).await;
         }
@@ -1524,7 +1557,7 @@ impl AgentLoop {
                     content,
                     tools: None,
                 });
-                self.persist_step(session);
+                self.persist_step(session).await;
             }
             self.finish_interrupted(session).await?;
             return Ok(TurnStep::Done);
@@ -1593,7 +1626,7 @@ impl AgentLoop {
                 content,
                 tools: None,
             });
-            self.persist_step(session);
+            self.persist_step(session).await;
         }
 
         if !tool_calls.is_empty() {
@@ -1610,7 +1643,7 @@ impl AgentLoop {
                         }],
                         tools: None,
                     });
-                    self.persist_step(session);
+                    self.persist_step(session).await;
                     let _ = self
                         .event_tx
                         .send(AgentEvent::ToolResult {
@@ -1650,7 +1683,9 @@ impl AgentLoop {
             // — answer the user's question first, then let the model regenerate.
             // The model will call ExitPlanMode again in the next turn if it still
             // wants to exit plan mode.
-            let has_ask_user = tool_calls.iter().any(|tc| tc.name == "AskUserQuestion");
+            let has_ask_user = tool_calls
+                .iter()
+                .any(|tc| tc.name == "AskUserQuestion" && self.tools.permits(&tc.name));
 
             let _ = self
                 .event_tx
@@ -1695,6 +1730,21 @@ impl AgentLoop {
                             "Invalid arguments for tool `{}`: {error}",
                             tc.name
                         ))),
+                    ));
+                    continue;
+                }
+
+                // Role allowlist gate. Runs before the permission chain and
+                // before every name-based interactive special case
+                // (AskUserQuestion, ExitPlanMode, SelectTools, ...), which do
+                // not go through `ToolRegistry::get`, so a hallucinated call
+                // to a tool outside the allowlist can never execute.
+                if !self.tools.permits(&tc.name) {
+                    tracing::warn!(tool = %tc.name, "tool call rejected by role allowlist");
+                    prepared.push((
+                        tc.id.clone(),
+                        tc.name.clone(),
+                        Prepared::Done(ToolOutput::error(tool_not_permitted_message(&tc.name))),
                     ));
                     continue;
                 }
@@ -2514,7 +2564,7 @@ impl AgentLoop {
                     &pending_schema_loads,
                 );
             }
-            self.persist_step(session);
+            self.persist_step(session).await;
 
             // Steer / delivery messages land after tool results (next model turn).
             let has_deliveries = !deliveries.is_empty();
@@ -2524,7 +2574,7 @@ impl AgentLoop {
             for msg in deliveries {
                 session.add_user_message(msg);
             }
-            self.persist_step(session);
+            self.persist_step(session).await;
 
             if session.is_interrupted() {
                 self.finish_interrupted(session).await?;
@@ -2632,8 +2682,14 @@ impl AgentLoop {
         let config = self.config.clone();
         let session_id = session.id.clone();
 
-        let judge_result =
-            crate::goal_judge::run_goal_judge(config, working_dir, &goal, &evidence_tail).await;
+        let judge_result = crate::goal_judge::run_goal_judge(
+            config,
+            working_dir,
+            &goal,
+            &evidence_tail,
+            self.tools.allowlist(),
+        )
+        .await;
         let record = match judge_result {
             Ok(record) => record,
             Err(reason) => {
@@ -2998,8 +3054,9 @@ impl AgentLoop {
 
         // Fork the current session to an archived copy so undo/fork can
         // transparently reach turns that existed before compaction.
-        let archive_session_id =
-            fork_before_compact(&self.transcript_db, session).unwrap_or_default();
+        let archive_session_id = fork_before_compact(self.session_store.as_deref(), session)
+            .await
+            .unwrap_or_default();
 
         // Session model alias wins over the global default for auto compaction
         // summaries unless a dedicated compaction/secondary model is set.
@@ -3311,6 +3368,9 @@ impl AgentLoop {
         input: &serde_json::Value,
         active_model_alias: &str,
     ) -> ToolOutput {
+        if !self.tools.permits(name) {
+            return ToolOutput::error(tool_not_permitted_message(name));
+        }
         if name == "AskUserQuestion" {
             return self.run_ask_user_question(session, input).await;
         }
@@ -3775,7 +3835,18 @@ struct ParallelToolRequest {
     model_alias: Option<String>,
 }
 
+/// Error text returned to the model when a call targets a tool outside the
+/// session's strict allowlist.
+fn tool_not_permitted_message(name: &str) -> String {
+    format!("Tool `{name}` is not permitted by this session's role (tool allowlist).")
+}
+
 async fn execute_tool_parallel(request: ParallelToolRequest) -> ToolOutput {
+    // Final gate at the single execution choke point, before any hook runs:
+    // whatever path led here, a tool outside the allowlist never executes.
+    if !request.tools.permits(&request.name) {
+        return ToolOutput::error(tool_not_permitted_message(&request.name));
+    }
     let ParallelToolRequest {
         tools,
         hooks,
@@ -4079,32 +4150,46 @@ fn describe_tool_action(name: &str, input: &serde_json::Value) -> String {
 /// undo/fork can transparently reach earlier turns. Returns the archive
 /// session id on success, or an empty string when the transcript DB is
 /// unavailable or the fork fails (non-fatal — compaction still proceeds).
-fn fork_before_compact(db: &Option<TranscriptDb>, session: &Session) -> Option<String> {
-    let db = db.as_ref()?;
+async fn fork_before_compact(
+    store: Option<&dyn SessionStore>,
+    session: &Session,
+) -> Option<String> {
+    let store = store?;
     // Ensure the current transcript is fully persisted before forking.
-    let serialized: Vec<(String, String)> = session
+    let serialized: Vec<NewMessage> = session
         .messages
         .iter()
         .filter_map(|m| {
             let json = serde_json::to_string(&m.content).ok()?;
-            Some((m.role.clone(), json))
+            Some(NewMessage {
+                role: m.role.clone(),
+                content_json: json,
+            })
         })
         .collect();
-    if let Err(error) = db.replace_messages(&session.id, &serialized, None) {
+    if let Err(error) = store.replace_messages(&session.id, &serialized, None).await {
         tracing::warn!("pre-compact persist failed (fork skipped): {error}");
         return None;
     }
 
     let short_id = &uuid::Uuid::new_v4().to_string()[..8];
     let archive_id = format!("{}::compact-{}", session.id, short_id);
-    if let Err(error) = db.fork_session(&session.id, &archive_id, None, None) {
+    if let Err(error) = store.fork_session(&session.id, &archive_id, None).await {
         tracing::warn!("pre-compact fork failed: {error}");
         return None;
     }
-    if let Err(error) = db.set_archived(&archive_id, true) {
+    let archive_patch = SessionPatch {
+        archived: Some(true),
+        ..Default::default()
+    };
+    if let Err(error) = store.update_session(&archive_id, &archive_patch).await {
         tracing::warn!("failed to archive compaction fork {archive_id}: {error}");
     }
-    if let Err(error) = db.set_parent_session_id(&session.id, &archive_id) {
+    let parent_patch = SessionPatch {
+        parent_session_id: Some(archive_id.clone()),
+        ..Default::default()
+    };
+    if let Err(error) = store.update_session(&session.id, &parent_patch).await {
         tracing::warn!("failed to set parent_session_id on {}: {error}", session.id);
     }
     Some(archive_id)

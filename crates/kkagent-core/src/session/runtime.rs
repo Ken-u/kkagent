@@ -202,6 +202,10 @@ pub struct Session {
     pub title: Option<String>,
     pub messages: Vec<ChatMessage>,
     pub system_prompt: String,
+    /// Whether `inject_workspace_instructions` may load project instruction
+    /// files (`AGENTS.md`). Set from the session's resolved role / the
+    /// `[extensions]` config; defaults to on.
+    pub load_project_instructions: bool,
     pub working_dir: PathBuf,
     pub image_config: kkagent_config::ImageConfig,
     /// Shared Arc so `/permission` can update mid-turn while the session is out of the map.
@@ -237,6 +241,10 @@ pub struct Session {
     /// while the agent loop owns the session; consumed by the agent loop for
     /// the "Turn interrupted" log.
     pub interrupt_source: Arc<std::sync::Mutex<Option<String>>>,
+    /// The last turn stopped because it used up `max_steps_per_turn` (not
+    /// because it finished). Reset when a turn starts; surfaced to ACP clients
+    /// as `stopReason: max_turn_requests`.
+    pub step_limit_reached: bool,
     /// Index of the current turn's user message (set by `begin_turn`).
     turn_message_start: Option<usize>,
     /// File mutations during the in-flight turn.
@@ -444,6 +452,7 @@ impl Session {
             title,
             messages: Vec::new(),
             system_prompt: crate::plugin_overrides::effective_base_system_prompt(),
+            load_project_instructions: true,
             working_dir,
             image_config: kkagent_config::ImageConfig::default(),
             permission_mode: Arc::new(std::sync::Mutex::new(permission_mode)),
@@ -463,6 +472,7 @@ impl Session {
             steer_mailbox: SessionSteerMailbox::default(),
             interrupted: Arc::new(AtomicBool::new(false)),
             interrupt_source: Arc::new(std::sync::Mutex::new(None)),
+            step_limit_reached: false,
             turn_message_start: None,
             current_turn_changes: Vec::new(),
             undo_stack: Vec::new(),
@@ -1174,6 +1184,9 @@ impl Session {
 
     /// Append AGENTS.md / `.kkagent/AGENTS.md` into the system prompt (kimi-style workspace instructions).
     pub async fn inject_workspace_instructions(&mut self) {
+        if !self.load_project_instructions {
+            return;
+        }
         if let Some(file) = SessionInstructionsProvider::load(&self.working_dir).await {
             self.system_prompt
                 .push_str(&SessionInstructionsProvider::format_for_system_prompt(

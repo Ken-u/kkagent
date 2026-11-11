@@ -408,6 +408,68 @@ impl DurableHttpStore {
     }
 }
 
+impl DurableHttpStore {
+    fn latest_event_sequence_for(&self, session_id: &str) -> anyhow::Result<u64> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("durable HTTP store lock poisoned"))?;
+        Ok(connection.query_row(
+            "SELECT COALESCE(MAX(event_seq), 0) FROM http_events WHERE session_id = ?1",
+            params![session_id],
+            |row| row.get(0),
+        )?)
+    }
+}
+
+/// The durable HTTP event log doubles as the default SQLite
+/// [`EventStore`](kkagent_core::storage::EventStore). Sequence numbers are
+/// global to the log, which satisfies the per-session contract (strictly
+/// increasing, gaps allowed).
+#[async_trait::async_trait]
+impl kkagent_core::storage::EventStore for DurableHttpStore {
+    async fn append(
+        &self,
+        session_id: &str,
+        event: &Value,
+    ) -> kkagent_core::storage::StorageResult<u64> {
+        let mut event = match event {
+            Value::Object(object) => Value::Object(object.clone()),
+            data => json!({"type": "event", "data": data}),
+        };
+        if let Some(object) = event.as_object_mut() {
+            object.insert("session_id".into(), json!(session_id));
+        }
+        let stored = self
+            .append_event(event)
+            .map_err(|error| kkagent_core::storage::StorageError::Backend(error.to_string()))?;
+        Ok(stored.get("event_seq").and_then(Value::as_u64).unwrap_or(0))
+    }
+
+    async fn since(
+        &self,
+        session_id: &str,
+        after_seq: u64,
+        limit: usize,
+    ) -> kkagent_core::storage::StorageResult<Vec<kkagent_core::storage::StoredEvent>> {
+        let events = self
+            .events_since(after_seq, Some(session_id), limit)
+            .map_err(|error| kkagent_core::storage::StorageError::Backend(error.to_string()))?;
+        Ok(events
+            .into_iter()
+            .map(|event| kkagent_core::storage::StoredEvent {
+                seq: event.get("event_seq").and_then(Value::as_u64).unwrap_or(0),
+                event,
+            })
+            .collect())
+    }
+
+    async fn latest_seq(&self, session_id: &str) -> kkagent_core::storage::StorageResult<u64> {
+        self.latest_event_sequence_for(session_id)
+            .map_err(|error| kkagent_core::storage::StorageError::Backend(error.to_string()))
+    }
+}
+
 fn read_turn(row: &rusqlite::Row<'_>) -> rusqlite::Result<DurableTurn> {
     Ok(DurableTurn {
         task_id: row.get(0)?,
@@ -3261,6 +3323,12 @@ mod security_tests {
 
     fn temporary_database() -> std::path::PathBuf {
         std::env::temp_dir().join(format!("kkagent-http-{}.db", uuid::Uuid::new_v4()))
+    }
+
+    #[tokio::test]
+    async fn durable_http_store_satisfies_the_event_store_contract() {
+        let store = DurableHttpStore::open_in_memory().unwrap();
+        kkagent_core::storage::conformance::event_store_contract(&store, "durable").await;
     }
 
     #[test]

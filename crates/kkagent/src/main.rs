@@ -147,7 +147,27 @@ enum Commands {
         http_audit_log: Option<PathBuf>,
     },
     /// Serve Agent Client Protocol over stdio (IDE bridge)
-    Acp,
+    Acp {
+        /// Run every session under this role from `[agent_roles.NAME]` in the
+        /// user config (system prompt + strict tool allowlist). The role is a
+        /// ceiling that session parameters can only narrow.
+        #[arg(long)]
+        role: Option<String>,
+        /// Do not load project instruction files (AGENTS.md)
+        #[arg(long)]
+        no_project_instructions: bool,
+        /// Do not load or run hooks
+        #[arg(long)]
+        no_hooks: bool,
+        /// Do not load plugins
+        #[arg(long)]
+        no_plugins: bool,
+        /// Where sessions and messages live; overrides `[storage] backend`.
+        /// `host` makes the connected client the only store and fails
+        /// closed when it does not serve one.
+        #[arg(long, value_enum)]
+        storage: Option<StorageArg>,
+    },
     /// Lightweight stdio bridge to a local kkagent server (used by SSH remote workspace)
     Bridge {
         /// Read/write NDJSON RPC frames on stdin/stdout
@@ -397,7 +417,7 @@ fn runtime_mode(cli: &Cli) -> &'static str {
     }
     match (&cli.command, &cli.prompt) {
         (Some(Commands::Server { .. }), _) => "server",
-        (Some(Commands::Acp), _) => "acp",
+        (Some(Commands::Acp { .. }), _) => "acp",
         (Some(Commands::Bridge { .. }), _) => "bridge",
         (Some(Commands::Ssh { .. }), _) => "ssh",
         (Some(Commands::Mcp { .. }), _) => "mcp",
@@ -582,8 +602,37 @@ async fn run(cli: Cli) -> Result<()> {
             };
             run_server(config, config_path, listen, http, token, security).await
         }
-        Some(Commands::Acp) => {
-            let state = build_server_state(Arc::new(config), config_path).await?;
+        Some(Commands::Acp {
+            role,
+            no_project_instructions,
+            no_hooks,
+            no_plugins,
+            storage,
+        }) => {
+            let mut policy = kkagent_core::role::ProcessPolicy::from_config(
+                &config,
+                role.as_deref(),
+                kkagent_config::ExtensionsConfig {
+                    load_project_instructions: !no_project_instructions,
+                    load_hooks: !no_hooks,
+                    load_plugins: !no_plugins,
+                },
+            )
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+            if let Some(storage) = storage {
+                policy.storage = storage.into();
+            }
+            let (shutdown_tx, _) = watch::channel(false);
+            let state = build_server_state_with_shutdown(
+                Arc::new(config),
+                config_path,
+                shutdown_tx,
+                kkagent_rpc::HttpSecurityOptions::default(),
+                None,
+                None,
+                policy,
+            )
+            .await?;
             let server = kkagent_acp::AcpServer::with_host(Arc::new(AgentAcpHost { state }));
             server.serve_stdio().await
         }
@@ -2750,6 +2799,7 @@ async fn run_server(
     http_token: Option<String>,
     http_security: kkagent_rpc::HttpSecurityOptions,
 ) -> Result<()> {
+    ensure_local_storage(&config)?;
     let socket_path = listen.unwrap_or_else(|| {
         kkagent_config::default_server_socket_path()
             .to_string_lossy()
@@ -2780,6 +2830,7 @@ async fn run_server(
     let init_config_path = config_path;
     let init_shutdown = shutdown_tx.clone();
     let init_http_security = http_security;
+    let init_policy = default_process_policy(&config_arc);
     tokio::spawn(async move {
         match build_server_state_with_shutdown(
             init_config,
@@ -2788,6 +2839,7 @@ async fn run_server(
             init_http_security,
             None,
             None,
+            init_policy,
         )
         .await
         {
@@ -3048,29 +3100,41 @@ struct AgentAcpHost {
 }
 
 async fn initialize_session_context(state: &ServerState, session: &mut Session) {
+    // The role is bound before the session is built (ACP `session/new|load|
+    // resume`); sessions without one run under the process default role.
+    let role = state.session_role(&session.id).await;
+    role.apply_before_context(session);
     session.image_config = state.config().image.clone();
     session.inject_working_directory_context();
     session.inject_workspace_instructions().await;
     session.attach_workspace_concurrency_guard();
-    append_composed_prompt_sections(&state.skills, &state.plugins, session).await;
+    append_composed_prompt_sections(&state.skills, &state.plugins, session, &role).await;
+    role.apply_after_context(session);
 }
 
 /// Append the workspace-composed prompt sections (skills catalog, plugin
-/// prompts) that every session shares, regardless of entry point.
+/// prompts) that every session shares, regardless of entry point. A role that
+/// cannot call `Skill` gets no catalog; a role with plugins off gets no plugin
+/// prompt.
 async fn append_composed_prompt_sections(
     skills: &kkagent_tools::SkillCatalog,
     plugins: &kkagent_core::PluginManager,
     session: &mut Session,
+    role: &kkagent_core::role::SessionRole,
 ) {
-    let skill_section = skills
-        .catalog_prompt_section_for(&session.working_dir)
-        .await;
-    if !skill_section.is_empty() {
-        session.system_prompt.push_str(&skill_section);
+    if role.permits_tool("Skill") {
+        let skill_section = skills
+            .catalog_prompt_section_for(&session.working_dir)
+            .await;
+        if !skill_section.is_empty() {
+            session.system_prompt.push_str(&skill_section);
+        }
     }
-    let plugin_section = plugins.prompt_append_all().await;
-    if !plugin_section.is_empty() {
-        session.system_prompt.push_str(&plugin_section);
+    if role.extensions.load_plugins {
+        let plugin_section = plugins.prompt_append_all().await;
+        if !plugin_section.is_empty() {
+            session.system_prompt.push_str(&plugin_section);
+        }
     }
 }
 
@@ -3084,6 +3148,7 @@ async fn run_dump_system_prompt(config_path: Option<&Path>) -> Result<()> {
     let config = load_config(config_path)?;
     let working_dir = std::env::current_dir().context("failed to resolve current directory")?;
 
+    let role = default_process_policy(&config).default_role();
     let (skills, plugins) = {
         let plugins_dir = kkagent_config::default_config_dir().join("plugins");
         let skill_dirs = skill_search_dirs(&config);
@@ -3093,7 +3158,13 @@ async fn run_dump_system_prompt(config_path: Option<&Path>) -> Result<()> {
                 &skill_dirs,
                 config.merge_all_available_skills,
             ),
-            kkagent_core::PluginManager::discover(&plugins_dir),
+            async {
+                if role.extensions.load_plugins {
+                    kkagent_core::PluginManager::discover(&plugins_dir).await
+                } else {
+                    kkagent_core::PluginManager::disabled(&plugins_dir)
+                }
+            },
         )
     };
     // `--dump-system-prompt` must reflect plugin persona replacement too.
@@ -3112,12 +3183,14 @@ async fn run_dump_system_prompt(config_path: Option<&Path>) -> Result<()> {
             .unwrap_or("default")
             .to_string(),
     );
+    role.apply_before_context(&mut session);
     session.image_config = config.image.clone();
     session.inject_working_directory_context();
     session.inject_workspace_instructions().await;
     session.attach_workspace_concurrency_guard();
 
-    append_composed_prompt_sections(&skills, &plugins, &mut session).await;
+    append_composed_prompt_sections(&skills, &plugins, &mut session, &role).await;
+    role.apply_after_context(&mut session);
 
     print!("{}", session.effective_system_prompt());
     use std::io::Write;
@@ -3284,21 +3357,27 @@ async fn ensure_session_loaded(state: &Arc<ServerState>, session_id: &str) -> Re
         return Ok(());
     }
     let (record, messages) = {
-        let database = state.transcript.lock().await;
-        let record = database
+        let record = state
+            .session_store
             .get_session(session_id)
+            .await
             .map_err(|error| error.to_string())?
             .ok_or_else(|| "session not found".to_string())?;
-        let records = database
+        let records = state
+            .session_store
             .load_messages(session_id)
+            .await
             .map_err(|error| error.to_string())?;
         (record, messages_from_records(&records))
     };
-    let permission_mode = state
-        .config()
-        .effective_permission_mode()
-        .parse()
-        .unwrap_or_default();
+    let permission_mode = match state.session_role(session_id).await.permission_mode {
+        Some(mode) => mode,
+        None => state
+            .config()
+            .effective_permission_mode()
+            .parse()
+            .unwrap_or_default(),
+    };
     let model = if record.model.is_empty() {
         state
             .config()
@@ -3384,11 +3463,29 @@ async fn ensure_session_loaded(state: &Arc<ServerState>, session_id: &str) -> Re
 /// directory is already gone, so closing must not write anything back into it,
 /// and no `active-session` marker may keep pointing at the removed session.
 async fn remove_session_runtime(state: &Arc<ServerState>, session_id: &str) {
+    let _ = state
+        .session_store
+        .update_session(
+            session_id,
+            &kkagent_core::storage::SessionPatch {
+                archived: Some(true),
+                ..Default::default()
+            },
+        )
+        .await;
+    teardown_session_runtime(state, session_id, SessionCloseReason::Discard).await;
+}
+
+/// Release everything the process holds for a session (live state, MCP
+/// servers, shells, role binding) without touching its stored conversation.
+async fn teardown_session_runtime(
+    state: &Arc<ServerState>,
+    session_id: &str,
+    reason: SessionCloseReason,
+) {
     kkagent_config::clear_active_session_if(session_id);
-    {
-        let db = state.transcript.lock().await;
-        let _ = db.archive_session(session_id);
-    }
+    state.drop_session_mcp(session_id).await;
+    state.unbind_session_role(session_id).await;
     let removed = state.sessions.lock().await.remove(session_id);
     state.interrupt_flags.lock().await.remove(session_id);
     state.interrupt_sources.lock().await.remove(session_id);
@@ -3414,7 +3511,24 @@ async fn remove_session_runtime(state: &Arc<ServerState>, session_id: &str) {
     // The external ACP agents of this session (one process each) stop with it.
     state.acp_backends.close_session(session_id).await;
     if let Some(session) = removed {
-        session.services.on_close(SessionCloseReason::Discard).await;
+        session.services.on_close(reason).await;
+    }
+}
+
+/// Interrupt a session's turn and give it a moment to wind down, so tearing
+/// the session down does not race the turn that is still checking it back in.
+async fn stop_turn_and_wait(state: &Arc<ServerState>, session_id: &str) {
+    if let Some(flag) = state.interrupt_flags.lock().await.get(session_id) {
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    if let Some(handle) = state.abort_registry.lock().await.remove(session_id) {
+        handle.abort();
+    }
+    for _ in 0..100 {
+        if !state.turn_locks.is_busy(session_id).await {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 
@@ -3562,8 +3676,10 @@ async fn fire_session_hook(
     session_id: &str,
     workspace: &Path,
 ) {
-    let _ = state
-        .hooks
+    let Some(hooks) = state.hooks_for_session(session_id).await else {
+        return;
+    };
+    let _ = hooks
         .fire(
             event,
             &serde_json::json!({
@@ -3574,12 +3690,146 @@ async fn fire_session_hook(
         .await;
 }
 
-#[async_trait::async_trait]
-impl kkagent_acp::AcpHost for AgentAcpHost {
-    async fn create_session(&self, session_id: &str, cwd: &str) -> Result<(), String> {
-        if session_id.is_empty() {
-            return Err("session id must not be empty".into());
+impl AgentAcpHost {
+    /// Resolve the role of a session from the process ceiling plus the
+    /// session parameters (standard `systemPrompt`, `_meta["kkagent/host"]`),
+    /// bind it to the session and return it. The result can only narrow what
+    /// the process allows.
+    async fn bind_role(
+        &self,
+        session_id: &str,
+        setup: &kkagent_acp::SessionSetup,
+    ) -> Result<Arc<kkagent_core::role::SessionRole>, String> {
+        let meta = kkagent_protocol::host::HostSessionMeta::from_meta(setup.meta.as_ref())?;
+        if !meta.host_tools.is_empty() {
+            if !self.state.host_capabilities().tools {
+                return Err(format!(
+                    "hostTools need the client to advertise `_meta[\"{}\"].tools` at initialize",
+                    kkagent_protocol::host::HOST_META_KEY
+                ));
+            }
+            kkagent_core::host_tool::validate_host_tool_names(
+                &meta.host_tools,
+                &builtin_tool_names(),
+            )
+            .map_err(|error| error.to_string())?;
         }
+        let system_prompt =
+            setup
+                .system_prompt
+                .as_ref()
+                .map(|prompt| kkagent_core::role::SystemPromptSpec {
+                    mode: match prompt.mode {
+                        kkagent_acp::SystemPromptParamMode::Append => {
+                            kkagent_config::SystemPromptMode::Append
+                        }
+                        kkagent_acp::SystemPromptParamMode::Override => {
+                            kkagent_config::SystemPromptMode::Replace
+                        }
+                    },
+                    text: prompt.text.clone(),
+                });
+        let mut role = kkagent_core::role::resolve_session_role(
+            &self.state.config(),
+            &self.state.process_policy,
+            &meta,
+            system_prompt,
+        )
+        .map_err(|error| error.to_string())?;
+        let mut roles = self.state.session_roles.lock().await;
+        if let Some(existing) = roles.get(session_id) {
+            // Re-binding a live session (a repeated session/load) can only
+            // narrow what the session already had.
+            role.tool_allowlist = kkagent_protocol::ToolAllowlist::narrow(
+                existing.tool_allowlist.as_ref(),
+                role.tool_allowlist.as_ref(),
+            );
+            role.extensions = existing.extensions.narrow(role.extensions);
+        }
+        let role = Arc::new(role);
+        roles.insert(session_id.to_string(), role.clone());
+        Ok(role)
+    }
+
+    /// Parse and vet the `mcpServers` a client attached to a session. Servers
+    /// the session's tool allowlist can never permit are left out (nothing is
+    /// started for tools that would be filtered anyway).
+    fn prepare_session_mcp(
+        &self,
+        cwd: &str,
+        servers: &[serde_json::Value],
+        role: &kkagent_core::role::SessionRole,
+    ) -> Result<Vec<kkagent_mcp::McpServerConfig>, String> {
+        if servers.is_empty() {
+            return Ok(Vec::new());
+        }
+        let working_dir = std::fs::canonicalize(cwd).unwrap_or_else(|_| PathBuf::from(cwd));
+        let parsed = kkagent_core::session_mcp::parse_acp_mcp_servers(servers, &working_dir)?;
+        let configured: std::collections::HashSet<String> = self
+            .state
+            .mcp
+            .configured_names()
+            .iter()
+            .map(|name| kkagent_mcp::sanitize_mcp_name_part(name))
+            .collect();
+        let mut accepted = Vec::new();
+        for config in parsed {
+            if configured.contains(&kkagent_mcp::sanitize_mcp_name_part(&config.name)) {
+                return Err(format!(
+                    "mcp server name `{}` is already configured for this kkagent process",
+                    config.name
+                ));
+            }
+            if !kkagent_core::session_mcp::allowlist_may_use_server(
+                role.tool_allowlist.as_ref(),
+                &config.name,
+            ) {
+                tracing::info!(
+                    "mcp server `{}` not started: the session's tool allowlist cannot permit its tools",
+                    config.name
+                );
+                continue;
+            }
+            accepted.push(config);
+        }
+        Ok(accepted)
+    }
+
+    /// Start the session's own MCP servers in the background; the first turn
+    /// waits for them like it does for the process-wide ones. Replaces the
+    /// servers of an earlier `session/load` of the same session.
+    async fn start_session_mcp(
+        &self,
+        session_id: &str,
+        servers: Vec<kkagent_mcp::McpServerConfig>,
+    ) {
+        if servers.is_empty() {
+            return;
+        }
+        let manager = Arc::new(McpManager::new(servers));
+        let previous = self
+            .state
+            .session_mcp
+            .lock()
+            .await
+            .insert(session_id.to_string(), manager.clone());
+        if let Some(previous) = previous {
+            stop_mcp_manager(&previous).await;
+        }
+        tokio::spawn(async move {
+            // Per-server failures are logged by connect_all; the session just
+            // gets fewer tools.
+            let _ = manager.connect_all().await;
+        });
+    }
+
+    /// Create the in-memory + persisted session once its role is bound.
+    async fn create_session_with_role(
+        &self,
+        session_id: &str,
+        cwd: &str,
+        role: &kkagent_core::role::SessionRole,
+    ) -> Result<(), String> {
         let working_dir = std::fs::canonicalize(cwd)
             .map_err(|e| format!("invalid ACP working directory {cwd}: {e}"))?;
         let model = self
@@ -3588,12 +3838,15 @@ impl kkagent_acp::AcpHost for AgentAcpHost {
             .default_model_alias()
             .ok_or_else(|| "default_model is not configured".to_string())?
             .to_string();
-        let permission_mode = self
-            .state
-            .config()
-            .effective_permission_mode()
-            .parse()
-            .map_err(|_| "invalid default permission mode".to_string())?;
+        let permission_mode = match role.permission_mode {
+            Some(mode) => mode,
+            None => self
+                .state
+                .config()
+                .effective_permission_mode()
+                .parse()
+                .map_err(|_| "invalid default permission mode".to_string())?,
+        };
         let mut session = Session::new(
             session_id.to_string(),
             working_dir.clone(),
@@ -3601,11 +3854,11 @@ impl kkagent_acp::AcpHost for AgentAcpHost {
             model.clone(),
         );
         initialize_session_context(&self.state, &mut session).await;
-        {
-            let db = self.state.transcript.lock().await;
-            db.create_session(session_id, &model, &working_dir.to_string_lossy())
-                .map_err(|e| e.to_string())?;
-        }
+        self.state
+            .session_store
+            .create_session(session_id, &model, &working_dir.to_string_lossy())
+            .await
+            .map_err(|e| e.to_string())?;
         session.services.on_created().await;
         fire_session_hook(
             &self.state,
@@ -3666,6 +3919,35 @@ impl kkagent_acp::AcpHost for AgentAcpHost {
             .insert(session_id.to_string(), session);
         Ok(())
     }
+}
+
+#[async_trait::async_trait]
+#[async_trait::async_trait]
+impl kkagent_acp::AcpHost for AgentAcpHost {
+    async fn create_session(
+        &self,
+        session_id: &str,
+        cwd: &str,
+        setup: &kkagent_acp::SessionSetup,
+    ) -> Result<(), String> {
+        if session_id.is_empty() {
+            return Err("session id must not be empty".into());
+        }
+        let role = self.bind_role(session_id, setup).await?;
+        let result = async {
+            // Validate everything the client sent before anything is created.
+            let mcp_servers = self.prepare_session_mcp(cwd, &setup.mcp_servers, &role)?;
+            self.create_session_with_role(session_id, cwd, &role)
+                .await?;
+            self.start_session_mcp(session_id, mcp_servers).await;
+            Ok(())
+        }
+        .await;
+        if result.is_err() {
+            self.state.unbind_session_role(session_id).await;
+        }
+        result
+    }
 
     async fn prompt(&self, session_id: &str, text: &str) -> Result<serde_json::Value, String> {
         if text.trim().is_empty() {
@@ -3677,6 +3959,9 @@ impl kkagent_acp::AcpHost for AgentAcpHost {
             let session = sessions
                 .get_mut(session_id)
                 .ok_or_else(|| "session not found".to_string())?;
+            // A cancel aimed at an earlier turn (or sent while idle) belongs
+            // to that turn and must not stop this one before it starts.
+            session.clear_interrupt();
             session.add_user_message(text.to_string());
         }
         run_http_turn(self.state.clone(), session_id, None)
@@ -3686,6 +3971,11 @@ impl kkagent_acp::AcpHost for AgentAcpHost {
         let session = sessions
             .get(session_id)
             .ok_or_else(|| "session disappeared after turn".to_string())?;
+        let stop_reason = if session.step_limit_reached {
+            "max_turn_requests"
+        } else {
+            "end_turn"
+        };
         let output = session
             .messages
             .iter()
@@ -3704,17 +3994,44 @@ impl kkagent_acp::AcpHost for AgentAcpHost {
             })
             .unwrap_or_default();
         Ok(serde_json::json!({
-            "stopReason": "end_turn",
+            "stopReason": stop_reason,
             "sessionId": session_id,
             "content": [{"type": "text", "text": output}],
         }))
     }
 
-    async fn load_session(&self, session_id: &str, cwd: &str) -> Result<(), String> {
-        ensure_session_loaded(&self.state, session_id).await?;
+    async fn load_session(
+        &self,
+        session_id: &str,
+        cwd: &str,
+        setup: &kkagent_acp::SessionSetup,
+    ) -> Result<(), String> {
+        let was_bound = self
+            .state
+            .session_roles
+            .lock()
+            .await
+            .contains_key(session_id);
+        let role = self.bind_role(session_id, setup).await?;
+        let mcp_servers = match self.prepare_session_mcp(cwd, &setup.mcp_servers, &role) {
+            Ok(servers) => servers,
+            Err(error) => {
+                if !was_bound {
+                    self.state.unbind_session_role(session_id).await;
+                }
+                return Err(error);
+            }
+        };
+        if let Err(error) = ensure_session_loaded(&self.state, session_id).await {
+            if !was_bound {
+                self.state.unbind_session_role(session_id).await;
+            }
+            return Err(error);
+        }
         if let Err(error) = std::fs::canonicalize(cwd) {
             tracing::warn!("ACP session/load cwd invalid: {error}");
         }
+        self.start_session_mcp(session_id, mcp_servers).await;
         Ok(())
     }
 
@@ -3722,13 +4039,174 @@ impl kkagent_acp::AcpHost for AgentAcpHost {
         true
     }
 
-    async fn session_history(&self, session_id: &str) -> Result<Vec<serde_json::Value>, String> {
-        let records = {
-            let database = self.state.transcript.lock().await;
-            database
-                .load_messages(session_id)
-                .map_err(|e| e.to_string())?
+    async fn list_sessions(
+        &self,
+        cwd: Option<&str>,
+    ) -> Result<Option<Vec<serde_json::Value>>, String> {
+        let records = self
+            .state
+            .session_store
+            .list_sessions(200)
+            .await
+            .map_err(|error| error.to_string())?;
+        let wanted =
+            cwd.map(|cwd| std::fs::canonicalize(cwd).unwrap_or_else(|_| PathBuf::from(cwd)));
+        let sessions = records
+            .into_iter()
+            .filter(|record| !record.is_archived)
+            .filter(|record| match &wanted {
+                None => true,
+                Some(wanted) => {
+                    let dir = PathBuf::from(&record.working_dir);
+                    std::fs::canonicalize(&dir).unwrap_or(dir) == *wanted
+                }
+            })
+            .map(|record| {
+                serde_json::json!({
+                    "sessionId": record.session_id,
+                    "cwd": record.working_dir,
+                    "title": record.title,
+                    "updatedAt": record.updated_at,
+                })
+            })
+            .collect();
+        Ok(Some(sessions))
+    }
+
+    async fn close_session(&self, session_id: &str) -> Result<(), String> {
+        stop_turn_and_wait(&self.state, session_id).await;
+        teardown_session_runtime(&self.state, session_id, SessionCloseReason::Exit).await;
+        Ok(())
+    }
+
+    async fn delete_session(&self, session_id: &str) -> Result<(), String> {
+        stop_turn_and_wait(&self.state, session_id).await;
+        if self.state.process_policy.storage == kkagent_config::StorageBackend::Host {
+            // The host owns the conversation: it is removed there. Locally
+            // only the runtime state exists.
+            let stored = self
+                .state
+                .session_store
+                .get_session(session_id)
+                .await
+                .map_err(|error| error.to_string())?;
+            if stored.is_none() && !session_is_live(&self.state, session_id).await {
+                return Err(format!("session not found: {session_id}"));
+            }
+            teardown_session_runtime(&self.state, session_id, SessionCloseReason::Discard).await;
+            return self
+                .state
+                .session_store
+                .delete_session(session_id)
+                .await
+                .map_err(|error| error.to_string());
+        }
+        let backend = AgentHttpBackend {
+            state: self.state.clone(),
         };
+        // The same removal the HTTP API performs (trash archive, journal
+        // directory, runtime maps).
+        let result = kkagent_rpc::HttpBackend::delete_session(&backend, session_id).await;
+        teardown_session_runtime(&self.state, session_id, SessionCloseReason::Discard).await;
+        result.map_err(|error| {
+            if error.contains("session not found") {
+                format!("session not found: {session_id}")
+            } else {
+                error
+            }
+        })
+    }
+
+    async fn session_title(&self, session_id: &str) -> Option<String> {
+        self.state
+            .sessions
+            .lock()
+            .await
+            .get(session_id)
+            .and_then(|session| session.title.clone())
+            .filter(|title| !title.trim().is_empty())
+    }
+
+    async fn context_window(&self, session_id: &str) -> Option<u64> {
+        let alias = {
+            let aliases = self.state.model_aliases.lock().await;
+            aliases
+                .get(session_id)
+                .map(|alias| alias.lock().unwrap_or_else(|e| e.into_inner()).clone())?
+        };
+        self.state
+            .config()
+            .models
+            .get(&alias)
+            .and_then(|model| model.max_context_size)
+    }
+
+    fn bind_client(&self, bridge: kkagent_acp::ClientBridge) {
+        self.state.host_channel.bind(Arc::new(bridge));
+    }
+
+    fn signals_turn_commit(&self) -> bool {
+        // `run_http_turn` closes every turn with `turn_committed`.
+        true
+    }
+
+    async fn initialize(
+        &self,
+        params: &serde_json::Value,
+    ) -> Result<Option<serde_json::Value>, String> {
+        let meta = params.get("_meta");
+        let capabilities = kkagent_protocol::host::HostCapabilities::from_meta(meta);
+        let host_storage =
+            self.state.process_policy.storage == kkagent_config::StorageBackend::Host;
+        if host_storage && !capabilities.store.sessions {
+            return Err(format!(
+                "storage backend \"host\" needs the client to advertise \
+                 `_meta[\"{}\"].store.sessions` at initialize",
+                kkagent_protocol::host::HOST_META_KEY
+            ));
+        }
+        self.state
+            .host_events_enabled
+            .store(host_storage && capabilities.store.events, Ordering::SeqCst);
+        *self
+            .state
+            .host_capabilities
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = capabilities.clone();
+        // Only hosts that speak the extension get an answer in `_meta`.
+        let negotiated = meta
+            .and_then(|meta| meta.get(kkagent_protocol::host::HOST_META_KEY))
+            .is_some();
+        Ok(negotiated.then(|| {
+            let mut answer = serde_json::Map::new();
+            answer.insert(
+                kkagent_protocol::host::HOST_META_KEY.to_string(),
+                serde_json::json!({
+                    "tools": capabilities.tools,
+                    "store": {
+                        "sessions": host_storage,
+                        "events": host_storage && capabilities.store.events,
+                    },
+                }),
+            );
+            serde_json::Value::Object(answer)
+        }))
+    }
+
+    async fn tools_restricted(&self, session_id: Option<&str>) -> bool {
+        match session_id {
+            Some(id) => self.state.session_role(id).await.is_restricted(),
+            None => self.state.process_policy.tool_ceiling().is_some(),
+        }
+    }
+
+    async fn session_history(&self, session_id: &str) -> Result<Vec<serde_json::Value>, String> {
+        let records = self
+            .state
+            .session_store
+            .load_messages(session_id)
+            .await
+            .map_err(|e| e.to_string())?;
         let mut history = Vec::with_capacity(records.len());
         for record in records {
             let Ok(blocks) =
@@ -3822,10 +4300,15 @@ impl kkagent_acp::AcpHost for AgentAcpHost {
             session.set_model_alias(model.to_string());
         }
         self.state
-            .transcript
-            .lock()
+            .session_store
+            .update_session(
+                session_id,
+                &kkagent_core::storage::SessionPatch {
+                    model: Some(model.to_string()),
+                    ..Default::default()
+                },
+            )
             .await
-            .set_model(session_id, model)
             .map_err(|e| e.to_string())?;
         Ok(())
     }
@@ -5142,10 +5625,33 @@ async fn build_turn_tool_registry(
     session_id: &str,
     working_dir: &std::path::Path,
 ) -> ToolRegistry {
+    build_turn_tools(state, event_tx, todos, session_id, working_dir)
+        .await
+        .0
+}
+
+/// The per-turn tool registry plus the permission policy of the session's
+/// host-injected tools that actually made it into the registry.
+async fn build_turn_tools(
+    state: &Arc<ServerState>,
+    event_tx: mpsc::Sender<AgentEvent>,
+    todos: Vec<kkagent_protocol::TodoItemEvent>,
+    session_id: &str,
+    working_dir: &std::path::Path,
+) -> (ToolRegistry, Vec<kkagent_core::permission::HostToolPolicy>) {
     // MCP discovery starts in the background so the TUI can paint immediately.
     // Synchronize only when a turn actually needs its final tool registry.
     state.mcp.wait_until_initialized().await;
     let mut tools = ToolRegistry::new();
+    // Strict role ceiling: applied to the empty registry so that built-ins,
+    // MCP bridging, plugin overrides, delegation and host tools are all
+    // filtered at the point of registration.
+    let role = state.session_role(session_id).await;
+    let load_plugins = role.extensions.load_plugins;
+    let tool_allowlist = role.tool_allowlist.clone();
+    if let Some(allowlist) = &tool_allowlist {
+        tools.set_allowlist(allowlist);
+    }
     kkagent_tools::register_builtin_tools(&mut tools);
     // `GenerateImage` opt-in resolution: global `[services.image_gen]`
     // enables the tool everywhere; a trusted workspace's
@@ -5227,22 +5733,47 @@ async fn build_turn_tool_registry(
             },
         },
     )));
-    register_mcp_tools(&mut tools, &state.mcp).await;
+    // Plugin-contributed MCP servers (`plugin-<id>:<server>`) are left out for
+    // sessions that switched plugins off.
+    kkagent_mcp::register_mcp_tools_where(&mut tools, &state.mcp, |server| {
+        load_plugins || !kkagent_mcp::is_plugin_mcp_server(server)
+    })
+    .await;
+    // MCP servers the client attached to this session (`mcpServers`).
+    let session_mcp = state.session_mcp.lock().await.get(session_id).cloned();
+    if let Some(manager) = session_mcp {
+        manager.wait_until_initialized().await;
+        kkagent_mcp::register_mcp_tools(&mut tools, &manager).await;
+    }
 
     let subagents = state.subagents.clone();
     let config = state.config();
     let max_depth = config.subagent.effective_max_depth();
-    let launch_web = state.web.read().await.clone();
+    let launch_web = state.web_for_role(&role).await;
+    let launch_load_instructions = role.extensions.load_project_instructions;
     // Plugin-contributed external subagent types (e.g. Cursor CLI over ACP).
     // Qualified names are `<plugin>.<name>`; the launch closure dispatches on
     // them before falling through to the built-in in-process agent loop.
-    let external_subagents = state.plugins.external_subagents().await;
-    let external_profiles = &external_subagents.0;
+    let external_subagents = if load_plugins {
+        state.plugins.external_subagents().await
+    } else {
+        Arc::new((Vec::new(), Vec::new()))
+    };
     for conflict in &external_subagents.1 {
         tracing::warn!(
             "external subagent type `{conflict}` declared by multiple plugins; first wins"
         );
     }
+    // Under a strict tool allowlist, external ACP agents (which bring their
+    // own tools) are not offered at all; internal plugin subagents remain
+    // available because they run through the allowlist-bound registry.
+    let external_profiles: Vec<(String, kkagent_core::plugin::PluginSubagentSpec)> =
+        external_subagents
+            .0
+            .iter()
+            .filter(|(_, spec)| tool_allowlist.is_none() || spec.transport != "acp")
+            .cloned()
+            .collect();
     let external_map: std::collections::HashMap<String, kkagent_core::plugin::PluginSubagentSpec> =
         external_profiles.iter().cloned().collect();
     // Self-referential launch slot: internal plugin subagents with
@@ -5251,8 +5782,18 @@ async fn build_turn_tool_registry(
     let launch_slot: Arc<std::sync::OnceLock<kkagent_tools::builtin::task::SubagentLaunchFn>> =
         Arc::new(std::sync::OnceLock::new());
     let launch_slot_for_closure = launch_slot.clone();
+    let launch_allowlist = tool_allowlist.clone();
     let launch: kkagent_tools::builtin::task::SubagentLaunchFn =
         Arc::new(move |mut sub_config, interrupt| {
+            // Delegation can never widen the tool surface: every launch (root,
+            // nested, resumed) carries the launching session's ceiling.
+            sub_config.tool_allowlist = kkagent_protocol::ToolAllowlist::narrow(
+                sub_config.tool_allowlist.as_ref(),
+                launch_allowlist.as_ref(),
+            );
+            // Likewise a session that switched project instructions off never
+            // gets them back through a subagent.
+            sub_config.load_project_instructions &= launch_load_instructions;
             let manager = subagents.clone();
             let app_config = config.clone();
             let web = launch_web.clone();
@@ -5394,7 +5935,7 @@ async fn build_turn_tool_registry(
     tools.register(Arc::new(kkagent_tools::builtin::SkillTool::new(
         state.skills.clone(),
     )));
-    if let Some(web) = kkagent_tools::builtin::WebTool::try_new(state.web.read().await.clone()) {
+    if let Some(web) = kkagent_tools::builtin::WebTool::try_new(state.web_for_role(&role).await) {
         tools.register(Arc::new(web));
     } else {
         tracing::debug!("Web tool not registered: client construction failed");
@@ -5405,7 +5946,11 @@ async fn build_turn_tool_registry(
 
     // Plugin overrides run LAST: built-ins and MCP-bridged tools are all
     // registered above, so re-binding cannot be clobbered by later registers.
-    let overrides = state.plugins.tool_overrides().await;
+    let overrides = if load_plugins {
+        state.plugins.tool_overrides().await
+    } else {
+        Vec::new()
+    };
     if !overrides.is_empty() {
         let policy = state.config().plugins.clone();
         let skipped = kkagent_core::plugin_overrides::apply_plugin_tool_overrides(
@@ -5419,7 +5964,104 @@ async fn build_turn_tool_registry(
             tracing::warn!(tool = %builtin, %reason, "plugin tool override skipped");
         }
     }
-    tools
+
+    // Host tools go in last and never replace anything: a host cannot shadow a
+    // built-in or plugin-overridden tool, and the allowlist filters them like
+    // every other insertion.
+    let mut host_policies = Vec::new();
+    if !role.host_tools.is_empty() {
+        let channel: Arc<dyn kkagent_core::host_channel::HostChannel> = state.host_channel.clone();
+        let (policies, refused) =
+            kkagent_core::host_tool::register_host_tools(&mut tools, &role.host_tools, &channel);
+        for error in refused {
+            tracing::warn!(session = session_id, "host tool not registered: {error}");
+        }
+        host_policies = policies;
+    }
+    (tools, host_policies)
+}
+
+impl ServerState {
+    /// The host's event log, once the connected host advertised `store.events`.
+    fn host_event_store(&self) -> Option<&Arc<dyn kkagent_core::storage::EventStore>> {
+        if self.host_events_enabled.load(Ordering::SeqCst) {
+            self.event_store.as_ref()
+        } else {
+            None
+        }
+    }
+
+    fn host_capabilities(&self) -> kkagent_protocol::host::HostCapabilities {
+        self.host_capabilities
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+}
+
+/// Disconnect every server of a session-scoped MCP manager.
+async fn stop_mcp_manager(manager: &McpManager) {
+    for name in manager.configured_names() {
+        manager.disconnect(&name).await;
+    }
+}
+
+impl ServerState {
+    /// Stop the MCP servers a session carried (session closed or deleted).
+    async fn drop_session_mcp(&self, session_id: &str) {
+        let manager = self.session_mcp.lock().await.remove(session_id);
+        if let Some(manager) = manager {
+            stop_mcp_manager(&manager).await;
+        }
+    }
+}
+
+/// Tool names kkagent registers itself. A host tool may not reuse any of them
+/// (registration additionally refuses every name already taken at runtime).
+fn builtin_tool_names() -> Vec<String> {
+    let mut scratch = ToolRegistry::new();
+    kkagent_tools::register_builtin_tools(&mut scratch);
+    let mut names: Vec<String> = scratch
+        .tool_definitions()
+        .into_iter()
+        .map(|definition| definition.name)
+        .collect();
+    // Registered per turn rather than by `register_builtin_tools`.
+    names.extend(
+        [
+            "Agent",
+            "AskUserQuestion",
+            "Bash",
+            "Cron",
+            "EnterPlanMode",
+            "ExitPlanMode",
+            "GenerateImage",
+            "Goal",
+            "SelectTools",
+            "Skill",
+            "TaskOutput",
+            "TodoList",
+            "Web",
+            "WritePlan",
+        ]
+        .map(String::from),
+    );
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// Streaming text deltas and heartbeats are not worth a host round trip each;
+/// every other event is part of the durable log.
+fn is_durable_event(event: &AgentEvent) -> bool {
+    !matches!(
+        event,
+        AgentEvent::MessageDelta { .. }
+            | AgentEvent::ThinkingDelta { .. }
+            | AgentEvent::BtwDelta { .. }
+            | AgentEvent::BtwThinkingDelta { .. }
+            | AgentEvent::Heartbeat { .. }
+    )
 }
 
 async fn run_http_turn(
@@ -5430,6 +6072,7 @@ async fn run_http_turn(
     let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(64);
     let live_events = state.events.clone();
     let event_state = state.clone();
+    let event_session_id = session_id.to_string();
     tokio::spawn(async move {
         while let Some(event) = event_rx.recv().await {
             if matches!(&event, AgentEvent::Heartbeat { .. }) {
@@ -5457,6 +6100,18 @@ async fn run_http_turn(
             }
             event_state.note_agent_event_for_resume(&event).await;
             if let Ok(value) = serde_json::to_value(&event) {
+                if let Some(store) = event_state.host_event_store() {
+                    if is_durable_event(&event) {
+                        // The event log is observability data: a failing host
+                        // must not abort the turn (messages are the
+                        // authoritative state and do fail closed).
+                        if let Err(error) = store.append(&event_session_id, &value).await {
+                            tracing::warn!(
+                                "session {event_session_id}: host event store append failed: {error}"
+                            );
+                        }
+                    }
+                }
                 let _ = live_events.send(value);
             }
         }
@@ -5468,7 +6123,7 @@ async fn run_http_turn(
         .ok_or_else(|| anyhow::anyhow!("session gone"))?;
     session.begin_turn();
 
-    let tools = build_turn_tool_registry(
+    let (tools, host_policies) = build_turn_tools(
         &state,
         event_tx.clone(),
         session.todo_items(),
@@ -5483,10 +6138,14 @@ async fn run_http_turn(
         .as_ref()
         .map(|p| p.rules.clone())
         .unwrap_or_default();
-    let permission = Arc::new(Mutex::new(PermissionChain::with_shared_mode(
-        session.permission_mode.clone(),
-        permission_rules,
-    )));
+    let permission = Arc::new(Mutex::new(
+        PermissionChain::with_shared_mode(session.permission_mode.clone(), permission_rules)
+            .with_host_tools(host_policies),
+    ));
+    // Kept to close the turn: events travel in order through this channel, so
+    // a marker sent after the turn tells consumers (the ACP server, before it
+    // answers `session/prompt`) that everything the turn produced is out.
+    let commit_tx = event_tx.clone();
     let agent = AgentLoop::new(
         state.config(),
         Arc::new(tools),
@@ -5494,18 +6153,19 @@ async fn run_http_turn(
         event_tx,
         state.abort_registry.clone(),
     )
-    .with_hooks(state.hooks.clone())
+    .with_optional_hooks(state.hooks_for_session(session.id.as_str()).await)
     .with_acp_backends(state.acp_backends.clone())
     .with_goal_manager(state.goal_for(session.id.as_str()).await)
     .with_tool_result_store(state.tool_result_store.clone())
-    .with_transcript_db(state.transcript.lock().await.clone());
+    .with_session_store(state.session_store.clone());
 
     let result = agent.run_turn(&mut session).await;
     let steer_result = session.close_and_apply_steers();
-    let persist_result = {
-        let db = state.transcript.lock().await;
-        persist_session_messages(&db, &mut session)
-    };
+    let persist_result = kkagent_core::transcript::persist_session_delta_to_store(
+        state.session_store.as_ref(),
+        &mut session,
+    )
+    .await;
     {
         // Keep reinsertion and the final request sync under the same lock. This
         // closes the gap where an RPC could otherwise update the shared flag
@@ -5513,6 +6173,11 @@ async fn run_http_turn(
         session.sync_requested_plan_mode()?;
         state.checkin_session(session_id, session).await;
     }
+    let _ = commit_tx
+        .send(AgentEvent::TurnCommitted {
+            session_id: session_id.to_string(),
+        })
+        .await;
     result?;
     steer_result?;
     persist_result
@@ -5554,7 +6219,24 @@ struct ServerState {
     /// Desired plan mode handles — reachable while the agent loop owns the Session.
     plan_mode_requests: Mutex<HashMap<String, Arc<AtomicBool>>>,
     abort_registry: Arc<Mutex<HashMap<String, AbortHandle>>>,
+    /// Local operational database (search index, usage, bookkeeping). With
+    /// `[storage] backend = "host"` it lives in memory and holds no session
+    /// data; sessions and messages go through [`Self::session_store`].
     transcript: Mutex<TranscriptDb>,
+    /// Replaceable session / message store: local SQLite by default, or the
+    /// embedding host's store (`[storage] backend = "host"`).
+    session_store: Arc<dyn kkagent_core::storage::SessionStore>,
+    /// Event log served by the host; `None` with local storage.
+    event_store: Option<Arc<dyn kkagent_core::storage::EventStore>>,
+    /// Whether the connected host advertised `store.events` (host backend).
+    host_events_enabled: AtomicBool,
+    /// Late-bound channel back to the embedding host (the ACP connection).
+    host_channel: Arc<kkagent_core::host_channel::HostChannelSlot>,
+    /// Capabilities the host advertised at `initialize`.
+    host_capabilities: StdRwLock<kkagent_protocol::host::HostCapabilities>,
+    /// MCP servers the client attached to a session (`mcpServers`), keyed by
+    /// session id. They live and die with the session.
+    session_mcp: Mutex<HashMap<String, Arc<McpManager>>>,
     /// Oversized tool-result store shared by every agent loop; also records
     /// DB rows so trash archival can map files back to sessions.
     tool_result_store: Arc<kkagent_core::agent_loop::ToolResultStore>,
@@ -5627,6 +6309,12 @@ struct ServerState {
     /// Turns publish here so Ctrl+B detach + reattach keeps streaming.
     rpc_event_subscribers: StdRwLock<HashMap<u64, mpsc::Sender<Frame>>>,
     rpc_event_subscriber_seq: AtomicUsize,
+    /// Process-wide ceiling: the `--role` role and the effective
+    /// `[extensions]` toggles. Session roles can only narrow it.
+    process_policy: kkagent_core::role::ProcessPolicy,
+    /// Roles bound to sessions at `session/new|load|resume` time. Sessions
+    /// without an entry run under the process default role.
+    session_roles: Mutex<HashMap<String, Arc<kkagent_core::role::SessionRole>>>,
 }
 
 #[derive(Clone)]
@@ -6183,6 +6871,43 @@ impl ServerState {
                 .join(session_id)
         })
         .join("goal.json")
+    }
+
+    /// Role of `session_id`: the one bound at `session/new|load|resume`, or the
+    /// process default for sessions that never supplied parameters.
+    async fn session_role(&self, session_id: &str) -> Arc<kkagent_core::role::SessionRole> {
+        if let Some(role) = self.session_roles.lock().await.get(session_id) {
+            return role.clone();
+        }
+        Arc::new(self.process_policy.default_role())
+    }
+
+    async fn unbind_session_role(&self, session_id: &str) {
+        self.session_roles.lock().await.remove(session_id);
+    }
+
+    /// Web backends for a session: user config + plugin service overrides,
+    /// without the plugin overrides when the session switched plugins off.
+    async fn web_for_role(
+        &self,
+        role: &kkagent_core::role::SessionRole,
+    ) -> Arc<kkagent_tools::WebServicesConfig> {
+        if role.extensions.load_plugins {
+            self.web.read().await.clone()
+        } else {
+            Arc::new(kkagent_tools::WebServicesConfig::from_app(
+                self.config().as_ref(),
+            ))
+        }
+    }
+
+    /// Hook manager for a session: `None` when the session switched hooks off.
+    async fn hooks_for_session(&self, session_id: &str) -> Option<Arc<kkagent_mcp::HookManager>> {
+        self.session_role(session_id)
+            .await
+            .extensions
+            .load_hooks
+            .then(|| self.hooks.clone())
     }
 
     pub async fn goal_for(&self, session_id: &str) -> Arc<kkagent_protocol::goal::GoalManager> {
@@ -7233,7 +7958,9 @@ async fn build_server_state(
     config: Arc<AppConfig>,
     config_path: PathBuf,
 ) -> Result<Arc<ServerState>> {
+    ensure_local_storage(&config)?;
     let (shutdown_tx, _) = watch::channel(false);
+    let policy = default_process_policy(&config);
     build_server_state_with_shutdown(
         config,
         config_path,
@@ -7241,8 +7968,46 @@ async fn build_server_state(
         kkagent_rpc::HttpSecurityOptions::default(),
         None,
         None,
+        policy,
     )
     .await
+}
+
+/// The process policy of entry points that take no role / extension flags:
+/// no role, extensions exactly as configured in `[extensions]`.
+fn default_process_policy(config: &AppConfig) -> kkagent_core::role::ProcessPolicy {
+    kkagent_core::role::ProcessPolicy {
+        role: None,
+        extensions: config.extensions,
+        storage: config.storage.backend,
+    }
+}
+
+/// `--storage` values of `kkagent acp`.
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum StorageArg {
+    Sqlite,
+    Host,
+}
+
+impl From<StorageArg> for kkagent_config::StorageBackend {
+    fn from(value: StorageArg) -> Self {
+        match value {
+            StorageArg::Sqlite => kkagent_config::StorageBackend::Sqlite,
+            StorageArg::Host => kkagent_config::StorageBackend::Host,
+        }
+    }
+}
+
+/// Entry points other than `kkagent acp` have no host to serve storage, so a
+/// config asking for it is an error rather than a silent local fallback.
+fn ensure_local_storage(config: &AppConfig) -> Result<()> {
+    if config.storage.backend == kkagent_config::StorageBackend::Host {
+        anyhow::bail!(
+            "[storage] backend = \"host\" needs an embedding host and is only supported by `kkagent acp`"
+        );
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7260,6 +8025,8 @@ async fn build_server_state_with_shutdown(
     // dir>/plugins`), so tests can declare plugins without touching the
     // user's real ones.
     plugins_dir_override: Option<PathBuf>,
+    // Process-wide role / extension ceiling (`kkagent acp --role ...`).
+    policy: kkagent_core::role::ProcessPolicy,
 ) -> Result<Arc<ServerState>> {
     let startup_started = std::time::Instant::now();
     let (events, _) = tokio::sync::broadcast::channel(1024);
@@ -7268,8 +8035,19 @@ async fn build_server_state_with_shutdown(
         .unwrap_or(false);
     let transcript_path = transcript_db_override
         .unwrap_or_else(|| kkagent_config::default_config_dir().join("transcripts.db"));
-    let (shared_sqlite, persistence_durable, persistence_error) =
-        open_transcript_with_policy(&transcript_path, allow_in_memory)?;
+    let (shared_sqlite, persistence_durable, persistence_error) = match policy.storage {
+        kkagent_config::StorageBackend::Sqlite => {
+            open_transcript_with_policy(&transcript_path, allow_in_memory)?
+        }
+        // The host is the only authority for session data, so nothing is
+        // written to `transcripts.db`: the operational tables (usage, durable
+        // tasks, subagent bookkeeping) live in memory. Durability of the
+        // transcript is the host's responsibility.
+        kkagent_config::StorageBackend::Host => {
+            tracing::info!("host storage selected: transcript database kept in memory");
+            (kkagent_core::open_shared_sqlite_memory()?, true, None)
+        }
+    };
     // Durable cross-session token usage history shares the transcript DB
     // (same WAL connection pool; one more table pair, no extra file).
     match kkagent_core::UsageStore::from_shared(shared_sqlite.clone()) {
@@ -7283,6 +8061,26 @@ async fn build_server_state_with_shutdown(
     let transcript = TranscriptDb::from_shared(shared_sqlite.clone())?;
     // Second handle shares the already-migrated connection — skip DDL.
     let db_for_tool_results = TranscriptDb::wrap_shared(shared_sqlite.clone());
+    let host_channel = Arc::new(kkagent_core::host_channel::HostChannelSlot::new());
+    let (session_store, event_store): (
+        Arc<dyn kkagent_core::storage::SessionStore>,
+        Option<Arc<dyn kkagent_core::storage::EventStore>>,
+    ) = match policy.storage {
+        kkagent_config::StorageBackend::Sqlite => (
+            Arc::new(kkagent_core::storage::SqliteSessionStore::new(
+                TranscriptDb::wrap_shared(shared_sqlite.clone()),
+            )),
+            None,
+        ),
+        kkagent_config::StorageBackend::Host => (
+            Arc::new(kkagent_core::storage::HostSessionStore::new(
+                host_channel.clone(),
+            )),
+            Some(Arc::new(kkagent_core::storage::HostEventStore::new(
+                host_channel.clone(),
+            ))),
+        ),
+    };
     let durable_http = kkagent_rpc::DurableHttpStore::from_shared(shared_sqlite.clone())?;
     let subagents = Arc::new(SubagentManager::from_shared(4, shared_sqlite)?);
     // Legacy cleanup: old builds persisted subagent runs as real sessions,
@@ -7317,7 +8115,12 @@ async fn build_server_state_with_shutdown(
 
     let plugins_dir = plugins_dir_override
         .unwrap_or_else(|| kkagent_config::default_config_dir().join("plugins"));
-    let plugins = kkagent_core::PluginManager::discover(&plugins_dir).await;
+    let plugins = if policy.extensions.load_plugins {
+        kkagent_core::PluginManager::discover(&plugins_dir).await
+    } else {
+        tracing::info!("plugin loading disabled ([extensions] load_plugins = false)");
+        kkagent_core::PluginManager::disabled(&plugins_dir)
+    };
     // Install any plugin base-prompt replacement before sessions are created.
     kkagent_core::plugin_overrides::sync_system_prompt_override(&plugins).await;
     let mcp_configs = combined_mcp_servers(&config, &plugins).await;
@@ -7340,7 +8143,12 @@ async fn build_server_state_with_shutdown(
     }
 
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let mut hooks_mgr = kkagent_mcp::HookManager::new(&cwd);
+    let mut hooks_mgr = if policy.extensions.load_hooks {
+        kkagent_mcp::HookManager::new(&cwd)
+    } else {
+        tracing::info!("hook loading disabled ([extensions] load_hooks = false)");
+        kkagent_mcp::HookManager::disabled(&cwd)
+    };
     hooks_mgr.load_from_app_config(&config.hooks).await;
     let cron_path = kkagent_config::default_config_dir().join("cron.json");
     let mcp_connect = mcp.clone();
@@ -7469,9 +8277,18 @@ async fn build_server_state_with_shutdown(
         plan_mode_requests: Mutex::new(HashMap::new()),
         abort_registry: Arc::new(Mutex::new(HashMap::new())),
         transcript: Mutex::new(transcript),
+        session_store,
+        event_store,
+        host_events_enabled: AtomicBool::new(false),
+        host_channel,
+        host_capabilities: StdRwLock::new(kkagent_protocol::host::HostCapabilities::default()),
+        session_mcp: Mutex::new(HashMap::new()),
         tool_result_store: Arc::new(kkagent_core::agent_loop::ToolResultStore::new(
             kkagent_config::default_config_dir(),
-            Some(db_for_tool_results),
+            // Spill files stay local scratch; their trash-archival rows only
+            // exist for local storage (a host owns the session data).
+            (policy.storage == kkagent_config::StorageBackend::Sqlite)
+                .then_some(db_for_tool_results),
         )),
         durable_http: durable_http.clone(),
         http_runtime: HttpServerManager::new(http_security, durable_http),
@@ -7510,6 +8327,8 @@ async fn build_server_state_with_shutdown(
         shutdown_tx,
         rpc_event_subscribers: StdRwLock::new(HashMap::new()),
         rpc_event_subscriber_seq: AtomicUsize::new(0),
+        process_policy: policy,
+        session_roles: Mutex::new(HashMap::new()),
     });
 
     // Wake idle sessions when a background task (subagent / background Bash)
@@ -8272,7 +9091,7 @@ async fn spawn_session_agent_turn_with_mode(
                 state_clone.abort_registry.clone(),
             )
             .with_headless_mode(headless_mode)
-            .with_hooks(state_clone.hooks.clone())
+            .with_optional_hooks(state_clone.hooks_for_session(&sid).await)
             .with_acp_backends(state_clone.acp_backends.clone())
             .with_goal_manager(state_clone.goal_for(&sid).await)
             .with_tool_result_store(state_clone.tool_result_store.clone())
@@ -10803,6 +11622,7 @@ async fn handle_rpc_call(
                         &goal_mgr,
                         &history,
                         &text,
+                        None,
                     )
                     .await
                     .map_err(|error| (-32000, error))?;
@@ -13923,6 +14743,17 @@ mod runtime_http_tests {
         config: AppConfig,
         plugins_dir: Option<PathBuf>,
     ) -> Arc<ServerState> {
+        let policy = default_process_policy(&config);
+        test_server_state_with_policy(config, plugins_dir, policy).await
+    }
+
+    /// [`test_server_state_with`] under an explicit process role / extension
+    /// ceiling (what `kkagent acp --role ...` builds).
+    pub(crate) async fn test_server_state_with_policy(
+        config: AppConfig,
+        plugins_dir: Option<PathBuf>,
+        policy: kkagent_core::role::ProcessPolicy,
+    ) -> Arc<ServerState> {
         let (shutdown_tx, _) = watch::channel(false);
         let temp_db_dir =
             std::env::temp_dir().join(format!("kkagent-test-home-{}", uuid::Uuid::new_v4()));
@@ -13934,6 +14765,7 @@ mod runtime_http_tests {
             kkagent_rpc::HttpSecurityOptions::default(),
             Some(temp_db_dir.join("transcripts.db")),
             plugins_dir,
+            policy,
         )
         .await
         .unwrap()
@@ -15992,3 +16824,8 @@ mod mcp_daemon_lifecycle_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod host_tests;
+#[cfg(test)]
+mod role_tests;

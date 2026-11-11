@@ -98,6 +98,8 @@ async fn spawn_subagent(
                     run_in_background,
                     depth: 0,
                     parent_model: ctx.model_alias.clone(),
+                    tool_allowlist: None,
+                    load_project_instructions: true,
                 };
                 if let Some(state) = subagent_mgr.get_state(&resume).await {
                     cfg.description = if desc == "Unnamed task" {
@@ -150,6 +152,8 @@ async fn spawn_subagent(
         run_in_background,
         depth: 0,
         parent_model: ctx.model_alias.clone(),
+        tool_allowlist: None,
+        load_project_instructions: true,
     };
 
     match subagent_mgr.spawn(config.clone()).await {
@@ -1097,6 +1101,8 @@ mod tests {
                 run_in_background: true,
                 depth: 0,
                 parent_model: None,
+                tool_allowlist: None,
+                load_project_instructions: true,
             })
             .await
             .unwrap();

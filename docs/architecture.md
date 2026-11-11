@@ -32,12 +32,12 @@ Agent turn 事件（含 Thinking / StatusUpdate / TurnEnd）由 server 扇出到
 | `kkagent-protocol` | RPC 消息、事件、权限、问题、目标和工具类型。 |
 | `kkagent-rpc` | codec、client/server、memory/UDS transport、HTTP/WS。 |
 | `kkagent-client` | 面向 TUI/CLI 的客户端 facade。 |
-| `kkagent-core` | Agent loop、会话生命周期、上下文、压缩、权限、调度和持久化。 |
+| `kkagent-core` | Agent loop、会话生命周期、上下文、压缩、权限、调度；`role`（角色解析）与 `storage`（会话/事件存储 trait 及 sqlite / memory / host 适配器）。 |
 | `kkagent-llm` | Anthropic、OpenAI Chat/Responses、Kimi、Google 协议适配和流解析。 |
 | `kkagent-tools` | 内置工具、参数验证、路径策略、Shell 安全和后台任务。 |
 | `kkagent-mcp` | MCP client、OAuth、Skills 和 Hooks。 |
 | `kkagent-tui` | ratatui UI、输入编辑、slash command 和事件渲染。 |
-| `kkagent-acp` | stdio ACP JSON-RPC 桥。 |
+| `kkagent-acp` | stdio ACP v1 JSON-RPC 桥，含 `_kkagent/*` 宿主扩展（宿主工具、宿主存储）。 |
 | `kkagent-oauth` | Kimi device-code、刷新和凭据存储。 |
 | `kkagent-wire` | 会话 journal、记录格式与迁移。 |
 | `kkagent-telemetry` | 本地/云事件 appender 和隐私清洗。 |
@@ -50,9 +50,13 @@ Agent turn 事件（含 Thinking / StatusUpdate / TurnEnd）由 server 扇出到
 2. Session 合并系统指令、`AGENTS.md`、Skill、插件提示和历史上下文（可用 `kkagent --dump-system-prompt` 查看合成结果）。
 3. LLM adapter 按 Provider 方言发起流式请求。
 4. 文本和工具调用增量转换为统一事件，同时写入会话记录。
-5. Tool policy、Plan guard、权限规则和 Hook 依次参与工具决策。
+5. 会话角色的严格工具白名单（如有）先于一切其他检查；随后 Tool policy、Plan guard、权限规则和 Hook 依次参与工具决策。
 6. Scheduler 执行允许的内置/MCP 工具，把结果送回下一次模型调用。
 7. 没有工具调用或达到终止条件时产生最终回答；超预算时可自动 compact。
+
+## 宿主化（嵌入）
+
+`kkagent acp` 可作为被上层程序（例如 supervisor/worker 架构里的 worker）驱动的子进程：宿主在标准 ACP v1 之上，通过 `_meta["kkagent/host"]` 协商能力，用 `_kkagent/*` 反向请求提供**宿主工具**和**宿主存储**。会话、消息、事件的读写统一经过 `SessionStore` / `EventStore` trait，默认适配器仍是本地 SQLite；宿主存储模式把它们转发给宿主，不落本地库。会话角色（系统提示词、工具白名单、扩展开关）由 `role` 模块在会话创建时一次性解析并只允许收窄。详见[扩展机制](extensions.md#宿主扩展_kkagent)与[安全](security.md#宿主与严格角色)。
 
 ## 会话与并发
 

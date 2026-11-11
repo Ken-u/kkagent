@@ -2,23 +2,66 @@
 
 ## ACP
 
-`kkagent acp` 在 stdin/stdout 上运行 newline-delimited JSON-RPC（Agent Client Protocol v1），供编辑器和 IDE 启动为子进程：
+`kkagent acp` 在 stdin/stdout 上运行 newline-delimited JSON-RPC（Agent Client Protocol v1），供编辑器、IDE 与上层宿主进程启动为子进程：
 
 ```bash
 kkagent --config ~/.kkagent/config.toml acp
+kkagent --config ~/.kkagent/config.toml acp --role reviewer --no-plugins
 ```
 
-客户端先调用 `initialize`，返回官方 `agentCapabilities`（`loadSession`、`promptCapabilities.tools`）与 `authMethods`。随后：
+### 标准 ACP v1
 
-- `session/new`（支持 `cwd` 与可选 `initialMessage`）返回 `sessionId` 与 `modes`；
-- `session/load` 按 transcript sessionId 恢复历史会话，并把历史按 `user_message_chunk` / `agent_message_chunk` 回放；
-- `session/prompt` 接受官方 content block 数组（text/image 等），turn 期间通过 `session/update` 通知流式推送 `agent_message_chunk`、`agent_thought_chunk`、`tool_call`、`tool_call_update` 等官方变体，turn 结束返回 `{stopReason}`（`end_turn` / `cancelled` / `max_tokens` …）；
-- 工具批准映射为 agent→client 请求 `session/request_permission`（options：`allow_once` / `allow_always` / `reject_once` / `reject_always`，kind 为 `edit` / `command` / `fetch`），客户端以 `{outcomeKind: "selected", optionId}` 或 `{outcomeKind: "cancelled"}` 响应；
-- 用户提问映射为 `session/request_input`（text 或 select，多选遵循 `multiSelect`），响应为 `{content: [...]}` 或 `{canceled: true}`。
+- `initialize`：返回 `protocolVersion: 1`（客户端请求更高版本时回落到 1）、`agentInfo`、`authMethods` 与 `agentCapabilities`（`loadSession`、`promptCapabilities`、`mcpCapabilities`、`sessionCapabilities.{list,resume,close}`）。`clientInfo` / `clientCapabilities` 会被保存。
+- 会话管理：`session/new`（`cwd`、`mcpServers`、可选 `initialMessage`）返回 `sessionId` 与 `modes: {currentModeId, availableModes}`；`session/load` 恢复历史会话并按 `user_message_chunk` / `agent_message_chunk` 回放；`session/resume` 只重新附着、不回放；`session/list`（可按 `cwd` 过滤）；`session/close` 停止当前工作并释放运行时资源，会话仍可恢复；`session/set_mode`（`modeId`）与 `session/set_model`（`modelId`）。未知会话统一返回 `-32002`。
+- `session/prompt` 接受官方 content block 数组，turn 期间用 `session/update` 流式推送 `agent_message_chunk`、`agent_thought_chunk`、`tool_call`（`title` / `kind` / `status` / `rawInput`）、`tool_call_update`（`status` 为 `in_progress` / `completed` / `failed`，`content` 为 `{type: "content", content}` 包装，另有 `rawOutput`）、`plan`、`current_mode_update`、`session_info_update`、`usage_update` 与 `available_commands_update`。**一个 turn 的所有更新都先于它的 `session/prompt` 响应送达。** 响应为 `{stopReason}`：`end_turn` / `max_tokens` / `max_turn_requests`（本轮用完 `max_steps_per_turn`）/ `refusal` / `cancelled`。
+- 取消：`session/cancel` 是通知（无响应）；正在进行的 `session/prompt` 以 `stopReason: "cancelled"` 结束，并同时放弃它等待中的 `session/request_permission` / `session/request_input`（客户端会收到 `$/cancel_request`）。`$/cancel_request` 作用于 `session/prompt` 时同样走协作取消；作用于其他请求时立即以 `-32800` 应答。在没有 turn 运行时发出的取消不会影响下一个 turn。
+- 工具批准映射为 agent→client 请求 `session/request_permission`：`toolCall`（`toolCallId` / `title` / `kind` / `status` / `rawInput`）、`options`（`optionId` 为 `allow_once` / `allow_always` / `reject_once` / `reject_always`，`name`，`kind`），客户端以 `{outcome: {outcome: "selected", optionId}}` 或 `{outcome: {outcome: "cancelled"}}` 响应。请求没有超时：用户可以慢慢决定，`session/cancel` 或连接断开会终止等待。`cancelled` 不授予任何权限，也不会被记住。
+- 用户提问映射为 `session/request_input`（kkagent 扩展：text 或 select，多选遵循 `multiSelect`），响应为 `{content: [...]}` 或 `{canceled: true}`。
+- Slash command：`available_commands_update` 通告的命令（`/help`、`/status`、`/version` …）可直接写在 prompt 文本里（`/status`），由 kkagent 本地回答，不经过模型。
 
-`model/list`、`session/set_mode`、`session/set_model`、`session/cancel`、`fs/*`、`terminal/*`、`mcp/list`、`commands/list` 与 slash commands 保持可用；旧 `approval/*` 接口保留为兼容层。
+`model/list`、`fs/*`、`terminal/*`、`mcp/list`、`commands/list` 与旧 `approval/*` 接口保持可用。为兼容旧客户端，部分非标准字段仍与标准字段并列输出（`tool_call` 的 `toolKind` / `toolName`、权限选项的 `optionKind`、权限请求顶层的 `kind`），客户端响应里的旧写法 `{outcomeKind: ...}` 也仍被接受。
 
-ACP 进程的 stdout 是协议通道，不能混入普通日志；诊断信息应读取 stderr。当前 [VS Code 扩展](../apps/vscode/README.md) 是一个实现了流式更新与权限/输入请求的 ACP 客户端示例。
+ACP 进程的 stdout 是协议通道，不能混入普通日志；诊断信息应读取 stderr。[VS Code 扩展](../apps/vscode/README.md) 是实现了流式更新、权限/输入请求与取消的 ACP 客户端示例。
+
+### 宿主扩展（`_kkagent/*`）
+
+上层宿主（例如驱动多个 kkagent worker 的 supervisor 进程）可以在同一条 stdio 通道上使用标准 ACP 加一组 `_kkagent/*` 扩展方法。能力在 `initialize` 的 `_meta["kkagent/host"]` 中协商；**不发送该字段的客户端行为与以前完全一致**，agent 也不会在 `_meta` 里回应它。
+
+```jsonc
+// initialize 请求
+{"_meta": {"kkagent/host": {"tools": true, "store": {"sessions": true, "events": true}}}}
+// initialize 响应（只对说了这个扩展的客户端）
+{"_meta": {"kkagent/host": {"tools": true, "store": {"sessions": false, "events": false}}}}
+```
+
+按会话的设置放在 `session/new`、`session/load`、`session/resume` 的 `_meta["kkagent/host"]`；字段拼写错误会被拒绝，而不是静默丢掉一条限制：
+
+| 字段 | 含义 |
+| --- | --- |
+| `role` | 使用 `[agent_roles.NAME]`（只来自用户级可信配置） |
+| `toolAllowlist` | 本会话的额外白名单，与角色、进程上限取**交集**，只能收窄 |
+| `hostTools` | 宿主注入的工具（见下） |
+| `extensions` | `loadProjectInstructions` / `loadHooks` / `loadPlugins`，只能关闭 |
+| `permissionMode` | 初始权限模式 `manual` / `yolo` / `auto` |
+
+**宿主工具。** `hostTools: [{name, description, inputSchema, readOnly, approval, timeoutSecs}]`。宿主必须在 `initialize` 声明 `tools: true`。工具名只能是 `[A-Za-z0-9_-]{1,64}`，不能与内置、插件或 MCP 工具同名（不允许遮蔽），`mcp__` 前缀保留。它们是普通工具：受白名单过滤，出现在模型的工具列表中。模型调用时，kkagent 向宿主发请求 `_kkagent/tool/call`：
+
+```jsonc
+// agent → host
+{"method": "_kkagent/tool/call", "params": {"sessionId": "…", "toolCallId": "…", "name": "host_ping", "input": {…}, "cwd": "…"}}
+// host → agent：字符串、{content: "…"}、content block 数组均可；isError: true 表示失败
+{"result": {"content": "pong"}}
+```
+
+`approval: "host"`（默认）表示宿主自行决定是否执行，kkagent 不再询问；`"ask"` 先走 kkagent 的权限链（`session/request_permission`）。Plan 模式拒绝非只读的宿主工具。取消 turn 时 kkagent 对该请求发 `$/cancel_request`，并发通知 `_kkagent/tool/cancel {sessionId, toolCallId}`；超过 `timeoutSecs`（默认 600）同样取消。
+
+**会话与事件存储。** `[storage] backend = "host"`（或 `kkagent acp --storage host`）让宿主成为会话、消息和事件的唯一存储。宿主必须声明 `store.sessions: true`（否则 `initialize` 报 `-32602`），本地 SQLite 不会写入任何会话内容；宿主没有连接或请求失败时**关闭失败**（turn 报错），绝不回退到本地库。kkagent 通过 agent→client 请求访问存储：
+
+`_kkagent/store/session/{create,get,list,update,delete,fork}`、`_kkagent/store/messages/{append,replace,load}`、`_kkagent/store/toolResult/record`，以及（声明 `store.events` 时）`_kkagent/store/events/{append,since,latestSeq}`。错误码 `-32002` 表示不存在，`-32003` 表示已存在。事件写入失败只记录警告；消息写入失败会让 turn 失败。Rust 宿主可以直接使用 `kkagent_core::storage::handle_store_request` 实现宿主侧。
+
+**会话级 MCP。** 标准 `mcpServers`（stdio / http / sse）在会话创建时启动，随会话结束而停止，不与用户配置或插件中的同名服务器冲突。严格白名单永远不可能放行 `mcp__<server>__*` 时，该服务器根本不会启动。
+
+完整的安全边界见[安全说明](security.md#宿主与严格角色)。
 
 ## MCP Client
 
