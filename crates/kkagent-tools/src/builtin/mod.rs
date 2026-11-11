@@ -20,7 +20,7 @@ pub mod write;
 pub mod write_plan;
 
 pub use ask_user::AskUserQuestionTool;
-pub use bash::{BackgroundShellManager, BashOptions, BashTool};
+pub use bash::{BackgroundCancelReport, BackgroundShellManager, BashOptions, BashTool};
 pub use cron::{CronManager, CronTool};
 pub use edit::EditTool;
 pub use glob::GlobTool;

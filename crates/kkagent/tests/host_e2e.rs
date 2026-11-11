@@ -1444,3 +1444,346 @@ fn the_allowlist_ceiling_reaches_subagents() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Tool review: `yolo` runs without asking, but the host is told and can veto
+// ---------------------------------------------------------------------------
+
+/// Index of the message the agent is currently answering: the newest user
+/// message that is not a harness reminder.
+fn current_prompt_index(request: &Value) -> Option<usize> {
+    request["messages"].as_array().and_then(|messages| {
+        messages.iter().rposition(|message| {
+            message["role"] == "user"
+                && !message["content"]
+                    .to_string()
+                    .starts_with("\"<system-reminder>")
+        })
+    })
+}
+
+/// Text of the message the agent is currently answering.
+fn current_prompt(request: &Value) -> String {
+    current_prompt_index(request)
+        .map(|index| request["messages"][index]["content"].to_string())
+        .unwrap_or_default()
+}
+
+/// A tool result that answers the current prompt (an earlier turn's results
+/// stay in the history and do not count).
+fn fresh_tool_result(request: &Value) -> bool {
+    let Some(index) = current_prompt_index(request) else {
+        return false;
+    };
+    request["messages"].as_array().is_some_and(|messages| {
+        messages[index + 1..]
+            .iter()
+            .any(|message| message["role"] == "tool")
+    })
+}
+
+/// A model that writes `path` on every turn and then reports it is finished.
+fn write_once(path: &'static str) -> impl Fn(&Value, usize) -> Reply + Send + Sync + 'static {
+    move |request, _| {
+        if fresh_tool_result(request) {
+            Reply::text("finished")
+        } else {
+            Reply::tool(
+                "call_w",
+                "Write",
+                json!({"path": path, "content": "written"}),
+            )
+        }
+    }
+}
+
+fn yolo_with_review(mode: &str) -> Value {
+    json!({"_meta": host_meta(json!({
+        "permissionMode": "yolo",
+        "toolReview": {"mode": mode},
+    }))})
+}
+
+#[test]
+fn a_host_can_veto_a_tool_call_that_yolo_would_wave_through() {
+    let llm = MockLlm::start(write_once("veto-target.txt"));
+    let mut acp = Acp::spawn(&llm, "", &[]);
+    let init = acp.initialize(Some(host_meta(json!({"toolReview": true}))));
+    assert_eq!(init["_meta"]["kkagent/host"]["toolReview"], true);
+
+    let allow = Arc::new(AtomicBool::new(false));
+    {
+        let allow = Arc::clone(&allow);
+        acp.on_agent_request(move |method, _| {
+            (method == "_kkagent/tool/review").then(|| {
+                if allow.load(Ordering::SeqCst) {
+                    Ok(json!({"decision": "allow"}))
+                } else {
+                    Ok(json!({"decision": "deny", "reason": "HOST-SAYS-NO"}))
+                }
+            })
+        });
+    }
+    let sid = acp.new_session(yolo_with_review("mutating"));
+    let target = acp.workspace.join("veto-target.txt");
+
+    // The host says no: nothing is written, the model is told why, and yolo
+    // never asked anyone (the review is the only gate it has).
+    assert_eq!(acp.prompt(&sid, "write it")["stopReason"], "end_turn");
+    assert!(!target.exists(), "a vetoed call must not run");
+    assert!(acp.requests_for("session/request_permission").is_empty());
+    let reviews = acp.requests_for("_kkagent/tool/review");
+    assert_eq!(reviews.len(), 1, "{reviews:?}");
+    assert_eq!(reviews[0]["name"], "Write");
+    assert_eq!(reviews[0]["sessionId"], json!(sid));
+    assert_eq!(reviews[0]["toolCallId"], "call_w");
+    assert_eq!(reviews[0]["readOnly"], false);
+    assert_eq!(reviews[0]["input"]["content"], "written");
+    assert_eq!(reviews[0]["cwd"], json!(acp.cwd()));
+    let told = last_tool_result(llm.requests().last().unwrap());
+    assert!(told.contains("HOST-SAYS-NO"), "{told}");
+    assert!(
+        acp.updates_of(&sid, "tool_call_update")
+            .iter()
+            .any(|update| update["status"] == "failed"),
+        "{:?}",
+        acp.updates(&sid)
+    );
+
+    // The host says yes: the same call now runs.
+    allow.store(true, Ordering::SeqCst);
+    assert_eq!(acp.prompt(&sid, "write it again")["stopReason"], "end_turn");
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "written");
+    assert_eq!(acp.requests_for("_kkagent/tool/review").len(), 2);
+}
+
+#[test]
+fn review_modes_pick_which_calls_the_host_sees() {
+    let llm = MockLlm::start(|request, _| {
+        if fresh_tool_result(request) {
+            Reply::text("read it")
+        } else {
+            Reply::tool("call_r", "Read", json!({"path": "AGENTS.md"}))
+        }
+    });
+    let mut acp = Acp::spawn(&llm, "", &[]);
+    acp.initialize(Some(host_meta(json!({"toolReview": true}))));
+    acp.on_agent_request(|method, _| {
+        (method == "_kkagent/tool/review").then(|| Ok(json!({"decision": "allow"})))
+    });
+
+    // `mutating` leaves a read-only tool alone…
+    let mutating = acp.new_session(yolo_with_review("mutating"));
+    assert_eq!(acp.prompt(&mutating, "read")["stopReason"], "end_turn");
+    assert!(acp.requests_for("_kkagent/tool/review").is_empty());
+    assert!(last_tool_result(llm.requests().last().unwrap()).contains(INSTRUCTIONS_MARK));
+
+    // …`all` shows it to the host as read-only…
+    let all = acp.new_session(yolo_with_review("all"));
+    assert_eq!(acp.prompt(&all, "read")["stopReason"], "end_turn");
+    let reviews = acp.requests_for("_kkagent/tool/review");
+    assert_eq!(reviews.len(), 1, "{reviews:?}");
+    assert_eq!(reviews[0]["name"], "Read");
+    assert_eq!(reviews[0]["readOnly"], true);
+
+    // …and a session that asked for no review is never bothered.
+    let off = acp.new_session(json!({"_meta": host_meta(json!({"permissionMode": "yolo"}))}));
+    assert_eq!(acp.prompt(&off, "read")["stopReason"], "end_turn");
+    assert_eq!(acp.requests_for("_kkagent/tool/review").len(), 1);
+}
+
+#[test]
+fn a_review_needs_the_capability_and_a_failing_host_means_no() {
+    let llm = MockLlm::start(write_once("never-written.txt"));
+
+    // Without `toolReview` at initialize the session is refused outright.
+    let mut acp = Acp::spawn(&llm, "", &[]);
+    acp.initialize(None);
+    let refused = acp
+        .call(
+            "session/new",
+            json!({"cwd": acp.cwd(), "_meta": host_meta(json!({"toolReview": {"mode": "all"}}))}),
+        )
+        .unwrap_err();
+    assert!(
+        refused["message"].as_str().unwrap().contains("toolReview"),
+        "{refused}"
+    );
+    drop(acp);
+
+    // A host that errors on the review denies the call (fail closed).
+    let mut acp = Acp::spawn(&llm, "", &[]);
+    acp.initialize(Some(host_meta(json!({"toolReview": true}))));
+    acp.on_agent_request(|method, _| {
+        (method == "_kkagent/tool/review").then(|| Err((-32000, "reviewer crashed".to_string())))
+    });
+    let sid = acp.new_session(yolo_with_review("all"));
+    assert_eq!(acp.prompt(&sid, "write")["stopReason"], "end_turn");
+    assert!(!acp.workspace.join("never-written.txt").exists());
+    let told = last_tool_result(llm.requests().last().unwrap());
+    assert!(told.contains("did not approve"), "{told}");
+}
+
+#[test]
+fn the_review_follows_a_tool_call_into_a_subagent() {
+    // The main model delegates; the subagent then tries to write. The host
+    // lets the delegation through but vetoes the write, and the subagent
+    // cannot dodge the review by being a different agent.
+    let llm = MockLlm::start(|request, _| {
+        let subagent = current_prompt(request).contains("SUBTASK");
+        match (subagent, fresh_tool_result(request)) {
+            (true, false) => Reply::tool(
+                "sub_w",
+                "Write",
+                json!({"path": "sub-target.txt", "content": "from the subagent"}),
+            ),
+            (true, true) => Reply::text("subagent done"),
+            (false, false) => Reply::tool(
+                "call_agent",
+                "Agent",
+                json!({
+                    "description": "write a file",
+                    "prompt": "SUBTASK: write the file",
+                    "profile": "general",
+                }),
+            ),
+            (false, true) => Reply::text("main done"),
+        }
+    });
+    let mut acp = Acp::spawn(&llm, "", &[]);
+    acp.initialize(Some(host_meta(json!({"toolReview": true}))));
+    let veto_writes = Arc::new(AtomicBool::new(true));
+    {
+        let veto_writes = Arc::clone(&veto_writes);
+        acp.on_agent_request(move |method, params| {
+            (method == "_kkagent/tool/review").then(|| {
+                if params["name"] == "Write" && veto_writes.load(Ordering::SeqCst) {
+                    Ok(json!({"decision": "deny", "reason": "SUBAGENT-WRITE-VETOED"}))
+                } else {
+                    Ok(json!({"decision": "allow"}))
+                }
+            })
+        });
+    }
+    let sid = acp.new_session(yolo_with_review("all"));
+    let target = acp.workspace.join("sub-target.txt");
+
+    assert_eq!(acp.prompt(&sid, "delegate it")["stopReason"], "end_turn");
+    let reviewed: Vec<String> = acp
+        .requests_for("_kkagent/tool/review")
+        .iter()
+        .filter_map(|review| review["name"].as_str().map(str::to_string))
+        .collect();
+    assert!(reviewed.contains(&"Agent".to_string()), "{reviewed:?}");
+    assert!(
+        reviewed.contains(&"Write".to_string()),
+        "the subagent's Write reached the host: {reviewed:?}\n{}",
+        acp.logs()
+    );
+    assert!(!target.exists(), "the vetoed subagent write must not run");
+
+    // Control: with the host allowing everything the subagent does write,
+    // so the veto above is what stopped it.
+    veto_writes.store(false, Ordering::SeqCst);
+    assert_eq!(acp.prompt(&sid, "delegate it")["stopReason"], "end_turn");
+    assert_eq!(
+        std::fs::read_to_string(&target).unwrap(),
+        "from the subagent"
+    );
+}
+
+#[test]
+fn a_result_is_reported_in_both_content_and_raw_output() {
+    let llm = MockLlm::start(|request, _| {
+        if has_tool_result(request) {
+            Reply::text("done")
+        } else {
+            Reply::tool("call_h", "host_echo", json!({"message": "hi"}))
+        }
+    });
+    let mut acp = Acp::spawn(&llm, "", &[]);
+    acp.initialize(Some(host_meta(json!({"tools": true}))));
+    acp.on_agent_request(|method, params| {
+        (method == "_kkagent/tool/call")
+            .then(|| Ok(json!({"content": format!("echo:{}", params["input"]["message"])})))
+    });
+    let sid = acp.new_session(json!({"_meta": host_meta(json!({
+        "hostTools": [{"name": "host_echo", "readOnly": true}]
+    }))}));
+    acp.prompt(&sid, "echo");
+    let finished: Vec<_> = acp
+        .updates_of(&sid, "tool_call_update")
+        .into_iter()
+        .filter(|update| update["status"] == "completed")
+        .collect();
+    assert_eq!(finished.len(), 1);
+    let text = finished[0]["content"][0]["content"]["text"]
+        .as_str()
+        .unwrap();
+    assert_eq!(text, "echo:\"hi\"");
+    assert_eq!(
+        finished[0]["rawOutput"], text,
+        "one result, two identical places"
+    );
+    // A call still running carries no result at all.
+    let running: Vec<_> = acp
+        .updates_of(&sid, "tool_call_update")
+        .into_iter()
+        .filter(|update| update["status"] == "in_progress")
+        .collect();
+    assert!(running
+        .iter()
+        .all(|update| update.get("rawOutput").is_none()));
+}
+
+#[test]
+fn session_load_can_skip_replaying_history_for_a_host_that_keeps_its_own() {
+    let llm = MockLlm::start(|_, _| Reply::text("remembered"));
+    let mut acp = Acp::spawn(&llm, "", &[]);
+    acp.initialize(None);
+    let sid = acp.new_session(json!({}));
+    acp.prompt(&sid, "first question");
+    let cwd = acp.cwd();
+
+    let history_chunks = |acp: &Acp, from: usize| {
+        acp.notifications[from..]
+            .iter()
+            .filter(|n| n["method"] == "session/update")
+            .filter(|n| {
+                matches!(
+                    n["params"]["update"]["sessionUpdate"].as_str(),
+                    Some("user_message_chunk" | "agent_message_chunk")
+                )
+            })
+            .count()
+    };
+
+    // `replay: false`: the session is loaded, but no history is sent.
+    acp.ok("session/close", json!({"sessionId": sid}));
+    let mark = acp.notifications.len();
+    acp.ok(
+        "session/load",
+        json!({
+            "sessionId": sid, "cwd": cwd, "mcpServers": [],
+            "_meta": host_meta(json!({"replay": false})),
+        }),
+    );
+    assert_eq!(history_chunks(&acp, mark), 0, "no history is replayed");
+    assert_eq!(
+        acp.prompt(&sid, "and now?")["stopReason"],
+        "end_turn",
+        "the loaded session works"
+    );
+
+    // Default: the stored conversation is replayed.
+    acp.ok("session/close", json!({"sessionId": sid}));
+    let mark = acp.notifications.len();
+    acp.ok(
+        "session/load",
+        json!({"sessionId": sid, "cwd": cwd, "mcpServers": []}),
+    );
+    assert!(
+        history_chunks(&acp, mark) >= 2,
+        "history is replayed by default"
+    );
+}

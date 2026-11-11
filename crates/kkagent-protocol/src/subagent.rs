@@ -57,6 +57,11 @@ pub struct SubagentConfig {
     /// also bind delegated work. Defaults to on (older persisted configs).
     #[serde(default = "default_true")]
     pub load_project_instructions: bool,
+    /// Host review gate inherited from the launching session. Stamped by the
+    /// launch closure like `tool_allowlist`, so delegated work is reviewed as
+    /// well. Never serialized: a revived persisted config has no gate.
+    #[serde(skip)]
+    pub tool_gate: Option<crate::ToolGateHandle>,
 }
 
 fn default_true() -> bool {
@@ -607,6 +612,7 @@ mod tests {
             parent_model: None,
             tool_allowlist: None,
             load_project_instructions: true,
+            tool_gate: None,
         };
         stamp_child_depth(&mut config, 0, 2).unwrap();
         assert_eq!(config.depth, 1);
@@ -662,6 +668,7 @@ mod tests {
                 parent_model: None,
                 tool_allowlist: None,
                 load_project_instructions: true,
+                tool_gate: None,
             })
             .await
             .unwrap();
@@ -699,6 +706,7 @@ mod tests {
             parent_model: None,
             tool_allowlist: None,
             load_project_instructions: true,
+            tool_gate: None,
         };
         {
             let manager = SubagentManager::new_persistent(2, &path).unwrap();

@@ -11,8 +11,9 @@ pub use http::{
     serve_listener_with_backend as serve_http_listener_with_backend,
     serve_listener_with_backend_and_security as serve_http_listener_with_backend_and_security,
     serve_listener_with_backend_security_and_persistence as serve_http_listener_with_backend_security_and_persistence,
-    serve_with_backend as serve_http_with_backend, DurableHttpStore, DurableTurn, HttpBackend,
-    HttpImageInput, HttpSecurityOptions, HttpState, MemoryBackend,
+    serve_with_backend as serve_http_with_backend, DurableHttpStore, DurableTurn, FsError,
+    FsErrorKind, HttpBackend, HttpImageInput, HttpSecurityOptions, HttpState, MemoryBackend,
+    SessionCreateClaim,
 };
 pub use server::RpcServer;
 pub use transport::*;

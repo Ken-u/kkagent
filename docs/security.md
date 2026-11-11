@@ -21,7 +21,7 @@ kkagent 能读取和修改文件、运行 Shell、访问网络和调用第三方
 
 - `auto` 是无人值守档：除 AskUserQuestion（直接 Deny）外批准一切，包括敏感文件访问；它的硬底线是**用户显式 deny 规则**与 shell 危险命令检测，不是交互确认。
 - `yolo` 在敏感文件（`~/.ssh`、`.env` 等）和 `.git` 控制路径上**仍然会 Ask**——比 `auto` 更晚的全批，使这两类风险保留人工确认。
-- `Read` / `ReadMediaFile` 读敏感路径在 manual/yolo 下同样触发 Ask（敏感检查先于只读白名单）。
+- `Read` / `ReadMediaFile` 读敏感路径在 manual/yolo 下同样触发 Ask（敏感检查先于只读白名单）。`ReadMediaFile` 与 `Read` 共用同一套路径守卫：`path_guard_mode = "strict"` 时只能读工作目录与 `additional_dirs`，符号链接按真实路径判定。
 - `permission_mode = "auto"` 与 `sandbox` `disabled` 组合会在启动时输出告警并记入审计日志：该组合只在受控容器/VM 内合理。
 
 `--disable-sandbox` 只覆盖当前 kkagent 进程，会完整关闭 Bash 的 OS 文件/网络隔离、Git 环境隔离和资源/进程限制。它不会关闭工具审批或危险命令检测，也不能覆盖通过 `--connect` 使用的远端 Server。只应在外层已有可信容器或 VM 隔离时使用。
@@ -67,6 +67,8 @@ WebSocket query token 是兼容机制，可能被访问日志记录；普通 HTT
 - **在工具调用层强制，多层兜底。** 工具注册表只构造白名单内的工具（模型看不到其他工具）；agent loop 在权限链之前再检查一次，所以模型凭空调用白名单外的工具既不执行也不会弹出审批；子 Agent、`Task` 的各条路径、插件外部子 Agent、goal judge 继承同一上限；`acp:` 外部 Agent 模型别名与动态加载（`SelectTools`）在严格白名单下不可用。
 - **不经过工具层的旁路也被关闭。** 严格白名单的会话拒绝 ACP 的 `fs/*` 与 `terminal/*`（`-32601`）；不可能被白名单放行的 `mcp__<server>__*` 会话级 MCP 服务器不会启动，名字为空或重复的服务器会被拒绝。
 - **宿主工具不遮蔽已有工具。** 宿主注入的工具不能使用 `mcp__`、`acp:` 前缀，也不能与已注册的内置、插件或 MCP 工具同名（同名的宿主工具被忽略，绝不替换已有工具）；它们同样受白名单过滤。`approval = "host"` 表示由宿主自己负责授权与执行，把不可信宿主接入前应清楚这一点：宿主工具的副作用不受 kkagent 权限链和沙箱约束。
+- **`yolo` 下也能逐次否决。** `yolo` / `auto` 不产生审批，宿主默认看不到调用。会话参数 `toolReview: {mode: "mutating" | "all"}`（需要宿主在 `initialize` 声明 `toolReview`）让每个被审查的调用在**执行前**发 `_kkagent/tool/review` 给宿主，宿主可否决。审查位于白名单、Hook 与参数校验之后，因此模式无法绕过；**关闭失败**：无能力、出错、超时、回复异常都按否决，子 Agent 沿用同一审查，不能被逐次审查的路径（`acp:` 外部模型、外部 ACP 子 Agent、goal judge 工具循环）在审查会话中被禁用。
+- **固定白名单不需要渐进披露。** 严格白名单下默认直接加载白名单内的全部工具（`[tools] dynamically_loaded_tools` 省略时），模型不用也不能靠 `SelectTools` 扩大范围；显式设置会覆盖这一默认。
 - **取消不授予权限。** `session/request_permission` 的 `cancelled` 结果、`session/cancel`、客户端断开都按拒绝处理，不会被记住为「始终允许」。
 - **宿主存储关闭失败。** `[storage] backend = "host"` 下宿主不可用时 turn 失败，不会写入本地 SQLite；宿主本身需要保护它保存的对话内容。
 - **扩展开关只能关。** `[extensions]`、`--no-project-instructions` / `--no-hooks` / `--no-plugins` 与会话参数 `extensions` 取最严的组合；让不可信仓库的 `AGENTS.md`、Hook 或插件不参与会话，应关闭对应开关。

@@ -48,12 +48,15 @@ pub async fn run_external_subagent(
     match spec.transport.as_str() {
         // An external ACP agent brings its own tools, sandbox and MCP servers
         // that kkagent cannot constrain, so it is refused outright when the
-        // launching session runs under a tool allowlist.
-        "acp" if sub_cfg.tool_allowlist.is_some() => anyhow::bail!(
-            "external ACP subagent `{}` is not available: the session runs under a strict \
-             tool allowlist that an external agent process cannot be bound by",
-            spec.name
-        ),
+        // launching session runs under a tool allowlist or a host tool review.
+        "acp" if sub_cfg.tool_allowlist.is_some() || sub_cfg.tool_gate.is_some() => {
+            anyhow::bail!(
+                "external ACP subagent `{}` is not available: the session runs under a strict \
+                 tool allowlist or host tool review that an external agent process cannot be \
+                 bound by",
+                spec.name
+            )
+        }
         "acp" => run_acp_subagent(spec, sub_cfg, mirror).await,
         "internal" => {
             crate::internal_subagent::run_internal_subagent(spec, sub_cfg, mirror, ctx).await
@@ -365,6 +368,7 @@ mod tests {
             parent_model: None,
             tool_allowlist: None,
             load_project_instructions: true,
+            tool_gate: None,
         }
     }
 
@@ -411,6 +415,31 @@ mod tests {
             .block_on(async { run_external_subagent(&s, cfg, None, ctx).await })
             .unwrap_err();
         assert!(err.to_string().contains("strict tool allowlist"), "{err}");
+    }
+
+    #[test]
+    fn acp_transport_is_refused_under_a_host_tool_review() {
+        struct AllowAll;
+        impl kkagent_protocol::ToolGate for AllowAll {
+            fn reviews(&self, _name: &str, _read_only: bool) -> bool {
+                true
+            }
+            fn review<'a>(
+                &'a self,
+                _call: &'a kkagent_protocol::ToolCallReview,
+            ) -> kkagent_protocol::GateFuture<'a> {
+                Box::pin(async { kkagent_protocol::GateVerdict::Allow })
+            }
+        }
+        let s = spec();
+        let mut cfg = test_config("do the thing");
+        cfg.tool_gate = Some(kkagent_protocol::ToolGateHandle(Arc::new(AllowAll)));
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let ctx = ExternalRunContext::detached(Arc::new(kkagent_config::AppConfig::default()));
+        let err = rt
+            .block_on(async { run_external_subagent(&s, cfg, None, ctx).await })
+            .unwrap_err();
+        assert!(err.to_string().contains("host tool review"), "{err}");
     }
 
     #[test]

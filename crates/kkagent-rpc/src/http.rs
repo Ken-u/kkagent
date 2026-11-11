@@ -14,7 +14,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::process::Child;
 use tokio::sync::{broadcast, Mutex};
 
@@ -24,6 +24,23 @@ const MAX_TERMINAL_OUTPUT_BYTES: usize = 1024 * 1024;
 const EVENT_HISTORY_CAPACITY: usize = 2048;
 const DEFAULT_TASK_MAX_ATTEMPTS: u32 = 3;
 const MULTIMODAL_PROMPT_PREFIX: &str = "kkagent:multimodal:v1\n";
+/// How long a `POST /sessions` idempotency key stays replayable.
+const SESSION_CREATE_RETENTION_SECS: i64 = 7 * 24 * 3600;
+/// A claim without a result younger than this belongs to a call still running.
+const SESSION_CREATE_IN_PROGRESS_SECS: i64 = 30;
+
+/// Answer of [`DurableHttpStore::begin_session_create`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum SessionCreateClaim {
+    /// First use of the key: go ahead and create the session.
+    Fresh,
+    /// The key already produced this response.
+    Replay(Value),
+    /// Another call with the key is still creating the session.
+    InProgress,
+    /// The key was used with different parameters.
+    Conflict,
+}
 
 #[derive(Debug, Clone)]
 pub struct DurableTurn {
@@ -129,10 +146,143 @@ impl DurableHttpStore {
                 ON durable_turns(session_id, idempotency_key)
                 WHERE idempotency_key IS NOT NULL;
              CREATE INDEX IF NOT EXISTS idx_durable_turns_recovery
-                ON durable_turns(state, lease_expires_at, created_at);",
+                ON durable_turns(state, lease_expires_at, created_at);
+             CREATE TABLE IF NOT EXISTS http_session_creates (
+                idempotency_key TEXT PRIMARY KEY,
+                request_hash TEXT NOT NULL,
+                response_json TEXT,
+                claimed_at INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS http_server_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+             );",
+            )?;
+            // Idempotency keys only need to outlive a client's retry window.
+            conn.execute(
+                "DELETE FROM http_session_creates WHERE claimed_at < ?1",
+                params![chrono::Utc::now().timestamp() - SESSION_CREATE_RETENTION_SECS],
             )?;
         }
         Ok(Self { connection })
+    }
+
+    /// Identity of this server's data: created with the database, kept across
+    /// restarts. A different value means the host is talking to another
+    /// server (or a wiped database), a different `boot_id` only to a restart.
+    pub fn instance_id(&self) -> anyhow::Result<String> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("durable HTTP store lock poisoned"))?;
+        let existing: Option<String> = connection
+            .query_row(
+                "SELECT value FROM http_server_meta WHERE key = 'instance_id'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(existing) = existing {
+            return Ok(existing);
+        }
+        let created = uuid::Uuid::new_v4().to_string();
+        connection.execute(
+            "INSERT OR IGNORE INTO http_server_meta(key, value) VALUES ('instance_id', ?1)",
+            params![created],
+        )?;
+        Ok(connection.query_row(
+            "SELECT value FROM http_server_meta WHERE key = 'instance_id'",
+            [],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// Claim `key` for one `POST /sessions` call. See [`SessionCreateClaim`].
+    pub fn begin_session_create(
+        &self,
+        key: &str,
+        request_hash: &str,
+    ) -> anyhow::Result<SessionCreateClaim> {
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("durable HTTP store lock poisoned"))?;
+        let transaction = connection.transaction()?;
+        let now = chrono::Utc::now().timestamp();
+        let existing: Option<(String, Option<String>, i64)> = transaction
+            .query_row(
+                "SELECT request_hash, response_json, claimed_at FROM http_session_creates
+                 WHERE idempotency_key = ?1",
+                params![key],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        let claim = match existing {
+            None => {
+                transaction.execute(
+                    "INSERT INTO http_session_creates(idempotency_key, request_hash, response_json, claimed_at)
+                     VALUES (?1, ?2, NULL, ?3)",
+                    params![key, request_hash, now],
+                )?;
+                SessionCreateClaim::Fresh
+            }
+            Some((hash, _, _)) if hash != request_hash => SessionCreateClaim::Conflict,
+            Some((_, Some(response), _)) => {
+                SessionCreateClaim::Replay(serde_json::from_str(&response)?)
+            }
+            Some((_, None, claimed_at)) if now - claimed_at < SESSION_CREATE_IN_PROGRESS_SECS => {
+                SessionCreateClaim::InProgress
+            }
+            // An attempt that never finished (the process died): take it over.
+            Some((_, None, _)) => {
+                transaction.execute(
+                    "UPDATE http_session_creates SET claimed_at = ?2 WHERE idempotency_key = ?1",
+                    params![key, now],
+                )?;
+                SessionCreateClaim::Fresh
+            }
+        };
+        transaction.commit()?;
+        Ok(claim)
+    }
+
+    /// Record the session a claimed key produced, so retries replay it.
+    pub fn complete_session_create(&self, key: &str, response: &Value) -> anyhow::Result<()> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("durable HTTP store lock poisoned"))?;
+        connection.execute(
+            "UPDATE http_session_creates SET response_json = ?2 WHERE idempotency_key = ?1",
+            params![key, serde_json::to_string(response)?],
+        )?;
+        Ok(())
+    }
+
+    /// Release a claim whose creation failed, so the client may retry.
+    pub fn abandon_session_create(&self, key: &str) -> anyhow::Result<()> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("durable HTTP store lock poisoned"))?;
+        connection.execute(
+            "DELETE FROM http_session_creates WHERE idempotency_key = ?1 AND response_json IS NULL",
+            params![key],
+        )?;
+        Ok(())
+    }
+
+    /// Forget a key outright (its session no longer exists).
+    pub fn forget_session_create(&self, key: &str) -> anyhow::Result<()> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("durable HTTP store lock poisoned"))?;
+        connection.execute(
+            "DELETE FROM http_session_creates WHERE idempotency_key = ?1",
+            params![key],
+        )?;
+        Ok(())
     }
 
     fn append_event(&self, event: Value) -> anyhow::Result<Value> {
@@ -616,14 +766,30 @@ pub trait HttpBackend: Send + Sync {
         let _ = (method, params);
         Err("plugins are not supported by this backend".into())
     }
-    async fn cancel_turn(&self, _task_id: &str) -> Result<Value, String> {
+    /// Cancel a turn. With `cancel_background` the session's background
+    /// commands are cancelled too; the reply reports what actually stopped.
+    async fn cancel_turn(&self, _task_id: &str, _cancel_background: bool) -> Result<Value, String> {
         Err("turn cancellation is not supported by this backend".into())
     }
-    async fn fs_read(&self, path: &str) -> Result<String, String>;
-    async fn fs_write(&self, path: &str, content: &str) -> Result<(), String>;
-    async fn list_files(&self, _path: &str) -> Result<Value, String> {
-        Err("file listing is not supported by this backend".into())
+    /// Turn a client-supplied path into the absolute path the file API may
+    /// touch (`for_write` for `POST /fs`). Backends that confine the API to
+    /// trusted workspaces refuse everything else here, with the matching
+    /// [`FsErrorKind`]. The default trusts the path as given.
+    async fn fs_resolve(
+        &self,
+        path: &str,
+        _for_write: bool,
+    ) -> Result<std::path::PathBuf, FsError> {
+        if path.trim().is_empty() {
+            return Err(FsError::bad_request("path must not be empty"));
+        }
+        Ok(std::path::PathBuf::from(path))
     }
+    /// A request reached the HTTP layer; lets the host process know the
+    /// server is in use (idle shutdown must not fire under live clients).
+    fn note_http_activity(&self) {}
+    /// A WebSocket event stream opened (`true`) or closed (`false`).
+    fn ws_connection_changed(&self, _opened: bool) {}
     async fn search(&self, query: &str) -> Value;
     async fn workspace_info(&self) -> Value;
     async fn list_questions(&self) -> Value {
@@ -896,15 +1062,6 @@ impl HttpBackend for MemoryBackend {
             json!({"ok": true, "approval_id": id, "decision": decision, "feedback": feedback, "selected_label": selected_label, "scope": scope}),
         )
     }
-    async fn fs_read(&self, path: &str) -> Result<String, String> {
-        std::fs::read_to_string(path).map_err(|e| e.to_string())
-    }
-    async fn fs_write(&self, path: &str, content: &str) -> Result<(), String> {
-        if let Some(parent) = std::path::Path::new(path).parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        std::fs::write(path, content).map_err(|e| e.to_string())
-    }
     async fn search(&self, query: &str) -> Value {
         json!({"query": query, "hits": []})
     }
@@ -1032,18 +1189,30 @@ impl HttpState {
             .as_ref()
             .and_then(|store| store.latest_event_sequence().ok())
             .unwrap_or(0);
+        let boot_id = uuid::Uuid::new_v4().to_string();
+        // Without a database there is nothing that outlives the process, so
+        // the instance is just this boot.
+        let instance_id = persistence
+            .as_ref()
+            .and_then(|store| store.instance_id().ok())
+            .unwrap_or_else(|| boot_id.clone());
         let state = Self {
             backend,
             meta: json!({
                 "name": "kkagent",
                 "version": env!("CARGO_PKG_VERSION"),
                 "api": ["v1"],
+                "instance_id": instance_id,
+                "boot_id": boot_id,
+                "started_at": chrono::Utc::now().to_rfc3339(),
                 "capabilities": [
                     "sessions","messages","approvals","ws","tools","tasks","skills",
                     "files","fs","workspaces","config","modelCatalog","search",
                     "terminals","questions","prompts","snapshot","eventReplay","turnStatus",
                     "health","readiness","metrics","durableEvents","durableTasks","idempotency",
-                    "fork","btw","timeline"
+                    "fork","btw","timeline",
+                    "fsRange","fsBinary","filesPaging","sessionIdempotency","instanceId",
+                    "taskFinished","approvalSessionId","backgroundCleanupReport"
                 ],
             }),
             events,
@@ -1126,12 +1295,15 @@ impl HttpState {
         };
         let event_type = event.get("type").and_then(Value::as_str).unwrap_or("");
         let sequence = event.get("event_seq").and_then(Value::as_u64).unwrap_or(0);
+        // `turn_start` / `turn_end` bracket one model round and can repeat
+        // inside a task; only `task_finished` is the task's final state.
         let state = match event_type {
             "turn_start" => Some("running"),
             "turn_end" => Some("completed"),
             "approval_requested" => Some("waiting_approval"),
             "question_asked" => Some("waiting_question"),
             "error" => Some("failed"),
+            "task_finished" => event.get("state").and_then(Value::as_str),
             _ => None,
         };
         if let Ok(mut turns) = self.turn_states.lock() {
@@ -1309,6 +1481,7 @@ async fn auth_middleware(
     next: Next,
 ) -> impl IntoResponse {
     state.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
+    state.backend.note_http_activity();
     let path = request.uri().path().to_string();
     let method = request.method().to_string();
     let request_id = request
@@ -1659,18 +1832,43 @@ async fn turn_status(
         .ok_or(StatusCode::NOT_FOUND)
 }
 
+#[derive(Deserialize, Default)]
+struct CancelTurnQuery {
+    #[serde(default)]
+    token: Option<String>,
+    /// Also cancel the session's background commands.
+    #[serde(default)]
+    cancel_background: Option<bool>,
+}
+
 async fn cancel_turn(
     State(state): State<HttpState>,
     Path(task_id): Path<String>,
-    Query(query): Query<AuthQuery>,
+    Query(query): Query<CancelTurnQuery>,
 ) -> Result<Json<Value>, StatusCode> {
-    check_auth(&state, &query)?;
+    check_auth(
+        &state,
+        &AuthQuery {
+            token: query.token.clone(),
+            ..Default::default()
+        },
+    )?;
     let result = state
         .backend
-        .cancel_turn(&task_id)
+        .cancel_turn(&task_id, query.cancel_background.unwrap_or(false))
         .await
-        .map_err(|_| StatusCode::CONFLICT)?;
-    state.publish(json!({"type": "turn_cancelled", "task_id": task_id}));
+        .map_err(|error| {
+            if error.to_ascii_lowercase().contains("not found") {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::CONFLICT
+            }
+        })?;
+    state.publish(json!({
+        "type": "turn_cancelled",
+        "task_id": task_id,
+        "session_id": result.get("session_id").cloned().unwrap_or(Value::Null),
+    }));
     Ok(Json(result))
 }
 
@@ -1688,21 +1886,96 @@ struct CreateSessionBody {
     title: Option<String>,
 }
 
+/// `Idempotency-Key` of a request: `None` when absent, `400` when unusable.
+fn idempotency_key_of(headers: &HeaderMap) -> Result<Option<String>, StatusCode> {
+    let Some(value) = headers.get("idempotency-key") else {
+        return Ok(None);
+    };
+    let key = value.to_str().map_err(|_| StatusCode::BAD_REQUEST)?.trim();
+    if key.is_empty() || key.len() > 256 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    Ok(Some(key.to_string()))
+}
+
+fn with_replayed(mut response: Value, replayed: bool) -> Value {
+    if let Some(object) = response.as_object_mut() {
+        object.insert("replayed".into(), json!(replayed));
+    }
+    response
+}
+
+/// `POST /sessions`. With an `Idempotency-Key` the same request returns the
+/// session the first call created (`replayed: true`) instead of a second one;
+/// the same key with other parameters is a `409`.
 async fn create_session(
     State(state): State<HttpState>,
     Query(q): Query<AuthQuery>,
+    headers: HeaderMap,
     Json(body): Json<CreateSessionBody>,
 ) -> Result<Json<Value>, StatusCode> {
     check_auth(&state, &q)?;
-    let sess = state
+    let claimed_key = match (idempotency_key_of(&headers)?, &state.persistence) {
+        (Some(key), Some(store)) => {
+            use sha2::{Digest, Sha256};
+            let request_hash = hex::encode(Sha256::digest(
+                json!([body.workspace, body.title]).to_string().as_bytes(),
+            ));
+            let mut claim = store
+                .begin_session_create(&key, &request_hash)
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            // A replay of a session that has since been deleted would hand
+            // back a dead id: make a new one instead.
+            if let SessionCreateClaim::Replay(previous) = &claim {
+                let alive = match previous.get("session_id").and_then(Value::as_str) {
+                    Some(id) => state.backend.get_session(id).await.is_some(),
+                    None => false,
+                };
+                if !alive {
+                    let _ = store.forget_session_create(&key);
+                    claim = store
+                        .begin_session_create(&key, &request_hash)
+                        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                }
+            }
+            match claim {
+                SessionCreateClaim::Fresh => Some(key),
+                SessionCreateClaim::Replay(previous) => {
+                    return Ok(Json(with_replayed(previous, true)));
+                }
+                SessionCreateClaim::InProgress | SessionCreateClaim::Conflict => {
+                    return Err(StatusCode::CONFLICT);
+                }
+            }
+        }
+        _ => None,
+    };
+    let sess = match state
         .backend
         .create_session(body.workspace, body.title)
         .await
-        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    {
+        Ok(sess) => sess,
+        Err(_) => {
+            if let (Some(key), Some(store)) = (&claimed_key, &state.persistence) {
+                let _ = store.abandon_session_create(key);
+            }
+            return Err(StatusCode::BAD_REQUEST);
+        }
+    };
+    if let (Some(key), Some(store)) = (&claimed_key, &state.persistence) {
+        if let Err(error) = store.complete_session_create(key, &sess) {
+            tracing::warn!("could not record the idempotent session create: {error}");
+        }
+    }
     if let Some(id) = sess.get("session_id").and_then(|v| v.as_str()) {
         state.publish(json!({"type": "session.created", "session_id": id}));
     }
-    Ok(Json(sess))
+    Ok(Json(if claimed_key.is_some() {
+        with_replayed(sess, false)
+    } else {
+        sess
+    }))
 }
 
 async fn get_session(
@@ -2119,10 +2392,21 @@ async fn post_approval(
             body.scope.clone(),
         )
         .await
-        .map_err(|_| StatusCode::BAD_REQUEST)?;
+        .map_err(|error| {
+            // An approval that timed out, was answered, or never existed is
+            // "not found", not a malformed request.
+            let lower = error.to_ascii_lowercase();
+            if lower.contains("no longer pending") || lower.contains("not found") {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::BAD_REQUEST
+            }
+        })?;
+    // `session_id` lets a client subscribed to one session see the answer.
     state.publish(json!({
         "type": "approval",
         "approval_id": id,
+        "session_id": v.get("session_id").cloned().unwrap_or(Value::Null),
         "decision": body.decision,
         "feedback": body.feedback,
         "selected_label": body.selected_label,
@@ -2355,9 +2639,323 @@ struct FsBody {
     content: Option<String>,
 }
 
+/// Largest slice of a file one `GET /api/v1/fs` call returns. A larger file is
+/// read in ranges (`offset` + `limit`).
+pub const FS_READ_MAX_BYTES: u64 = 4 * 1024 * 1024;
+/// Default and largest page of `GET /api/v1/files`.
+pub const FILES_DEFAULT_LIMIT: usize = 200;
+pub const FILES_MAX_LIMIT: usize = 1000;
+
+/// What went wrong in a file-system API call; each kind maps to one HTTP
+/// status so clients never have to parse a `200` body to find a failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FsErrorKind {
+    /// Malformed request: empty path, a directory where a file was expected, a
+    /// bad range or encoding. `400`.
+    BadRequest,
+    /// The path is outside the trusted workspaces or the OS refused. `403`.
+    Forbidden,
+    /// Nothing at that path. `404`.
+    NotFound,
+    /// The file is larger than one response may carry. `413`.
+    TooLarge,
+    /// The bytes are not valid UTF-8 and `encoding=utf8` was asked for. `415`.
+    NotText,
+    /// Anything else. `500`.
+    Internal,
+}
+
+#[derive(Debug, Clone)]
+pub struct FsError {
+    pub kind: FsErrorKind,
+    pub message: String,
+}
+
+impl FsError {
+    pub fn new(kind: FsErrorKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+        }
+    }
+
+    pub fn bad_request(message: impl Into<String>) -> Self {
+        Self::new(FsErrorKind::BadRequest, message)
+    }
+
+    pub fn forbidden(message: impl Into<String>) -> Self {
+        Self::new(FsErrorKind::Forbidden, message)
+    }
+
+    pub fn not_found(message: impl Into<String>) -> Self {
+        Self::new(FsErrorKind::NotFound, message)
+    }
+
+    pub fn from_io(error: &std::io::Error) -> Self {
+        let kind = match error.kind() {
+            std::io::ErrorKind::NotFound => FsErrorKind::NotFound,
+            std::io::ErrorKind::PermissionDenied => FsErrorKind::Forbidden,
+            std::io::ErrorKind::InvalidInput => FsErrorKind::BadRequest,
+            _ => FsErrorKind::Internal,
+        };
+        Self::new(kind, error.to_string())
+    }
+
+    pub fn status(&self) -> StatusCode {
+        match self.kind {
+            FsErrorKind::BadRequest => StatusCode::BAD_REQUEST,
+            FsErrorKind::Forbidden => StatusCode::FORBIDDEN,
+            FsErrorKind::NotFound => StatusCode::NOT_FOUND,
+            FsErrorKind::TooLarge => StatusCode::PAYLOAD_TOO_LARGE,
+            FsErrorKind::NotText => StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            FsErrorKind::Internal => StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
+
+    fn code(&self) -> &'static str {
+        match self.kind {
+            FsErrorKind::BadRequest => "bad_request",
+            FsErrorKind::Forbidden => "forbidden",
+            FsErrorKind::NotFound => "not_found",
+            FsErrorKind::TooLarge => "too_large",
+            FsErrorKind::NotText => "not_text",
+            FsErrorKind::Internal => "internal",
+        }
+    }
+}
+
+impl std::fmt::Display for FsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl IntoResponse for FsError {
+    fn into_response(self) -> axum::response::Response {
+        (
+            self.status(),
+            Json(json!({"error": self.message, "code": self.code()})),
+        )
+            .into_response()
+    }
+}
+
+fn rfc3339_of(time: std::io::Result<SystemTime>) -> Value {
+    time.ok()
+        .map(|time| json!(chrono::DateTime::<chrono::Utc>::from(time).to_rfc3339()))
+        .unwrap_or(Value::Null)
+}
+
+/// How the bytes of `GET /api/v1/fs` are put in the JSON body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FsEncoding {
+    Utf8,
+    Base64,
+}
+
+impl FsEncoding {
+    fn parse(value: Option<&str>) -> Result<Self, FsError> {
+        match value.map(str::trim).filter(|value| !value.is_empty()) {
+            None | Some("utf8") | Some("utf-8") => Ok(Self::Utf8),
+            Some("base64") => Ok(Self::Base64),
+            Some(other) => Err(FsError::bad_request(format!(
+                "unsupported encoding {other:?}; use utf8 or base64"
+            ))),
+        }
+    }
+}
+
+/// Read `limit` bytes of `path` from `offset`.
+///
+/// Without `limit` the whole rest of the file is returned, and a file that
+/// does not fit in [`FS_READ_MAX_BYTES`] is refused (`413`) rather than cut
+/// short. With `limit` (capped at [`FS_READ_MAX_BYTES`]) a partial read is
+/// normal and `truncated` / `next_offset` say where to continue.
+pub async fn read_file_range(
+    path: &std::path::Path,
+    offset: u64,
+    limit: Option<u64>,
+    encoding: FsEncoding,
+) -> Result<Value, FsError> {
+    let metadata = tokio::fs::metadata(path)
+        .await
+        .map_err(|error| FsError::from_io(&error))?;
+    if metadata.is_dir() {
+        return Err(FsError::bad_request(
+            "path is a directory; list it with GET /api/v1/files",
+        ));
+    }
+    let size = metadata.len();
+    if offset > size {
+        return Err(FsError::bad_request(format!(
+            "offset {offset} is past the end of the file ({size} bytes)"
+        )));
+    }
+    let remaining = size - offset;
+    let wanted = match limit {
+        Some(limit) => limit.min(FS_READ_MAX_BYTES),
+        None if remaining > FS_READ_MAX_BYTES => {
+            return Err(FsError::new(
+                FsErrorKind::TooLarge,
+                format!(
+                    "file has {remaining} bytes from offset {offset}, over the \
+                     {FS_READ_MAX_BYTES}-byte limit of one read; pass offset and limit"
+                ),
+            ));
+        }
+        None => remaining,
+    };
+    let to_read = wanted.min(remaining);
+    let mut file = tokio::fs::File::open(path)
+        .await
+        .map_err(|error| FsError::from_io(&error))?;
+    if offset > 0 {
+        file.seek(std::io::SeekFrom::Start(offset))
+            .await
+            .map_err(|error| FsError::from_io(&error))?;
+    }
+    let mut bytes = Vec::with_capacity(to_read as usize);
+    file.take(to_read)
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(|error| FsError::from_io(&error))?;
+
+    let more = offset + (bytes.len() as u64) < size;
+    let (content, encoding_name, bytes_read) = match encoding {
+        FsEncoding::Base64 => {
+            use base64::Engine as _;
+            (
+                base64::engine::general_purpose::STANDARD.encode(&bytes),
+                "base64",
+                bytes.len() as u64,
+            )
+        }
+        FsEncoding::Utf8 => {
+            let usable = match std::str::from_utf8(&bytes) {
+                Ok(_) => bytes.len(),
+                // A range may end inside a multi-byte character: stop before
+                // it and let `next_offset` point at it.
+                Err(error) if error.error_len().is_none() && more && error.valid_up_to() > 0 => {
+                    error.valid_up_to()
+                }
+                Err(_) => {
+                    return Err(FsError::new(
+                        FsErrorKind::NotText,
+                        "the requested bytes are not valid UTF-8 text; ask for encoding=base64",
+                    ));
+                }
+            };
+            bytes.truncate(usable);
+            let text = String::from_utf8(bytes).map_err(|_| {
+                FsError::new(
+                    FsErrorKind::NotText,
+                    "the requested bytes are not valid UTF-8 text",
+                )
+            })?;
+            (text, "utf8", usable as u64)
+        }
+    };
+    let truncated = offset + bytes_read < size;
+    Ok(json!({
+        "encoding": encoding_name,
+        "content": content,
+        "offset": offset,
+        "bytes_read": bytes_read,
+        "size": size,
+        "modified_at": rfc3339_of(metadata.modified()),
+        "truncated": truncated,
+        "next_offset": if truncated { json!(offset + bytes_read) } else { Value::Null },
+    }))
+}
+
+/// One page of a directory, sorted by name. `cursor` is the last name of the
+/// previous page; entries are returned with size and modification time.
+pub async fn list_directory_page(
+    path: &std::path::Path,
+    cursor: Option<&str>,
+    limit: usize,
+) -> Result<Value, FsError> {
+    let metadata = tokio::fs::metadata(path)
+        .await
+        .map_err(|error| FsError::from_io(&error))?;
+    if !metadata.is_dir() {
+        return Err(FsError::bad_request("path is not a directory"));
+    }
+    let limit = limit.clamp(1, FILES_MAX_LIMIT);
+    let mut directory = tokio::fs::read_dir(path)
+        .await
+        .map_err(|error| FsError::from_io(&error))?;
+    let mut names: Vec<std::ffi::OsString> = Vec::new();
+    while let Some(entry) = directory
+        .next_entry()
+        .await
+        .map_err(|error| FsError::from_io(&error))?
+    {
+        names.push(entry.file_name());
+    }
+    names.sort();
+    let total = names.len();
+    let remaining: Vec<&std::ffi::OsString> = names
+        .iter()
+        .filter(|name| cursor.is_none_or(|cursor| name.to_string_lossy().as_ref() > cursor))
+        .collect();
+    let truncated = remaining.len() > limit;
+    let mut entries = Vec::new();
+    for name in remaining.into_iter().take(limit) {
+        let entry_path = path.join(name);
+        // The entry may vanish between listing and stat: skip it quietly.
+        let Ok(entry_metadata) = tokio::fs::symlink_metadata(&entry_path).await else {
+            continue;
+        };
+        let file_type = entry_metadata.file_type();
+        let kind = if file_type.is_symlink() {
+            "symlink"
+        } else if file_type.is_dir() {
+            "dir"
+        } else if file_type.is_file() {
+            "file"
+        } else {
+            "other"
+        };
+        entries.push(json!({
+            "name": name.to_string_lossy(),
+            "path": entry_path.display().to_string(),
+            "is_dir": file_type.is_dir(),
+            "type": kind,
+            "size": if file_type.is_file() { json!(entry_metadata.len()) } else { Value::Null },
+            "modified_at": rfc3339_of(entry_metadata.modified()),
+        }));
+    }
+    let next_cursor = if truncated {
+        entries
+            .last()
+            .and_then(|entry| entry.get("name"))
+            .cloned()
+            .unwrap_or(Value::Null)
+    } else {
+        Value::Null
+    };
+    Ok(json!({
+        "entries": entries,
+        "count": entries.len(),
+        "total": total,
+        "truncated": truncated,
+        "next_cursor": next_cursor,
+    }))
+}
+
 #[derive(Deserialize)]
 struct FsPathQuery {
     path: String,
+    /// First byte to read (default 0).
+    #[serde(default)]
+    offset: Option<u64>,
+    /// Bytes to read (default: to the end, refused above the per-call cap).
+    #[serde(default)]
+    limit: Option<u64>,
+    /// `utf8` (default) or `base64` for binary files.
+    #[serde(default)]
+    encoding: Option<String>,
     #[serde(default)]
     token: Option<String>,
 }
@@ -2366,59 +2964,104 @@ struct FsPathQuery {
 struct FilesQuery {
     #[serde(default)]
     path: Option<String>,
+    /// Entries per page (default 200, at most 1000).
+    #[serde(default)]
+    limit: Option<usize>,
+    /// Last name of the previous page (`next_cursor`).
+    #[serde(default)]
+    cursor: Option<String>,
     #[serde(default)]
     token: Option<String>,
 }
 
 async fn fs_read(
     State(state): State<HttpState>,
-    Query(path_q): Query<FsPathQuery>,
-) -> Result<Json<Value>, StatusCode> {
+    Query(query): Query<FsPathQuery>,
+) -> Result<Json<Value>, FsErrorOrStatus> {
     check_auth(
         &state,
         &AuthQuery {
-            token: path_q.token.clone(),
+            token: query.token.clone(),
             ..Default::default()
         },
     )?;
-    match state.backend.fs_read(&path_q.path).await {
-        Ok(content) => Ok(Json(json!({"path": path_q.path, "content": content}))),
-        Err(e) => Ok(Json(json!({"error": e}))),
-    }
+    let encoding = FsEncoding::parse(query.encoding.as_deref())?;
+    let resolved = state.backend.fs_resolve(&query.path, false).await?;
+    let mut body =
+        read_file_range(&resolved, query.offset.unwrap_or(0), query.limit, encoding).await?;
+    body["path"] = json!(query.path);
+    Ok(Json(body))
 }
 
 async fn fs_write(
     State(state): State<HttpState>,
     Query(q): Query<AuthQuery>,
     Json(body): Json<FsBody>,
-) -> Result<Json<Value>, StatusCode> {
+) -> Result<Json<Value>, FsErrorOrStatus> {
     check_auth(&state, &q)?;
     let content = body.content.unwrap_or_default();
-    state
-        .backend
-        .fs_write(&body.path, &content)
+    let resolved = state.backend.fs_resolve(&body.path, true).await?;
+    if let Some(parent) = resolved.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|error| FsError::from_io(&error))?;
+    }
+    tokio::fs::write(&resolved, content)
         .await
-        .map_err(|_| StatusCode::BAD_REQUEST)?;
+        .map_err(|error| FsError::from_io(&error))?;
     Ok(Json(json!({"ok": true, "path": body.path})))
 }
 
 async fn files_list(
     State(state): State<HttpState>,
     Query(query): Query<FilesQuery>,
-) -> Result<Json<Value>, StatusCode> {
+) -> Result<Json<Value>, FsErrorOrStatus> {
     check_auth(
         &state,
         &AuthQuery {
-            token: query.token,
+            token: query.token.clone(),
             ..Default::default()
         },
     )?;
-    state
-        .backend
-        .list_files(query.path.as_deref().unwrap_or("."))
-        .await
-        .map(Json)
-        .map_err(|_| StatusCode::BAD_REQUEST)
+    let requested = query.path.as_deref().unwrap_or(".");
+    let resolved = state.backend.fs_resolve(requested, false).await?;
+    let mut body = list_directory_page(
+        &resolved,
+        query.cursor.as_deref(),
+        query.limit.unwrap_or(FILES_DEFAULT_LIMIT),
+    )
+    .await?;
+    body["path"] = json!(requested);
+    Ok(Json(body))
+}
+
+/// Handler failure that is either a bare status (auth) or a file-system
+/// error with a JSON body.
+#[derive(Debug)]
+enum FsErrorOrStatus {
+    Status(StatusCode),
+    Fs(FsError),
+}
+
+impl From<StatusCode> for FsErrorOrStatus {
+    fn from(status: StatusCode) -> Self {
+        Self::Status(status)
+    }
+}
+
+impl From<FsError> for FsErrorOrStatus {
+    fn from(error: FsError) -> Self {
+        Self::Fs(error)
+    }
+}
+
+impl IntoResponse for FsErrorOrStatus {
+    fn into_response(self) -> axum::response::Response {
+        match self {
+            Self::Status(status) => status.into_response(),
+            Self::Fs(error) => error.into_response(),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -3053,12 +3696,29 @@ async fn ws_handler(
     Ok(ws.on_upgrade(move |socket| ws_loop(socket, state, query.since, query.session_id)))
 }
 
+/// Tells the backend a WebSocket stream is open for as long as it lives.
+struct WsConnection(Arc<dyn HttpBackend>);
+
+impl WsConnection {
+    fn open(backend: &Arc<dyn HttpBackend>) -> Self {
+        backend.ws_connection_changed(true);
+        Self(backend.clone())
+    }
+}
+
+impl Drop for WsConnection {
+    fn drop(&mut self) {
+        self.0.ws_connection_changed(false);
+    }
+}
+
 async fn ws_loop(
     mut socket: WebSocket,
     state: HttpState,
     since: u64,
     mut session_filter: Option<String>,
 ) {
+    let _connection = WsConnection::open(&state.backend);
     let mut rx = state.events.subscribe();
     let latest = state.event_sequence.load(Ordering::SeqCst);
     let _ = socket
@@ -3959,5 +4619,419 @@ mod security_tests {
         assert_eq!(result["ok"], true);
         assert_eq!(result["restored"], true);
         assert_eq!(result["messages"].as_array().unwrap().len(), 1);
+    }
+
+    fn scratch_dir() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("kkagent-fs-api-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[tokio::test]
+    async fn file_reads_are_ranged_bounded_and_binary_safe() {
+        let dir = scratch_dir();
+        let text = dir.join("note.txt");
+        std::fs::write(&text, "héllo wörld").unwrap();
+
+        // Whole file: text, size and mtime come back with it.
+        let whole = read_file_range(&text, 0, None, FsEncoding::Utf8)
+            .await
+            .unwrap();
+        assert_eq!(whole["content"], "héllo wörld");
+        assert_eq!(whole["encoding"], "utf8");
+        assert_eq!(whole["size"], 13);
+        assert_eq!(whole["truncated"], false);
+        assert_eq!(whole["next_offset"], Value::Null);
+        assert!(whole["modified_at"].as_str().is_some());
+
+        // A range that would end inside "é" (bytes 1..3) stops before it and
+        // says where to continue.
+        let cut = read_file_range(&text, 0, Some(2), FsEncoding::Utf8)
+            .await
+            .unwrap();
+        assert_eq!(cut["content"], "h");
+        assert_eq!(cut["bytes_read"], 1);
+        assert_eq!(cut["truncated"], true);
+        assert_eq!(cut["next_offset"], 1);
+        let rest = read_file_range(&text, 1, None, FsEncoding::Utf8)
+            .await
+            .unwrap();
+        assert_eq!(rest["content"], "éllo wörld");
+
+        // `limit=0` is a stat.
+        let stat = read_file_range(&text, 0, Some(0), FsEncoding::Utf8)
+            .await
+            .unwrap();
+        assert_eq!(stat["content"], "");
+        assert_eq!(stat["size"], 13);
+        assert_eq!(stat["truncated"], true);
+
+        // Binary data: refused as text (415), served as base64.
+        let blob = dir.join("blob.bin");
+        std::fs::write(&blob, [0u8, 159, 146, 150, 255]).unwrap();
+        let refused = read_file_range(&blob, 0, None, FsEncoding::Utf8)
+            .await
+            .unwrap_err();
+        assert_eq!(refused.kind, FsErrorKind::NotText);
+        assert_eq!(refused.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        let encoded = read_file_range(&blob, 1, Some(3), FsEncoding::Base64)
+            .await
+            .unwrap();
+        assert_eq!(encoded["encoding"], "base64");
+        assert_eq!(encoded["content"], "n5KW");
+        assert_eq!(encoded["bytes_read"], 3);
+        assert_eq!(encoded["next_offset"], 4);
+
+        // A file over the per-call cap is refused whole, readable in ranges.
+        let big = dir.join("big.bin");
+        let file = std::fs::File::create(&big).unwrap();
+        file.set_len(FS_READ_MAX_BYTES + 10).unwrap();
+        let too_large = read_file_range(&big, 0, None, FsEncoding::Base64)
+            .await
+            .unwrap_err();
+        assert_eq!(too_large.kind, FsErrorKind::TooLarge);
+        assert_eq!(too_large.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let tail = read_file_range(&big, FS_READ_MAX_BYTES, None, FsEncoding::Base64)
+            .await
+            .unwrap();
+        assert_eq!(tail["bytes_read"], 10);
+        assert_eq!(tail["truncated"], false);
+        let capped = read_file_range(&big, 0, Some(u64::MAX), FsEncoding::Base64)
+            .await
+            .unwrap();
+        assert_eq!(capped["bytes_read"], FS_READ_MAX_BYTES);
+        assert_eq!(capped["truncated"], true);
+
+        // Errors carry the status that describes them.
+        let missing = read_file_range(&dir.join("nope"), 0, None, FsEncoding::Utf8)
+            .await
+            .unwrap_err();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+        let directory = read_file_range(&dir, 0, None, FsEncoding::Utf8)
+            .await
+            .unwrap_err();
+        assert_eq!(directory.status(), StatusCode::BAD_REQUEST);
+        let past_end = read_file_range(&text, 99, None, FsEncoding::Utf8)
+            .await
+            .unwrap_err();
+        assert_eq!(past_end.status(), StatusCode::BAD_REQUEST);
+        assert!(FsEncoding::parse(Some("latin1")).is_err());
+        assert_eq!(FsEncoding::parse(None).unwrap(), FsEncoding::Utf8);
+        assert_eq!(
+            FsEncoding::parse(Some("base64")).unwrap(),
+            FsEncoding::Base64
+        );
+        assert_eq!(FsError::forbidden("no").status(), StatusCode::FORBIDDEN);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn fs_endpoint_answers_errors_with_their_status_not_200() {
+        let state = HttpState::new(None);
+        let dir = scratch_dir();
+        let missing = fs_read(
+            State(state.clone()),
+            Query(FsPathQuery {
+                path: dir.join("absent.txt").display().to_string(),
+                offset: None,
+                limit: None,
+                encoding: None,
+                token: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(missing.into_response().status(), StatusCode::NOT_FOUND);
+
+        let empty = fs_read(
+            State(state.clone()),
+            Query(FsPathQuery {
+                path: " ".into(),
+                offset: None,
+                limit: None,
+                encoding: None,
+                token: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(empty.into_response().status(), StatusCode::BAD_REQUEST);
+
+        let bad_encoding = fs_read(
+            State(state.clone()),
+            Query(FsPathQuery {
+                path: dir.display().to_string(),
+                offset: None,
+                limit: None,
+                encoding: Some("rot13".into()),
+                token: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            bad_encoding.into_response().status(),
+            StatusCode::BAD_REQUEST
+        );
+
+        let file = dir.join("ok.txt");
+        std::fs::write(&file, "fine").unwrap();
+        let Json(read) = fs_read(
+            State(state.clone()),
+            Query(FsPathQuery {
+                path: file.display().to_string(),
+                offset: None,
+                limit: None,
+                encoding: None,
+                token: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(read["content"], "fine");
+        assert_eq!(read["path"], file.display().to_string());
+
+        let not_a_dir = files_list(
+            State(state),
+            Query(FilesQuery {
+                path: Some(file.display().to_string()),
+                limit: None,
+                cursor: None,
+                token: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(not_a_dir.into_response().status(), StatusCode::BAD_REQUEST);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn directory_listing_pages_with_size_and_mtime() {
+        let dir = scratch_dir();
+        for index in 0..5 {
+            std::fs::write(dir.join(format!("f{index}.txt")), vec![b'x'; index + 1]).unwrap();
+        }
+        std::fs::create_dir(dir.join("sub")).unwrap();
+
+        let first = list_directory_page(&dir, None, 4).await.unwrap();
+        assert_eq!(first["total"], 6);
+        assert_eq!(first["count"], 4);
+        assert_eq!(first["truncated"], true);
+        assert_eq!(first["next_cursor"], "f3.txt");
+        let entries = first["entries"].as_array().unwrap();
+        assert_eq!(entries[0]["name"], "f0.txt");
+        assert_eq!(entries[0]["size"], 1);
+        assert_eq!(entries[0]["type"], "file");
+        assert_eq!(entries[0]["is_dir"], false);
+        assert!(entries[0]["modified_at"].as_str().is_some());
+
+        let second = list_directory_page(&dir, Some("f3.txt"), 4).await.unwrap();
+        let names: Vec<&str> = second["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["f4.txt", "sub"]);
+        assert_eq!(second["truncated"], false);
+        assert_eq!(second["next_cursor"], Value::Null);
+        let directory = &second["entries"][1];
+        assert_eq!(directory["type"], "dir");
+        assert_eq!(directory["is_dir"], true);
+        assert_eq!(directory["size"], Value::Null);
+
+        // The page size is bounded, and a file is not a directory.
+        let clamped = list_directory_page(&dir, None, usize::MAX).await.unwrap();
+        assert_eq!(clamped["count"], 6);
+        let error = list_directory_page(&dir.join("f0.txt"), None, 10)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, FsErrorKind::BadRequest);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn session_creation_is_idempotent_per_key() {
+        let backend = Arc::new(MemoryBackend::default());
+        let state = HttpState::with_backend_security_and_persistence(
+            backend.clone(),
+            None,
+            HttpSecurityOptions::default(),
+            Some(DurableHttpStore::open_in_memory().unwrap()),
+        );
+        let create = |key: Option<&'static str>, title: &'static str| {
+            let state = state.clone();
+            async move {
+                let mut headers = HeaderMap::new();
+                if let Some(key) = key {
+                    headers.insert("idempotency-key", key.parse().unwrap());
+                }
+                create_session(
+                    State(state),
+                    Query(AuthQuery::default()),
+                    headers,
+                    Json(CreateSessionBody {
+                        workspace: Some(".".into()),
+                        title: Some(title.into()),
+                    }),
+                )
+                .await
+            }
+        };
+
+        let Json(first) = create(Some("job-1"), "review").await.unwrap();
+        assert_eq!(first["replayed"], false);
+        let Json(retry) = create(Some("job-1"), "review").await.unwrap();
+        assert_eq!(retry["replayed"], true);
+        assert_eq!(retry["session_id"], first["session_id"]);
+        assert_eq!(
+            backend.list_sessions().await["sessions"]
+                .as_array()
+                .map(Vec::len),
+            Some(1),
+            "the retry did not create a second session"
+        );
+
+        // Same key, other parameters: conflict.
+        assert_eq!(
+            create(Some("job-1"), "other title").await.unwrap_err(),
+            StatusCode::CONFLICT
+        );
+        // A different key, or no key at all, is a new session.
+        let Json(second) = create(Some("job-2"), "review").await.unwrap();
+        assert_ne!(second["session_id"], first["session_id"]);
+        let Json(plain) = create(None, "review").await.unwrap();
+        assert!(plain.get("replayed").is_none());
+        assert_ne!(plain["session_id"], first["session_id"]);
+
+        // A key whose session is gone makes a fresh one rather than echoing
+        // a dead id.
+        backend
+            .delete_session(first["session_id"].as_str().unwrap())
+            .await
+            .unwrap();
+        let Json(again) = create(Some("job-1"), "review").await.unwrap();
+        assert_eq!(again["replayed"], false);
+        assert_ne!(again["session_id"], first["session_id"]);
+
+        // Keys must be usable.
+        let mut headers = HeaderMap::new();
+        headers.insert("idempotency-key", "x".repeat(300).parse().unwrap());
+        assert_eq!(idempotency_key_of(&headers), Err(StatusCode::BAD_REQUEST));
+    }
+
+    #[test]
+    fn session_create_claims_cover_in_flight_failed_and_stale_attempts() {
+        let store = DurableHttpStore::open_in_memory().unwrap();
+        assert_eq!(
+            store.begin_session_create("k", "h").unwrap(),
+            SessionCreateClaim::Fresh
+        );
+        // Still creating: a concurrent twin must wait, not create another.
+        assert_eq!(
+            store.begin_session_create("k", "h").unwrap(),
+            SessionCreateClaim::InProgress
+        );
+        assert_eq!(
+            store.begin_session_create("k", "other").unwrap(),
+            SessionCreateClaim::Conflict
+        );
+        // A failed creation releases the key.
+        store.abandon_session_create("k").unwrap();
+        assert_eq!(
+            store.begin_session_create("k", "h").unwrap(),
+            SessionCreateClaim::Fresh
+        );
+        store
+            .complete_session_create("k", &json!({"session_id": "s1"}))
+            .unwrap();
+        assert_eq!(
+            store.begin_session_create("k", "h").unwrap(),
+            SessionCreateClaim::Replay(json!({"session_id": "s1"}))
+        );
+        // `abandon` never discards a finished creation.
+        store.abandon_session_create("k").unwrap();
+        assert!(matches!(
+            store.begin_session_create("k", "h").unwrap(),
+            SessionCreateClaim::Replay(_)
+        ));
+
+        // An attempt abandoned by a dead process is taken over after a while.
+        store.begin_session_create("stale", "h").unwrap();
+        {
+            let connection = store.connection.lock().unwrap();
+            connection
+                .execute(
+                    "UPDATE http_session_creates SET claimed_at = claimed_at - 3600
+                     WHERE idempotency_key = 'stale'",
+                    [],
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            store.begin_session_create("stale", "h").unwrap(),
+            SessionCreateClaim::Fresh
+        );
+    }
+
+    #[test]
+    fn meta_tells_a_restart_from_a_replaced_server() {
+        let path = temporary_database();
+        let boot = |path: &std::path::Path| {
+            let state = HttpState::with_backend_security_and_persistence(
+                Arc::new(MemoryBackend::default()),
+                None,
+                HttpSecurityOptions::default(),
+                Some(DurableHttpStore::open(path).unwrap()),
+            );
+            (
+                state.meta["instance_id"].as_str().unwrap().to_string(),
+                state.meta["boot_id"].as_str().unwrap().to_string(),
+            )
+        };
+        let (instance_a, boot_a) = boot(&path);
+        let (instance_b, boot_b) = boot(&path);
+        assert_eq!(instance_a, instance_b, "same database, same server");
+        assert_ne!(boot_a, boot_b, "every start is a new boot");
+        let other = temporary_database();
+        let (instance_c, _) = boot(&other);
+        assert_ne!(instance_a, instance_c, "another database, another server");
+
+        let ephemeral = HttpState::new(None);
+        assert_eq!(ephemeral.meta["instance_id"], ephemeral.meta["boot_id"]);
+        for capability in [
+            "fsRange",
+            "filesPaging",
+            "sessionIdempotency",
+            "taskFinished",
+        ] {
+            assert!(
+                ephemeral.meta["capabilities"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|value| value == capability),
+                "{capability}"
+            );
+        }
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(other);
+    }
+
+    #[test]
+    fn task_finished_is_the_final_task_state() {
+        let state = HttpState::new(None);
+        state.publish(json!({"type": "turn_start", "session_id": "s"}));
+        state.publish(json!({"type": "turn_end", "session_id": "s"}));
+        // `turn_end` is only the end of a model round; goals keep going.
+        state.publish(json!({"type": "turn_start", "session_id": "s"}));
+        assert_eq!(state.turn_states.lock().unwrap()["s"]["state"], "running");
+        state.publish(json!({
+            "type": "task_finished", "session_id": "s", "task_id": "t", "state": "failed",
+        }));
+        assert_eq!(state.turn_states.lock().unwrap()["s"]["state"], "failed");
+        let events = state.events_since(0, Some("s"), 10);
+        assert_eq!(events.last().unwrap()["type"], "task_finished");
     }
 }

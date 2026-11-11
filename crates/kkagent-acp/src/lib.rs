@@ -709,7 +709,16 @@ impl AcpServer {
             "session/load" | "session/resume" => {
                 // `load` replays the history to the client; `resume` only
                 // reattaches (the client already has it).
-                let replay = req.method == "session/load";
+                // A host that keeps its own copy of the conversation can ask
+                // for no replay: `_meta["kkagent/host"].replay = false`.
+                let replay = req.method == "session/load"
+                    && req
+                        .params
+                        .get("_meta")
+                        .and_then(|meta| meta.get(kkagent_protocol::host::HOST_META_KEY))
+                        .and_then(|host| host.get("replay"))
+                        .and_then(Value::as_bool)
+                        .unwrap_or(true);
                 let transcript_id = req
                     .params
                     .get("sessionId")
@@ -1359,11 +1368,10 @@ impl AcpServer {
                     }),
                     title: None,
                     kind: None,
-                    content: if output.is_empty() {
-                        vec![]
-                    } else {
-                        vec![ToolCallContent::text(output)]
-                    },
+                    // One shape for every finished call: the result text is in
+                    // `rawOutput` and in `content[0]` alike, empty or not, so
+                    // a host never has to guess which one to read.
+                    content: vec![ToolCallContent::text(output)],
                     raw_input: None,
                     raw_output: Some(Value::String(output.to_string())),
                 }
@@ -2789,6 +2797,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn load_can_skip_the_replay_for_a_host_that_keeps_its_own_history() {
+        let mut host = LifecycleHost::new(false);
+        host.history = vec![json!({"role": "user", "blocks": [{"type": "text", "text": "hi"}]})];
+        let host = Arc::new(host);
+        let server = AcpServer::with_host(Arc::clone(&host) as Arc<dyn AcpHost>);
+        let (bridge, mut outgoing) = test_bridge();
+        server.attach_client_bridge(bridge).await;
+
+        let loaded = server
+            .handle(rpc(
+                "session/load",
+                json!({
+                    "sessionId": "s1", "cwd": "/tmp",
+                    "_meta": {"kkagent/host": {"replay": false}},
+                }),
+            ))
+            .await;
+        assert!(loaded.error.is_none(), "{:?}", loaded.error);
+        assert_eq!(loaded.result.unwrap()["sessionId"], "s1");
+        assert!(
+            outgoing.try_recv().is_err(),
+            "replay:false must not send history"
+        );
+        // The session is loaded all the same.
+        assert_eq!(*host.loaded.lock().await, vec!["s1"]);
+
+        // `replay: true` and the default still replay.
+        for meta in [json!({"kkagent/host": {"replay": true}}), json!({})] {
+            server
+                .handle(rpc(
+                    "session/load",
+                    json!({"sessionId": "s1", "cwd": "/tmp", "_meta": meta}),
+                ))
+                .await;
+            let replay: Value = serde_json::from_str(&outgoing.recv().await.unwrap()).unwrap();
+            assert_eq!(
+                replay["params"]["update"]["sessionUpdate"],
+                "user_message_chunk"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn unknown_sessions_answer_with_resource_not_found() {
         let host = Arc::new(LifecycleHost::new(false));
         let server = AcpServer::with_host(Arc::clone(&host) as Arc<dyn AcpHost>);
@@ -3339,6 +3390,20 @@ mod tests {
             "boom"
         );
         assert_eq!(result["params"]["update"]["rawOutput"], "boom");
+
+        // An empty result has the same shape: both fields, never one or the other.
+        next(json!({
+            "type": "tool_result", "session_id": sid, "tool_call_id": "c2",
+            "tool_name": "bash", "output": "", "is_error": false,
+        }))
+        .await;
+        let empty: Value = serde_json::from_str(&outgoing.recv().await.unwrap()).unwrap();
+        assert_eq!(empty["params"]["update"]["status"], "completed");
+        assert_eq!(empty["params"]["update"]["rawOutput"], "");
+        assert_eq!(
+            empty["params"]["update"]["content"][0]["content"]["text"],
+            ""
+        );
 
         next(json!({"type": "plan_mode_changed", "session_id": sid, "enabled": true})).await;
         let mode: Value = serde_json::from_str(&outgoing.recv().await.unwrap()).unwrap();

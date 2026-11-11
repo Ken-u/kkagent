@@ -41,9 +41,9 @@ curl --fail --silent \
 
 `health` 是存活探针，`ready` 会检查持久化并在显式内存降级时返回 503。`metrics` 输出 Prometheus 文本。完整端到端检查还应创建临时 Session、向低成本模型发送短 prompt，并确认事件序号连续；避免高频执行实网 LLM 检查。
 
-Transcript DB 默认打不开时进程启动失败，防止静默丢会话。只有明确接受非持久化运行时才设置 `KKAGENT_ALLOW_IN_MEMORY_TRANSCRIPTS=1`；此时 health 会标记 `durable=false`，ready 保持 503。
+Transcript DB 默认打不开时进程启动失败，防止静默丢会话，错误信息会列出处理办法。数据库位置可用 `[storage] transcripts_path` 或 `KKAGENT_TRANSCRIPTS_DB` 指定：SQLite 打开前会读取路径所有上级目录的元数据，严格的 `sandbox-exec` 配置不放行这些目录时会报 `unable to open database file`，把数据库放到进程可到达的位置即可。只有明确接受非持久化运行时才设置 `[storage] allow_in_memory = true`（或 `KKAGENT_ALLOW_IN_MEMORY_TRANSCRIPTS=1`）；此时 health 会标记 `durable=false`，ready 保持 503。
 
-独立 Server 重启后会把未完成 turn 和后台 Agent 标记为恢复态并重新领取；每项最多执行三次。客户端提交消息时应带 `Idempotency-Key`，网络超时后使用同一 key 和相同 body 重试，避免创建第二项任务。审批默认 15 分钟超时，重启时处于待审批状态的 turn 会从已持久化 transcript 重新运行，而不会自动沿用旧批准。
+独立 Server 重启后会把未完成 turn 和后台 Agent 标记为恢复态并重新领取；每项最多执行三次。客户端提交消息时应带 `Idempotency-Key`，网络超时后使用同一 key 和相同 body 重试，避免创建第二项任务。审批默认 15 分钟超时（`[background] approval_timeout_s`，`0` = 不限时），重启时处于待审批状态的 turn 会从已持久化 transcript 重新运行，而不会自动沿用旧批准；但审批 ID 在同一持久化任务内是稳定的，恢复后同一任务再次请求同一个审批时 ID 不变，宿主已经给出的答复仍然可用。创建会话也支持 `Idempotency-Key`，`GET /api/v1/meta` 的 `instance_id` / `boot_id` 用来区分“同一个 server 重启”和“换了 server”。HTTP 任务的最终状态以 `task_finished` 事件为准，`turn_start` / `turn_end` 只是模型步骤边界（见 [Server API](server-api.md)）。
 
 ## 备份与恢复
 
@@ -74,7 +74,7 @@ Linux 生产主机需安装 Bubblewrap 并允许非特权 user namespace；否�
 | `kkagent server status --json` | JSON：`alive`、`active_turns`、`client_count`、`uptime_secs`、`pid`。 |
 | `kkagent server stop` | 优雅停止；有 active turn 时拒绝。 |
 
-空闲策略见配置 `[server].idle_timeout_secs`（默认 1800 秒；`0` 表示永不自动退出）。`./upload.sh` 在本地 CI 前会检测并停止无 turn 的 server；有 turn 时会报错退出。
+空闲策略见配置 `[server].idle_timeout_secs`（默认 1800 秒；`0` 表示永不自动退出）。进行中的 turn、待决审批/提问、运行中的后台任务默认都会阻止空闲退出（`idle_hold_for_turns` / `idle_hold_for_approvals` / `idle_hold_for_background_tasks`），连接中的本地客户端、打开的 HTTP 事件流与每个 HTTP 请求也都算活动。`./upload.sh` 在本地 CI 前会检测并停止无 turn 的 server；有 turn 时会报错退出。
 
 ## 容量与清理
 

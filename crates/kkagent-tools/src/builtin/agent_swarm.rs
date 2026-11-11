@@ -406,6 +406,7 @@ impl AgentSwarmTool {
                     parent_model: ctx.model_alias.clone(),
                     tool_allowlist: None,
                     load_project_instructions: true,
+                    tool_gate: None,
                 },
                 agent_id: spec.agent_id.clone(),
                 retries: 0,
@@ -968,6 +969,7 @@ mod tests {
             parent_model: None,
             tool_allowlist: None,
             load_project_instructions: true,
+            tool_gate: None,
         };
         auto.manager.spawn(config).await.unwrap();
         auto.manager

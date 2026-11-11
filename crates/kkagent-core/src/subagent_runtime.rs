@@ -113,6 +113,10 @@ fn run_subagent_mirrored_boxed(
         if let Some(allowlist) = &sub_cfg.tool_allowlist {
             tools.set_allowlist(allowlist);
         }
+        // The launching session's host review gate follows delegated work.
+        if let Some(gate) = &sub_cfg.tool_gate {
+            tools.set_gate(gate.0.clone());
+        }
         register_core_tools(&mut tools);
         let nested_manager = Arc::new(SubagentManager::new(
             app_config.subagent.effective_max_concurrent(),
@@ -124,6 +128,7 @@ fn run_subagent_mirrored_boxed(
         let max_depth = app_config.subagent.effective_max_depth();
         let parent_depth = sub_cfg.depth;
         let launch_allowlist = sub_cfg.tool_allowlist.clone();
+        let launch_gate = sub_cfg.tool_gate.clone();
         let launch_load_instructions = sub_cfg.load_project_instructions;
         let nested_launch: kkagent_tools::builtin::task::SubagentLaunchFn =
             Arc::new(move |mut config, interrupt| {
@@ -132,6 +137,7 @@ fn run_subagent_mirrored_boxed(
                     config.tool_allowlist.as_ref(),
                     launch_allowlist.as_ref(),
                 );
+                config.tool_gate = launch_gate.clone();
                 config.load_project_instructions &= launch_load_instructions;
                 let manager = launch_manager.clone();
                 let app_config = launch_config.clone();

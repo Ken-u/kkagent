@@ -136,18 +136,41 @@ impl ToolContext {
     /// Returns `Ok(())` if the path is allowed by the current `path_guard_mode`,
     /// or an `Err` with the reason when `strict` mode denies it.
     pub fn check_path_guard(&self, path: &std::path::Path) -> Result<(), String> {
-        if self.is_path_allowed(path) {
-            return Ok(());
+        let strict = self.tools_config.path_guard_mode == "strict";
+        if !self.is_path_allowed(path) {
+            return if strict {
+                Err(format!(
+                    "Path `{}` is outside the workspace and `path_guard_mode = strict` is enabled. \
+                     Only paths within `{}` or `tools.additional_dirs` are allowed.",
+                    path.display(),
+                    self.working_dir.display()
+                ))
+            } else {
+                Ok(()) // warn mode — allow but the caller may log
+            };
         }
-        match self.tools_config.path_guard_mode.as_str() {
-            "strict" => Err(format!(
-                "Path `{}` is outside the workspace and `path_guard_mode = strict` is enabled. \
-                 Only paths within `{}` or `tools.additional_dirs` are allowed.",
-                path.display(),
-                self.working_dir.display()
-            )),
-            _ => Ok(()), // warn mode — allow but the caller may log
+        // The check above is lexical. In strict mode a symlink inside the
+        // workspace must not lead out of it either, so an existing path is
+        // also resolved and compared against the resolved allowed roots.
+        if strict {
+            if let Ok(real) = std::fs::canonicalize(path) {
+                let roots: Vec<std::path::PathBuf> = std::iter::once(&self.working_dir)
+                    .chain(self.tools_config.additional_dirs.iter())
+                    .filter_map(|root| std::fs::canonicalize(root).ok())
+                    .collect();
+                if !roots.is_empty() && !roots.iter().any(|root| real.starts_with(root)) {
+                    return Err(format!(
+                        "Path `{}` resolves to `{}`, outside the workspace, and \
+                         `path_guard_mode = strict` is enabled. Only paths within `{}` or \
+                         `tools.additional_dirs` are allowed.",
+                        path.display(),
+                        real.display(),
+                        self.working_dir.display()
+                    ));
+                }
+            }
         }
+        Ok(())
     }
 
     /// Returns `true` if sensitive-path checking is enabled (S2-6).

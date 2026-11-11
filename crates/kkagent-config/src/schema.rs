@@ -315,6 +315,17 @@ pub enum StorageBackend {
 pub struct StorageConfig {
     #[serde(default)]
     pub backend: StorageBackend,
+    /// Where the local SQLite database (`transcripts.db`) lives. Defaults to
+    /// `<config dir>/transcripts.db`. The `KKAGENT_TRANSCRIPTS_DB` environment
+    /// variable overrides it. Point it at a directory a strict sandbox lets
+    /// the process traverse when the default location is not reachable.
+    #[serde(default)]
+    pub transcripts_path: Option<std::path::PathBuf>,
+    /// When the database cannot be opened, keep running on an in-memory
+    /// database (nothing is persisted) instead of failing to start. Off by
+    /// default: silently losing history is worse than a clear error.
+    #[serde(default)]
+    pub allow_in_memory: bool,
 }
 
 /// Subagent delegation limits and per-profile defaults (`[subagent]` in
@@ -642,6 +653,17 @@ pub struct ServerConfig {
     /// When false, use the legacy in-process server (Ctrl+B unavailable).
     #[serde(default = "default_true")]
     pub standalone: bool,
+    /// Never exit for idleness while a turn is running (default `true`).
+    #[serde(default = "default_true")]
+    pub idle_hold_for_turns: bool,
+    /// Never exit for idleness while an approval or a question waits for an
+    /// answer (default `true`).
+    #[serde(default = "default_true")]
+    pub idle_hold_for_approvals: bool,
+    /// Never exit for idleness while a background Bash task or subagent is
+    /// still running (default `true`; the exit would kill them).
+    #[serde(default = "default_true")]
+    pub idle_hold_for_background_tasks: bool,
 }
 
 impl Default for ServerConfig {
@@ -649,6 +671,9 @@ impl Default for ServerConfig {
         Self {
             idle_timeout_secs: default_idle_timeout_secs(),
             standalone: true,
+            idle_hold_for_turns: true,
+            idle_hold_for_approvals: true,
+            idle_hold_for_background_tasks: true,
         }
     }
 }
@@ -1330,8 +1355,20 @@ pub struct BackgroundConfig {
     #[serde(default)]
     pub bash_task_timeout_s: Option<u64>,
     /// Maximum time a turn may wait for an approval before rejecting it.
+    /// Default 900; clamped to 1..=86400. `0` waits without a limit (for a
+    /// host that answers approvals on its own schedule).
     #[serde(default)]
     pub approval_timeout_s: Option<u64>,
+}
+
+/// Seconds a turn waits for an approval before treating it as rejected;
+/// `None` waits without a limit (`approval_timeout_s = 0`).
+pub fn approval_timeout_secs(background: Option<&BackgroundConfig>) -> Option<u64> {
+    match background.and_then(|background| background.approval_timeout_s) {
+        Some(0) => None,
+        Some(seconds) => Some(seconds.clamp(1, 86_400)),
+        None => Some(900),
+    }
 }
 
 fn default_max_tasks() -> u32 {
@@ -1513,13 +1550,17 @@ pub struct ToolsConfig {
     /// Additional directories allowed for file access in strict mode.
     #[serde(default)]
     pub additional_dirs: Vec<std::path::PathBuf>,
-    /// When `true` (default), deferred tools are loaded progressively via
-    /// `SelectTools` for the Kimi provider or models declaring the
-    /// `dynamically_loaded_tools` capability. Kimi preserves message-level
-    /// schemas; other adapters merge loaded schemas into top-level `tools[]`,
-    /// which may refresh the provider prompt cache.
-    #[serde(default = "default_true")]
-    pub dynamically_loaded_tools: bool,
+    /// Whether deferred tools are loaded progressively via `SelectTools` for
+    /// the Kimi provider or models declaring the `dynamically_loaded_tools`
+    /// capability. Kimi preserves message-level schemas; other adapters merge
+    /// loaded schemas into top-level `tools[]`, which may refresh the provider
+    /// prompt cache.
+    ///
+    /// Unset: on, except for a session under a strict role tool allowlist,
+    /// where the tool set is fixed in advance and everything it permits is
+    /// loaded up front. An explicit value always wins.
+    #[serde(default)]
+    pub dynamically_loaded_tools: Option<bool>,
     /// Directory names skipped by Glob / Grep / `@` completion walks.
     /// When set (including `[]`), replaces the built-in default list.
     /// Use [`Self::extra_heavy_dirs`] to append without replacing.
@@ -1546,7 +1587,7 @@ impl Default for ToolsConfig {
             path_guard_mode: default_path_guard_mode(),
             sensitive_path_check: true,
             additional_dirs: Vec::new(),
-            dynamically_loaded_tools: true,
+            dynamically_loaded_tools: None,
             heavy_dirs: None,
             extra_heavy_dirs: Vec::new(),
             subagent_timeout_secs: None,
@@ -1556,6 +1597,12 @@ impl Default for ToolsConfig {
 }
 
 impl ToolsConfig {
+    /// The effective `dynamically_loaded_tools` switch for a session.
+    /// `allowlist_active` is true when a strict role allowlist is in force.
+    pub fn dynamic_loading_enabled(&self, allowlist_active: bool) -> bool {
+        self.dynamically_loaded_tools.unwrap_or(!allowlist_active)
+    }
+
     /// Built-in names always skipped unless the caller explicitly descends
     /// into them (e.g. Glob `out/soong/**`). Includes `.repo` for AOSP-style
     /// multi-git checkouts.
@@ -3288,6 +3335,63 @@ experimental_retry_partial_stream_errors = false
             .unwrap_err()
             .to_string()
             .contains("plugin_marketplace"));
+    }
+
+    #[test]
+    fn dynamic_tool_loading_follows_the_allowlist_unless_set_explicitly() {
+        let unset = ToolsConfig::default();
+        assert!(unset.dynamic_loading_enabled(false), "on by default");
+        assert!(
+            !unset.dynamic_loading_enabled(true),
+            "a fixed allowlist loads everything up front"
+        );
+
+        let on: AppConfig = toml::from_str("[tools]\ndynamically_loaded_tools = true\n").unwrap();
+        assert!(on.tools.dynamic_loading_enabled(true));
+        let off: AppConfig = toml::from_str("[tools]\ndynamically_loaded_tools = false\n").unwrap();
+        assert!(!off.tools.dynamic_loading_enabled(false));
+    }
+
+    #[test]
+    fn approval_timeout_defaults_clamps_and_can_be_unlimited() {
+        let make = |seconds: Option<u64>| BackgroundConfig {
+            max_running_tasks: 4,
+            keep_alive_on_exit: false,
+            bash_auto_background_on_timeout: None,
+            bash_task_timeout_s: None,
+            approval_timeout_s: seconds,
+        };
+        assert_eq!(approval_timeout_secs(None), Some(900));
+        assert_eq!(approval_timeout_secs(Some(&make(None))), Some(900));
+        assert_eq!(approval_timeout_secs(Some(&make(Some(30)))), Some(30));
+        assert_eq!(
+            approval_timeout_secs(Some(&make(Some(10_000_000)))),
+            Some(86_400)
+        );
+        assert_eq!(approval_timeout_secs(Some(&make(Some(0)))), None);
+    }
+
+    #[test]
+    fn server_idle_guards_default_on_and_storage_path_is_optional() {
+        let config: AppConfig = toml::from_str("").unwrap();
+        assert!(config.server.idle_hold_for_turns);
+        assert!(config.server.idle_hold_for_approvals);
+        assert!(config.server.idle_hold_for_background_tasks);
+        assert!(config.storage.transcripts_path.is_none());
+        assert!(!config.storage.allow_in_memory);
+
+        let tuned: AppConfig = toml::from_str(
+            "[server]\nidle_hold_for_background_tasks = false\n\
+             [storage]\ntranscripts_path = \"/data/t.db\"\nallow_in_memory = true\n",
+        )
+        .unwrap();
+        assert!(!tuned.server.idle_hold_for_background_tasks);
+        assert!(tuned.server.idle_hold_for_turns);
+        assert_eq!(
+            tuned.storage.transcripts_path.as_deref(),
+            Some(std::path::Path::new("/data/t.db"))
+        );
+        assert!(tuned.storage.allow_in_memory);
     }
 
     #[test]

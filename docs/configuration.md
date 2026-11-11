@@ -251,22 +251,26 @@ bash_task_timeout_s = 120
 approval_timeout_s = 900
 ```
 
-`max_running_tasks` 控制 Agent 后台任务并发；`approval_timeout_s` 到期后按拒绝处理，范围在运行时限制为 1 秒到 24 小时。`bash_auto_background_on_timeout` 控制前台 Bash 命令超时后是否自动转入后台（默认 `true`）。`bash_task_timeout_s` 控制前台 Bash 命令的默认超时秒数（默认 `120`，即 2 分钟），LLM 可通过 `timeout` 参数覆盖。
+`max_running_tasks` 控制 Agent 后台任务并发；`approval_timeout_s`（默认 900）到期后按拒绝处理，范围在运行时限制为 1 秒到 24 小时；设为 `0` 表示**不限时**，一直等到被批准、拒绝或取消（适合宿主自己负责回答审批的场景，需要同时用 `[server] idle_hold_for_approvals` 保证等待期间 server 不退出）。`bash_auto_background_on_timeout` 控制前台 Bash 命令超时后是否自动转入后台（默认 `true`）。`bash_task_timeout_s` 控制前台 Bash 命令的默认超时秒数（默认 `120`，即 2 分钟），LLM 可通过 `timeout` 参数覆盖。
 
 ## 工具与超大工程
 
 ```toml
 [tools]
-path_guard_mode = "warn"          # warn | strict
+path_guard_mode = "warn"          # warn | strict；Read / ReadMediaFile / Grep 等文件工具共用
 sensitive_path_check = true
 additional_dirs = []
-dynamically_loaded_tools = true
+# dynamically_loaded_tools = true  # 省略 = 默认开启，但角色白名单固定时默认关闭（见下）
 # 覆盖默认重型目录跳过列表（Glob / Grep / `@` 补全共用）。
 # 默认：["node_modules", "target", ".git", "out", ".repo"]
 # heavy_dirs = ["out", "target", "node_modules", ".git", ".repo"]
 # 在默认（或 heavy_dirs）之上追加：
 # extra_heavy_dirs = ["bazel-out", "dist"]
 ```
+
+`path_guard_mode = "strict"` 时 `Read`、`ReadMediaFile` 等读文件工具只能访问工作目录与 `additional_dirs`（符号链接按真实路径判定），`ReadMediaFile` 还会做和 `Read` 相同的敏感路径检查。
+
+`dynamically_loaded_tools` 省略时：普通会话为开启（渐进式披露，见[工具与权限](tools-and-permissions.md#渐进式工具披露progressive-tool-disclosure)）；而会话处于**严格角色白名单**下时，可用工具集合在启动时已经固定，默认直接把白名单允许的工具全部随请求加载，不再需要 `SelectTools`。显式写 `true` / `false` 总是优先。
 
 `heavy_dirs` 一旦写出（含空数组）就会替换内置默认值；只想追加时用 `extra_heavy_dirs`。项目级 `.kkagent/config.toml` 也可写同样的 `[tools]` 字段，启动时与全局配置合并。显式定向到重型目录的搜索（例如 Glob `out/soong/**` 或 Grep `path = "out"`）仍会进入该目录。
 
@@ -317,7 +321,13 @@ idle_timeout_secs = 1800
 # true：`kk` 默认拉起/连接独立 server（Ctrl+B 可用）。
 # false：退回进程内 server（旧行为，Ctrl+B 不可用）。
 standalone = true
+# 即使空闲计时到了，下列情况默认也不退出（退出会中止它们）；设为 false 可放开。
+idle_hold_for_turns = true             # 有进行中的 turn
+idle_hold_for_approvals = true         # 有待决的审批或提问
+idle_hold_for_background_tasks = true  # 有运行中的后台 Bash / 子 Agent
 ```
+
+空闲判定：没有本地客户端连接、没有打开的 HTTP WebSocket 事件流，且距离上次本地连接或 **HTTP 请求**超过 `idle_timeout_secs`，并且上面三类“不能中断的工作”都不存在时才退出。只通过 HTTP 轮询的宿主不需要保持 UDS 连接；每个 HTTP 请求都会重置计时。
 
 默认 `kk`（无参数）会连接 `~/.kkagent/server.sock` 上的独立 server；不存在时自动后台启动。TUI 退出不会杀死该 server。`~/.kkagent/active-sessions/` 按工作目录各存一份后台化的 session id（`~/.kkagent/active-session` 保留为最近一次后台化的全局兼容标记），下次在该目录启动时自动 resume；已被删除/丢弃（归档）的 session 不会被自动 resume，对应标记也会随删除一并清除。
 
@@ -326,7 +336,7 @@ standalone = true
 ```toml
 [sandbox]
 mode = "auto"       # auto | workspace | process | disabled
-network = true
+network = false     # 默认 false（最小权限）；构建/测试需要联网时显式设为 true
 memory_mb = 4096
 cpu_seconds = 600
 max_processes = 128
@@ -413,7 +423,11 @@ load_plugins = true               # 发现并应用插件（toolOverride、插�
 ```toml
 [storage]
 backend = "sqlite"   # 默认：本地 ~/.kkagent/transcripts.db；host：由宿主提供
+# transcripts_path = "/data/kkagent/transcripts.db"  # 可选：数据库位置（相对路径相对配置目录）
+# allow_in_memory = false                             # 可选：打不开数据库时改用内存库继续运行
 ```
+
+`transcripts_path` 默认是 `<配置目录>/transcripts.db`，环境变量 `KKAGENT_TRANSCRIPTS_DB` 优先于配置。SQLite 打开数据库前会读取其**所有上级目录**的元数据；严格的 `sandbox-exec` / seccomp 配置若不放行这些目录会报 `unable to open database file`。此时可以放行这些目录，或用 `transcripts_path` 把数据库放到进程可到达的位置；确实不需要持久化时设 `allow_in_memory = true`（等价于 `KKAGENT_ALLOW_IN_MEMORY_TRANSCRIPTS=1`，健康检查会标记 `durable=false`，ready 保持 503）；也可以改用 `backend = "host"` 由宿主保存会话。启动失败的错误信息会列出这些办法。
 
 `backend = "host"`（或 `kkagent acp --storage host`）把会话、消息和事件交给已连接的宿主，通过 ACP 通道上的 `_kkagent/store/*` 方法访问。宿主必须在 `initialize` 声明 `store.sessions`；没有宿主、宿主不支持或调用失败时 turn 直接失败，**不会**回退到本地 SQLite，本地库也不会写入任何会话内容。该后端只由 `kkagent acp` 支持：TUI、`kkagent server` 等其他入口读到 `backend = "host"` 会直接报错，而不是悄悄用本地库。默认的 `sqlite` 与以前完全一致。这三段都只能写在用户级配置里，项目级文件含有它们会被拒绝。
 
@@ -636,6 +650,7 @@ client_label = "kkagent"
 | `KKAGENT_HTTP_WRITE_TOKEN` | read + 非 terminal 写操作 token。 |
 | `KKAGENT_HTTP_TERMINAL_TOKEN` | read + terminal token。 |
 | `KKAGENT_ALLOW_IN_MEMORY_TRANSCRIPTS` | 显式允许 transcript 非持久化降级；readiness 会保持失败。 |
+| `KKAGENT_TRANSCRIPTS_DB` | transcript 数据库路径，优先于 `[storage] transcripts_path`。 |
 | `KKAGENT_TELEMETRY_ENDPOINT`、`KKAGENT_TELEMETRY_CLOUD` | 云遥测地址和开关。 |
 | `KKAGENT_NOTIFY` | TUI 任务完成提醒：响铃 + `OSC 9` 文本通知（iTerm2 / WezTerm / kitty / Windows Terminal 等会弹出系统通知，内容为 `完成: <用户上一条输入的首行，30 字符内>`；无已发送输入时为 `turn completed`）。设为 `0` 或 `off` 关闭，默认开启。不支持该序列的终端会静默忽略。 |
 | `RUST_LOG` | 日志过滤器。 |

@@ -182,6 +182,37 @@ pub struct AgentLoop {
     /// Backends for sessions whose model is an `acp:<plugin>.<agent>` alias
     /// (see `acp_turn`). Without it such sessions fail with a readable error.
     acp_backends: Option<Arc<crate::acp_backend::AcpBackendHub>>,
+    /// When set, approval ids are derived from this namespace (a durable task
+    /// id) instead of random: the same task asking for the same thing again,
+    /// for instance after a server restart re-ran it, gets the same id.
+    approval_namespace: Option<String>,
+    approval_counter: std::sync::atomic::AtomicU64,
+}
+
+/// Await `future`, giving up after `limit_secs` (`None` waits without limit).
+async fn wait_within<F: std::future::Future>(
+    limit_secs: Option<u64>,
+    future: F,
+) -> Result<F::Output, tokio::time::error::Elapsed> {
+    match limit_secs {
+        Some(seconds) => {
+            tokio::time::timeout(std::time::Duration::from_secs(seconds), future).await
+        }
+        None => Ok(future.await),
+    }
+}
+
+/// An approval id that stays the same when the same durable task asks the same
+/// question in the same order: `sha256(namespace | ordinal | tool | input)`.
+fn stable_approval_id(
+    namespace: &str,
+    ordinal: u64,
+    tool_name: &str,
+    input: &serde_json::Value,
+) -> String {
+    let material = format!("{namespace}\0{ordinal}\0{tool_name}\0{input}");
+    let digest = crate::workspace_registry::sha256_hex(material.as_bytes());
+    format!("apr_{}", &digest[..32])
 }
 
 /// Spills oversized tool results to `<config_dir>/tool-results/` and, when a
@@ -428,6 +459,27 @@ impl AgentLoop {
             session_store: None,
             vision_cache: Arc::new(Mutex::new(Default::default())),
             acp_backends: None,
+            approval_namespace: None,
+            approval_counter: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Derive approval ids from `namespace` (see `stable_approval_id`).
+    pub fn with_approval_namespace(mut self, namespace: impl Into<String>) -> Self {
+        self.approval_namespace = Some(namespace.into());
+        self
+    }
+
+    /// Id for the next approval request of this loop.
+    fn next_approval_id(&self, tool_name: &str, input: &serde_json::Value) -> String {
+        match &self.approval_namespace {
+            Some(namespace) => {
+                let ordinal = self
+                    .approval_counter
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                stable_approval_id(namespace, ordinal, tool_name, input)
+            }
+            None => uuid::Uuid::new_v4().to_string(),
         }
     }
 
@@ -582,12 +634,12 @@ impl AgentLoop {
             // The external agent owns its tools, sandbox and MCP servers, so a
             // strict tool allowlist cannot bind it. Fail closed instead of
             // letting a model alias sidestep the role.
-            if self.tools.allowlist().is_some() {
+            if self.tools.allowlist().is_some() || self.tools.gate().is_some() {
                 return self
                     .acp_fail(
                         session,
                         "ACP model aliases are not available while a strict tool allowlist \
-                         is active; pick a regular model."
+                         or a host tool review is active; pick a regular model."
                             .to_string(),
                     )
                     .await;
@@ -664,7 +716,9 @@ impl AgentLoop {
         // Progressive disclosure is native for message-level tool dialects,
         // and can be explicitly enabled for other model capabilities.
         let dynamic_tools_enabled = crate::dynamic_tools::dynamic_tools_enabled(
-            self.config.tools.dynamically_loaded_tools,
+            self.config
+                .tools
+                .dynamic_loading_enabled(self.tools.allowlist().is_some()),
             capability.supports("dynamically_loaded_tools"),
             &primary_provider_config.provider_type,
         );
@@ -1849,7 +1903,7 @@ impl AgentLoop {
                                 self.review_exit_plan_mode(session, &session_id, tc).await?,
                             )
                         } else {
-                            let approval_id = uuid::Uuid::new_v4().to_string();
+                            let approval_id = self.next_approval_id(&tc.name, &tc.input);
                             let action = describe_tool_action(&tc.name, &tc.input);
                             let _ = self
                                 .event_tx
@@ -1875,15 +1929,11 @@ impl AgentLoop {
                                 })
                                 .await;
 
-                            let approval_timeout = self
-                                .config
-                                .background
-                                .as_ref()
-                                .and_then(|background| background.approval_timeout_s)
-                                .unwrap_or(900)
-                                .clamp(1, 86_400);
-                            let response = match tokio::time::timeout(
-                                std::time::Duration::from_secs(approval_timeout),
+                            let approval_timeout = kkagent_config::approval_timeout_secs(
+                                self.config.background.as_ref(),
+                            );
+                            let response = match wait_within(
+                                approval_timeout,
                                 session.wait_approval(&approval_id),
                             )
                             .await
@@ -1894,7 +1944,8 @@ impl AgentLoop {
                                     decision: kkagent_protocol::ApprovalDecision::Rejected,
                                     scope: None,
                                     feedback: Some(format!(
-                                        "approval timed out after {approval_timeout} seconds"
+                                        "approval timed out after {} seconds",
+                                        approval_timeout.unwrap_or_default()
                                     )),
                                     selected_label: None,
                                 },
@@ -2041,7 +2092,7 @@ impl AgentLoop {
                         *prep = Prepared::Done(ToolOutput::error(format!("Denied: {reason}")));
                     }
                     PermissionDecision::Ask => {
-                        let approval_id = uuid::Uuid::new_v4().to_string();
+                        let approval_id = self.next_approval_id(name, input);
                         let action = describe_tool_action(name, input);
                         let _ = self
                             .event_tx
@@ -2065,15 +2116,10 @@ impl AgentLoop {
                                 status: SessionStatus::WaitingApproval,
                             })
                             .await;
-                        let approval_timeout = self
-                            .config
-                            .background
-                            .as_ref()
-                            .and_then(|background| background.approval_timeout_s)
-                            .unwrap_or(900)
-                            .clamp(1, 86_400);
-                        let response = match tokio::time::timeout(
-                            std::time::Duration::from_secs(approval_timeout),
+                        let approval_timeout =
+                            kkagent_config::approval_timeout_secs(self.config.background.as_ref());
+                        let response = match wait_within(
+                            approval_timeout,
                             session.wait_approval(&approval_id),
                         )
                         .await
@@ -2084,7 +2130,8 @@ impl AgentLoop {
                                 decision: kkagent_protocol::ApprovalDecision::Rejected,
                                 scope: None,
                                 feedback: Some(format!(
-                                    "approval timed out after {approval_timeout} seconds"
+                                    "approval timed out after {} seconds",
+                                    approval_timeout.unwrap_or_default()
                                 )),
                                 selected_label: None,
                             },
@@ -2682,12 +2729,20 @@ impl AgentLoop {
         let config = self.config.clone();
         let session_id = session.id.clone();
 
+        // The judge runs its own tool loop, which the host's review gate does
+        // not cover. Under a gate it therefore reads nothing beyond the
+        // transcript tail instead of acting outside the host's sight.
+        let judge_ceiling = if self.tools.gate().is_some() {
+            Some(kkagent_protocol::ToolAllowlist::deny_all())
+        } else {
+            self.tools.allowlist().cloned()
+        };
         let judge_result = crate::goal_judge::run_goal_judge(
             config,
             working_dir,
             &goal,
             &evidence_tail,
-            self.tools.allowlist(),
+            judge_ceiling.as_ref(),
         )
         .await;
         let record = match judge_result {
@@ -3288,7 +3343,7 @@ impl AgentLoop {
             })
             .await;
 
-        let approval_id = uuid::Uuid::new_v4().to_string();
+        let approval_id = self.next_approval_id("ExitPlanMode", &tc.input);
         let request = kkagent_protocol::ApprovalRequest {
             approval_id: approval_id.clone(),
             session_id: session_id.to_string(),
@@ -3314,30 +3369,22 @@ impl AgentLoop {
             })
             .await;
 
-        let approval_timeout = self
-            .config
-            .background
-            .as_ref()
-            .and_then(|background| background.approval_timeout_s)
-            .unwrap_or(900)
-            .clamp(1, 86_400);
-        let response = match tokio::time::timeout(
-            std::time::Duration::from_secs(approval_timeout),
-            session.wait_approval(&approval_id),
-        )
-        .await
-        {
-            Ok(response) => response,
-            Err(_) => kkagent_protocol::ApprovalResponse {
-                approval_id: approval_id.clone(),
-                decision: kkagent_protocol::ApprovalDecision::Rejected,
-                scope: None,
-                feedback: Some(format!(
-                    "approval timed out after {approval_timeout} seconds"
-                )),
-                selected_label: Some(crate::plan_review::LABEL_REVISE.into()),
-            },
-        };
+        let approval_timeout =
+            kkagent_config::approval_timeout_secs(self.config.background.as_ref());
+        let response =
+            match wait_within(approval_timeout, session.wait_approval(&approval_id)).await {
+                Ok(response) => response,
+                Err(_) => kkagent_protocol::ApprovalResponse {
+                    approval_id: approval_id.clone(),
+                    decision: kkagent_protocol::ApprovalDecision::Rejected,
+                    scope: None,
+                    feedback: Some(format!(
+                        "approval timed out after {} seconds",
+                        approval_timeout.unwrap_or_default()
+                    )),
+                    selected_label: Some(crate::plan_review::LABEL_REVISE.into()),
+                },
+            };
         let _ = self
             .event_tx
             .send(AgentEvent::StatusUpdate {
@@ -3908,6 +3955,27 @@ async fn execute_tool_parallel(request: ParallelToolRequest) -> ToolOutput {
         kkagent_tools::args_validator::validate_against_schema(&tool.parameters_schema(), &input)
     {
         return ToolOutput::error(e.message);
+    }
+
+    // Host review, last: it sees the call exactly as it would run (after
+    // hooks rewrote the input and defaults were applied), and a refusal here
+    // is final whatever permission mode let the call this far.
+    if let Some(gate) = tools.gate() {
+        let read_only = tool.read_only();
+        if gate.reviews(&name, read_only) {
+            let review = kkagent_protocol::ToolCallReview {
+                session_id: session_id.clone(),
+                tool_call_id: tool_call_id.clone().unwrap_or_default(),
+                name: name.clone(),
+                input: input.clone(),
+                cwd: working_dir.display().to_string(),
+                read_only,
+                interrupted: Some(interrupted.clone()),
+            };
+            if let kkagent_protocol::GateVerdict::Deny(reason) = gate.review(&review).await {
+                return ToolOutput::error(reason);
+            }
+        }
     }
 
     let ctx = ToolContext {

@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, watch, Mutex};
@@ -2461,6 +2461,30 @@ fn format_uptime(secs: u64) -> String {
     }
 }
 
+/// What keeps a standalone server alive besides a quiet timer.
+#[derive(Debug, Clone, Copy, Default)]
+struct IdleSnapshot {
+    active_turns: bool,
+    /// An approval or a question is waiting for its answer.
+    pending_approvals: bool,
+    /// A background Bash task or subagent is running.
+    background_tasks: bool,
+    /// A local (UDS/TUI) client is connected.
+    clients: bool,
+    /// An HTTP WebSocket event stream is open.
+    http_streams: bool,
+}
+
+/// Whether the server must stay up right now, per `[server] idle_hold_*`.
+/// Connected clients and open event streams always hold it.
+fn idle_held(server: &kkagent_config::ServerConfig, snapshot: &IdleSnapshot) -> bool {
+    snapshot.clients
+        || snapshot.http_streams
+        || (server.idle_hold_for_turns && snapshot.active_turns)
+        || (server.idle_hold_for_approvals && snapshot.pending_approvals)
+        || (server.idle_hold_for_background_tasks && snapshot.background_tasks)
+}
+
 /// Idle-watchdog decision helper (unit-tested).
 fn should_idle_shutdown(
     idle_timeout: Duration,
@@ -2822,6 +2846,7 @@ async fn run_server(
     let _endpoint_guard = LocalEndpointGuard(endpoint_path.clone());
 
     let idle_timeout = Duration::from_secs(config.server.idle_timeout_secs);
+    let idle_guards = config.server.clone();
     let config_arc = Arc::new(config);
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
     let (state_tx, state_rx) = watch::channel(None::<Result<Arc<ServerState>, String>>);
@@ -2925,11 +2950,16 @@ async fn run_server(
                     last_activity = Instant::now();
                     continue;
                 };
-                let has_active_turns = state.has_active_turns().await;
-                let has_clients = state.client_count() > 0;
-                if has_active_turns || has_clients {
+                if idle_held(&idle_guards, &state.idle_snapshot().await) {
                     last_activity = Instant::now();
                     continue;
+                }
+                // Traffic on the HTTP API is activity too: a host that only
+                // polls over HTTP never opens the local socket.
+                if let Some(since) = state.since_last_http_activity() {
+                    if since < last_activity.elapsed() {
+                        last_activity = Instant::now().checked_sub(since).unwrap_or(last_activity);
+                    }
                 }
                 if should_idle_shutdown(
                     idle_timeout,
@@ -3532,6 +3562,28 @@ async fn stop_turn_and_wait(state: &Arc<ServerState>, session_id: &str) {
     }
 }
 
+/// How long an HTTP turn cancellation waits for the turn and the background
+/// commands it was asked to stop before it reports what is still running.
+const HTTP_CANCEL_WAIT_MS: u64 = 3_000;
+
+/// Wait up to `limit` for `session_id` to release its turn; `true` when it did.
+async fn wait_for_turn_to_stop(
+    state: &Arc<ServerState>,
+    session_id: &str,
+    limit: Duration,
+) -> bool {
+    let deadline = Instant::now() + limit;
+    loop {
+        if !state.turn_locks.is_busy(session_id).await {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
 async fn recover_durable_turns(backend: Arc<AgentHttpBackend>) {
     let turns = match backend.state.durable_http.recoverable_turns() {
         Ok(turns) => turns,
@@ -3556,6 +3608,7 @@ async fn recover_durable_turns(backend: Arc<AgentHttpBackend>) {
                 .state
                 .durable_http
                 .finish_turn(&turn.task_id, "failed", Some(&error));
+            publish_task_finished(&backend.state, &turn.session_id, &turn.task_id);
         }
     }
 }
@@ -3714,6 +3767,17 @@ impl AgentAcpHost {
             )
             .map_err(|error| error.to_string())?;
         }
+        if meta
+            .tool_review
+            .is_some_and(|review| review.mode != kkagent_protocol::host::ToolReviewMode::Off)
+            && !self.state.host_capabilities().tool_review
+        {
+            return Err(format!(
+                "toolReview needs the client to advertise `_meta[\"{}\"].toolReview` at \
+                 initialize (a review nobody can answer would deny every call)",
+                kkagent_protocol::host::HOST_META_KEY
+            ));
+        }
         let system_prompt =
             setup
                 .system_prompt
@@ -3745,6 +3809,8 @@ impl AgentAcpHost {
                 role.tool_allowlist.as_ref(),
             );
             role.extensions = existing.extensions.narrow(role.extensions);
+            role.tool_review =
+                kkagent_core::role::merge_tool_review(existing.tool_review, role.tool_review);
         }
         let role = Arc::new(role);
         roles.insert(session_id.to_string(), role.clone());
@@ -4183,6 +4249,7 @@ impl kkagent_acp::AcpHost for AgentAcpHost {
                 kkagent_protocol::host::HOST_META_KEY.to_string(),
                 serde_json::json!({
                     "tools": capabilities.tools,
+                    "toolReview": capabilities.tool_review,
                     "store": {
                         "sessions": host_storage,
                         "events": host_storage && capabilities.store.events,
@@ -5002,6 +5069,7 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
                         );
                     }
                 }
+                publish_task_finished(&state, &sid, &task_id);
             }
             if let Err(e) = result {
                 tracing::warn!("HTTP-triggered turn failed: {e}");
@@ -5261,11 +5329,48 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
             feedback,
             selected_label,
         };
-        let txs = self.state.approval_txs.lock().await;
-        for tx in txs.values() {
-            let _ = tx.try_send(resp.clone());
+        // Deliver to the one session that is waiting on this approval. An id
+        // nobody waits on (answered, timed out, interrupted, never issued) is
+        // an error, not a silent success.
+        let mut pending = self.state.pending_tool_approvals.lock().await;
+        let session_id = pending
+            .iter()
+            .find(|(_, request)| request.approval_id == id)
+            .map(|(session_id, _)| session_id.clone())
+            .ok_or_else(|| format!("approval {id} {}", kkagent_protocol::APPROVAL_NOT_PENDING))?;
+        let tx = self
+            .state
+            .approval_txs
+            .lock()
+            .await
+            .get(&session_id)
+            .cloned()
+            .ok_or_else(|| format!("no approval channel for session {session_id}: not found"))?;
+        tx.try_send(resp)
+            .map_err(|error| format!("failed to deliver approval response: {error}"))?;
+        pending.remove(&session_id);
+        Ok(serde_json::json!({
+            "ok": true,
+            "approval_id": id,
+            "session_id": session_id,
+        }))
+    }
+
+    fn note_http_activity(&self) {
+        self.state.note_http_activity();
+    }
+
+    fn ws_connection_changed(&self, opened: bool) {
+        if opened {
+            self.state.http_ws_clients.fetch_add(1, Ordering::SeqCst);
+        } else {
+            let _ = self.state.http_ws_clients.fetch_update(
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+                |count| count.checked_sub(1),
+            );
         }
-        Ok(serde_json::json!({"ok": true, "approval_id": id}))
+        self.state.note_http_activity();
     }
 
     async fn plugin_rpc(
@@ -5291,7 +5396,11 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
         http_rpc(&self.state, method, params).await
     }
 
-    async fn cancel_turn(&self, task_id: &str) -> Result<serde_json::Value, String> {
+    async fn cancel_turn(
+        &self,
+        task_id: &str,
+        cancel_background: bool,
+    ) -> Result<serde_json::Value, String> {
         let turn = self
             .state
             .durable_http
@@ -5333,53 +5442,58 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
         {
             handle.abort();
         }
+        self.state
+            .clear_pending_tool_approval(&turn.session_id, None)
+            .await;
+        self.state
+            .clear_pending_question(&turn.session_id, None)
+            .await;
+        // The request returns once the cancellation is real, not merely
+        // requested: the turn has released the session, and the background
+        // commands that were asked to stop have been seen stopping.
+        let turn_stopped = wait_for_turn_to_stop(
+            &self.state,
+            &turn.session_id,
+            Duration::from_millis(HTTP_CANCEL_WAIT_MS),
+        )
+        .await;
+        let background = if cancel_background {
+            self.state
+                .bash_shells
+                .cancel_session_and_wait(
+                    &turn.session_id,
+                    Duration::from_millis(HTTP_CANCEL_WAIT_MS),
+                )
+                .await
+                .as_json()
+        } else {
+            let running: Vec<String> = self
+                .state
+                .bash_shells
+                .list_running_for_session(&turn.session_id)
+                .await
+                .into_iter()
+                .map(|job| job.id)
+                .collect();
+            serde_json::json!({"requested": [], "stopped": [], "still_running": running})
+        };
         Ok(serde_json::json!({
             "ok": true,
             "task_id": cancelled.task_id,
             "session_id": cancelled.session_id,
             "state": cancelled.state,
+            "turn_stopped": turn_stopped,
+            "cancel_background": cancel_background,
+            "background": background,
         }))
     }
 
-    async fn fs_read(&self, path: &str) -> Result<String, String> {
-        let path = resolve_http_fs_path(self.state.config().as_ref(), path, false)?;
-        tokio::fs::read_to_string(path)
-            .await
-            .map_err(|e| e.to_string())
-    }
-
-    async fn fs_write(&self, path: &str, content: &str) -> Result<(), String> {
-        let path = resolve_http_fs_path(self.state.config().as_ref(), path, true)?;
-        if let Some(parent) = path.parent() {
-            let _ = tokio::fs::create_dir_all(parent).await;
-        }
-        tokio::fs::write(&path, content)
-            .await
-            .map_err(|e| e.to_string())
-    }
-
-    async fn list_files(&self, path: &str) -> Result<serde_json::Value, String> {
-        let path = resolve_http_fs_path(self.state.config().as_ref(), path, false)?;
-        let mut directory = tokio::fs::read_dir(&path)
-            .await
-            .map_err(|error| error.to_string())?;
-        let mut entries = Vec::new();
-        while entries.len() < 200 {
-            let Some(entry) = directory
-                .next_entry()
-                .await
-                .map_err(|error| error.to_string())?
-            else {
-                break;
-            };
-            let file_type = entry.file_type().await.map_err(|error| error.to_string())?;
-            entries.push(serde_json::json!({
-                "name": entry.file_name().to_string_lossy(),
-                "path": entry.path().display().to_string(),
-                "is_dir": file_type.is_dir(),
-            }));
-        }
-        Ok(serde_json::json!({"entries": entries}))
+    async fn fs_resolve(
+        &self,
+        path: &str,
+        for_write: bool,
+    ) -> Result<PathBuf, kkagent_rpc::FsError> {
+        resolve_http_fs_path(self.state.config().as_ref(), path, for_write)
     }
 
     async fn search(&self, query: &str) -> serde_json::Value {
@@ -5574,47 +5688,101 @@ fn trusted_http_roots(config: &AppConfig) -> Result<Vec<PathBuf>, String> {
         .collect()
 }
 
-fn resolve_http_fs_path(config: &AppConfig, raw: &str, for_write: bool) -> Result<PathBuf, String> {
-    if raw.trim().is_empty() {
-        return Err("path must not be empty".into());
+/// Where a path that does not exist (yet) would land: its deepest existing
+/// ancestor with symlinks resolved, plus the rest as written. `None` when the
+/// missing part climbs with `..` (it could end up anywhere).
+fn resolve_missing_path(candidate: &Path) -> Result<Option<PathBuf>, kkagent_rpc::FsError> {
+    use kkagent_rpc::FsError;
+    let mut ancestor = candidate;
+    while !ancestor.exists() {
+        ancestor = ancestor.parent().ok_or_else(|| {
+            FsError::bad_request(format!("cannot resolve parent of {}", candidate.display()))
+        })?;
     }
-    let roots = trusted_http_roots(config)?;
+    let canonical_ancestor = std::fs::canonicalize(ancestor).map_err(|e| {
+        FsError::new(
+            FsError::from_io(&e).kind,
+            format!("cannot resolve {}: {e}", ancestor.display()),
+        )
+    })?;
+    let suffix = candidate
+        .strip_prefix(ancestor)
+        .map_err(|e| FsError::bad_request(e.to_string()))?;
+    if suffix
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Ok(None);
+    }
+    Ok(Some(canonical_ancestor.join(suffix)))
+}
+
+/// The absolute path behind a client path of the file API, or why it is
+/// refused: outside the trusted workspaces is `Forbidden` (also for paths that
+/// do not exist, so probing cannot map the file system), a trusted path with
+/// nothing behind it is `NotFound`.
+fn resolve_http_fs_path(
+    config: &AppConfig,
+    raw: &str,
+    for_write: bool,
+) -> Result<PathBuf, kkagent_rpc::FsError> {
+    use kkagent_rpc::FsError;
+    if raw.trim().is_empty() {
+        return Err(FsError::bad_request("path must not be empty"));
+    }
+    let roots = trusted_http_roots(config).map_err(FsError::bad_request)?;
     let candidate = {
         let path = PathBuf::from(raw);
         if path.is_absolute() {
             path
         } else {
             std::env::current_dir()
-                .map_err(|e| e.to_string())?
+                .map_err(|e| FsError::from_io(&e))?
                 .join(path)
         }
     };
+    let outside = |candidate: &Path| {
+        FsError::forbidden(format!(
+            "path {} is outside trusted workspaces",
+            candidate.display()
+        ))
+    };
 
     let resolved = if candidate.exists() || !for_write {
-        std::fs::canonicalize(&candidate)
-            .map_err(|e| format!("cannot resolve {}: {e}", candidate.display()))?
-    } else {
-        let mut ancestor = candidate.as_path();
-        while !ancestor.exists() {
-            ancestor = ancestor
-                .parent()
-                .ok_or_else(|| format!("cannot resolve parent of {}", candidate.display()))?;
+        match std::fs::canonicalize(&candidate) {
+            Ok(resolved) => resolved,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // Judge the missing path by where it would be, through the
+                // symlinks of the part that does exist.
+                let Some(would_be) = resolve_missing_path(&candidate)? else {
+                    return Err(outside(&candidate));
+                };
+                if !roots.iter().any(|root| would_be.starts_with(root)) {
+                    return Err(outside(&candidate));
+                }
+                return Err(FsError::not_found(format!(
+                    "{} does not exist",
+                    candidate.display()
+                )));
+            }
+            Err(error) => {
+                return Err(FsError::new(
+                    FsError::from_io(&error).kind,
+                    format!("cannot resolve {}: {error}", candidate.display()),
+                ));
+            }
         }
-        let canonical_ancestor = std::fs::canonicalize(ancestor)
-            .map_err(|e| format!("cannot resolve {}: {e}", ancestor.display()))?;
-        let suffix = candidate
-            .strip_prefix(ancestor)
-            .map_err(|e| e.to_string())?;
-        canonical_ancestor.join(suffix)
+    } else {
+        match resolve_missing_path(&candidate)? {
+            Some(resolved) => resolved,
+            None => return Err(outside(&candidate)),
+        }
     };
 
     if roots.iter().any(|root| resolved.starts_with(root)) {
         Ok(resolved)
     } else {
-        Err(format!(
-            "path {} is outside trusted workspaces",
-            candidate.display()
-        ))
+        Err(outside(&candidate))
     }
 }
 
@@ -5651,6 +5819,19 @@ async fn build_turn_tools(
     let tool_allowlist = role.tool_allowlist.clone();
     if let Some(allowlist) = &tool_allowlist {
         tools.set_allowlist(allowlist);
+    }
+    // Host review of tool calls: one gate on this registry, handed on to every
+    // subagent through the launch closure below.
+    let tool_gate = {
+        let channel: Arc<dyn kkagent_core::host_channel::HostChannel> = state.host_channel.clone();
+        kkagent_core::tool_review::HostToolGate::for_session(
+            &channel,
+            role.tool_review.as_ref(),
+            &role.host_tools,
+        )
+    };
+    if let Some(gate) = &tool_gate {
+        tools.set_gate(gate.clone());
     }
     kkagent_tools::register_builtin_tools(&mut tools);
     // `GenerateImage` opt-in resolution: global `[services.image_gen]`
@@ -5771,7 +5952,9 @@ async fn build_turn_tools(
         external_subagents
             .0
             .iter()
-            .filter(|(_, spec)| tool_allowlist.is_none() || spec.transport != "acp")
+            .filter(|(_, spec)| {
+                (tool_allowlist.is_none() && tool_gate.is_none()) || spec.transport != "acp"
+            })
             .cloned()
             .collect();
     let external_map: std::collections::HashMap<String, kkagent_core::plugin::PluginSubagentSpec> =
@@ -5783,6 +5966,7 @@ async fn build_turn_tools(
         Arc::new(std::sync::OnceLock::new());
     let launch_slot_for_closure = launch_slot.clone();
     let launch_allowlist = tool_allowlist.clone();
+    let launch_gate = tool_gate.clone().map(kkagent_protocol::ToolGateHandle);
     let launch: kkagent_tools::builtin::task::SubagentLaunchFn =
         Arc::new(move |mut sub_config, interrupt| {
             // Delegation can never widen the tool surface: every launch (root,
@@ -5791,6 +5975,8 @@ async fn build_turn_tools(
                 sub_config.tool_allowlist.as_ref(),
                 launch_allowlist.as_ref(),
             );
+            // The host's review follows delegated work too.
+            sub_config.tool_gate = launch_gate.clone();
             // Likewise a session that switched project instructions off never
             // gets them back through a subagent.
             sub_config.load_project_instructions &= launch_load_instructions;
@@ -6064,11 +6250,35 @@ fn is_durable_event(event: &AgentEvent) -> bool {
     )
 }
 
+/// The final event of an HTTP task: `turn_start` / `turn_end` bracket every
+/// model round (and repeat inside one task), so a client that wants to know
+/// the task is over waits for this one. `state` is the durable task state
+/// (`completed`, `failed` or `cancelled`).
+fn publish_task_finished(state: &ServerState, session_id: &str, task_id: &str) {
+    let (final_state, error) = match state.durable_http.get_turn(task_id) {
+        Ok(Some(turn)) => (turn.state, turn.error),
+        _ => (
+            "failed".to_string(),
+            Some("task state unavailable".to_string()),
+        ),
+    };
+    let _ = state.events.send(serde_json::json!({
+        "type": "task_finished",
+        "task_id": task_id,
+        "session_id": session_id,
+        "state": final_state,
+        "error": error,
+    }));
+}
+
 async fn run_http_turn(
     state: Arc<ServerState>,
     session_id: &str,
     durable_task_id: Option<String>,
 ) -> anyhow::Result<()> {
+    // Approval ids derive from the durable task, so the same task asking the
+    // same thing after a restart gets the same id.
+    let approval_namespace = durable_task_id.clone();
     let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(64);
     let live_events = state.events.clone();
     let event_state = state.clone();
@@ -6158,6 +6368,10 @@ async fn run_http_turn(
     .with_goal_manager(state.goal_for(session.id.as_str()).await)
     .with_tool_result_store(state.tool_result_store.clone())
     .with_session_store(state.session_store.clone());
+    let agent = match approval_namespace {
+        Some(namespace) => agent.with_approval_namespace(namespace),
+        None => agent,
+    };
 
     let result = agent.run_turn(&mut session).await;
     let steer_result = session.close_and_apply_steers();
@@ -6304,6 +6518,11 @@ struct ServerState {
     persistence_error: Option<String>,
     started_at: std::time::Instant,
     client_count: AtomicUsize,
+    /// Open HTTP WebSocket event streams (a connected host is not idle).
+    http_ws_clients: AtomicUsize,
+    /// Time of the last HTTP request, in ms since `started_at` plus one
+    /// (`0` = none yet).
+    http_last_activity_ms: AtomicU64,
     shutdown_tx: watch::Sender<bool>,
     /// Live TUI/RPC writers that should receive agent event frames.
     /// Turns publish here so Ctrl+B detach + reattach keeps streaming.
@@ -6938,6 +7157,52 @@ impl ServerState {
 
     async fn has_active_turns(&self) -> bool {
         self.turn_locks.active_count().await > 0
+    }
+
+    /// Record that an HTTP request arrived (idle shutdown looks at it).
+    fn note_http_activity(&self) {
+        let elapsed_ms = self.started_at.elapsed().as_millis() as u64;
+        self.http_last_activity_ms
+            .store(elapsed_ms.saturating_add(1), Ordering::Relaxed);
+    }
+
+    /// Time since the last HTTP request, `None` when there has been none.
+    fn since_last_http_activity(&self) -> Option<Duration> {
+        match self.http_last_activity_ms.load(Ordering::Relaxed) {
+            0 => None,
+            stamp => Some(
+                self.started_at
+                    .elapsed()
+                    .saturating_sub(Duration::from_millis(stamp - 1)),
+            ),
+        }
+    }
+
+    /// A background Bash task or subagent is still running.
+    async fn has_background_work(&self) -> bool {
+        if self
+            .bash_shells
+            .list_jobs()
+            .await
+            .iter()
+            .any(|(_, _, _, running)| *running)
+        {
+            return true;
+        }
+        !self.subagents.list_running().await.is_empty()
+    }
+
+    /// Everything the idle watchdog weighs.
+    async fn idle_snapshot(&self) -> IdleSnapshot {
+        let pending_approvals = !self.pending_tool_approvals.lock().await.is_empty()
+            || !self.pending_questions.lock().await.is_empty();
+        IdleSnapshot {
+            active_turns: self.has_active_turns().await,
+            pending_approvals,
+            background_tasks: self.has_background_work().await,
+            clients: self.client_count() > 0,
+            http_streams: self.http_ws_clients.load(Ordering::SeqCst) > 0,
+        }
     }
 
     fn request_shutdown(&self) {
@@ -7928,6 +8193,36 @@ async fn install_marketplace_plugin(
     anyhow::bail!("plugin {id} was not found in {}", sources.join(", "))
 }
 
+/// Where `transcripts.db` lives: `KKAGENT_TRANSCRIPTS_DB`, else
+/// `[storage] transcripts_path`, else `<config dir>/transcripts.db`. A relative
+/// path is taken relative to the config dir.
+fn resolve_transcripts_path(config: &AppConfig) -> PathBuf {
+    transcripts_path_from(
+        config,
+        std::env::var_os("KKAGENT_TRANSCRIPTS_DB").filter(|value| !value.is_empty()),
+    )
+}
+
+fn transcripts_path_from(config: &AppConfig, env_value: Option<std::ffi::OsString>) -> PathBuf {
+    let configured = env_value
+        .map(PathBuf::from)
+        .or_else(|| config.storage.transcripts_path.clone());
+    match configured {
+        Some(path) if path.is_absolute() => path,
+        Some(path) => kkagent_config::default_config_dir().join(path),
+        None => kkagent_config::default_config_dir().join("transcripts.db"),
+    }
+}
+
+/// Why opening the database may fail where the process looks fine from the
+/// outside, and what to change.
+const TRANSCRIPT_OPEN_HINT: &str = "SQLite looks at the metadata of every parent directory of the \
+database path, which a strict sandbox profile can forbid (\"unable to open database file\"). \
+Allow reading those directories, or move the database somewhere the process may reach with \
+[storage] transcripts_path / KKAGENT_TRANSCRIPTS_DB, or let it run without persistence with \
+[storage] allow_in_memory = true (KKAGENT_ALLOW_IN_MEMORY_TRANSCRIPTS=1), or keep sessions in \
+the host with [storage] backend = \"host\"";
+
 fn open_transcript_with_policy(
     path: &Path,
     allow_in_memory: bool,
@@ -7949,7 +8244,8 @@ fn open_transcript_with_policy(
             ))
         }
         Err(error) => Err(anyhow::anyhow!(
-            "cannot open durable transcript DB: {error}; set KKAGENT_ALLOW_IN_MEMORY_TRANSCRIPTS=1 only for explicit degraded operation"
+            "cannot open durable transcript DB {}: {error}. {TRANSCRIPT_OPEN_HINT}",
+            path.display()
         )),
     }
 }
@@ -8030,11 +8326,12 @@ async fn build_server_state_with_shutdown(
 ) -> Result<Arc<ServerState>> {
     let startup_started = std::time::Instant::now();
     let (events, _) = tokio::sync::broadcast::channel(1024);
-    let allow_in_memory = std::env::var("KKAGENT_ALLOW_IN_MEMORY_TRANSCRIPTS")
-        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
-    let transcript_path = transcript_db_override
-        .unwrap_or_else(|| kkagent_config::default_config_dir().join("transcripts.db"));
+    let allow_in_memory = config.storage.allow_in_memory
+        || std::env::var("KKAGENT_ALLOW_IN_MEMORY_TRANSCRIPTS")
+            .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+    let transcript_path =
+        transcript_db_override.unwrap_or_else(|| resolve_transcripts_path(&config));
     let (shared_sqlite, persistence_durable, persistence_error) = match policy.storage {
         kkagent_config::StorageBackend::Sqlite => {
             open_transcript_with_policy(&transcript_path, allow_in_memory)?
@@ -8324,6 +8621,8 @@ async fn build_server_state_with_shutdown(
         persistence_error,
         started_at: std::time::Instant::now(),
         client_count: AtomicUsize::new(0),
+        http_ws_clients: AtomicUsize::new(0),
+        http_last_activity_ms: AtomicU64::new(0),
         shutdown_tx,
         rpc_event_subscribers: StdRwLock::new(HashMap::new()),
         rpc_event_subscriber_seq: AtomicUsize::new(0),
@@ -9728,7 +10027,7 @@ async fn handle_rpc_call(
             // The sink lives in this (server) process; fall back to a direct
             // read of the shared DB for embedded/in-memory edge cases.
             let store = kkagent_core::usage_store::global_snapshot().or_else(|| {
-                let path = kkagent_config::default_config_dir().join("transcripts.db");
+                let path = resolve_transcripts_path(&state.config());
                 kkagent_core::open_shared_sqlite(&path)
                     .ok()
                     .and_then(|shared| kkagent_core::UsageStore::from_shared(shared).ok())
@@ -11803,21 +12102,37 @@ async fn handle_rpc_call(
             if let Some(handle) = state.abort_registry.lock().await.remove(&session_id) {
                 handle.abort();
             }
-            if cancel_background {
-                // Session teardown: kill the background Bash jobs it owns.
-                state.bash_shells.cancel_session(&session_id).await;
-            }
+            // Session teardown: kill the background Bash jobs it owns and say
+            // which of them were really seen stopping.
+            let background = if cancel_background {
+                Some(
+                    state
+                        .bash_shells
+                        .cancel_session_and_wait(
+                            &session_id,
+                            Duration::from_millis(HTTP_CANCEL_WAIT_MS),
+                        )
+                        .await
+                        .as_json(),
+                )
+            } else {
+                None
+            };
             tracing::info!(
                 "Interrupt requested for session {} (source: {}, cancel_background: {})",
                 session_id,
                 source,
                 cancel_background
             );
-            Ok(serde_json::json!({
+            let mut reply = serde_json::json!({
                 "ok": true,
                 "source": source,
                 "cancel_background": cancel_background,
-            }))
+            });
+            if let Some(background) = background {
+                reply["background"] = background;
+            }
+            Ok(reply)
         }
         "session.btw" => {
             let session_id = params
@@ -13792,6 +14107,7 @@ async fn handle_rpc_call(
 #[cfg(test)]
 mod http_path_tests {
     use super::*;
+    use crate::runtime_http_tests::test_server_state;
 
     #[test]
     fn serializes_plan_resume_payload_with_full_content() {
@@ -14287,9 +14603,59 @@ mod http_path_tests {
             false,
         )
         .unwrap_err();
-        assert!(err.contains("outside trusted workspaces"));
+        assert_eq!(err.kind, kkagent_rpc::FsErrorKind::Forbidden);
+        assert!(err.message.contains("outside trusted workspaces"));
         std::fs::remove_dir_all(root).unwrap();
         std::fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[test]
+    fn missing_paths_are_not_found_inside_and_forbidden_outside() {
+        use kkagent_rpc::FsErrorKind;
+        let root = std::env::temp_dir().join(format!("kkagent-http-root-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let config = config_with_root(&root);
+
+        let inside = resolve_http_fs_path(
+            &config,
+            &root.join("absent.txt").display().to_string(),
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(inside.kind, FsErrorKind::NotFound, "{inside}");
+
+        // Neither a missing nor an existing path outside tells the caller
+        // anything about the file system beyond the workspace.
+        let missing_outside =
+            resolve_http_fs_path(&config, "/definitely/not/a/real/place.txt", false).unwrap_err();
+        assert_eq!(missing_outside.kind, FsErrorKind::Forbidden);
+        let climbing = resolve_http_fs_path(
+            &config,
+            &root.join("..").join("nowhere-at-all").display().to_string(),
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(climbing.kind, FsErrorKind::Forbidden);
+
+        // A new file may not climb out through `..` in the part that does
+        // not exist yet.
+        let escape = resolve_http_fs_path(
+            &config,
+            &root
+                .join("new")
+                .join("..")
+                .join("..")
+                .join("x")
+                .display()
+                .to_string(),
+            true,
+        )
+        .unwrap_err();
+        assert_eq!(escape.kind, FsErrorKind::Forbidden);
+
+        let empty = resolve_http_fs_path(&config, "  ", false).unwrap_err();
+        assert_eq!(empty.kind, FsErrorKind::BadRequest);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -14389,6 +14755,184 @@ mod http_path_tests {
         assert!(!session.transcript_rewrite_required);
         assert_eq!(session.persisted_message_count, 3);
         std::fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[test]
+    fn idle_hold_follows_the_configured_guards() {
+        let server = kkagent_config::ServerConfig::default();
+        let nothing = IdleSnapshot::default();
+        assert!(!idle_held(&server, &nothing));
+        for (name, snapshot) in [
+            (
+                "turn",
+                IdleSnapshot {
+                    active_turns: true,
+                    ..nothing
+                },
+            ),
+            (
+                "approval",
+                IdleSnapshot {
+                    pending_approvals: true,
+                    ..nothing
+                },
+            ),
+            (
+                "background",
+                IdleSnapshot {
+                    background_tasks: true,
+                    ..nothing
+                },
+            ),
+            (
+                "client",
+                IdleSnapshot {
+                    clients: true,
+                    ..nothing
+                },
+            ),
+            (
+                "stream",
+                IdleSnapshot {
+                    http_streams: true,
+                    ..nothing
+                },
+            ),
+        ] {
+            assert!(idle_held(&server, &snapshot), "{name} holds by default");
+        }
+
+        let relaxed = kkagent_config::ServerConfig {
+            idle_hold_for_turns: false,
+            idle_hold_for_approvals: false,
+            idle_hold_for_background_tasks: false,
+            ..server
+        };
+        assert!(!idle_held(
+            &relaxed,
+            &IdleSnapshot {
+                active_turns: true,
+                pending_approvals: true,
+                background_tasks: true,
+                ..nothing
+            }
+        ));
+        // A connected client or open stream holds regardless.
+        assert!(idle_held(
+            &relaxed,
+            &IdleSnapshot {
+                clients: true,
+                ..nothing
+            }
+        ));
+        assert!(idle_held(
+            &relaxed,
+            &IdleSnapshot {
+                http_streams: true,
+                ..nothing
+            }
+        ));
+    }
+
+    #[test]
+    fn transcripts_path_prefers_env_then_config_then_default() {
+        let mut config = AppConfig::default();
+        let default = kkagent_config::default_config_dir().join("transcripts.db");
+        assert_eq!(transcripts_path_from(&config, None), default);
+
+        config.storage.transcripts_path = Some(PathBuf::from("/data/kk/transcripts.db"));
+        assert_eq!(
+            transcripts_path_from(&config, None),
+            PathBuf::from("/data/kk/transcripts.db")
+        );
+        assert_eq!(
+            transcripts_path_from(&config, Some("/elsewhere/t.db".into())),
+            PathBuf::from("/elsewhere/t.db"),
+            "the environment wins over the config file"
+        );
+
+        config.storage.transcripts_path = Some(PathBuf::from("db/t.db"));
+        assert_eq!(
+            transcripts_path_from(&config, None),
+            kkagent_config::default_config_dir().join("db/t.db"),
+            "relative paths hang off the config directory"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_activity_is_remembered_for_the_idle_watchdog() {
+        let state = test_server_state().await;
+        assert!(state.since_last_http_activity().is_none());
+        state.note_http_activity();
+        let since = state.since_last_http_activity().expect("activity recorded");
+        assert!(since < Duration::from_secs(5));
+        let snapshot = state.idle_snapshot().await;
+        assert!(!snapshot.active_turns && !snapshot.http_streams);
+        state.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn open_event_streams_hold_the_server_up() {
+        use kkagent_rpc::HttpBackend as _;
+        let state = test_server_state().await;
+        let backend = AgentHttpBackend {
+            state: state.clone(),
+        };
+        assert!(!state.idle_snapshot().await.http_streams);
+        backend.ws_connection_changed(true);
+        assert!(state.idle_snapshot().await.http_streams);
+        backend.ws_connection_changed(false);
+        assert!(!state.idle_snapshot().await.http_streams);
+        // A stray close never wraps the counter around.
+        backend.ws_connection_changed(false);
+        assert!(!state.idle_snapshot().await.http_streams);
+        assert!(state.since_last_http_activity().is_some());
+        state.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn http_approvals_reach_only_the_session_waiting_for_them() {
+        use kkagent_rpc::HttpBackend as _;
+        let state = test_server_state().await;
+        let backend = AgentHttpBackend {
+            state: state.clone(),
+        };
+        let answer = |id: &'static str| {
+            let backend = &backend;
+            async move { backend.approve(id, "approve", None, None, None).await }
+        };
+
+        // An id nobody waits on is an error (404 over HTTP), not a success.
+        let ghost = answer("ghost").await.unwrap_err();
+        assert!(ghost.contains("no longer pending"), "{ghost}");
+
+        let (tx_a, mut rx_a) = mpsc::channel(4);
+        let (tx_b, mut rx_b) = mpsc::channel(4);
+        {
+            let mut txs = state.approval_txs.lock().await;
+            txs.insert("sess-a".into(), tx_a);
+            txs.insert("sess-b".into(), tx_b);
+        }
+        state
+            .remember_pending_tool_approval(kkagent_protocol::ApprovalRequest {
+                approval_id: "apr-1".into(),
+                session_id: "sess-a".into(),
+                tool_call_id: "call-1".into(),
+                tool_name: "Bash".into(),
+                action: "run".into(),
+                tool_input_display: None,
+                created_at: chrono::Utc::now(),
+            })
+            .await;
+        let reply = answer("apr-1").await.unwrap();
+        assert_eq!(reply["session_id"], "sess-a");
+        assert_eq!(rx_a.try_recv().unwrap().approval_id, "apr-1");
+        assert!(rx_b.try_recv().is_err(), "other sessions are not bothered");
+
+        // Answered once, gone: a second answer is refused.
+        let again = answer("apr-1").await.unwrap_err();
+        assert!(again.contains("no longer pending"), "{again}");
+        state.shutdown().await;
     }
 
     #[test]
@@ -15535,6 +16079,7 @@ mod runtime_http_tests {
         // Plain Esc: the job keeps running.
         let reply = interrupt_rpc(&state, session_id, serde_json::json!({})).await;
         assert_eq!(reply["cancel_background"], false);
+        assert!(reply.get("background").is_none());
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert_eq!(
             state
@@ -15554,6 +16099,16 @@ mod runtime_http_tests {
         )
         .await;
         assert_eq!(reply["cancel_background"], true);
+        assert_eq!(
+            reply["background"]["requested"].as_array().map(Vec::len),
+            Some(1),
+            "the reply names the job it cancelled: {reply}"
+        );
+        assert_eq!(
+            reply["background"]["stopped"], reply["background"]["requested"],
+            "and says it was seen stopping: {reply}"
+        );
+        assert_eq!(reply["background"]["still_running"], serde_json::json!([]));
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while !state
             .bash_shells

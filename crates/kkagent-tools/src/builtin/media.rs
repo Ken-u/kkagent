@@ -62,6 +62,18 @@ Audio and video currently return metadata only. Files are never modified."
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow::anyhow!("Missing path"))?;
         let path = resolve_path(path_str, &ctx.working_dir);
+        // Same boundary as `Read`: `path_guard_mode = "strict"` confines media
+        // reads to the workspace and `tools.additional_dirs`, and the check runs
+        // before the file is touched so it does not reveal whether a path outside
+        // exists.
+        if let Err(reason) = ctx.check_path_guard(&path) {
+            return Ok(ToolOutput::error(reason));
+        }
+        if ctx.sensitive_check_enabled() && crate::path_policy::is_sensitive_path(&path) {
+            return Ok(ToolOutput::error(format!(
+                "Refusing to read sensitive file `{path_str}`. Ask the user to provide only the specific non-secret value needed."
+            )));
+        }
         let metadata = match tokio::fs::metadata(&path).await {
             Ok(metadata) if metadata.is_file() => metadata,
             Ok(_) => return Ok(ToolOutput::error(format!("Not a file: {path_str}"))),
@@ -542,6 +554,150 @@ mod tests {
         assert!(!output.is_error);
         assert!(!output.content.contains(&B64.encode(b"fake video")));
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn strict_context(dir: &Path, additional: &[&Path]) -> ToolContext {
+        let mut ctx = context(dir);
+        ctx.tools_config.path_guard_mode = "strict".into();
+        ctx.tools_config.additional_dirs = additional.iter().map(|p| p.to_path_buf()).collect();
+        ctx
+    }
+
+    fn temp_dir(label: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("kkagent-media-{label}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_png(path: &Path) {
+        image::RgbImage::new(8, 8).save(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn strict_mode_refuses_media_outside_the_workspace() {
+        let workspace = temp_dir("ws");
+        let outside = temp_dir("outside");
+        write_png(&outside.join("secret.png"));
+        let ctx = strict_context(&workspace, &[]);
+
+        for target in [
+            outside.join("secret.png").display().to_string(),
+            format!(
+                "../{}/secret.png",
+                outside.file_name().unwrap().to_string_lossy()
+            ),
+        ] {
+            let output = ReadMediaFileTool
+                .execute(json!({"path": target}), &ctx)
+                .await
+                .unwrap();
+            assert!(output.is_error, "{target} must be refused");
+            assert!(
+                output.content.contains("path_guard_mode"),
+                "{}",
+                output.content
+            );
+            assert!(output.images.is_empty(), "no image may leave the guard");
+        }
+        // A missing file outside does not reveal whether it exists.
+        let missing = ReadMediaFileTool
+            .execute(
+                json!({"path": outside.join("nope.png").display().to_string()}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(
+            missing.content.contains("path_guard_mode"),
+            "{}",
+            missing.content
+        );
+
+        std::fs::remove_dir_all(workspace).unwrap();
+        std::fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[tokio::test]
+    async fn strict_mode_allows_workspace_and_additional_dirs() {
+        let workspace = temp_dir("ws");
+        let extra = temp_dir("extra");
+        write_png(&workspace.join("inside.png"));
+        write_png(&extra.join("shared.png"));
+        let ctx = strict_context(&workspace, &[extra.as_path()]);
+
+        let inside = ReadMediaFileTool
+            .execute(json!({"path": "inside.png"}), &ctx)
+            .await
+            .unwrap();
+        assert!(!inside.is_error, "{}", inside.content);
+        assert_eq!(inside.images.len(), 1);
+        let shared = ReadMediaFileTool
+            .execute(
+                json!({"path": extra.join("shared.png").display().to_string()}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!shared.is_error, "{}", shared.content);
+
+        std::fs::remove_dir_all(workspace).unwrap();
+        std::fs::remove_dir_all(extra).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn strict_mode_refuses_a_symlink_that_leaves_the_workspace() {
+        let workspace = temp_dir("ws");
+        let outside = temp_dir("outside");
+        write_png(&outside.join("secret.png"));
+        std::os::unix::fs::symlink(outside.join("secret.png"), workspace.join("link.png")).unwrap();
+        std::os::unix::fs::symlink(&outside, workspace.join("dir")).unwrap();
+        let ctx = strict_context(&workspace, &[]);
+
+        for target in ["link.png", "dir/secret.png"] {
+            let output = ReadMediaFileTool
+                .execute(json!({"path": target}), &ctx)
+                .await
+                .unwrap();
+            assert!(output.is_error, "{target} escapes through a symlink");
+            assert!(output.images.is_empty());
+        }
+
+        std::fs::remove_dir_all(workspace).unwrap();
+        std::fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[tokio::test]
+    async fn default_warn_mode_keeps_reading_outside_the_workspace() {
+        let workspace = temp_dir("ws");
+        let outside = temp_dir("outside");
+        write_png(&outside.join("far.png"));
+        let output = ReadMediaFileTool
+            .execute(
+                json!({"path": outside.join("far.png").display().to_string()}),
+                &context(&workspace),
+            )
+            .await
+            .unwrap();
+        assert!(!output.is_error, "{}", output.content);
+        assert_eq!(output.images.len(), 1);
+
+        std::fs::remove_dir_all(workspace).unwrap();
+        std::fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[tokio::test]
+    async fn sensitive_files_are_refused_by_the_tool_itself() {
+        let workspace = temp_dir("ws");
+        std::fs::write(workspace.join(".env"), b"KEY=value").unwrap();
+        let output = ReadMediaFileTool
+            .execute(json!({"path": ".env"}), &context(&workspace))
+            .await
+            .unwrap();
+        assert!(output.is_error);
+        assert!(output.content.contains("sensitive"), "{}", output.content);
+        std::fs::remove_dir_all(workspace).unwrap();
     }
 
     #[test]

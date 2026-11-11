@@ -1184,25 +1184,17 @@ impl AgentLoop {
         session: &mut Session,
         approval_id: &str,
     ) -> ApprovalResponse {
-        let timeout_secs = self
-            .config
-            .background
-            .as_ref()
-            .and_then(|background| background.approval_timeout_s)
-            .unwrap_or(900)
-            .clamp(1, 86_400);
-        match tokio::time::timeout(
-            Duration::from_secs(timeout_secs),
-            session.wait_approval(approval_id),
-        )
-        .await
-        {
+        let timeout_secs = kkagent_config::approval_timeout_secs(self.config.background.as_ref());
+        match super::wait_within(timeout_secs, session.wait_approval(approval_id)).await {
             Ok(response) => response,
             Err(_) => ApprovalResponse {
                 approval_id: approval_id.to_string(),
                 decision: ApprovalDecision::Rejected,
                 scope: None,
-                feedback: Some(format!("approval timed out after {timeout_secs} seconds")),
+                feedback: Some(format!(
+                    "approval timed out after {} seconds",
+                    timeout_secs.unwrap_or_default()
+                )),
                 selected_label: Some(crate::plan_review::LABEL_REVISE.into()),
             },
         }

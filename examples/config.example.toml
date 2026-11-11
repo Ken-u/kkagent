@@ -102,11 +102,11 @@ max_running_tasks = 4
 keep_alive_on_exit = false
 # bash_auto_background_on_timeout = true
 # bash_task_timeout_s = 120
-# approval_timeout_s = 900
+# approval_timeout_s = 900   # 到期按拒绝处理；0 = 不限时（宿主/用户负责回答或取消）
 
 [sandbox]
 mode = "auto"       # auto | workspace | process | disabled
-network = true
+network = false     # 默认 false（最小权限）；构建/测试需要联网时显式设为 true
 memory_mb = 4096
 cpu_seconds = 600
 max_processes = 128 # Windows Job Object only; Linux/macOS cannot enforce this per process tree
@@ -138,6 +138,8 @@ max_processes = 128 # Windows Job Object only; Linux/macOS cannot enforce this p
 # `_kkagent/store/*` 提供；宿主不可用时 turn 失败，不会回退本地库）。
 # [storage]
 # backend = "sqlite"
+# transcripts_path = "/data/kkagent/transcripts.db"  # 默认 <配置目录>/transcripts.db；环境变量 KKAGENT_TRANSCRIPTS_DB 优先
+# allow_in_memory = false   # true：打不开数据库时改用内存库继续运行（不持久化）
 
 # [[permission.rules]]
 # decision = "allow" # allow | deny | ask
@@ -167,6 +169,10 @@ max_processes = 128 # Windows Job Object only; Linux/macOS cannot enforce this p
 [server]
 idle_timeout_secs = 1800
 standalone = true
+# 空闲计时之外，下列情况默认也不退出（退出会中止它们）；设为 false 可放开：
+# idle_hold_for_turns = true             # 有进行中的 turn
+# idle_hold_for_approvals = true         # 有待决的审批或提问
+# idle_hold_for_background_tasks = true  # 有运行中的后台命令/子 Agent
 
 # stdio MCP
 # [mcp_servers.filesystem]

@@ -292,7 +292,20 @@ async fn scan_dir(root: &Path, output: &mut BTreeMap<String, SkillEntry>) {
         let Ok(file_type) = item.file_type().await else {
             continue;
         };
-        if !file_type.is_dir() || file_type.is_symlink() {
+        if file_type.is_symlink() {
+            // Skill directories are never followed through links (a skill
+            // must live inside the skills root). Say so instead of silently
+            // dropping it: plugin directories behave differently.
+            if path.is_dir() {
+                tracing::warn!(
+                    "skill directory {} is a symbolic link and is ignored; \
+                     put the directory itself under the skills root",
+                    path.display()
+                );
+            }
+            continue;
+        }
+        if !file_type.is_dir() {
             continue;
         }
         let skill_file = path.join("SKILL.md");

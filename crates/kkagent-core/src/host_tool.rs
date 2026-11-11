@@ -100,7 +100,7 @@ impl Tool for HostTool {
             .request(METHOD_HOST_TOOL_CALL, params, options)
             .await
         {
-            Ok(result) => Ok(tool_output_from_result(&result)),
+            Ok(result) => Ok(tool_output_from_result(&result, &ctx.image)),
             Err(error @ (HostChannelError::Cancelled | HostChannelError::TimedOut)) => {
                 // Tell the host which call to stop (`$/cancel_request` already
                 // told it which request).
@@ -127,52 +127,123 @@ impl Tool for HostTool {
     }
 }
 
+/// Largest image a host tool result may carry, measured on the decoded bytes
+/// before kkagent re-encodes it to the provider-safe size. Bigger images are
+/// replaced by a placeholder; the host should downscale or crop them.
+pub const MAX_HOST_IMAGE_BYTES: usize = 10 * 1024 * 1024;
+/// Most images kept from one result; the rest are named in the text.
+pub const MAX_HOST_IMAGES_PER_RESULT: usize = 8;
+
 /// Map the host's `_kkagent/tool/call` result to a tool output.
 ///
 /// Accepted shapes: `{"content": "text"}`, `{"content": [{"type":"text",
 /// "text": ".."}, ..]}` (ACP content blocks, optionally wrapped as
 /// `{"type":"content","content":{..}}`), and a bare string. `isError: true`
 /// marks a failed call. Anything else is passed to the model as JSON.
-pub fn tool_output_from_result(result: &Value) -> ToolOutput {
+///
+/// Inline image blocks (`{"type":"image","data":"<base64>","mimeType":".."}`,
+/// also accepted as a `data:` URI) reach the model as images, normalized like
+/// the images of any other tool and capped by [`MAX_HOST_IMAGE_BYTES`] and
+/// [`MAX_HOST_IMAGES_PER_RESULT`]. An image that is refused leaves a
+/// `[image omitted: ...]` line in the text instead.
+pub fn tool_output_from_result(
+    result: &Value,
+    image_config: &kkagent_config::ImageConfig,
+) -> ToolOutput {
     let is_error = result
         .get("isError")
         .or_else(|| result.get("is_error"))
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let mut images = Vec::new();
+    let mut blocks = BlockReader {
+        image_config,
+        images: &mut images,
+        seen: 0,
+    };
     let text = match result {
         Value::String(text) => text.clone(),
         Value::Object(object) => match object.get("content") {
             Some(Value::String(text)) => text.clone(),
-            Some(Value::Array(blocks)) => blocks
+            Some(Value::Array(items)) => items
                 .iter()
-                .map(content_block_text)
+                .map(|block| blocks.text(block))
                 .collect::<Vec<_>>()
                 .join("\n"),
-            Some(block @ Value::Object(_)) => content_block_text(block),
+            Some(block @ Value::Object(_)) => blocks.text(block),
             _ => result.to_string(),
         },
         other => other.to_string(),
     };
-    if is_error {
+    let mut output = if is_error {
         ToolOutput::error(text)
     } else {
         ToolOutput::success(text)
-    }
+    };
+    output.images = images;
+    output
 }
 
-fn content_block_text(block: &Value) -> String {
-    if let Some(text) = block.as_str() {
-        return text.to_string();
+/// Walks content blocks, collecting images and rendering everything else as
+/// text.
+struct BlockReader<'a> {
+    image_config: &'a kkagent_config::ImageConfig,
+    images: &'a mut Vec<kkagent_tools::MediaOutput>,
+    /// Image blocks met so far, accepted or not.
+    seen: usize,
+}
+
+impl BlockReader<'_> {
+    fn text(&mut self, block: &Value) -> String {
+        if let Some(text) = block.as_str() {
+            return text.to_string();
+        }
+        if let Some(text) = block.get("text").and_then(Value::as_str) {
+            return text.to_string();
+        }
+        if block.get("type").and_then(Value::as_str) == Some("image") {
+            return self.image(block);
+        }
+        if let Some(inner) = block.get("content") {
+            return self.text(inner);
+        }
+        match block.get("type").and_then(Value::as_str) {
+            Some(kind) => format!("[{kind} content omitted]"),
+            None => block.to_string(),
+        }
     }
-    if let Some(text) = block.get("text").and_then(Value::as_str) {
-        return text.to_string();
-    }
-    if let Some(inner) = block.get("content") {
-        return content_block_text(inner);
-    }
-    match block.get("type").and_then(Value::as_str) {
-        Some(kind) => format!("[{kind} content omitted]"),
-        None => block.to_string(),
+
+    fn image(&mut self, block: &Value) -> String {
+        self.seen += 1;
+        let index = self.seen;
+        let omitted = |reason: &str| format!("[image {index} omitted: {reason}]");
+        if self.images.len() >= MAX_HOST_IMAGES_PER_RESULT {
+            return omitted(&format!(
+                "a result carries at most {MAX_HOST_IMAGES_PER_RESULT} images"
+            ));
+        }
+        let Some(data) = block.get("data").and_then(Value::as_str) else {
+            return omitted("only inline base64 `data` is supported");
+        };
+        // A `data:` URI is accepted as well as plain base64.
+        let data = data
+            .strip_prefix("data:")
+            .and_then(|rest| rest.split_once(','))
+            .map_or(data, |(_, payload)| payload);
+        // Base64 is 4 characters per 3 bytes: refuse before decoding anything.
+        let decoded_len = data.len() / 4 * 3;
+        if decoded_len > MAX_HOST_IMAGE_BYTES {
+            return omitted(&format!(
+                "about {decoded_len} bytes exceeds the {MAX_HOST_IMAGE_BYTES}-byte limit"
+            ));
+        }
+        match kkagent_tools::builtin::media::normalize_external_image(data, self.image_config) {
+            Ok(image) => {
+                self.images.push(image);
+                format!("[image {index} attached]")
+            }
+            Err(error) => omitted(&error.to_string()),
+        }
     }
 }
 
@@ -381,24 +452,111 @@ mod tests {
 
     #[test]
     fn results_are_read_from_every_documented_shape() {
-        let text = |value: Value| tool_output_from_result(&value).content;
+        let config = kkagent_config::ImageConfig::default();
+        let text = |value: Value| tool_output_from_result(&value, &config).content;
         assert_eq!(text(json!("plain")), "plain");
         assert_eq!(text(json!({"content": "a"})), "a");
         assert_eq!(
             text(json!({"content": [
                 {"type": "text", "text": "one"},
                 {"type": "content", "content": {"type": "text", "text": "two"}},
-                {"type": "image", "data": "..."},
+                {"type": "resource", "uri": "file:///x"},
             ]})),
-            "one\ntwo\n[image content omitted]"
+            "one\ntwo\n[resource content omitted]"
         );
         assert_eq!(
             text(json!({"content": {"type": "text", "text": "solo"}})),
             "solo"
         );
         assert_eq!(text(json!({"ok": true})), r#"{"ok":true}"#);
-        assert!(tool_output_from_result(&json!({"content": "x", "isError": true})).is_error);
-        assert!(!tool_output_from_result(&json!({"content": "x"})).is_error);
+        assert!(
+            tool_output_from_result(&json!({"content": "x", "isError": true}), &config).is_error
+        );
+        assert!(!tool_output_from_result(&json!({"content": "x"}), &config).is_error);
+    }
+
+    fn png_base64(width: u32, height: u32) -> String {
+        use base64::Engine;
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgb8(image::RgbImage::new(width, height))
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        base64::engine::general_purpose::STANDARD.encode(png)
+    }
+
+    #[test]
+    fn image_blocks_reach_the_model_as_images() {
+        let config = kkagent_config::ImageConfig::default();
+        let data = png_base64(4, 4);
+        let output = tool_output_from_result(
+            &json!({"content": [
+                {"type": "text", "text": "chart:"},
+                {"type": "image", "data": data, "mimeType": "image/png"},
+                {"type": "content", "content": {"type": "image", "data": format!("data:image/png;base64,{data}")}},
+            ]}),
+            &config,
+        );
+        assert!(!output.is_error);
+        assert_eq!(output.images.len(), 2, "{}", output.content);
+        assert!(output
+            .images
+            .iter()
+            .all(|image| image.media_type == "image/jpeg"));
+        assert_eq!(
+            output.content,
+            "chart:\n[image 1 attached]\n[image 2 attached]"
+        );
+        assert!(
+            !output.content.contains(&data),
+            "the base64 payload never enters the text"
+        );
+    }
+
+    #[test]
+    fn refused_images_leave_a_reason_not_a_silent_drop() {
+        let config = kkagent_config::ImageConfig::default();
+        // Not an image at all.
+        let broken = tool_output_from_result(
+            &json!({"content": [{"type": "image", "data": "bm90IGFuIGltYWdl"}]}),
+            &config,
+        );
+        assert!(broken.images.is_empty());
+        assert!(
+            broken.content.starts_with("[image 1 omitted: "),
+            "{}",
+            broken.content
+        );
+        // Referenced by URI only.
+        let by_uri = tool_output_from_result(
+            &json!({"content": [{"type": "image", "uri": "file:///x.png"}]}),
+            &config,
+        );
+        assert!(by_uri.images.is_empty());
+        assert!(
+            by_uri.content.contains("inline base64"),
+            "{}",
+            by_uri.content
+        );
+        // Over the size limit: refused before anything is decoded.
+        let oversized = "A".repeat((MAX_HOST_IMAGE_BYTES / 3 + 1) * 4);
+        let big = tool_output_from_result(
+            &json!({"content": [{"type": "image", "data": oversized}]}),
+            &config,
+        );
+        assert!(big.images.is_empty());
+        assert!(big.content.contains("limit"), "{}", big.content);
+    }
+
+    #[test]
+    fn a_result_keeps_at_most_a_bounded_number_of_images() {
+        let config = kkagent_config::ImageConfig::default();
+        let data = png_base64(2, 2);
+        let blocks: Vec<Value> = (0..MAX_HOST_IMAGES_PER_RESULT + 2)
+            .map(|_| json!({"type": "image", "data": data}))
+            .collect();
+        let output = tool_output_from_result(&json!({"content": blocks}), &config);
+        assert_eq!(output.images.len(), MAX_HOST_IMAGES_PER_RESULT);
+        assert!(output.content.contains("at most"), "{}", output.content);
     }
 
     #[test]

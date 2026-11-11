@@ -268,6 +268,57 @@ impl BackgroundShellManager {
         }
     }
 
+    /// Cancel every running job of `session_id` and wait up to `wait` to see
+    /// which of them really stopped. Unlike [`Self::cancel_session`] the answer
+    /// says what happened: a job that is still running after the window is
+    /// reported, never assumed gone.
+    pub async fn cancel_session_and_wait(
+        &self,
+        session_id: &str,
+        wait: std::time::Duration,
+    ) -> BackgroundCancelReport {
+        let mut requested: Vec<String> = {
+            let jobs = self.jobs.lock().await;
+            jobs.iter()
+                .filter(|(_, job)| {
+                    job.session_id == session_id && job.status == ShellStatus::Running
+                })
+                .map(|(id, job)| {
+                    job.cancel.cancel();
+                    id.clone()
+                })
+                .collect()
+        };
+        requested.sort();
+        let deadline = std::time::Instant::now() + wait;
+        loop {
+            let still_running: Vec<String> = {
+                let jobs = self.jobs.lock().await;
+                requested
+                    .iter()
+                    .filter(|id| {
+                        jobs.get(*id)
+                            .is_some_and(|job| job.status == ShellStatus::Running)
+                    })
+                    .cloned()
+                    .collect()
+            };
+            if still_running.is_empty() || std::time::Instant::now() >= deadline {
+                let stopped = requested
+                    .iter()
+                    .filter(|id| !still_running.contains(id))
+                    .cloned()
+                    .collect();
+                return BackgroundCancelReport {
+                    requested,
+                    stopped,
+                    still_running,
+                };
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
+
     async fn append_output(&self, id: &str, chunk: &str) {
         let output_log = {
             let mut jobs = self.jobs.lock().await;
@@ -485,6 +536,27 @@ impl BackgroundShellManager {
             }
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
+    }
+}
+
+/// What cancelling a session's background jobs actually achieved.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BackgroundCancelReport {
+    /// Jobs that were running and got a cancel request.
+    pub requested: Vec<String>,
+    /// Of those, the ones observed to have stopped within the wait.
+    pub stopped: Vec<String>,
+    /// The ones still running when the wait ended.
+    pub still_running: Vec<String>,
+}
+
+impl BackgroundCancelReport {
+    pub fn as_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "requested": self.requested,
+            "stopped": self.stopped,
+            "still_running": self.still_running,
+        })
     }
 }
 
@@ -2059,6 +2131,48 @@ mod tests {
         })
         .await
         .expect("stopped jobs must leave the running list");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelling_a_session_reports_what_actually_stopped() {
+        redirect_bg_output_logs();
+        let tool = BashTool::default();
+        let first = start_sleep_job(&tool, "session-cancel", "first").await;
+        let second = start_sleep_job(&tool, "session-cancel", "second").await;
+        let bystander = start_sleep_job(&tool, "session-other", "other").await;
+
+        let report = tool
+            .backgrounds
+            .cancel_session_and_wait("session-cancel", std::time::Duration::from_secs(5))
+            .await;
+        let mut expected = vec![first.clone(), second.clone()];
+        expected.sort();
+        assert_eq!(report.requested, expected);
+        assert_eq!(report.stopped, expected, "both jobs were seen to stop");
+        assert!(report.still_running.is_empty());
+        assert!(tool
+            .backgrounds
+            .list_running_for_session("session-cancel")
+            .await
+            .is_empty());
+        assert_eq!(
+            tool.backgrounds
+                .list_running_for_session("session-other")
+                .await
+                .len(),
+            1,
+            "another session's job is untouched"
+        );
+        assert_eq!(report.as_json()["stopped"].as_array().unwrap().len(), 2);
+
+        // Nothing left to cancel: an empty, honest report.
+        let again = tool
+            .backgrounds
+            .cancel_session_and_wait("session-cancel", std::time::Duration::from_millis(100))
+            .await;
+        assert_eq!(again, BackgroundCancelReport::default());
+        tool.backgrounds.stop(&bystander).await;
     }
 
     #[cfg(unix)]

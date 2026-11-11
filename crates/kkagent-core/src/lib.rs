@@ -45,6 +45,7 @@ pub mod token_counting;
 pub mod tool_dedupe;
 pub mod tool_policy;
 pub mod tool_results;
+pub mod tool_review;
 pub mod tool_scheduler;
 pub mod transcript;
 pub mod trash;

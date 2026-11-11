@@ -12,8 +12,8 @@ kkagent --config ~/.kkagent/config.toml acp --role reviewer --no-plugins
 ### 标准 ACP v1
 
 - `initialize`：返回 `protocolVersion: 1`（客户端请求更高版本时回落到 1）、`agentInfo`、`authMethods` 与 `agentCapabilities`（`loadSession`、`promptCapabilities`、`mcpCapabilities`、`sessionCapabilities.{list,resume,close}`）。`clientInfo` / `clientCapabilities` 会被保存。
-- 会话管理：`session/new`（`cwd`、`mcpServers`、可选 `initialMessage`）返回 `sessionId` 与 `modes: {currentModeId, availableModes}`；`session/load` 恢复历史会话并按 `user_message_chunk` / `agent_message_chunk` 回放；`session/resume` 只重新附着、不回放；`session/list`（可按 `cwd` 过滤）；`session/close` 停止当前工作并释放运行时资源，会话仍可恢复；`session/set_mode`（`modeId`）与 `session/set_model`（`modelId`）。未知会话统一返回 `-32002`。
-- `session/prompt` 接受官方 content block 数组，turn 期间用 `session/update` 流式推送 `agent_message_chunk`、`agent_thought_chunk`、`tool_call`（`title` / `kind` / `status` / `rawInput`）、`tool_call_update`（`status` 为 `in_progress` / `completed` / `failed`，`content` 为 `{type: "content", content}` 包装，另有 `rawOutput`）、`plan`、`current_mode_update`、`session_info_update`、`usage_update` 与 `available_commands_update`。**一个 turn 的所有更新都先于它的 `session/prompt` 响应送达。** 响应为 `{stopReason}`：`end_turn` / `max_tokens` / `max_turn_requests`（本轮用完 `max_steps_per_turn`）/ `refusal` / `cancelled`。
+- 会话管理：`session/new`（`cwd`、`mcpServers`、可选 `initialMessage`）返回 `sessionId` 与 `modes: {currentModeId, availableModes}`；`session/load` 恢复历史会话并按 `user_message_chunk` / `agent_message_chunk` 回放（自己保存对话的宿主可在 `_meta["kkagent/host"]` 里带 `"replay": false` 跳过回放，会话照常加载）；`session/resume` 只重新附着、不回放；`session/list`（可按 `cwd` 过滤）；`session/close` 停止当前工作并释放运行时资源，会话仍可恢复；`session/set_mode`（`modeId`）与 `session/set_model`（`modelId`）。未知会话统一返回 `-32002`。
+- `session/prompt` 接受官方 content block 数组，turn 期间用 `session/update` 流式推送 `agent_message_chunk`、`agent_thought_chunk`、`tool_call`（`title` / `kind` / `status` / `rawInput`）、`tool_call_update`（`status` 为 `in_progress` / `completed` / `failed`；结束的更新**总是同时**带两处结果：`content` 里恰好一个 `{type: "content", content: {type: "text", text}}` 块，和等值的字符串 `rawOutput`，空输出时二者都是空串，宿主读哪一处都一样；`in_progress` 更新不带结果）、`plan`、`current_mode_update`、`session_info_update`、`usage_update` 与 `available_commands_update`。**一个 turn 的所有更新都先于它的 `session/prompt` 响应送达。** 响应为 `{stopReason}`：`end_turn` / `max_tokens` / `max_turn_requests`（本轮用完 `max_steps_per_turn`）/ `refusal` / `cancelled`。
 - 取消：`session/cancel` 是通知（无响应）；正在进行的 `session/prompt` 以 `stopReason: "cancelled"` 结束，并同时放弃它等待中的 `session/request_permission` / `session/request_input`（客户端会收到 `$/cancel_request`）。`$/cancel_request` 作用于 `session/prompt` 时同样走协作取消；作用于其他请求时立即以 `-32800` 应答。在没有 turn 运行时发出的取消不会影响下一个 turn。
 - 工具批准映射为 agent→client 请求 `session/request_permission`：`toolCall`（`toolCallId` / `title` / `kind` / `status` / `rawInput`）、`options`（`optionId` 为 `allow_once` / `allow_always` / `reject_once` / `reject_always`，`name`，`kind`），客户端以 `{outcome: {outcome: "selected", optionId}}` 或 `{outcome: {outcome: "cancelled"}}` 响应。请求没有超时：用户可以慢慢决定，`session/cancel` 或连接断开会终止等待。`cancelled` 不授予任何权限，也不会被记住。
 - 用户提问映射为 `session/request_input`（kkagent 扩展：text 或 select，多选遵循 `multiSelect`），响应为 `{content: [...]}` 或 `{canceled: true}`。
@@ -29,12 +29,12 @@ ACP 进程的 stdout 是协议通道，不能混入普通日志；诊断信息�
 
 ```jsonc
 // initialize 请求
-{"_meta": {"kkagent/host": {"tools": true, "store": {"sessions": true, "events": true}}}}
+{"_meta": {"kkagent/host": {"tools": true, "toolReview": true, "store": {"sessions": true, "events": true}}}}
 // initialize 响应（只对说了这个扩展的客户端）
 {"_meta": {"kkagent/host": {"tools": true, "store": {"sessions": false, "events": false}}}}
 ```
 
-按会话的设置放在 `session/new`、`session/load`、`session/resume` 的 `_meta["kkagent/host"]`；字段拼写错误会被拒绝，而不是静默丢掉一条限制：
+按会话的设置放在 `session/new`、`session/load`、`session/resume` 的 `_meta["kkagent/host"]`；未知字段（包括 `hostTools` 条目、`extensions`、`toolReview` 里的拼写错误）会以 `-32602` 拒绝，而不是静默丢掉一条限制：
 
 | 字段 | 含义 |
 | --- | --- |
@@ -43,6 +43,8 @@ ACP 进程的 stdout 是协议通道，不能混入普通日志；诊断信息�
 | `hostTools` | 宿主注入的工具（见下） |
 | `extensions` | `loadProjectInstructions` / `loadHooks` / `loadPlugins`，只能关闭 |
 | `permissionMode` | 初始权限模式 `manual` / `yolo` / `auto` |
+| `toolReview` | `{mode: "off"｜"mutating"｜"all", timeoutSecs?}`：放行前先问宿主（见下），只能收紧 |
+| `replay` | 仅 `session/load`：`false` 不回放历史（默认 `true`） |
 
 **宿主工具。** `hostTools: [{name, description, inputSchema, readOnly, approval, timeoutSecs}]`。宿主必须在 `initialize` 声明 `tools: true`。工具名只能是 `[A-Za-z0-9_-]{1,64}`，不能与内置、插件或 MCP 工具同名（不允许遮蔽），`mcp__` 前缀保留。它们是普通工具：受白名单过滤，出现在模型的工具列表中。模型调用时，kkagent 向宿主发请求 `_kkagent/tool/call`：
 
@@ -53,7 +55,20 @@ ACP 进程的 stdout 是协议通道，不能混入普通日志；诊断信息�
 {"result": {"content": "pong"}}
 ```
 
+宿主工具结果可以带图片：content block 数组里的 `{type: "image", data: <base64>, mimeType}` 会作为图片块交给模型（按与其他工具图片相同的方式规整；单张解码后最大 10 MiB，一次结果最多 8 张，被拒绝的图片在文本里留下一行 `[image N omitted: 原因]`，其余内容照常保留）。
+
 `approval: "host"`（默认）表示宿主自行决定是否执行，kkagent 不再询问；`"ask"` 先走 kkagent 的权限链（`session/request_permission`）。Plan 模式拒绝非只读的宿主工具。取消 turn 时 kkagent 对该请求发 `$/cancel_request`，并发通知 `_kkagent/tool/cancel {sessionId, toolCallId}`；超过 `timeoutSecs`（默认 600）同样取消。
+
+**放行前通知宿主（`toolReview`）。** `yolo` / `auto` 模式下工具不经审批直接运行，宿主因此看不到、也拦不住调用。想要“自动放行但每次通知宿主、宿主可否决”的宿主，在 `initialize` 声明 `toolReview: true`，并在会话参数里设置 `toolReview: {mode}`：`mutating` 只审查非只读工具，`all` 审查全部（含 `Read` 等），`off`（默认）不审查。每个被审查的调用在执行前发出一个 agent→client 请求：
+
+```jsonc
+{"method": "_kkagent/tool/review", "params": {"sessionId": "…", "toolCallId": "…", "name": "Bash", "input": {…}, "cwd": "…", "readOnly": false}}
+// host → agent
+{"result": {"decision": "allow"}}                       // 放行
+{"result": {"decision": "deny", "reason": "写入 /etc 被策略禁止"}}   // 否决：reason 作为错误结果交给模型
+```
+
+审查发生在白名单、PreToolCall hook 与参数校验**之后**、真正执行**之前**，所以宿主看到的就是即将执行的输入，且 yolo 也绕不过。**关闭失败**：宿主没有声明能力、请求出错、超时（`timeoutSecs`，默认 300 秒，最大 24 小时）或回复无法解析都按否决处理。子 Agent 沿用同一审查；无法逐次审查的路径（`acp:` 外部 Agent 模型别名、外部 ACP 子 Agent、goal judge 的工具循环）在启用审查的会话里被禁用。未设置 `toolReview` 的会话行为不变。
 
 **会话与事件存储。** `[storage] backend = "host"`（或 `kkagent acp --storage host`）让宿主成为会话、消息和事件的唯一存储。宿主必须声明 `store.sessions: true`（否则 `initialize` 报 `-32602`），本地 SQLite 不会写入任何会话内容；宿主没有连接或请求失败时**关闭失败**（turn 报错），绝不回退到本地库。kkagent 通过 agent→client 请求访问存储：
 
@@ -320,6 +335,8 @@ triggers: [review, release]
 按 references/checklist.md 执行检查。
 ```
 
+Skill 目录**不会**经符号链接加载：skills 根目录下作为符号链接的子目录会被跳过（日志里有一条警告），请把目录本身放进去；这与手工放置的插件目录不同（见[插件](#插件)）。
+
 Skill 名只能包含 ASCII 字母、数字、`-`、`_`。`SKILL.md` 最大 256 KiB；目录中的资源会被列给模型，`Skill` 工具可用 `resource` 参数读取最大 1 MiB 的 UTF-8 文本资源，并阻止绝对路径、`..` 和符号链接逃逸。每次列出或加载都会重新扫描，因此编辑无需重启。
 
 同名优先级为项目 `.kkagent` > 项目 `.agents` > 项目 `.kimi` > 插件市场安装的 Skill（`~/.kkagent/plugins/skills/`）> `extra_skill_dirs` > 用户目录。独立 Server 会按每个 Session workspace 单独发现。Skill 不会绕过工具权限；`merge_all_available_skills = true` 会增加初始上下文占用。
@@ -358,7 +375,7 @@ Hook 进程工作目录是当前 workspace，并收到 `KKAGENT_HOOK_EVENT` 和 
 > 本节是机制原理参考。
 
 插件从 `~/.kkagent/plugins/<directory>/` 发现，也兼容
-`~/.kkagent/plugins/managed/<id>/` 布局。Manifest 按以下优先级读取：
+`~/.kkagent/plugins/managed/<id>/` 布局。手工放置的插件目录**会跟随符号链接**（方便把开发中的插件链接进来），无论有没有 `installed.json`；`managed/` 下的目录在存在 `installed.json` 时必须解析到 `managed/` 内部，指向外部的符号链接会被忽略（并记录警告）。市场安装的 ZIP 里的符号链接一律拒绝。对比：Skill 目录从不跟随符号链接。Manifest 按以下优先级读取：
 
 1. `kk.plugin.json`；
 2. `.kk-plugin/plugin.json`；

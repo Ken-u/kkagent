@@ -17,6 +17,9 @@ pub const HOST_META_KEY: &str = "kkagent/host";
 pub const METHOD_HOST_TOOL_CALL: &str = "_kkagent/tool/call";
 /// Agent→client notification: a host tool call was cancelled.
 pub const METHOD_HOST_TOOL_CANCEL: &str = "_kkagent/tool/cancel";
+/// Agent→client request: may this tool call run? Sent before every reviewed
+/// call, whatever permission mode let it through.
+pub const METHOD_HOST_TOOL_REVIEW: &str = "_kkagent/tool/review";
 /// Agent→client request prefix for host-backed storage.
 pub const METHOD_STORE_PREFIX: &str = "_kkagent/store/";
 
@@ -27,6 +30,9 @@ pub struct HostCapabilities {
     /// The host can execute tools it injected (`_kkagent/tool/call`).
     #[serde(default)]
     pub tools: bool,
+    /// The host answers `_kkagent/tool/review` requests.
+    #[serde(default)]
+    pub tool_review: bool,
     /// The host can serve session/event storage (`_kkagent/store/*`).
     #[serde(default)]
     pub store: HostStoreCapabilities,
@@ -66,7 +72,7 @@ pub enum HostToolApproval {
 
 /// A tool injected by the host.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct HostToolSpec {
     pub name: String,
     #[serde(default)]
@@ -127,7 +133,7 @@ impl HostToolSpec {
 /// Per-session extension toggles from the host. Each flag can only turn an
 /// extension off; `None` leaves it as configured.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ExtensionOverrides {
     #[serde(default)]
     pub load_project_instructions: Option<bool>,
@@ -137,9 +143,119 @@ pub struct ExtensionOverrides {
     pub load_plugins: Option<bool>,
 }
 
+/// Which tool calls the host reviews before they run.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolReviewMode {
+    /// No review (default).
+    #[default]
+    Off,
+    /// Review every call of a tool that is not read-only.
+    Mutating,
+    /// Review every call.
+    All,
+}
+
+impl ToolReviewMode {
+    fn strictness(self) -> u8 {
+        match self {
+            Self::Off => 0,
+            Self::Mutating => 1,
+            Self::All => 2,
+        }
+    }
+
+    /// The stricter of two modes (a review can be tightened, never loosened).
+    pub fn strictest(self, other: Self) -> Self {
+        if other.strictness() > self.strictness() {
+            other
+        } else {
+            self
+        }
+    }
+
+    /// Whether a call of a tool with this read-only flag is reviewed.
+    pub fn reviews(self, read_only: bool) -> bool {
+        match self {
+            Self::Off => false,
+            Self::Mutating => !read_only,
+            Self::All => true,
+        }
+    }
+}
+
+/// Default time the host has to answer one review.
+pub const DEFAULT_TOOL_REVIEW_TIMEOUT_SECS: u64 = 300;
+/// Longest time a host may be given to answer one review.
+pub const MAX_TOOL_REVIEW_TIMEOUT_SECS: u64 = 24 * 60 * 60;
+
+/// Host review of tool calls: `_meta["kkagent/host"].toolReview`.
+///
+/// kkagent sends `_kkagent/tool/review` *after* its own permission chain
+/// (including `yolo`) let a call through and *before* the tool runs. The host
+/// answers `{decision: "allow" | "deny", reason?}`. Anything else (no answer,
+/// timeout, a disconnected host, an error) is a denial.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ToolReviewSpec {
+    #[serde(default)]
+    pub mode: ToolReviewMode,
+    /// How long the host may take per call. Defaults to
+    /// [`DEFAULT_TOOL_REVIEW_TIMEOUT_SECS`]; an unanswered review is a denial.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
+}
+
+impl ToolReviewSpec {
+    pub fn validate(&self) -> Result<(), String> {
+        if let Some(seconds) = self.timeout_secs {
+            if seconds == 0 || seconds > MAX_TOOL_REVIEW_TIMEOUT_SECS {
+                return Err(format!(
+                    "toolReview.timeoutSecs must be between 1 and {MAX_TOOL_REVIEW_TIMEOUT_SECS}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn timeout_secs(&self) -> u64 {
+        self.timeout_secs
+            .unwrap_or(DEFAULT_TOOL_REVIEW_TIMEOUT_SECS)
+    }
+}
+
+/// Params of `_kkagent/tool/review`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolReviewRequest {
+    pub session_id: String,
+    pub tool_call_id: String,
+    pub name: String,
+    pub input: Value,
+    pub cwd: String,
+    pub read_only: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolReviewDecision {
+    Allow,
+    Deny,
+}
+
+/// Result of `_kkagent/tool/review`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolReviewReply {
+    pub decision: ToolReviewDecision,
+    /// Shown to the model when the call is denied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
 /// Per-session settings carried in `_meta["kkagent/host"]`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct HostSessionMeta {
     /// Name of a role from the trusted config (`[agent_roles.NAME]`).
     #[serde(default)]
@@ -156,6 +272,14 @@ pub struct HostSessionMeta {
     /// Initial permission mode (`manual`, `yolo`, `auto`).
     #[serde(default)]
     pub permission_mode: Option<String>,
+    /// Ask the host before tool calls run (works under `yolo`/`auto` too).
+    #[serde(default)]
+    pub tool_review: Option<ToolReviewSpec>,
+    /// `session/load` only: `false` skips replaying the stored history to the
+    /// client (for a host that already persists the conversation itself).
+    /// Default `true`; ignored by `session/new` and `session/resume`.
+    #[serde(default)]
+    pub replay: Option<bool>,
 }
 
 impl HostSessionMeta {
@@ -172,6 +296,9 @@ impl HostSessionMeta {
         let parsed: Self = serde_json::from_value(section.clone())
             .map_err(|error| format!("invalid _meta[\"{HOST_META_KEY}\"]: {error}"))?;
         let mut seen = std::collections::HashSet::new();
+        if let Some(review) = &parsed.tool_review {
+            review.validate()?;
+        }
         for tool in &parsed.host_tools {
             tool.validate()?;
             if !seen.insert(tool.name.as_str()) {
@@ -359,9 +486,91 @@ mod tests {
     }
 
     #[test]
+    fn replay_flag_is_a_known_session_field() {
+        let parse = |value: serde_json::Value| {
+            HostSessionMeta::from_meta(Some(&json!({"kkagent/host": value})))
+        };
+        assert_eq!(parse(json!({})).unwrap().replay, None);
+        assert_eq!(parse(json!({"replay": false})).unwrap().replay, Some(false));
+        assert_eq!(parse(json!({"replay": true})).unwrap().replay, Some(true));
+        // A typo is rejected like every other unknown field.
+        assert!(parse(json!({"replays": false})).is_err());
+        assert!(parse(json!({"replay": "no"})).is_err());
+    }
+
+    #[test]
     fn malformed_section_is_an_error_not_a_silent_default() {
         let meta = json!({"kkagent/host": {"toolAllowlist": "Read"}});
         assert!(HostSessionMeta::from_meta(Some(&meta)).is_err());
+    }
+
+    #[test]
+    fn unknown_fields_are_rejected_at_every_level() {
+        // A misspelled restriction must not be silently dropped.
+        for meta in [
+            json!({"kkagent/host": {"toolAllowlst": ["Read"]}}),
+            json!({"kkagent/host": {"extensions": {"loadHook": false}}}),
+            json!({"kkagent/host": {"hostTools": [{"name": "a", "readOnlyy": true}]}}),
+            json!({"kkagent/host": {"toolReview": {"mod": "all"}}}),
+        ] {
+            let error = HostSessionMeta::from_meta(Some(&meta)).unwrap_err();
+            assert!(error.contains("unknown field"), "{error}");
+        }
+    }
+
+    #[test]
+    fn tool_review_parses_and_is_bounded() {
+        let meta = json!({"kkagent/host": {"toolReview": {"mode": "mutating", "timeoutSecs": 20}}});
+        let review = HostSessionMeta::from_meta(Some(&meta))
+            .unwrap()
+            .tool_review
+            .unwrap();
+        assert_eq!(review.mode, ToolReviewMode::Mutating);
+        assert_eq!(review.timeout_secs(), 20);
+        assert_eq!(
+            ToolReviewSpec::default().timeout_secs(),
+            DEFAULT_TOOL_REVIEW_TIMEOUT_SECS
+        );
+        for bad in [0u64, MAX_TOOL_REVIEW_TIMEOUT_SECS + 1] {
+            let meta = json!({"kkagent/host": {"toolReview": {"mode": "all", "timeoutSecs": bad}}});
+            assert!(HostSessionMeta::from_meta(Some(&meta))
+                .unwrap_err()
+                .contains("timeoutSecs"));
+        }
+        let unknown_mode = json!({"kkagent/host": {"toolReview": {"mode": "sometimes"}}});
+        assert!(HostSessionMeta::from_meta(Some(&unknown_mode)).is_err());
+    }
+
+    #[test]
+    fn review_modes_select_calls_and_only_tighten() {
+        assert!(!ToolReviewMode::Off.reviews(false));
+        assert!(ToolReviewMode::Mutating.reviews(false));
+        assert!(!ToolReviewMode::Mutating.reviews(true));
+        assert!(ToolReviewMode::All.reviews(true));
+        assert_eq!(
+            ToolReviewMode::Mutating.strictest(ToolReviewMode::Off),
+            ToolReviewMode::Mutating
+        );
+        assert_eq!(
+            ToolReviewMode::Mutating.strictest(ToolReviewMode::All),
+            ToolReviewMode::All
+        );
+        assert_eq!(
+            ToolReviewMode::All.strictest(ToolReviewMode::Mutating),
+            ToolReviewMode::All
+        );
+    }
+
+    #[test]
+    fn review_reply_wire_shape() {
+        let reply: ToolReviewReply =
+            serde_json::from_value(json!({"decision": "deny", "reason": "no"})).unwrap();
+        assert_eq!(reply.decision, ToolReviewDecision::Deny);
+        assert_eq!(reply.reason.as_deref(), Some("no"));
+        let allow: ToolReviewReply = serde_json::from_value(json!({"decision": "allow"})).unwrap();
+        assert_eq!(allow.decision, ToolReviewDecision::Allow);
+        assert!(serde_json::from_value::<ToolReviewReply>(json!({"decision": "maybe"})).is_err());
+        assert!(serde_json::from_value::<ToolReviewReply>(json!({})).is_err());
     }
 
     #[test]
@@ -437,9 +646,12 @@ mod tests {
 
     #[test]
     fn capabilities_read_from_initialize_meta() {
-        let meta = json!({"kkagent/host": {"tools": true, "store": {"sessions": true}}});
+        let meta = json!({"kkagent/host": {
+            "tools": true, "toolReview": true, "store": {"sessions": true}
+        }});
         let caps = HostCapabilities::from_meta(Some(&meta));
         assert!(caps.tools);
+        assert!(caps.tool_review);
         assert!(caps.store.sessions);
         assert!(!caps.store.events);
         assert_eq!(

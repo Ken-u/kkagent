@@ -13,7 +13,9 @@ use kkagent_config::{
     validate_tool_pattern, AgentRoleConfig, AppConfig, ExtensionsConfig, StorageBackend,
     SystemPromptMode,
 };
-use kkagent_protocol::host::{ExtensionOverrides, HostSessionMeta, HostToolSpec};
+use kkagent_protocol::host::{
+    ExtensionOverrides, HostSessionMeta, HostToolSpec, ToolReviewMode, ToolReviewSpec,
+};
 use kkagent_protocol::{PermissionMode, ToolAllowlist};
 
 use crate::session::Session;
@@ -39,6 +41,8 @@ pub struct SessionRole {
     /// Tools the host injected for this session. They are only registered
     /// when the tool allowlist permits their names.
     pub host_tools: Vec<HostToolSpec>,
+    /// Host review of tool calls (`None` = no review).
+    pub tool_review: Option<ToolReviewSpec>,
 }
 
 impl SessionRole {
@@ -192,6 +196,7 @@ fn role_from_config(
             .transpose()?,
         extensions,
         host_tools: Vec::new(),
+        tool_review: None,
     })
 }
 
@@ -275,7 +280,29 @@ pub fn resolve_session_role(
         permission_mode,
         extensions: apply_extension_overrides(process.extensions, meta.extensions.as_ref()),
         host_tools: meta.host_tools.clone(),
+        tool_review: meta
+            .tool_review
+            .filter(|review| review.mode != ToolReviewMode::Off),
     })
+}
+
+/// Combine the review a live session already had with the one a re-bind asks
+/// for: the stricter mode wins and the shorter answer time applies, so a
+/// repeated `session/load` can never switch a review off or relax it.
+pub fn merge_tool_review(
+    existing: Option<ToolReviewSpec>,
+    requested: Option<ToolReviewSpec>,
+) -> Option<ToolReviewSpec> {
+    match (existing, requested) {
+        (None, other) | (other, None) => other,
+        (Some(a), Some(b)) => Some(ToolReviewSpec {
+            mode: a.mode.strictest(b.mode),
+            timeout_secs: match (a.timeout_secs, b.timeout_secs) {
+                (Some(x), Some(y)) => Some(x.min(y)),
+                (x, y) => x.or(y),
+            },
+        }),
+    }
 }
 
 #[cfg(test)]
@@ -491,6 +518,55 @@ mod tests {
         append.apply_after_context(&mut session);
         assert_eq!(session.system_prompt, format!("{builtin}\nCTX\n\nEXTRA"));
         let _ = std::fs::remove_dir_all(session.session_dir());
+    }
+
+    #[test]
+    fn tool_review_comes_from_the_session_and_off_means_none() {
+        let config = AppConfig::default();
+        let process =
+            ProcessPolicy::from_config(&config, None, ExtensionsConfig::default()).unwrap();
+        let reviewed = resolve_session_role(
+            &config,
+            &process,
+            &meta(serde_json::json!({"toolReview": {"mode": "all", "timeoutSecs": 5}})),
+            None,
+        )
+        .unwrap();
+        let review = reviewed.tool_review.unwrap();
+        assert_eq!(review.mode, ToolReviewMode::All);
+        assert_eq!(review.timeout_secs(), 5);
+
+        let off = resolve_session_role(
+            &config,
+            &process,
+            &meta(serde_json::json!({"toolReview": {"mode": "off"}})),
+            None,
+        )
+        .unwrap();
+        assert!(off.tool_review.is_none());
+        assert!(process.default_role().tool_review.is_none());
+    }
+
+    #[test]
+    fn rebinding_can_only_tighten_a_review() {
+        let mutating = ToolReviewSpec {
+            mode: ToolReviewMode::Mutating,
+            timeout_secs: Some(60),
+        };
+        let all = ToolReviewSpec {
+            mode: ToolReviewMode::All,
+            timeout_secs: Some(10),
+        };
+        assert_eq!(merge_tool_review(None, None), None);
+        assert_eq!(merge_tool_review(Some(mutating), None), Some(mutating));
+        assert_eq!(merge_tool_review(None, Some(all)), Some(all));
+        let merged = merge_tool_review(Some(mutating), Some(all)).unwrap();
+        assert_eq!(merged.mode, ToolReviewMode::All);
+        assert_eq!(merged.timeout_secs, Some(10));
+        // A re-bind asking for less keeps the stricter existing review.
+        let merged = merge_tool_review(Some(all), Some(mutating)).unwrap();
+        assert_eq!(merged.mode, ToolReviewMode::All);
+        assert_eq!(merged.timeout_secs, Some(10));
     }
 
     #[test]

@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use kkagent_protocol::ToolAllowlist;
+use kkagent_protocol::{ToolAllowlist, ToolGate};
 use serde_json::Value;
 
 use crate::{Tool, ToolAccesses, ToolContext, ToolDisclosure, ToolDisplaySchema, ToolOutput};
@@ -27,6 +27,10 @@ pub struct ToolRegistry {
     /// it, so plugin overrides, MCP bridging, dynamic loading and host tool
     /// injection cannot add a tool the role does not allow.
     allowlist: Option<ToolAllowlist>,
+    /// Optional pre-execution reviewer (the embedding host). It is consulted
+    /// at the single point where a tool call turns into an execution, after
+    /// kkagent's own permission chain has let the call through.
+    gate: Option<Arc<dyn ToolGate>>,
 }
 
 impl ToolRegistry {
@@ -34,7 +38,18 @@ impl ToolRegistry {
         Self {
             tools: BTreeMap::new(),
             allowlist: None,
+            gate: None,
         }
+    }
+
+    /// Put a host review gate in front of every tool of this registry.
+    pub fn set_gate(&mut self, gate: Arc<dyn ToolGate>) {
+        self.gate = Some(gate);
+    }
+
+    /// The host review gate, if one is installed.
+    pub fn gate(&self) -> Option<&Arc<dyn ToolGate>> {
+        self.gate.as_ref()
     }
 
     /// Restrict this registry to `allowlist`. Combined with any existing

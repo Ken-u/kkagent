@@ -358,3 +358,416 @@ async fn acp_model_alias_is_refused_under_an_allowlist() {
     assert!(message.contains("strict tool allowlist"), "{message}");
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// Host review gate
+// ---------------------------------------------------------------------------
+
+struct ScriptedGate {
+    verdict: kkagent_protocol::GateVerdict,
+    only_mutating: bool,
+    seen: std::sync::Mutex<Vec<kkagent_protocol::ToolCallReview>>,
+}
+
+impl ScriptedGate {
+    fn new(verdict: kkagent_protocol::GateVerdict, only_mutating: bool) -> Arc<Self> {
+        Arc::new(Self {
+            verdict,
+            only_mutating,
+            seen: std::sync::Mutex::new(Vec::new()),
+        })
+    }
+}
+
+impl kkagent_protocol::ToolGate for ScriptedGate {
+    fn reviews(&self, _name: &str, read_only: bool) -> bool {
+        !(self.only_mutating && read_only)
+    }
+
+    fn review<'a>(
+        &'a self,
+        call: &'a kkagent_protocol::ToolCallReview,
+    ) -> kkagent_protocol::GateFuture<'a> {
+        self.seen.lock().unwrap().push(call.clone());
+        let verdict = self.verdict.clone();
+        Box::pin(async move { verdict })
+    }
+}
+
+/// A read-only probe, to tell reviewed calls from unreviewed ones.
+struct ReadOnlyProbe {
+    ran: Arc<AtomicBool>,
+}
+
+#[async_trait::async_trait]
+impl kkagent_tools::Tool for ReadOnlyProbe {
+    fn name(&self) -> &str {
+        "Peek"
+    }
+    fn description(&self) -> &str {
+        "read-only probe"
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object", "properties": {}})
+    }
+    fn read_only(&self) -> bool {
+        true
+    }
+    async fn execute(
+        &self,
+        _input: serde_json::Value,
+        _ctx: &kkagent_tools::ToolContext,
+    ) -> anyhow::Result<ToolOutput> {
+        self.ran.store(true, Ordering::SeqCst);
+        Ok(ToolOutput::success("peek ran"))
+    }
+}
+
+fn request_for(tools: Arc<ToolRegistry>, name: &str) -> ParallelToolRequest {
+    ParallelToolRequest {
+        tools,
+        hooks: None,
+        working_dir: std::env::temp_dir(),
+        session_id: "gate-session".into(),
+        turn_id: "gate-session:1".into(),
+        image: kkagent_config::ImageConfig::default(),
+        name: name.into(),
+        input: serde_json::json!({}),
+        tool_call_id: Some("call-7".into()),
+        interrupted: Arc::new(AtomicBool::new(false)),
+        plan_file_path: std::path::PathBuf::new(),
+        tools_config: kkagent_config::ToolsConfig::default(),
+        model_alias: None,
+    }
+}
+
+#[tokio::test]
+async fn a_denying_gate_stops_execution_and_tells_the_model_why() {
+    let ran = Arc::new(AtomicBool::new(false));
+    let gate = ScriptedGate::new(
+        kkagent_protocol::GateVerdict::Deny("host says no".into()),
+        false,
+    );
+    let mut registry = ToolRegistry::new();
+    registry.set_gate(gate.clone());
+    registry.register(Arc::new(ProbeTool {
+        name: "Probe",
+        ran: ran.clone(),
+    }));
+    let output = execute_tool_parallel(request_for(Arc::new(registry), "Probe")).await;
+    assert!(output.is_error);
+    assert_eq!(output.content, "host says no");
+    assert!(!ran.load(Ordering::SeqCst));
+
+    let seen = gate.seen.lock().unwrap();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].name, "Probe");
+    assert_eq!(seen[0].session_id, "gate-session");
+    assert_eq!(seen[0].tool_call_id, "call-7");
+    assert!(!seen[0].read_only);
+}
+
+#[tokio::test]
+async fn an_allowing_gate_reviews_first_and_then_the_tool_runs() {
+    let ran = Arc::new(AtomicBool::new(false));
+    let gate = ScriptedGate::new(kkagent_protocol::GateVerdict::Allow, false);
+    let mut registry = ToolRegistry::new();
+    registry.set_gate(gate.clone());
+    registry.register(Arc::new(ProbeTool {
+        name: "Probe",
+        ran: ran.clone(),
+    }));
+    let output = execute_tool_parallel(request_for(Arc::new(registry), "Probe")).await;
+    assert!(!output.is_error, "{}", output.content);
+    assert!(ran.load(Ordering::SeqCst));
+    assert_eq!(gate.seen.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn calls_the_gate_does_not_review_run_without_asking() {
+    let ran = Arc::new(AtomicBool::new(false));
+    // Would deny everything it reviews, but only mutating tools are reviewed.
+    let gate = ScriptedGate::new(kkagent_protocol::GateVerdict::Deny("no".into()), true);
+    let mut registry = ToolRegistry::new();
+    registry.set_gate(gate.clone());
+    registry.register(Arc::new(ReadOnlyProbe { ran: ran.clone() }));
+    let output = execute_tool_parallel(request_for(Arc::new(registry), "Peek")).await;
+    assert!(!output.is_error, "{}", output.content);
+    assert!(ran.load(Ordering::SeqCst));
+    assert!(gate.seen.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn the_gate_cannot_widen_the_allowlist() {
+    // Allowed by the gate but outside the allowlist: still refused, and the
+    // host is not even asked.
+    let gate = ScriptedGate::new(kkagent_protocol::GateVerdict::Allow, false);
+    let mut registry = ToolRegistry::new();
+    registry.set_allowlist(&ToolAllowlist::new(["Allowed"]));
+    registry.set_gate(gate.clone());
+    let output = execute_tool_parallel(request_for(Arc::new(registry), "Bash")).await;
+    assert!(output.is_error);
+    assert!(output.content.contains("not permitted"));
+    assert!(gate.seen.lock().unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_review_overrules_yolo_mode_inside_a_whole_turn() {
+    let (base_url, server) = spawn_mock_llm(vec![
+        tool_call_sse("c1", "Probe", "{}"),
+        text_sse("understood"),
+    ])
+    .await;
+    let ran = Arc::new(AtomicBool::new(false));
+    let gate = ScriptedGate::new(
+        kkagent_protocol::GateVerdict::Deny("not on a Friday".into()),
+        false,
+    );
+    let mut tools = ToolRegistry::new();
+    tools.set_gate(gate.clone());
+    tools.register(Arc::new(ProbeTool {
+        name: "Probe",
+        ran: ran.clone(),
+    }));
+    let (event_tx, _event_rx) = mpsc::channel(512);
+    let loop_ = AgentLoop::new(
+        Arc::new(test_config(base_url)),
+        Arc::new(tools),
+        Arc::new(Mutex::new(PermissionChain::new(
+            PermissionMode::Yolo,
+            Vec::new(),
+        ))),
+        event_tx,
+        Arc::new(Mutex::new(HashMap::new())),
+    );
+    let dir = workspace("yolo-review");
+    let mut session = Session::new(
+        "gate-yolo".into(),
+        dir.clone(),
+        PermissionMode::Yolo,
+        "test/model".into(),
+    );
+    session.add_user_message("go".into());
+    loop_.run_turn(&mut session).await.unwrap();
+    drop(loop_);
+    server.await.unwrap();
+
+    assert!(!ran.load(Ordering::SeqCst), "yolo must not skip the review");
+    assert_eq!(
+        tool_result_texts(&session),
+        vec!["not on a Friday".to_string()]
+    );
+    assert_eq!(gate.seen.lock().unwrap().len(), 1);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn acp_model_alias_is_refused_under_a_host_review() {
+    let mut registry = ToolRegistry::new();
+    registry.set_gate(ScriptedGate::new(
+        kkagent_protocol::GateVerdict::Allow,
+        false,
+    ));
+    let (event_tx, mut event_rx) = mpsc::channel(64);
+    let loop_ = AgentLoop::new(
+        Arc::new(AppConfig::default()),
+        Arc::new(registry),
+        Arc::new(Mutex::new(PermissionChain::new(
+            PermissionMode::Yolo,
+            Vec::new(),
+        ))),
+        event_tx,
+        Arc::new(Mutex::new(HashMap::new())),
+    );
+    let dir = workspace("acp-alias-review");
+    let mut session = Session::for_subagent(
+        "gate-acp-alias".into(),
+        dir.clone(),
+        PermissionMode::Yolo,
+        "acp:some-plugin.agent".into(),
+    );
+    session.add_user_message("go".into());
+    loop_.run_turn(&mut session).await.unwrap();
+    drop(loop_);
+
+    let mut message = None;
+    while let Ok(event) = event_rx.try_recv() {
+        if let AgentEvent::Error { message: m, .. } = event {
+            message = Some(m);
+        }
+    }
+    let message = message.expect("an error event explaining the refusal");
+    assert!(message.contains("host tool review"), "{message}");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Approval ids and waiting
+// ---------------------------------------------------------------------------
+
+fn plain_loop(namespace: Option<&str>) -> AgentLoop {
+    let (event_tx, _event_rx) = mpsc::channel(8);
+    let loop_ = AgentLoop::new(
+        Arc::new(AppConfig::default()),
+        Arc::new(ToolRegistry::new()),
+        Arc::new(Mutex::new(PermissionChain::new(
+            PermissionMode::Manual,
+            Vec::new(),
+        ))),
+        event_tx,
+        Arc::new(Mutex::new(HashMap::new())),
+    );
+    match namespace {
+        Some(namespace) => loop_.with_approval_namespace(namespace),
+        None => loop_,
+    }
+}
+
+#[test]
+fn approval_ids_repeat_for_the_same_task_and_never_collide_within_it() {
+    let input = serde_json::json!({"command": "make deploy"});
+    let first_run = plain_loop(Some("task-1"));
+    let a1 = first_run.next_approval_id("Bash", &input);
+    let a2 = first_run.next_approval_id("Bash", &input);
+    assert_ne!(
+        a1, a2,
+        "two identical asks in one turn stay distinguishable"
+    );
+
+    // A restart re-runs the same task: the same sequence gets the same ids.
+    let second_run = plain_loop(Some("task-1"));
+    assert_eq!(second_run.next_approval_id("Bash", &input), a1);
+    assert_eq!(second_run.next_approval_id("Bash", &input), a2);
+
+    // Another task, another tool or other input never reuses an id.
+    assert_ne!(
+        plain_loop(Some("task-2")).next_approval_id("Bash", &input),
+        a1
+    );
+    assert_ne!(
+        plain_loop(Some("task-1")).next_approval_id("Write", &input),
+        a1
+    );
+    assert_ne!(
+        plain_loop(Some("task-1")).next_approval_id("Bash", &serde_json::json!({"command": "ls"})),
+        a1
+    );
+    assert!(a1.starts_with("apr_"));
+}
+
+#[test]
+fn without_a_namespace_approval_ids_are_random() {
+    let loop_ = plain_loop(None);
+    let input = serde_json::json!({});
+    assert_ne!(
+        loop_.next_approval_id("Bash", &input),
+        loop_.next_approval_id("Bash", &input)
+    );
+}
+
+#[tokio::test]
+async fn waiting_gives_up_only_when_a_limit_is_set() {
+    let never = std::future::pending::<u8>();
+    assert!(wait_within(Some(0), never).await.is_err());
+    assert_eq!(wait_within(Some(5), async { 7_u8 }).await.unwrap(), 7);
+    // `None` is "no limit": a slow answer still arrives.
+    let slow = async {
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        9_u8
+    };
+    assert_eq!(wait_within(None, slow).await.unwrap(), 9);
+}
+
+// ---------------------------------------------------------------------------
+// Dynamic tool loading under a fixed allowlist
+// ---------------------------------------------------------------------------
+
+struct LazyProbe;
+
+#[async_trait::async_trait]
+impl kkagent_tools::Tool for LazyProbe {
+    fn name(&self) -> &str {
+        "Lazy"
+    }
+    fn description(&self) -> &str {
+        "a deferred tool"
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object", "properties": {}})
+    }
+    fn disclosure(&self) -> kkagent_protocol::tools::ToolDisclosure {
+        kkagent_protocol::tools::ToolDisclosure::Deferred
+    }
+    async fn execute(
+        &self,
+        _input: serde_json::Value,
+        _ctx: &kkagent_tools::ToolContext,
+    ) -> anyhow::Result<ToolOutput> {
+        Ok(ToolOutput::success("lazy ran"))
+    }
+}
+
+/// Run one turn and report whether the deferred tool's schema was sent with
+/// the first request.
+async fn deferred_tool_is_sent_inline(
+    allowlist: Option<ToolAllowlist>,
+    explicit: Option<bool>,
+) -> bool {
+    let (base_url, server) = spawn_mock_llm(vec![text_sse("ok")]).await;
+    let mut config = test_config(base_url);
+    config
+        .models
+        .get_mut("test/model")
+        .unwrap()
+        .capabilities
+        .push("dynamically_loaded_tools".into());
+    config.tools.dynamically_loaded_tools = explicit;
+    let mut tools = ToolRegistry::new();
+    if let Some(allowlist) = &allowlist {
+        tools.set_allowlist(allowlist);
+    }
+    tools.register(Arc::new(LazyProbe));
+    kkagent_tools::register_builtin_tools(&mut tools);
+
+    let (event_tx, _event_rx) = mpsc::channel(512);
+    let loop_ = AgentLoop::new(
+        Arc::new(config),
+        Arc::new(tools),
+        Arc::new(Mutex::new(PermissionChain::new(
+            PermissionMode::Auto,
+            Vec::new(),
+        ))),
+        event_tx,
+        Arc::new(Mutex::new(HashMap::new())),
+    );
+    let dir = workspace("dynamic");
+    let mut session = Session::new(
+        format!("dynamic-{}", uuid::Uuid::new_v4()),
+        dir.clone(),
+        PermissionMode::Auto,
+        "test/model".into(),
+    );
+    session.add_user_message("go".into());
+    loop_.run_turn(&mut session).await.unwrap();
+    drop(loop_);
+    let requests = server.await.unwrap();
+    std::fs::remove_dir_all(dir).unwrap();
+    requests[0].contains("\"name\":\"Lazy\"")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fixed_allowlist_loads_its_tools_up_front() {
+    // Unrestricted: the deferred tool waits behind SelectTools.
+    assert!(!deferred_tool_is_sent_inline(None, None).await);
+    // A strict allowlist fixes the set, so nothing is deferred.
+    assert!(deferred_tool_is_sent_inline(Some(ToolAllowlist::new(["Lazy"])), None).await);
+    // An explicit setting still wins in both directions.
+    assert!(
+        !deferred_tool_is_sent_inline(
+            Some(ToolAllowlist::new(["Lazy", "SelectTools"])),
+            Some(true)
+        )
+        .await
+    );
+    assert!(deferred_tool_is_sent_inline(None, Some(false)).await);
+}

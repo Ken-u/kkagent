@@ -28,6 +28,8 @@
 
 Kimi provider 原生支持 `messages[].tools`：加载的 schema 追加在历史消息里，顶层 `tools[]` 保持字节级稳定，provider prompt cache 不受影响。OpenAI/Anthropic/Google 模型也可通过 `capabilities = ["dynamically_loaded_tools"]` 显式启用渐进式披露；这些 adapter 会在序列化时把已加载 schema 合并到顶层 `tools[]`，因此每次首次加载新工具都可能刷新 provider prompt cache。这是减少常规请求 schema 体积与缓存命中率之间的显式取舍。
 
+`[tools] dynamically_loaded_tools` 省略时，普通会话开启渐进式披露；会话处于**严格角色白名单**下时，可用工具集合在启动时就已固定，默认直接加载白名单允许的全部工具（`SelectTools` 不再必要）。显式写 `true` / `false` 总是优先。
+
 官方 OpenAI endpoint 会为主 Agent 请求自动发送一个由模型、system prompt 与稳定工具集共同派生的 `prompt_cache_key`。自定义 OpenAI-compatible endpoint 默认不发送该字段；确认端点兼容后，可在模型 `capabilities` 中加入 `prompt_cache_key`。`/usage` 同时读取 OpenAI 返回的 cache read/write token。
 
 基线约 4.5k token 的工具 schema 降至常规请求约 2.3k token（约 -49%）。随后通过合并语义重叠的冷门工具（Task/Agent/AgentSwarm → Agent；TaskList/TaskStop → TaskOutput action；Goal 四件套 → Goal；Cron 三件套 → Cron；WebSearch/FetchURL → Web），并把零调用的沙箱元工具（RequestToolchainAccess、ToolchainDoctor）转为 Deferred，工具总数从 29 降至 19，公告名从 15 降至 8，inline schema 降至 12 个。再后来这两个沙箱元工具因长期零调用被彻底移除：工具链诊断并入 `kkagent doctor`（`toolchain` 检查项含完整报告与缓存配额告警），一次性路径授权改为在 `~/.kkagent/config.toml` 的 `[toolchain.profiles.<name>]` 里静态声明（`runtime_read_only` / `agent_cache_read_write` / `env`），模型侧引导收敛到内置 skill `toolchain-sandbox`。
