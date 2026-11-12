@@ -5364,7 +5364,7 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
         if opened {
             self.state.http_ws_clients.fetch_add(1, Ordering::SeqCst);
         } else {
-            let _ = self.state.http_ws_clients.fetch_update(
+            let _ = self.state.http_ws_clients.try_update(
                 Ordering::SeqCst,
                 Ordering::SeqCst,
                 |count| count.checked_sub(1),
