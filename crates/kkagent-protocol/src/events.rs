@@ -41,6 +41,11 @@ pub enum AgentEvent {
         output: String,
         #[serde(default)]
         is_error: bool,
+        /// Structured file changes so a client can render the edit without
+        /// parsing the tool's prose. Empty for read-only tools and for tools
+        /// that do not produce a diff (Bash, MCP, host tools).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        changes: Vec<FileChange>,
     },
     TurnStart {
         session_id: String,
@@ -75,6 +80,14 @@ pub enum AgentEvent {
     UsageUpdate {
         session_id: String,
         usage: super::TokenUsage,
+        /// Model alias (or provider model name when no alias is known) that
+        /// this call actually ran on. Absent for legacy events.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        /// Effective context window of that model, in tokens. Absent when the
+        /// config declares no `max_context_size` for it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        context_window: Option<u64>,
         /// Estimated per-part token breakdown of the request just sent.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         context: Option<super::ContextBreakdownInfo>,
@@ -361,6 +374,22 @@ pub struct TodoItemEvent {
     pub id: String,
     pub content: String,
     pub status: String,
+}
+
+/// One file a tool call changed, in the shape clients render as a diff.
+///
+/// `path` is relative to the session working directory when the file is
+/// inside it, otherwise absolute. `old_text` is `None` for a created file.
+/// `truncated` says the diff was cut down before sending (very large edits);
+/// `old_text`/`new_text` are then the head of the change only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileChange {
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_text: Option<String>,
+    pub new_text: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

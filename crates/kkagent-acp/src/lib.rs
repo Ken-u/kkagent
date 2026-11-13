@@ -1359,6 +1359,28 @@ impl AcpServer {
                     .get("is_error")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
+                // A structured change becomes a real `diff` content block, so
+                // a client can render the edit instead of parsing prose. The
+                // text block stays first and is always present.
+                let mut content = vec![ToolCallContent::text(output)];
+                if let Some(changes) = event.get("changes").and_then(|v| v.as_array()) {
+                    for change in changes {
+                        let Some(path) = change.get("path").and_then(|v| v.as_str()) else {
+                            continue;
+                        };
+                        let Some(new_text) = change.get("new_text").and_then(|v| v.as_str()) else {
+                            continue;
+                        };
+                        content.push(ToolCallContent::Diff {
+                            path: path.to_string(),
+                            old_text: change
+                                .get("old_text")
+                                .and_then(|v| v.as_str())
+                                .map(str::to_string),
+                            new_text: new_text.to_string(),
+                        });
+                    }
+                }
                 SessionUpdate::ToolCallUpdate {
                     tool_call_id: call_id(),
                     status: Some(if failed {
@@ -1371,7 +1393,7 @@ impl AcpServer {
                     // One shape for every finished call: the result text is in
                     // `rawOutput` and in `content[0]` alike, empty or not, so
                     // a host never has to guess which one to read.
-                    content: vec![ToolCallContent::text(output)],
+                    content,
                     raw_input: None,
                     raw_output: Some(Value::String(output.to_string())),
                 }
@@ -1435,17 +1457,126 @@ impl AcpServer {
                             .sum()
                     })
                     .unwrap_or(0);
-                let Some(size) = self.host.context_window(&sid).await else {
-                    return false;
+                let has_usage = event.get("usage").is_some_and(|usage| !usage.is_null());
+                // Host first (it owns the session model), then the event's own
+                // `context_window` (the model that actually ran, which may be a
+                // fallback): a call that used a different model than the session
+                // default still reports its real window.
+                let size = match self.host.context_window(&sid).await {
+                    Some(size) if size > 0 => size,
+                    _ => event
+                        .get("context_window")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0),
                 };
-                if used == 0 || size == 0 {
+                // A host that knows no window size still needs the token
+                // numbers, so `size: 0` means "unknown" rather than "drop it".
+                if used == 0 && !has_usage {
                     return false;
                 }
-                SessionUpdate::UsageUpdate { used, size }
+                // Standard v1 has no token accounting, so the per-call numbers
+                // ride in `_meta` (a host that ignores it is unaffected).
+                let mut meta = serde_json::Map::new();
+                if let Some(usage) = event.get("usage") {
+                    meta.insert("usage".into(), usage.clone());
+                }
+                if let Some(model) = event.get("model").and_then(|v| v.as_str()) {
+                    meta.insert("model".into(), Value::String(model.to_string()));
+                }
+                if size > 0 {
+                    meta.insert("contextWindow".into(), Value::from(size));
+                }
+                for key in ["steps", "turns", "byModel"] {
+                    let source = if key == "byModel" { "by_model" } else { key };
+                    if let Some(value) = event.get(source) {
+                        meta.insert(key.to_string(), value.clone());
+                    }
+                }
+                SessionUpdate::UsageUpdate {
+                    used,
+                    size,
+                    meta: Value::Object(meta),
+                }
             }
-            // Everything else (status, heartbeats, retries, errors, notices)
-            // has no variant in official v1; the prompt response carries the
-            // outcome.
+            // Everything else (status, heartbeats) has no variant in official
+            // v1; the prompt response carries the outcome. The non-standard
+            // updates below are prefixed `kkagent_` so a standard client
+            // ignores them instead of guessing.
+            "notice" | "Notice" => SessionUpdate::Notice {
+                level: "info".to_string(),
+                message: event
+                    .get("message")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            },
+            "llm_retry" | "LlmRetry" => {
+                // One update per retry, not one per countdown tick: a client
+                // renders "retrying in Ns" itself from `waitSeconds`.
+                if !event
+                    .get("initial")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
+                    return false;
+                }
+                SessionUpdate::Retry {
+                    retry_number: event
+                        .get("retry_number")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as u32,
+                    reason: event
+                        .get("reason")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    wait_seconds: event
+                        .get("wait_seconds")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0),
+                    remaining_seconds: event
+                        .get("remaining_seconds")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0),
+                    initial: true,
+                }
+            }
+            "auto_compact_completed" | "AutoCompactCompleted" => SessionUpdate::Compaction {
+                kind: "auto".to_string(),
+                removed: event
+                    .get("compacted_count")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0),
+                archive_session_id: event
+                    .get("archive_session_id")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+                error: None,
+            },
+            "compact_completed" | "CompactCompleted" => SessionUpdate::Compaction {
+                kind: "manual".to_string(),
+                removed: event.get("deleted").and_then(|v| v.as_u64()).unwrap_or(0),
+                archive_session_id: event
+                    .get("archive_session_id")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+                error: event
+                    .get("error")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+            },
+            "skill_activated" | "SkillActivated" => SessionUpdate::SkillActivated {
+                skill_name: event
+                    .get("skill_name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                trigger: event
+                    .get("trigger")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            },
             _ => return false,
         };
         bridge
@@ -3437,6 +3568,176 @@ mod tests {
 
         let (ignored, _) = next(json!({"type": "heartbeat", "session_id": sid})).await;
         assert!(!ignored);
+    }
+
+    /// Per-call token accounting, the model that ran, and the window size all
+    /// reach the host in `usage_update._meta`; `used`/`size` keep the standard
+    /// shape. The diff content block and the `kkagent_*` updates are additive,
+    /// so a standard v1 client is unaffected.
+    #[tokio::test]
+    async fn usage_meta_carries_tokens_and_model_and_changes_render_as_diffs() {
+        struct NoWindowHost;
+        #[async_trait::async_trait]
+        impl AcpHost for NoWindowHost {
+            async fn prompt(&self, _sid: &str, _text: &str) -> Result<Value, String> {
+                Ok(json!({}))
+            }
+            async fn cancel(&self, _sid: &str) -> Result<(), String> {
+                Ok(())
+            }
+        }
+        let server = AcpServer::with_host(Arc::new(NoWindowHost));
+        let (bridge, mut outgoing) = test_bridge();
+        server.attach_client_bridge(bridge.clone()).await;
+        let dir = tempfile::tempdir().unwrap();
+        let sid = new_session(&server, dir.path().to_str().unwrap()).await;
+
+        // A host that knows no window size still gets the numbers, and the
+        // event's own window (a fallback model) fills `size`.
+        server
+            .forward_event(
+                &bridge,
+                &json!({
+                    "type": "usage_update", "session_id": sid,
+                    "usage": {"input_tokens": 1200, "output_tokens": 30,
+                              "cache_read_input_tokens": 800, "cache_creation_input_tokens": 0,
+                              "input_includes_cache": true},
+                    "model": "gpt-4.1", "context_window": 1047576,
+                    "context": {"system": 10, "conversation": 20, "tools": 5, "media": 0},
+                    "steps": 2, "turns": 1,
+                }),
+            )
+            .await;
+        let usage: Value = serde_json::from_str(&outgoing.recv().await.unwrap()).unwrap();
+        let update = &usage["params"]["update"];
+        assert_eq!(update["sessionUpdate"], "usage_update");
+        assert_eq!(
+            (update["used"].as_u64(), update["size"].as_u64()),
+            (Some(35), Some(1047576))
+        );
+        let meta = &update["_meta"];
+        assert_eq!(meta["usage"]["input_tokens"], 1200);
+        assert_eq!(meta["usage"]["cache_read_input_tokens"], 800);
+        assert_eq!(meta["usage"]["input_includes_cache"], true);
+        assert_eq!(meta["model"], "gpt-4.1");
+        assert_eq!(meta["contextWindow"], 1047576);
+        assert_eq!(meta["steps"], 2);
+        assert_eq!(meta["turns"], 1);
+
+        // A token-only event (no context breakdown) is still worth sending.
+        server
+            .forward_event(
+                &bridge,
+                &json!({
+                    "type": "usage_update", "session_id": sid,
+                    "usage": {"input_tokens": 10, "output_tokens": 1},
+                }),
+            )
+            .await;
+        let usage: Value = serde_json::from_str(&outgoing.recv().await.unwrap()).unwrap();
+        assert_eq!(usage["params"]["update"]["used"], 0);
+        assert_eq!(
+            usage["params"]["update"]["_meta"]["usage"]["input_tokens"],
+            10
+        );
+
+        // An edit's structured change becomes a `diff` block after the text.
+        server
+            .forward_event(
+                &bridge,
+                &json!({
+                    "type": "tool_result", "session_id": sid, "tool_call_id": "c9",
+                    "tool_name": "Edit", "output": "Replaced 1 occurrence(s) in a.txt", "is_error": false,
+                    "changes": [{"path": "a.txt", "old_text": "old", "new_text": "new"}],
+                }),
+            )
+            .await;
+        let result: Value = serde_json::from_str(&outgoing.recv().await.unwrap()).unwrap();
+        let content = &result["params"]["update"]["content"];
+        assert_eq!(content[0]["type"], "content");
+        assert_eq!(
+            content[0]["content"]["text"],
+            "Replaced 1 occurrence(s) in a.txt"
+        );
+        assert_eq!(content[1]["type"], "diff");
+        assert_eq!(content[1]["path"], "a.txt");
+        assert_eq!(content[1]["oldText"], "old");
+        assert_eq!(content[1]["newText"], "new");
+        assert_eq!(
+            result["params"]["update"]["rawOutput"], "Replaced 1 occurrence(s) in a.txt",
+            "a host reading only the text still sees the same result"
+        );
+
+        // The updates that official v1 has no variant for are prefixed so a
+        // standard client ignores them instead of guessing.
+        let sent = server
+            .forward_event(
+                &bridge,
+                &json!({"type": "notice", "session_id": sid, "message": "cross-session conflict"}),
+            )
+            .await;
+        assert!(sent);
+        let notice: Value = serde_json::from_str(&outgoing.recv().await.unwrap()).unwrap();
+        assert_eq!(
+            notice["params"]["update"]["sessionUpdate"],
+            "kkagent_notice"
+        );
+        assert_eq!(
+            notice["params"]["update"]["message"],
+            "cross-session conflict"
+        );
+
+        // One update per retry, not one per countdown tick.
+        let tick = server
+            .forward_event(
+                &bridge,
+                &json!({"type": "llm_retry", "session_id": sid, "retry_number": 1,
+                        "reason": "429", "wait_seconds": 8, "remaining_seconds": 5, "initial": false}),
+            )
+            .await;
+        assert!(!tick);
+        server
+            .forward_event(
+                &bridge,
+                &json!({"type": "llm_retry", "session_id": sid, "retry_number": 1,
+                        "reason": "429", "wait_seconds": 8, "remaining_seconds": 8, "initial": true}),
+            )
+            .await;
+        let retry: Value = serde_json::from_str(&outgoing.recv().await.unwrap()).unwrap();
+        assert_eq!(retry["params"]["update"]["sessionUpdate"], "kkagent_retry");
+        assert_eq!(retry["params"]["update"]["retryNumber"], 1);
+        assert_eq!(retry["params"]["update"]["waitSeconds"], 8);
+
+        server
+            .forward_event(
+                &bridge,
+                &json!({"type": "auto_compact_completed", "session_id": sid,
+                        "archive_session_id": "arch", "compacted_count": 42}),
+            )
+            .await;
+        let compact: Value = serde_json::from_str(&outgoing.recv().await.unwrap()).unwrap();
+        assert_eq!(
+            compact["params"]["update"]["sessionUpdate"],
+            "kkagent_compaction"
+        );
+        assert_eq!(compact["params"]["update"]["kind"], "auto");
+        assert_eq!(compact["params"]["update"]["removed"], 42);
+        assert_eq!(compact["params"]["update"]["archiveSessionId"], "arch");
+
+        server
+            .forward_event(
+                &bridge,
+                &json!({"type": "skill_activated", "session_id": sid,
+                        "activation_id": "a1", "skill_name": "pdf", "trigger": "model-tool"}),
+            )
+            .await;
+        let skill: Value = serde_json::from_str(&outgoing.recv().await.unwrap()).unwrap();
+        assert_eq!(
+            skill["params"]["update"]["sessionUpdate"],
+            "kkagent_skill_activated"
+        );
+        assert_eq!(skill["params"]["update"]["skillName"], "pdf");
+        assert_eq!(skill["params"]["update"]["trigger"], "model-tool");
     }
 
     #[tokio::test]

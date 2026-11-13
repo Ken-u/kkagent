@@ -565,6 +565,7 @@ mod tests {
                 tool_name: "Grep".into(),
                 output: "3 matches".into(),
                 is_error: false,
+                changes: Vec::new(),
             },
         );
         store.apply_child_event(
@@ -625,6 +626,7 @@ mod tests {
                 tool_name: "Bash".into(),
                 output: "error E0432".into(),
                 is_error: true,
+                changes: Vec::new(),
             },
         );
         let entry = &store.entries[0];

@@ -293,6 +293,7 @@ async fn run_prompt(
                                 tool_name: label,
                                 output: "[ok]".into(),
                                 is_error: false,
+                                changes: Vec::new(),
                             },
                             Some("failed") => AgentEvent::ToolResult {
                                 session_id: sub_cfg.agent_id.clone(),
@@ -300,6 +301,7 @@ async fn run_prompt(
                                 tool_name: label,
                                 output: "[failed]".into(),
                                 is_error: true,
+                                changes: Vec::new(),
                             },
                             // "pending"/"in_progress"/None: open (or refresh) the card.
                             _ => AgentEvent::ToolCall {

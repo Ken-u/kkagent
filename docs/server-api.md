@@ -144,12 +144,13 @@ curl -sS -H "$AUTH" -H 'Content-Type: application/json' \
 | `GET /api/v1/health` | 存活、持久化状态、uptime 和 Session 数。 |
 | `GET /api/v1/ready` | 可接流量时返回 200；降级或持久化失败返回 503。 |
 | `GET /api/v1/metrics` | Prometheus 文本指标。 |
+| `GET /api/v1/usage/tokens?days=` | 这台 Server 自己的用量历史（默认 30 天，范围 1 到 365）：`by_day`、`by_model`、`by_location`、`by_session`。口径见[用量历史的口径](#用量历史的口径)。 |
 | `GET /api/v1/events?since=&session_id=&limit=` | 从 SQLite 回放持久事件；单次最多 10000 条。 |
 | `GET /api/v1/turns/{task-id}` | 查询持久 turn 状态；也兼容 Session ID 查询最近一项。 |
 | `DELETE /api/v1/turns/{task-id}?cancel_background=` | 取消排队/运行/待审批 turn，并中断对应 Session；响应含 `turn_stopped` 与后台任务清理报告。 |
 | `GET /api/v1/sessions` | 列出会话。 |
 | `POST /api/v1/sessions` | 创建会话；body 为 `{workspace, title?}`，`workspace` 必填；支持 `Idempotency-Key`。 |
-| `GET /api/v1/sessions/{id}` | 读取会话。 |
+| `GET /api/v1/sessions/{id}` | 读取会话，含 `model` 与 `context_window`（该模型的有效窗口；不知道就省略），见[会话与事件字段](#会话与事件字段)。 |
 | `DELETE /api/v1/sessions/{id}` | 删除会话。 |
 | `POST /api/v1/sessions/{id}/messages` | 提交 `{text}`。 |
 | `GET /api/v1/sessions/{id}/export` | 导出 JSON 会话。 |
@@ -172,6 +173,32 @@ curl -sS -H "$AUTH" -H 'Content-Type: application/json' \
 | `GET /api/v1/ws` | WebSocket 事件流。 |
 
 终端创建 body 为 `{command?, cwd?}`。API 必须用 `--allow-terminal-api` 开启并持有 `terminal` 或 `admin` scope。最多同时保留 64 个 HTTP terminal，命令最大 64 KiB，stdout 和 stderr 各最多保留约 1 MiB。
+
+## 会话与事件字段
+
+宿主（驱动 Worker 的上层程序）需要的字段都写在事件与会话响应里，不需要再查模型清单或从配置猜：
+
+| 字段 | 出现位置 | 含义 |
+|---|---|---|
+| `usage` | 事件 `usage_update`、`GET /sessions/{id}` | `input_tokens`、`output_tokens`、`cache_read_input_tokens`、`cache_creation_input_tokens` 与 `input_includes_cache`。**事件里的 `usage` 是这一次模型调用**，会话响应里的 `usage` 是累计（另带 `steps`、`turns`、`context`）。 |
+| `model` | 事件 `usage_update`、`GET /sessions/{id}` | 这一次调用**实际运行**的模型别名（回退模型生效时是回退的那个）。 |
+| `context_window` | 事件 `usage_update`、`GET /sessions/{id}` | 该模型的有效窗口（token）。配置里的 `max_context_size` 优先，否则按模型名查内置清单；都不知道就**省略**，客户端不要自己猜一个数。 |
+| `context` | 事件 `usage_update` | 这次请求的估算分项 `{system, conversation, tools, media, reserved_output?, estimated?}`；已占用 = `system + conversation + tools + media`（`reserved_output` 不算，与 ACP 的 `used` 同一算法）。 |
+| `by_model`、`steps`、`turns` | 事件 `usage_update` | 会话累计。`by_model` 是**本进程内**的累计：进程重启后归零，逐条事件的 `usage` 才是可以累加的。 |
+| `initial` | 事件 `llm_retry` | 倒计时期间每秒发一条，只有 `initial: true` 的那条代表一次新的重试。 |
+| `items[].status` | 事件 `todo_updated` | `pending` / `in_progress` / `completed` / `cancelled`（内部枚举的 `Done` 对外统一写成 `completed`）。 |
+| `changes` | 事件 `tool_result` | 这次工具调用改动的文件：`[{path, old_text?, new_text, truncated?}]`，`old_text` 为空表示新建文件；单边最多 32 KiB，被截断时 `truncated: true` 且只保留开头。只对 `Edit`、`Write` 等编辑工具出现，只读工具与 Bash、MCP 为空。 |
+| `archive_session_id` | 事件 `compact_completed`、`auto_compact_completed` | 压缩前归档出来的会话 ID。 |
+
+`session.updated` 与 `session_config_changed` 在模型或模式变化时发出，带 `model`、`permission_mode`、`plan_mode`。
+
+### 用量历史的口径
+
+`GET /usage/tokens` 读的是这台 Server 自己的用量库（`usage_store`），与事件流里的 `usage_update` 是两套东西：
+
+- 按 **kkagent 的会话**聚合，不知道调用方（宿主）的任务划分；要按任务算消耗，用事件流里逐条 `usage` 自己累加。
+- 事件保留 `event_retention_days` 天（响应里给出），`by_session` 只在这个窗口内可取；更早的只有按天、按模型的聚合。
+- 没有用量库（内存或降级模式）时 `available: false`，其余字段为空数组，**不要**当成“没有消耗”。
 
 ## 文件接口
 

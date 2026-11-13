@@ -264,11 +264,67 @@ pub enum SessionUpdate {
         used: u64,
         /// Size of the context window.
         size: u64,
+        /// Token accounting this client needs to cost a task. Standard v1 only
+        /// defines `used`/`size`, so the numbers ride in `_meta` and a client
+        /// that does not read it sees the same update as before.
+        #[serde(rename = "_meta", default, skip_serializing_if = "Value::is_null")]
+        meta: Value,
     },
     DiffEvent {
         event: DiffEventType,
         #[serde(rename = "textDiff")]
         text_diff: TextDiff,
+    },
+    /// Non-standard: a human-readable, non-terminal warning from the turn
+    /// (for example a cross-session file conflict). The turn keeps running.
+    /// Serialized as `kkagent_notice` so a standard v1 client cannot mistake
+    /// it for a spec variant; such clients ignore unknown `sessionUpdate`
+    /// values.
+    #[serde(rename = "kkagent_notice")]
+    Notice {
+        /// `info` | `warning` | `error` (does not end the turn).
+        level: String,
+        message: String,
+    },
+    /// Non-standard: a model request will be retried. `initial` marks the
+    /// first update of one retry; later countdown updates reuse the number.
+    #[serde(rename = "kkagent_retry")]
+    Retry {
+        #[serde(rename = "retryNumber")]
+        retry_number: u32,
+        reason: String,
+        #[serde(rename = "waitSeconds")]
+        wait_seconds: u64,
+        #[serde(rename = "remainingSeconds")]
+        remaining_seconds: u64,
+        initial: bool,
+    },
+    /// Non-standard: the transcript was compacted (manual `/compact` or the
+    /// agent loop's automatic compaction).
+    #[serde(rename = "kkagent_compaction")]
+    Compaction {
+        /// `auto` | `manual`
+        kind: String,
+        /// Messages removed from the transcript.
+        #[serde(default)]
+        removed: u64,
+        #[serde(
+            rename = "archiveSessionId",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        archive_session_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+    /// Non-standard: a skill was loaded into the turn.
+    #[serde(rename = "kkagent_skill_activated")]
+    SkillActivated {
+        #[serde(rename = "skillName")]
+        skill_name: String,
+        /// `user-slash` | `model-tool` | `nested-skill`
+        #[serde(default)]
+        trigger: String,
     },
 }
 
@@ -460,6 +516,17 @@ pub fn agent_capabilities(load_session: bool) -> Value {
         "_meta": {
             "kkagent": {
                 "sessionDelete": true,
+                // Non-standard `session/update` variants this agent emits.
+                // A client that does not read them sees standard v1 only.
+                "sessionUpdates": [
+                    "kkagent_notice",
+                    "kkagent_retry",
+                    "kkagent_compaction",
+                    "kkagent_skill_activated",
+                    "diff",
+                ],
+                // `usage_update._meta` carries per-call token accounting.
+                "usageMeta": true,
             },
         },
     })
@@ -771,6 +838,7 @@ mod tests {
         let usage = serde_json::to_value(SessionUpdate::UsageUpdate {
             used: 10,
             size: 100,
+            meta: Value::Null,
         })
         .unwrap();
         assert_eq!(usage["sessionUpdate"], "usage_update");
@@ -778,6 +846,8 @@ mod tests {
             (usage["used"].as_u64(), usage["size"].as_u64()),
             (Some(10), Some(100))
         );
+        // A client that does not read `_meta` sees the standard shape only.
+        assert!(usage.get("_meta").is_none());
     }
 
     #[test]

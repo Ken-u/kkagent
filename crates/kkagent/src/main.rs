@@ -4200,11 +4200,7 @@ impl kkagent_acp::AcpHost for AgentAcpHost {
                 .get(session_id)
                 .map(|alias| alias.lock().unwrap_or_else(|e| e.into_inner()).clone())?
         };
-        self.state
-            .config()
-            .models
-            .get(&alias)
-            .and_then(|model| model.max_context_size)
+        context_window_for_model(&self.state.config(), &alias)
     }
 
     fn bind_client(&self, bridge: kkagent_acp::ClientBridge) {
@@ -4549,6 +4545,25 @@ impl kkagent_acp::AcpHost for AgentAcpHost {
     }
 }
 
+/// Effective context window of a model alias, for `usage_update` and the
+/// session body.
+///
+/// The config wins: `max_context_size` is what the user declared. Otherwise the
+/// builtin catalog is consulted by the provider model name (a configured alias
+/// such as `gpt-4.1-fast` may map to `gpt-4.1`). `None` means "unknown" — the
+/// caller omits the field instead of guessing a window.
+fn context_window_for_model(config: &kkagent_config::AppConfig, alias: &str) -> Option<u64> {
+    if let Some((model, _)) = config.resolve_model(alias) {
+        if let Some(size) = model.max_context_size {
+            return Some(size);
+        }
+        if let Some(entry) = kkagent_llm::lookup_model(&model.model) {
+            return Some(entry.context_window);
+        }
+    }
+    kkagent_llm::lookup_model(alias).map(|entry| entry.context_window)
+}
+
 impl AgentHttpBackend {
     async fn attach_session_live_fields(
         &self,
@@ -4607,9 +4622,23 @@ impl AgentHttpBackend {
                 question.is_some(),
             )
             .await;
+        // Same window the `usage_update` reports, so a client reading a session
+        // once (or after a reconnect) never needs the model catalog to size the
+        // context ring.
+        let context_window = current_model
+            .clone()
+            .or_else(|| {
+                body.get("model")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string)
+            })
+            .and_then(|alias| context_window_for_model(&self.state.config(), &alias));
         if let Some(object) = body.as_object_mut() {
             if let Some(model) = current_model {
                 object.insert("model".into(), serde_json::json!(model));
+            }
+            if let Some(size) = context_window {
+                object.insert("context_window".into(), serde_json::json!(size));
             }
             if let Some(mode) = current_permission_mode {
                 object.insert("permission_mode".into(), serde_json::json!(mode));
@@ -15708,6 +15737,7 @@ mod runtime_http_tests {
             output: "User rejected the plan. Feedback:\n\napproval timed out after 900 seconds"
                 .into(),
             is_error: false,
+            changes: Vec::new(),
         };
 
         state
@@ -16251,6 +16281,86 @@ mod runtime_http_tests {
         manager.stop().await.unwrap();
     }
 
+    /// The session body carries the effective context window, so a host can
+    /// size the context ring from one `GET /sessions/{id}` without the model
+    /// catalog. Unknown models omit the field instead of guessing.
+    #[tokio::test]
+    async fn session_body_carries_the_context_window_of_its_model() {
+        let state = test_server_state_with(config_with_a_model(), None).await;
+        let workspace =
+            std::env::temp_dir().join(format!("kkagent-window-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace).unwrap();
+        state
+            .transcript
+            .lock()
+            .await
+            .create_session(
+                "window-session",
+                "test/model",
+                &workspace.display().to_string(),
+            )
+            .unwrap();
+        state.sessions.lock().await.insert(
+            "window-session".into(),
+            Session::new(
+                "window-session".into(),
+                workspace.clone(),
+                PermissionMode::Manual,
+                "test/model".into(),
+            ),
+        );
+        let backend = AgentHttpBackend {
+            state: state.clone(),
+        };
+        let body = backend.get_session("window-session").await.unwrap();
+        assert_eq!(body["model"], "test/model");
+        assert_eq!(body["context_window"], 128_000, "the config's value wins");
+
+        // A configured alias whose model is in the builtin catalog still gets a
+        // window when the config does not declare one.
+        let mut config = config_with_a_model();
+        config.models.insert(
+            "fast".into(),
+            serde_json::from_value(serde_json::json!({
+                "provider": "test", "model": "gpt-4.1", "capabilities": ["tool_use"]
+            }))
+            .unwrap(),
+        );
+        let state = test_server_state_with(config, None).await;
+        state
+            .transcript
+            .lock()
+            .await
+            .create_session("catalog-session", "fast", &workspace.display().to_string())
+            .unwrap();
+        state.sessions.lock().await.insert(
+            "catalog-session".into(),
+            Session::new(
+                "catalog-session".into(),
+                workspace,
+                PermissionMode::Manual,
+                "fast".into(),
+            ),
+        );
+        let backend = AgentHttpBackend {
+            state: state.clone(),
+        };
+        let body = backend.get_session("catalog-session").await.unwrap();
+        assert_eq!(body["context_window"], 1_047_576);
+
+        // Nothing known: the field is absent rather than a made-up number.
+        let state = test_server_state().await;
+        state
+            .transcript
+            .lock()
+            .await
+            .create_session("unknown-session", "nobody/knows", "/tmp")
+            .unwrap();
+        let backend = AgentHttpBackend { state };
+        let body = backend.get_session("unknown-session").await.unwrap();
+        assert!(body.get("context_window").is_none());
+    }
+
     #[tokio::test]
     async fn get_session_keeps_history_while_turn_owns_session() {
         let state = test_server_state().await;
@@ -16470,6 +16580,7 @@ mod runtime_http_tests {
                 tool_name: "bash".into(),
                 output: "file list".into(),
                 is_error: false,
+                changes: Vec::new(),
             })
             .await;
 
@@ -16629,6 +16740,7 @@ mod runtime_http_tests {
                 tool_name: "read".into(),
                 output: "data".into(),
                 is_error: false,
+                changes: Vec::new(),
             })
             .await;
 

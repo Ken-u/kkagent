@@ -21,6 +21,22 @@ kkagent --config ~/.kkagent/config.toml acp --role reviewer --no-plugins
 
 `model/list`、`fs/*`、`terminal/*`、`mcp/list`、`commands/list` 与旧 `approval/*` 接口保持可用。为兼容旧客户端，部分非标准字段仍与标准字段并列输出（`tool_call` 的 `toolKind` / `toolName`、权限选项的 `optionKind`、权限请求顶层的 `kind`），客户端响应里的旧写法 `{outcomeKind: ...}` 也仍被接受。
 
+#### 非标准的 `session/update` 与 `_meta`
+
+标准 v1 没有 token 记账、重试、压缩、通知与技能启用的更新。这些内容以**加法**形式发出，只读标准字段的客户端看到的与以前完全一样：
+
+| `sessionUpdate` | 何时发 | 关键字段 |
+|---|---|---|
+| `usage_update` | 每次模型调用后 | 标准字段 `used`（上下文已占用）/ `size`（窗口大小，未知时为 `0`）；`_meta` 里是 `usage`（这一次调用的 `input_tokens`、`output_tokens`、`cache_read_input_tokens`、`cache_creation_input_tokens`、`input_includes_cache`）、`model`（实际运行的模型）、`contextWindow`（≥1 时才有）、`steps`、`turns`、`byModel` |
+| `kkagent_notice` | turn 内的非终止警告（如跨会话文件冲突） | `level`（目前恒为 `info`）、`message` |
+| `kkagent_retry` | 模型请求将重试 | `retryNumber`、`reason`、`waitSeconds`、`remainingSeconds`；**每次重试只发一条**（`initial` 恒为 `true`），倒计时由客户端自己算 |
+| `kkagent_compaction` | 转录被压缩（`/compact` 或自动压缩） | `kind`（`auto` / `manual`）、`removed`、`archiveSessionId?`、`error?` |
+| `kkagent_skill_activated` | 技能被载入本轮 | `skillName`、`trigger`（`user-slash` / `model-tool` / `nested-skill`） |
+
+`tool_call_update` / `tool_call` 的 `content` 里除文本外还可能有 `{type: "diff", path, oldText?, newText}`（编辑类工具），文本块仍然是**第一个**，`rawOutput` 仍是同样的字符串，所以只读文本的宿主行为不变。
+
+这些都写在 `initialize` 响应的 `_meta.kkagent` 里：`sessionUpdates` 列出会发的非标准 `sessionUpdate` 取值，`usageMeta: true` 表示 `usage_update._meta` 带记账。
+
 ACP 进程的 stdout 是协议通道，不能混入普通日志；诊断信息应读取 stderr。[VS Code 扩展](../apps/vscode/README.md) 是实现了流式更新、权限/输入请求与取消的 ACP 客户端示例。
 
 ### 宿主扩展（`_kkagent/*`）

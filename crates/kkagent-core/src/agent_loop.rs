@@ -1173,6 +1173,14 @@ impl AgentLoop {
                             );
                             let snap = session.usage.snapshot();
                             let by_model = session.usage.by_model_entries();
+                            // The event names the model that actually ran
+                            // (a fallback may have taken over) so a client
+                            // never has to guess from the session config.
+                            let used_model = active_model_alias.clone();
+                            let context_window = self
+                                .config
+                                .resolve_model(&used_model)
+                                .and_then(|(m, _)| m.max_context_size);
                             // LLM stream completed — refresh the workspace
                             // registry heartbeat so this session is always
                             // considered fresh between background ticks.
@@ -1182,6 +1190,8 @@ impl AgentLoop {
                                 .send(AgentEvent::UsageUpdate {
                                     session_id: session_id.clone(),
                                     usage: tu,
+                                    model: Some(used_model),
+                                    context_window,
                                     context: session.usage.last_context.clone(),
                                     steps: snap.steps,
                                     turns: snap.turns,
@@ -1706,6 +1716,7 @@ impl AgentLoop {
                             tool_name: tc.name.clone(),
                             output: reason.clone(),
                             is_error: true,
+                            changes: Vec::new(),
                         })
                         .await;
                 }
@@ -2505,6 +2516,8 @@ impl AgentLoop {
                         // UI sees content only — note stays model-side.
                         output: output.content.clone(),
                         is_error: output.is_error,
+                        // Structured edits, so clients need not parse the prose.
+                        changes: output.changes.clone(),
                     })
                     .await;
 

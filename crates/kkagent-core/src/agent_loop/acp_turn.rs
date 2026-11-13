@@ -950,6 +950,8 @@ impl AgentLoop {
                 tool_name: name,
                 output,
                 is_error,
+                // An external agent's tool call: we never see the file content.
+                changes: Vec::new(),
             })
             .await;
         if run.running == 0 {

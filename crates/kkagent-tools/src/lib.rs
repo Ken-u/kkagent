@@ -3,6 +3,7 @@ pub mod args_validator;
 pub mod bash_ast;
 pub mod bash_route;
 pub mod builtin;
+pub mod diff;
 pub mod display;
 pub mod git_worktree;
 pub mod output_log;
@@ -25,6 +26,10 @@ pub use builtin::{
     BackgroundShellManager, BashOptions, BashTool, CronManager, SkillCatalog, SkillTool,
 };
 pub use registry::*;
+
+/// Structured file change handed to clients (`AgentEvent::ToolResult.changes`).
+pub use kkagent_protocol::FileChange;
+
 pub use toolchain::{
     deny_toolchain_mutation, doctor_report, toolchain_sandbox_overlay, ToolchainSandboxOverlay,
 };
@@ -205,6 +210,8 @@ pub struct ToolOutput {
     pub note: Option<String>,
     /// Optional steer message delivered after this tool result into the next turn.
     pub delivery: Option<ToolDelivery>,
+    /// File changes this call made, in the shape clients render as a diff.
+    pub changes: Vec<FileChange>,
 }
 
 impl ToolOutput {
@@ -217,6 +224,7 @@ impl ToolOutput {
             stop_turn: false,
             note: None,
             delivery: None,
+            changes: Vec::new(),
         }
     }
 
@@ -229,6 +237,7 @@ impl ToolOutput {
             stop_turn: false,
             note: None,
             delivery: None,
+            changes: Vec::new(),
         }
     }
 
@@ -241,6 +250,7 @@ impl ToolOutput {
             stop_turn: false,
             note: None,
             delivery: None,
+            changes: Vec::new(),
         }
     }
 
@@ -253,6 +263,7 @@ impl ToolOutput {
             stop_turn: true,
             note: None,
             delivery: None,
+            changes: Vec::new(),
         }
     }
 
@@ -283,6 +294,12 @@ impl ToolOutput {
 
     pub fn with_stop_turn(mut self) -> Self {
         self.stop_turn = true;
+        self
+    }
+
+    /// Attach the file changes this call made (rendered as a diff by clients).
+    pub fn with_changes(mut self, changes: Vec<FileChange>) -> Self {
+        self.changes = changes;
         self
     }
 

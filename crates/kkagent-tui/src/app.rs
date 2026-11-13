@@ -17585,6 +17585,8 @@ mod app_state_tests {
             data: serde_json::to_value(AgentEvent::UsageUpdate {
                 session_id: "s".into(),
                 usage: usage.clone(),
+                model: Some("m".into()),
+                context_window: Some(200_000),
                 context: None,
                 steps: 3,
                 turns: 1,
@@ -17904,6 +17906,7 @@ mod app_state_tests {
                 tool_name: "Read".into(),
                 output: "file contents".into(),
                 is_error: false,
+                changes: Vec::new(),
             })
             .unwrap(),
         });
@@ -19219,6 +19222,7 @@ mod app_state_tests {
                 output: "User rejected the plan. Feedback:\n\napproval timed out after 900 seconds"
                     .into(),
                 is_error: false,
+                changes: Vec::new(),
             })
             .unwrap(),
         }
@@ -19834,6 +19838,7 @@ mod app_state_tests {
                 tool_name: "Read".into(),
                 output: "file body".into(),
                 is_error: false,
+                changes: Vec::new(),
             },
             AgentEvent::TodoUpdated {
                 session_id: "a".into(),

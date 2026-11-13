@@ -66,6 +66,11 @@ impl Tool for WriteTool {
         }
 
         let bytes = content.as_bytes();
+        // Capture the previous text first: the diff is what clients render.
+        let previous = tokio::fs::read(&path)
+            .await
+            .ok()
+            .map(|raw| String::from_utf8_lossy(&raw).into_owned());
         match mode {
             "append" => {
                 use tokio::io::AsyncWriteExt;
@@ -82,6 +87,11 @@ impl Tool for WriteTool {
         }
 
         let line_count = content.lines().count();
+        // Append changes only the tail, so the "old" side of the diff is empty.
+        let old_text = match mode {
+            "append" => Some(String::new()),
+            _ => previous,
+        };
         Ok(ToolOutput::success_with_data(
             format!(
                 "Wrote {} lines ({} bytes) to {}",
@@ -94,7 +104,10 @@ impl Tool for WriteTool {
                 "lineCount": line_count,
                 "path": path_str,
             }),
-        ))
+        )
+        .with_changes(vec![crate::diff::bounded_change(
+            path_str, old_text, content,
+        )]))
     }
 }
 

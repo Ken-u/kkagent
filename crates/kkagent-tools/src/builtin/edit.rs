@@ -111,7 +111,12 @@ Preserves original CRLF/LF line endings."
             "Replaced {} occurrence(s) in {}",
             if replace_all { count } else { 1 },
             path_str
-        )))
+        ))
+        .with_changes(vec![crate::diff::bounded_change(
+            path_str,
+            Some(content),
+            new_content,
+        )]))
     }
 }
 
