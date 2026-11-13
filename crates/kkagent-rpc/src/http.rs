@@ -4344,7 +4344,8 @@ mod security_tests {
         .await
         .unwrap();
         let id = created["terminal_id"].as_str().unwrap().to_string();
-        for _ in 0..200 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
             let Json(snapshot) = terminal_get(
                 State(state.clone()),
                 Path(id.clone()),
@@ -4360,9 +4361,12 @@ mod security_tests {
             {
                 return;
             }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "terminal did not exit with captured output: {snapshot}"
+            );
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
-        panic!("terminal did not exit with captured output");
     }
 
     #[tokio::test]

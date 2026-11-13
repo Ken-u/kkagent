@@ -3097,6 +3097,18 @@ impl HttpServerManager {
             .ok_or_else(|| "HTTP server is not running".to_string())?;
         handle.task.abort();
         let _ = handle.task.await;
+        // The aborted task still owns the listener for a moment while the
+        // runtime tears it down; wait until the OS actually frees the port so
+        // an immediate rebind of the same address succeeds.
+        for _ in 0..100 {
+            match tokio::net::TcpListener::bind(&handle.address).await {
+                // Bound successfully means the port is free — drop the probe
+                // and let the next `start` bind it again.
+                Ok(probe) => drop(probe),
+                Err(_) if handle.address.ends_with(":0") => break,
+                Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+            }
+        }
         tracing::info!("HTTP server on {} stopped", handle.address);
         Ok(handle.address)
     }
