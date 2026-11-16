@@ -766,6 +766,12 @@ pub trait HttpBackend: Send + Sync {
         let _ = (method, params);
         Err("plugins are not supported by this backend".into())
     }
+    /// Re-read the configuration file the server was started with and apply
+    /// it to the running server (`POST /api/v1/config/reload`). Takes no
+    /// input: it can only put into effect what is already on disk.
+    async fn reload_config(&self) -> Result<Value, String> {
+        Err("config reload is not supported by this backend".into())
+    }
     /// Cancel a turn. With `cancel_background` the session's background
     /// commands are cancelled too; the reply reports what actually stopped.
     async fn cancel_turn(&self, _task_id: &str, _cancel_background: bool) -> Result<Value, String> {
@@ -1098,6 +1104,73 @@ fn normalize_permission_mode(mode: &str) -> Result<&'static str, String> {
     }
 }
 
+/// A failed request that says why. Most handlers answer a failure with a bare
+/// [`StatusCode`]; this carries the reason the backend gave as the body
+/// `{"error": "…", "code": "…"}` (the shape of the file API's errors), and
+/// converts from a bare status so `?` on those keeps working.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApiError {
+    status: StatusCode,
+    message: Option<String>,
+}
+
+impl ApiError {
+    pub fn with_message(status: StatusCode, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            message: Some(message.into()),
+        }
+    }
+
+    pub fn status(&self) -> StatusCode {
+        self.status
+    }
+
+    pub fn message(&self) -> Option<&str> {
+        self.message.as_deref()
+    }
+
+    fn code(&self) -> &'static str {
+        match self.status {
+            StatusCode::BAD_REQUEST => "bad_request",
+            StatusCode::UNAUTHORIZED => "unauthorized",
+            StatusCode::FORBIDDEN => "forbidden",
+            StatusCode::NOT_FOUND => "not_found",
+            StatusCode::CONFLICT => "conflict",
+            StatusCode::NOT_IMPLEMENTED => "not_implemented",
+            _ => "error",
+        }
+    }
+}
+
+impl From<StatusCode> for ApiError {
+    fn from(status: StatusCode) -> Self {
+        Self {
+            status,
+            message: None,
+        }
+    }
+}
+
+impl PartialEq<StatusCode> for ApiError {
+    fn eq(&self, other: &StatusCode) -> bool {
+        self.status == *other
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> axum::response::Response {
+        match &self.message {
+            Some(message) => (
+                self.status,
+                Json(json!({"error": message, "code": self.code()})),
+            )
+                .into_response(),
+            None => self.status.into_response(),
+        }
+    }
+}
+
 fn backend_error_status(error: String) -> StatusCode {
     let lower = error.to_ascii_lowercase();
     if lower.contains("not found") {
@@ -1212,7 +1285,8 @@ impl HttpState {
                     "health","readiness","metrics","durableEvents","durableTasks","idempotency",
                     "fork","btw","timeline",
                     "fsRange","fsBinary","filesPaging","sessionIdempotency","instanceId",
-                    "taskFinished","approvalSessionId","backgroundCleanupReport"
+                    "taskFinished","approvalSessionId","backgroundCleanupReport",
+                    "configReload"
                 ],
             }),
             events,
@@ -1563,6 +1637,8 @@ async fn auth_middleware(
 fn required_scope(method: &str, path: &str) -> &'static str {
     if path.starts_with("/api/v1/terminals") {
         "terminal"
+    } else if path == "/api/v1/config/reload" {
+        "admin"
     } else if method == "GET" {
         "read"
     } else {
@@ -1913,7 +1989,7 @@ async fn create_session(
     Query(q): Query<AuthQuery>,
     headers: HeaderMap,
     Json(body): Json<CreateSessionBody>,
-) -> Result<Json<Value>, StatusCode> {
+) -> Result<Json<Value>, ApiError> {
     check_auth(&state, &q)?;
     let claimed_key = match (idempotency_key_of(&headers)?, &state.persistence) {
         (Some(key), Some(store)) => {
@@ -1944,7 +2020,7 @@ async fn create_session(
                     return Ok(Json(with_replayed(previous, true)));
                 }
                 SessionCreateClaim::InProgress | SessionCreateClaim::Conflict => {
-                    return Err(StatusCode::CONFLICT);
+                    return Err(StatusCode::CONFLICT.into());
                 }
             }
         }
@@ -1956,11 +2032,14 @@ async fn create_session(
         .await
     {
         Ok(sess) => sess,
-        Err(_) => {
+        Err(reason) => {
             if let (Some(key), Some(store)) = (&claimed_key, &state.persistence) {
                 let _ = store.abandon_session_create(key);
             }
-            return Err(StatusCode::BAD_REQUEST);
+            // The reason (an untrusted workspace, a missing default model, a
+            // path that does not exist…) goes back to the caller: the status
+            // alone cannot tell them apart.
+            return Err(ApiError::with_message(StatusCode::BAD_REQUEST, reason));
         }
     };
     if let (Some(key), Some(store)) = (&claimed_key, &state.persistence) {
@@ -2622,6 +2701,28 @@ async fn config_get(
 ) -> Result<Json<Value>, StatusCode> {
     check_auth(&state, &q)?;
     Ok(Json(state.backend.get_config().await))
+}
+
+/// `POST /api/v1/config/reload` — apply the configuration file on disk to the
+/// running server without a restart. Needs an `admin` token (it can change the
+/// sandbox, the trusted workspaces and the models), accepts no body, and cannot
+/// introduce anything that is not already in the file. MCP connections, hook
+/// processes and plugins still need a restart to pick up new definitions.
+async fn config_reload(
+    State(state): State<HttpState>,
+    Query(q): Query<AuthQuery>,
+) -> Result<Json<Value>, ApiError> {
+    check_auth(&state, &q)?;
+    match state.backend.reload_config().await {
+        Ok(reply) => {
+            state.publish(json!({"type": "config.reloaded"}));
+            Ok(Json(reply))
+        }
+        Err(reason) if reason.to_ascii_lowercase().contains("not supported") => {
+            Err(ApiError::with_message(StatusCode::NOT_IMPLEMENTED, reason))
+        }
+        Err(reason) => Err(ApiError::with_message(StatusCode::BAD_REQUEST, reason)),
+    }
 }
 
 async fn workspaces(
@@ -3843,6 +3944,7 @@ pub fn router(state: HttpState) -> Router {
         .route("/api/v1/modelCatalog", get(model_catalog))
         .route("/api/v1/models", get(model_catalog))
         .route("/api/v1/config", get(config_get))
+        .route("/api/v1/config/reload", post(config_reload))
         .route("/api/v1/workspaces", get(workspaces))
         .route("/api/v1/workspaceFs", get(workspaces))
         .route("/api/v1/fs", get(fs_read).post(fs_write))
@@ -5009,6 +5111,7 @@ mod security_tests {
             "filesPaging",
             "sessionIdempotency",
             "taskFinished",
+            "configReload",
         ] {
             assert!(
                 ephemeral.meta["capabilities"]
@@ -5037,5 +5140,229 @@ mod security_tests {
         assert_eq!(state.turn_states.lock().unwrap()["s"]["state"], "failed");
         let events = state.events_since(0, Some("s"), 10);
         assert_eq!(events.last().unwrap()["type"], "task_finished");
+    }
+
+    /// A backend that refuses to create sessions and whose config reload is
+    /// scripted; everything else is the in-memory backend.
+    struct RefusingBackend {
+        inner: MemoryBackend,
+        create_error: &'static str,
+        reload: Result<Value, String>,
+    }
+
+    #[async_trait::async_trait]
+    impl HttpBackend for RefusingBackend {
+        async fn list_sessions(&self) -> Value {
+            self.inner.list_sessions().await
+        }
+        async fn create_session(
+            &self,
+            _: Option<String>,
+            _: Option<String>,
+        ) -> Result<Value, String> {
+            Err(self.create_error.into())
+        }
+        async fn get_session(&self, id: &str) -> Option<Value> {
+            self.inner.get_session(id).await
+        }
+        async fn post_message(
+            &self,
+            id: &str,
+            text: &str,
+            images: &[HttpImageInput],
+            task_id: Option<&str>,
+        ) -> Result<Value, String> {
+            self.inner.post_message(id, text, images, task_id).await
+        }
+        async fn list_tools(&self) -> Value {
+            self.inner.list_tools().await
+        }
+        async fn list_tasks(&self) -> Value {
+            self.inner.list_tasks().await
+        }
+        async fn list_skills(&self) -> Value {
+            self.inner.list_skills().await
+        }
+        async fn list_models(&self) -> Value {
+            self.inner.list_models().await
+        }
+        async fn get_config(&self) -> Value {
+            self.inner.get_config().await
+        }
+        async fn approve(
+            &self,
+            id: &str,
+            decision: &str,
+            feedback: Option<String>,
+            selected_label: Option<String>,
+            scope: Option<String>,
+        ) -> Result<Value, String> {
+            self.inner
+                .approve(id, decision, feedback, selected_label, scope)
+                .await
+        }
+        async fn reload_config(&self) -> Result<Value, String> {
+            self.reload.clone()
+        }
+        async fn search(&self, query: &str) -> Value {
+            self.inner.search(query).await
+        }
+        async fn workspace_info(&self) -> Value {
+            self.inner.workspace_info().await
+        }
+    }
+
+    async fn body_json(response: axum::response::Response) -> Value {
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null)
+    }
+
+    #[tokio::test]
+    async fn a_refused_session_create_says_why() {
+        let reason = "workspace /srv/other is outside trusted_workspaces";
+        let state = HttpState::with_backend(
+            Arc::new(RefusingBackend {
+                inner: MemoryBackend::default(),
+                create_error: reason,
+                reload: Ok(json!({})),
+            }),
+            None,
+        );
+        let error = create_session(
+            State(state),
+            Query(AuthQuery::default()),
+            HeaderMap::new(),
+            Json(CreateSessionBody {
+                workspace: Some("/srv/other".into()),
+                title: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        // Still a 400 — clients that only look at the status keep working —
+        // but the body now carries the reason.
+        assert_eq!(error, StatusCode::BAD_REQUEST);
+        assert_eq!(error.message(), Some(reason));
+        let response = error.into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = body_json(response).await;
+        assert_eq!(body["error"], reason);
+        assert_eq!(body["code"], "bad_request");
+
+        // A bare status stays bare.
+        let bare = ApiError::from(StatusCode::CONFLICT).into_response();
+        assert_eq!(bare.status(), StatusCode::CONFLICT);
+        assert_eq!(body_json(bare).await, Value::Null);
+    }
+
+    #[tokio::test]
+    async fn a_refused_idempotent_create_can_be_retried_after_fixing_the_cause() {
+        let state = HttpState::with_backend_security_and_persistence(
+            Arc::new(RefusingBackend {
+                inner: MemoryBackend::default(),
+                create_error: "invalid workspace /nope",
+                reload: Ok(json!({})),
+            }),
+            None,
+            HttpSecurityOptions::default(),
+            Some(DurableHttpStore::open_in_memory().unwrap()),
+        );
+        let attempt = || {
+            let state = state.clone();
+            async move {
+                let mut headers = HeaderMap::new();
+                headers.insert("idempotency-key", "job".parse().unwrap());
+                create_session(
+                    State(state),
+                    Query(AuthQuery::default()),
+                    headers,
+                    Json(CreateSessionBody {
+                        workspace: Some("/nope".into()),
+                        title: Some("t".into()),
+                    }),
+                )
+                .await
+                .unwrap_err()
+            }
+        };
+        // A failed create does not keep the key claimed: the same request is
+        // refused with the same reason again, not turned into a conflict.
+        assert_eq!(attempt().await.message(), Some("invalid workspace /nope"));
+        assert_eq!(attempt().await.message(), Some("invalid workspace /nope"));
+    }
+
+    #[tokio::test]
+    async fn config_reload_reports_what_the_backend_did() {
+        let reloaded = HttpState::with_backend(
+            Arc::new(RefusingBackend {
+                inner: MemoryBackend::default(),
+                create_error: "",
+                reload: Ok(json!({"ok": true, "models": 2})),
+            }),
+            None,
+        );
+        let Json(reply) = config_reload(State(reloaded.clone()), Query(AuthQuery::default()))
+            .await
+            .unwrap();
+        assert_eq!(reply["models"], 2);
+        assert_eq!(
+            reloaded.events_since(0, None, 10).last().unwrap()["type"],
+            "config.reloaded"
+        );
+
+        // A configuration that no longer loads is the caller's to fix: 400
+        // with the reason, and no event.
+        let broken = HttpState::with_backend(
+            Arc::new(RefusingBackend {
+                inner: MemoryBackend::default(),
+                create_error: "",
+                reload: Err("config.toml:3: expected a table".into()),
+            }),
+            None,
+        );
+        let error = config_reload(State(broken.clone()), Query(AuthQuery::default()))
+            .await
+            .unwrap_err();
+        assert_eq!(error, StatusCode::BAD_REQUEST);
+        assert_eq!(error.message(), Some("config.toml:3: expected a table"));
+        assert!(broken.events_since(0, None, 10).is_empty());
+
+        // A backend that cannot reload says so with 501.
+        let memory = HttpState::with_backend(Arc::new(MemoryBackend::default()), None);
+        let error = config_reload(State(memory), Query(AuthQuery::default()))
+            .await
+            .unwrap_err();
+        assert_eq!(error, StatusCode::NOT_IMPLEMENTED);
+    }
+
+    #[test]
+    fn config_reload_is_reserved_for_admin_tokens() {
+        let mut scoped_tokens = HashMap::new();
+        scoped_tokens.insert("writer".into(), vec!["read".into(), "write".into()]);
+        scoped_tokens.insert("root".into(), vec!["admin".into()]);
+        let state = HttpState::with_backend_and_security(
+            Arc::new(MemoryBackend::default()),
+            None,
+            HttpSecurityOptions {
+                scoped_tokens,
+                ..HttpSecurityOptions::default()
+            },
+        );
+        let reload = |token: &str| {
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/config/reload")
+                .header("authorization", format!("Bearer {token}"))
+                .body(axum::body::Body::empty())
+                .unwrap()
+        };
+        assert_eq!(
+            authorize_request(&state, &mut reload("writer")),
+            Err(StatusCode::FORBIDDEN),
+            "a write token may not change the sandbox or the trusted workspaces"
+        );
+        assert!(authorize_request(&state, &mut reload("root")).is_ok());
     }
 }

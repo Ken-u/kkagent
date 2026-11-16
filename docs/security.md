@@ -57,6 +57,8 @@ workspace 模式不限制进程能力（macOS profile 含 `(allow process*)`，s
 - 保留并轮转 `~/.kkagent/http-audit.jsonl`；
 - 把 `trusted_workspaces` 限定为必要的绝对路径。
 
+`POST /api/v1/config/reload` 只允许主 token（`admin`）：它会让磁盘上的沙箱、受信工作区与模型设置立即生效。scoped token 不能调用，它也不接受任何请求内容，所以只能应用本机配置文件里已经存在的内容。
+
 WebSocket query token 是兼容机制，可能被访问日志记录；普通 HTTP 和 Node SDK 使用 Bearer Header。terminal API 即使有 token 也必须通过 `--allow-terminal-api` 显式打开。
 
 ## 宿主与严格角色

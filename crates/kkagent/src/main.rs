@@ -5537,6 +5537,12 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
         resolve_http_fs_path(self.state.config().as_ref(), path, for_write)
     }
 
+    async fn reload_config(&self) -> Result<serde_json::Value, String> {
+        reload_server_config_from_disk(self.state.clone())
+            .await
+            .map_err(|(_, message)| message)
+    }
+
     async fn search(&self, query: &str) -> serde_json::Value {
         let db = self.state.transcript.lock().await;
         match db.search_messages(query, 100, None, None, None, None) {
@@ -5710,6 +5716,13 @@ fn prepare_http_user_message(
     Ok(session.messages.len())
 }
 
+/// The directories the file API may touch: the configured
+/// `trusted_workspaces`, or the server's own directory when none is
+/// configured. A configured entry that cannot be resolved (it does not exist,
+/// or cannot be read) is left out and logged instead of failing the whole API;
+/// it cannot contain anything to serve anyway, and the entries that do resolve
+/// stay usable. If none resolves, nothing is trusted — the list does *not* fall
+/// back to the server's own directory, which would widen what was configured.
 fn trusted_http_roots(config: &AppConfig) -> Result<Vec<PathBuf>, String> {
     let configured = if config.trusted_workspaces.is_empty() {
         vec![std::env::current_dir().map_err(|e| e.to_string())?]
@@ -5720,13 +5733,16 @@ fn trusted_http_roots(config: &AppConfig) -> Result<Vec<PathBuf>, String> {
             .map(PathBuf::from)
             .collect()
     };
-    configured
+    Ok(configured
         .into_iter()
-        .map(|root| {
-            std::fs::canonicalize(&root)
-                .map_err(|e| format!("invalid trusted workspace {}: {e}", root.display()))
+        .filter_map(|root| match std::fs::canonicalize(&root) {
+            Ok(resolved) => Some(resolved),
+            Err(error) => {
+                tracing::warn!("ignoring trusted workspace {}: {error}", root.display());
+                None
+            }
         })
-        .collect()
+        .collect())
 }
 
 /// Where a path that does not exist (yet) would land: its deepest existing
@@ -9883,7 +9899,9 @@ async fn reload_server_config_from_disk(
     state: Arc<ServerState>,
 ) -> Result<serde_json::Value, (i32, String)> {
     let path = state.config_path.clone();
-    let mut next = load_config(Some(&path)).map_err(|error| (-32000, error.to_string()))?;
+    // `{:#}` keeps the cause (the TOML line and column) behind "Failed to parse
+    // config", which is what a client needs to show for a file that no longer loads.
+    let mut next = load_config(Some(&path)).map_err(|error| (-32000, format!("{error:#}")))?;
     hydrate_provider_oauth(&mut next)
         .await
         .map_err(|error| (-32000, error.to_string()))?;
@@ -14648,6 +14666,152 @@ mod http_path_tests {
         assert!(err.message.contains("outside trusted workspaces"));
         std::fs::remove_dir_all(root).unwrap();
         std::fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[test]
+    fn an_unresolvable_trusted_workspace_does_not_break_the_others() {
+        let root = std::env::temp_dir().join(format!("kkagent-http-root-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a.txt"), "a").unwrap();
+        let ghost =
+            std::env::temp_dir().join(format!("kkagent-http-ghost-{}", uuid::Uuid::new_v4()));
+        let config = AppConfig {
+            trusted_workspaces: vec![ghost.display().to_string(), root.display().to_string()],
+            ..AppConfig::default()
+        };
+
+        // The entry that does not exist is left out; the one that does still serves.
+        let roots = trusted_http_roots(&config).unwrap();
+        assert_eq!(roots, vec![std::fs::canonicalize(&root).unwrap()]);
+        let inside =
+            resolve_http_fs_path(&config, &root.join("a.txt").display().to_string(), false);
+        assert!(inside.is_ok(), "{inside:?}");
+
+        // When nothing configured resolves, nothing is trusted. It must not
+        // fall back to the server's own directory: that is wider than what
+        // was configured.
+        let only_ghost = AppConfig {
+            trusted_workspaces: vec![ghost.display().to_string()],
+            ..AppConfig::default()
+        };
+        assert!(trusted_http_roots(&only_ghost).unwrap().is_empty());
+        let refused = resolve_http_fs_path(
+            &only_ghost,
+            &std::env::current_dir().unwrap().display().to_string(),
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(refused.kind, kkagent_rpc::FsErrorKind::Forbidden);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// `POST /api/v1/config/reload` on the real backend: the trusted
+    /// workspaces in the file on disk take effect without a restart, for the
+    /// file API and for creating sessions, and a file that no longer loads is
+    /// refused while the running configuration stays as it was.
+    #[tokio::test]
+    async fn http_config_reload_applies_trusted_workspaces_without_a_restart() {
+        use kkagent_rpc::HttpBackend as _;
+        let dir = std::env::temp_dir().join(format!("kkagent-reload-{}", uuid::Uuid::new_v4()));
+        let (a, b) = (dir.join("a"), dir.join("b"));
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let (a, b) = (
+            std::fs::canonicalize(&a).unwrap(),
+            std::fs::canonicalize(&b).unwrap(),
+        );
+        let config_path = dir.join("config.toml");
+        let write_roots = |roots: &[&PathBuf]| {
+            let list = roots
+                .iter()
+                .map(|root| format!("{:?}", root.display().to_string()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            // A model is configured (with a made-up key, nothing is ever
+            // called): without a default model no session can be created at all.
+            std::fs::write(
+                &config_path,
+                format!(
+                    "default_model = \"main\"\ntrusted_workspaces = [{list}]\n\n\
+                     [providers.p1]\ntype = \"openai\"\napi_key = \"FAKE-KEY-FOR-TEST\"\n\
+                     base_url = \"http://127.0.0.1:9/v1\"\n\n\
+                     [models.main]\nprovider = \"p1\"\nmodel = \"m\"\n"
+                ),
+            )
+            .unwrap();
+        };
+        write_roots(&[&a]);
+
+        let config = load_config(Some(&config_path)).unwrap();
+        let (shutdown_tx, _) = watch::channel(false);
+        let state = build_server_state_with_shutdown(
+            Arc::new(config),
+            config_path.clone(),
+            shutdown_tx,
+            kkagent_rpc::HttpSecurityOptions::default(),
+            Some(dir.join("transcripts.db")),
+            None,
+            default_process_policy(&AppConfig::default()),
+        )
+        .await
+        .unwrap();
+        let backend = AgentHttpBackend {
+            state: state.clone(),
+        };
+        let file_in_b = b.join("x.txt").display().to_string();
+        let refused = |reason: &str| reason.contains("outside trusted");
+
+        assert!(!state.workspace_is_trusted(&b));
+        let error = backend
+            .create_session(Some(b.display().to_string()), None)
+            .await
+            .unwrap_err();
+        assert!(refused(&error), "{error}");
+        assert_eq!(
+            backend
+                .fs_resolve(&file_in_b, false)
+                .await
+                .unwrap_err()
+                .kind,
+            kkagent_rpc::FsErrorKind::Forbidden
+        );
+
+        // Editing the file changes nothing until it is reloaded.
+        write_roots(&[&a, &b]);
+        assert!(!state.workspace_is_trusted(&b));
+
+        let reply = backend.reload_config().await.unwrap();
+        assert_eq!(reply["ok"], serde_json::json!(true));
+        assert!(state.workspace_is_trusted(&b));
+        let created = backend
+            .create_session(Some(b.display().to_string()), None)
+            .await
+            .unwrap();
+        assert!(created["session_id"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty()));
+        assert_eq!(
+            backend
+                .fs_resolve(&file_in_b, false)
+                .await
+                .unwrap_err()
+                .kind,
+            kkagent_rpc::FsErrorKind::NotFound,
+            "inside the workspace now: the file is merely missing"
+        );
+
+        // A file that does not parse is refused and leaves the running
+        // configuration alone.
+        std::fs::write(&config_path, "trusted_workspaces = [\n").unwrap();
+        let error = backend.reload_config().await.unwrap_err();
+        assert!(
+            error.contains("Failed to parse config") && error.contains("line 1"),
+            "the reason names the line: {error}"
+        );
+        assert!(state.workspace_is_trusted(&b));
+
+        state.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -26,6 +26,14 @@ kkagent server --http 127.0.0.1:8787 \
   --http-rate-limit 600
 ```
 
+## 配置热加载
+
+`POST /api/v1/config/reload` 与 TUI 的 `/reload`（本地 JSON-RPC `config.reload`）是同一个操作：从磁盘重新读取配置，整体替换运行中的 `AppConfig`。
+
+- **立即对新的请求生效：** `trusted_workspaces`（文件接口与创建会话）、沙箱设置（对之后启动的 Bash 命令）、模型与 provider、默认权限模式、停用的技能。对已经在执行的 turn 的影响没有逐项核对。
+- **仍需重启：** MCP 连接与 Hook 进程的新定义、插件（只在进程启动时读取）、`HTTP_PROXY` 等进程环境变量、监听地址与 token。
+- 与受信目录相关的两点：`trusted_workspaces` 里解析不了的条目（目录不存在）被跳过并写一条警告日志，不会让文件接口整体报错；全部条目都解析不了时没有任何受信目录，**不会**退回 Server 的当前目录。
+
 ## 认证
 
 主 token 拥有 `admin` scope：
@@ -43,6 +51,8 @@ Authorization: Bearer <token>
 | `KKAGENT_HTTP_READ_TOKEN` | GET、WebSocket、health、metrics。 |
 | `KKAGENT_HTTP_WRITE_TOKEN` | read + Session、消息、批准和直接文件写等非 terminal 写操作。 |
 | `KKAGENT_HTTP_TERMINAL_TOKEN` | read + terminal；不能创建 Agent Session。 |
+
+`POST /api/v1/config/reload` 只有主 token（`admin`）能调用，read / write / terminal token 得到 `403`。
 
 每个 token 默认每分钟最多 600 个请求；`--http-rate-limit 0` 可关闭。请求会获得 `x-request-id`，脱敏 token 指纹、方法、路径、状态码和 request ID 默认写入 `~/.kkagent/http-audit.jsonl`。
 
@@ -149,7 +159,7 @@ curl -sS -H "$AUTH" -H 'Content-Type: application/json' \
 | `GET /api/v1/turns/{task-id}` | 查询持久 turn 状态；也兼容 Session ID 查询最近一项。 |
 | `DELETE /api/v1/turns/{task-id}?cancel_background=` | 取消排队/运行/待审批 turn，并中断对应 Session；响应含 `turn_stopped` 与后台任务清理报告。 |
 | `GET /api/v1/sessions` | 列出会话。 |
-| `POST /api/v1/sessions` | 创建会话；body 为 `{workspace, title?}`，`workspace` 必填；支持 `Idempotency-Key`。 |
+| `POST /api/v1/sessions` | 创建会话；body 为 `{workspace, title?}`，`workspace` 必填；支持 `Idempotency-Key`。失败时返回 `400`，body 为 `{"error": "…", "code": "bad_request"}`，`error` 是原因（工作区不在 `trusted_workspaces` 内、没有配置默认模型、路径无效等），用状态码无法区分这些情况。 |
 | `GET /api/v1/sessions/{id}` | 读取会话，含 `model` 与 `context_window`（该模型的有效窗口；不知道就省略），见[会话与事件字段](#会话与事件字段)。 |
 | `DELETE /api/v1/sessions/{id}` | 删除会话。 |
 | `POST /api/v1/sessions/{id}/messages` | 提交 `{text}`。 |
@@ -160,6 +170,7 @@ curl -sS -H "$AUTH" -H 'Content-Type: application/json' \
 | `GET /api/v1/tools`、`/tasks`、`/skills` | 当前能力和后台任务。 |
 | `GET /api/v1/modelCatalog` | 模型目录；`/models` 是别名。 |
 | `GET /api/v1/config` | 安全裁剪后的运行配置。 |
+| `POST /api/v1/config/reload` | 重新读取 Server 启动时使用的配置文件并应用到运行中的 Server，不需要重启（能力 `configReload`）。**需要 `admin` token**（它能改沙箱、受信工作区与模型），不接受 body，只能让磁盘上已有的内容生效。成功返回 `{ok, path, models, mcp_servers, default_model, mcp_hooks_restart_hint}` 并发出 `config.reloaded` 事件；文件读不进来（语法或校验错误）返回 `400` 与原因，运行中的配置保持原样。生效范围见下面的[配置热加载](#配置热加载)。 |
 | `GET /api/v1/workspaces` | 工作区信息；`/workspaceFs` 是别名。 |
 | `GET /api/v1/fs?path=&offset=&limit=&encoding=` | 读取可信工作区内的文件：UTF-8 文本或 base64 二进制，可按字节范围读，见[文件接口](#文件接口)。 |
 | `POST /api/v1/fs` | 写入 `{path, content?}`。 |
@@ -292,7 +303,8 @@ WebSocket 是广播流；慢客户端会收到 `resync_required`，随后应从�
 - `401`：token 缺失或错误。
 - `403`：scope 不够，或文件路径在可信工作区之外。
 - `404`：会话、终端、任务或批准 ID 不存在（包括已不再待决的审批），文件接口里指文件不存在。
-- `400`：请求字段、路径或后端操作无效。
+- `400`：请求字段、路径或后端操作无效。创建会话与配置重载的 `400` 带 `{"error", "code"}` 说明原因，其余接口目前只有状态码。
+- `501`：后端不支持该操作（例如内存后端的配置重载）。
 - `409`：幂等键冲突、任务不可取消或 Session 正忙。
 - `413`：终端命令超过限制，或文件超过单次读取上限。
 - `415`：文件不是合法 UTF-8（改用 `encoding=base64`）。

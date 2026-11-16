@@ -34,7 +34,7 @@ kkagent config preset safe
 | `plugin_marketplace` | string | 无 | 默认 KK plugin marketplace JSON 的本地路径、`file://` URL 或 HTTP(S) URL。环境变量 `KKAGENT_PLUGIN_MARKETPLACE_URL` 优先。 |
 | `plugin_marketplaces` | array | `[]` | 额外 marketplace 列表。元素可以是 URL/路径字符串，或 `{ name = "...", source = "..." }`。与 `plugin_marketplace` 合并去重后全部出现在 `/plugins` 市场列表中（配置项不可移除）。 |
 | `telemetry` | bool | `false` | 是否启用云遥测发送。 |
-| `trusted_workspaces` | string[] | `[]` | 预配置的绝对工作区；TUI 也会通过首次进入信任弹窗维护配置旁的 trust sidecar。为空时，非交互 Server 仍只隐式信任启动目录。 |
+| `trusted_workspaces` | string[] | `[]` | 预配置的绝对工作区；TUI 也会通过首次进入信任弹窗维护配置旁的 trust sidecar。为空时，非交互 Server 仍只隐式信任启动目录。HTTP 文件接口会跳过解析不了的条目（目录不存在）并记一条警告，其余条目照常生效；全部解析不了时没有任何受信目录。改动后可用 `POST /api/v1/config/reload` 让运行中的 Server 生效，不必重启。 |
 
 ## Goal（`[goal]`）
 
