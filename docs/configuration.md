@@ -352,6 +352,24 @@ Linux 支持内存和 CPU，macOS 支持 CPU，Windows Job Object 支持内存�
 
 `extra_read_paths`/`extra_write_paths` 必须已经存在。`disabled` 会跳过 Bash 的文件/网络隔离、Git 环境改写和全部资源限制，只建议用于受控容器或 VM 内排障。`kkagent --disable-sandbox` 可仅对当前进程关闭上述全部隔离且不写回配置；该参数不能与 `--connect` 同时使用。HTTP terminal 是单独的显式管理接口，不继承 Bash sandbox。
 
+### 按会话的沙箱覆盖上限
+
+Server 上所有会话默认共用上面的 `[sandbox]`。要让个别会话单独联网或多开放几个目录，不必为此放宽全局设置：管理员先在配置文件里划定一个**上限**，API 创建会话时才可以在上限内带 `sandbox` 对象（见 [Server API](server-api.md#按会话的沙箱覆盖)）。
+
+```toml
+[sandbox.session_override]   # 不写这张表 = 功能关闭（默认），每个会话都用上面的 [sandbox]
+allow_network = false        # 会话是否可以把网络打开；默认 false
+read_roots  = ["/data/android-sdk"]   # 会话的 extra_read_paths 可以落在这些目录之内
+write_roots = ["/data/build-cache"]   # 会话的 extra_write_paths 可以落在这些目录之内（同时可读）
+```
+
+- 上限只能由配置文件放开，没有任何 API 能提高；创建会话的请求需要 `admin` token。
+- 表存在但三项都是默认值，意思是“允许会话收窄（关网络、减少目录），不允许放宽”。
+- `read_roots` / `write_roots` 必须是绝对路径、不能是 `/`，也不能是 HOME 或凭据目录（`allow_sensitive_extra_paths` 的规则同样适用）；Server 自己的 `extra_read_paths` / `extra_write_paths` 也算会话可以选的范围，会话可以收窄到它们之内。
+- 只在实际生效的沙箱模式是 `workspace` 时可用；`process` / `disabled` 做不到按会话限制网络与目录，请求会被拒绝而不是假装生效。
+- 热加载（`POST /config/reload`）后新上限立即用于之后的每个 turn：已有会话里超出新上限的部分被丢弃，只收窄不变宽。
+- 不提供按会话设置环境变量的入口；Server 级的环境与工具链仍用 `[toolchain]`。
+
 ### 工作区与 Git 信任
 
 TUI 首次进入一个尚未记录的工作区时，会先确认工作区信任，再独立检查两类权限：

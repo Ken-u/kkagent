@@ -280,7 +280,7 @@ impl TranscriptDb {
     /// Bump this whenever the transcript schema changes. `migrate` skips all
     /// DDL (and the expensive FTS population check) when the on-disk version
     /// already matches, turning a ~1.4 s cold-open of a large DB into <1 ms.
-    const SCHEMA_VERSION: i64 = 2;
+    const SCHEMA_VERSION: i64 = 3;
 
     fn migrate(&self) -> anyhow::Result<()> {
         // Serialize schema creation both in-process (global mutex) and
@@ -359,6 +359,15 @@ impl TranscriptDb {
 
             CREATE INDEX IF NOT EXISTS idx_tool_results_tool_call_id
                 ON tool_results(tool_call_id);
+
+            -- Per-session sandbox override (`POST /api/v1/sessions` with a
+            -- `sandbox` object): the validated request as JSON. Sessions
+            -- without a row use the server's `[sandbox]` policy.
+            CREATE TABLE IF NOT EXISTS session_sandbox_overrides (
+                session_id TEXT PRIMARY KEY,
+                request_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
 
             CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
                 session_id UNINDEXED,
@@ -960,6 +969,10 @@ impl TranscriptDb {
             "DELETE FROM tool_results WHERE session_id = ?1",
             params![session_id],
         )?;
+        tx.execute(
+            "DELETE FROM session_sandbox_overrides WHERE session_id = ?1",
+            params![session_id],
+        )?;
         if has_quarantine {
             tx.execute(
                 "DELETE FROM messages_quarantine WHERE session_id = ?1",
@@ -979,6 +992,30 @@ impl TranscriptDb {
             anyhow::bail!("session not found: {session_id}");
         }
         Ok(())
+    }
+
+    /// Store the (already validated) sandbox override of a session as JSON.
+    /// Replaces any earlier value.
+    pub fn set_session_sandbox(&self, session_id: &str, request_json: &str) -> anyhow::Result<()> {
+        self.lock()?.execute(
+            "INSERT INTO session_sandbox_overrides (session_id, request_json, created_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(session_id) DO UPDATE SET request_json = excluded.request_json",
+            params![session_id, request_json, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    /// The stored sandbox override JSON of a session, if it has one.
+    pub fn get_session_sandbox(&self, session_id: &str) -> anyhow::Result<Option<String>> {
+        let conn = self.lock()?;
+        let mut statement = conn
+            .prepare("SELECT request_json FROM session_sandbox_overrides WHERE session_id = ?1")?;
+        let mut rows = statement.query(params![session_id])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(row.get(0)?)),
+            None => Ok(None),
+        }
     }
 
     pub fn set_archived(&self, session_id: &str, archived: bool) -> anyhow::Result<()> {
@@ -1071,6 +1108,15 @@ impl TranscriptDb {
                 messages.len() as u32,
                 Option::<String>::None,
             ],
+        )?;
+        // A fork keeps the source's sandbox override: it continues the same
+        // work, and the server re-checks the override against its ceiling on
+        // every turn anyway. Dropping it would silently hand the fork the
+        // (possibly wider) server policy.
+        transaction.execute(
+            "INSERT OR REPLACE INTO session_sandbox_overrides (session_id, request_json, created_at)
+             SELECT ?2, request_json, ?3 FROM session_sandbox_overrides WHERE session_id = ?1",
+            params![source_id, target_id, now],
         )?;
         {
             let mut statement = transaction.prepare(
@@ -1517,6 +1563,75 @@ mod tests {
             .unwrap()
             .fallback_model
             .is_none());
+    }
+
+    #[test]
+    fn session_sandbox_override_is_stored_replaced_and_purged_with_the_session() {
+        let db = test_db();
+        db.create_session("s1", "model", "/workspace").unwrap();
+        db.create_session("s2", "model", "/workspace").unwrap();
+        assert!(db.get_session_sandbox("s1").unwrap().is_none());
+
+        db.set_session_sandbox("s1", r#"{"network":true}"#).unwrap();
+        db.set_session_sandbox("s2", r#"{"network":false}"#)
+            .unwrap();
+        assert_eq!(
+            db.get_session_sandbox("s1").unwrap().as_deref(),
+            Some(r#"{"network":true}"#)
+        );
+        db.set_session_sandbox("s1", r#"{"extra_read_paths":[]}"#)
+            .unwrap();
+        assert_eq!(
+            db.get_session_sandbox("s1").unwrap().as_deref(),
+            Some(r#"{"extra_read_paths":[]}"#)
+        );
+
+        db.purge_session("s1").unwrap();
+        assert!(db.get_session_sandbox("s1").unwrap().is_none());
+        // Another session keeps its own value.
+        assert_eq!(
+            db.get_session_sandbox("s2").unwrap().as_deref(),
+            Some(r#"{"network":false}"#)
+        );
+    }
+
+    #[test]
+    fn a_fork_keeps_the_sandbox_override_of_its_source() {
+        let db = test_db();
+        db.create_session("source", "model", "/workspace").unwrap();
+        db.create_session("plain", "model", "/workspace").unwrap();
+        db.set_session_sandbox("source", r#"{"network":false}"#)
+            .unwrap();
+        db.fork_session("source", "fork", None, None).unwrap();
+        db.fork_session("plain", "plain-fork", None, None).unwrap();
+        assert_eq!(
+            db.get_session_sandbox("fork").unwrap().as_deref(),
+            Some(r#"{"network":false}"#)
+        );
+        assert!(db.get_session_sandbox("plain-fork").unwrap().is_none());
+        // The fork's value is its own: changing it leaves the source alone.
+        db.set_session_sandbox("fork", "{}").unwrap();
+        assert_eq!(
+            db.get_session_sandbox("source").unwrap().as_deref(),
+            Some(r#"{"network":false}"#)
+        );
+    }
+
+    #[test]
+    fn a_version_two_database_gets_the_sandbox_table_on_open() {
+        let shared = open_shared_sqlite_memory().unwrap();
+        shared
+            .lock()
+            .unwrap()
+            .execute_batch("PRAGMA user_version = 2")
+            .unwrap();
+        let db = TranscriptDb::from_shared(shared).unwrap();
+        db.create_session("old", "model", ".").unwrap();
+        db.set_session_sandbox("old", "{}").unwrap();
+        assert_eq!(
+            db.get_session_sandbox("old").unwrap().as_deref(),
+            Some("{}")
+        );
     }
 
     #[test]

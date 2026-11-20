@@ -38,6 +38,17 @@ kkagent 能读取和修改文件、运行 Shell、访问网络和调用第三方
 
 workspace 模式不限制进程能力（macOS profile 含 `(allow process*)`，shell 需要自由 exec）。`extra_read_paths` / `extra_write_paths` 默认拒绝 HOME 与凭据目录（`.ssh` / `.aws` / `.kube` 等）；确需开放时设置 `sandbox.allow_sensitive_extra_paths = true`。
 
+#### 按会话的沙箱覆盖
+
+沙箱策略默认是 Server 级的，同一个 Server 上的会话共用它。`[sandbox.session_override]`（默认不存在 = 关闭）是一个有边界的例外：它让 **admin token** 在创建会话时为这个会话打开网络、增加额外可读/可写目录，**只能在配置文件划定的上限之内**。这与角色规则“只收窄、不放宽”并不冲突，因为上限本身由配置文件（进程所有者）设定；请求只能在它之下选。
+
+- 谁能放开：上限只能由配置文件设定，没有 API 能提高；创建会话带 `sandbox` 需要 `admin` token（没有配置 token 的 Server 不区分调用者，按开放处理，上限仍然生效）。
+- 越界一律拒绝并列出原因，不静默裁剪；路径按真实目录（解析符号链接后）核对，HOME 与凭据目录（`allow_sensitive_extra_paths` 为假时）永远不可选；每类最多 16 个目录。
+- 只在 `workspace` 模式生效；其他模式拒绝请求，不假装隔离。
+- 每个 turn 开始时按**当前**上限重新核对已保存的覆盖：配置热加载降低上限后，会话只会变窄；读不出覆盖时用不联网、无额外目录的最小策略。
+- 覆盖不改变工作区隔离、环境变量白名单、资源上限或命令的权限审批；它也不是授权，只是这一个会话里命令能触达的范围。
+- 已知限制：网络是整体开关（没有按域名的控制）；已经在运行的 turn 与后台命令继续用启动时的策略，新策略对之后启动的命令生效。
+
 应用层路径策略（`tools.path_guard_mode`、敏感文件检测）是第二道防线，在 disabled/process 模式下尤为重要，但不能替代 OS 沙盒。Bash 命令中的敏感路径扫描是 best-effort，不是可靠隔离。
 
 ### 审计与持久化审批

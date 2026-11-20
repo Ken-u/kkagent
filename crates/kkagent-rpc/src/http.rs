@@ -690,6 +690,21 @@ pub trait HttpBackend: Send + Sync {
         workspace: Option<String>,
         title: Option<String>,
     ) -> Result<Value, String>;
+    /// `create_session` with a per-session sandbox override
+    /// (`sandbox` in `POST /sessions`). Only backends that can enforce one
+    /// implement it; the HTTP layer has already checked the caller is an
+    /// admin, the backend checks the request against the server's ceiling.
+    async fn create_session_with_sandbox(
+        &self,
+        workspace: Option<String>,
+        title: Option<String>,
+        sandbox: Option<kkagent_config::SessionSandboxRequest>,
+    ) -> Result<Value, String> {
+        if sandbox.is_some() {
+            return Err("per-session sandbox overrides are not supported by this backend".into());
+        }
+        self.create_session(workspace, title).await
+    }
     async fn get_session(&self, id: &str) -> Option<Value>;
     async fn delete_session(&self, _id: &str) -> Result<(), String> {
         Err("session deletion is not supported by this backend".into())
@@ -1286,7 +1301,7 @@ impl HttpState {
                     "fork","btw","timeline",
                     "fsRange","fsBinary","filesPaging","sessionIdempotency","instanceId",
                     "taskFinished","approvalSessionId","backgroundCleanupReport",
-                    "configReload"
+                    "configReload","sessionSandbox"
                 ],
             }),
             events,
@@ -1460,6 +1475,14 @@ fn check_auth(state: &HttpState, q: &AuthQuery) -> Result<(), StatusCode> {
         .ok_or(StatusCode::UNAUTHORIZED)
 }
 
+/// What `authorize_request` learned about the caller, for handlers that need
+/// more than the route's scope (e.g. an admin-only field in a body). Absent
+/// means unknown, which handlers treat as not admin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CallerScope {
+    admin: bool,
+}
+
 fn authorize_request(state: &HttpState, request: &mut Request) -> Result<String, StatusCode> {
     // Cross-origin browser requests are rejected outright (DNS-rebinding and
     // cross-site token abuse). Non-browser clients simply omit Origin.
@@ -1483,6 +1506,10 @@ fn authorize_request(state: &HttpState, request: &mut Request) -> Result<String,
         }
     }
     if state.token_scopes.is_empty() {
+        // No tokens are configured at all: there is nothing to tell callers
+        // apart, so the admin-only operations follow the same open policy as
+        // everything else on this server.
+        request.extensions_mut().insert(CallerScope { admin: true });
         return Ok("anonymous".into());
     }
     let path = request.uri().path();
@@ -1515,6 +1542,9 @@ fn authorize_request(state: &HttpState, request: &mut Request) -> Result<String,
         .get(&presented)
         .ok_or(StatusCode::UNAUTHORIZED)?;
     let required_scope = required_scope(request.method().as_str(), request.uri().path());
+    request.extensions_mut().insert(CallerScope {
+        admin: scopes.iter().any(|scope| scope == "admin"),
+    });
     if !scopes
         .iter()
         .any(|scope| scope == "admin" || scope == required_scope)
@@ -1960,6 +1990,10 @@ async fn list_sessions(
 struct CreateSessionBody {
     workspace: Option<String>,
     title: Option<String>,
+    /// Per-session sandbox override (admin token only); parsed by the handler
+    /// so a malformed object is answered with a message, not a bare 422.
+    #[serde(default)]
+    sandbox: Option<Value>,
 }
 
 /// `Idempotency-Key` of a request: `None` when absent, `400` when unusable.
@@ -1988,15 +2022,43 @@ async fn create_session(
     State(state): State<HttpState>,
     Query(q): Query<AuthQuery>,
     headers: HeaderMap,
+    caller: Option<axum::Extension<CallerScope>>,
     Json(body): Json<CreateSessionBody>,
 ) -> Result<Json<Value>, ApiError> {
     check_auth(&state, &q)?;
+    // A sandbox override widens what the session's commands may do, so it is
+    // an admin operation like `config/reload`; the server's ceiling
+    // (`[sandbox.session_override]`) still bounds it.
+    let sandbox = match body.sandbox.as_ref() {
+        None | Some(Value::Null) => None,
+        Some(value) => {
+            if !caller.map(|extension| extension.0.admin).unwrap_or(false) {
+                return Err(ApiError::with_message(
+                    StatusCode::FORBIDDEN,
+                    "a per-session sandbox override needs an admin token",
+                ));
+            }
+            Some(
+                serde_json::from_value::<kkagent_config::SessionSandboxRequest>(value.clone())
+                    .map_err(|error| {
+                        ApiError::with_message(
+                            StatusCode::BAD_REQUEST,
+                            format!("invalid sandbox: {error}"),
+                        )
+                    })?,
+            )
+        }
+    };
     let claimed_key = match (idempotency_key_of(&headers)?, &state.persistence) {
         (Some(key), Some(store)) => {
             use sha2::{Digest, Sha256};
-            let request_hash = hex::encode(Sha256::digest(
-                json!([body.workspace, body.title]).to_string().as_bytes(),
-            ));
+            // Requests without a sandbox keep the hash they always had, so a
+            // key claimed before this field existed still replays.
+            let hashed = match &sandbox {
+                None => json!([body.workspace, body.title]),
+                Some(sandbox) => json!([body.workspace, body.title, sandbox]),
+            };
+            let request_hash = hex::encode(Sha256::digest(hashed.to_string().as_bytes()));
             let mut claim = store
                 .begin_session_create(&key, &request_hash)
                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -2028,7 +2090,7 @@ async fn create_session(
     };
     let sess = match state
         .backend
-        .create_session(body.workspace, body.title)
+        .create_session_with_sandbox(body.workspace, body.title, sandbox)
         .await
     {
         Ok(sess) => sess,
@@ -4977,9 +5039,11 @@ mod security_tests {
                     State(state),
                     Query(AuthQuery::default()),
                     headers,
+                    None,
                     Json(CreateSessionBody {
                         workspace: Some(".".into()),
                         title: Some(title.into()),
+                        sandbox: None,
                     }),
                 )
                 .await
@@ -5112,6 +5176,7 @@ mod security_tests {
             "sessionIdempotency",
             "taskFinished",
             "configReload",
+            "sessionSandbox",
         ] {
             assert!(
                 ephemeral.meta["capabilities"]
@@ -5234,9 +5299,11 @@ mod security_tests {
             State(state),
             Query(AuthQuery::default()),
             HeaderMap::new(),
+            None,
             Json(CreateSessionBody {
                 workspace: Some("/srv/other".into()),
                 title: None,
+                sandbox: None,
             }),
         )
         .await
@@ -5278,9 +5345,11 @@ mod security_tests {
                     State(state),
                     Query(AuthQuery::default()),
                     headers,
+                    None,
                     Json(CreateSessionBody {
                         workspace: Some("/nope".into()),
                         title: Some("t".into()),
+                        sandbox: None,
                     }),
                 )
                 .await
@@ -5364,5 +5433,302 @@ mod security_tests {
             "a write token may not change the sandbox or the trusted workspaces"
         );
         assert!(authorize_request(&state, &mut reload("root")).is_ok());
+    }
+    /// Records the sandbox request of every create; delegates the rest.
+    struct SandboxRecordingBackend {
+        inner: MemoryBackend,
+        seen: StdMutex<Vec<Option<kkagent_config::SessionSandboxRequest>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl HttpBackend for SandboxRecordingBackend {
+        async fn list_sessions(&self) -> Value {
+            self.inner.list_sessions().await
+        }
+        async fn create_session(
+            &self,
+            workspace: Option<String>,
+            title: Option<String>,
+        ) -> Result<Value, String> {
+            self.create_session_with_sandbox(workspace, title, None)
+                .await
+        }
+        async fn create_session_with_sandbox(
+            &self,
+            workspace: Option<String>,
+            title: Option<String>,
+            sandbox: Option<kkagent_config::SessionSandboxRequest>,
+        ) -> Result<Value, String> {
+            if let Some(request) = sandbox.as_ref() {
+                if request.network == Some(true) {
+                    return Err("network is not allowed for sessions on this server".into());
+                }
+            }
+            self.seen.lock().unwrap().push(sandbox);
+            self.inner.create_session(workspace, title).await
+        }
+        async fn get_session(&self, id: &str) -> Option<Value> {
+            self.inner.get_session(id).await
+        }
+        async fn post_message(
+            &self,
+            id: &str,
+            text: &str,
+            images: &[HttpImageInput],
+            task_id: Option<&str>,
+        ) -> Result<Value, String> {
+            self.inner.post_message(id, text, images, task_id).await
+        }
+        async fn list_tools(&self) -> Value {
+            self.inner.list_tools().await
+        }
+        async fn list_tasks(&self) -> Value {
+            self.inner.list_tasks().await
+        }
+        async fn list_skills(&self) -> Value {
+            self.inner.list_skills().await
+        }
+        async fn list_models(&self) -> Value {
+            self.inner.list_models().await
+        }
+        async fn get_config(&self) -> Value {
+            self.inner.get_config().await
+        }
+        async fn approve(
+            &self,
+            id: &str,
+            decision: &str,
+            feedback: Option<String>,
+            selected_label: Option<String>,
+            scope: Option<String>,
+        ) -> Result<Value, String> {
+            self.inner
+                .approve(id, decision, feedback, selected_label, scope)
+                .await
+        }
+        async fn search(&self, query: &str) -> Value {
+            self.inner.search(query).await
+        }
+        async fn workspace_info(&self) -> Value {
+            self.inner.workspace_info().await
+        }
+    }
+
+    fn sandbox_state() -> (Arc<SandboxRecordingBackend>, HttpState) {
+        let backend = Arc::new(SandboxRecordingBackend {
+            inner: MemoryBackend::default(),
+            seen: StdMutex::new(Vec::new()),
+        });
+        let state = HttpState::with_backend_security_and_persistence(
+            backend.clone(),
+            None,
+            HttpSecurityOptions::default(),
+            Some(DurableHttpStore::open_in_memory().unwrap()),
+        );
+        (backend, state)
+    }
+
+    async fn create_with(
+        state: &HttpState,
+        key: Option<&str>,
+        admin: Option<bool>,
+        sandbox: Option<Value>,
+    ) -> Result<Json<Value>, ApiError> {
+        let mut headers = HeaderMap::new();
+        if let Some(key) = key {
+            headers.insert("idempotency-key", key.parse().unwrap());
+        }
+        create_session(
+            State(state.clone()),
+            Query(AuthQuery::default()),
+            headers,
+            admin.map(|admin| axum::Extension(CallerScope { admin })),
+            Json(CreateSessionBody {
+                workspace: Some(".".into()),
+                title: Some("t".into()),
+                sandbox,
+            }),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_session_sandbox_needs_an_admin_and_reaches_the_backend_parsed() {
+        let (backend, state) = sandbox_state();
+        let wanted = json!({"network": false, "extra_read_paths": ["/data/sdk"]});
+
+        // Not an admin, or unknown: refused before anything is created.
+        for caller in [Some(false), None] {
+            let error = create_with(&state, None, caller, Some(wanted.clone()))
+                .await
+                .unwrap_err();
+            assert_eq!(error, StatusCode::FORBIDDEN);
+            assert!(error.message().unwrap().contains("admin token"));
+        }
+        assert!(backend.seen.lock().unwrap().is_empty());
+
+        // An admin's request arrives typed.
+        let _ = create_with(&state, None, Some(true), Some(wanted))
+            .await
+            .unwrap();
+        let seen = backend.seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1);
+        let request = seen[0].clone().unwrap();
+        assert_eq!(request.network, Some(false));
+        assert_eq!(
+            request.extra_read_paths,
+            Some(vec!["/data/sdk".to_string()])
+        );
+        assert_eq!(request.extra_write_paths, None);
+
+        // No sandbox (or null) never needs admin and reaches the backend as None.
+        let _ = create_with(&state, None, Some(false), None).await.unwrap();
+        let _ = create_with(&state, None, None, Some(Value::Null))
+            .await
+            .unwrap();
+        assert_eq!(
+            backend
+                .seen
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|s| s.is_none())
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn a_malformed_or_unsupported_sandbox_is_answered_with_a_reason() {
+        let (backend, state) = sandbox_state();
+        for bad in [
+            json!({"mode": "off"}),
+            json!({"network": "yes"}),
+            json!({"extra_read_paths": "/data"}),
+            json!("network"),
+        ] {
+            let error = create_with(&state, None, Some(true), Some(bad))
+                .await
+                .unwrap_err();
+            assert_eq!(error, StatusCode::BAD_REQUEST);
+            assert!(
+                error.message().unwrap().starts_with("invalid sandbox"),
+                "{:?}",
+                error.message()
+            );
+        }
+        // The backend's own refusal (the ceiling) comes back as the reason.
+        let error = create_with(&state, None, Some(true), Some(json!({"network": true})))
+            .await
+            .unwrap_err();
+        assert_eq!(error, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            error.message(),
+            Some("network is not allowed for sessions on this server")
+        );
+        assert!(backend.seen.lock().unwrap().is_empty());
+
+        // A backend that cannot enforce one says so instead of ignoring it.
+        let memory = HttpState::with_backend(Arc::new(MemoryBackend::default()), None);
+        let error = create_with(&memory, None, Some(true), Some(json!({"network": false})))
+            .await
+            .unwrap_err();
+        assert_eq!(error, StatusCode::BAD_REQUEST);
+        assert!(error.message().unwrap().contains("not supported"));
+    }
+
+    #[tokio::test]
+    async fn the_sandbox_is_part_of_what_an_idempotency_key_identifies() {
+        let (backend, state) = sandbox_state();
+        let a = json!({"extra_read_paths": ["/data/a"]});
+        let b = json!({"extra_read_paths": ["/data/b"]});
+
+        let Json(first) = create_with(&state, Some("k"), Some(true), Some(a.clone()))
+            .await
+            .unwrap();
+        assert_eq!(first["replayed"], false);
+        let Json(retry) = create_with(&state, Some("k"), Some(true), Some(a))
+            .await
+            .unwrap();
+        assert_eq!(retry["replayed"], true);
+        assert_eq!(retry["session_id"], first["session_id"]);
+        assert_eq!(
+            backend.seen.lock().unwrap().len(),
+            1,
+            "the retry created nothing"
+        );
+        // Same key, another sandbox, or none at all: conflict, never a replay
+        // of a session with different limits.
+        assert_eq!(
+            create_with(&state, Some("k"), Some(true), Some(b))
+                .await
+                .unwrap_err(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            create_with(&state, Some("k"), Some(true), None)
+                .await
+                .unwrap_err(),
+            StatusCode::CONFLICT
+        );
+        // And a key first used without a sandbox does not replay for one.
+        let _ = create_with(&state, Some("plain"), Some(true), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            create_with(
+                &state,
+                Some("plain"),
+                Some(true),
+                Some(json!({"network": false}))
+            )
+            .await
+            .unwrap_err(),
+            StatusCode::CONFLICT
+        );
+    }
+
+    #[test]
+    fn authorization_records_whether_the_caller_is_an_admin() {
+        let mut scoped_tokens = HashMap::new();
+        scoped_tokens.insert("writer".into(), vec!["read".into(), "write".into()]);
+        scoped_tokens.insert("root".into(), vec!["admin".into()]);
+        let state = HttpState::with_backend_and_security(
+            Arc::new(MemoryBackend::default()),
+            None,
+            HttpSecurityOptions {
+                scoped_tokens,
+                ..HttpSecurityOptions::default()
+            },
+        );
+        let create = |token: &str| {
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/sessions")
+                .header("authorization", format!("Bearer {token}"))
+                .body(axum::body::Body::empty())
+                .unwrap()
+        };
+        let mut writer = create("writer");
+        authorize_request(&state, &mut writer).unwrap();
+        assert_eq!(
+            writer.extensions().get::<CallerScope>(),
+            Some(&CallerScope { admin: false })
+        );
+        let mut root = create("root");
+        authorize_request(&state, &mut root).unwrap();
+        assert_eq!(
+            root.extensions().get::<CallerScope>(),
+            Some(&CallerScope { admin: true })
+        );
+
+        // A server with no tokens has nothing to tell callers apart.
+        let open = HttpState::with_backend(Arc::new(MemoryBackend::default()), None);
+        let mut anonymous = create("whatever");
+        authorize_request(&open, &mut anonymous).unwrap();
+        assert_eq!(
+            anonymous.extensions().get::<CallerScope>(),
+            Some(&CallerScope { admin: true })
+        );
     }
 }

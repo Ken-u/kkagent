@@ -81,6 +81,31 @@ curl -sS -H "$AUTH" -H 'Content-Type: application/json' \
 
 `POST /sessions` 同样接受 `Idempotency-Key`（最长 256 字节）。网络超时后用同一个 key、同样的 `{workspace, title}` 重试，得到的是第一次创建的那个会话（响应里 `replayed: true`），不会多出一个孤儿会话；第一次调用的响应则带 `replayed: false`。同 key 不同参数返回 `409`；同 key 的另一次调用还在创建中也返回 `409`（稍后重试即可）。创建失败不占用 key；key 对应的会话已被删除时，重试会新建一个。key 保留 7 天。不带 key 的请求行为不变（响应没有 `replayed` 字段）。
 
+### 按会话的沙箱覆盖
+
+默认所有会话共用 Server 配置里的 `[sandbox]`（联网与否、额外可读/可写目录）。多个会话需要不同设置时（例如某个会话要读 SDK 目录、要联网装依赖），创建会话时可以带一个 `sandbox` 对象，只影响这个会话里的命令（能力 `sessionSandbox`）：
+
+```bash
+curl -sS -H "$AUTH" -H 'Content-Type: application/json' \
+  -d '{"workspace":"/srv/app","sandbox":{"network":false,"extra_read_paths":["/data/android-sdk"]}}' \
+  "$API/sessions"
+```
+
+| 字段 | 含义 |
+|---|---|
+| `network` | 本会话的命令能否联网。省略 = 用 Server 的值。 |
+| `extra_read_paths` | 本会话额外可读的目录，**替换** Server 的 `extra_read_paths`；省略 = 沿用，空数组 = 本会话不要额外目录。 |
+| `extra_write_paths` | 同上，额外可写。 |
+
+- **只有配置文件能放开上限。** 必须先在 Server 的配置里写 `[sandbox.session_override]`（见 [配置参考](configuration.md)）；没有这张表时带 `sandbox` 创建会话返回 `400`（`per-session sandbox overrides are not enabled …`）。API 没有任何入口能提高上限。
+- **需要 `admin` token**（它扩大会话里命令能做的事，与 `config/reload` 同级）；其他 token 带 `sandbox` 得到 `403`。没有配置任何 token 的 Server 不区分调用者，按开放处理，上限仍然生效。
+- **超出上限一律拒绝，不静默裁剪：** 返回 `400`，`error` 列出所有问题（网络不允许、路径不存在、不是绝对路径、落在 HOME 或凭据目录、不在任何上限目录之内、每类最多 16 个）。拒绝时不创建会话。收窄（关网络、减少目录）总是允许的。
+- 路径按服务器上的真实目录（解析符号链接后）核对；可写路径必须落在 `write_roots` 或 Server 自己的 `extra_write_paths` 内，可读路径落在 `read_roots`、`write_roots` 或 Server 自己的两类目录内。
+- 只在 `workspace` 沙箱模式下可用：`process` / `disabled` 模式做不到按会话限制网络或目录，请求返回 `400`，不假装生效。`GET /health` 的 `sandbox.session_override` 给出 `{enabled, allow_network, read_roots, write_roots}`，客户端可据此判断能要什么。
+- 覆盖随会话保存（存在事务库里，`GET /sessions/{id}` 的 `sandbox` 字段返回创建时校验后的值），fork 出的会话继承它；会话删除时一并删除。**每个 turn 开始时都会按当前上限重新核对**：配置热加载降低了上限（或去掉了 `[sandbox.session_override]`）后，已有会话里不再符合的部分被丢弃（网络回到关闭、目录被去掉），只会收窄、不会变宽，并写一条警告日志。读不出已保存的覆盖时，启用了该功能的 Server 用最小策略（不联网、没有额外目录）。
+- `Idempotency-Key` 把 `sandbox` 算进请求身份：同 key 不同的 `sandbox`（或有无）返回 `409`；没带 `sandbox` 的请求身份与之前完全一致。
+- 不支持按会话设置环境变量：Server 级工具链仍在 `[toolchain]`（见配置参考）。
+
 ### 服务实例标识
 
 `GET /meta` 返回：
@@ -159,7 +184,7 @@ curl -sS -H "$AUTH" -H 'Content-Type: application/json' \
 | `GET /api/v1/turns/{task-id}` | 查询持久 turn 状态；也兼容 Session ID 查询最近一项。 |
 | `DELETE /api/v1/turns/{task-id}?cancel_background=` | 取消排队/运行/待审批 turn，并中断对应 Session；响应含 `turn_stopped` 与后台任务清理报告。 |
 | `GET /api/v1/sessions` | 列出会话。 |
-| `POST /api/v1/sessions` | 创建会话；body 为 `{workspace, title?}`，`workspace` 必填；支持 `Idempotency-Key`。失败时返回 `400`，body 为 `{"error": "…", "code": "bad_request"}`，`error` 是原因（工作区不在 `trusted_workspaces` 内、没有配置默认模型、路径无效等），用状态码无法区分这些情况。 |
+| `POST /api/v1/sessions` | 创建会话；body 为 `{workspace, title?, sandbox?}`，`workspace` 必填；`sandbox` 见[按会话的沙箱覆盖](#按会话的沙箱覆盖)（`admin` token，能力 `sessionSandbox`）；支持 `Idempotency-Key`。失败时返回 `400`，body 为 `{"error": "…", "code": "bad_request"}`，`error` 是原因（工作区不在 `trusted_workspaces` 内、没有配置默认模型、路径无效等），用状态码无法区分这些情况。 |
 | `GET /api/v1/sessions/{id}` | 读取会话，含 `model` 与 `context_window`（该模型的有效窗口；不知道就省略），见[会话与事件字段](#会话与事件字段)。 |
 | `DELETE /api/v1/sessions/{id}` | 删除会话。 |
 | `POST /api/v1/sessions/{id}/messages` | 提交 `{text}`。 |

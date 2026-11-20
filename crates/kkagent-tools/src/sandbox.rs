@@ -77,6 +77,9 @@ pub struct SandboxPolicy {
     /// Toolchain-derived mounts/env applied in workspace mode.
     pub toolchain_overlay: crate::toolchain::ToolchainSandboxOverlay,
     workspace_trust: Vec<kkagent_config::WorkspaceTrust>,
+    /// `[sandbox.session_override]`: how far a session may widen this policy.
+    /// `None` = per-session overrides are off.
+    pub session_ceiling: Option<kkagent_config::SandboxSessionOverride>,
 }
 
 impl Default for SandboxPolicy {
@@ -95,6 +98,7 @@ impl Default for SandboxPolicy {
             auto_fallback_warning: None,
             toolchain_overlay: crate::toolchain::ToolchainSandboxOverlay::default(),
             workspace_trust: Vec::new(),
+            session_ceiling: None,
         }
     }
 }
@@ -150,6 +154,7 @@ impl SandboxPolicy {
             auto_fallback_warning,
             toolchain_overlay: crate::toolchain::ToolchainSandboxOverlay::default(),
             workspace_trust: Vec::new(),
+            session_ceiling: config.session_override.clone(),
         })
     }
 
@@ -161,6 +166,188 @@ impl SandboxPolicy {
             policy.network = true;
         }
         Ok(policy)
+    }
+
+    /// Whether `[sandbox.session_override]` is configured, i.e. whether a
+    /// session may be created with its own sandbox settings at all.
+    pub fn session_override_enabled(&self) -> bool {
+        self.session_ceiling.is_some()
+    }
+
+    /// Validate a session's sandbox request at creation time and return it in
+    /// normalized form (canonical absolute paths) for storing. Every problem
+    /// is an error: nothing is silently clamped.
+    ///
+    /// Rules (the ceiling is `[sandbox.session_override]`, only the config
+    /// file can raise it):
+    /// - the effective mode must be `workspace`: `process`/`disabled` cannot
+    ///   enforce network or path limits, so pretending would be a lie;
+    /// - `network: true` needs `allow_network` (or the server already allows
+    ///   network); `network: false` is always fine;
+    /// - every path must be absolute, exist, not be HOME or a credential
+    ///   directory (unless the server allows sensitive paths), and lie inside
+    ///   the server's own extra paths of that kind or a ceiling root. A write
+    ///   path may lie inside `write_roots` (or the server's write paths); a
+    ///   read path inside `read_roots`, `write_roots` or either server list.
+    pub fn validate_session_request(
+        &self,
+        request: &kkagent_config::SessionSandboxRequest,
+    ) -> Result<kkagent_config::SessionSandboxRequest, String> {
+        if self.session_ceiling.is_none() {
+            return Err(
+                "per-session sandbox overrides are not enabled on this server \
+(add a [sandbox.session_override] table to its configuration)"
+                    .into(),
+            );
+        }
+        if request.is_empty() {
+            return Err(
+                "sandbox must set at least one of network, extra_read_paths, extra_write_paths"
+                    .into(),
+            );
+        }
+        let (normalized, problems) = self.evaluate_session_request(request);
+        if problems.is_empty() {
+            Ok(normalized)
+        } else {
+            Err(problems.join("; "))
+        }
+    }
+
+    /// The policy of one session: this server policy with the session's stored
+    /// request applied. The request was validated when the session was
+    /// created, but the server configuration may have been reloaded since, so
+    /// anything that no longer fits the ceiling is dropped (never widened) and
+    /// reported in the returned notes.
+    pub fn for_session(
+        &self,
+        request: &kkagent_config::SessionSandboxRequest,
+    ) -> (SandboxPolicy, Vec<String>) {
+        let mut notes = Vec::new();
+        if self.mode != SandboxMode::Workspace {
+            notes.push(format!(
+                "the session's sandbox override is not applied: sandbox mode `{}` cannot enforce it",
+                self.mode_name()
+            ));
+            return (self.clone(), notes);
+        }
+        let (normalized, problems) = self.evaluate_session_request(request);
+        notes.extend(problems);
+        let mut policy = self.clone();
+        if let Some(network) = normalized.network {
+            policy.network = network;
+        }
+        if let Some(paths) = normalized.extra_read_paths.as_ref() {
+            policy.extra_read_paths = paths.iter().map(PathBuf::from).collect();
+        }
+        if let Some(paths) = normalized.extra_write_paths.as_ref() {
+            policy.extra_write_paths = paths.iter().map(PathBuf::from).collect();
+        }
+        (policy, notes)
+    }
+
+    /// Normalize `request` and collect what does not fit. The normalized
+    /// request keeps only the parts that fit: a network request the ceiling
+    /// forbids becomes `false` (never `true`), a path that does not fit is
+    /// left out.
+    fn evaluate_session_request(
+        &self,
+        request: &kkagent_config::SessionSandboxRequest,
+    ) -> (kkagent_config::SessionSandboxRequest, Vec<String>) {
+        use std::collections::BTreeSet;
+
+        let mut problems: Vec<String> = Vec::new();
+        let mut normalized = kkagent_config::SessionSandboxRequest::default();
+        if self.mode != SandboxMode::Workspace {
+            problems.push(format!(
+                "sandbox mode `{}` cannot enforce per-session network or path limits (only `workspace` can)",
+                self.mode_name()
+            ));
+            return (normalized, problems);
+        }
+        let ceiling = self.session_ceiling.clone().unwrap_or_default();
+
+        if let Some(want) = request.network {
+            if want && !(ceiling.allow_network || self.network) {
+                problems.push(
+                    "network is not allowed for sessions on this server (sandbox.session_override.allow_network is false)"
+                        .into(),
+                );
+                normalized.network = Some(false);
+            } else {
+                normalized.network = Some(want);
+            }
+        }
+
+        let canonical_all = |raw: &[String]| -> Vec<PathBuf> {
+            raw.iter()
+                .map(|item| canonical_or_owned(&kkagent_config::expand_user_path(item)))
+                .collect()
+        };
+        let canonical_paths = |paths: &[PathBuf]| -> Vec<PathBuf> {
+            paths.iter().map(|p| canonical_or_owned(p)).collect()
+        };
+        let read_roots = canonical_all(&ceiling.read_roots);
+        let write_roots = canonical_all(&ceiling.write_roots);
+        let server_read = canonical_paths(&self.extra_read_paths);
+        let server_write = canonical_paths(&self.extra_write_paths);
+        let read_bases: Vec<&PathBuf> = read_roots
+            .iter()
+            .chain(write_roots.iter())
+            .chain(server_read.iter())
+            .chain(server_write.iter())
+            .collect();
+        let write_bases: Vec<&PathBuf> = write_roots.iter().chain(server_write.iter()).collect();
+
+        let mut check = |kind: &str, raw: &[String], bases: &[&PathBuf]| -> Vec<String> {
+            let mut kept: BTreeSet<String> = BTreeSet::new();
+            if raw.len() > kkagent_config::SESSION_SANDBOX_MAX_PATHS {
+                problems.push(format!(
+                    "{kind} lists {} paths; at most {} are allowed",
+                    raw.len(),
+                    kkagent_config::SESSION_SANDBOX_MAX_PATHS
+                ));
+            }
+            for item in raw.iter().take(kkagent_config::SESSION_SANDBOX_MAX_PATHS) {
+                let expanded = kkagent_config::expand_user_path(item);
+                if !expanded.is_absolute() {
+                    problems.push(format!("{kind} `{item}` is not an absolute path"));
+                    continue;
+                }
+                let Ok(canonical) = std::fs::canonicalize(&expanded) else {
+                    problems.push(format!("{kind} `{item}` does not exist on the server"));
+                    continue;
+                };
+                if let Some(problem) = kkagent_config::sandbox_path_problem(
+                    &expanded,
+                    self.allow_sensitive_extra_paths,
+                )
+                .or_else(|| {
+                    kkagent_config::sandbox_path_problem(
+                        &canonical,
+                        self.allow_sensitive_extra_paths,
+                    )
+                }) {
+                    problems.push(format!("{kind} `{item}` {problem}"));
+                    continue;
+                }
+                if !bases.iter().any(|base| path_is_within(&canonical, base)) {
+                    problems.push(format!(
+                        "{kind} `{item}` is outside what this server allows for sessions (sandbox.session_override roots and the server's own extra paths)"
+                    ));
+                    continue;
+                }
+                kept.insert(canonical.to_string_lossy().into_owned());
+            }
+            kept.into_iter().collect()
+        };
+        if let Some(raw) = request.extra_read_paths.as_ref() {
+            normalized.extra_read_paths = Some(check("extra_read_paths", raw, &read_bases));
+        }
+        if let Some(raw) = request.extra_write_paths.as_ref() {
+            normalized.extra_write_paths = Some(check("extra_write_paths", raw, &write_bases));
+        }
+        (normalized, problems)
     }
 
     pub fn refresh_toolchain(&mut self, config: &kkagent_config::ToolchainConfig) {
@@ -1431,5 +1618,381 @@ Max processes             127588               127588               processes
         );
         std::fs::remove_file(config_path).unwrap();
         std::fs::remove_dir_all(workspace).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod session_override_tests {
+    use super::*;
+    use kkagent_config::{SandboxSessionOverride, SessionSandboxRequest};
+
+    fn workspace_policy(ceiling: Option<SandboxSessionOverride>) -> SandboxPolicy {
+        SandboxPolicy {
+            mode: SandboxMode::Workspace,
+            configured_mode: "workspace".into(),
+            session_ceiling: ceiling,
+            ..SandboxPolicy::default()
+        }
+    }
+
+    fn ceiling(network: bool, read: &[&Path], write: &[&Path]) -> SandboxSessionOverride {
+        SandboxSessionOverride {
+            allow_network: network,
+            read_roots: read
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect(),
+            write_roots: write
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect(),
+        }
+    }
+
+    fn reads(paths: &[&Path]) -> SessionSandboxRequest {
+        SessionSandboxRequest {
+            extra_read_paths: Some(
+                paths
+                    .iter()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .collect(),
+            ),
+            ..Default::default()
+        }
+    }
+
+    fn writes(paths: &[&Path]) -> SessionSandboxRequest {
+        SessionSandboxRequest {
+            extra_write_paths: Some(
+                paths
+                    .iter()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .collect(),
+            ),
+            ..Default::default()
+        }
+    }
+
+    fn net(value: bool) -> SessionSandboxRequest {
+        SessionSandboxRequest {
+            network: Some(value),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn overrides_are_off_until_the_config_file_sets_a_ceiling() {
+        let policy = workspace_policy(None);
+        assert!(!policy.session_override_enabled());
+        let error = policy.validate_session_request(&net(true)).unwrap_err();
+        assert!(error.contains("not enabled"), "{error}");
+        assert!(
+            workspace_policy(Some(SandboxSessionOverride::default())).session_override_enabled()
+        );
+    }
+
+    #[test]
+    fn an_empty_request_is_rejected() {
+        let policy = workspace_policy(Some(SandboxSessionOverride::default()));
+        let error = policy
+            .validate_session_request(&SessionSandboxRequest::default())
+            .unwrap_err();
+        assert!(error.contains("at least one"), "{error}");
+    }
+
+    #[test]
+    fn only_the_workspace_mode_can_enforce_per_session_limits() {
+        for mode in [SandboxMode::Process, SandboxMode::Disabled] {
+            let policy = SandboxPolicy {
+                mode,
+                session_ceiling: Some(SandboxSessionOverride {
+                    allow_network: true,
+                    ..Default::default()
+                }),
+                ..SandboxPolicy::default()
+            };
+            let error = policy.validate_session_request(&net(false)).unwrap_err();
+            assert!(error.contains("cannot enforce"), "{error}");
+            // An existing session is left on the server policy, with a note.
+            let (effective, notes) = policy.for_session(&net(false));
+            assert_eq!(effective.network, policy.network);
+            assert!(notes.iter().any(|n| n.contains("not applied")), "{notes:?}");
+        }
+    }
+
+    #[test]
+    fn network_can_always_be_turned_off_but_only_turned_on_within_the_ceiling() {
+        let denied = workspace_policy(Some(ceiling(false, &[], &[])));
+        assert!(denied
+            .validate_session_request(&net(true))
+            .unwrap_err()
+            .contains("not allowed"));
+        assert_eq!(
+            denied
+                .validate_session_request(&net(false))
+                .unwrap()
+                .network,
+            Some(false)
+        );
+
+        let allowed = workspace_policy(Some(ceiling(true, &[], &[])));
+        assert_eq!(
+            allowed
+                .validate_session_request(&net(true))
+                .unwrap()
+                .network,
+            Some(true)
+        );
+
+        // Narrowing below a server that has network on is fine; asking for
+        // what the server already allows is not a widening.
+        let mut open = workspace_policy(Some(ceiling(false, &[], &[])));
+        open.network = true;
+        assert_eq!(
+            open.validate_session_request(&net(true)).unwrap().network,
+            Some(true)
+        );
+        let (effective, notes) = open.for_session(&net(false));
+        assert!(!effective.network && notes.is_empty(), "{notes:?}");
+    }
+
+    #[test]
+    fn paths_must_exist_and_lie_inside_a_ceiling_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("sdk");
+        let inside = root.join("android");
+        let outside = temp.path().join("elsewhere");
+        for dir in [&inside, &outside] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let policy = workspace_policy(Some(ceiling(false, &[&root], &[])));
+
+        let ok = policy
+            .validate_session_request(&reads(&[&inside, &root]))
+            .unwrap();
+        let canonical_root = std::fs::canonicalize(&root)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert!(ok.extra_read_paths.unwrap().contains(&canonical_root));
+
+        let error = policy
+            .validate_session_request(&reads(&[&outside]))
+            .unwrap_err();
+        assert!(error.contains("outside what this server allows"), "{error}");
+        let missing = root.join("nope");
+        let error = policy
+            .validate_session_request(&reads(&[&missing]))
+            .unwrap_err();
+        assert!(error.contains("does not exist"), "{error}");
+        let error = policy
+            .validate_session_request(&SessionSandboxRequest {
+                extra_read_paths: Some(vec!["relative/dir".into()]),
+                ..Default::default()
+            })
+            .unwrap_err();
+        assert!(error.contains("not an absolute path"), "{error}");
+        // Every problem is reported together, nothing is clamped silently.
+        let error = policy
+            .validate_session_request(&SessionSandboxRequest {
+                network: Some(true),
+                extra_read_paths: Some(vec![outside.to_string_lossy().into_owned()]),
+                ..Default::default()
+            })
+            .unwrap_err();
+        assert!(
+            error.contains("network is not allowed")
+                && error.contains("outside what this server allows"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn write_paths_need_a_write_root_and_a_write_root_also_allows_reading() {
+        let temp = tempfile::tempdir().unwrap();
+        let read_root = temp.path().join("ro");
+        let write_root = temp.path().join("rw");
+        std::fs::create_dir_all(&read_root).unwrap();
+        std::fs::create_dir_all(&write_root).unwrap();
+        let policy = workspace_policy(Some(ceiling(false, &[&read_root], &[&write_root])));
+
+        assert!(policy
+            .validate_session_request(&writes(&[&write_root]))
+            .is_ok());
+        assert!(policy
+            .validate_session_request(&reads(&[&write_root]))
+            .is_ok());
+        let error = policy
+            .validate_session_request(&writes(&[&read_root]))
+            .unwrap_err();
+        assert!(error.contains("outside what this server allows"), "{error}");
+    }
+
+    #[test]
+    fn the_servers_own_extra_paths_count_as_allowed_so_a_session_can_narrow_to_them() {
+        let temp = tempfile::tempdir().unwrap();
+        let shared = temp.path().join("shared");
+        std::fs::create_dir_all(&shared).unwrap();
+        let mut policy = workspace_policy(Some(ceiling(false, &[], &[])));
+        policy.extra_read_paths = vec![shared.clone()];
+        assert!(policy.validate_session_request(&reads(&[&shared])).is_ok());
+        // An empty list removes the server's extra paths for this session.
+        let (effective, notes) = policy.for_session(&SessionSandboxRequest {
+            extra_read_paths: Some(vec![]),
+            ..Default::default()
+        });
+        assert!(
+            effective.extra_read_paths.is_empty() && notes.is_empty(),
+            "{notes:?}"
+        );
+        // An absent list keeps them.
+        let (effective, _) = policy.for_session(&net(false));
+        assert_eq!(effective.extra_read_paths, vec![shared]);
+    }
+
+    #[test]
+    fn credential_directories_stay_closed_even_inside_a_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let ssh = temp.path().join("home").join(".ssh");
+        std::fs::create_dir_all(&ssh).unwrap();
+        let policy = workspace_policy(Some(ceiling(false, &[temp.path()], &[])));
+        let error = policy
+            .validate_session_request(&reads(&[&ssh]))
+            .unwrap_err();
+        assert!(error.contains("sensitive path"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_cannot_lead_out_of_the_ceiling() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let secret = temp.path().join("secret");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&secret).unwrap();
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&secret, &link).unwrap();
+        let policy = workspace_policy(Some(ceiling(false, &[&root], &[])));
+        let error = policy
+            .validate_session_request(&reads(&[&link]))
+            .unwrap_err();
+        assert!(error.contains("outside what this server allows"), "{error}");
+    }
+
+    #[test]
+    fn at_most_sixteen_paths_per_kind() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut dirs = Vec::new();
+        for index in 0..17 {
+            let dir = temp.path().join(format!("d{index}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            dirs.push(dir);
+        }
+        let policy = workspace_policy(Some(ceiling(false, &[temp.path()], &[])));
+        let refs: Vec<&Path> = dirs.iter().map(|d| d.as_path()).collect();
+        assert!(policy.validate_session_request(&reads(&refs[..16])).is_ok());
+        let error = policy.validate_session_request(&reads(&refs)).unwrap_err();
+        assert!(error.contains("at most 16"), "{error}");
+    }
+
+    #[test]
+    fn a_reload_that_lowers_the_ceiling_never_widens_an_existing_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("sdk");
+        std::fs::create_dir_all(&root).unwrap();
+        let request = SessionSandboxRequest {
+            network: Some(true),
+            extra_read_paths: Some(vec![root.to_string_lossy().into_owned()]),
+            ..Default::default()
+        };
+        let before = workspace_policy(Some(ceiling(true, &[&root], &[])));
+        let stored = before.validate_session_request(&request).unwrap();
+        let (effective, notes) = before.for_session(&stored);
+        assert!(
+            effective.network && effective.extra_read_paths.len() == 1 && notes.is_empty(),
+            "{notes:?}"
+        );
+
+        // The server was reloaded with a lower ceiling (and without the root).
+        let after = workspace_policy(Some(ceiling(false, &[], &[])));
+        let (effective, notes) = after.for_session(&stored);
+        assert!(!effective.network, "network must fall back to off");
+        assert!(effective.extra_read_paths.is_empty());
+        assert!(notes.len() >= 2, "{notes:?}");
+        // And with the feature switched off entirely.
+        let (effective, _) = workspace_policy(None).for_session(&stored);
+        assert!(!effective.network && effective.extra_read_paths.is_empty());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_mac_profile_follows_the_session_policy() {
+        let temp = tempfile::tempdir().unwrap();
+        let extra = temp.path().join("rw");
+        std::fs::create_dir_all(&extra).unwrap();
+        let base = workspace_policy(Some(ceiling(true, &[], &[&extra])));
+        let work = Path::new("/tmp/work");
+        let off = macos_profile(&base, None, work, work).unwrap();
+        assert!(!off.contains("allow network"));
+        assert!(!off.contains(&*std::fs::canonicalize(&extra).unwrap().to_string_lossy()));
+
+        let request = base
+            .validate_session_request(&SessionSandboxRequest {
+                network: Some(true),
+                extra_write_paths: Some(vec![extra.to_string_lossy().into_owned()]),
+                ..Default::default()
+            })
+            .unwrap();
+        let (session, notes) = base.for_session(&request);
+        assert!(notes.is_empty(), "{notes:?}");
+        let on = macos_profile(&session, None, work, work).unwrap();
+        assert!(on.contains("allow network"));
+        assert!(on.contains(&*std::fs::canonicalize(&extra).unwrap().to_string_lossy()));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn mac_a_session_override_opens_one_extra_write_directory_and_the_server_policy_does_not()
+    {
+        let workspace =
+            std::env::temp_dir().join(format!("kkagent-sess-ws-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace).unwrap();
+        // Outside the workspace and outside the system temp area the sandbox leaves closed.
+        let extra = dirs::home_dir()
+            .unwrap()
+            .join(format!(".kkagent-session-extra-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&extra).unwrap();
+        let base = workspace_policy(Some(ceiling(false, &[], &[&extra])));
+        let script = format!("printf ok > {}/out.txt", extra.display());
+
+        let status = base
+            .command("/bin/bash", "-c", &script, &workspace)
+            .unwrap()
+            .status()
+            .await
+            .unwrap();
+        assert!(
+            !status.success(),
+            "the server policy must keep the directory closed"
+        );
+        assert!(!extra.join("out.txt").exists());
+
+        let request = base.validate_session_request(&writes(&[&extra])).unwrap();
+        let (session, notes) = base.for_session(&request);
+        assert!(notes.is_empty(), "{notes:?}");
+        let status = session
+            .command("/bin/bash", "-c", &script, &workspace)
+            .unwrap()
+            .status()
+            .await
+            .unwrap();
+        assert!(status.success(), "the session policy opens the directory");
+        assert_eq!(
+            std::fs::read_to_string(extra.join("out.txt")).unwrap(),
+            "ok"
+        );
+
+        std::fs::remove_dir_all(&extra).unwrap();
+        std::fs::remove_dir_all(&workspace).unwrap();
     }
 }

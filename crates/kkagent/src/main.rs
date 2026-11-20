@@ -4620,6 +4620,13 @@ impl AgentHttpBackend {
             .cloned()
             .map(|requested| requested.load(std::sync::atomic::Ordering::SeqCst));
         let extra = self.state.resume_reconnect_fields(session_id).await;
+        // The override the session was created with (validated at creation;
+        // the effective policy is re-clamped to the server ceiling every turn).
+        let sandbox_override = {
+            let db = self.state.transcript.lock().await;
+            db.get_session_sandbox(session_id).ok().flatten()
+        }
+        .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok());
         let approval = self
             .state
             .pending_tool_approval_for_session(session_id)
@@ -4672,6 +4679,9 @@ impl AgentHttpBackend {
             }
             if let Some(question) = question {
                 object.insert("pending_question".into(), question);
+            }
+            if let Some(sandbox_override) = sandbox_override {
+                object.insert("sandbox".into(), sandbox_override);
             }
         }
         body
@@ -4748,7 +4758,27 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
         workspace: Option<String>,
         title: Option<String>,
     ) -> Result<serde_json::Value, String> {
+        self.create_session_with_sandbox(workspace, title, None)
+            .await
+    }
+
+    async fn create_session_with_sandbox(
+        &self,
+        workspace: Option<String>,
+        title: Option<String>,
+        sandbox: Option<kkagent_config::SessionSandboxRequest>,
+    ) -> Result<serde_json::Value, String> {
         let id = uuid::Uuid::new_v4().to_string();
+        // The server's ceiling decides whether this override is acceptable;
+        // nothing is created when it is not, and nothing is clamped silently.
+        let sandbox = match sandbox {
+            Some(request) => Some(
+                self.state
+                    .sandbox_snapshot()
+                    .validate_session_request(&request)?,
+            ),
+            None => None,
+        };
         let requested = workspace
             .filter(|value| !value.trim().is_empty())
             .map(PathBuf::from)
@@ -4785,6 +4815,20 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
                 .map_err(|error| error.to_string())?;
             if let Some(ref t) = title {
                 db.set_title(&id, t).map_err(|error| error.to_string())?;
+            }
+            if let Some(ref request) = sandbox {
+                let stored = serde_json::to_string(request)
+                    .map_err(|error| error.to_string())
+                    .and_then(|json| {
+                        db.set_session_sandbox(&id, &json)
+                            .map_err(|error| error.to_string())
+                    });
+                if let Err(error) = stored {
+                    // A session whose limits could not be kept must not exist:
+                    // it would run with the server's policy instead.
+                    let _ = db.purge_session(&id);
+                    return Err(format!("could not store the session sandbox: {error}"));
+                }
             }
         }
         session.services.on_created().await;
@@ -4845,7 +4889,7 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
         let plan_mode = session.plan_mode;
         let model_alias = session.get_model_alias();
         self.state.sessions.lock().await.insert(id.clone(), session);
-        Ok(serde_json::json!({
+        let mut created = serde_json::json!({
             "session_id": id,
             "workspace": cwd.display().to_string(),
             "title": title,
@@ -4854,7 +4898,14 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
             "plan_mode": plan_mode,
             "model": model_alias,
             "created_at": chrono::Utc::now().to_rfc3339(),
-        }))
+        });
+        if let (Some(request), Some(object)) = (sandbox.as_ref(), created.as_object_mut()) {
+            object.insert(
+                "sandbox".into(),
+                serde_json::to_value(request).unwrap_or_default(),
+            );
+        }
+        Ok(created)
     }
 
     async fn get_session(&self, id: &str) -> Option<serde_json::Value> {
@@ -5666,6 +5717,7 @@ impl kkagent_rpc::HttpBackend for AgentHttpBackend {
             "sandbox": {
                 "mode": sandbox.mode_name(),
                 "network": sandbox.network,
+                "session_override": session_override_json(&sandbox),
             },
         })
     }
@@ -5855,6 +5907,20 @@ async fn build_turn_tool_registry(
         .0
 }
 
+/// What `GET /health` tells a client about per-session sandbox overrides:
+/// whether they can be used at all and how far (the ceiling).
+fn session_override_json(policy: &kkagent_tools::sandbox::SandboxPolicy) -> serde_json::Value {
+    match policy.session_ceiling.as_ref() {
+        Some(ceiling) => serde_json::json!({
+            "enabled": policy.mode == kkagent_tools::sandbox::SandboxMode::Workspace,
+            "allow_network": ceiling.allow_network,
+            "read_roots": ceiling.read_roots,
+            "write_roots": ceiling.write_roots,
+        }),
+        None => serde_json::json!({"enabled": false}),
+    }
+}
+
 /// The per-turn tool registry plus the permission policy of the session's
 /// host-injected tools that actually made it into the registry.
 async fn build_turn_tools(
@@ -5947,11 +6013,12 @@ async fn build_turn_tools(
         // `0` is not a meaningful timeout (would kill instantly); treat as unset.
         .filter(|seconds| *seconds > 0)
         .unwrap_or(kkagent_tools::builtin::bash::DEFAULT_TIMEOUT_S);
+    let session_sandbox = state.session_sandbox_policy(session_id).await;
     tools.register(Arc::new(kkagent_tools::builtin::BashTool::new(
         state.bash_shells.clone(),
         kkagent_tools::builtin::BashOptions {
             auto_background_on_timeout,
-            sandbox: state.sandbox_snapshot(),
+            sandbox: session_sandbox,
             default_timeout_s,
             toolchain: state.config().toolchain.clone(),
             kaos: {
@@ -6730,6 +6797,54 @@ impl ServerState {
             .read()
             .unwrap_or_else(|error| error.into_inner())
             .clone()
+    }
+
+    /// The sandbox policy of one session's commands: the server policy with
+    /// the override the session was created with (if any) applied, re-checked
+    /// against the server's current ceiling so a reload that lowers it never
+    /// leaves a session wider than the server now allows.
+    async fn session_sandbox_policy(
+        &self,
+        session_id: &str,
+    ) -> kkagent_tools::sandbox::SandboxPolicy {
+        let base = self.sandbox_snapshot();
+        let stored = {
+            let db = self.transcript.lock().await;
+            db.get_session_sandbox(session_id)
+        };
+        // What a session gets when its override cannot be read: as little as
+        // possible, never the (possibly wider) server policy.
+        let closed = || kkagent_config::SessionSandboxRequest {
+            network: Some(false),
+            extra_read_paths: Some(Vec::new()),
+            extra_write_paths: Some(Vec::new()),
+        };
+        let request = match stored {
+            Ok(None) => return base,
+            Ok(Some(json)) => {
+                match serde_json::from_str::<kkagent_config::SessionSandboxRequest>(&json) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        tracing::warn!(session_id, %error, "stored session sandbox is unreadable; using the closed policy");
+                        closed()
+                    }
+                }
+            }
+            Err(error) => {
+                if !base.session_override_enabled() {
+                    // The feature is not in use on this server: behave exactly
+                    // as before it existed.
+                    return base;
+                }
+                tracing::warn!(session_id, %error, "could not read the session sandbox; using the closed policy");
+                closed()
+            }
+        };
+        let (policy, notes) = base.for_session(&request);
+        for note in notes {
+            tracing::warn!(session_id, "session sandbox: {note}");
+        }
+        policy
     }
 
     fn workspace_is_trusted(&self, workspace: &Path) -> bool {
@@ -14809,6 +14924,192 @@ mod http_path_tests {
             "the reason names the line: {error}"
         );
         assert!(state.workspace_is_trusted(&b));
+
+        state.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Everything `[sandbox.session_override]` promises, on a real server
+    /// state: validated against the ceiling at creation (nothing is created
+    /// on refusal), stored with the session, applied to its commands every
+    /// turn, never wider after a reload lowers the ceiling, gone with the
+    /// session.
+    #[tokio::test]
+    async fn a_session_sandbox_is_checked_stored_applied_and_follows_a_reload() {
+        use kkagent_rpc::HttpBackend as _;
+        let dir = std::env::temp_dir().join(format!("kkagent-sess-sbx-{}", uuid::Uuid::new_v4()));
+        let names = ["ws", "sdk", "cache", "other"];
+        for name in names {
+            std::fs::create_dir_all(dir.join(name)).unwrap();
+        }
+        let [ws, sdk, cache, other] =
+            names.map(|name| std::fs::canonicalize(dir.join(name)).unwrap());
+        let config_path = dir.join("config.toml");
+        let write_config = |write_roots: &[&PathBuf], ceiling: bool| {
+            let roots = write_roots
+                .iter()
+                .map(|root| format!("{:?}", root.display().to_string()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let ceiling = if ceiling {
+                format!(
+                    "[sandbox.session_override]\nallow_network = false\nread_roots = [{:?}]\nwrite_roots = [{roots}]\n\n",
+                    sdk.display().to_string()
+                )
+            } else {
+                String::new()
+            };
+            std::fs::write(
+                &config_path,
+                format!(
+                    "default_model = \"main\"\ntrusted_workspaces = [{:?}]\n\n\
+                     [sandbox]\nmode = \"auto\"\n\n{ceiling}\
+                     [providers.p1]\ntype = \"openai\"\napi_key = \"FAKE-KEY-FOR-TEST\"\n\
+                     base_url = \"http://127.0.0.1:9/v1\"\n\n\
+                     [models.main]\nprovider = \"p1\"\nmodel = \"m\"\n",
+                    ws.display().to_string()
+                ),
+            )
+            .unwrap();
+        };
+        write_config(&[&cache], true);
+        let config = load_config(Some(&config_path)).unwrap();
+        let (shutdown_tx, _) = watch::channel(false);
+        let state = build_server_state_with_shutdown(
+            Arc::new(config),
+            config_path.clone(),
+            shutdown_tx,
+            kkagent_rpc::HttpSecurityOptions::default(),
+            Some(dir.join("transcripts.db")),
+            None,
+            default_process_policy(&AppConfig::default()),
+        )
+        .await
+        .unwrap();
+        if state.sandbox_snapshot().mode != kkagent_tools::sandbox::SandboxMode::Workspace {
+            // No workspace sandbox on this machine (e.g. Linux without
+            // bubblewrap): per-session limits cannot be enforced here.
+            eprintln!("skipped: no workspace sandbox on this machine");
+            state.shutdown().await;
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        let backend = AgentHttpBackend {
+            state: state.clone(),
+        };
+        let request = |network: Option<bool>, read: &[&PathBuf], write: &[&PathBuf]| {
+            let list = |paths: &[&PathBuf]| {
+                Some(
+                    paths
+                        .iter()
+                        .map(|path| path.display().to_string())
+                        .collect::<Vec<_>>(),
+                )
+                .filter(|paths| !paths.is_empty())
+            };
+            kkagent_config::SessionSandboxRequest {
+                network,
+                extra_read_paths: list(read),
+                extra_write_paths: list(write),
+            }
+        };
+        let ws_arg = || Some(ws.display().to_string());
+
+        // The health report tells a client what it may ask for.
+        let health = backend.health().await;
+        assert_eq!(health["sandbox"]["session_override"]["enabled"], true);
+        assert_eq!(
+            health["sandbox"]["session_override"]["allow_network"],
+            false
+        );
+
+        // Refused: outside the ceiling / network not allowed. Nothing is made.
+        let before = state.sessions.lock().await.len();
+        let error = backend
+            .create_session_with_sandbox(ws_arg(), None, Some(request(None, &[], &[&other])))
+            .await
+            .unwrap_err();
+        assert!(error.contains("outside what this server allows"), "{error}");
+        let error = backend
+            .create_session_with_sandbox(ws_arg(), None, Some(request(Some(true), &[], &[])))
+            .await
+            .unwrap_err();
+        assert!(error.contains("network is not allowed"), "{error}");
+        assert_eq!(state.sessions.lock().await.len(), before);
+
+        // Accepted: the session keeps its (normalized) override.
+        let created = backend
+            .create_session_with_sandbox(
+                ws_arg(),
+                None,
+                Some(request(Some(false), &[&sdk], &[&cache])),
+            )
+            .await
+            .unwrap();
+        let id = created["session_id"].as_str().unwrap().to_string();
+        assert_eq!(created["sandbox"]["network"], false);
+        assert_eq!(
+            created["sandbox"]["extra_write_paths"],
+            serde_json::json!([cache.display().to_string()])
+        );
+        let shown = backend.get_session(&id).await.unwrap();
+        assert_eq!(shown["sandbox"], created["sandbox"]);
+
+        // Its commands run under the session policy; others under the server's.
+        let policy = state.session_sandbox_policy(&id).await;
+        assert!(!policy.network);
+        assert_eq!(policy.extra_read_paths, vec![sdk.clone()]);
+        assert_eq!(policy.extra_write_paths, vec![cache.clone()]);
+        let plain = backend.create_session(ws_arg(), None).await.unwrap();
+        assert!(plain.get("sandbox").is_none());
+        let plain_id = plain["session_id"].as_str().unwrap();
+        let plain_policy = state.session_sandbox_policy(plain_id).await;
+        assert!(
+            plain_policy.extra_read_paths.is_empty() && plain_policy.extra_write_paths.is_empty()
+        );
+
+        // The ceiling is lowered by a reload: the session never keeps more.
+        write_config(&[&other], true);
+        backend.reload_config().await.unwrap();
+        let policy = state.session_sandbox_policy(&id).await;
+        assert!(
+            policy.extra_write_paths.is_empty(),
+            "{:?}",
+            policy.extra_write_paths
+        );
+        assert_eq!(
+            policy.extra_read_paths,
+            vec![sdk.clone()],
+            "still within the read root"
+        );
+        // And without a ceiling at all the override can only narrow.
+        write_config(&[], false);
+        backend.reload_config().await.unwrap();
+        let policy = state.session_sandbox_policy(&id).await;
+        assert!(
+            !policy.network
+                && policy.extra_write_paths.is_empty()
+                && policy.extra_read_paths.is_empty()
+        );
+        let error = backend
+            .create_session_with_sandbox(ws_arg(), None, Some(request(Some(false), &[], &[])))
+            .await
+            .unwrap_err();
+        assert!(error.contains("not enabled"), "{error}");
+        assert_eq!(
+            backend.health().await["sandbox"]["session_override"]["enabled"],
+            false
+        );
+
+        // Gone with the session.
+        backend.delete_session(&id).await.unwrap();
+        assert!(state
+            .transcript
+            .lock()
+            .await
+            .get_session_sandbox(&id)
+            .unwrap()
+            .is_none());
 
         state.shutdown().await;
         let _ = std::fs::remove_dir_all(&dir);

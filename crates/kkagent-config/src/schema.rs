@@ -1403,6 +1403,58 @@ pub struct SandboxConfig {
     /// not exist are skipped. The default system roots are always bound.
     #[serde(default)]
     pub system_read_paths: Vec<String>,
+    /// Server-side ceiling for per-session sandbox overrides: a session created
+    /// with a `sandbox` object (`POST /api/v1/sessions`, admin token) may turn
+    /// network on and add read/write paths, but only within this ceiling.
+    /// Absent (the default) = the feature is off and every session uses the
+    /// server's `[sandbox]` settings above. Only the configuration file can
+    /// raise the ceiling; no API can.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_override: Option<SandboxSessionOverride>,
+}
+
+/// `[sandbox.session_override]`: how far a single session's sandbox may be
+/// widened beyond the server's `[sandbox]` settings. Narrowing (network off,
+/// fewer paths) is always allowed once the table exists.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SandboxSessionOverride {
+    /// A session may turn network on. Default `false`.
+    #[serde(default)]
+    pub allow_network: bool,
+    /// A session's `extra_read_paths` may be inside these directories (in
+    /// addition to the server's own `extra_read_paths`).
+    #[serde(default)]
+    pub read_roots: Vec<String>,
+    /// A session's `extra_write_paths` may be inside these directories (in
+    /// addition to the server's own `extra_write_paths`). Implies read access.
+    #[serde(default)]
+    pub write_roots: Vec<String>,
+}
+
+/// Most paths one session may list per kind; bounds the size of a stored
+/// override and of the sandbox command line.
+pub const SESSION_SANDBOX_MAX_PATHS: usize = 16;
+
+/// The `sandbox` object of `POST /api/v1/sessions`. `None` fields keep the
+/// server's value; `Some` replaces it (an empty path list removes the
+/// server's extra paths for this session).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionSandboxRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extra_read_paths: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extra_write_paths: Option<Vec<String>>,
+}
+
+impl SessionSandboxRequest {
+    pub fn is_empty(&self) -> bool {
+        self.network.is_none()
+            && self.extra_read_paths.is_none()
+            && self.extra_write_paths.is_none()
+    }
 }
 
 impl Default for SandboxConfig {
@@ -1417,6 +1469,7 @@ impl Default for SandboxConfig {
             extra_write_paths: Vec::new(),
             allow_sensitive_extra_paths: false,
             system_read_paths: Vec::new(),
+            session_override: None,
         }
     }
 }
@@ -1435,14 +1488,11 @@ impl SandboxConfig {
         )
     }
 
-    /// Reject `extra_read_paths` / `extra_write_paths` that open HOME or
-    /// credential directories unless `allow_sensitive_extra_paths` is set.
+    /// Reject `extra_read_paths` / `extra_write_paths` (and the session
+    /// override roots) that open HOME or credential directories unless
+    /// `allow_sensitive_extra_paths` is set.
     pub fn validate_extra_paths(&self) -> anyhow::Result<()> {
-        if self.allow_sensitive_extra_paths {
-            return Ok(());
-        }
-        let home = dirs::home_dir();
-        for (kind, path) in self
+        let mut entries: Vec<(&str, &str)> = self
             .extra_read_paths
             .iter()
             .map(|p| ("extra_read_paths", p.as_str()))
@@ -1451,27 +1501,61 @@ impl SandboxConfig {
                     .iter()
                     .map(|p| ("extra_write_paths", p.as_str())),
             )
-        {
-            let expanded = expand_user_path(path);
-            if let Some(home) = home.as_ref() {
-                if paths_equal_or_same(&expanded, home) {
+            .collect();
+        if let Some(ceiling) = self.session_override.as_ref() {
+            for root in &ceiling.read_roots {
+                entries.push(("session_override.read_roots", root.as_str()));
+            }
+            for root in &ceiling.write_roots {
+                entries.push(("session_override.write_roots", root.as_str()));
+            }
+            // A ceiling root must be a real directory prefix: relative paths
+            // and the filesystem root would make the ceiling meaningless.
+            for (kind, root) in entries
+                .iter()
+                .filter(|(kind, _)| kind.starts_with("session_override."))
+            {
+                let expanded = expand_user_path(root);
+                if !expanded.is_absolute() || expanded.parent().is_none() {
                     anyhow::bail!(
-                        "sandbox.{kind} must not include the user HOME ({}); \
-set sandbox.allow_sensitive_extra_paths = true to override (unsafe)",
-                        home.display()
+                        "sandbox.{kind} entry `{root}` must be an absolute directory other than `/`"
                     );
                 }
             }
-            if is_sensitive_extra_path(&expanded) {
-                anyhow::bail!(
-                    "sandbox.{kind} includes sensitive path `{}`; \
-set sandbox.allow_sensitive_extra_paths = true to override (unsafe)",
-                    expanded.display()
-                );
+        }
+        for (kind, path) in entries {
+            if let Some(problem) =
+                sandbox_path_problem(&expand_user_path(path), self.allow_sensitive_extra_paths)
+            {
+                anyhow::bail!("sandbox.{kind} {problem}");
             }
         }
         Ok(())
     }
+}
+
+/// Why `path` may not be opened to the sandbox as an extra path (HOME itself,
+/// credential directories), or `None`. `allow_sensitive` is the server-level
+/// escape hatch `sandbox.allow_sensitive_extra_paths`.
+pub fn sandbox_path_problem(path: &std::path::Path, allow_sensitive: bool) -> Option<String> {
+    if allow_sensitive {
+        return None;
+    }
+    if let Some(home) = dirs::home_dir() {
+        if paths_equal_or_same(path, &home) {
+            return Some(format!(
+                "must not include the user HOME ({}); set sandbox.allow_sensitive_extra_paths = true to override (unsafe)",
+                home.display()
+            ));
+        }
+    }
+    if is_sensitive_extra_path(path) {
+        return Some(format!(
+            "includes sensitive path `{}`; set sandbox.allow_sensitive_extra_paths = true to override (unsafe)",
+            path.display()
+        ));
+    }
+    None
 }
 
 /// Expand a leading `~` / `~/` to the user's home directory, leaving other
@@ -3721,6 +3805,82 @@ plugin_marketplaces = [
             },
         );
         config.validate().unwrap();
+    }
+
+    #[test]
+    fn session_override_ceiling_is_off_by_default_and_parses_from_the_file() {
+        let off: AppConfig = toml::from_str("").unwrap();
+        assert!(off.sandbox.session_override.is_none());
+        // Off stays off when the config is written back.
+        assert!(!toml::to_string(&off.sandbox)
+            .unwrap()
+            .contains("session_override"));
+
+        let on: AppConfig = toml::from_str(
+            "[sandbox.session_override]
+allow_network = true
+read_roots = [\"/data/sdk\"]
+write_roots = [\"/data/cache\"]",
+        )
+        .unwrap();
+        let ceiling = on.sandbox.session_override.as_ref().unwrap();
+        assert!(ceiling.allow_network);
+        assert_eq!(ceiling.read_roots, vec!["/data/sdk".to_string()]);
+        assert_eq!(ceiling.write_roots, vec!["/data/cache".to_string()]);
+        on.sandbox.validate_extra_paths().unwrap();
+
+        // An empty table is a valid, narrowing-only ceiling.
+        let empty: AppConfig = toml::from_str("[sandbox.session_override]").unwrap();
+        assert_eq!(
+            empty.sandbox.session_override,
+            Some(SandboxSessionOverride::default())
+        );
+    }
+
+    #[test]
+    fn session_override_roots_must_be_real_directory_prefixes() {
+        for roots in [
+            "read_roots = [\"relative/dir\"]",
+            "read_roots = [\"/\"]",
+            "write_roots = [\"/\"]",
+            "write_roots = [\"~/.ssh\"]",
+        ] {
+            let config: AppConfig =
+                toml::from_str(&format!("[sandbox.session_override]\n{roots}")).unwrap();
+            let error = config
+                .sandbox
+                .validate_extra_paths()
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("sandbox.session_override."),
+                "{roots}: {error}"
+            );
+        }
+        // The server-level escape hatch still applies to credential dirs, but
+        // never makes a relative path or `/` acceptable.
+        let config: AppConfig = toml::from_str(
+            "[sandbox]\nallow_sensitive_extra_paths = true\n[sandbox.session_override]\nread_roots = [\"/\"]",
+        )
+        .unwrap();
+        assert!(config.sandbox.validate_extra_paths().is_err());
+    }
+
+    #[test]
+    fn session_sandbox_request_rejects_unknown_fields_and_knows_when_it_is_empty() {
+        assert!(SessionSandboxRequest::default().is_empty());
+        let request: SessionSandboxRequest =
+            serde_json::from_str(r#"{"network":false,"extra_read_paths":[]}"#).unwrap();
+        assert!(!request.is_empty());
+        assert_eq!(request.extra_read_paths, Some(vec![]));
+        assert!(
+            serde_json::from_str::<SessionSandboxRequest>(r#"{"network":true,"mode":"off"}"#)
+                .is_err()
+        );
+        // Round trip keeps "absent" distinct from "empty".
+        let back: SessionSandboxRequest =
+            serde_json::from_str(&serde_json::to_string(&request).unwrap()).unwrap();
+        assert_eq!(back, request);
     }
 
     #[test]
