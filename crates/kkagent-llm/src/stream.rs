@@ -672,6 +672,8 @@ async fn chat_completions_stream(
     let mut started: std::collections::HashSet<usize> = std::collections::HashSet::new();
     let mut usage = TokenUsage::default();
     let mut completed = false;
+    // What the endpoint said ended the answer (`finish_reason`), in the names `MessageEnd` uses for every provider.
+    let mut stop_reason: Option<String> = None;
     let mut first_token = FirstTokenGate::new(request.first_token_timeout, &request.model);
     let mut stream_timer = crate::http_error::StreamTimer::start();
     loop {
@@ -701,10 +703,7 @@ async fn chat_completions_stream(
                     }
                 }
                 let _ = event_tx
-                    .send(StreamEvent::MessageEnd {
-                        usage,
-                        stop_reason: None,
-                    })
+                    .send(StreamEvent::MessageEnd { usage, stop_reason })
                     .await;
                 return Ok(());
             }
@@ -792,11 +791,12 @@ async fn chat_completions_stream(
                     }
                 }
             }
-            if choice
+            if let Some(reason) = choice
                 .get("finish_reason")
-                .is_some_and(|reason| !reason.is_null())
+                .filter(|reason| !reason.is_null())
             {
                 completed = true;
+                stop_reason = reason.as_str().map(openai_stop_reason);
                 for index in started.drain() {
                     if let Some((id, _)) = tool_ids.get(&index) {
                         let _ = event_tx
@@ -809,15 +809,24 @@ async fn chat_completions_stream(
     }
     if completed {
         let _ = event_tx
-            .send(StreamEvent::MessageEnd {
-                usage,
-                stop_reason: None,
-            })
+            .send(StreamEvent::MessageEnd { usage, stop_reason })
             .await;
         Ok(())
     } else {
         anyhow::bail!("OpenAI stream connection closed before [DONE] or finish_reason")
     }
+}
+
+/// Chat Completions' `finish_reason` in the names the other providers' `MessageEnd` uses
+/// (`end_turn`, `tool_use`, `max_tokens`); a reason this does not know is passed on as it came.
+fn openai_stop_reason(reason: &str) -> String {
+    match reason {
+        "stop" => "end_turn",
+        "tool_calls" | "function_call" => "tool_use",
+        "length" => "max_tokens",
+        other => other,
+    }
+    .to_string()
 }
 
 pub async fn google_stream(
@@ -2398,6 +2407,39 @@ mod tests {
             ended,
             std::collections::HashSet::from(["a".into(), "b".into()])
         );
+    }
+
+    #[tokio::test]
+    async fn openai_reports_why_the_answer_ended_in_the_names_other_providers_use() {
+        for (finish, expected) in [
+            ("tool_calls", "tool_use"),
+            ("stop", "end_turn"),
+            ("length", "max_tokens"),
+            ("content_filter", "content_filter"),
+        ] {
+            let sse = format!(
+                "data: {{\"choices\":[{{\"delta\":{{\"content\":\"x\"}}}}]}}\n\n\
+                 data: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"{finish}\"}}]}}\n\n\
+                 data: {{\"choices\":[],\"usage\":{{\"prompt_tokens\":4,\"completion_tokens\":2}}}}\n\n\
+                 data: [DONE]\n\n"
+            );
+            let (base_url, _captured) = serve_once("200 OK", "text/event-stream", &sse).await;
+            let (tx, mut rx) = mpsc::channel(32);
+            openai_stream(&Client::new(), &base_url, "token", request(), tx)
+                .await
+                .unwrap();
+            let mut ended = None;
+            while let Some(event) = rx.recv().await {
+                if let StreamEvent::MessageEnd { usage, stop_reason } = event {
+                    ended = Some((usage.input_tokens, usage.output_tokens, stop_reason));
+                }
+            }
+            assert_eq!(
+                ended,
+                Some((4, 2, Some(expected.to_string()))),
+                "finish_reason {finish}"
+            );
+        }
     }
 
     #[tokio::test]

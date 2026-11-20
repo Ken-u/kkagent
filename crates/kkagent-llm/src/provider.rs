@@ -107,7 +107,10 @@ impl OpenAiProvider {
         Self::with_responses(settings, None)
     }
 
-    fn with_responses(settings: &ProviderSettings, responses: Option<bool>) -> anyhow::Result<Self> {
+    fn with_responses(
+        settings: &ProviderSettings,
+        responses: Option<bool>,
+    ) -> anyhow::Result<Self> {
         let base_url = settings
             .base_url
             .as_deref()
