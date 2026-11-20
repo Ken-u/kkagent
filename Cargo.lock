@@ -1586,6 +1586,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "kkagent-host"
+version = "0.5.1"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "kkagent-kaos"
 version = "0.5.1"
 dependencies = [
@@ -1607,7 +1615,6 @@ dependencies = [
  "futures",
  "futures-util",
  "httpdate",
- "kkagent-config",
  "reqwest 0.12.28",
  "reqwest-eventsource",
  "serde",
@@ -1675,6 +1682,7 @@ version = "0.5.1"
 dependencies = [
  "anyhow",
  "chrono",
+ "kkagent-host",
  "rusqlite",
  "serde",
  "serde_json",

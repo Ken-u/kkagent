@@ -22,6 +22,17 @@ pub const METHOD_HOST_TOOL_CANCEL: &str = "_kkagent/tool/cancel";
 pub const METHOD_HOST_TOOL_REVIEW: &str = "_kkagent/tool/review";
 /// Agent→client request prefix for host-backed storage.
 pub const METHOD_STORE_PREFIX: &str = "_kkagent/store/";
+/// Agent→client request: start one model call at the host; answers `{streamId}`.
+pub const METHOD_HOST_LLM_START: &str = "_kkagent/llm/start";
+/// Agent→client request: collect what the call has produced so far (long poll).
+pub const METHOD_HOST_LLM_NEXT: &str = "_kkagent/llm/next";
+/// Agent→client notification: the agent no longer wants this call's events.
+pub const METHOD_HOST_LLM_CANCEL: &str = "_kkagent/llm/cancel";
+
+/// Version of the `_kkagent/*` host protocol this build speaks. A host that
+/// names a version in `initialize` must name this one; the answer always says
+/// which one the agent speaks.
+pub const HOST_PROTOCOL_VERSION: u32 = 1;
 
 /// Capabilities a host (client side) can offer; also echoed by the agent.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -36,6 +47,13 @@ pub struct HostCapabilities {
     /// The host can serve session/event storage (`_kkagent/store/*`).
     #[serde(default)]
     pub store: HostStoreCapabilities,
+    /// The host makes the model calls itself (`_kkagent/llm/*`); a provider of
+    /// type `host` is usable only when this is set.
+    #[serde(default)]
+    pub llm: bool,
+    /// The `_kkagent/*` protocol version the host speaks. `None` = not stated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol_version: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -429,6 +447,121 @@ pub struct StoreEvent {
     pub event: Value,
 }
 
+/// Parameters of `_kkagent/llm/start`: one model call, in the host's hands from
+/// here on. `messages` and `tools` are the JSON of `kkagent_llm::ChatMessage`
+/// and `kkagent_llm::ToolDef` (the same shapes a provider crate sends over HTTP),
+/// kept as values so this crate does not depend on the model client.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostLlmStart {
+    /// The upstream model id of the configured model (what `[models.X].model` says).
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system: Option<String>,
+    pub messages: Vec<Value>,
+    #[serde(default)]
+    pub tools: Vec<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<HostLlmThinking>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_key: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostLlmThinking {
+    pub budget_tokens: u32,
+    #[serde(default)]
+    pub adaptive: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+}
+
+/// Answer of `_kkagent/llm/start`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostLlmStarted {
+    pub stream_id: String,
+}
+
+/// Parameters of `_kkagent/llm/next` (and of the `_kkagent/llm/cancel` notification, which
+/// only needs `streamId`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostLlmNext {
+    pub stream_id: String,
+    /// How long the host may hold the request while nothing has happened yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_ms: Option<u64>,
+}
+
+/// Answer of `_kkagent/llm/next`: the events since the last call, oldest first.
+/// `done` means the stream has ended (a `message_end` or `error` is its last event)
+/// and the host has dropped it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostLlmBatch {
+    #[serde(default)]
+    pub events: Vec<HostLlmEvent>,
+    #[serde(default)]
+    pub done: bool,
+}
+
+/// Token accounting of one model call.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostLlmUsage {
+    #[serde(default)]
+    pub input_tokens: u64,
+    #[serde(default)]
+    pub output_tokens: u64,
+    #[serde(default)]
+    pub cache_creation_input_tokens: u64,
+    #[serde(default)]
+    pub cache_read_input_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_includes_cache: Option<bool>,
+}
+
+/// One event of a host-made model call: the stream events of `kkagent_llm`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum HostLlmEvent {
+    TextDelta {
+        text: String,
+    },
+    ThinkingDelta {
+        text: String,
+    },
+    ToolUseStart {
+        id: String,
+        name: String,
+    },
+    ToolUseInputDelta {
+        id: String,
+        delta: String,
+    },
+    ToolUseEnd {
+        id: String,
+    },
+    MessageEnd {
+        #[serde(default)]
+        usage: HostLlmUsage,
+        #[serde(default, rename = "stopReason", skip_serializing_if = "Option::is_none")]
+        stop_reason: Option<String>,
+    },
+    RateLimited {
+        message: String,
+        #[serde(default, rename = "retryAfterMs", skip_serializing_if = "Option::is_none")]
+        retry_after_ms: Option<u64>,
+    },
+    Error {
+        message: String,
+    },
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -658,5 +791,61 @@ mod tests {
             HostCapabilities::from_meta(None),
             HostCapabilities::default()
         );
+    }
+
+    #[test]
+    fn llm_capability_and_version_are_read_from_initialize_meta() {
+        let meta = json!({"kkagent/host": {"llm": true, "protocolVersion": 1}});
+        let caps = HostCapabilities::from_meta(Some(&meta));
+        assert!(caps.llm);
+        assert_eq!(caps.protocol_version, Some(1));
+        let plain = HostCapabilities::from_meta(Some(&json!({"kkagent/host": {"tools": true}})));
+        assert!(!plain.llm, "a host that did not offer model calls has not offered them");
+        assert_eq!(plain.protocol_version, None);
+    }
+
+    #[test]
+    fn llm_events_use_the_documented_wire_shape() {
+        let events = vec![
+            HostLlmEvent::TextDelta { text: "hi".into() },
+            HostLlmEvent::ToolUseStart { id: "t1".into(), name: "vfs__read_file".into() },
+            HostLlmEvent::ToolUseInputDelta { id: "t1".into(), delta: "{\"a\":".into() },
+            HostLlmEvent::ToolUseEnd { id: "t1".into() },
+            HostLlmEvent::MessageEnd {
+                usage: HostLlmUsage { input_tokens: 10, output_tokens: 3, ..Default::default() },
+                stop_reason: Some("end_turn".into()),
+            },
+            HostLlmEvent::RateLimited { message: "slow down".into(), retry_after_ms: Some(1500) },
+            HostLlmEvent::Error { message: "boom".into() },
+        ];
+        let wire = serde_json::to_value(&events).unwrap();
+        assert_eq!(wire[0], json!({"type": "text_delta", "text": "hi"}));
+        assert_eq!(wire[1], json!({"type": "tool_use_start", "id": "t1", "name": "vfs__read_file"}));
+        assert_eq!(wire[4]["type"], "message_end");
+        assert_eq!(wire[4]["usage"]["inputTokens"], 10);
+        assert_eq!(wire[4]["stopReason"], "end_turn");
+        assert_eq!(wire[5]["retryAfterMs"], 1500);
+        let back: Vec<HostLlmEvent> = serde_json::from_value(wire).unwrap();
+        assert_eq!(back, events);
+        // A batch missing its optional parts still reads.
+        let batch: HostLlmBatch = serde_json::from_value(json!({})).unwrap();
+        assert!(batch.events.is_empty() && !batch.done);
+    }
+
+    #[test]
+    fn llm_start_round_trips_and_leaves_out_what_is_unset() {
+        let start = HostLlmStart {
+            model: "m".into(),
+            system: None,
+            messages: vec![json!({"role": "user", "content": [{"type": "text", "text": "hi"}]})],
+            tools: vec![],
+            max_tokens: Some(1024),
+            thinking: None,
+            prompt_cache_key: None,
+        };
+        let wire = serde_json::to_value(&start).unwrap();
+        assert_eq!(wire["maxTokens"], 1024);
+        assert!(wire.get("system").is_none() && wire.get("thinking").is_none());
+        assert_eq!(serde_json::from_value::<HostLlmStart>(wire).unwrap(), start);
     }
 }

@@ -84,6 +84,7 @@ WebSocket query token 是兼容机制，可能被访问日志记录；普通 HTT
 - **固定白名单不需要渐进披露。** 严格白名单下默认直接加载白名单内的全部工具（`[tools] dynamically_loaded_tools` 省略时），模型不用也不能靠 `SelectTools` 扩大范围；显式设置会覆盖这一默认。
 - **取消不授予权限。** `session/request_permission` 的 `cancelled` 结果、`session/cancel`、客户端断开都按拒绝处理，不会被记住为「始终允许」。
 - **宿主存储关闭失败。** `[storage] backend = "host"` 下宿主不可用时 turn 失败，不会写入本地 SQLite；宿主本身需要保护它保存的对话内容。
+- **模型调用可以整个交给宿主。** `type = "host"` 的 provider（需要宿主在 `initialize` 声明 `llm`）让 worker 不持有任何模型凭据：配置校验拒绝给它写 `api_key` / `api_key_env` / `base_url` / `custom_headers` / `oauth`；每次调用走 `_kkagent/llm/*` 请求宿主，宿主不可用、没声明能力或流中途断开都按失败处理，不回退到别的 provider。宿主需要自己保护它代为发出的请求与它看到的提示词、工具结果。`initialize` 里的 `protocolVersion` 不一致会被拒绝。
 - **扩展开关只能关。** `[extensions]`、`--no-project-instructions` / `--no-hooks` / `--no-plugins` 与会话参数 `extensions` 取最严的组合；让不可信仓库的 `AGENTS.md`、Hook 或插件不参与会话，应关闭对应开关。
 
 默认配置（不设 `--role`、没有 `[agent_roles]`、`[storage]` 保持 `sqlite`、三个扩展开关全开）下，以上机制都不改变现有行为。宿主与角色的配置方式见[配置参考](configuration.md#agent-角色agent_rolesname)，协议见[扩展机制](extensions.md#宿主扩展_kkagent)。

@@ -17,6 +17,8 @@ pub mod full_compaction;
 pub mod git_context;
 pub mod goal_judge;
 pub mod host_channel;
+pub mod host_llm;
+pub mod provider_factory;
 pub mod host_tool;
 pub mod internal_subagent;
 pub mod legacy_migrate;

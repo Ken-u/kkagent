@@ -1866,6 +1866,42 @@ mod tests {
             .starts_with("POST /v1/chat/completions HTTP/1.1"));
     }
 
+    /// `openai-chat` is a promise to a compatible gateway that only speaks chat completions:
+    /// a model name that merely looks like a Responses-era one (`o…`, `gpt-5…`) must not
+    /// change the endpoint. Only the automatic type picks by model.
+    #[tokio::test]
+    async fn an_explicit_chat_provider_never_switches_to_the_responses_api() {
+        use crate::provider::{LlmProvider, OpenAiProvider, ProviderSettings};
+        let sse = "data: [DONE]\n";
+        for (forced, expected) in [
+            (true, "POST /v1/chat/completions HTTP/1.1"),
+            (false, "POST /v1/responses HTTP/1.1"),
+        ] {
+            let (base_url, captured) = serve_once("200 OK", "text/event-stream", sse).await;
+            let settings = ProviderSettings {
+                provider_type: if forced { "openai-chat" } else { "openai" }.into(),
+                base_url: Some(base_url),
+                api_key: Some("token".into()),
+                ..ProviderSettings::default()
+            };
+            let provider = if forced {
+                OpenAiProvider::new(&settings).unwrap()
+            } else {
+                OpenAiProvider::auto(&settings).unwrap()
+            };
+            let mut request = request();
+            request.model = "o4-mini".into();
+            let (tx, _rx) = mpsc::channel(8);
+            let _ = provider.stream_chat(request, tx).await;
+            let captured = captured.await.unwrap();
+            assert!(
+                captured.head.starts_with(expected),
+                "forced chat = {forced}: {}",
+                captured.head.lines().next().unwrap_or_default()
+            );
+        }
+    }
+
     #[tokio::test]
     async fn openai_orders_tool_result_before_followup_image() {
         let sse = "data: [DONE]\n";

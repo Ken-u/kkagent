@@ -1787,3 +1787,316 @@ fn session_load_can_skip_replaying_history_for_a_host_that_keeps_its_own() {
         "history is replayed by default"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Model calls made by the host (`type = "host"`)
+// ---------------------------------------------------------------------------
+
+/// A provider of type `host` and a model on it, next to the scripted `test` provider (which a
+/// host-model session must never reach: the mock model records every request it gets).
+const HOSTED_MODEL: &str = r#"
+[providers.hosted]
+type = "host"
+
+[models."hosted/model"]
+provider = "hosted"
+model = "upstream-x"
+max_context_size = 1000000
+max_output_size = 1000
+capabilities = ["tool_use"]
+"#;
+
+fn usage(input: u64, output: u64) -> Value {
+    json!({"inputTokens": input, "outputTokens": output})
+}
+
+/// A host that makes the model calls from a script: each `_kkagent/llm/start` takes the next
+/// scripted reply (a list of events) and `_kkagent/llm/next` hands it over in one batch.
+fn scripted_model_host(
+    replies: Vec<Vec<Value>>,
+    seen: Arc<Mutex<Vec<Value>>>,
+) -> impl FnMut(&str, &Value) -> HostAnswer {
+    let mut queue: std::collections::VecDeque<Vec<Value>> = replies.into();
+    let mut streams: HashMap<String, Vec<Value>> = HashMap::new();
+    move |method, params| match method {
+        "_kkagent/llm/start" => {
+            let mut seen = seen.lock().unwrap();
+            seen.push(params.clone());
+            let events = queue.pop_front().unwrap_or_else(|| {
+                vec![json!({"type": "error", "message": "the script has no more replies"})]
+            });
+            let id = format!("s{}", seen.len());
+            streams.insert(id.clone(), events);
+            Some(Ok(json!({"streamId": id})))
+        }
+        "_kkagent/llm/next" => {
+            let id = params["streamId"].as_str().unwrap_or_default();
+            let events = streams.remove(id).unwrap_or_default();
+            Some(Ok(json!({"events": events, "done": true})))
+        }
+        _ => None,
+    }
+}
+
+fn hosted_session(acp: &mut Acp, extra: Value) -> String {
+    let sid = acp.new_session(extra);
+    acp.ok(
+        "session/set_model",
+        json!({"sessionId": sid, "modelId": "hosted/model"}),
+    );
+    sid
+}
+
+#[test]
+fn a_host_provider_takes_the_model_call_to_the_host_and_never_to_the_network() {
+    let llm = MockLlm::start(|_, _| Reply::text("the network was reached"));
+    let mut acp = Acp::spawn(&llm, HOSTED_MODEL, &[]);
+    let init = acp.initialize(Some(host_meta(json!({"protocolVersion": 1, "llm": true}))));
+    assert_eq!(init["_meta"]["kkagent/host"]["llm"], true);
+    assert_eq!(init["_meta"]["kkagent/host"]["protocolVersion"], 1);
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    acp.on_agent_request(scripted_model_host(
+        vec![vec![
+            json!({"type": "text_delta", "text": "hel"}),
+            json!({"type": "text_delta", "text": "lo"}),
+            json!({"type": "message_end", "usage": usage(11, 3)}),
+        ]],
+        Arc::clone(&seen),
+    ));
+
+    let sid = hosted_session(&mut acp, json!({}));
+    let result = acp.prompt(&sid, "say hello");
+    assert_eq!(result["stopReason"], "end_turn");
+    assert_eq!(acp.agent_text(&sid), "hello");
+
+    // What the host was asked: the configured upstream model name (not the alias), the user's
+    // words, no credentials anywhere in it.
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 1, "one model call for the turn: {seen:?}");
+    assert_eq!(seen[0]["model"], "upstream-x");
+    assert!(seen[0].to_string().contains("say hello"));
+    let asked = seen[0].to_string().to_lowercase();
+    for key in ["\"token\":", "api_key", "apikey", "authorization", "\"secret\""] {
+        assert!(
+            !asked.contains(key),
+            "no credential in what the host is asked ({key}): {}",
+            seen[0]
+        );
+    }
+    assert!(
+        llm.requests().is_empty(),
+        "the scripted network model got a request: {:?}",
+        llm.requests()
+    );
+}
+
+#[test]
+fn a_host_made_model_call_can_use_host_tools_and_sees_their_results() {
+    let llm = MockLlm::start(|_, _| Reply::text("the network was reached"));
+    let mut acp = Acp::spawn(&llm, HOSTED_MODEL, &[]);
+    acp.initialize(Some(host_meta(
+        json!({"protocolVersion": 1, "llm": true, "tools": true}),
+    )));
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let mut model = scripted_model_host(
+        vec![
+            vec![
+                json!({"type": "tool_use_start", "id": "call_1", "name": "host_ping"}),
+                json!({"type": "tool_use_input_delta", "id": "call_1", "delta": "{\"message\":"}),
+                json!({"type": "tool_use_input_delta", "id": "call_1", "delta": "\"ping\"}"}),
+                json!({"type": "tool_use_end", "id": "call_1"}),
+                json!({"type": "message_end", "usage": usage(20, 5), "stopReason": "tool_use"}),
+            ],
+            vec![
+                json!({"type": "text_delta", "text": "all done"}),
+                json!({"type": "message_end", "usage": usage(30, 2)}),
+            ],
+        ],
+        Arc::clone(&seen),
+    );
+    acp.on_agent_request(move |method, params| {
+        model(method, params).or_else(|| {
+            (method == "_kkagent/tool/call").then(|| {
+                Ok(json!({"content": format!("pong:{}", params["input"]["message"].as_str().unwrap())}))
+            })
+        })
+    });
+
+    let sid = hosted_session(
+        &mut acp,
+        json!({"_meta": host_meta(json!({"hostTools": [{
+            "name": "host_ping",
+            "description": "Ping the host",
+            "inputSchema": {"type": "object", "properties": {"message": {"type": "string"}}},
+            "readOnly": true,
+        }]}))}),
+    );
+    assert_eq!(acp.prompt(&sid, "ping")["stopReason"], "end_turn");
+    assert_eq!(acp.agent_text(&sid), "all done");
+
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 2);
+    assert!(seen[0]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|tool| tool["name"] == "host_ping"));
+    let second = seen[1].to_string();
+    assert!(
+        second.contains("tool_result") && second.contains("pong:ping"),
+        "the second call carries the tool's answer: {second}"
+    );
+    assert!(llm.requests().is_empty());
+}
+
+#[test]
+fn a_host_that_did_not_offer_model_calls_fails_the_turn_instead_of_falling_back() {
+    let llm = MockLlm::start(|_, _| Reply::text("the network was reached"));
+    let mut acp = Acp::spawn(&llm, HOSTED_MODEL, &[]);
+    let init = acp.initialize(Some(host_meta(json!({"protocolVersion": 1}))));
+    assert_eq!(init["_meta"]["kkagent/host"]["llm"], false);
+    let sid = hosted_session(&mut acp, json!({}));
+    let result = acp.call(
+        "session/prompt",
+        json!({"sessionId": sid, "prompt": [{"type": "text", "text": "hi"}]}),
+    );
+    let said = match &result {
+        Ok(value) => value.to_string(),
+        Err(error) => error.to_string(),
+    };
+    assert!(
+        said.contains("did not offer model calls") || acp.logs().contains("did not offer model calls"),
+        "the turn says why it failed: {said}\n{}",
+        acp.logs()
+    );
+    assert!(acp.requests_for("_kkagent/llm/start").is_empty());
+    assert!(llm.requests().is_empty());
+}
+
+#[test]
+fn a_protocol_version_the_agent_does_not_speak_is_refused_at_initialize() {
+    let llm = MockLlm::start(|_, _| Reply::text("x"));
+    let mut acp = Acp::spawn(&llm, "", &[]);
+    let refused = acp
+        .call(
+            "initialize",
+            json!({
+                "protocolVersion": 1, "clientCapabilities": {},
+                "_meta": host_meta(json!({"protocolVersion": 99, "tools": true})),
+            }),
+        )
+        .expect_err("version 99 is not spoken");
+    assert!(
+        refused.to_string().contains("version 99"),
+        "the refusal names the version: {refused}"
+    );
+}
+
+#[test]
+fn cancelling_a_turn_tells_the_host_to_stop_the_model_call() {
+    let llm = MockLlm::start(|_, _| Reply::text("the network was reached"));
+    let mut acp = Acp::spawn(&llm, HOSTED_MODEL, &[]);
+    acp.initialize(Some(host_meta(json!({"protocolVersion": 1, "llm": true}))));
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let mut model = scripted_model_host(vec![vec![]], Arc::clone(&seen));
+    // The host starts the call and then never has anything to say.
+    acp.park("_kkagent/llm/next");
+    acp.on_agent_request(move |method, params| model(method, params));
+    let sid = hosted_session(&mut acp, json!({}));
+    let turn = acp.send(
+        "session/prompt",
+        json!({"sessionId": sid, "prompt": [{"type": "text", "text": "go"}]}),
+    );
+    acp.wait_for_agent_request("_kkagent/llm/next");
+    acp.notify("session/cancel", json!({"sessionId": sid}));
+    assert_eq!(acp.wait(turn).unwrap()["stopReason"], "cancelled");
+    acp.pump_until("_kkagent/llm/cancel", |acp| {
+        acp.notifications
+            .iter()
+            .any(|n| n["method"] == "_kkagent/llm/cancel")
+    });
+    let cancel = acp
+        .notifications
+        .iter()
+        .find(|n| n["method"] == "_kkagent/llm/cancel")
+        .unwrap();
+    assert_eq!(cancel["params"]["streamId"], "s1");
+}
+
+// ---------------------------------------------------------------------------
+// Pictures in a prompt
+// ---------------------------------------------------------------------------
+
+/// A 1×1 PNG.
+const TINY_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+
+const VISION_MODEL: &str = r#"
+[models."test/vision"]
+provider = "test"
+model = "vision-model"
+max_context_size = 1000000
+max_output_size = 1000
+capabilities = ["tool_use", "image_in"]
+"#;
+
+#[test]
+fn a_picture_in_a_prompt_reaches_the_model_as_an_image_part_in_order() {
+    let llm = MockLlm::start(|_, _| Reply::text("a tiny square"));
+    let mut acp = Acp::spawn(&llm, VISION_MODEL, &[]);
+    let init = acp.initialize(None);
+    assert_eq!(
+        init["agentCapabilities"]["promptCapabilities"]["image"], true,
+        "the agent says it takes pictures"
+    );
+    let sid = acp.new_session(json!({}));
+    acp.ok(
+        "session/set_model",
+        json!({"sessionId": sid, "modelId": "test/vision"}),
+    );
+    let result = acp.ok(
+        "session/prompt",
+        json!({"sessionId": sid, "prompt": [
+            {"type": "text", "text": "what is this picture?"},
+            {"type": "image", "data": TINY_PNG, "mimeType": "image/png"},
+        ]}),
+    );
+    assert_eq!(result["stopReason"], "end_turn");
+    assert_eq!(acp.agent_text(&sid), "a tiny square");
+
+    let requests = llm.requests();
+    let body = requests
+        .iter()
+        .find(|request| mentions(request, "what is this picture?"))
+        .expect("the model got the question");
+    let sent = body.to_string();
+    assert!(
+        sent.contains("image_url") && sent.contains("data:image/"),
+        "the picture is an image part of the user message: {sent}"
+    );
+}
+
+#[test]
+fn a_picture_that_is_not_one_fails_the_turn_instead_of_being_dropped() {
+    let llm = MockLlm::start(|_, _| Reply::text("never asked"));
+    let mut acp = Acp::spawn(&llm, VISION_MODEL, &[]);
+    acp.initialize(None);
+    let sid = acp.new_session(json!({}));
+    acp.ok(
+        "session/set_model",
+        json!({"sessionId": sid, "modelId": "test/vision"}),
+    );
+    let refused = acp
+        .call(
+            "session/prompt",
+            json!({"sessionId": sid, "prompt": [
+                {"type": "text", "text": "look"},
+                {"type": "image", "data": "bm90IGEgcGljdHVyZQ==", "mimeType": "image/png"},
+            ]}),
+        )
+        .expect_err("bytes that are not an image are refused");
+    assert!(
+        refused.to_string().contains("picture"),
+        "the refusal says it is about a picture: {refused}"
+    );
+    assert!(llm.requests().is_empty(), "no model call was made");
+}

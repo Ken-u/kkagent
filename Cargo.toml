@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/kkagent",
     "crates/kkagent-protocol",
+    "crates/kkagent-host",
     "crates/kkagent-rpc",
     "crates/kkagent-config",
     "crates/kkagent-llm",
@@ -109,6 +110,7 @@ tokio-tungstenite = "0.26"
 
 # Internal crates
 kkagent-protocol = { path = "crates/kkagent-protocol" }
+kkagent-host = { path = "crates/kkagent-host" }
 kkagent-rpc = { path = "crates/kkagent-rpc" }
 kkagent-config = { path = "crates/kkagent-config" }
 kkagent-llm = { path = "crates/kkagent-llm" }

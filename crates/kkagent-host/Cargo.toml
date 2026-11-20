@@ -1,0 +1,10 @@
+[package]
+name = "kkagent-host"
+description = "Wire types of the embedding-host extension of ACP (`_kkagent/*`): the contract between kkagent and a host process, with no dependency on the agent itself"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }

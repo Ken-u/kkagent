@@ -4028,7 +4028,16 @@ impl kkagent_acp::AcpHost for AgentAcpHost {
     }
 
     async fn prompt(&self, session_id: &str, text: &str) -> Result<serde_json::Value, String> {
-        if text.trim().is_empty() {
+        self.prompt_with_images(session_id, text, Vec::new()).await
+    }
+
+    async fn prompt_with_images(
+        &self,
+        session_id: &str,
+        text: &str,
+        images: Vec<(String, String)>,
+    ) -> Result<serde_json::Value, String> {
+        if text.trim().is_empty() && images.is_empty() {
             return Err("prompt must not be empty".into());
         }
         let _turn_permit = self.state.turn_locks.try_acquire(session_id).await?;
@@ -4040,7 +4049,13 @@ impl kkagent_acp::AcpHost for AgentAcpHost {
             // A cancel aimed at an earlier turn (or sent while idle) belongs
             // to that turn and must not stop this one before it starts.
             session.clear_interrupt();
-            session.add_user_message(text.to_string());
+            if images.is_empty() {
+                session.add_user_message(text.to_string());
+            } else {
+                session
+                    .add_user_message_with_images(text.to_string(), images)
+                    .map_err(|error| format!("a picture of the prompt cannot be used: {error}"))?;
+            }
         }
         run_http_turn(self.state.clone(), session_id, None)
             .await
@@ -4230,6 +4245,15 @@ impl kkagent_acp::AcpHost for AgentAcpHost {
     ) -> Result<Option<serde_json::Value>, String> {
         let meta = params.get("_meta");
         let capabilities = kkagent_protocol::host::HostCapabilities::from_meta(meta);
+        if let Some(version) = capabilities.protocol_version {
+            if version != kkagent_protocol::host::HOST_PROTOCOL_VERSION {
+                return Err(format!(
+                    "the host speaks `_kkagent/*` protocol version {version}; this build speaks {}",
+                    kkagent_protocol::host::HOST_PROTOCOL_VERSION
+                ));
+            }
+        }
+        self.state.host_llm.set_offered(capabilities.llm);
         let host_storage =
             self.state.process_policy.storage == kkagent_config::StorageBackend::Host;
         if host_storage && !capabilities.store.sessions {
@@ -4256,8 +4280,10 @@ impl kkagent_acp::AcpHost for AgentAcpHost {
             answer.insert(
                 kkagent_protocol::host::HOST_META_KEY.to_string(),
                 serde_json::json!({
+                    "protocolVersion": kkagent_protocol::host::HOST_PROTOCOL_VERSION,
                     "tools": capabilities.tools,
                     "toolReview": capabilities.tool_review,
+                    "llm": capabilities.llm,
                     "store": {
                         "sessions": host_storage,
                         "events": host_storage && capabilities.store.events,
@@ -6572,6 +6598,8 @@ struct ServerState {
     host_channel: Arc<kkagent_core::host_channel::HostChannelSlot>,
     /// Capabilities the host advertised at `initialize`.
     host_capabilities: StdRwLock<kkagent_protocol::host::HostCapabilities>,
+    /// Model calls made by the host (`type = "host"` providers).
+    host_llm: Arc<kkagent_core::host_llm::HostLlm>,
     /// MCP servers the client attached to a session (`mcpServers`), keyed by
     /// session id. They live and die with the session.
     session_mcp: Mutex<HashMap<String, Arc<McpManager>>>,
@@ -8531,6 +8559,8 @@ async fn build_server_state_with_shutdown(
     // Second handle shares the already-migrated connection — skip DDL.
     let db_for_tool_results = TranscriptDb::wrap_shared(shared_sqlite.clone());
     let host_channel = Arc::new(kkagent_core::host_channel::HostChannelSlot::new());
+    let host_llm = kkagent_core::host_llm::HostLlm::new(host_channel.clone());
+    host_llm.install()?;
     let (session_store, event_store): (
         Arc<dyn kkagent_core::storage::SessionStore>,
         Option<Arc<dyn kkagent_core::storage::EventStore>>,
@@ -8749,6 +8779,7 @@ async fn build_server_state_with_shutdown(
         session_store,
         event_store,
         host_events_enabled: AtomicBool::new(false),
+        host_llm,
         host_channel,
         host_capabilities: StdRwLock::new(kkagent_protocol::host::HostCapabilities::default()),
         session_mcp: Mutex::new(HashMap::new()),

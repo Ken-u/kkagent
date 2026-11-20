@@ -58,6 +58,21 @@ impl ContentBlock {
         Self::Text { text: text.into() }
     }
 
+    /// `(media type, base64 data)` of every image block, in order. A block without a media
+    /// type is taken for `image/png`; the host sniffs and normalises the bytes anyway.
+    pub fn images(blocks: &[ContentBlock]) -> Vec<(String, String)> {
+        blocks
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Image { data, mime_type } => Some((
+                    mime_type.clone().unwrap_or_else(|| "image/png".to_string()),
+                    data.clone(),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Concatenated plain text of all text blocks.
     pub fn join_text(blocks: &[ContentBlock]) -> String {
         blocks
@@ -500,7 +515,7 @@ pub fn agent_capabilities(load_session: bool) -> Value {
         "loadSession": load_session,
         // Prompts are reduced to their text; richer blocks are not consumed.
         "promptCapabilities": {
-            "image": false,
+            "image": true,
             "audio": false,
             "embeddedContext": false,
             // Non-standard; kept for older clients.
@@ -729,6 +744,29 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn images_of_a_prompt_come_out_in_order_and_default_to_png() {
+        let blocks = vec![
+            ContentBlock::text("look"),
+            ContentBlock::Image {
+                data: "AAAA".into(),
+                mime_type: Some("image/jpeg".into()),
+            },
+            ContentBlock::Image {
+                data: "BBBB".into(),
+                mime_type: None,
+            },
+        ];
+        assert_eq!(
+            ContentBlock::images(&blocks),
+            vec![
+                ("image/jpeg".to_string(), "AAAA".to_string()),
+                ("image/png".to_string(), "BBBB".to_string())
+            ]
+        );
+        assert_eq!(ContentBlock::join_text(&blocks), "look");
+    }
+
+    #[test]
     fn session_update_serializes_with_official_tags() {
         let update = SessionUpdate::agent_message_chunk("hello");
         let json = serde_json::to_value(&update).unwrap();
@@ -862,7 +900,7 @@ mod tests {
     fn capabilities_declare_only_what_is_implemented() {
         let caps = agent_capabilities(true);
         assert_eq!(caps["loadSession"], true);
-        assert_eq!(caps["promptCapabilities"]["image"], false);
+        assert_eq!(caps["promptCapabilities"]["image"], true);
         assert_eq!(caps["sessionCapabilities"]["resume"], serde_json::json!({}));
         assert!(caps["sessionCapabilities"].get("fork").is_none());
         assert_eq!(caps["mcpCapabilities"]["http"], true);

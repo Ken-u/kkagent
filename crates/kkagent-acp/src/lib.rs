@@ -334,6 +334,20 @@ pub trait AcpHost: Send + Sync {
         Ok(vec![])
     }
     async fn prompt(&self, session_id: &str, text: &str) -> Result<Value, String>;
+    /// A prompt with pictures: `(media type, base64 data)` of each `image` block, in order.
+    /// Default: a host that cannot take pictures says so instead of dropping them silently.
+    async fn prompt_with_images(
+        &self,
+        session_id: &str,
+        text: &str,
+        images: Vec<(String, String)>,
+    ) -> Result<Value, String> {
+        if images.is_empty() {
+            self.prompt(session_id, text).await
+        } else {
+            Err("this agent host does not take pictures in a prompt".into())
+        }
+    }
     async fn cancel(&self, session_id: &str) -> Result<(), String>;
     async fn set_mode(&self, _session_id: &str, _mode: &str) -> Result<(), String> {
         Ok(())
@@ -855,9 +869,13 @@ impl AcpServer {
                 if blocks.is_empty() {
                     return err(id, -32602, "prompt must contain at least one content block");
                 }
-                // `/name args` runs one of the advertised commands.
-                if let Some((name, args)) = parse_slash_command(&ContentBlock::join_text(&blocks)) {
-                    return self.run_slash_command(id, &sid, &name, &args).await;
+                // `/name args` runs one of the advertised commands — except in a session under a strict tool
+                // allowlist: there the prompt belongs to the host's user and goes to the model whole, so a
+                // message that happens to begin with `/help` is never answered by the agent itself.
+                if !self.host.tools_restricted(Some(&sid)).await {
+                    if let Some((name, args)) = parse_slash_command(&ContentBlock::join_text(&blocks)) {
+                        return self.run_slash_command(id, &sid, &name, &args).await;
+                    }
                 }
                 // Reject concurrent turns on the same session.
                 {
@@ -871,9 +889,10 @@ impl AcpServer {
                 let cancelled = self.store.cancel_flag(&sid).await;
                 cancelled.store(false, Ordering::SeqCst);
                 let delivered_before = self.store.delivered_turns(&sid).await;
+                let images = ContentBlock::images(&blocks);
                 let outcome = self
                     .host
-                    .prompt(&sid, &ContentBlock::join_text(&blocks))
+                    .prompt_with_images(&sid, &ContentBlock::join_text(&blocks), images)
                     .await;
                 if outcome.is_ok() {
                     self.store.wait_turn_delivered(&sid, delivered_before).await;
@@ -3356,6 +3375,36 @@ mod tests {
         );
         assert_eq!(parse_slash_command("/not-a-command"), None);
         assert_eq!(parse_slash_command("explain /status"), None);
+    }
+
+    #[tokio::test]
+    async fn a_restricted_session_sends_slash_text_to_the_model_instead_of_running_it() {
+        struct Recording(std::sync::Mutex<Vec<String>>);
+        #[async_trait::async_trait]
+        impl AcpHost for Recording {
+            async fn prompt(&self, _sid: &str, text: &str) -> Result<Value, String> {
+                self.0.lock().unwrap().push(text.to_string());
+                Ok(json!({"stopReason": "end_turn"}))
+            }
+            async fn cancel(&self, _sid: &str) -> Result<(), String> {
+                Ok(())
+            }
+            async fn tools_restricted(&self, _session_id: Option<&str>) -> bool {
+                true
+            }
+        }
+        let host = Arc::new(Recording(Default::default()));
+        let server = AcpServer::with_host(host.clone());
+        let dir = tempfile::tempdir().unwrap();
+        let sid = new_session(&server, dir.path().to_str().unwrap()).await;
+        let response = server
+            .handle(rpc(
+                "session/prompt",
+                json!({"sessionId": sid, "prompt": [{"type": "text", "text": "/help me with this"}]}),
+            ))
+            .await;
+        assert_eq!(response.result.unwrap()["stopReason"], "end_turn");
+        assert_eq!(*host.0.lock().unwrap(), vec!["/help me with this".to_string()]);
     }
 
     #[tokio::test]

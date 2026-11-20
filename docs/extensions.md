@@ -13,7 +13,7 @@ kkagent --config ~/.kkagent/config.toml acp --role reviewer --no-plugins
 
 - `initialize`：返回 `protocolVersion: 1`（客户端请求更高版本时回落到 1）、`agentInfo`、`authMethods` 与 `agentCapabilities`（`loadSession`、`promptCapabilities`、`mcpCapabilities`、`sessionCapabilities.{list,resume,close}`）。`clientInfo` / `clientCapabilities` 会被保存。
 - 会话管理：`session/new`（`cwd`、`mcpServers`、可选 `initialMessage`）返回 `sessionId` 与 `modes: {currentModeId, availableModes}`；`session/load` 恢复历史会话并按 `user_message_chunk` / `agent_message_chunk` 回放（自己保存对话的宿主可在 `_meta["kkagent/host"]` 里带 `"replay": false` 跳过回放，会话照常加载）；`session/resume` 只重新附着、不回放；`session/list`（可按 `cwd` 过滤）；`session/close` 停止当前工作并释放运行时资源，会话仍可恢复；`session/set_mode`（`modeId`）与 `session/set_model`（`modelId`）。未知会话统一返回 `-32002`。
-- `session/prompt` 接受官方 content block 数组，turn 期间用 `session/update` 流式推送 `agent_message_chunk`、`agent_thought_chunk`、`tool_call`（`title` / `kind` / `status` / `rawInput`）、`tool_call_update`（`status` 为 `in_progress` / `completed` / `failed`；结束的更新**总是同时**带两处结果：`content` 里恰好一个 `{type: "content", content: {type: "text", text}}` 块，和等值的字符串 `rawOutput`，空输出时二者都是空串，宿主读哪一处都一样；`in_progress` 更新不带结果）、`plan`、`current_mode_update`、`session_info_update`、`usage_update` 与 `available_commands_update`。**一个 turn 的所有更新都先于它的 `session/prompt` 响应送达。** 响应为 `{stopReason}`：`end_turn` / `max_tokens` / `max_turn_requests`（本轮用完 `max_steps_per_turn`）/ `refusal` / `cancelled`。
+- `session/prompt` 接受官方 content block 数组（`text` 与 `image`：`image` 块 `{type: "image", data: <base64>, mimeType}` 作为图片随这条用户消息交给模型，数据与大小按其他用户图片的方式规整，不可用的图片让这个 turn 失败而不是被悄悄丢掉；`initialize` 里 `promptCapabilities.image` 为 `true`，模型能不能看图由所选模型的 `image_in` 能力与 provider 决定），turn 期间用 `session/update` 流式推送 `agent_message_chunk`、`agent_thought_chunk`、`tool_call`（`title` / `kind` / `status` / `rawInput`）、`tool_call_update`（`status` 为 `in_progress` / `completed` / `failed`；结束的更新**总是同时**带两处结果：`content` 里恰好一个 `{type: "content", content: {type: "text", text}}` 块，和等值的字符串 `rawOutput`，空输出时二者都是空串，宿主读哪一处都一样；`in_progress` 更新不带结果）、`plan`、`current_mode_update`、`session_info_update`、`usage_update` 与 `available_commands_update`。**一个 turn 的所有更新都先于它的 `session/prompt` 响应送达。** 响应为 `{stopReason}`：`end_turn` / `max_tokens` / `max_turn_requests`（本轮用完 `max_steps_per_turn`）/ `refusal` / `cancelled`。
 - 取消：`session/cancel` 是通知（无响应）；正在进行的 `session/prompt` 以 `stopReason: "cancelled"` 结束，并同时放弃它等待中的 `session/request_permission` / `session/request_input`（客户端会收到 `$/cancel_request`）。`$/cancel_request` 作用于 `session/prompt` 时同样走协作取消；作用于其他请求时立即以 `-32800` 应答。在没有 turn 运行时发出的取消不会影响下一个 turn。
 - 工具批准映射为 agent→client 请求 `session/request_permission`：`toolCall`（`toolCallId` / `title` / `kind` / `status` / `rawInput`）、`options`（`optionId` 为 `allow_once` / `allow_always` / `reject_once` / `reject_always`，`name`，`kind`），客户端以 `{outcome: {outcome: "selected", optionId}}` 或 `{outcome: {outcome: "cancelled"}}` 响应。请求没有超时：用户可以慢慢决定，`session/cancel` 或连接断开会终止等待。`cancelled` 不授予任何权限，也不会被记住。
 - 用户提问映射为 `session/request_input`（kkagent 扩展：text 或 select，多选遵循 `multiSelect`），响应为 `{content: [...]}` 或 `{canceled: true}`。
@@ -45,9 +45,9 @@ ACP 进程的 stdout 是协议通道，不能混入普通日志；诊断信息�
 
 ```jsonc
 // initialize 请求
-{"_meta": {"kkagent/host": {"tools": true, "toolReview": true, "store": {"sessions": true, "events": true}}}}
+{"_meta": {"kkagent/host": {"protocolVersion": 1, "tools": true, "toolReview": true, "llm": true, "store": {"sessions": true, "events": true}}}}
 // initialize 响应（只对说了这个扩展的客户端）
-{"_meta": {"kkagent/host": {"tools": true, "store": {"sessions": false, "events": false}}}}
+{"_meta": {"kkagent/host": {"protocolVersion": 1, "tools": true, "llm": true, "store": {"sessions": false, "events": false}}}}
 ```
 
 按会话的设置放在 `session/new`、`session/load`、`session/resume` 的 `_meta["kkagent/host"]`；未知字段（包括 `hostTools` 条目、`extensions`、`toolReview` 里的拼写错误）会以 `-32602` 拒绝，而不是静默丢掉一条限制：
@@ -61,6 +61,8 @@ ACP 进程的 stdout 是协议通道，不能混入普通日志；诊断信息�
 | `permissionMode` | 初始权限模式 `manual` / `yolo` / `auto` |
 | `toolReview` | `{mode: "off"｜"mutating"｜"all", timeoutSecs?}`：放行前先问宿主（见下），只能收紧 |
 | `replay` | 仅 `session/load`：`false` 不回放历史（默认 `true`） |
+
+**严格白名单会话不解析斜杠命令。** 会话处于严格工具白名单（角色或 `toolAllowlist` 生效）时，`session/prompt` 的文本一律原样交给模型：以 `/help`、`/status`、`/compact` 等开头的用户消息不会被 agent 自己当命令回答（它们是交互式编辑器的界面，宿主的用户并不在那里）。`fs/*`、`terminal/*` 在同样条件下已按“方法不存在”拒绝。
 
 **宿主工具。** `hostTools: [{name, description, inputSchema, readOnly, approval, timeoutSecs}]`。宿主必须在 `initialize` 声明 `tools: true`。工具名只能是 `[A-Za-z0-9_-]{1,64}`，不能与内置、插件或 MCP 工具同名（不允许遮蔽），`mcp__` 前缀保留。它们是普通工具：受白名单过滤，出现在模型的工具列表中。模型调用时，kkagent 向宿主发请求 `_kkagent/tool/call`：
 
@@ -89,6 +91,23 @@ ACP 进程的 stdout 是协议通道，不能混入普通日志；诊断信息�
 **会话与事件存储。** `[storage] backend = "host"`（或 `kkagent acp --storage host`）让宿主成为会话、消息和事件的唯一存储。宿主必须声明 `store.sessions: true`（否则 `initialize` 报 `-32602`），本地 SQLite 不会写入任何会话内容；宿主没有连接或请求失败时**关闭失败**（turn 报错），绝不回退到本地库。kkagent 通过 agent→client 请求访问存储：
 
 `_kkagent/store/session/{create,get,list,update,delete,fork}`、`_kkagent/store/messages/{append,replace,load}`、`_kkagent/store/toolResult/record`，以及（声明 `store.events` 时）`_kkagent/store/events/{append,since,latestSeq}`。错误码 `-32002` 表示不存在，`-32003` 表示已存在。事件写入失败只记录警告；消息写入失败会让 turn 失败。Rust 宿主可以直接使用 `kkagent_core::storage::handle_store_request` 实现宿主侧。
+
+**协议版本。** 宿主可在 `initialize` 里带 `protocolVersion`（整数，当前为 `1`）；与 agent 不一致时 `initialize` 报错，而不是各按各的理解运行。不带则不检查。agent 总在回应里给出自己的版本。`_kkagent/*` 的方法或字段有不兼容改动时才增加它。
+
+**由宿主调用模型（`llm`）。** 宿主在 `initialize` 声明 `llm: true`，并在配置里把模型的 provider 写成 `type = "host"`（不带 `api_key` / `api_key_env` / `base_url` / `custom_headers` / `oauth`，带了就在配置校验时被拒绝）：这个 provider 的每一次模型调用都不出 worker，而是请求宿主，凭据、网络出口、限流和计费都在宿主那一侧；worker 手里没有任何密钥。流是拉取式的，和其他 `_kkagent/*` 一样走 agent→client 请求，不引入 client→agent 的推送：
+
+```jsonc
+// agent → host：开始一次调用，立刻返回 streamId（messages / tools 是 kkagent-llm 的 ChatMessage / ToolDef 原样的 JSON）
+{"method": "_kkagent/llm/start", "params": {"model": "<配置里的上游模型名>", "system": "…", "messages": [{"role": "user", "content": [{"type": "text", "text": "…"}, {"type": "image", "media_type": "image/png", "data": "<base64>"}]}, {"role": "assistant", "content": [{"type": "tool_use", "id": "…", "name": "…", "input": {…}}]}, {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "…", "content": "…", "is_error": false}]}], "tools": [{"name": "…", "description": "…", "input_schema": {…}}], "maxTokens": 4096, "thinking": {"budgetTokens": 2048, "adaptive": false, "effort": "high"}, "promptCacheKey": "…"}}
+{"result": {"streamId": "s1"}}
+// agent → host：长轮询（waitMs 内有事件就返回），events 按顺序，done 表示流结束
+{"method": "_kkagent/llm/next", "params": {"streamId": "s1", "waitMs": 20000}}
+{"result": {"events": [{"type": "text_delta", "text": "你"}, …], "done": false}}
+// agent → host：取消（通知，不等回复；agent 丢弃流时也会发）
+{"method": "_kkagent/llm/cancel", "params": {"streamId": "s1"}}
+```
+
+事件为 `text_delta`、`thinking_delta`、`tool_use_start {id, name}`、`tool_use_input_delta {id, delta}`、`tool_use_end {id}`、`message_end {usage, stopReason}`、`rate_limited {message, retryAfterMs}`、`error {message}`。`message_end.usage` 是 `{inputTokens, outputTokens, cacheCreationInputTokens, cacheReadInputTokens, inputIncludesCache?}`，`stopReason` 为空表示正常结束。流在 `message_end` 或 `error` 之前结束算错误。宿主没有声明 `llm`、请求出错或宿主断开都**关闭失败**（turn 报错），不会回退到别的 provider。`type = "host"` 的 provider 只在 `kkagent acp` 下可用。
 
 **会话级 MCP。** 标准 `mcpServers`（stdio / http / sse）在会话创建时启动，随会话结束而停止，不与用户配置或插件中的同名服务器冲突。严格白名单永远不可能放行 `mcp__<server>__*` 时，该服务器根本不会启动。
 

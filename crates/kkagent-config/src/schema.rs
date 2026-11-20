@@ -2132,10 +2132,23 @@ impl AppConfig {
                     | "google"
                     | "google-genai"
                     | "gemini"
+                    | "host"
             ) {
                 anyhow::bail!(
                     "provider {name} has unsupported type {}",
                     provider.provider_type
+                );
+            }
+            if provider.provider_type == "host"
+                && (provider.api_key.is_some()
+                    || provider.api_key_env.is_some()
+                    || provider.base_url.is_some()
+                    || !provider.custom_headers.is_empty()
+                    || provider.oauth.is_some())
+            {
+                anyhow::bail!(
+                    "provider {name} is of type \"host\": the host makes its model calls, so it takes no \
+                     api_key, api_key_env, base_url, custom_headers or oauth"
                 );
             }
             if let Some(base_url) = provider.base_url.as_deref() {
@@ -3367,6 +3380,34 @@ experimental_retry_partial_stream_errors = false
         }
         for mode in ["auto", "process", "workspace", "unknown"] {
             assert!(!SandboxConfig::mode_is_disabled(mode), "mode {mode:?}");
+        }
+    }
+
+    #[test]
+    fn a_host_provider_is_valid_only_without_anything_to_connect_with() {
+        let mut config = valid_config();
+        {
+            let provider = config.providers.get_mut("test").unwrap();
+            provider.provider_type = "host".into();
+            provider.api_key = None;
+            provider.api_key_env = None;
+            provider.base_url = None;
+            provider.custom_headers.clear();
+            provider.oauth = None;
+        }
+        config.validate().expect("a bare host provider is fine");
+        for spoil in [
+            |p: &mut ProviderConfig| p.api_key = Some("sk-secret".into()),
+            |p: &mut ProviderConfig| p.api_key_env = Some("SOME_KEY".into()),
+            |p: &mut ProviderConfig| p.base_url = Some("https://example.com".into()),
+            |p: &mut ProviderConfig| {
+                p.custom_headers.insert("x-key".into(), "v".into());
+            },
+        ] {
+            let mut spoiled = config.clone();
+            spoil(spoiled.providers.get_mut("test").unwrap());
+            let why = spoiled.validate().unwrap_err().to_string();
+            assert!(why.contains("the host makes its model calls"), "{why}");
         }
     }
 
