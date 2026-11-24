@@ -216,15 +216,16 @@ MCP 客户端本地直连：URL `http://127.0.0.1:8788/mcp`，Header `Authorizat
 
 ## 架构概览
 
-Workspace 包含 16 个 crate：
+Workspace 包含 17 个 crate：
 
 | Crate | 说明 |
 |---|---|
 | `kkagent` | 主入口二进制，CLI / TUI 启动器。 |
 | `kkagent-protocol` | 跨 crate 的协议类型、消息与错误定义。 |
+| `kkagent-host` | 宿主扩展（`_kkagent/*`）的线上类型，只依赖 serde；宿主进程可单独依赖它（见 [docs/extensions.md](docs/extensions.md#作为库依赖)）。 |
 | `kkagent-rpc` | RPC 传输层（memory / UDS / TCP）。 |
 | `kkagent-config` | TOML 配置加载、验证、环境变量覆盖。 |
-| `kkagent-llm` | LLM Provider 抽象、流解析、token 计数。 |
+| `kkagent-llm` | LLM Provider 抽象、流解析、token 计数；不依赖其他 kkagent crate，可单独作为库依赖。 |
 | `kkagent-core` | Agent 主循环、上下文投影、权限链、计划审阅。 |
 | `kkagent-tools` | 内置工具实现与注册表。 |
 | `kkagent-mcp` | MCP Client / Server 支持。 |

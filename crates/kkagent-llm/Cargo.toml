@@ -1,7 +1,10 @@
 [package]
 name = "kkagent-llm"
+description = "Model client of kkagent: provider abstraction, streaming parsers and token usage for Anthropic, OpenAI (chat / responses), Kimi and Google, with no dependency on the rest of kkagent"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 tokio = { workspace = true }

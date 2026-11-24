@@ -216,15 +216,16 @@ Local MCP client config: URL `http://127.0.0.1:8788/mcp`, header `Authorization:
 
 ## Architecture Overview
 
-The workspace contains 16 crates:
+The workspace contains 17 crates:
 
 | Crate | Description |
 |---|---|
 | `kkagent` | Main binary entrypoint, CLI / TUI launcher. |
 | `kkagent-protocol` | Protocol types, messages, and error definitions shared across crates. |
+| `kkagent-host` | Wire types of the host extension (`_kkagent/*`), depends on serde only; a host process can depend on it alone (see [docs/extensions.md](docs/extensions.md)). |
 | `kkagent-rpc` | RPC transport layer (memory / UDS / TCP). |
 | `kkagent-config` | TOML config loading, validation, and environment variable overrides. |
-| `kkagent-llm` | LLM provider abstraction, stream parsing, token counting. |
+| `kkagent-llm` | LLM provider abstraction, stream parsing, token counting; depends on no other kkagent crate and can be taken as a library on its own. |
 | `kkagent-core` | Agent main loop, context projection, permission chain, plan review. |
 | `kkagent-tools` | Built-in tool implementations and registry. |
 | `kkagent-mcp` | MCP Client / Server support. |

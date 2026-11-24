@@ -113,6 +113,27 @@ ACP 进程的 stdout 是协议通道，不能混入普通日志；诊断信息�
 
 完整的安全边界见[安全说明](security.md#宿主与严格角色)。
 
+### 作为库依赖
+
+上层宿主要说这套协议、或者要用 kkagent 的模型客户端，不必把整个 kkagent 拉进来。两个库各自是叶子（`crates/kkagent-host/tests/stays_a_leaf.rs` 钉住这一点）：
+
+| crate | 内容 | 依赖 |
+|---|---|---|
+| `kkagent-host` | `_kkagent/*` 宿主扩展的线上类型：`initialize` 协商、宿主工具、工具审查、宿主存储、宿主 LLM 的请求与事件 | 只有 `serde` / `serde_json` |
+| `kkagent-llm` | 模型客户端：Provider 抽象、Anthropic / OpenAI（chat、responses）/ Kimi / Google 的流解析、用量 | 只有 crates.io 的库，不依赖任何 `kkagent-*` |
+
+不需要把仓库放在某个固定目录。两种取法（`kkagent` 二进制和这两个库来自同一个提交才保证协议一致，所以**固定到同一个 `rev`**）：
+
+```toml
+# Cargo.toml：git 依赖。cargo 会在仓库里按名字找到 workspace 成员
+kkagent-host = { git = "https://github.com/Ken-u/kkagent", rev = "<提交>" }
+kkagent-llm  = { git = "https://github.com/Ken-u/kkagent", rev = "<提交>" }
+```
+
+或者把本仓库加成宿主仓库的 git submodule（例如 `third_party/kkagent`），再用路径依赖；宿主的 `[workspace]` 要写 `exclude = ["third_party/kkagent"]`，否则 cargo 会把路径依赖当成宿主 workspace 的成员，与 kkagent 自己的 workspace 冲突。worker 二进制同样从这份检出里构建：`cargo build -p kkagent`（宿主可用 `CARGO_TARGET_DIR` 把产物放到自己的 `target/` 下，不弄脏 submodule）。
+
+宿主怎么找到二进制是宿主的事（kkagent 不假定任何目录）。宿主在 `initialize` 里带上 `HOST_PROTOCOL_VERSION` 和它提供的能力，agent 回显它支持的部分；一个不回显宿主能力的二进制是旧版本或不对的二进制，宿主应当在握手时就拒绝它，而不是等到某个 turn 中间才以奇怪的方式失败。
+
 ## MCP Client
 
 kkagent 可把外部 MCP Server 的工具动态注册给模型。支持：
