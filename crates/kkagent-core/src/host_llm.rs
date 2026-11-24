@@ -227,8 +227,9 @@ impl LlmProvider for HostLlmProvider {
                 )
                 .await
                 .map_err(|error| anyhow::anyhow!("host model call: {}", describe(&error)))?;
-            serde_json::from_value(answer)
-                .map_err(|error| anyhow::anyhow!("host model call: malformed start answer: {error}"))?
+            serde_json::from_value(answer).map_err(|error| {
+                anyhow::anyhow!("host model call: malformed start answer: {error}")
+            })?
         };
         let mut guard = CancelOnDrop {
             channel: channel.clone(),
@@ -272,7 +273,10 @@ impl LlmProvider for HostLlmProvider {
             for event in batch.events {
                 let event = stream_event(event);
                 got_content |= is_content(&event);
-                ended |= matches!(event, StreamEvent::MessageEnd { .. } | StreamEvent::Error(_));
+                ended |= matches!(
+                    event,
+                    StreamEvent::MessageEnd { .. } | StreamEvent::Error(_)
+                );
                 if event_tx.send(event).await.is_err() {
                     // Nobody listens any more: the guard tells the host.
                     return Ok(());
@@ -281,7 +285,9 @@ impl LlmProvider for HostLlmProvider {
             if batch.done {
                 guard.finished = true;
                 if !ended {
-                    anyhow::bail!("host model call: the host ended the stream without a message end");
+                    anyhow::bail!(
+                        "host model call: the host ended the stream without a message end"
+                    );
                 }
                 return Ok(());
             }
@@ -323,7 +329,10 @@ mod tests {
             params: Value,
             _options: RequestOptions,
         ) -> Result<Value, HostChannelError> {
-            self.calls.lock().unwrap().push((method.to_string(), params));
+            self.calls
+                .lock()
+                .unwrap()
+                .push((method.to_string(), params));
             if method == METHOD_HOST_LLM_START {
                 return Ok(json!({"streamId": "s1"}));
             }
@@ -334,7 +343,10 @@ mod tests {
                 .unwrap_or(Err(HostChannelError::Closed))
         }
         async fn notify(&self, method: &str, params: Value) {
-            self.notices.lock().unwrap().push((method.to_string(), params));
+            self.notices
+                .lock()
+                .unwrap()
+                .push((method.to_string(), params));
         }
     }
 
@@ -355,7 +367,11 @@ mod tests {
         }
     }
 
-    async fn run(host: &Arc<ScriptedHost>, offered: bool, request: LlmRequest) -> (anyhow::Result<()>, Vec<StreamEvent>) {
+    async fn run(
+        host: &Arc<ScriptedHost>,
+        offered: bool,
+        request: LlmRequest,
+    ) -> (anyhow::Result<()>, Vec<StreamEvent>) {
         let llm = HostLlm::new(host.clone());
         llm.set_offered(offered);
         let provider = HostLlmProvider::new(llm);
@@ -384,7 +400,9 @@ mod tests {
         result.unwrap();
         assert_eq!(events.len(), 6);
         assert!(matches!(&events[0], StreamEvent::TextDelta(t) if t == "he"));
-        assert!(matches!(&events[2], StreamEvent::ToolUseStart { id, name } if id == "t1" && name == "vfs__read_file"));
+        assert!(
+            matches!(&events[2], StreamEvent::ToolUseStart { id, name } if id == "t1" && name == "vfs__read_file")
+        );
         match &events[5] {
             StreamEvent::MessageEnd { usage, stop_reason } => {
                 assert_eq!((usage.input_tokens, usage.output_tokens), (7, 2));
@@ -400,8 +418,14 @@ mod tests {
         assert_eq!(calls[0].1["maxTokens"], 512);
         assert_eq!(calls[0].1["messages"][0]["role"], "user");
         assert_eq!(calls[0].1["tools"][0]["name"], "vfs__read_file");
-        assert!(calls.iter().skip(1).all(|(method, params)| method == METHOD_HOST_LLM_NEXT && params["streamId"] == "s1"));
-        assert!(host.notices.lock().unwrap().is_empty(), "a call that ended is not cancelled");
+        assert!(calls
+            .iter()
+            .skip(1)
+            .all(|(method, params)| method == METHOD_HOST_LLM_NEXT && params["streamId"] == "s1"));
+        assert!(
+            host.notices.lock().unwrap().is_empty(),
+            "a call that ended is not cancelled"
+        );
     }
 
     #[tokio::test]
@@ -416,22 +440,35 @@ mod tests {
 
     #[tokio::test]
     async fn a_host_that_goes_away_fails_the_call_and_says_so() {
-        let host = ScriptedHost::new(vec![Ok(json!({"events": [{"type": "text_delta", "text": "x"}], "done": false})), Err(HostChannelError::Closed)]);
+        let host = ScriptedHost::new(vec![
+            Ok(json!({"events": [{"type": "text_delta", "text": "x"}], "done": false})),
+            Err(HostChannelError::Closed),
+        ]);
         let (result, events) = run(&host, true, request()).await;
-        assert!(result.unwrap_err().to_string().contains("host disconnected"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("host disconnected"));
         assert_eq!(events.len(), 1, "what arrived before is kept");
     }
 
     #[tokio::test]
     async fn a_stream_that_ends_without_a_message_end_is_an_error() {
-        let host = ScriptedHost::new(vec![Ok(json!({"events": [{"type": "text_delta", "text": "x"}], "done": true}))]);
+        let host = ScriptedHost::new(vec![Ok(
+            json!({"events": [{"type": "text_delta", "text": "x"}], "done": true}),
+        )]);
         let (result, _events) = run(&host, true, request()).await;
-        assert!(result.unwrap_err().to_string().contains("without a message end"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("without a message end"));
     }
 
     #[tokio::test]
     async fn an_error_event_ends_the_stream_and_reaches_the_loop() {
-        let host = ScriptedHost::new(vec![Ok(json!({"events": [{"type": "error", "message": "provider said no"}], "done": true}))]);
+        let host = ScriptedHost::new(vec![Ok(
+            json!({"events": [{"type": "error", "message": "provider said no"}], "done": true}),
+        )]);
         let (result, events) = run(&host, true, request()).await;
         result.unwrap();
         assert!(matches!(&events[0], StreamEvent::Error(m) if m == "provider said no"));
@@ -439,7 +476,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_listener_that_went_away_makes_the_host_drop_the_call() {
-        let host = ScriptedHost::new(vec![Ok(json!({"events": [{"type": "text_delta", "text": "x"}], "done": false}))]);
+        let host = ScriptedHost::new(vec![Ok(
+            json!({"events": [{"type": "text_delta", "text": "x"}], "done": false}),
+        )]);
         let llm = HostLlm::new(host.clone());
         llm.set_offered(true);
         let provider = HostLlmProvider::new(llm);
@@ -467,7 +506,9 @@ mod tests {
         ], "done": true}))]);
         let (result, events) = run(&host, true, request()).await;
         result.unwrap();
-        assert!(matches!(&events[0], StreamEvent::RateLimited { retry_after: Some(d), .. } if *d == Duration::from_millis(1500)));
+        assert!(
+            matches!(&events[0], StreamEvent::RateLimited { retry_after: Some(d), .. } if *d == Duration::from_millis(1500))
+        );
     }
 
     #[test]
@@ -480,7 +521,10 @@ mod tests {
             ..Default::default()
         };
         assert!(kkagent_llm::create_provider(&settings, "m").is_ok());
-        let replace = register_provider_type("openai", Arc::new(|_: &ProviderSettings, _: &str| anyhow::bail!("no")));
+        let replace = register_provider_type(
+            "openai",
+            Arc::new(|_: &ProviderSettings, _: &str| anyhow::bail!("no")),
+        );
         assert!(replace.is_err());
     }
 }

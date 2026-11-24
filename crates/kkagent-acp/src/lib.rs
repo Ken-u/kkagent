@@ -873,7 +873,9 @@ impl AcpServer {
                 // allowlist: there the prompt belongs to the host's user and goes to the model whole, so a
                 // message that happens to begin with `/help` is never answered by the agent itself.
                 if !self.host.tools_restricted(Some(&sid)).await {
-                    if let Some((name, args)) = parse_slash_command(&ContentBlock::join_text(&blocks)) {
+                    if let Some((name, args)) =
+                        parse_slash_command(&ContentBlock::join_text(&blocks))
+                    {
                         return self.run_slash_command(id, &sid, &name, &args).await;
                     }
                 }
@@ -3404,7 +3406,10 @@ mod tests {
             ))
             .await;
         assert_eq!(response.result.unwrap()["stopReason"], "end_turn");
-        assert_eq!(*host.0.lock().unwrap(), vec!["/help me with this".to_string()]);
+        assert_eq!(
+            *host.0.lock().unwrap(),
+            vec!["/help me with this".to_string()]
+        );
     }
 
     #[tokio::test]

@@ -1876,7 +1876,13 @@ fn a_host_provider_takes_the_model_call_to_the_host_and_never_to_the_network() {
     assert_eq!(seen[0]["model"], "upstream-x");
     assert!(seen[0].to_string().contains("say hello"));
     let asked = seen[0].to_string().to_lowercase();
-    for key in ["\"token\":", "api_key", "apikey", "authorization", "\"secret\""] {
+    for key in [
+        "\"token\":",
+        "api_key",
+        "apikey",
+        "authorization",
+        "\"secret\"",
+    ] {
         assert!(
             !asked.contains(key),
             "no credential in what the host is asked ({key}): {}",
@@ -1965,7 +1971,8 @@ fn a_host_that_did_not_offer_model_calls_fails_the_turn_instead_of_falling_back(
         Err(error) => error.to_string(),
     };
     assert!(
-        said.contains("did not offer model calls") || acp.logs().contains("did not offer model calls"),
+        said.contains("did not offer model calls")
+            || acp.logs().contains("did not offer model calls"),
         "the turn says why it failed: {said}\n{}",
         acp.logs()
     );

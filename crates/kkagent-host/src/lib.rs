@@ -549,12 +549,20 @@ pub enum HostLlmEvent {
     MessageEnd {
         #[serde(default)]
         usage: HostLlmUsage,
-        #[serde(default, rename = "stopReason", skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            rename = "stopReason",
+            skip_serializing_if = "Option::is_none"
+        )]
         stop_reason: Option<String>,
     },
     RateLimited {
         message: String,
-        #[serde(default, rename = "retryAfterMs", skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            rename = "retryAfterMs",
+            skip_serializing_if = "Option::is_none"
+        )]
         retry_after_ms: Option<u64>,
     },
     Error {
@@ -800,7 +808,10 @@ mod tests {
         assert!(caps.llm);
         assert_eq!(caps.protocol_version, Some(1));
         let plain = HostCapabilities::from_meta(Some(&json!({"kkagent/host": {"tools": true}})));
-        assert!(!plain.llm, "a host that did not offer model calls has not offered them");
+        assert!(
+            !plain.llm,
+            "a host that did not offer model calls has not offered them"
+        );
         assert_eq!(plain.protocol_version, None);
     }
 
@@ -808,19 +819,37 @@ mod tests {
     fn llm_events_use_the_documented_wire_shape() {
         let events = vec![
             HostLlmEvent::TextDelta { text: "hi".into() },
-            HostLlmEvent::ToolUseStart { id: "t1".into(), name: "vfs__read_file".into() },
-            HostLlmEvent::ToolUseInputDelta { id: "t1".into(), delta: "{\"a\":".into() },
+            HostLlmEvent::ToolUseStart {
+                id: "t1".into(),
+                name: "vfs__read_file".into(),
+            },
+            HostLlmEvent::ToolUseInputDelta {
+                id: "t1".into(),
+                delta: "{\"a\":".into(),
+            },
             HostLlmEvent::ToolUseEnd { id: "t1".into() },
             HostLlmEvent::MessageEnd {
-                usage: HostLlmUsage { input_tokens: 10, output_tokens: 3, ..Default::default() },
+                usage: HostLlmUsage {
+                    input_tokens: 10,
+                    output_tokens: 3,
+                    ..Default::default()
+                },
                 stop_reason: Some("end_turn".into()),
             },
-            HostLlmEvent::RateLimited { message: "slow down".into(), retry_after_ms: Some(1500) },
-            HostLlmEvent::Error { message: "boom".into() },
+            HostLlmEvent::RateLimited {
+                message: "slow down".into(),
+                retry_after_ms: Some(1500),
+            },
+            HostLlmEvent::Error {
+                message: "boom".into(),
+            },
         ];
         let wire = serde_json::to_value(&events).unwrap();
         assert_eq!(wire[0], json!({"type": "text_delta", "text": "hi"}));
-        assert_eq!(wire[1], json!({"type": "tool_use_start", "id": "t1", "name": "vfs__read_file"}));
+        assert_eq!(
+            wire[1],
+            json!({"type": "tool_use_start", "id": "t1", "name": "vfs__read_file"})
+        );
         assert_eq!(wire[4]["type"], "message_end");
         assert_eq!(wire[4]["usage"]["inputTokens"], 10);
         assert_eq!(wire[4]["stopReason"], "end_turn");

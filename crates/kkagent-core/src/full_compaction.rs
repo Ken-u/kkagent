@@ -4,8 +4,8 @@
 //! compaction (covered by the summary) so Anthropic-style tool_use/tool_result
 //! pairing cannot 400 the next request.
 
-use kkagent_config::AppConfig;
 use crate::provider_factory::create_provider;
+use kkagent_config::AppConfig;
 use kkagent_llm::{ChatContent, ChatMessage, LlmRequest, StreamEvent, ToolDef};
 use kkagent_protocol::TokenUsage;
 use std::sync::Arc;

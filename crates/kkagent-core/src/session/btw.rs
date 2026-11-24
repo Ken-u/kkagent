@@ -3,11 +3,11 @@
 //! Tracks a text-only side channel (prior Q&A + optional child agent id)
 //! and streams answers against main-session history without tools.
 
+use crate::provider_factory::create_provider;
 use crate::session::agent_lifecycle::{AgentLifecycleService, CreateAgentOptions, MAIN_AGENT_ID};
 use crate::session::metadata::AgentKind;
 use anyhow::{anyhow, Result};
 use kkagent_config::AppConfig;
-use crate::provider_factory::create_provider;
 use kkagent_llm::types::{ChatContent, ChatMessage, LlmRequest, StreamEvent};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
